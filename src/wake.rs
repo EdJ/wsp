@@ -2144,6 +2144,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
         let hook = if state == crate::place::State::Working { "UserPromptSubmit" } else { "Stop" };
         compound.heard(&seat, hook, state, &json!({}));
+        assert_eq!(compound.state(&seat).unwrap(), state);
         store.save_task(&crate::model::Task::new(&format!("{task} a row mid-turn"), task)).unwrap();
         store.set_binding(seat.as_str(), json!({ "pane": seat.as_str(), "task_id": task }));
         (seat.as_str().to_string(), ends)
@@ -2340,7 +2341,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let (seat, _ends) = compound_seat_in(&store, "wsp-700", State::Working);
-        // A tell typed into the turn logs `agent-told` without `queued`.
+        // The nothing-typed check is backed by the command's exit code and the held count, not by watching what was typed.
         let delivered = || store.events_of("agent-told").iter().filter(|e| e["queued"] != json!(true)).count();
         assert_eq!(delivered(), 0);
 
