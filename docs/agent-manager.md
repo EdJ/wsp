@@ -1091,8 +1091,8 @@ and that a job whose manager restarts mid-run is resent under its key and runs o
 Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**
 Trees live with the agents on each host, and a land is a fenced push to a trunk remote. **d1's Q6 ("T1 now",
 2026-11-17) is superseded by this answer**, for M3 groups 5-8 and for M4. The source is Ed's answers as relayed by
-Jesper and recorded on wsp-093's overview. d1's other answers stand, Q14 included. The person confirms the
-supersession at wsp-093's review and records the project decision. Ed's other answers change nothing here. There
+Jesper and recorded on wsp-093's overview. Jesper confirmed it on 2026-11-18 (below). d1's other answers stand, Q14
+included. Recording the project decision is his to do. Ed's other answers change nothing here. There
 is one manager per host over compound-sup, wsp dials the managers, and wsp keeps the throttle decision (Q11). The
 renderer answer needs no row either: the manager starts no renderer, it reads the render socket from compound-sup's
 handshake and reports it with the seat's sockets.
@@ -1162,16 +1162,18 @@ end, as d1 Q14 says for every step.
 | 7 | wsp-057 contract | **Kept, with a note.** The `place_of` seam stays. treecopy.rs is not deleted here (M4). |
 | 8 | wsp-058 measure | **Kept, with a note.** The measure is the Mac's alone, because the Mac's manager is the only one. |
 
-**The answers (2026-11-18, on wsp-093, every one the recommended answer).** These were put to the person. The
-m3-t2-plan governor seat answered them (ask m-dmyftmwv5200-pacf40), not the person. They stand as the plan until the
-person confirms or changes them at wsp-093's review:
+**Jesper's answers (2026-11-18, about 15:27Z, every one the recommended option).** He gave them in the m3-t2-plan
+pane, to a question put to him directly, and the governor relayed them. They replace the answers the governor seat
+gave earlier (ask m-dmyftmwv5200-pacf40), which were not the person's:
+- **d1's Q6 is superseded.** T2 replaces "T1 now".
 - **The trunk remote** is a bare repository per project on the Mac, reached over ssh on the tailnet (1.3, "What T2
   costs", item 1). The Mac stays the trunk's host and the barrier's default host, and the person's checkout becomes
   a clone that pulls. The alternative put to the person was the forge.
 - **Verify runs on the row's host.** The verifier is spawned where the row's tree is, with no fetch and no copy.
 - **The landing record is the store's**, from the push's `tree.landed`. The reflog is read only for lands made
   before T2.
-- **M4 is broken down at M3's end**, after wsp-058, as d1 Q14 says. Groups 5-8 go ahead as amended.
+- **M4 is broken down at M3's end**, after wsp-058, as d1 Q14 says. Every answer is the recommended option, so
+  wsp-052..058 need no change and go ahead as amended.
 
 **No row in groups 5-8 needs `tree.checkout` or `tree.land` to meet its done-when.** At M3 the Mac is the tree's host
 for every row. So `place_of` makes check, verify and barrier trees on the Mac in-process, and every job is named by
