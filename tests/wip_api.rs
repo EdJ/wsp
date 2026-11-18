@@ -234,8 +234,9 @@ fn snapshot_with(client: &Client, ready: impl Fn(&Value) -> bool) -> Value {
 }
 
 /// The moment readings, which stay out of the contract (the person's decision
-/// on wsp-076): `load` and `idle_memory` are read live on both paths, so their
-/// values may move between two calls. Each is checked present and well-formed
+/// on wsp-076): `load` and `idle_memory` are read live on both paths, and an
+/// agent's `held` and wait `line` count seconds since a moment (`elapsed_masked`),
+/// so their values may move between two calls. Each is checked present and well-formed
 /// and masked in the text; every other byte is compared.
 fn masked(out: &Output) -> String {
     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -262,11 +263,29 @@ fn masked(out: &Output) -> String {
         } else if let Some(rest) = line.strip_prefix("  \"idle_memory\": ") {
             skipping = rest == "{";
             lines.push("  \"idle_memory\": <masked>".to_string());
+        } else if let Some(m) = elapsed_masked(line) {
+            lines.push(m);
         } else {
             lines.push(line.to_string());
         }
     }
     lines.join("\n")
+}
+
+/// An agent's `held` and its wait's `line` count whole seconds since a moment
+/// (`held 3s`, `waiting on a person 3s: …`), so two reads a second apart
+/// differ; each is masked with its key, indentation and comma kept.
+fn elapsed_masked(line: &str) -> Option<String> {
+    let body = line.trim_start();
+    let indent = &line[..line.len() - body.len()];
+    let comma = if body.ends_with(',') { "," } else { "" };
+    if body.starts_with("\"held\": ") {
+        return Some(format!("{indent}\"held\": <masked>{comma}"));
+    }
+    if body.starts_with("\"line\": \"waiting on ") {
+        return Some(format!("{indent}\"line\": <masked>{comma}"));
+    }
+    None
 }
 
 /// The throttle line with the person's idle seconds masked (`idle 3s`, `away
