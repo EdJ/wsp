@@ -1089,8 +1089,10 @@ and that a job whose manager restarts mid-run is resent under its key and runs o
 #### M3 under T2 (wsp-093, 2026-11-18)
 
 Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**
-Trees live with the agents on each host, and a land is a fenced push to a trunk remote. This replaces d1's "Q6 T1
-now". His other answers change nothing here. There is one manager per host over compound-sup, wsp dials the managers,
+Trees live with the agents on each host, and a land is a fenced push to a trunk remote. **d1's Q6 ("T1 now",
+2026-11-17) is superseded by this answer**, for M3 groups 5-8 and for M4. The source is Ed's answers as relayed by
+Jesper and recorded on wsp-093's overview. d1's other answers stand, Q14 included. The person confirms the
+supersession at wsp-093's review and records the project decision. His other answers change nothing here. There is one manager per host over compound-sup, wsp dials the managers,
 and wsp keeps the throttle decision (Q11). The renderer answer needs no row either: the manager starts no renderer, it
 reads the render socket from compound-sup's handshake and reports it with the seat's sockets.
 
@@ -1130,10 +1132,11 @@ host, by key, not with `kill -0`.
    because the trunk moved lands nothing. The row is rebased on the new head, its checks are rerun where the trunk
    moved, and it is pushed again under the new lease. Nothing is ever pushed without a lease, and nothing is
    overwritten.
-4. The push's answer (`H` to the new head, the commits it carried) is journalled as `tree.landed` and folded into the
-   store. That is the landing record. `Landings` (cmd_checkout.rs:1438) reads the trunk's reflog today, and a bare
-   trunk on another host has no reflog the store can read. So `placed` reads the store's record, and the reflog only
-   for lands made before T2.
+4. The pushing manager records the outcome of every fenced push, accepted or refused, as a land event: the row, the
+   old head `H`, the new head, and for an accepted push the commits it carried. The event is journalled as
+   `tree.landed` and folded into the store, and that is the landing record. `Landings` (cmd_checkout.rs:1438) reads
+   the trunk's reflog today. A bare repository has `core.logAllRefUpdates` off, so the bare trunk keeps no reflog for
+   it to read. `placed` therefore reads the store's land events, and reads the reflog only for lands made before T2.
 
 Each host's trunk-tracking ref moves at its next fetch, which the manager runs at every spawn and every land. The
 person's checkout becomes a clone that pulls. The trunk must be a bare repository, because git refuses a push to the
@@ -1159,12 +1162,18 @@ end, as d1 Q14 says for every step.
 | 8 | wsp-058 measure | **Kept, with a note.** The measure is the Mac's alone, because the Mac's manager is the only one. |
 
 **The person's answers (2026-11-18, on wsp-093, every one the recommended answer):**
-- **The trunk remote** is a bare repository per project on the Mac, reached over ssh on the tailnet. The Mac stays
-  the trunk's host and the barrier's default host, and the person's checkout becomes a clone that pulls.
+- **The trunk remote** is a bare repository per project on the Mac, reached over ssh on the tailnet (1.3, "What T2
+  costs", item 1). The Mac stays the trunk's host and the barrier's default host, and the person's checkout becomes
+  a clone that pulls. The alternative put to the person was the forge.
 - **Verify runs on the row's host.** The verifier is spawned where the row's tree is, with no fetch and no copy.
 - **The landing record is the store's**, from the push's `tree.landed`. The reflog is read only for lands made
   before T2.
 - **M4 is broken down at M3's end**, after wsp-058, as d1 Q14 says. Groups 5-8 go ahead as amended.
+
+**No row in groups 5-8 needs `tree.checkout` or `tree.land` to meet its done-when.** At M3 the Mac is the tree's host
+for every row. So `place_of` makes check, verify and barrier trees on the Mac in-process, and every job is keyed by
+`(row, host)`. No row in groups 5-8 lands. Land stays today's local fast-forward until M4's fenced push. So no verb is
+pulled into M3.
 
 ### 6.3 How this reorders state-core section 7
 
