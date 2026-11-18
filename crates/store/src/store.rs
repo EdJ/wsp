@@ -4907,13 +4907,24 @@ mod tests {
 
     /// A store whose git children see a machine with no git identity at all:
     /// an empty global config, no system config, no identity in the
-    /// environment. Set on the store's own children, so the process
-    /// environment other tests read is never touched.
+    /// environment, and no identity guessed from the machine. Set on the
+    /// store's own children, so the process environment other tests read is
+    /// never touched.
+    ///
+    /// Without `user.useConfigOnly` git makes an identity up from the login
+    /// name and the host name (`jesper@Jespers-MacBook-Pro.local`), so on any
+    /// host whose name has a dot "no identity" would still commit. It goes in
+    /// through `GIT_CONFIG_*` rather than the global file, which the tests
+    /// assert is never written; a test that sets `GIT_CONFIG_KEY_0` itself
+    /// replaces it.
     fn without_identity(store: Store, home: &std::path::Path, global: &std::path::Path) -> Store {
         let mut store = store
             .with_git_env("HOME", Some(home.as_os_str()))
             .with_git_env("GIT_CONFIG_GLOBAL", Some(global.as_os_str()))
-            .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")));
+            .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")))
+            .with_git_env("GIT_CONFIG_COUNT", Some(std::ffi::OsStr::new("1")))
+            .with_git_env("GIT_CONFIG_KEY_0", Some(std::ffi::OsStr::new("user.useConfigOnly")))
+            .with_git_env("GIT_CONFIG_VALUE_0", Some(std::ffi::OsStr::new("true")));
         for k in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"] {
             store = store.with_git_env(k, None);
         }

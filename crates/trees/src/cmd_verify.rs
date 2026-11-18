@@ -1872,13 +1872,27 @@ bench::b: benchmark
     }
 
     /// A repository with one commit, and `git` configured enough to make it.
+    ///
+    /// The commit is made against a git of its own: an empty global config
+    /// under the test's directory, no system config, and no signing — so a
+    /// machine whose global config signs every commit (`commit.gpgsign=true`
+    /// with no key) still gets its fixture. All of it is set on the child, so
+    /// no other test's environment is touched.
     fn repo(dir: &Path) {
+        let home = dir.join(".test-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let global = home.join("gitconfig");
+        std::fs::write(&global, "").unwrap();
         let run = |args: &[&str]| {
             let out = Command::new("git")
                 .arg("-C")
                 .arg(dir)
+                .args(["-c", "commit.gpgsign=false"])
                 .args(args)
                 .env_remove("GIT_INDEX_FILE")
+                .env("HOME", &home)
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -1888,6 +1902,8 @@ bench::b: benchmark
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         run(&["init", "--quiet", "-b", "master"]);
+        // The fixture's own git home is no part of the tree under test.
+        std::fs::write(dir.join(".git/info/exclude"), ".test-home/\n").unwrap();
         std::fs::write(dir.join("kept.txt"), "one\n").unwrap();
         run(&["add", "kept.txt"]);
         run(&["commit", "--quiet", "-m", "first"]);
@@ -1903,28 +1919,52 @@ bench::b: benchmark
     /// exported still gets its own staging read correctly.
     #[test]
     fn a_caller_holding_a_private_index_still_gets_its_own_diff() {
-        // `GIT_INDEX_FILE` is process-wide, and this test exports one over
-        // the whole process while it runs — so any test in another thread that
-        // shells out to git during it would read this staging instead of its
-        // own. One process-wide resource, one lock.
-        let _env = util::env_lock();
+        // `GIT_INDEX_FILE` is process-wide, so it is exported in a process of
+        // its own — this test binary again, running only
+        // `patch_built_under_an_exported_index` — and never over the threads
+        // of the other tests here, which would read this staging as theirs.
         let dir = scratch_dir("index");
         repo(&dir);
         std::fs::write(dir.join("kept.txt"), "one\ntwo\n").unwrap();
 
         // Somebody else's index, exported over us, holding nothing at all.
         let theirs = dir.join("their-index");
-        std::env::set_var("GIT_INDEX_FILE", &theirs);
-
-        let scratch = dir.join("scratch");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let mine = scratch.join("index");
-        let patch = build_patch(&dir, &dir, &mine, &scratch, &[]).unwrap();
-        std::env::remove_var("GIT_INDEX_FILE");
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cmd_verify::tests::patch_built_under_an_exported_index"])
+            .args(["--ignored", "--nocapture", "--test-threads=1"])
+            .env("GIT_INDEX_FILE", &theirs)
+            .env(EXPORTED_INDEX_REPO, &dir)
+            .output()
+            .unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child failed:\n{said}");
+        let patch = std::fs::read_to_string(dir.join("scratch/patch-out"))
+            .unwrap_or_else(|e| panic!("the child built no patch ({e}):\n{said}"));
 
         assert!(patch.contains("+two"), "the change was not in the patch:\n{patch}");
         assert!(!theirs.exists(), "we wrote to the caller's index");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Names the repository `patch_built_under_an_exported_index` works in.
+    const EXPORTED_INDEX_REPO: &str = "WSP_TEST_EXPORTED_INDEX_REPO";
+
+    /// The half of `a_caller_holding_a_private_index_still_gets_its_own_diff`
+    /// that runs with `GIT_INDEX_FILE` exported: only ever in the child that
+    /// test starts, which sets both variables. Run any other way it does
+    /// nothing.
+    #[test]
+    #[ignore = "run by a_caller_holding_a_private_index_still_gets_its_own_diff, in a process of its own"]
+    fn patch_built_under_an_exported_index() {
+        let Some(dir) = std::env::var_os(EXPORTED_INDEX_REPO).map(PathBuf::from) else {
+            return;
+        };
+        assert!(std::env::var_os("GIT_INDEX_FILE").is_some(), "the caller's index was not exported");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mine = scratch.join("index");
+        let patch = build_patch(&dir, &dir, &mine, &scratch, &[]).unwrap();
+        std::fs::write(scratch.join("patch-out"), patch).unwrap();
     }
 
     /// A new file is the commonest thing an agent adds and the easiest thing
