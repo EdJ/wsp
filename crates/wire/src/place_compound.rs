@@ -2091,6 +2091,22 @@ pub use wsp_host::test_sups;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wsp_host_api::OrderFail;
+
+    /// The manager's wording of a no-composer refusal (`host_tcp::fail_word`)
+    /// is typed past on an empty composer, as `refused` and `no composer` are.
+    #[test]
+    fn a_manager_no_composer_refusal_is_typed_past() {
+        let typed = std::cell::Cell::new(0);
+        let type_it = || {
+            typed.set(typed.get() + 1);
+            Ok(())
+        };
+        let why = format!("cpd-1: {}", crate::host_tcp::fail_word(OrderFail::NoComposer));
+        assert_eq!(why, "cpd-1: no-composer", "the manager's wording");
+        assert_eq!(past_a_refusal(Err(Refusal::Failed(why)), || Some(false), type_it), Ok(Delivery::Unconfirmed));
+        assert_eq!(typed.get(), 1);
+    }
 
     /// `wsp-602`: a caller whose `PATH` lacks `~/.local/bin` still finds the
     /// supervisor there, and a set-but-missing `$COMPOUND_SUP` falls through.

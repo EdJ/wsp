@@ -725,7 +725,7 @@ fn heard_of(sub: &mut Subscription, seat: &str, order: &OrderId, wait: Duration,
 
 /// compound-sup's failure word for an `order.refused`, as `read_deliver`
 /// words it in-process: `"busy"`, `"no-composer"`, ….
-fn fail_word(why: OrderFail) -> String {
+pub(crate) fn fail_word(why: OrderFail) -> String {
     serde_json::to_value(why).ok().and_then(|v| v.as_str().map(|s| s.replace('_', "-"))).unwrap_or_else(|| "unknown".into())
 }
 
