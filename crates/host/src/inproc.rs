@@ -52,15 +52,6 @@ pub const BURN_FILE: &str = "burn.json";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a dial to a session's socket waits for it to accept.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long one `compound-sup vitals` is waited on (wsp-061). A launchd-run
-/// process once blocked for good in dyld opening a new unsigned compound-sup on
-/// an unapproved removable volume, and a manager adopting seats behind it never
-/// served; past this the child's group is killed and the session read as
-/// unreadable.
-pub const VITALS_WAIT: Duration = Duration::from_secs(2);
-/// How long one other short compound-sup or compound-render call
-/// (`wire-version`, `screen`, `state`) is waited on, for the same reason.
-pub const PROBE_WAIT: Duration = Duration::from_secs(5);
 
 /// `seat.spawn` for a pty seat: what runs in it and where, already decided.
 pub struct Spawn<'a> {
@@ -432,7 +423,10 @@ impl InProcess {
         let bin = compound_render_binary().ok_or_else(|| {
             Refusal::Backend("no renderer (compound-render or compound-reader) found beside compound-sup or on PATH — set $COMPOUND_RENDER".into())
         })?;
-        let out = output_within(Command::new(&bin).args(["screen"]).arg(render), PROBE_WAIT)
+        let out = Command::new(&bin)
+            .args(["screen"])
+            .arg(render)
+            .output()
             .map_err(|e| Refusal::Backend(e.to_string()))?;
         if !out.status.success() {
             return Err(Refusal::Backend(String::from_utf8_lossy(&out.stderr).trim().to_string()));
@@ -454,7 +448,7 @@ impl InProcess {
 
     pub fn screen_state(&self, render: &Path, kind: &str) -> Option<State> {
         let bin = compound_render_binary()?;
-        let out = output_within(Command::new(&bin).args(["state"]).arg(render).arg(kind), PROBE_WAIT).ok()?;
+        let out = Command::new(&bin).args(["state"]).arg(render).arg(kind).output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -470,8 +464,11 @@ impl InProcess {
 
     pub fn osc_title(&self, socket: &Path) -> Option<String> {
         let sup = self.sup()?;
-        let out = vitals(&sup, socket, VITALS_WAIT).ok()??;
-        out.lines().find_map(|l| l.strip_prefix("osc_title ").map(str::to_string))
+        let out = Command::new(&sup).args(["vitals"]).arg(socket).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("osc_title ").map(str::to_string))
     }
 
     pub fn can_deliver(&self) -> bool {
@@ -610,43 +607,6 @@ impl InProcess {
 /// A set-but-missing `$COMPOUND_SUP` falls through rather than failing, and a
 /// caller whose `PATH` lacks `~/.local/bin` (a seat's shell running `advance`)
 /// still finds the binary the daemon's own `PATH` has (`wsp-602`).
-/// `cmd`'s output, waited on for `wait` at most (wsp-061). It runs in a
-/// process group of its own, and past `wait` that group is killed and the
-/// answer is an error of kind [`std::io::ErrorKind::TimedOut`]: a child that
-/// never returns (stuck loading its binary, a session that never answers)
-/// costs its caller `wait`, not the caller's life. The killed child is reaped
-/// by the thread that waited on it whenever it does end. Its stdin is null and
-/// its stdout and stderr are read.
-pub fn output_within(cmd: &mut Command, wait: Duration) -> std::io::Result<std::process::Output> {
-    let program = cmd.get_program().to_string_lossy().into_owned();
-    let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?;
-    let group = child.id();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(wait) {
-        Ok(out) => out,
-        Err(_) => {
-            signal_group(group, "KILL");
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("{program} gave no answer within {}s; its group {group} killed", wait.as_secs_f64()),
-            ))
-        }
-    }
-}
-
-/// `compound-sup vitals <socket>`, within `wait`: `Ok(Some(lines))` when the
-/// session answers, `Ok(None)` when compound-sup says it does not, and an
-/// error when compound-sup itself could not be asked or gave no answer in time
-/// ([`output_within`]), which says nothing of the session: it is unreadable,
-/// not gone.
-pub fn vitals(sup: &Path, socket: &Path, wait: Duration) -> std::io::Result<Option<String>> {
-    let out = output_within(Command::new(sup).arg("vitals").arg(socket), wait)?;
-    Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
-}
-
 /// A probe's stdout, when it ran and exited 0.
 fn succeeded(cmd: &mut Command) -> Option<String> {
     let out = cmd.output().ok().filter(|o| o.status.success())?;
@@ -863,7 +823,7 @@ pub fn wire_health_of(sup: &std::path::Path, problems: &mut Vec<String>, notes: 
 /// current build prints `OLDEST VERSION`; an older one a bare number, which
 /// accepts only that. Parsed by [`parse_wire`], the rule far machines get.
 pub fn ask_wire_range(bin: &std::path::Path) -> Option<std::result::Result<(u32, u32), String>> {
-    let out = output_within(Command::new(bin).arg("wire-version"), PROBE_WAIT).ok()?;
+    let out = Command::new(bin).arg("wire-version").stderr(Stdio::null()).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1870,59 +1830,4 @@ pub fn read_json(path: &PathBuf) -> Value {
 
 pub fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    /// A compound-sup whose `vitals` answers for one socket and, for a socket
-    /// whose name says `hang`, starts a sleeper, writes its pid, and waits on
-    /// it for good: a probe that never returns (wsp-061).
-    const HANGING_SUP: &str = r#"#!/bin/sh
-case "$2" in
-*hang*) sleep 1000 & echo $! > "$2.sleeper"; wait ;;
-*) echo "output_at 0"; echo "osc_title working" ;;
-esac
-"#;
-
-    fn place(tag: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("wh-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let sup = dir.join("sup");
-        fs::write(&sup, HANGING_SUP).unwrap();
-        fs::set_permissions(&sup, fs::Permissions::from_mode(0o755)).unwrap();
-        (dir, sup)
-    }
-
-    #[test]
-    fn a_vitals_that_never_returns_is_unreadable_within_its_bound_and_its_group_is_killed() {
-        let (dir, sup) = place("vitals");
-        let (good, hung) = (dir.join("good.sock"), dir.join("hang.sock"));
-        assert_eq!(vitals(&sup, &good, VITALS_WAIT).unwrap().as_deref(), Some("output_at 0\nosc_title working\n"));
-
-        let began = Instant::now();
-        let err = vitals(&sup, &hung, Duration::from_millis(500)).expect_err("a probe that never returns is no answer");
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
-        assert!(began.elapsed() < Duration::from_secs(3), "the bound held: {:?}", began.elapsed());
-
-        // The whole group, the sleeper the probe started included.
-        let sleeper: u32 = fs::read_to_string(hung.with_extension("sock.sleeper")).unwrap().trim().parse().unwrap();
-        let until = Instant::now() + Duration::from_secs(5);
-        while alive(&[sleeper]).contains(&sleeper) {
-            assert!(Instant::now() < until, "the probe's group was not killed: {sleeper} still runs");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        // The in-process host's own vitals reader has the same bound.
-        let host = InProcess::with_sup(&sup);
-        assert_eq!(host.osc_title(&good).as_deref(), Some("working"));
-        let began = Instant::now();
-        assert_eq!(host.osc_title(&dir.join("hang2.sock")), None);
-        assert!(began.elapsed() < VITALS_WAIT + Duration::from_secs(2), "osc_title waited {:?}", began.elapsed());
-        let _ = fs::remove_dir_all(&dir);
-    }
 }
