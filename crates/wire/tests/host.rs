@@ -244,6 +244,58 @@ fn the_tcp_host_holds_the_contract_on_a_loopback_manager() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// wsp-108: under the manager an ask waits its own wait and 250 ms more, not
+/// 5 s more (wsp-104: a tick of six asks to a stuck seat ran 43 s, not 16.5 s).
+/// The fake answers a `slow` order two seconds late: an ask of 500 ms is left
+/// pending at about 0.75 s, and the same id asked once the fake has answered
+/// gets the manager's kept answer at once, typed once.
+#[test]
+fn a_manager_deliver_waits_its_wait_and_a_quarter_second_more_not_five() {
+    let (dir, sup) = place("dmargin");
+    let sweep = Sweep::default();
+    let m = manager(&dir, &sup, 0);
+    let tcp = Tcp::with_local(m.addrs()[0], token(&dir), Role::Cli, "test", InProcess::with_sup(&sup));
+    let seat = Seat::new(format!("cpd-m{}", std::process::id()));
+    let args = vec!["-c".to_string(), "true".to_string()];
+    let spawn = Spawn {
+        key: Key { row: RowId("wsp-108".into()), attempt: 0 },
+        seat: seat.as_str(),
+        kind: Some("claude".into()),
+        cwd: dir.display().to_string(),
+        env: BTreeMap::new(),
+        program: "sh",
+        args: &args,
+    };
+    let session = tcp.spawn_session(&spawn).expect("the seat starts");
+    sweep.add(session.pid);
+
+    // Left pending at its wait and 250 ms.
+    let wait = Duration::from_millis(500);
+    let asked = Instant::now();
+    let first = tcp.deliver(&session.socket, "o-late", "slow work", wait, &seat);
+    let took = asked.elapsed();
+    match first {
+        Err(Refusal::Backend(why)) => assert!(why.contains(wsp_wire::place_compound::DELIVERY_PENDING), "{why}"),
+        other => panic!("expected the delivery left pending, got {other:?}"),
+    }
+    assert!(took >= wait, "it waited its wait: {took:?}");
+    assert!(took < Duration::from_secs(3), "its wait and 250 ms, not 5 s more: {took:?}");
+
+    // The fake answers two seconds in; the manager keeps the answer for the next ask.
+    let orders = session.socket.with_extension("sock.orders");
+    wait_until("the fake answered the order", || orders.join("o-late").exists());
+    let asked = Instant::now();
+    assert_eq!(tcp.deliver(&session.socket, "o-late", "slow work", wait, &seat), Ok(Delivery::Acked));
+    assert!(asked.elapsed() < Duration::from_secs(3), "the kept answer, at once: {:?}", asked.elapsed());
+    let typed = fs::read_to_string(orders.join("typed")).unwrap();
+    assert_eq!(typed.lines().filter(|l| l.starts_with("o-late ")).count(), 1, "typed once: {typed}");
+
+    drop(tcp);
+    m.stop();
+    drop(sweep);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The key is the caller's (row, attempt), not the seat: the same key twice is
 /// one seat, and the next attempt is another.
 #[test]
