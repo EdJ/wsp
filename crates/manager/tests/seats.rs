@@ -31,7 +31,12 @@ const WAIT: Duration = Duration::from_secs(10);
 /// `.label` sidecar, a plain file for a socket), `vitals`, and `deliver <id>`
 /// at most once per id (an ask while one is pending waits for its answer). A
 /// text with `slow` takes two seconds; one with `busy` fails `busy`.
-const FAKE_SUP: &str = r#"#!/bin/sh
+///
+/// Under bash, not `/bin/sh`: a session leads its own process group, as
+/// compound-sup's does, by `set -m`, and dash (Debian's and Ubuntu's `sh`)
+/// turns job control off without a tty, leaving the session in the fake's
+/// group, where a stop by group never reaches it.
+const FAKE_SUP: &str = r#"#!/usr/bin/env bash
 OWNER=__OWNER__
 verb=$1; shift
 case "$verb" in

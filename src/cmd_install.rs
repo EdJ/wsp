@@ -1696,7 +1696,8 @@ fn launcher(
     agent
 }
 
-/// Put `wsp-manager` beside `wsp`, write its LaunchAgent (`<label>.manager`),
+/// Put `wsp-manager` beside `wsp`, write its launcher (a LaunchAgent,
+/// `<label>.manager`, on macOS; the `wsp-manager` systemd user unit on Linux),
 /// load it, and copy its token into the local machine record's secret file
 /// (`docs/agent-manager.md` 2.4, 3.3).
 ///
@@ -1715,15 +1716,16 @@ fn manager_agent(
 ) -> Value {
     use crate::launchd as l;
     use crate::manager as m;
+    use backend as b;
 
     let mgr = dst.with_file_name(m::BINARY);
     let exec_dir = m::default_exec_dir();
     let port = m::DEFAULT_PORT;
     let var = l::path_for(std::env::var_os("PATH").as_deref());
-    let path = l::manager_plist_path();
+    let path = b::manager_definition_path();
 
     if dry {
-        let change = match l::plan(&l::manager_plist(&mgr, &exec_dir, port, &var), &path) {
+        let change = match b::plan(&b::manager_definition(&mgr, &exec_dir, port, &var), &path) {
             l::Plan::Unchanged => "unchanged",
             l::Plan::Write => "would write",
         };
@@ -1735,17 +1737,17 @@ fn manager_agent(
                 p.dim(change)
             );
         }
-        return json!({"installed": false, "label": l::MANAGER_LABEL,
+        return json!({"installed": false, "label": b::MANAGER_LABEL,
                       "path": util::contract(&path), "plist": change});
     }
 
-    let done = (|| -> Result<(l::Done, bool), String> {
+    let done = (|| -> Result<(b::Done, bool), String> {
         let restarted = match src {
             Some(src) => put_manager(src, tree, &mgr)?,
             None if mgr.is_file() => false,
             None => return Err(format!("{} is not there — `wsp install` puts it beside wsp", util::contract(&mgr))),
         };
-        let done = l::ensure_manager(&mgr, &exec_dir, port, &var, restarted)?;
+        let done = b::ensure_manager(&mgr, &exec_dir, port, &var, restarted)?;
         m::install_record(&store.state, &m::Local::new(&exec_dir, port), Duration::from_secs(15))?;
         Ok((done, restarted))
     })();
@@ -1753,23 +1755,24 @@ fn manager_agent(
     if !json_out {
         match &done {
             Ok((d, restarted)) => println!(
-                "{} {} · {} — the manager is a launchd agent now, and it comes back on its own",
+                "{} {} · {} — the manager is {} now, and it comes back on its own",
                 p.green("✓"),
                 util::contract(&d.path),
                 match (d.wrote, d.loaded, restarted) {
                     (_, true, _) => "loaded, and it is running now",
                     _ => "already loaded",
-                }
+                },
+                b::MANAGER_KIND
             ),
             Err(why) => println!("{} the manager is not running — {why} (`wsp install --daemon` tries again)", p.red("✗")),
         }
     }
     match done {
-        Ok((d, restarted)) => json!({"installed": true, "label": l::MANAGER_LABEL,
+        Ok((d, restarted)) => json!({"installed": true, "label": b::MANAGER_LABEL,
                                     "path": util::contract(&d.path),
                                     "plist": if d.wrote { "written" } else { "unchanged" },
                                     "loaded": d.loaded, "binary_replaced": restarted}),
-        Err(why) => json!({"installed": false, "label": l::MANAGER_LABEL,
+        Err(why) => json!({"installed": false, "label": b::MANAGER_LABEL,
                            "path": util::contract(&path), "error": why}),
     }
 }
@@ -1817,16 +1820,16 @@ fn uninstall_manager(store: &Store, json_out: bool, p: &crate::util::Paint) -> i
         eprintln!("wsp: this is a sandbox — the manager's agent is not the sandbox's to remove");
         return 2;
     }
-    let removed = crate::launchd::remove_manager();
+    let removed = backend::remove_manager();
     crate::manager::remove_record(&store.state);
     if json_out {
         match &removed {
-            Ok(had) => println!("{}", json!({"ok": true, "label": crate::launchd::MANAGER_LABEL, "removed": had})),
-            Err(why) => println!("{}", json!({"ok": false, "label": crate::launchd::MANAGER_LABEL, "error": why})),
+            Ok(had) => println!("{}", json!({"ok": true, "label": backend::MANAGER_LABEL, "removed": had})),
+            Err(why) => println!("{}", json!({"ok": false, "label": backend::MANAGER_LABEL, "error": why})),
         }
     } else {
         match &removed {
-            Ok(true) => println!("{} {} unloaded and removed", p.green("✓"), crate::launchd::MANAGER_LABEL),
+            Ok(true) => println!("{} {} unloaded and removed", p.green("✓"), backend::MANAGER_LABEL),
             Ok(false) => println!("{}", p.dim("the manager's agent was not installed")),
             Err(why) => eprintln!("{} {why}", p.red("✗")),
         }

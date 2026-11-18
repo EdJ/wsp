@@ -249,24 +249,33 @@ fn ctl(args: &[&str]) -> Result<(), String> {
 /// status — since the stderr line of `enable --now` alone seldom says why the
 /// daemon would not run.
 fn ctl_start(args: &[&str]) -> Result<(), String> {
-    ctl(args).map_err(|e| format!("{e}{}", unit_said()))
+    ctl_start_unit(LABEL, args)
 }
 
-fn unit_said() -> String {
+/// [`ctl_start`] for the unit `label`.
+fn ctl_start_unit(label: &str, args: &[&str]) -> Result<(), String> {
+    ctl(args).map_err(|e| format!("{e}{}", unit_said(label)))
+}
+
+fn unit_said(label: &str) -> String {
     let status = Command::new("systemctl")
-        .args(["--user", "status", "--no-pager", "-n", "5", LABEL])
+        .args(["--user", "status", "--no-pager", "-n", "5", label])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    said(&show(), &status)
+    said_of(label, &show_of(label), &status)
 }
 
 /// What to append to a start failure: the unit's state and exec status, and the
 /// last few lines `status` printed. Empty when there is nothing to add.
 pub fn said(show: &Show, status: &str) -> String {
+    said_of(LABEL, show, status)
+}
+
+fn said_of(label: &str, show: &Show, status: &str) -> String {
     let mut out = String::new();
     if !show.active.is_empty() {
-        out.push_str(&format!("\n  unit: {}", describe(show)));
+        out.push_str(&format!("\n  unit: {}", describe_unit(label, show)));
     }
     let tail: Vec<&str> = status.lines().filter(|l| !l.trim().is_empty()).collect();
     for l in &tail[tail.len().saturating_sub(5)..] {
@@ -275,9 +284,9 @@ pub fn said(show: &Show, status: &str) -> String {
     out
 }
 
-fn active() -> bool {
+fn active(label: &str) -> bool {
     Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", LABEL])
+        .args(["--user", "is-active", "--quiet", label])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -312,7 +321,7 @@ pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> 
             .map_err(|e| e.to_string());
         check_version(v.as_deref().map_err(|e| e.as_str()))?;
     }
-    let step = decide(&change, active(), crate::launchd::sandboxed());
+    let step = decide(&change, active(LABEL), crate::launchd::sandboxed());
     let linger = linger();
     if step == Step::Nothing {
         return Ok(Done { path, wrote: false, loaded: false, linger });
@@ -326,7 +335,7 @@ pub fn ensure(bin: &Path, state: &Path, path_var: &str) -> Result<Done, String> 
     if step == Step::Restart {
         ctl_start(&["restart", LABEL])?;
     }
-    settle(Duration::from_secs(8))?;
+    settle(LABEL, Duration::from_secs(8))?;
     Ok(Done { path, wrote: change == Plan::Write, loaded: true, linger })
 }
 
@@ -402,8 +411,13 @@ pub fn settled(held: &mut Option<(u32, u32, u64)>, s: &Show, now: u64, hold_ms: 
 
 /// One sentence for a unit that did not settle.
 pub fn describe(s: &Show) -> String {
+    describe_unit(LABEL, s)
+}
+
+/// [`describe`] for the unit `label`.
+fn describe_unit(label: &str, s: &Show) -> String {
     format!(
-        "{LABEL} is {}/{} (result {}, exec status {}, {} restarts) — `journalctl --user -u {LABEL}`",
+        "{label} is {}/{} (result {}, exec status {}, {} restarts) — `journalctl --user -u {label}`",
         s.active,
         s.sub,
         if s.result.is_empty() { "unknown" } else { &s.result },
@@ -412,24 +426,24 @@ pub fn describe(s: &Show) -> String {
     )
 }
 
-fn show() -> Show {
+fn show_of(label: &str) -> Show {
     Command::new("systemctl")
-        .args(["--user", "show", "-p", "ActiveState,SubState,MainPID,NRestarts,Result,ExecMainStatus", LABEL])
+        .args(["--user", "show", "-p", "ActiveState,SubState,MainPID,NRestarts,Result,ExecMainStatus", label])
         .output()
         .map(|o| show_from(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
 }
 
-fn settle(limit: Duration) -> Result<(), String> {
+fn settle(label: &str, limit: Duration) -> Result<(), String> {
     let t = std::time::Instant::now();
     let mut held = None;
     loop {
-        let s = show();
+        let s = show_of(label);
         if settled(&mut held, &s, t.elapsed().as_millis() as u64, 2000) {
             return Ok(());
         }
         if t.elapsed() >= limit {
-            return Err(describe(&s));
+            return Err(describe_unit(label, &s));
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -469,13 +483,156 @@ pub fn reload() -> Result<String, String> {
     ctl(&["enable", LABEL])?;
     // `start`, like launchd's kickstart without -k: a running job is left alone.
     ctl_start(&["start", LABEL])?;
-    settle(Duration::from_secs(8))?;
+    settle(LABEL, Duration::from_secs(8))?;
     Ok(format!("{LABEL} started"))
+}
+
+// ---- the manager's unit (docs/agent-manager.md 2.4; wsp-024) -----------------
+
+/// The manager's unit, without `.service`, beside the daemon's [`LABEL`].
+pub const MANAGER_LABEL: &str = "wsp-manager";
+
+/// What the manager is, in the line `wsp install` prints.
+pub const MANAGER_KIND: &str = "a systemd user unit";
+
+/// Where the manager's unit goes under `home`; a function of `home`, so a test
+/// writes into a temp HOME.
+pub fn manager_unit_path_in(home: &Path) -> PathBuf {
+    home.join(".config/systemd/user").join(format!("{MANAGER_LABEL}.service"))
+}
+
+/// [`manager_unit_path_in`] for this user, under the name both launchers share.
+pub fn manager_definition_path() -> PathBuf {
+    manager_unit_path_in(&util::home())
+}
+
+/// The manager's unit as text: [`crate::launchd::manager_plist`] mapped as the
+/// module header maps the daemon's, with two differences that plist has too.
+///
+/// - `Restart=always`, launchd's plain `KeepAlive true`: the manager has no
+///   clean exit to leave alone, and one that declines to start (another answers
+///   its port) is tried again every [`crate::launchd::MANAGER_THROTTLE`]
+///   seconds until the other is gone.
+/// - `KillMode=process` matters more here than for the daemon: the manager's
+///   seats are its children's process groups, and a seat outlives its manager
+///   (a restart adopts it) — under the default every manager restart would end
+///   every seat on the machine.
+///
+/// `--port` is written out, so the machine record and the process cannot
+/// disagree about it; the log is the plist's `<exec_dir>/log/launchd.log`.
+pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+    let log = crate::launchd::manager_log(exec_dir).display().to_string();
+    format!(
+        "[Unit]\n\
+         Description=wsp agent manager\n\
+         \n\
+         [Service]\n\
+         Type=exec\n\
+         KillMode=process\n\
+         ExecStart={bin} --exec-dir {exec_dir} --port {port}\n\
+         Environment={path}\n\
+         Restart=always\n\
+         RestartSec={sec}\n\
+         StandardOutput=append:{log}\n\
+         StandardError=append:{log}\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        bin = quote(&bin.display().to_string()),
+        exec_dir = quote(&exec_dir.display().to_string()),
+        path = quote_env(&format!("PATH={path_var}")),
+        sec = crate::launchd::MANAGER_THROTTLE,
+        log = bare(&log),
+    )
+}
+
+/// Write the manager's unit if it differs and make sure it is enabled and
+/// running: [`ensure`]'s steps for [`MANAGER_LABEL`]. `restarted` says the
+/// binary beside it was just replaced, so a running unit whose text did not
+/// change is restarted to run it.
+pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, restarted: bool) -> Result<Done, String> {
+    let _ = std::fs::create_dir_all(exec_dir.join("log"));
+    let path = manager_definition_path();
+    let want = manager_definition(bin, exec_dir, port, path_var);
+    let change = plan(&want, &path);
+    let sandboxed = crate::launchd::sandboxed();
+    if !sandboxed {
+        let v = Command::new("systemctl")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .map_err(|e| e.to_string());
+        check_version(v.as_deref().map_err(|e| e.as_str()))?;
+    }
+    let linger = linger();
+    let step = match decide(&change, active(MANAGER_LABEL), sandboxed) {
+        Step::Nothing if restarted && !sandboxed => Step::Restart,
+        step => step,
+    };
+    if step == Step::Nothing {
+        return Ok(Done { path, wrote: false, loaded: false, linger });
+    }
+    if change == Plan::Write {
+        crate::store::write_atomic(&path, &want).map_err(|e| format!("cannot write {}: {e}", util::contract(&path)))?;
+        ctl(&["daemon-reload"])?;
+    }
+    ctl_start_unit(MANAGER_LABEL, &["enable", "--now", MANAGER_LABEL])?;
+    if step == Step::Restart {
+        ctl_start_unit(MANAGER_LABEL, &["restart", MANAGER_LABEL])?;
+    }
+    settle(MANAGER_LABEL, Duration::from_secs(8))?;
+    Ok(Done { path, wrote: change == Plan::Write, loaded: true, linger })
+}
+
+/// Stop and disable the manager's unit and remove its file, as
+/// [`crate::launchd::remove_manager`] boots its job out. Nothing to stop and
+/// nothing to remove is success; the value says whether there was a unit file.
+pub fn remove_manager() -> Result<bool, String> {
+    let path = manager_definition_path();
+    let had = path.exists();
+    if had || active(MANAGER_LABEL) {
+        ctl(&["disable", "--now", MANAGER_LABEL])?;
+    }
+    if active(MANAGER_LABEL) {
+        return Err(format!("{MANAGER_LABEL} is still active after `systemctl --user disable --now`"));
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot remove {}: {e}", util::contract(&path))),
+    }
+    if had {
+        ctl(&["daemon-reload"])?;
+    }
+    Ok(had)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_managers_unit_names_what_2_4_asks() {
+        let home = Path::new("/home/u");
+        assert!(manager_unit_path_in(home).ends_with(".config/systemd/user/wsp-manager.service"));
+        let u = manager_definition(
+            Path::new("/home/u/.local/bin/wsp-manager"),
+            Path::new("/home/u/.local/state/wsp-manager"),
+            7487,
+            "/usr/bin:/bin",
+        );
+        assert!(
+            u.contains("ExecStart=\"/home/u/.local/bin/wsp-manager\" --exec-dir \"/home/u/.local/state/wsp-manager\" --port 7487\n"),
+            "{u}"
+        );
+        assert!(u.contains("Restart=always\n"), "no clean exit to leave alone: {u}");
+        assert!(u.contains("KillMode=process\n"), "a seat outlives its manager: {u}");
+        assert!(u.contains("Type=exec\n"));
+        assert!(u.contains(&format!("RestartSec={}\n", crate::launchd::MANAGER_THROTTLE)));
+        assert!(u.contains("StandardOutput=append:/home/u/.local/state/wsp-manager/log/launchd.log\n"), "{u}");
+        assert!(u.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
+        assert!(u.contains("WantedBy=default.target"));
+    }
 
     #[test]
     fn unit_text_has_what_systemd_needs() {

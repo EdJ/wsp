@@ -455,6 +455,21 @@ pub fn manager_plist_path() -> PathBuf {
     manager_plist_path_in(&util::home())
 }
 
+/// What the manager is, in the line `wsp install` prints.
+pub const MANAGER_KIND: &str = "a launchd agent";
+
+/// [`manager_plist_path`] under the name both launchers share
+/// ([`crate::systemd::manager_definition_path`]).
+pub fn manager_definition_path() -> PathBuf {
+    manager_plist_path()
+}
+
+/// [`manager_plist`] under the name both launchers share
+/// ([`crate::systemd::manager_definition`]).
+pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+    manager_plist(bin, exec_dir, port, path_var)
+}
+
 /// The manager's launchd log: `<exec_dir>/log/launchd.log`, beside the
 /// manager's own `manager.log`. It holds what the process says before its own
 /// log is open, and what it says as it dies.

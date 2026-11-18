@@ -382,7 +382,11 @@ impl InProcess {
             cmd.arg("-E");
         }
         let out = cmd.args(["-o", columns]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        let table = out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())?;
+        if cfg!(target_os = "linux") {
+            return Some(comm_as_run(&table, columns, |pid| fs::read(format!("/proc/{pid}/cmdline")).ok()));
+        }
+        Some(table)
     }
 
     pub fn rows_of(&self, pids: &[u32], columns: &str) -> Option<String> {
@@ -1057,6 +1061,65 @@ pub fn sup_command(sup: &Path, spawn: &Spawn<'_>) -> Command {
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     cmd
+}
+
+/// A `ps` table whose last column is `comm=` and first `pid=`, with each row's
+/// `comm` made the name the process was run under: its `argv[0]`, out of
+/// `cmdline` (NUL-separated).
+///
+/// macOS's `ps -o comm=` already answers that, the full path or the login
+/// shell's `-zsh`; Linux's answers the kernel's 15-byte task name, which drops
+/// the directory, and the callers ask the path (a finished tree's own binary
+/// is one whose executable lives under the tree). A row whose `cmdline` is
+/// empty or unreadable (a kernel thread, a process gone since `ps` ran) keeps
+/// what `ps` said. Any other column list is answered unchanged.
+fn comm_as_run(table: &str, columns: &str, cmdline: impl Fn(u32) -> Option<Vec<u8>>) -> String {
+    let cols: Vec<&str> = columns.split(',').map(str::trim).collect();
+    if cols.len() < 2 || cols.first() != Some(&"pid=") || cols.last() != Some(&"comm=") {
+        return table.to_string();
+    }
+    let before = cols.len() - 1;
+    let mut out = String::with_capacity(table.len());
+    for line in table.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let argv0 = fields
+            .first()
+            .and_then(|p| p.parse::<u32>().ok())
+            .filter(|_| fields.len() > before)
+            .and_then(&cmdline)
+            .and_then(|b| b.split(|c| *c == 0).next().map(|a| String::from_utf8_lossy(a).into_owned()))
+            .filter(|a| !a.is_empty());
+        match argv0 {
+            Some(a) => {
+                out.push_str(&fields[..before].join(" "));
+                out.push(' ');
+                out.push_str(&a);
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod comm_tests {
+    use super::*;
+
+    #[test]
+    fn comm_is_the_name_a_process_was_run_under() {
+        let cmdline = |pid: u32| match pid {
+            10 => Some(b"/w/.worktrees/r/target/debug/stand\x0060\x00".to_vec()),
+            11 => Some(b"-bash\x00".to_vec()),
+            _ => Some(Vec::new()),
+        };
+        let ps = "   10     1 stand\n   11    10 bash\n    2     0 kthreadd\n";
+        assert_eq!(
+            comm_as_run(ps, "pid=,ppid=,comm=", cmdline),
+            "10 1 /w/.worktrees/r/target/debug/stand\n11 10 -bash\n    2     0 kthreadd\n"
+        );
+        assert_eq!(comm_as_run(ps, "pid=,command=", cmdline), ps, "only a trailing comm= is read again");
+    }
 }
 
 /// Ends the pane of a seat whose agent has left: the supervisor, its shell and
