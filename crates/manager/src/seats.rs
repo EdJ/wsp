@@ -56,9 +56,10 @@ use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wsp_base::calls::Command;
+use wsp_base::util::{Clock, Wall};
 use wsp_host::inproc::{self, Spawn, Stop};
 use wsp_host::{Delivery, InProcess, Refusal as HostRefusal, Seat as HostSeat};
 use wsp_host_api::{
@@ -79,8 +80,16 @@ const HANDSHAKE: Duration = Duration::from_secs(5);
 /// How long one `compound-sup deliver` is waited on before it is asked again
 /// under the same id.
 const DELIVER_WAIT: Duration = Duration::from_secs(60);
-/// Between asks of a delivery that came back with no answer.
+/// Between asks of a delivery that came back with no answer: the first gap.
 const ASK_AGAIN: Duration = Duration::from_secs(1);
+/// ...and the longest: the gap doubles from [`ASK_AGAIN`] up to this (wsp-109).
+const ASK_AGAIN_MOST: Duration = Duration::from_secs(60);
+/// An order nobody has asked about for this long is dropped, silently: its
+/// entry and its record go, and its thread stops (wsp-109, the owner's d1 on
+/// wsp-104). The daemon asks again every tick under the same id while it keeps
+/// the id (900 s, `DELIVER_PENDING_FOR` in place_compound.rs), so an order
+/// nobody has asked about is one it has stopped asking about.
+const UNASKED: Duration = Duration::from_secs(900);
 /// What a seat's shells are called, for `seats`' count.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"];
 
@@ -143,7 +152,7 @@ enum KeyState {
 
 enum Order {
     /// Handed to compound-sup and not yet answered.
-    InFlight { waiters: Vec<Asker> },
+    InFlight { waiters: Vec<Asker>, asked: Instant },
     /// Answered: the answer, sent again to whoever asks again.
     Answered(Vec<Message>),
 }
@@ -559,7 +568,7 @@ pub(crate) fn deliver(shared: &Arc<Shared>, asker: Asker, o: OrderDeliver) {
                 }
                 return;
             }
-            Some(Order::InFlight { waiters }) => return waiters.push(asker),
+            Some(Order::InFlight { waiters, asked }) => return joined(waiters, asked, asker, Instant::now()),
             None => {}
         }
         let Some(run) = t.seats.get(&o.seat) else {
@@ -579,10 +588,80 @@ pub(crate) fn deliver(shared: &Arc<Shared>, asker: Asker, o: OrderDeliver) {
             shared.log.line(&format!("order {}: not asked, its record could not be written: {e}", o.order.0));
             return asker.refuse(Refusal::Failed, format!("the order's record could not be written: {e}"));
         }
-        t.orders.insert(o.order.clone(), Order::InFlight { waiters: vec![asker] });
+        t.orders.insert(o.order.clone(), Order::InFlight { waiters: vec![asker], asked: Instant::now() });
     }
     let shared = shared.clone();
     std::thread::spawn(move || ask(&shared, o));
+}
+
+/// One run of `compound-sup deliver`, as [`ask_until`] reads it.
+enum Try {
+    /// An answer: delivered (when the turn began), or why not.
+    Answer(Result<At, OrderFail>),
+    /// No answer this run (a wait that ran out, a run that printed neither
+    /// `delivered` nor `failed`), and what it said.
+    NoAnswer(String),
+}
+
+/// How [`ask_until`] ended.
+#[derive(Debug, PartialEq)]
+enum Asked {
+    Answer(Result<At, OrderFail>),
+    /// Nobody asked for it for [`UNASKED`]; already out of the table.
+    Unasked,
+    /// The manager is stopping; the next start asks again from the record.
+    Stopping,
+}
+
+/// The gap after the `tries`-th run with no answer: 1 s, doubling, at most 60 s.
+fn ask_again_after(_tries: u32) -> Duration {
+    ASK_AGAIN
+}
+
+/// A later ask for an order in flight: it waits with the others, and the
+/// order counts as asked about at `at` (wsp-109).
+fn joined(waiters: &mut Vec<Asker>, _asked: &mut Instant, asker: Asker, _at: Instant) {
+    waiters.push(asker);
+}
+
+/// Take `order` out of the table when it is in flight and nobody has asked
+/// for it for [`UNASKED`] at `now`; `true` when it did. An answered order, or
+/// one not there, is left alone.
+fn forget_unasked(_t: &mut Table, _order: &OrderId, _now: Instant) -> bool {
+    false
+}
+
+/// Ask until compound-sup answers, the order goes unasked for [`UNASKED`], or
+/// the manager stops. `once` is one run. `unasked(now)` takes the order out of
+/// the table and says `true` when nobody has asked for it for [`UNASKED`], in
+/// one step under the table's lock, so an ask that comes at that moment either
+/// keeps the order or finds it gone and starts it afresh, never waits on a
+/// thread that has stopped. `said(tries, why)` hears each run with no answer.
+/// Every gap is the clock's, so a test winds it.
+fn ask_until(
+    clock: &dyn Clock,
+    stopping: &dyn Fn() -> bool,
+    unasked: &mut dyn FnMut(Instant) -> bool,
+    once: &mut dyn FnMut() -> Try,
+    said: &mut dyn FnMut(u32, &str),
+) -> Asked {
+    let mut tries = 0u32;
+    loop {
+        if stopping() {
+            return Asked::Stopping;
+        }
+        if unasked(clock.now()) {
+            return Asked::Unasked;
+        }
+        match once() {
+            Try::Answer(answer) => return Asked::Answer(answer),
+            Try::NoAnswer(why) => {
+                tries += 1;
+                said(tries, &why);
+                clock.rest(ask_again_after(tries));
+            }
+        }
+    }
 }
 
 /// Ask compound-sup until it answers, then answer. The id is its at-most-once
@@ -637,7 +716,7 @@ fn answered(shared: &Shared, o: &OrderDeliver, outcome: Result<At, OrderFail>) {
         return;
     }
     let waiters = match t.orders.remove(&o.order) {
-        Some(Order::InFlight { waiters }) => waiters,
+        Some(Order::InFlight { waiters, .. }) => waiters,
         _ => vec![],
     };
     let said = match outcome {
@@ -955,7 +1034,7 @@ pub(crate) fn adopt(shared: &Arc<Shared>) {
             let _ = fs::remove_file(&path);
             continue;
         }
-        t.orders.insert(o.order.clone(), Order::InFlight { waiters: vec![] });
+        t.orders.insert(o.order.clone(), Order::InFlight { waiters: vec![], asked: Instant::now() });
         again.push(o);
     }
     drop(t);
@@ -1098,5 +1177,147 @@ mod tests {
         assert_eq!(sup_of(&forking, "", &SeatId("cpd-1".into())), vec![10], "its own fork is not a second sup");
         let both = format!("{twice}  16  15 /usr/local/bin/compound-sup spawn --label cpd-1 -- sh\n");
         assert_eq!(sup_of(&both, "", &SeatId("cpd-1".into())), vec![10, 15], "two sups still refused, a fork of either aside");
+    }
+    /// A clock the test winds: `rest` moves it and returns at once.
+    struct Wound(std::cell::Cell<Instant>);
+
+    impl Clock for Wound {
+        fn now(&self) -> Instant {
+            self.0.get()
+        }
+        fn rest(&self, d: Duration) {
+            self.0.set(self.0.get() + d);
+        }
+    }
+
+    fn s(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// wsp-109 R1: 1 s, doubling, at most 60 s.
+    #[test]
+    fn the_gap_between_asks_doubles_from_one_second_to_sixty() {
+        let gaps: Vec<Duration> = (1..=9).map(ask_again_after).collect();
+        assert_eq!(gaps, vec![s(1), s(2), s(4), s(8), s(16), s(32), s(60), s(60), s(60)]);
+        assert_eq!(ask_again_after(u32::MAX), s(60), "no overflow at any count");
+    }
+
+    /// wsp-109 R1 and R3: a supervisor that answers nothing at once, asked
+    /// about by nobody, is run 20 times (at 0, 1, 3, 7, 15, 31, 63 s, then
+    /// every 60 s) and dropped at 903 s, not run once a second forever.
+    #[test]
+    fn a_supervisor_that_never_answers_is_run_twenty_times_then_dropped_unasked() {
+        let began = Instant::now();
+        let clock = Wound(std::cell::Cell::new(began));
+        let runs = std::cell::Cell::new(0u32);
+        let asked = ask_until(
+            &clock,
+            &|| false,
+            &mut |at| at.saturating_duration_since(began) >= UNASKED,
+            &mut || {
+                runs.set(runs.get() + 1);
+                Try::NoAnswer("compound-sup deliver: sup: internal error".into())
+            },
+            &mut |_, _| {},
+        );
+        assert_eq!(asked, Asked::Unasked);
+        assert_eq!(runs.get(), 20);
+        assert_eq!(clock.now() - began, s(903));
+    }
+
+    /// wsp-109 R3: a supervisor that hangs (each run waits out `DELIVER_WAIT`)
+    /// is dropped too: 10 runs, at 903 s.
+    #[test]
+    fn a_hanging_supervisor_is_dropped_once_nobody_asks() {
+        let began = Instant::now();
+        let clock = Wound(std::cell::Cell::new(began));
+        let runs = std::cell::Cell::new(0u32);
+        let asked = ask_until(
+            &clock,
+            &|| false,
+            &mut |at| at.saturating_duration_since(began) >= UNASKED,
+            &mut || {
+                runs.set(runs.get() + 1);
+                clock.rest(DELIVER_WAIT);
+                Try::NoAnswer("delivery still pending after 60s".into())
+            },
+            &mut |_, _| {},
+        );
+        assert_eq!(asked, Asked::Unasked);
+        assert_eq!(runs.get(), 10);
+        assert_eq!(clock.now() - began, s(903));
+    }
+
+    /// wsp-109 R2: an order asked about again on every run outlives 900 s and
+    /// is answered when compound-sup answers.
+    #[test]
+    fn an_order_asked_about_again_is_kept_past_900s() {
+        let began = Instant::now();
+        let clock = Wound(std::cell::Cell::new(began));
+        let last = std::cell::Cell::new(began);
+        let asked = ask_until(
+            &clock,
+            &|| false,
+            &mut |at| at.saturating_duration_since(last.get()) >= UNASKED,
+            &mut || {
+                if clock.now() - began >= s(1200) {
+                    return Try::Answer(Ok(At(7)));
+                }
+                last.set(clock.now());
+                Try::NoAnswer("no answer yet".into())
+            },
+            &mut |_, _| {},
+        );
+        assert_eq!(asked, Asked::Answer(Ok(At(7))));
+        assert!(clock.now() - began >= s(1200));
+    }
+
+    /// wsp-109 R1 and R6: an answer ends the asking at once, and so does a stop.
+    #[test]
+    fn an_answer_or_a_stop_ends_the_asking() {
+        let clock = Wound(std::cell::Cell::new(Instant::now()));
+        let runs = std::cell::Cell::new(0u32);
+        let refused = ask_until(&clock, &|| false, &mut |_| false, &mut || Try::Answer(Err(OrderFail::Busy)), &mut |_, _| {});
+        assert_eq!(refused, Asked::Answer(Err(OrderFail::Busy)));
+        let stopped = ask_until(
+            &clock,
+            &|| runs.get() >= 3,
+            &mut |_| false,
+            &mut || {
+                runs.set(runs.get() + 1);
+                Try::NoAnswer("no answer yet".into())
+            },
+            &mut |_, _| {},
+        );
+        assert_eq!(stopped, Asked::Stopping);
+        assert_eq!(runs.get(), 3);
+    }
+
+    /// wsp-109 R3 and R5: only an order in flight and unasked for 900 s is
+    /// taken out; one asked again meanwhile (`joined`) is kept.
+    #[test]
+    fn only_an_order_nobody_asked_about_for_900s_is_forgotten() {
+        let began = Instant::now();
+        let mut t = Table::default();
+        let id = OrderId("o-1".into());
+        t.orders.insert(id.clone(), Order::InFlight { waiters: vec![], asked: began });
+        assert!(!forget_unasked(&mut t, &id, began + s(899)), "asked 899 s ago: kept");
+        assert!(t.orders.contains_key(&id));
+
+        // Asked again at 600 s: 900 s from then, not from the first ask.
+        let asker = Asker { client: None, out: None, req: None };
+        if let Some(Order::InFlight { waiters, asked }) = t.orders.get_mut(&id) {
+            joined(waiters, asked, asker, began + s(600));
+        }
+        assert!(!forget_unasked(&mut t, &id, began + s(1000)), "asked again 400 s ago: kept");
+        assert!(matches!(t.orders.get(&id), Some(Order::InFlight { waiters, .. }) if waiters.len() == 1));
+        assert!(forget_unasked(&mut t, &id, began + s(1500)), "900 s since the last ask: gone");
+        assert!(!t.orders.contains_key(&id));
+
+        let done = OrderId("o-2".into());
+        t.orders.insert(done.clone(), Order::Answered(vec![]));
+        assert!(!forget_unasked(&mut t, &done, began + s(10_000)), "an answered order is never forgotten");
+        assert!(t.orders.contains_key(&done));
+        assert!(!forget_unasked(&mut t, &OrderId("o-3".into()), began + s(10_000)), "nor one not there");
     }
 }
