@@ -261,7 +261,8 @@ pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
 /// `rows`, `check` or `person`), `owed_text`, and `until` or `on` (wsp-095:
 /// [`crate::owed`]), and `attention` (`needs-you` or `follow-up`, absent for
 /// neither), `attention_text`, and `waiting_on` or `due` ([`crate::classify`],
-/// wsp-096). List `fields`: title, caption, status, project,
+/// wsp-096), and on a needs-you group only `action`, the runnable act as a
+/// JSON string `{verb, args, sentence, buttons}` (wsp-097). List `fields`: title, caption, status, project,
 /// prio, after, alone, created, planned, and `body`: the list file's text,
 /// verbatim, for each list `texts` holds (wsp-076), so [`list_of`] rebuilds
 /// the `Worklist` with the store's own parser — a list's groups and settings
@@ -333,7 +334,7 @@ fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeM
                         }
                         // `wsp-096`: needs-you or follow-up, from the one
                         // classifier every reader asks; absent is neither.
-                        if let Some(a) = crate::classify::of(crate::classify::Item::Barrier(&owed)) {
+                        if let Some(a) = crate::classify::of(crate::classify::Item::Barrier(&w.id, &owed)) {
                             for (k, v) in a.fields() {
                                 put(&mut f, k, &v);
                             }
@@ -389,8 +390,9 @@ fn about(a: &About) -> Option<Subject> {
 /// id `flag:<task>`) is `Flag`. States by [`ask_state`]. `fields`: `shape`,
 /// `message_kind` (stop, direction, note, fyi), `state` (the file's word), `at`,
 /// `scope` for a scope the contract has no subject for, `reply_to`, and for an
-/// open question for the person `attention` = `needs-you` and `attention_text`
-/// ([`crate::classify`], wsp-096).
+/// open question for the person `attention` = `needs-you`, `attention_text`
+/// ([`crate::classify`], wsp-096) and `action`, the runnable act as a JSON
+/// string `{verb, args, sentence, buttons}` (wsp-097).
 pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde_json::Value>) -> Vec<Entity> {
     let mut out: Vec<Entity> = messages
         .values()
@@ -1044,6 +1046,14 @@ mod tests {
         assert_eq!(late.get("attention").map(String::as_str), Some("needs-you"), "{late:?}");
         assert!(late["attention_text"].contains("wsp worklist go m1"));
         assert!(!late.contains_key("due"));
+        // `wsp-097`: `action` on the needs-you read only, naming this list.
+        assert!(!early.contains_key("action"), "follow-up carries no action: {early:?}");
+        let act: serde_json::Value = serde_json::from_str(&late["action"]).unwrap();
+        assert_eq!(act["verb"], "worklist");
+        assert_eq!(act["args"], serde_json::json!(["go", "m1"]));
+        assert_eq!(act["sentence"], "needed");
+        let labels: Vec<&str> = act["buttons"].as_array().unwrap().iter().map(|b| b["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, vec!["Pass", "Hold"]);
         // Read in the other order, the answers are the same: nothing was kept.
         assert_eq!(fields(3_000).get("attention").map(String::as_str), Some("needs-you"));
         assert_eq!(fields(1_000).get("attention").map(String::as_str), Some("follow-up"));
@@ -1068,11 +1078,12 @@ mod tests {
         assert_eq!(held.get("attention").map(String::as_str), Some("follow-up"), "{held:?}");
         assert_eq!(held.get("waiting_on").map(String::as_str), Some("wsp-093"));
         assert_eq!(held.get("attention_text").map(String::as_str), Some("waiting on wsp-093"));
+        assert!(!held.contains_key("action"), "wsp-097: follow-up carries no action");
         // Running, its members all landed: the run opens the check, so neither.
         w.set_status(WorklistStatus::Running);
         let barrier = group(&w, &|_| true);
         assert_eq!(barrier.get("owed").map(String::as_str), Some("check"), "{barrier:?}");
-        assert!(!barrier.contains_key("attention"), "{barrier:?}");
+        assert!(!barrier.contains_key("attention") && !barrier.contains_key("action"), "{barrier:?}");
         let running = group(&w, &|_| false);
         assert!(!running.contains_key("attention") && !running.contains_key("owed"), "{running:?}");
     }
@@ -1104,6 +1115,10 @@ mod tests {
         assert!(p["attention_text"].contains("wsp answer m-p"), "{p:?}");
         assert!(!p.contains_key("due") && !p.contains_key("waiting_on"));
         assert!(!fields("m-g").contains_key("attention"), "a governor's to answer");
+        // `wsp-097`: the needs-you question carries its action, the governor's none.
+        let act: serde_json::Value = serde_json::from_str(&p["action"]).unwrap();
+        assert_eq!((act["verb"].as_str(), &act["args"], act["sentence"].as_str()), (Some("answer"), &serde_json::json!(["m-p"]), Some("needed")));
+        assert!(!fields("m-g").contains_key("action"), "not needs-you, so no action");
     }
 
     #[test]

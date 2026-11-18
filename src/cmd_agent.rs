@@ -5297,8 +5297,9 @@ fn answers_to(
 /// sorted by [`crate::classify`] on this read into `needs_you` and `follow_up`
 /// (`wsp-096`). Groups and asks carry the same answer as their own `attention`
 /// field in the mirror. Each entry is an object, `kind` and its id beside the
-/// classifier's `attention`, `text`, and `waiting_on` or `due`, so the `action`
-/// the next row adds is one more key. No seat is follow-up yet: one waiting on
+/// classifier's `attention`, `text`, and `waiting_on` or `due`, and `action`
+/// where the classifier gives one (`wsp-097`: no seat yet; a seat held on a
+/// dialog is acted on through that question). No seat is follow-up yet: one waiting on
 /// a named other party is `wsp-095`'s third sub-task.
 fn wip_attention(rows: &[WipRow]) -> serde_json::Value {
     let (mut needs_you, mut follow_up) = (Vec::new(), Vec::new());
@@ -9911,7 +9912,7 @@ mod tests {
         assert_eq!(held["attention"], "needs-you");
         assert_eq!(held["task"], "t-001");
         assert!(held["text"].as_str().unwrap().contains("m-hold"), "{held}");
-        assert!(held.get("action").is_none(), "the next row adds it");
+        assert!(held.get("action").is_none(), "wsp-097: a seat carries none, its dialog's question does");
         for e in &now {
             assert!(!e["text"].as_str().unwrap().is_empty(), "{e}");
         }
