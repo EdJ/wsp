@@ -867,8 +867,16 @@ struct Tick {
     started: Instant,
     cpu0: (u64, u64),
     kids0: (u64, u64),
-    phase: Option<(String, Instant)>,
+    phase: Option<(String, Instant, (u64, u64))>,
     phases: Vec<(String, f64)>,
+    /// What each phase cost this process in CPU (user + sys, ms), and which
+    /// programs it ran. A phase's wall time cannot say whether it was this
+    /// process computing, a child it waited on or a lock it slept on
+    /// (`wsp-665`): this is the split, so the next busy tick answers it.
+    cpu: Vec<(String, f64)>,
+    spent: Vec<(String, Kids)>,
+    /// Everything the phases drained, so `children` is still the tick's total.
+    kids_total: Kids,
 }
 
 static TICK: Mutex<Option<Tick>> = Mutex::new(None);
@@ -891,6 +899,9 @@ pub fn tick_begin() {
         kids0: children_cpu(),
         phase: None,
         phases: Vec::new(),
+        cpu: Vec::new(),
+        spent: Vec::new(),
+        kids_total: Kids::default(),
     });
 }
 
@@ -900,15 +911,38 @@ pub fn phase(name: &str) {
     let mut g = tick_guard();
     let Some(t) = g.as_mut() else { return };
     close(t);
-    t.phase = Some((name.to_string(), Instant::now()));
+    t.phase = Some((name.to_string(), Instant::now(), own_cpu()));
 }
 
 fn close(t: &mut Tick) {
-    if let Some((n, at)) = t.phase.take() {
+    if let Some((n, at, cpu0)) = t.phase.take() {
         let d = at.elapsed().as_secs_f64() * 1000.0;
         match t.phases.iter_mut().find(|(p, _)| *p == n) {
             Some(e) => e.1 += d,
-            None => t.phases.push((n, d)),
+            None => t.phases.push((n.clone(), d)),
+        }
+        let (u, s) = own_cpu();
+        let c = ms(u.saturating_sub(cpu0.0)) + ms(s.saturating_sub(cpu0.1));
+        match t.cpu.iter_mut().find(|(p, _)| *p == n) {
+            Some(e) => e.1 += c,
+            None => t.cpu.push((n.clone(), c)),
+        }
+        // The children this phase ran or finished waiting on.
+        let k = drain_children();
+        for (prog, (n, wall)) in &k.0 {
+            let e = t.kids_total.0.entry(prog.clone()).or_insert((0, 0.0));
+            e.0 += n;
+            e.1 += wall;
+        }
+        match t.spent.iter_mut().find(|(p, _)| *p == n) {
+            Some((_, have)) => {
+                for (prog, (n, wall)) in k.0 {
+                    let e = have.0.entry(prog).or_insert((0, 0.0));
+                    e.0 += n;
+                    e.1 += wall;
+                }
+            }
+            None => t.spent.push((n.clone(), k)),
         }
     }
 }
@@ -939,15 +973,45 @@ pub fn tick_end() {
     close(&mut t);
     let (u, s) = own_cpu();
     let (ku, ks) = children_cpu();
-    let line = tick_line(
+    let mut total = std::mem::take(&mut t.kids_total);
+    for (prog, (n, wall)) in drain_children().0 {
+        let e = total.0.entry(prog).or_insert((0, 0.0));
+        e.0 += n;
+        e.1 += wall;
+    }
+    let mut line = tick_line(
         t.at,
         t.started.elapsed(),
         (u.saturating_sub(t.cpu0.0), s.saturating_sub(t.cpu0.1)),
         (ku.saturating_sub(t.kids0.0), ks.saturating_sub(t.kids0.1)),
         &t.phases,
-        &drain_children(),
+        &total,
     );
+    if let Some(o) = line.as_object_mut() {
+        o.insert("phase_cpu_ms".into(), phase_cpu_json(&t.cpu));
+        o.insert("phase_kids".into(), phase_kids_json(&t.spent));
+    }
     write(Log::Actions, line);
+}
+
+/// Per phase, this process's own CPU in ms. Pure.
+pub fn phase_cpu_json(cpu: &[(String, f64)]) -> Value {
+    let mut m = serde_json::Map::new();
+    for (n, c) in cpu {
+        m.insert(n.clone(), json!(round1(*c)));
+    }
+    Value::Object(m)
+}
+
+/// Per phase, the programs it ran, and only the phases that ran any. Pure.
+pub fn phase_kids_json(spent: &[(String, Kids)]) -> Value {
+    let mut m = serde_json::Map::new();
+    for (n, k) in spent {
+        if !k.0.is_empty() {
+            m.insert(n.clone(), k.json());
+        }
+    }
+    Value::Object(m)
 }
 
 /// Drop a tick that did nothing worth a line (the loop's early `continue`).
@@ -1595,13 +1659,58 @@ mod tests {
 
     #[test]
     fn phases_add_when_a_name_comes_round_again() {
-        let mut t = Tick { at: 0, started: Instant::now(), cpu0: (0, 0), kids0: (0, 0), phase: None, phases: vec![] };
-        t.phase = Some(("a".into(), Instant::now() - Duration::from_millis(30)));
+        let mut t = Tick {
+            at: 0,
+            started: Instant::now(),
+            cpu0: (0, 0),
+            kids0: (0, 0),
+            phase: None,
+            phases: vec![],
+            cpu: vec![],
+            spent: vec![],
+            kids_total: Kids::default(),
+        };
+        t.phase = Some(("a".into(), Instant::now() - Duration::from_millis(30), own_cpu()));
         close(&mut t);
-        t.phase = Some(("a".into(), Instant::now() - Duration::from_millis(30)));
+        t.phase = Some(("a".into(), Instant::now() - Duration::from_millis(30), own_cpu()));
         close(&mut t);
         assert_eq!(t.phases.len(), 1);
         assert!(t.phases[0].1 >= 59.0);
+        assert_eq!(t.cpu.len(), 1, "one CPU figure per phase name, added when it comes round again");
+    }
+
+    /// `wsp-665`: a phase says which programs it ran, and the tick's `children`
+    /// stays the sum of them. The test drains the process-wide tally, so it is
+    /// the only test that reads it.
+    #[test]
+    fn a_phase_keeps_the_children_it_ran_and_the_tick_the_total() {
+        let _ = drain_children();
+        let mut t = Tick {
+            at: 0,
+            started: Instant::now(),
+            cpu0: (0, 0),
+            kids0: (0, 0),
+            phase: None,
+            phases: vec![],
+            cpu: vec![],
+            spent: vec![],
+            kids_total: Kids::default(),
+        };
+        t.phase = Some(("one".into(), Instant::now(), own_cpu()));
+        note_child("git", 3, Duration::from_millis(30));
+        close(&mut t);
+        t.phase = Some(("two".into(), Instant::now(), own_cpu()));
+        note_child("git", 2, Duration::from_millis(20));
+        note_child("compound-sup", 1, Duration::from_millis(500));
+        close(&mut t);
+        t.phase = Some(("three".into(), Instant::now(), own_cpu()));
+        close(&mut t);
+        assert_eq!(t.kids_total.0["git"].0, 5, "the tick's total is every phase's");
+        let v = phase_kids_json(&t.spent);
+        assert_eq!(v["one"]["git"]["n"], 3);
+        assert_eq!(v["two"]["compound-sup"]["n"], 1);
+        assert!(v.get("three").is_none(), "a phase that ran nothing says nothing");
+        assert!(phase_cpu_json(&t.cpu).get("three").is_some(), "every phase has a CPU figure");
     }
 
     /// The whole of what an exit does — role, parent name, both `getrusage`s,
