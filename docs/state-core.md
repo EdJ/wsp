@@ -711,6 +711,112 @@ installs the trunk and web-chrome's app, and a day passes on both before the mea
   Recommended: not in step 1. Re-reading on events already takes polling to 0. Folding means new parsers in compound for
   the contract's entities, which belongs with step 4, when `--json` may change shape.
 
+### Step 2's breakdown (wsp-115, 2026-11-18)
+
+There are two lists, both at status init and not started. `s2-state-core` runs after `s1-state-core` (d1). It ends at a
+step only the person can do, which is installing the trunk with the store as the default (wsp-091). `s2-state-core-2`
+waits on it. It follows wsp-018's rules: expand, then contract; a cut that cannot be staged is one row run as legs; each
+row's checks build the workspace and test every crate the row touches, with budgets of at least 120 s per cargo step. It
+also follows wsp-068's rule (one seam, one group) and wsp-086's (no row here loads the machine on purpose, so none needs
+a group of its own for that). Each overview names its seam and its files.
+
+**What step 2 is, as amended.** Orders become commands to the store, and section 3.1's machine owns the order record
+and the `deliver:<seat>` lease. The manager already delivers and acks (M1: `order.deliver` → compound-sup's `deliver`
+verb, and `order.delivered`/`order.acked`/`order.refused`), and the daemon already folds those answers (src/fold.rs into
+`manager/<host>.orders.json`, and mirrored as `Order`s since wsp-075). What is missing is the owner. Today an order has
+no record of its own before the manager answers. Its id is minted by the seat's directory (`deliver.pending` in
+place_compound.rs). Three files and a phase stand in for its state:
+- `typed-unsent.json`: `repair::unsent_tick`, the `repair:unsent` phase. It already skips itself under the manager.
+- `first-orders.json`: `owe_first_order` from five sites in cmd_spawn.rs, and `first_order_tick`'s press, resend and
+  flag.
+- `stuck-commands.json`: `stuck_tick`'s record of a stalled command and whether the seat was told.
+
+A fourth, `refused-deliveries.json` (refusals.rs, wsp-634), counts refusals toward ending a deaf governor.
+untaken.rs (wsp-252) presses and resends from cycle.log markers. These files and that pressing are what the machine
+replaces.
+
+**Found while reading the code.**
+- **Every send has one choke point**: `agent_commands::Kind::tell` → `Place::tell` → `Compound::tell` → `deliver_through`
+  → `Host::deliver` (crates/wire/src/host_tcp.rs: `order.deliver` to the manager under wsp's id). The senders above it
+  are `wsp tell` (cmd_agent.rs `tell_seat`), answers (cmd_message.rs `deliver`, `deliver_held`/`type_at`), wake.rs
+  (`deliver_to` and its read at :1116), cycle.rs `tell_seat`, the spawn (cmd_spawn.rs `start_ordered`/`confirm_turn`),
+  repair.rs `stuck_tick`, and untaken.rs. Each moves over in one row of group 5.
+- **The first order already carries a wsp-minted id** (`FirstOrder { order: place::new_order_id(seat) }`, cmd_spawn.rs),
+  so the store's order id can replace it with no wire change. A told order's id is minted in the wire crate
+  (`delivery_id`), so the wire needs `deliver_order` with a caller's id (wsp-120). That is the new row of that number,
+  not D20's herdr row.
+- **The manager answers an id at most once**, and it keeps an unanswered order in `<exec_dir>/orders/` across a restart
+  (crates/manager/src/seats.rs). So the delivery worker can lose its lease mid-delivery and the next holder asks again
+  under the same id without doubling. Fencing protects the store's record, and the manager's key protects the seat.
+- **stuck-commands.json is not delivery.** It records a stalled shell command (wsp-397). Under the manager the stall is
+  already the folded `seat.stuck` (`manager/<host>.stuck.json`), and the file adds only `told`. That becomes the state
+  of the order that told the seat (part 4 below).
+- **The contract has `order.send` and `order.cancel` and nothing that moves an order on**, and the server refuses every
+  command (`unsupported`, crates/server/src/conn.rs). There is no `wsp-machines` crate yet. So the expand half is
+  contract → machine → server → the daemon's worker, each beside the old path.
+- **The daemon and the server share one process** (wsp-075), and the daemon holds the manager connections until step 3.
+  So delivery runs in the daemon, through the in-process store, and not in the server (part 1 below).
+
+**List `s2-state-core`: expand, move over, default on.** Every root row is behind `WSP_ORDERS` (`files` is today's path
+and the default until group 7).
+
+| group | kind | row | tier | what | creates / changes · seam |
+|---|---|---|---|---|---|
+| 1 | contract | wsp-117 | opus high | The contract carries the machine (R5): `order.deliver` (fenced on `deliver:<seat>`), `order.delivered`, `order.acked`, `order.refused { why, counts }`, `order.done`; `first` on `order.send` and `Order`; `LeaseName::deliver` | crates/store-contract, crates/store-conformance/src/domain.rs, crates/server/src/mirror.rs, docs/components.md · the contract's types |
+| 2 | components | wsp-118 | opus high | `wsp-machines`: `orders::Orders`, a pure `Domain` with 3.1's table, named refusals, the attempts cap, and repeat answers as empty decisions; case 9 against it | creates crates/machines; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the orders machine |
+| 2 | components | wsp-119 | sonnet high | `wsp-client`: `apply` under one key across retries, `await_order` over subscribe | crates/client · the wire's client side |
+| 2 | components | wsp-120 | sonnet high | `Place::deliver_order(seat, order, text)`: tell's supervisor path under the caller's id, with no `deliver.pending` | crates/wire/src/{place.rs, place_compound.rs, fake.rs} · place_compound's deliver |
+| 3 | components | wsp-121 | opus high | `wsp-server` composes `Orders` and `Mirror`. Under `Owned` it accepts `order.send`/`order.cancel` from clients and the answers only from the instance or a manager. The daemon opens it `Mirrored` (no change) | crates/server, Cargo.lock, tests/layering.rs, docs/components.md, the root's open call site · the server's command path |
+| 4 | wiring | wsp-122 | opus high | src/orders.rs, the door (`mode`, `send`, `answer`, in process or through the client), and src/deliver.rs, the worker: `deliver:<seat>` taken, `order.deliver` fenced, `deliver_order` under the order's id, the answer applied. Two legs: `door`, `worker` | creates src/orders.rs, src/deliver.rs, tests/orders.rs; src/daemon.rs, src/main.rs · the daemon's start-up and delivery |
+| 5 | wiring | wsp-123 | opus high | The fold applies the manager's order answers as machine commands under the worker's keys, and `order.done` when the acked turn ends | src/fold.rs · the manager fold |
+| 5 | wiring | wsp-124 | opus high | `wsp tell` and answers: `order.send`, then the ack, with the receipts and `--json` unchanged. A held answer is a queued order | src/cmd_agent.rs (`tell_seat`), src/cmd_message.rs, tests/tell_orders.rs · the CLI's tells |
+| 5 | wiring | wsp-125 | opus high | The daemon's tells: the governor's spool and its confirmation, barrier checks, the stall's telling, and the deaf governor read from `failed` orders | src/wake.rs, src/cycle.rs (`tell_seat`), src/repair.rs (`stuck_tick_with`, `refusal_tick`), src/refusals.rs · the daemon's tells |
+| 5 | wiring | wsp-126 | opus high | The spawn's first order is `order.send { first }`, carried in `seat.spawn` under its id. untaken waits on `failed` and does not press | src/cmd_spawn.rs, src/untaken.rs · the spawn's first order |
+| 6 | wiring | wsp-127 | opus high | wip's `unsent`, `dropped`, `refusing` and `stuck`, and waiting.rs's `unsent`, read from the orders and the folded stall, with `--json` byte-identical | src/cmd_agent.rs (`Wip`), src/waiting.rs · wip's seat columns |
+| 7 | wiring | wsp-128 | opus high | `WSP_ORDERS` defaults to `store` under the manager, and doctor names the mode. `files` is the rollback | src/orders.rs, src/daemon.rs · the orders flag |
+
+**List `s2-state-core-2`: measure, then delete.** It runs after `s2-state-core`, once the person has installed it.
+
+| group | kind | row | tier | what | creates / changes · seam |
+|---|---|---|---|---|---|
+| 1 | insitu | wsp-129 | sonnet high | The measure, held until 14 days after the install: typed-but-unsent incidents and wait-loop stalls over the fortnight, renders per tick, `wsp calls` a day before and after, written here as "Step 2's result" | this section |
+| 2 | removal | wsp-130 | opus high | Delete `typed-unsent.json`, `first-orders.json`, `stuck-commands.json`, `refused-deliveries.json`, `repair:unsent`, `deliver.pending`/`delivery_id`, the `files` branches, `WSP_ORDERS` and `Orders::Mirrored`. Three legs: `root`, `wire`, `server` | src/ (repair, refusals and every order path), crates/wire/src/place_compound.rs, crates/server · every order path |
+
+**Why the groups are what they are.** Groups 1–4 are serial because each builds on the one before (types, machine,
+server, worker), and groups 1–3 each edit docs/components.md. Group 2 is the only components group run side by side.
+Its three rows name disjoint files, and only wsp-118 touches Cargo.toml, Cargo.lock or tests/layering.rs. Group 5's four
+rows are on four seams with disjoint files: fold.rs; cmd_agent.rs's `tell_seat` region with cmd_message.rs;
+wake/cycle/repair/refusals; and cmd_spawn/untaken. All four read src/orders.rs and none changes it. Their tests live in
+their own files (wsp-124's in tests/tell_orders.rs, not wsp-122's tests/orders.rs). wsp-127 is a group after wsp-124
+because both edit src/cmd_agent.rs, in different regions. wsp-128 flips the default only after every reader has moved, so
+the trunk never reads a file the default stopped writing. wsp-130 is alone because it touches every order path.
+
+**The stops.** After `s2-state-core`'s group 7, the person installs the trunk (`wsp install`) and restarts the daemon.
+That ends the list. `s2-state-core-2` starts once it is done, and its group 1 is held `--until` 14 days after the
+install. After its group 1, the deletion goes ahead only if the measure reads met. Otherwise the list holds and the
+`files` path stays the rollback.
+
+**Left for the person** (one `wsp ask` on wsp-115, each part with a recommended answer):
+- (1) Where delivery runs, meaning who holds `deliver:<seat>`. Recommended: a thread in the daemon process beside the
+  fold, through the in-process store. It is woken by `wait_for`, not paced by the tick. Step 3 moves it into the server
+  together with the manager connections.
+- (2) The orders machine under `WSP_HOST=inproc`. Recommended: `store` only under the manager. The in-process host keeps
+  today's path until M1's contraction removes it, and wsp-130 waits for that.
+- (3) Attempts and a busy seat. Recommended: the worker delivers only to a seat the mirror reads `idle` (or `started`,
+  for a first order). A `busy` refusal is no attempt (`counts: false`). The cap is 3, then `failed`, which wip draws as
+  today's `order not received` or `refusing`, and which ends a deaf governor (wsp-634).
+- (4) stuck-commands.json, which records stalls, not deliveries. Recommended: the record is the folded `seat.stuck`
+  (the seat machine's at step 3), and the telling is an order keyed by (seat, stall start), whose state replaces `told`.
+- (5) refused-deliveries.json, which section 3.5 does not name. Recommended: retire it with the others in wsp-130. The
+  deaf-governor ending reads the seat's `failed` orders.
+- (6) When the `files` path is deleted. Recommended: after the fortnight's measure passes (list 2: measure, then
+  delete), so the rollback stays one flag away (`WSP_ORDERS=files`) through the measure. After the deletion the
+  rollback is a revert. This replaces section 7's "repair:unsent restored behind a flag".
+- (7) `wsp tell` from a person's shell. Recommended: unchanged as the person sees it. It sends `order.send`, waits on the
+  order's events for today's 30 s, and prints the same receipt and `--json`. The tick never waits. It queues and reads
+  the order's state on the next tick.
+- (8) Two lists, split at the install (wsp-091). Recommended: yes, as filed.
+
 ---
 
 ## 8. Resilience and scale
