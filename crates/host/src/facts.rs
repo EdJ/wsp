@@ -38,9 +38,17 @@ pub struct Read {
 /// Read the host's facts now, with disk free for the volumes holding `volumes`
 /// (one entry per volume, however many of the paths it holds).
 pub fn read(host: &InProcess, volumes: &[PathBuf]) -> Read {
-    let sys = host.sysctls(SYSCTLS).unwrap_or_default();
     let paths: Vec<&Path> = volumes.iter().map(PathBuf::as_path).collect();
     let df = host.disks_free(&paths).unwrap_or_default();
+    if cfg!(target_os = "linux") {
+        return read_linux(
+            &host.load().unwrap_or_default(),
+            host.meminfo().as_deref(),
+            host.vmstat().as_deref(),
+            &df,
+        );
+    }
+    let sys = host.sysctls(SYSCTLS).unwrap_or_default();
     let therm = host.thermal();
     let mut read = assemble(&sys, &df, therm.as_deref());
     throttle_facts(&mut read.facts, host.idle().as_deref(), host.pageouts().as_deref());
@@ -125,6 +133,15 @@ pub fn assemble_linux(loadavg: &str, meminfo: &str, df: &str) -> Read {
         _ => None,
     };
     gather(parse_loads(loadavg), swap, memory, df, None)
+}
+
+/// What [`read`] makes of Linux's raw answers: `/proc/loadavg`, `/proc/meminfo`
+/// and `/proc/vmstat` (the last two absent as `None`), and `df -Pk`. A pure
+/// function of the texts, so the dispatch is tested without a Linux.
+pub fn read_linux(loadavg: &str, meminfo: Option<&str>, vmstat: Option<&str>, df: &str) -> Read {
+    let mut read = assemble_linux(loadavg, meminfo.unwrap_or_default(), df);
+    throttle_facts_linux(&mut read.facts, meminfo, vmstat);
+    read
 }
 
 /// A `/proc/meminfo` field in kB (`MemTotal:  16314496 kB`).
@@ -390,6 +407,21 @@ mod tests {
         let mut bare = assemble_linux("", "", "");
         throttle_facts_linux(&mut bare.facts, Some("nothing"), None);
         assert_eq!((bare.facts.free_memory_bytes, bare.facts.pageouts), (None, None));
+    }
+
+    #[test]
+    fn a_linux_read_is_the_proc_texts_made_into_facts() {
+        let meminfo = "MemTotal:       16000000 kB\nMemAvailable:    1600000 kB\n\
+            SwapTotal:       2097148 kB\nSwapFree:        2096124 kB\n";
+        let r = read_linux("1.25 0.80 0.50 2/345 6789\n", Some(meminfo), Some("pswpout 4000\n"), DF);
+        assert_eq!(r.missing, vec!["thermal"], "everything but thermal is answered");
+        assert_eq!(r.facts.load_centi, 125);
+        assert_eq!(r.facts.memory, MemoryPressure::Warn);
+        assert_eq!(r.facts.free_memory_bytes, Some(1600000 * 1024), "the throttle's free memory is present");
+        assert_eq!(r.facts.pageouts, Some(4000));
+        let none = read_linux("", None, None, "");
+        assert_eq!(none.missing, vec!["load", "swap", "memory", "disks", "thermal"]);
+        assert_eq!((none.facts.free_memory_bytes, none.facts.pageouts), (None, None));
     }
 
     /// The live host answers all its asks but thermal.
