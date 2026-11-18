@@ -3065,7 +3065,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     `go` passes the barrier; `wsp reopen` of a
                                     member the check held on is the other: the
                                     run goes back to that group, reseats the
-                                    member and checks the barrier afresh"##,
+                                    member and checks the barrier afresh.
+                                    --until WHEN (a time, or 24h/2d from now),
+                                    --on <row>… and --for "the person's act"
+                                    say what the hold waits on, so it is not
+                                    shown as needing the person before that is
+                                    all that is left; on a held list they
+                                    re-describe the wait, with no reason"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -5643,6 +5649,99 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     hold_by(store, args, None)
 }
 
+/// What a hold waits on (`wsp-095`): `--until`, `--on`, `--for`. Read off the
+/// list by [`crate::owed`], which lists a held barrier as needing the person
+/// only when the time has come, the rows have landed and no check is reading it.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Wait {
+    until: Option<String>,
+    on: Vec<String>,
+    act: Option<String>,
+}
+
+impl Wait {
+    fn given(&self) -> bool {
+        self.until.is_some() || !self.on.is_empty() || self.act.is_some()
+    }
+
+    /// Onto a list being held: the whole wait, replacing any before it.
+    fn put(self, w: &mut Worklist) {
+        w.held_until = self.until;
+        w.held_on = self.on;
+        w.held_for = self.act;
+    }
+
+    fn said(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(u) = &self.until {
+            parts.push(format!("until {u}"));
+        }
+        if !self.on.is_empty() {
+            parts.push(format!("on {}", self.on.join(" ")));
+        }
+        if let Some(a) = &self.act {
+            parts.push(format!("then for the person: {a}"));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// `--until`: an ISO time, a date, or `<n>m|h|d` from `now`; written as
+/// [`util::iso_at`] writes a stamp.
+fn until_of(said: &str, now: i64) -> Result<String, String> {
+    let t = said.trim();
+    let rel = t.char_indices().last().and_then(|(i, unit)| {
+        let n: i64 = t[..i].trim().parse().ok().filter(|n| *n > 0)?;
+        let per = match unit {
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        Some(now + n * per)
+    });
+    let at = rel.or_else(|| {
+        let ok = t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-';
+        Some(util::epoch_of(t)).filter(|e| ok && *e > 0)
+    });
+    at.map(util::iso_at)
+        .ok_or_else(|| format!("--until `{t}` is not a time: give 2026-11-19T15:15Z, a date, or 24h / 2d / 90m from now"))
+}
+
+pub(crate) fn hold_wait(args: &Args, now: i64) -> Result<Wait, String> {
+    let until = match args.get("until").filter(|u| u != "true") {
+        Some(u) => Some(until_of(&u, now)?),
+        None if args.has("until") => return Err("--until needs a time".into()),
+        None => None,
+    };
+    let on: Vec<String> = args.all("on").into_iter().flat_map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>()).filter(|s| s != "true").collect();
+    if args.has("on") && on.is_empty() {
+        return Err("--on needs the rows the hold waits on".into());
+    }
+    let act = args.get("for").map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a != "true");
+    if args.has("for") && act.is_none() {
+        return Err("--for needs the person's act, in words".into());
+    }
+    Ok(Wait { until, on, act })
+}
+
+/// A held list given a new wait and no new hold: the wait replaces the one
+/// before it, and the log says so.
+fn rewait(store: &Store, w: &mut Worklist, wait: Wait) -> i32 {
+    let said = wait.said();
+    wait.put(w);
+    w.log(&format!("hold waits {said}"));
+    let groups = w.groups();
+    let msg = format!("hold {} waits", w.id);
+    let code = save(store, w, &groups, "hold", &msg);
+    if code != 0 {
+        return code;
+    }
+    store.log_event("worklist-hold-waits", json!({ "id": w.id, "until": w.held_until, "on": w.held_on, "for": w.held_for }));
+    println!("{} {} {said}", w.id, Paint::new().dim("held, and waits"));
+    0
+}
+
 /// Rows a hold's reason names that stand on no list and were filed at this
 /// barrier: made after its check opened, or sub-tasks of a member. `wsp-530`.
 ///
@@ -5691,6 +5790,17 @@ pub(crate) fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i3
         Ok(v) => v,
         Err(code) => return code,
     };
+    // `wsp-095`: what the hold waits on — a time, rows, the person's act.
+    let wait = match hold_wait(args, util::epoch_secs()) {
+        Ok(v) => v,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
+    };
+    if w.status() == WorklistStatus::Held && wait.given() {
+        return rewait(store, &mut w, wait);
+    }
     // Given no reason: the verdict the check wrote at the place wsp keeps for it
     // (`wsp-374`), when it opens with `hold` and was written in this run.
     if said.trim().is_empty() {
@@ -5773,6 +5883,7 @@ pub(crate) fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i3
     let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members, &BTreeMap::new());
 
     w.set_status(WorklistStatus::Held);
+    wait.put(&mut w);
     w.log(&with_caption(&format!("{HELD} {}", said.trim()), caption.as_deref()));
     let groups = w.groups();
     let msg = format!("hold {}", w.id);
@@ -10224,6 +10335,46 @@ mod tests {
 
         assert_eq!(run(&store, &["go", "batch", "settled", "again"]), 0);
         assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
+    }
+
+    /// `wsp-095`: a hold says what it waits on — a time, rows, the person's
+    /// act — and a held list's wait is described again without a new hold.
+    #[test]
+    fn a_hold_records_what_it_waits_on_and_a_held_list_is_given_a_new_wait() {
+        let (_env, store) = running("hold-wait");
+        task(&store, "wl-001", "doing");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["go", "batch"]);
+        let flags = [("until", "2026-11-19T15:15:00Z"), ("on", "wsp-093"), ("for", "rebuild web-chrome")];
+        assert_eq!(flagged(&store, &["hold", "batch", "a", "day", "on", "the", "trunk"], &flags), 0);
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(w.held_until.as_deref(), Some("2026-11-19T15:15:00Z"));
+        assert_eq!(w.held_on, vec!["wsp-093".to_string()]);
+        assert_eq!(w.held_for.as_deref(), Some("rebuild web-chrome"));
+
+        // The person's step done: what is left is the day, and nothing else.
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("until", "24h")]), 0, "no reason needed to re-describe");
+        let w = store.worklist("batch").unwrap();
+        assert!(w.held_until.as_deref().is_some_and(|u| util::epoch_of(u) > util::epoch_secs() + 86_000));
+        assert!(w.held_on.is_empty() && w.held_for.is_none(), "the new wait replaces the old");
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("until", "soon")]), 2, "a time it cannot read");
+
+        // Passing the barrier ends the hold, and its wait with it.
+        assert_eq!(run(&store, &["go", "batch", "a", "day", "passed"]), 0);
+        let w = store.worklist("batch").unwrap();
+        assert!(w.held_until.is_none() && w.held_on.is_empty() && w.held_for.is_none());
+    }
+
+    #[test]
+    fn until_reads_a_time_a_date_or_a_span_from_now() {
+        assert_eq!(until_of("2026-11-19T15:15:00Z", 0).unwrap(), "2026-11-19T15:15:00Z");
+        assert_eq!(until_of("2026-11-19", 0).unwrap(), "2026-11-19T00:00:00Z");
+        assert_eq!(until_of("24h", 1_000).unwrap(), util::iso_at(1_000 + 86_400));
+        assert_eq!(until_of("2d", 0).unwrap(), util::iso_at(2 * 86_400));
+        assert_eq!(until_of("90m", 0).unwrap(), util::iso_at(5_400));
+        assert!(until_of("tomorrow", 0).is_err());
+        assert!(until_of("0h", 0).is_err());
     }
 
     /// `wsp-173`'s done-when: a person's pause at a barrier, and the way back

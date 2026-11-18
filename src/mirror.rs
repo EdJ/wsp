@@ -257,7 +257,9 @@ pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
 /// longer holds counts as done), `Held` when the list is held, else `Running`;
 /// those after it are `Pending`. A draft's groups are all `Pending`, a done
 /// list's all `Passed`. Group `fields`: caption, cap, stop, verdict, agent,
-/// kind, weight, together. List `fields`: title, caption, status, project,
+/// kind, weight, together, and where it is `held` or `barrier` `owed` (`time`,
+/// `rows`, `check` or `person`), `owed_text`, and `until` or `on` (wsp-095:
+/// [`crate::owed`]). List `fields`: title, caption, status, project,
 /// prio, after, alone, created, planned, and `body`: the list file's text,
 /// verbatim, for each list `texts` holds (wsp-076), so [`list_of`] rebuilds
 /// the `Worklist` with the store's own parser — a list's groups and settings
@@ -266,7 +268,7 @@ pub fn lists(lists: &[Worklist], tasks: &[Task], texts: &BTreeMap<String, String
     let done: BTreeSet<&str> =
         tasks.iter().filter(|t| Status::parse(&t.status_raw) == Some(Status::Done)).map(|t| t.id.as_str()).collect();
     let known: BTreeSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-    lists_with(lists, &|m| done.contains(m) || !known.contains(m), texts)
+    lists_with(lists, &|m| done.contains(m) || !known.contains(m), texts, wsp_base::util::epoch_secs())
 }
 
 /// The `Worklist` a list was projected from, as `Store::worklists` reads it:
@@ -284,7 +286,7 @@ pub fn list_texts_of(store: &Store, lists: &[Worklist]) -> BTreeMap<String, Stri
         .collect()
 }
 
-fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeMap<String, String>) -> Vec<Entity> {
+fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeMap<String, String>, now: i64) -> Vec<Entity> {
     lists
         .iter()
         .map(|w| {
@@ -315,6 +317,18 @@ fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeM
                     put(&mut f, "weight", &g.weight);
                     if g.together {
                         f.insert("together".into(), "true".into());
+                    }
+                    // `wsp-095`: what a held or ready barrier waits on, so a
+                    // reader lists it as needing the person only where `owed`
+                    // is `person`, and says the act `owed_text` names.
+                    if let Some(owed) = crate::owed::of(w, g, state, settled, now) {
+                        put(&mut f, "owed", owed.word());
+                        put(&mut f, "owed_text", &owed.text());
+                        match &owed {
+                            crate::owed::Owed::Until(when) => put(&mut f, "until", when),
+                            crate::owed::Owed::Rows(rows) => put(&mut f, "on", &rows.join(" ")),
+                            _ => {}
+                        }
                     }
                     c::Group {
                         id: GroupId { list: ListId(w.id.clone()), n: ord as u32 },
@@ -730,6 +744,22 @@ fn held(state: &c::State, half: Half) -> BTreeMap<Subject, Entity> {
     all.into_iter().map(|e| (subject_of(&e), e)).collect()
 }
 
+/// The soonest `until` on a group (`wsp-095`), in seconds since the epoch: the
+/// moment a held barrier stops waiting on time, which no file write marks.
+pub fn next_due(entities: &[Entity]) -> Option<i64> {
+    entities
+        .iter()
+        .filter_map(|e| match e {
+            Entity::List(l) => Some(l.groups.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|g| g.fields.get("until"))
+        .map(|u| wsp_base::util::epoch_of(u))
+        .filter(|e| *e > 0)
+        .min()
+}
+
 /// Start the mirror thread: once a second it reads the two stamps, and when
 /// one moves (and at start) re-reads that half, diffs against what it last
 /// applied for it, and applies one `Command::Mirror` if that is not empty. The
@@ -747,7 +777,14 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
             let mut seq = 0u64;
             let mut stamps: [Option<(u64, [Option<std::time::SystemTime>; 2])>; 2] = [None, None];
             let mut last: [Option<BTreeMap<Subject, Entity>>; 2] = [None, None];
+            // The soonest `until` a held barrier waits for (`wsp-095`): no file
+            // moves when it comes, so the rows half is re-read then.
+            let mut due: Option<i64> = None;
             while !flag.load(Ordering::SeqCst) {
+                if due.is_some_and(|d| wsp_base::util::epoch_secs() >= d) {
+                    stamps[0] = None;
+                    due = None;
+                }
                 for (i, half) in [Half::RowsEtc, Half::Attention].into_iter().enumerate() {
                     let now_stamp = stamp_of(&store, half);
                     if stamps[i] == Some(now_stamp) {
@@ -765,6 +802,9 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
                         },
                     };
                     let now = read_half(&store, half);
+                    if half == Half::RowsEtc {
+                        due = next_due(&now);
+                    }
                     let cmd = diff_half(&before, now.clone(), half);
                     let empty = matches!(&cmd, Command::Mirror { put, gone } if put.is_empty() && gone.is_empty());
                     if !empty {
@@ -958,6 +998,31 @@ mod tests {
     /// A row rebuilds the `Task` `wip` reads, for a task it opens (the file's
     /// text through the store's parser) and for one it reads bodiless (the
     /// index's head), and each is what `wip_tasks`'s reading of the files gives.
+    /// `wsp-095`: a held barrier carries what it waits on, so "Needs you"
+    /// lists it only where `owed` is `person`, and the mirror re-reads when
+    /// its time comes.
+    #[test]
+    fn a_held_group_carries_what_it_waits_on_and_its_time_is_when_the_mirror_reads_again() {
+        let mut w = Worklist::new("m1", "m1");
+        w.set_status(WorklistStatus::Held);
+        w.set_groups(&[wsp_store::model::Group { members: vec!["a-1".into()], agent: "claude".into(), ..Default::default() }]);
+        w.held_until = Some(wsp_base::util::iso_at(2_000));
+        let fields = |now: i64| match &lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), now)[0] {
+            Entity::List(l) => l.groups[0].fields.clone(),
+            _ => unreachable!(),
+        };
+        let early = fields(1_000);
+        assert_eq!(early.get("owed").map(String::as_str), Some("time"), "{early:?}");
+        assert_eq!(early.get("until"), Some(&wsp_base::util::iso_at(2_000)));
+        assert!(early["owed_text"].starts_with("waiting until "));
+        let late = fields(3_000);
+        assert_eq!(late.get("owed").map(String::as_str), Some("person"), "{late:?}");
+        assert!(late["owed_text"].contains("wsp worklist go m1"));
+        let es = lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), 1_000);
+        assert_eq!(next_due(&es), Some(2_000));
+        assert_eq!(next_due(&lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), 3_000)), None);
+    }
+
     #[test]
     fn a_task_round_trips_row_to_task_equal_to_the_files() {
         let s = seed("mirror-task");
