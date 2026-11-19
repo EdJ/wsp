@@ -167,23 +167,36 @@ Plan `wsp-156`, 2026-11-19. It changes no code. The rows are sub-tasks of wsp-15
 
 ### The lists
 
-| list | spec | gate | rows | after |
+Each phase is two lists. The first builds, and it ends at a step only the person can do: installing the trunk, and what the measure needs after that (documents written, providers set, a month gone by). The second is the phase's measure, one row, and it waits on the first. So no list stands at a person's step with its governor seated (the handbook's rule, wsp-091), as `s2-state-core` and `s2-state-core-2` are cut. The next phase waits on the measure.
+
+| list | spec | rows | after | ends at |
 |---|---|---|---|---|
-| `kl1-files` | Proof of concept step 1: files only. A repo per scope, Layer 1 in every brief, Layer 2 read whole or by grep, reads scoped from the token | ten questions per engineer and ten for the group | wsp-193, wsp-195 to wsp-202 | `pa1-tell` |
-| `kl2-search` | Step 2: hybrid search. One index per scope, FTS5 plus vectors, reciprocal rank fusion, embedders a scope approved | the same questions again | wsp-203 to wsp-210 | `kl1-files` |
-| `kl3-contextual` | Step 3: contextual retrieval and a reranker | the same questions under three configurations | wsp-211 to wsp-214 | `kl2-search` |
-| `kl4-scopes` | Step 4: authority and conflict, drafts, commit outward, the mandate on reads | the three cross-scope tests | wsp-274 to wsp-282 | `kl3-contextual` |
-| `kl5-provenance` | Step 5: provenance, derived trust, logged retrievals, tombstones, `wsp knowledge trace` | the trace test | wsp-283 to wsp-291 | `kl4-scopes` |
-| `kl6-tending` | Curation the five steps leave out: a curator per scope, moves into and out of Layer 1, a quorum's accept | a month's tending, read by each owner | wsp-292 to wsp-297, wsp-299 | `kl5-provenance` |
-| `kl7-pgvector` | Storage's last step: the indexes follow the store into Postgres | the five index cases on the new backend | wsp-298 | `mp5-scale` |
+| `kl1-files` | Proof of concept step 1: files only. A repo per scope, Layer 1 in every brief, Layer 2 read whole or by grep, reads scoped from the token, the question harness | wsp-193, wsp-195 to wsp-201 | `pa1-tell` | the person installs the trunk, runs `wsp knowledge init` for every scope, and the engineers and the group write Layer 1 and their first Layer 2 documents |
+| `kl1-measure` | Step 1's gate: ten questions per engineer and ten for the group | wsp-202 | `kl1-files` | "Phase 1 measured": go or no-go for search |
+| `kl2-search` | Step 2: hybrid search. One index per scope, FTS5 plus vectors, reciprocal rank fusion, embedders a scope approved | wsp-203 to wsp-209 | `kl1-measure` | the person installs the trunk, sets each scope's providers, and reindexes every scope with `--prove` |
+| `kl2-measure` | Step 2's gate: the same questions again | wsp-210 | `kl2-search` | "Phase 2 measured": go or no-go for step 3 |
+| `kl3-contextual` | Step 3: contextual retrieval and a reranker | wsp-211 to wsp-213 | `kl2-measure` | the person installs the trunk and approves the context and rerank providers |
+| `kl3-measure` | Step 3's gate: the same questions under three configurations | wsp-214 | `kl3-contextual` | "Phase 3 measured": the configuration each scope keeps |
+| `kl4-scopes` | Step 4: authority and conflict, drafts, commit outward, the mandate on reads, and the three cross-scope cases as a sandbox test | wsp-274 to wsp-282 | `kl3-measure` | the person installs the trunk |
+| `kl4-measure` | Step 4's gate: the three cross-scope cases asked of real agents | wsp-301 | `kl4-scopes` | "Phase 4 measured": three verdicts |
+| `kl5-provenance` | Step 5: provenance, derived trust, logged retrievals, tombstones, `wsp knowledge trace` | wsp-283 to wsp-290 | `kl4-measure` | the person installs the trunk, and the fleet works on it until real rows hold retrievals |
+| `kl5-measure` | Step 5's gate: the trace test | wsp-291 | `kl5-provenance` | "Phase 5 measured": the spec's three conditions, met or not |
+| `kl6-tending` | Curation the five steps leave out: a curator per scope, moves into and out of Layer 1, a quorum's accept | wsp-292 to wsp-296, wsp-299 | `kl5-measure` | the person installs the trunk |
+| `kl6-measure` | A month's tending, read by each owner | wsp-297 | `kl6-tending`, and a month after its install | "Tending measured" |
+| `kl7-pgvector` | Storage's last step: the indexes follow the store into Postgres | wsp-298 | `mp5-scale` | the five index cases on the new backend |
+
+That is 48 rows in 13 lists. A measure list is set planned once the person's step in front of it is done, and not before: at init it holds no seat. `kl6-measure` also waits a month, either at init or planned and held (`wsp worklist hold kl6-measure --until <install + 30d> --for "a month's tending on the installed trunk"`).
+
+The measures that ask questions (wsp-202, wsp-210, wsp-214, wsp-301) run the harness of wsp-201, which starts one seat at a time, so none loads the machine (wsp-086). wsp-291 and wsp-297 start no seat.
 
 A list has one `after`, so what else a list rests on is in its overview ("Before group 1") and on its first row:
 - `kl1-files` rests on multiplayer phase 2 and personal agents phase 1. `pa1-tell` is itself after `mp2-workspaces`, and wsp-193 rests on wsp-180 and wsp-224, the last rows of the two.
 - `kl4-scopes` rests on `mp3-commit` (stewards, the rights table) and `pa2-mandate` (the mandate). wsp-274 rests on wsp-192 and wsp-232.
-- `kl6-tending`'s group 5 rests on `pa4-quorum`. wsp-299 rests on wsp-246.
+- `kl5-provenance` rests on the real agents' verdicts: wsp-283 and wsp-284 rest on wsp-301.
+- `kl6-tending`'s group 5 rests on `pa4-quorum`. wsp-299 rests on wsp-246. If `pa4-quorum` is not complete when group 4 lands, the list does not wait: wsp-299 moves out to a list of its own, after `pa4-quorum`.
 - `kl7-pgvector` rests on `kl2-search` for the index contract. wsp-298 rests on wsp-206.
 
-**kl2 and kl3 are conditional.** The spec adds search "only when a scope outgrows loading it whole, or when questions fail for lack of recall", and contextual retrieval and a reranker only "if the failures that remain are retrieval misses". Each of those lists ends the one before it with a measure that says go or no-go. `kl4-scopes` needs only `kl1-files` among the knowledge lists, and every row in it works on a scope with no index. If kl2 or kl3 is held, point kl4 at the last list that ran: `wsp worklist after kl4-scopes kl1-files`.
+**kl2 and kl3 are conditional.** The spec adds search "only when a scope outgrows loading it whole, or when questions fail for lack of recall", and contextual retrieval and a reranker only "if the failures that remain are retrieval misses". The measure before each says go or no-go: `kl1-measure` for `kl2-search`, and `kl2-measure` for `kl3-contextual`. `kl4-scopes` needs only `kl1-files` among the knowledge lists, and every row in it works on a scope with no index. It is `after kl3-measure`. If a measure says no-go, leave the lists it rules on at init and point kl4 at that measure: `wsp worklist after kl4-scopes kl1-measure` when search is not built, `wsp worklist after kl4-scopes kl2-measure` when search is built and step 3 is not.
 
 Every group runs on `claude opus high`, except three rows on `claude fable high`, where the spec leaves the design open: wsp-193 (the document and routing-card format), wsp-275 (the authority and conflict rule) and wsp-285 (the trust function).
 
@@ -222,7 +235,7 @@ They are not settled here. Each has a recommended answer in a note on wsp-156, a
 
 | # | question | recommended | needed before |
 |---|---|---|---|
-| 1 | Which embedding model | local for private scopes, hosted where the org approves it | `kl2-search` group 5 indexes real content |
+| 1 | Which embedding model | local for private scopes, hosted where the org approves it | the step `kl2-search` ends at, where the person sets each scope's providers. No row waits on it: they test with fake providers |
 | 2 | One repo per group, or a folder | a repo per scope; a folder is a valid root | nothing |
 | 3 | Who promotes to the org's Layer 1 | org admins only | `kl6-tending` group 2 |
 | 4 | Outside live sources through MCP | yes, per scope, in a list of its own later | nothing here |
@@ -236,4 +249,5 @@ They are not settled here. Each has a recommended answer in a note on wsp-156, a
 - **An edited provenance cannot be prevented**, since people push. wsp-286 does not serve a version whose provenance was edited: the version before stays the answer, and the owner gets an ask.
 - **Two repos are not one transaction.** Accepting a commit writes the group's repo and then supersedes the personal document. wsp-280 keys the second step by the proposal and has the daemon finish one that was cut short.
 - **The query is content too.** wsp-209 embeds a query only with a provider approved for every scope searched, and falls back to keyword for a scope with none.
+- **One citation type.** `Citation` and its text form `doc@version#chunk` are wsp-knowledge's alone (wsp-204), which links wsp-base and serde_json and not the contract. The contract carries the same three fields in an event as `Cited`, with no text form (wsp-283), and the server copies one into the other where both are linked (wsp-287).
 - **The spec's grid is "&#91;embedded content\]" in this copy.** The table under "What lives in each cell" carries the same nine cells.
