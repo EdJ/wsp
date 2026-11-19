@@ -3129,7 +3129,7 @@ mod tests {
         wsp_testkit::script(&render, "#!/bin/sh\ncase \"$1\" in state) echo working;; *) echo '001|hi';; esac\n");
         RENDER.with(|r| *r.borrow_mut() = Some(render.clone()));
         assert_eq!(place.state(&seat).unwrap(), State::Working, "the renderer serves a working screen: no hook is needed");
-        fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo idle;; *) echo '001|hi';; esac\n").unwrap();
+        wsp_testkit::script(&render, "#!/bin/sh\ncase \"$1\" in state) echo idle;; *) echo '001|hi';; esac\n");
         assert!(place.state(&seat).unwrap().will_take_a_prompt(), "an idle screen takes a prompt");
         fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo unknown;; *) echo '001|hi';; esac\n").unwrap();
         assert_eq!(place.state(&seat).unwrap(), State::Starting, "a screen that says nothing keeps it starting");

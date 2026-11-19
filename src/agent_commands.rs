@@ -912,13 +912,13 @@ pub(crate) mod stand_in {
     }
 
     fn script() -> PathBuf {
+        // The check and the write share a lock, so a second test thread never
+        // sees the file half-written (the rename this replaced did that job).
+        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let path = std::env::temp_dir().join(format!("wsp-stand-in-agent-{}", std::process::id()));
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
         if !path.is_file() {
-            use std::os::unix::fs::PermissionsExt;
-            let part = path.with_extension("part");
-            std::fs::write(&part, "#!/bin/sh\nexec sleep 600\n").unwrap();
-            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::fs::rename(&part, &path).unwrap();
+            wsp_testkit::script(&path, "#!/bin/sh\nexec sleep 600\n");
         }
         path
     }
