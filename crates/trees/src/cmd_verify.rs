@@ -1733,8 +1733,7 @@ mod tests {
     fn a_test_that_never_answers_is_a_failure_rather_than_a_hung_pass() {
         let dir = scratch_dir("alone-hang");
         let exe = dir.join("hangs");
-        std::fs::write(&exe, "#!/bin/sh\nexec sleep 300\n").unwrap();
-        chmod_x(&exe);
+        wsp_testkit::script(&exe, "#!/bin/sh\nexec sleep 300\n");
 
         let out = run_alone(
             &exe,
@@ -1768,8 +1767,7 @@ mod tests {
     fn a_slow_test_is_not_a_hung_one_unless_a_budget_was_asked_for() {
         let dir = scratch_dir("alone-slow");
         let exe = dir.join("slow");
-        std::fs::write(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n").unwrap();
-        chmod_x(&exe);
+        wsp_testkit::script(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n");
         let log = dir.join("log");
 
         // A budget it cannot meet accuses a test that passes.
@@ -1797,12 +1795,10 @@ mod tests {
         let dir = scratch_dir("alone-red");
         let exe = dir.join("fails");
         // libtest's own shape, which is what the real binary prints.
-        std::fs::write(
+        wsp_testkit::script(
             &exe,
             "#!/bin/sh\ncat <<'OUT'\nrunning 1 test\ntest a::b ... FAILED\n\nfailures:\n\n---- a::b stdout ----\nthread 'a::b' panicked at src/a.rs:12:9:\nthe seat was empty\n\nfailures:\n    a::b\n\ntest result: FAILED. 0 passed; 1 failed\nOUT\nexit 101\n",
-        )
-        .unwrap();
-        chmod_x(&exe);
+        );
 
         // No budget: this is about what the parser makes of a red test, and a
         // clock here has nothing to measure and one thing to get wrong. With
@@ -1815,8 +1811,7 @@ mod tests {
         assert_eq!(f.message.as_deref(), Some("the seat was empty"), "the assertion was lost");
 
         let ok = dir.join("passes");
-        std::fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
-        chmod_x(&ok);
+        wsp_testkit::script(&ok, "#!/bin/sh\nexit 0\n");
         assert!(
             run_alone(&ok, "a::b", &dir.join("log"), None).is_none(),
             "a passing test was reported as a failure"
@@ -1856,12 +1851,6 @@ bench::b: benchmark
             vec!["store::tests::a".to_string()],
             "the count line or the benchmark was taken for a test"
         );
-    }
-
-    /// `chmod +x`, without a dependency for it.
-    fn chmod_x(p: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn scratch_dir(name: &str) -> PathBuf {

@@ -27,7 +27,6 @@
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -404,8 +403,7 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
 
     // The loopback manager, on record in the sandbox's state.
     let sup = sb.dir.join("sup");
-    std::fs::write(&sup, FAKE_SUP.replace("__OWNER__", &std::process::id().to_string())).unwrap();
-    std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
     let exec = sb.dir.join("exec");
     let mport = free_port();
     let mut cfg = Config::new(&exec, HOST);

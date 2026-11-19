@@ -766,8 +766,6 @@ fn bootstrap(domain: &str, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::Permissions;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
     /// The manager's plist, written for a temp HOME and read back as text:
@@ -908,12 +906,7 @@ mod tests {
         // chosen for.
         let ran = dir.join("ran.log");
         let bin = dir.join("fake-wsp");
-        std::fs::write(
-            &bin,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", ran.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&bin, &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", ran.display()));
 
         let first = ensure_as(&label, &path, &bin, &dir, "/usr/bin:/bin").expect("the first install");
         assert!(first.wrote, "nothing was written on the first run");

@@ -308,8 +308,7 @@ mod tests {
     /// A `compound-sup` that answers `wire-version` with `reply`.
     fn fake_sup(dir: &Path, reply: &str) -> PathBuf {
         let p = dir.join("compound-sup");
-        fs::write(&p, format!("#!/bin/sh\n[ \"$1\" = wire-version ] && echo '{reply}'\n")).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&p, &format!("#!/bin/sh\n[ \"$1\" = wire-version ] && echo '{reply}'\n"));
         p
     }
 

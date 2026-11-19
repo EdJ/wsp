@@ -982,12 +982,7 @@ mod tests {
         let landed = env.path("landed");
         let hook = env.home().join("hooks/on-attention-raised");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(&hook, format!("#!/bin/sh\ncat > {}\n", landed.display())).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        wsp_testkit::script(&hook, &format!("#!/bin/sh\ncat > {}\n", landed.display()));
 
         let mut pass = Pass::new();
         tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);

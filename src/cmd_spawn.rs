@@ -11096,8 +11096,7 @@ mod tests {
         let exec = env.path("x");
         std::fs::create_dir_all(&exec).unwrap();
         let sup = env.path("sup");
-        std::fs::write(&sup, FAKE_SUP.replace("__OWNER__", &std::process::id().to_string())).unwrap();
-        std::fs::set_permissions(&sup, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
         let mut cfg = wsp_manager::Config::new(&exec, "test-host");
         cfg.port = 0;
         cfg.sup = Some(sup);

@@ -2466,7 +2466,6 @@ mod tests {
     /// A `cargo` that records the job cap it was given and the niceness it ran
     /// at, then takes `$FAKE_SLEEP` seconds.
     fn rig(name: &str) -> Rig {
-        use std::os::unix::fs::PermissionsExt;
         let iso = crate::util::isolated(name);
         // `wsp verify` runs these tests under a shim of its own, so the process
         // is born holding a tree and a job cap; the fake tool must see only
@@ -2480,8 +2479,7 @@ mod tests {
             "#!/bin/sh\necho \"$$ jobs=${{CARGO_BUILD_JOBS:-none}} nice=$(ps -o ni= -p $$ | tr -d ' ') held=${{{HELD}:+yes}} args=$*\" >> {out}\n[ -n \"$FAKE_SLEEP\" ] && sleep \"$FAKE_SLEEP\"\nexit 0\n",
             out = out.display()
         );
-        fs::write(bin.join("cargo"), script).unwrap();
-        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&bin.join("cargo"), &script);
         let tree = iso.path("tree");
         fs::create_dir_all(&tree).unwrap();
         fs::write(tree.join(".git"), "gitdir: x").unwrap();
@@ -2856,11 +2854,9 @@ mod tests {
     /// reason is the row's log; a verifier and a check are not asked.
     #[test]
     fn a_members_full_nextest_is_refused_and_allowed_with_a_reason_that_lands_in_the_log() {
-        use std::os::unix::fs::PermissionsExt;
         let rig = rig("throttle-member-suite");
         mode(&rig, Mode::Off, 1);
-        fs::write(rig.bin.join("cargo"), "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(rig.bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&rig.bin.join("cargo"), "#!/bin/sh\nexit 0\n");
         let idle = || None;
         let said = std::cell::RefCell::new(Vec::<String>::new());
         let say = |m: &str| said.borrow_mut().push(m.to_string());
@@ -2929,11 +2925,9 @@ mod tests {
 
     #[test]
     fn the_exit_code_of_the_build_is_the_exit_code_of_the_shim() {
-        use std::os::unix::fs::PermissionsExt;
         let rig = rig("throttle-exit");
         mode(&rig, Mode::Off, 1);
-        fs::write(rig.bin.join("cargo"), "#!/bin/sh\nexit 101\n").unwrap();
-        fs::set_permissions(rig.bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&rig.bin.join("cargo"), "#!/bin/sh\nexit 101\n");
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         assert_eq!(run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test"])), 101);
     }

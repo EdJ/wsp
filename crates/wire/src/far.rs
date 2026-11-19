@@ -1592,7 +1592,6 @@ mod tests {
     /// ran and failed, are not.
     #[test]
     fn a_fake_ssh_that_drops_is_a_down_link_and_one_that_answers_is_not() {
-        use std::os::unix::fs::PermissionsExt;
         struct Fake(String);
         impl Wire for Fake {
             fn machine(&self, name: &str) -> Option<Machine> {
@@ -1616,8 +1615,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let script = |name: &str, body: &str| {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&p, &format!("#!/bin/sh\n{body}\n"));
             Fake(p.to_string_lossy().into_owned())
         };
         let drops = script("drops", "echo 'ssh: connect to host mb2 port 22: Operation timed out' >&2; exit 255");
@@ -1637,17 +1635,11 @@ mod tests {
     /// pipe, as ssh has it. It must return on the handshake.
     #[test]
     fn the_session_start_returns_once_the_handshake_is_read_not_when_the_session_ends() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("wsp-far-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sup = dir.join("compound-sup");
-        std::fs::write(
-            &sup,
-            "#!/bin/sh\necho 'sup 1'; echo 'pid 2'; echo 'socket /run/x.sock'; echo 'render /run/x.rsock'; sleep 8\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&sup, "#!/bin/sh\necho 'sup 1'; echo 'pid 2'; echo 'socket /run/x.sock'; echo 'render /run/x.rsock'; sleep 8\n");
         let mut m = Machine::new("mb2", "mb2");
         m.sup_at = sup.to_string_lossy().into_owned();
         m.exec_dir = dir.to_string_lossy().into_owned();
@@ -1687,15 +1679,13 @@ mod tests {
     /// stale `wsp` ahead on its PATH and a `compound-sup` that runs the agent.
     #[test]
     fn a_far_agent_has_the_executors_bin_first_on_its_path_so_wsp_is_the_shim() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("wsp-far-shim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (exec, stale) = (dir.join("exec"), dir.join("stale"));
         std::fs::create_dir_all(exec.join("bin")).unwrap();
         std::fs::create_dir_all(&stale).unwrap();
         let exe = |p: std::path::PathBuf, body: &str| {
-            std::fs::write(&p, body).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&p, body);
         };
         exe(exec.join("bin/wsp"), "#!/bin/sh\n");
         exe(stale.join("wsp"), "#!/bin/sh\n");
@@ -1815,7 +1805,6 @@ mod tests {
     /// taken as the program (`env: -u: No such file or directory` on macOS).
     #[test]
     fn the_seat_command_puts_every_unset_before_any_assignment_and_a_shell_starts_the_program() {
-        use std::os::unix::fs::PermissionsExt;
         let m = machine();
         let env = BTreeMap::from([
             ("A_SET".to_string(), "1".to_string()),
@@ -1834,15 +1823,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sup = dir.join("compound-sup");
         let seen = dir.join("seen");
-        std::fs::write(
+        wsp_testkit::script(
             &sup,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"${{B_GONE-unset}} ${{D_GONE-unset}} $A_SET $C_SET\" > {}\necho 'socket /run/x.sock'\n",
                 seen.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::write(dir.join(TOKEN_FILE), "sekret\n").unwrap();
         let mut m = Machine::new("mb2", "mb2");
         m.sup_at = sup.to_string_lossy().into_owned();
@@ -1863,21 +1850,18 @@ mod tests {
     /// token does not, and a missing token stops before a session starts.
     #[test]
     fn the_seat_command_run_by_a_shell_exports_the_token_and_returns_on_the_handshake() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("wsp-far-seat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sup = dir.join("compound-sup");
         let seen = dir.join("seen");
-        std::fs::write(
+        wsp_testkit::script(
             &sup,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$CLAUDE_CODE_OAUTH_TOKEN $WSP_SEAT_ID $*\" > {}\necho 'sup 1'; echo 'pid 2'; echo 'socket /run/x.sock'; echo 'render /run/x.rsock'; sleep 6\n",
                 seen.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&sup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut m = Machine::new("mb2", "mb2");
         m.sup_at = sup.to_string_lossy().into_owned();
         m.exec_dir = dir.to_string_lossy().into_owned();

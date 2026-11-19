@@ -11,7 +11,6 @@
 //! that has a real one there the "sccache missing" route cannot be reproduced; that test skips then.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -42,8 +41,7 @@ impl Bin {
     /// A fake `name` with `body` as its whole script.
     fn script(&self, name: &str, body: &str) {
         let p = self.dir.join(name);
-        fs::write(&p, body).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&p, body);
     }
     /// A fake `sccache` whose server is alive and never answers: it logs, then sleeps past any
     /// bound, on a compile and on `--show-stats` alike. `exec sleep` so a kill or an alarm ends it.

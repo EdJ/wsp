@@ -2491,8 +2491,7 @@ mod tests {
         let dir = scratch("stamp");
         let fake = |name: &str, says: &str| {
             let p = dir.join(name);
-            fs::write(&p, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&p, &format!("#!/bin/sh\necho '{says}'\n"));
             p
         };
 
@@ -2568,8 +2567,7 @@ mod tests {
         // A binary that says what it is, in a tree that has since moved on.
         let bin = |name: &str, says: &str| {
             let b = dir.join(name);
-            fs::write(&b, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
-            fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&b, &format!("#!/bin/sh\necho '{says}'\n"));
             b
         };
         let src = bin("stamped", "wsp 0.1.0 (be58dac)");

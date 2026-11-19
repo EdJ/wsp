@@ -2186,7 +2186,6 @@ mod tests {
     /// A `sup` that is a shell script: it reads the text from stdin, records
     /// the id it was asked under, and then runs `answer`.
     fn script_sup(scratch: &Scratch, answer: &str) -> (PathBuf, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let sup = scratch.root.join("sup");
         let said = scratch.root.join("said");
         let asked = scratch.root.join("asked");
@@ -2195,10 +2194,7 @@ mod tests {
             asked.display(),
             said.display()
         );
-        let tmp = scratch.root.join("sup.tmp");
-        fs::write(&tmp, body).unwrap();
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::rename(&tmp, &sup).unwrap();
+        wsp_testkit::script(&sup, &body);
         (sup, said, asked)
     }
 
@@ -3104,7 +3100,6 @@ mod tests {
     /// `wsp tell`: *delivered, no turn seen*, both on a seat that worked).
     #[test]
     fn a_far_seat_reads_ready_off_its_screen_and_its_silent_hooks_are_not_no_turn() {
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
         let (far, root) = far_script("ready", false, false);
         let place = Compound { far: &far, ..Compound::at(root.join("seats")) };
@@ -3131,8 +3126,7 @@ mod tests {
         assert_eq!(place.state(&seat).unwrap(), State::Starting, "no screen, no hook");
 
         let render = root.join("compound-render");
-        fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo working;; *) echo '001|hi';; esac\n").unwrap();
-        fs::set_permissions(&render, fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&render, "#!/bin/sh\ncase \"$1\" in state) echo working;; *) echo '001|hi';; esac\n");
         RENDER.with(|r| *r.borrow_mut() = Some(render.clone()));
         assert_eq!(place.state(&seat).unwrap(), State::Working, "the renderer serves a working screen: no hook is needed");
         fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo idle;; *) echo '001|hi';; esac\n").unwrap();
@@ -3485,8 +3479,7 @@ mod tests {
             let screen = scratch.root.join("screen.txt");
             fs::write(&screen, format!("{body}\n{foot}")).unwrap();
             let script = bin.join("pi");
-            fs::write(&script, format!("#!/bin/sh\ncat '{}'\nexec sleep 600\n", screen.display())).unwrap();
-            fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&script, &format!("#!/bin/sh\ncat '{}'\nexec sleep 600\n", screen.display()));
             let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
 
             let place = scratch.place();

@@ -28,7 +28,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -119,8 +118,7 @@ fn place(tag: &str) -> (PathBuf, PathBuf) {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let sup = dir.join("sup");
-    fs::write(&sup, FAKE_SUP.replace("__OWNER__", &std::process::id().to_string())).unwrap();
-    fs::set_permissions(&sup, fs::Permissions::from_mode(0o755)).unwrap();
+    wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
     (dir, sup)
 }
 

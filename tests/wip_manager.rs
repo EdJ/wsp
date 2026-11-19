@@ -17,7 +17,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -74,8 +73,7 @@ fn place() -> PathBuf {
     fs::create_dir_all(dir.join("state")).unwrap();
     fs::create_dir_all(dir.join("home")).unwrap();
     let sup = dir.join("sup");
-    fs::write(&sup, FAKE_SUP.replace("__OWNER__", &std::process::id().to_string())).unwrap();
-    fs::set_permissions(&sup, fs::Permissions::from_mode(0o755)).unwrap();
+    wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
     dir
 }
 

@@ -12,7 +12,6 @@
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -102,9 +101,26 @@ fn place(tag: &str) -> (PathBuf, PathBuf) {
     let _ = fs::remove_dir_all(&dir);
     let sup = base.join(format!("wm-{tag}-{}.sup", std::process::id()));
     fs::create_dir_all(&base).unwrap();
-    fs::write(&sup, FAKE_SUP.replace("__OWNER__", &std::process::id().to_string())).unwrap();
-    fs::set_permissions(&sup, fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
     (dir, sup)
+}
+
+/// The same as `wsp_testkit::script`, copied because the manager may link only
+/// base, host and host-api (tests/layering.rs): written from a child process so
+/// a forking test thread cannot hold it open (ETXTBSY on Linux).
+fn write_script(path: &Path, body: &str) {
+    use std::io::Write;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("cat > \"$1\" && chmod 755 \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(body.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success(), "writing {}", path.display());
 }
 
 /// Ends what a test started, however it ends: the fake's sessions, and a

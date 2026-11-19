@@ -5006,11 +5006,7 @@ mod tests {
         let global = env.home().join("gitconfig");
         // A signer that works: says it signed, writes a signature.
         let signer = env.home().join("signer");
-        std::fs::write(&signer, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] SIG_CREATED ' >&2\necho sig\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        wsp_testkit::script(&signer, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] SIG_CREATED ' >&2\necho sig\n");
         std::fs::write(
             &global,
             format!(

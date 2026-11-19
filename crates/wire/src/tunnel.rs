@@ -957,14 +957,12 @@ mod tests {
     /// new tunnel attached to it as a mux client and exited 0.
     #[test]
     fn a_stale_master_is_asked_to_exit_and_its_path_swept_before_a_new_one_starts() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("wsp-tunnel-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let said = dir.join("said");
         let fake = dir.join("ssh");
-        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", said.display())).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&fake, &format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", said.display()));
         let control = dir.join("cm-mb2");
         std::fs::write(&control, "").unwrap();
         let m = Machine::new("mb2", "mac-mini");
@@ -1534,7 +1532,6 @@ mod tests {
     /// answers, and the probe prints a wire range. Each master and link test is
     /// a line in `said`.
     fn fake_ssh(dir: &std::path::Path) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let d = dir.display();
         let script = format!(
             r#"#!/bin/sh
@@ -1553,8 +1550,7 @@ esac
 "#
         );
         let fake = dir.join("ssh");
-        std::fs::write(&fake, script).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&fake, &script);
         fake.display().to_string()
     }
 

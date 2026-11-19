@@ -2447,12 +2447,10 @@ mod tests {
         fs::create_dir_all(dir.join("bin")).unwrap();
         let log = dir.join("log");
         let wsp = dir.join("bin/wsp");
-        fs::write(&wsp, format!("#!/bin/sh\ncat >/dev/null\necho \"$2\" >> '{}'\n", log.display())).unwrap();
-        fs::set_permissions(&wsp, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&wsp, &format!("#!/bin/sh\ncat >/dev/null\necho \"$2\" >> '{}'\n", log.display()));
         // A `compound-sup` that records the prompt it is told was submitted.
         let sup = dir.join("bin/compound-sup");
-        fs::write(&sup, format!("#!/bin/sh\ncat > '{}'/$$\n", dir.join("sup").display())).unwrap();
-        fs::set_permissions(&sup, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&sup, &format!("#!/bin/sh\ncat > '{}'/$$\n", dir.join("sup").display()));
         fs::create_dir_all(dir.join("sup")).unwrap();
         fs::create_dir_all(dir.join("state/compound-seats/t:1")).unwrap();
         fs::write(dir.join("state/compound-seats/t:1/seat.json"), r#"{"socket":"/s"}"#).unwrap();
