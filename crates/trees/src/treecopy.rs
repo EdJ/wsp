@@ -1168,13 +1168,10 @@ mod tests {
     /// (a global `commit.gpgsign` here would make its commits ask for a key).
     fn stand_in(dir: &Path) -> String {
         let p = dir.join("fake-ssh");
-        fs::write(
+        wsp_testkit::script(
             &p,
             "#!/bin/sh\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nexec sh -c \"$*\"\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         p.display().to_string()
     }
 
@@ -1279,9 +1276,7 @@ mod tests {
         let count = dir.join("tries");
         let flaky = |fails: u32| {
             let ssh = dir.join(format!("flaky-ssh-{fails}"));
-            fs::write(&ssh, format!("#!/bin/sh\necho x >> {c}\nn=$(wc -l < {c})\nif [ \"$n\" -le {fails} ]; then exit 255; fi\necho ok\n", c = shq(&count.display().to_string()))).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&ssh, &format!("#!/bin/sh\necho x >> {c}\nn=$(wc -l < {c})\nif [ \"$n\" -le {fails} ]; then exit 255; fi\necho ok\n", c = shq(&count.display().to_string())));
             let mut remote = r.copy.remote.clone();
             remote.ssh = ssh.display().to_string();
             remote.control = Some(dir.join("cm-gone"));
@@ -1663,9 +1658,7 @@ mod tests {
         let bin = d.0.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let ssh = bin.join("ssh");
-        fs::write(&ssh, format!("#!/bin/sh\n{ssh_body}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&ssh, &format!("#!/bin/sh\n{ssh_body}\n"));
         let link = d.0.join("link-down");
         let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../executor/wsp");
         let out = Command::new("sh")

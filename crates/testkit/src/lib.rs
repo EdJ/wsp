@@ -29,6 +29,24 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Writes an executable script (mode 0755) at `path` from a child process,
+/// never from this one: a test thread that forks while this process holds the
+/// file open for writing hands the fd to its child, and on Linux exec of the
+/// script then fails with ETXTBSY ("Text file busy") until that child execs.
+pub fn script(path: &Path, body: &str) {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("cat > \"$1\" && chmod 755 \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), body.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success(), "writing {}", path.display());
+}
+
 /// The empty repository every [`repo`] is a copy of, made on first use.
 fn template() -> &'static Path {
     static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
