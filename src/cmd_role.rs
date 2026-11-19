@@ -13,7 +13,7 @@
 //! | `wsp reap <pid>…` | any pid that passes the guards | pids in trees of rows on a list it governs, and its barrier tree | refused |
 //! | `wsp done <row>` | rows at review | refused | refused |
 //! | `wsp daemon reload` | yes | refused | refused |
-//! | `wsp check <row> --set --why …` | any row | rows on a list it governs, any change | its own row: raise a budget, add or correct a `cd`, narrow to its files, add a step |
+//! | `wsp check <row> --set --why …` (gated in `check`) | any row | rows on a list it governs, any change | its own row: raise a budget, add or correct a `cd`, narrow to its files, add a step |
 //!
 //! **The role is read from the seat wsp recorded**, never from anything the
 //! caller says: the caller's seat (`WSP_SEAT_ID`, or herdr's pane) is looked up
@@ -133,84 +133,6 @@ fn refuse(store: &Store, verb: &str, role: &Role, why: &str) -> i32 {
 fn list_of_row(store: &Store, row: &str) -> Option<String> {
     let t = store.task(row)?;
     crate::worklist::Running::read(store).list_for(&t).map(str::to_string)
-}
-
-/// The list a row is on, if any.
-pub(crate) fn list_of(store: &Store, row: &str) -> Option<String> {
-    list_of_row(store, row)
-}
-
-// ---- wsp check --set (wsp-681) ------------------------------------------------
-
-/// The row the caller's seat is bound to, as wsp recorded it (never from what
-/// the caller says): the binding of its pane.
-pub(crate) fn own_row(store: &Store) -> Option<String> {
-    let pane = crate::cmd_agent::my_pane()?;
-    store.bindings().get(&pane)?.get("task_id")?.as_str().map(str::to_string)
-}
-
-/// Who may make what a member may not, for a row on `list`.
-pub(crate) fn who_may(list: Option<&str>) -> String {
-    match list {
-        Some(l) => format!("the governor of {l}, or Ed"),
-        None => "Ed, or the primary seat".into(),
-    }
-}
-
-/// Who a change to a row's checks is logged as.
-pub(crate) fn who_set(role: &Role) -> String {
-    match role {
-        Role::Seat => "the row's member seat".into(),
-        r => r.name(),
-    }
-}
-
-/// Whether `role` may write `row`'s checks, as a pure decision. `own` is the
-/// row the caller's seat is bound to, `list` and `project` the row's, and
-/// `refused` what of the change a member may not make ([`crate::check::edits`]).
-///
-/// The primary and a person set anything. A governor sets the checks of the
-/// rows on the list (or project) it governs, whatever the change. A member sets
-/// its own row's only, and only what [`crate::check::edits`] lets it.
-pub(crate) fn checks_allowed(
-    role: &Role,
-    row: &str,
-    own: Option<&str>,
-    list: Option<&str>,
-    project: Option<&str>,
-    refused: &[String],
-) -> Result<(), String> {
-    match role {
-        Role::Outside | Role::Primary => Ok(()),
-        Role::Governor(scope) if list == Some(scope.as_str()) || project == Some(scope.as_str()) => Ok(()),
-        Role::Governor(scope) => Err(format!(
-            "{row} is {}; the governor of {scope} sets the checks of rows on {scope} only — it needs {}",
-            list.map(|l| format!("on list {l}")).unwrap_or_else(|| "on no list".into()),
-            who_may(list)
-        )),
-        Role::Seat if own != Some(row) => Err(format!(
-            "a member sets the checks of its own row only ({}); {row}'s are set by {}",
-            own.unwrap_or("this seat is bound to none"),
-            who_may(list)
-        )),
-        Role::Seat if !refused.is_empty() => Err(format!(
-            "a member may raise a step's budget, add or correct a leading `cd <dir> &&`, narrow a step to the files its commits touched, or add a step; {}: only {} may do that",
-            refused.join("; "),
-            who_may(list)
-        )),
-        Role::Seat => Ok(()),
-    }
-}
-
-/// Whether `role` may write a project's checks: never a member, verifier or
-/// check seat, and a governor only its own project's.
-pub(crate) fn project_checks_allowed(role: &Role, project: &str) -> Result<(), String> {
-    match role {
-        Role::Outside | Role::Primary => Ok(()),
-        Role::Governor(scope) if scope == project => Ok(()),
-        Role::Governor(scope) => Err(format!("the governor of {scope} does not set project {project}'s checks; Ed or the primary seat does")),
-        Role::Seat => Err(format!("a member, verifier or check seat does not set project {project}'s checks; Ed or the primary seat does")),
-    }
 }
 
 // ---- despawn ----------------------------------------------------------------
@@ -1417,28 +1339,5 @@ mod tests {
         let retro = vec!["retro".to_string()];
         assert_eq!(seat_spawn_args("claude", None, false, &retro, &state), retro_settings_args("claude", &state), "a retro seat as before");
         let _ = std::fs::remove_dir_all(&state);
-    }
-
-    #[test]
-    fn check_set_by_role_a_member_its_own_row_within_limits_a_governor_its_lists_rows() {
-        let none: &[String] = &[];
-        let deleted = vec!["`build` is deleted".to_string()];
-        assert!(checks_allowed(&Role::Outside, "r-1", None, Some("fleet"), None, &deleted).is_ok());
-        assert!(checks_allowed(&Role::Primary, "r-1", None, Some("fleet"), None, &deleted).is_ok());
-        let gov = Role::Governor("fleet".into());
-        assert!(checks_allowed(&gov, "r-1", None, Some("fleet"), None, &deleted).is_ok(), "a governor deletes on its list's row");
-        assert!(checks_allowed(&gov, "r-1", None, None, Some("fleet"), &deleted).is_ok(), "and on its project's");
-        let no = checks_allowed(&gov, "r-1", None, Some("other"), None, none).unwrap_err();
-        assert!(no.contains("on list other") && no.contains("the governor of other, or Ed"), "{no}");
-        assert!(checks_allowed(&Role::Seat, "r-1", Some("r-1"), Some("fleet"), None, none).is_ok(), "a member, its own row");
-        let no = checks_allowed(&Role::Seat, "r-1", Some("r-2"), Some("fleet"), None, none).unwrap_err();
-        assert!(no.contains("its own row only (r-2)") && no.contains("the governor of fleet, or Ed"), "{no}");
-        let no = checks_allowed(&Role::Seat, "r-1", Some("r-1"), Some("fleet"), None, &deleted).unwrap_err();
-        assert!(no.contains("`build` is deleted") && no.contains("only the governor of fleet, or Ed may"), "{no}");
-        assert!(project_checks_allowed(&Role::Seat, "pj").is_err());
-        assert!(project_checks_allowed(&Role::Governor("pj".into()), "pj").is_ok());
-        assert!(project_checks_allowed(&Role::Governor("x".into()), "pj").is_err());
-        assert!(project_checks_allowed(&Role::Outside, "pj").is_ok());
-        assert_eq!(who_set(&Role::Seat), "the row's member seat");
     }
 }

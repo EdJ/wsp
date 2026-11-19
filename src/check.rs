@@ -2242,14 +2242,11 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
 /// of a project (when the name is one) or of a task. The list is the whole
 /// section: it replaces what was there.
 fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
-    let role = crate::cmd_role::role(store);
-    let own = crate::cmd_role::own_row(store);
-    set_as(store, args, needle, usage, &role, own.as_deref())
+    set_as(store, args, needle, usage, &setter(store))
 }
 
-/// [`set`] for a caller whose role and own row are already read: `own` is the
-/// row the caller's seat is bound to (wsp-681).
-pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role: &crate::cmd_role::Role, own: Option<&str>) -> i32 {
+/// [`set`] for a caller already read (wsp-681).
+pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role: &Setter) -> i32 {
     // `--from FILE`, or `-` for the stream: the list keeps its lines, which is
     // the whole of it, so it is not folded the way a log entry is.
     let src = args.get("from").or_else(|| args.rest.get(1).cloned().filter(|a| a == "-"));
@@ -2292,7 +2289,7 @@ pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role
     }
     let why = args.get("why").map(|w| w.trim().to_string()).filter(|w| !w.is_empty());
     let what = if let Some(mut proj) = store.project(needle) {
-        if let Err(no) = crate::cmd_role::project_checks_allowed(role, &proj.id) {
+        if let Err(no) = project_checks_allowed(role, &proj.id) {
             return refuse_set(store, role, &proj.id, &no);
         }
         if steps.iter().any(|s| s.end) && !steps.iter().any(|s| s.barrier) {
@@ -2323,8 +2320,8 @@ pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role
         let before = t.section(SECTION).unwrap_or_default();
         let edits = edits(&before, &text, &touched_by(store, &t));
         let refused: Vec<String> = edits.iter().filter_map(|e| e.refused.clone()).collect();
-        let list = crate::cmd_role::list_of(store, &t.id);
-        if let Err(no) = crate::cmd_role::checks_allowed(role, &t.id, own, list.as_deref(), t.project.as_deref(), &refused) {
+        let list = crate::worklist::Running::read(store).list_for(&t).map(str::to_string);
+        if let Err(no) = checks_allowed(role, &t.id, list.as_deref(), t.project.as_deref(), &refused) {
             return refuse_set(store, role, &t.id, &no);
         }
         if !edits.is_empty() && !before.trim().is_empty() && why.is_none() {
@@ -2333,7 +2330,7 @@ pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role
         }
         crate::model::set_section_in(&mut t.body, SECTION, &text);
         if !before.trim().is_empty() {
-            let who = crate::cmd_role::who_set(role);
+            let who = role.name();
             for e in &edits {
                 t.log(&e.log_line(&who, why.as_deref().unwrap_or_default()));
             }
@@ -2349,10 +2346,103 @@ pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role
     0
 }
 
-fn refuse_set(store: &Store, role: &crate::cmd_role::Role, id: &str, why: &str) -> i32 {
+fn refuse_set(store: &Store, role: &Setter, id: &str, why: &str) -> i32 {
     eprintln!("wsp: not written — {why}");
     crate::store::log_line(store, &format!("refused check {id} --set by {}: {why}", role.name()));
     2
+}
+
+/// Who is setting checks, read from the seat wsp recorded for the caller and
+/// never from anything it says: the reading the seats layer's role check makes, from the
+/// same seat helpers in wire and store, so the engine does not reach up into
+/// the seats layer for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Setter {
+    /// No seat: a person at a terminal, or the daemon.
+    Person,
+    /// The primary seat.
+    Primary,
+    /// The governor of this list (or project).
+    Governor(String),
+    /// A member, verifier or check seat, and the row its seat is bound to.
+    Member(Option<String>),
+}
+
+impl Setter {
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Setter::Person => "a person".into(),
+            Setter::Primary => "the primary seat".into(),
+            Setter::Governor(s) => format!("the governor of {s}"),
+            Setter::Member(_) => "the row's member seat".into(),
+        }
+    }
+}
+
+/// The caller of `wsp check --set`.
+pub(crate) fn setter(store: &Store) -> Setter {
+    let Some(pane) = crate::place::my_pane() else { return Setter::Person };
+    match crate::place::governs(&store.governors(), &crate::place::Seat::new(&pane)) {
+        Some(s) if crate::governors::is_primary(&s) => Setter::Primary,
+        Some(s) => Setter::Governor(s),
+        None => {
+            let spawned = std::env::var_os(crate::base::seat::SEAT_ENV).is_some_and(|v| !v.is_empty());
+            let bound = store.bindings().get(&pane).cloned();
+            match spawned || bound.is_some() {
+                true => Setter::Member(bound.and_then(|b| b.get("task_id")?.as_str().map(str::to_string))),
+                false => Setter::Person,
+            }
+        }
+    }
+}
+
+/// Who may make what a member may not, for a row on `list`.
+pub(crate) fn who_may(list: Option<&str>) -> String {
+    match list {
+        Some(l) => format!("the governor of {l}, or Ed"),
+        None => "Ed, or the primary seat".into(),
+    }
+}
+
+/// Whether `role` may write `row`'s checks, as a pure decision. `list` and
+/// `project` are the row's, and `refused` what of the change a member may not
+/// make ([`edits`]).
+///
+/// A person and the primary set anything. A governor sets the checks of the
+/// rows on the list (or project) it governs, whatever the change. A member sets
+/// its own row's only, and only what [`edits`] lets it.
+pub(crate) fn checks_allowed(role: &Setter, row: &str, list: Option<&str>, project: Option<&str>, refused: &[String]) -> Result<(), String> {
+    match role {
+        Setter::Person | Setter::Primary => Ok(()),
+        Setter::Governor(scope) if list == Some(scope.as_str()) || project == Some(scope.as_str()) => Ok(()),
+        Setter::Governor(scope) => Err(format!(
+            "{row} is {}; the governor of {scope} sets the checks of rows on {scope} only — it needs {}",
+            list.map(|l| format!("on list {l}")).unwrap_or_else(|| "on no list".into()),
+            who_may(list)
+        )),
+        Setter::Member(own) if own.as_deref() != Some(row) => Err(format!(
+            "a member sets the checks of its own row only ({}); {row}'s are set by {}",
+            own.as_deref().unwrap_or("this seat is bound to none"),
+            who_may(list)
+        )),
+        Setter::Member(_) if !refused.is_empty() => Err(format!(
+            "a member may raise a step's budget, add or correct a leading `cd <dir> &&`, narrow a step to the files its commits touched, or add a step; {}: only {} may do that",
+            refused.join("; "),
+            who_may(list)
+        )),
+        Setter::Member(_) => Ok(()),
+    }
+}
+
+/// Whether `role` may write a project's checks: never a member, verifier or
+/// check seat, and a governor only its own project's.
+pub(crate) fn project_checks_allowed(role: &Setter, project: &str) -> Result<(), String> {
+    match role {
+        Setter::Person | Setter::Primary => Ok(()),
+        Setter::Governor(scope) if scope == project => Ok(()),
+        Setter::Governor(scope) => Err(format!("the governor of {scope} does not set project {project}'s checks; Ed or the primary seat does")),
+        Setter::Member(_) => Err(format!("a member, verifier or check seat does not set project {project}'s checks; Ed or the primary seat does")),
+    }
 }
 
 // ---- what a `--set` changes (wsp-681) ----------------------------------------
@@ -4017,7 +4107,7 @@ mod tests {
 
     const BEFORE: &str = "- tests (60s): ls .\n- build (5m): true\n";
 
-    fn set_by(store: &Store, env: &util::Isolated, role: &crate::cmd_role::Role, own: Option<&str>, row: &str, text: &str, why: Option<&str>) -> i32 {
+    fn set_by(store: &Store, env: &util::Isolated, role: &Setter, row: &str, text: &str, why: Option<&str>) -> i32 {
         let file = env.path("set.md");
         std::fs::write(&file, text).unwrap();
         let from = file.display().to_string();
@@ -4025,7 +4115,7 @@ mod tests {
         if let Some(w) = why {
             flags.push(("why", w));
         }
-        set_as(store, &Args::synth("check", &[row], &flags), row, USAGE, role, own)
+        set_as(store, &Args::synth("check", &[row], &flags), row, USAGE, role)
     }
 
     fn declared(store: &Store) -> String {
@@ -4035,12 +4125,12 @@ mod tests {
     #[test]
     fn a_member_raises_a_budget_adds_a_cd_and_narrows_a_path_on_its_own_row_and_each_is_logged() {
         let (env, store, _) = world("set-member", "", "exit 0\n");
-        let seat = crate::cmd_role::Role::Seat;
-        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", BEFORE, None), 0, "its first declaration needs no why");
+        let seat = Setter::Member(Some("pj-001".into()));
+        assert_eq!(set_by(&store, &env, &seat, "pj-001", BEFORE, None), 0, "its first declaration needs no why");
         let after = "- tests (180s): cd . && ls check.sh\n- build (5m): true\n";
-        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", after, None), 2, "a change says why");
+        assert_eq!(set_by(&store, &env, &seat, "pj-001", after, None), 2, "a change says why");
         assert_eq!(declared(&store).trim(), BEFORE.trim(), "nothing was written without one");
-        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", after, Some("vitest took 74s cold")), 0);
+        assert_eq!(set_by(&store, &env, &seat, "pj-001", after, Some("vitest took 74s cold")), 0);
         assert_eq!(declared(&store).trim(), after.trim());
         let t = store.find_task("pj-001").unwrap();
         let logged = changes_logged(&t);
@@ -4052,15 +4142,15 @@ mod tests {
         assert!(l.ends_with("why: vitest took 74s cold"), "{l}");
         // Adding a step is a member's too.
         let more = format!("{after}- lint (30s): true\n");
-        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", &more, Some("the lint the row asked for")), 0);
+        assert_eq!(set_by(&store, &env, &seat, "pj-001", &more, Some("the lint the row asked for")), 0);
         assert!(changes_logged(&store.find_task("pj-001").unwrap())[1].contains("adds `lint`"));
     }
 
     #[test]
     fn a_member_deleting_a_step_lowering_a_budget_replacing_a_command_or_setting_another_row_is_refused_with_who_may() {
         let (env, store, _) = world("set-refused", "", "exit 0\n");
-        let seat = crate::cmd_role::Role::Seat;
-        assert_eq!(set_by(&store, &env, &crate::cmd_role::Role::Outside, None, "pj-001", BEFORE, None), 0);
+        let seat = Setter::Member(Some("pj-001".into()));
+        assert_eq!(set_by(&store, &env, &Setter::Person, "pj-001", BEFORE, None), 0);
         let why = Some("it passes now");
         for (bad, says) in [
             ("- tests (60s): ls .\n", "`build` is deleted"),
@@ -4068,18 +4158,18 @@ mod tests {
             ("- tests (60s): echo ok\n- build (5m): true\n", "replaces `ls .` with `echo ok`"),
             ("- tests (60s): ls README.md\n- build (5m): true\n", "replaces `ls .` with `ls README.md`"),
         ] {
-            assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", bad, why), 2, "{bad}");
+            assert_eq!(set_by(&store, &env, &seat, "pj-001", bad, why), 2, "{bad}");
             assert_eq!(declared(&store).trim(), BEFORE.trim(), "{bad} was written");
             let e = edits(BEFORE, bad, &touched_by(&store, &store.find_task("pj-001").unwrap()));
             let refused: Vec<String> = e.iter().filter_map(|e| e.refused.clone()).collect();
             assert!(refused.iter().any(|r| r.contains(says)), "{bad}: {refused:?}");
-            let no = crate::cmd_role::checks_allowed(&seat, "pj-001", Some("pj-001"), None, Some("pj"), &refused).unwrap_err();
+            let no = checks_allowed(&seat, "pj-001", None, Some("pj"), &refused).unwrap_err();
             assert!(no.contains(says) && no.contains("only Ed, or the primary seat may"), "the sentence names who may: {no}");
         }
         let raise = "- tests (90s): ls .\n- build (5m): true\n";
-        assert_eq!(set_by(&store, &env, &seat, Some("pj-002"), "pj-001", raise, why), 2, "another row's checks");
-        assert_eq!(set_by(&store, &env, &seat, None, "pj-001", raise, why), 2, "a seat bound to no row");
-        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj", raise, why), 2, "a project's checks");
+        assert_eq!(set_by(&store, &env, &Setter::Member(Some("pj-002".into())), "pj-001", raise, why), 2, "another row's checks");
+        assert_eq!(set_by(&store, &env, &Setter::Member(None), "pj-001", raise, why), 2, "a seat bound to no row");
+        assert_eq!(set_by(&store, &env, &seat, "pj", raise, why), 2, "a project's checks");
         assert_eq!(declared(&store).trim(), BEFORE.trim());
         assert!(changes_logged(&store.find_task("pj-001").unwrap()).is_empty(), "a refusal logs no change");
     }
@@ -4087,12 +4177,12 @@ mod tests {
     #[test]
     fn a_governor_deletes_lowers_and_replaces_on_its_own_rows_and_on_no_other() {
         let (env, store, _) = world("set-governor", "", "exit 0\n");
-        assert_eq!(set_by(&store, &env, &crate::cmd_role::Role::Outside, None, "pj-001", BEFORE, None), 0);
+        assert_eq!(set_by(&store, &env, &Setter::Person, "pj-001", BEFORE, None), 0);
         let after = "- tests (30s): echo ok\n";
-        let other = crate::cmd_role::Role::Governor("elsewhere".into());
-        assert_eq!(set_by(&store, &env, &other, None, "pj-001", after, Some("x")), 2, "not its list's row");
-        let gov = crate::cmd_role::Role::Governor("pj".into());
-        assert_eq!(set_by(&store, &env, &gov, None, "pj-001", after, Some("the build step is the barrier's")), 0);
+        let other = Setter::Governor("elsewhere".into());
+        assert_eq!(set_by(&store, &env, &other, "pj-001", after, Some("x")), 2, "not its list's row");
+        let gov = Setter::Governor("pj".into());
+        assert_eq!(set_by(&store, &env, &gov, "pj-001", after, Some("the build step is the barrier's")), 0);
         assert_eq!(declared(&store).trim(), after.trim());
         let logged = changes_logged(&store.find_task("pj-001").unwrap());
         assert_eq!(logged.len(), 2, "{logged:?}");
@@ -4119,5 +4209,42 @@ mod tests {
         let e = edits("- web (60s): cd web && npm test\n", "- web (60s): cd spikes/web && npm test\n", &touched);
         assert!(e[0].refused.is_none() && e[0].said.contains("corrects its cd web → spikes/web"), "{e:?}");
         assert!(edits(BEFORE, BEFORE, &touched).is_empty());
+    }
+
+    #[test]
+    fn check_set_by_role_a_member_its_own_row_within_limits_a_governor_its_lists_rows() {
+        let none: &[String] = &[];
+        let deleted = vec!["`build` is deleted".to_string()];
+        assert!(checks_allowed(&Setter::Person, "r-1", Some("fleet"), None, &deleted).is_ok());
+        assert!(checks_allowed(&Setter::Primary, "r-1", Some("fleet"), None, &deleted).is_ok());
+        let gov = Setter::Governor("fleet".into());
+        assert!(checks_allowed(&gov, "r-1", Some("fleet"), None, &deleted).is_ok(), "a governor deletes on its list's row");
+        assert!(checks_allowed(&gov, "r-1", None, Some("fleet"), &deleted).is_ok(), "and on its project's");
+        let no = checks_allowed(&gov, "r-1", Some("other"), None, none).unwrap_err();
+        assert!(no.contains("on list other") && no.contains("the governor of other, or Ed"), "{no}");
+        let own = Setter::Member(Some("r-1".into()));
+        assert!(checks_allowed(&own, "r-1", Some("fleet"), None, none).is_ok(), "a member, its own row");
+        let no = checks_allowed(&Setter::Member(Some("r-2".into())), "r-1", Some("fleet"), None, none).unwrap_err();
+        assert!(no.contains("its own row only (r-2)") && no.contains("the governor of fleet, or Ed"), "{no}");
+        let no = checks_allowed(&own, "r-1", Some("fleet"), None, &deleted).unwrap_err();
+        assert!(no.contains("`build` is deleted") && no.contains("only the governor of fleet, or Ed may"), "{no}");
+        assert!(project_checks_allowed(&own, "pj").is_err());
+        assert!(project_checks_allowed(&Setter::Governor("pj".into()), "pj").is_ok());
+        assert!(project_checks_allowed(&Setter::Governor("x".into()), "pj").is_err());
+        assert!(project_checks_allowed(&Setter::Person, "pj").is_ok());
+    }
+
+    #[test]
+    fn a_caller_in_no_seat_sets_checks_as_a_person_and_a_spawned_seat_as_a_member_of_its_bound_row() {
+        let env = util::isolated("check-setter");
+        let _ = &env;
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        assert_eq!(setter(&store), Setter::Person);
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
+        store.set_binding("cpd-77", serde_json::json!({"task_id": "pj-001"}));
+        let got = setter(&store);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert_eq!(got, Setter::Member(Some("pj-001".into())));
     }
 }
