@@ -3896,7 +3896,7 @@ pub(crate) fn end_exit_when_idle(store: &Store, seat: &str) -> Result<(), String
 /// Run `wsp <argv>` detached, under [`END_WHEN_IDLE`], with its output in the
 /// handover log.
 fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
+    let exe = wsp_base::util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -4626,7 +4626,7 @@ const ROTATED_BY: &str = "WSP_ROTATED_BY";
 /// pane it is ending. The backend flags this rotation was given are passed on,
 /// so the helper looks where the rotation looked.
 fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
+    let exe = wsp_base::util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

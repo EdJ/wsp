@@ -1050,7 +1050,36 @@ impl Paint {
 /// not read our own path, which is a reason not to reload rather than a
 /// reason to.
 pub fn exe_stamp() -> Option<(u64, u64)> {
-    stamp(&std::env::current_exe().ok()?)
+    stamp(&self_exe().ok()?)
+}
+
+/// The path of the binary we are running **as it is on disk now**, for running
+/// wsp again or asking whether it was replaced. Use this, never
+/// `std::env::current_exe()`, wherever a long-lived process does either.
+///
+/// `wsp-152`: on Linux `current_exe` reads `/proc/self/exe`, and once an install
+/// has replaced the binary under a running process that link reads
+/// `<path> (deleted)`. The daemon's `wsp despawn` was spawned at that name, so
+/// on Omarchy 2026-11-19 every verifier seat it went to end failed with "No
+/// such file or directory (os error 2)", tried again each tick. Its
+/// [`exe_stamp`] read nothing at that name either, so it never reloaded onto
+/// the new binary, which would have cleared it. macOS reports the path, so it
+/// never had this.
+pub fn self_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe().map(|p| on_disk(&p))
+}
+
+/// [`self_exe`]'s reading of a path, the half that can be tested: a path that
+/// is gone and ends in Linux's ` (deleted)` names what stands at the path
+/// without it. Any other path is returned as it is.
+pub fn on_disk(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    match path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(was) => PathBuf::from(was),
+        None => path.to_path_buf(),
+    }
 }
 
 /// [`exe_stamp`] against a path you name, which is the half that can be tested.

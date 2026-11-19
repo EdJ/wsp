@@ -1455,7 +1455,7 @@ fn respawn(argv: &[String], json: bool) -> (String, i32) {
         tests::RESEATED.with(|r| r.borrow_mut().push(argv.to_vec()));
         return (String::new(), 0);
     }
-    let Ok(exe) = std::env::current_exe() else { return ("no wsp binary to run".to_string(), 1) };
+    let Ok(exe) = wsp_base::util::self_exe() else { return ("no wsp binary to run".to_string(), 1) };
     let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(argv).stdin(std::process::Stdio::null());
     if json {
@@ -1581,7 +1581,7 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
         }
         return Told::Yes;
     }
-    let Ok(exe) = std::env::current_exe() else { return Told::No };
+    let Ok(exe) = wsp_base::util::self_exe() else { return Told::No };
     let mut argv = vec!["tell", id, "-"];
     if anyway {
         argv.push("--anyway");

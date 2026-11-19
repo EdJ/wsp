@@ -706,7 +706,7 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
     if std::fs::write(&file, &sentence).is_err() {
         return false;
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = wsp_base::util::self_exe() else { return false };
     if cfg!(test) {
         return false;
     }

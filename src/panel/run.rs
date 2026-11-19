@@ -407,7 +407,7 @@ pub fn run(store: &Store, full: bool) -> i32 {
         // Replace this process rather than spawning beside it: the pane, its
         // pty and its place in the layout all survive, and nothing has to
         // reattach.
-        if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = wsp_base::util::self_exe() {
             let mut c = Command::new(exe);
             c.arg("panel");
             // The fullscreen panel comes back as itself. Without this a reload

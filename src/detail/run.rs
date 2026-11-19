@@ -199,7 +199,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     }
 
     if reload {
-        if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = wsp_base::util::self_exe() {
             let mut c = wsp_base::calls::Command::new(exe);
             c.arg("view");
             if let Some(id) = args.rest.first() {

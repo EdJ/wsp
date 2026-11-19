@@ -55,7 +55,7 @@ pub fn run(store: &Store, args: &crate::Args) -> i32 {
     // panel and the detail pane give: replace this process, so the pane, its
     // pty and its place in the layout all survive.
     if code == RELOAD {
-        if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = wsp_base::util::self_exe() {
             let mut c = wsp_base::calls::Command::new(exe);
             c.arg("kanban");
             if let Some(name) = args.rest.first() {

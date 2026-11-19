@@ -125,7 +125,7 @@ fn git(dir: &Path, argv: &[&str]) -> Option<String> {
 /// told to, so prose never passes through a shell string.
 fn wsp(verb: &str, task: &str, account: &str) -> bool {
     use std::io::Write;
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = wsp_base::util::self_exe() else { return false };
     let Ok(mut child) = Command::new(exe).args([verb, task, "-"]).stdin(Stdio::piped()).spawn() else { return false };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(account.as_bytes());
@@ -143,7 +143,7 @@ fn say(hook: &str, session: &str) {
     if std::env::var_os(crate::base::seat::SEAT_ENV).is_none() {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = wsp_base::util::self_exe() else { return };
     let Ok(mut child) = Command::new(exe).args(["report", hook]).stdin(Stdio::piped()).spawn() else { return };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(serde_json::json!({ "hook_event_name": hook, "session_id": session }).to_string().as_bytes());
@@ -223,7 +223,7 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
             let _ = git(&here, &["commit", "-q", "-m", &format!("{}: {} (attention)", t.id, t.title)]);
         }
         let landed = crate::worklist::verified_by_a_run(store, &t.id)
-            || Command::new(std::env::current_exe().unwrap_or_default())
+            || Command::new(wsp_base::util::self_exe().unwrap_or_default())
                 .args(["land", &t.id])
                 .status()
                 .map(|s| s.success())

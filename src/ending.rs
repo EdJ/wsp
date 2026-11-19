@@ -2355,4 +2355,46 @@ mod tests {
         exits(&store, &f);
         assert_eq!(log_of(&store, "m-1").matches(EXIT_GONE).count(), 2);
     }
+
+    /// **`wsp-152`: on Linux, a verifier seat is still ended after an install
+    /// replaced the wsp the daemon is running.** The daemon ends a seat by
+    /// running `wsp despawn` again at its own path. Linux names a replaced
+    /// binary `<path> (deleted)`, and spawning that name failed with "No such
+    /// file or directory (os error 2)" for cpd-10, cpd-14 and cpd-15 every tick
+    /// on Omarchy 2026-11-19. Here a real process loses its binary to an
+    /// "install", the name its `/proc/<pid>/exe` gives is shown to fail as it
+    /// did, and [`util::on_disk`] gives the path that runs the new binary, as
+    /// `cycle::despawn_seat_keeping` runs it (cwd `/`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat_is_ended_by_the_wsp_on_disk_after_an_install_replaced_the_running_one() {
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("wsp-152-{}-{}", std::process::id(), util::epoch_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("sleep");
+        // Copied by a child, never written by this process (ETXTBSY: see
+        // `wsp_testkit::script`).
+        let cp = Command::new("sh").arg("-c").arg("cp -L \"$(command -v sleep)\" \"$1\"").arg("sh").arg(&bin).status().unwrap();
+        assert!(cp.success(), "copying sleep to {}", bin.display());
+        let mut running = Command::new(&bin).arg("60").stdin(Stdio::null()).spawn().unwrap();
+
+        // The install: the binary that is running is unlinked and a new one
+        // takes its path.
+        std::fs::remove_file(&bin).unwrap();
+        wsp_testkit::script(&bin, "#!/bin/sh\necho \"ended $*\"\n");
+        let linked = std::fs::read_link(format!("/proc/{}/exe", running.id()));
+        let _ = running.kill();
+        let _ = running.wait();
+        let linked = linked.unwrap();
+        assert!(linked.to_string_lossy().ends_with(" (deleted)"), "Linux names the replaced binary so: {}", linked.display());
+        let before = Command::new(&linked).current_dir("/").stdin(Stdio::null()).output().unwrap_err();
+        assert_eq!(before.kind(), std::io::ErrorKind::NotFound, "the name that failed each tick: {before}");
+
+        let exe = util::on_disk(&linked);
+        assert_eq!(exe, bin);
+        let out = Command::new(&exe).args(["despawn", "--pane", "cpd-10"]).current_dir("/").stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ended despawn --pane cpd-10\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

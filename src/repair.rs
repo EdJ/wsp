@@ -1776,7 +1776,7 @@ pub(crate) fn tell_member(store: &Store, id: &str, text: &str) {
         #[cfg(test)]
         return crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), text.to_string())));
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = wsp_base::util::self_exe() else { return };
     let child = wsp_base::calls::Command::new(exe)
         .args(["tell", id, "-"])
         .stdin(std::process::Stdio::piped())
@@ -2297,7 +2297,7 @@ fn land_for_the_run(id: &str) -> Result<(), String> {
             tests::LAND_FAILS.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
         });
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
     let out = wsp_base::calls::Command::new(exe)
         .args(["land", id, "--for-run"])
         .current_dir("/")

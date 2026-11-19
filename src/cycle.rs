@@ -451,7 +451,7 @@ fn launch(store: &Store, argv: &[&str]) {
     if cfg!(test) || std::env::var_os(OFF).is_some() {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = wsp_base::util::self_exe() else { return };
     let log = store.state_file("cycle.log");
     let Ok(out) = std::fs::OpenOptions::new().create(true).append(true).open(&log) else { return };
     let Ok(err) = out.try_clone() else { return };
@@ -1410,7 +1410,7 @@ fn tell_seat(store: &Store, check: &str, text: &str, what: &str) {
         crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text.to_string())));
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = wsp_base::util::self_exe() else { return };
     let mut child = match wsp_base::calls::Command::new(exe)
         .args(["tell", check, "-"])
         .stdin(std::process::Stdio::piped())
@@ -2492,7 +2492,7 @@ fn start_leg(store: &Store, row: &str, leg: &str, owned: Option<(&str, &str)>) -
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -2844,7 +2844,7 @@ fn start_piece(store: &Store, row: &str, n: usize, owned: Option<(&str, &str)>) 
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -3983,7 +3983,7 @@ fn start(store: &Store, id: &str, policy: &Policy, owned: (&str, &str), verify: 
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -4020,7 +4020,7 @@ pub(crate) fn start_check(store: &Store, list: &str, at: usize, policy: &Policy)
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -5126,7 +5126,7 @@ pub(crate) fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String>
             tests::END_FAIL.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
         });
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
     let out = Command::new(exe)
         .args(despawn_argv(&["--pane", seat], keep))
         .current_dir("/")
@@ -5169,7 +5169,7 @@ pub(crate) fn despawned_keeping(store: &Store, id: &str, keep: bool) -> Result<(
         }
         return Ok(());
     }
-    let Ok(exe) = std::env::current_exe() else { return Err("could not find wsp itself".into()) };
+    let Ok(exe) = wsp_base::util::self_exe() else { return Err("could not find wsp itself".into()) };
     let out = Command::new(exe).args(despawn_argv(&[id], keep)).stdin(Stdio::null()).output();
     let (said, result) = match out {
         Ok(o) if o.status.success() => ("ended".to_string(), Ok(())),

@@ -742,7 +742,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let json_out = args.json();
 
-    let Ok(bin) = std::env::current_exe() else {
+    let Ok(bin) = wsp_base::util::self_exe() else {
         eprintln!("wsp: cannot tell which binary is running, so cannot put it in a sandbox");
         return 2;
     };
