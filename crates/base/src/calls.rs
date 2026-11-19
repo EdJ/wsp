@@ -1379,22 +1379,30 @@ mod tests {
     #[test]
     fn a_child_carried_over_an_exec_is_adopted_and_reaped_when_it_ends() {
         let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
-        let spawn = |args: &[&str]| {
-            let c = std::process::Command::new(args[0]).args(&args[1..]).spawn().unwrap();
-            let pid = c.id();
-            std::mem::forget(c);
-            pid
-        };
-        let ended = spawn(&["true"]);
-        let running = spawn(&["sleep", "0.3"]);
+        let spawn = |args: &[&str]| std::process::Command::new(args[0]).args(&args[1..]).spawn().unwrap();
+        let ended = spawn(&["true"]).id();
+        // Long enough to outlast any loaded wait below: it ends when it is
+        // killed, after the adoption, not on a clock (wsp-684).
+        let mut sleeper = spawn(&["sleep", "30"]);
+        let running = sleeper.id();
         until("never defunct", || ps_state(ended).starts_with('Z'));
-        let found = children();
+        // Until its exec is done `ps` names it `(sleep)` on macOS, its argv
+        // not yet readable: wait for the line asserted (wsp-684).
+        let mut found = Vec::new();
+        until("the running child's args never read as `sleep 30`", || {
+            found = children();
+            found.iter().any(|(p, l)| *p == running && l.contains("sleep 30"))
+        });
         assert!(!found.iter().any(|(_, l)| l.starts_with("ps -axo")), "ps listed itself: {found:?}");
         let mine: Vec<_> = found.iter().filter(|(p, _)| *p == ended || *p == running).cloned().collect();
         assert_eq!(mine.len(), 2, "{found:?}");
-        assert!(mine.iter().any(|(p, l)| *p == running && l.contains("sleep 0.3")), "{mine:?}");
         adopt(&mine);
-        until("an adopted child stayed defunct", || ps_state(ended).is_empty() && ps_state(running).is_empty());
+        until("the adopted ended child stayed defunct", || ps_state(ended).is_empty());
+        let s = ps_state(running);
+        assert!(!s.is_empty() && !s.starts_with('Z'), "the running child was taken before it ended: {s:?}");
+        sleeper.kill().unwrap();
+        std::mem::forget(sleeper);
+        until("the adopted running child stayed defunct once it ended", || ps_state(running).is_empty());
     }
 
     /// **wsp-667: the reaper never robs a waiter.** `output()` waits on its
