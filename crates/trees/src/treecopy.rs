@@ -1225,7 +1225,8 @@ mod tests {
             let d = Dir::new("sha");
             let f = d.0.join("f");
             fs::write(&f, data).unwrap();
-            let theirs = run(&d.0, "shasum -a 256 f | cut -d' ' -f1").trim().to_string();
+            // The same choice the far script makes (`H=` above): sha256sum on Linux, shasum on macOS.
+            let theirs = run(&d.0, "if command -v sha256sum >/dev/null 2>&1; then sha256sum f; else shasum -a 256 f; fi | cut -d' ' -f1").trim().to_string();
             assert_eq!(sha256_hex(data.as_bytes()), theirs, "{} bytes", data.len());
         }
     }
