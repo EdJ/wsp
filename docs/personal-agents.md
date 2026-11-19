@@ -167,7 +167,10 @@ settles an open question: each list's overview says what the person confirms bef
 | `pa5-org-scale` | 5. Org scale | none in the spec; wsp-251 proposes and measures one (fifty agents in five groups) | 5 | wsp-247 … wsp-251 | `pa4-quorum` |
 
 A list has one `after`. `pa2-mandate` and `pa4-quorum` also need `mp3-commit` (its rights table and audit); their
-overviews say so. The knowledge-layers lists rest on `pa1-tell`.
+overviews say so, and a row's `after` holds it: wsp-225, `pa2-mandate`'s first row, rests on wsp-192, `mp3-commit`'s
+gate row, as well as on wsp-224, so the list cannot start before mp3 has completed. `pa4-quorum` carries no wait of
+its own: it is after `pa3-filing`, which is after `pa2-mandate`, and so is covered through `pa2-mandate`. The
+knowledge-layers lists rest on `pa1-tell`.
 
 **Shape of each list.** A contract row first, in a group of its own (R5: docs/components.md, applied in
 docs/state-core.md section 6); then the pure rule in `wsp-machines`; then the server's path for it; then the CLI,
