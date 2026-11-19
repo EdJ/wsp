@@ -5387,10 +5387,18 @@ fn noticed_on(w: &Worklist) -> Option<String> {
 
 /// Whether a notice [`tell_now`] puts on this list's member reaches a seat, as
 /// against the person's panel.
+///
+/// **The walk `cmd_govern::answering_seat` makes, from the layer below it**
+/// ([`crate::governors::seat_for`]: the member's running list, then its
+/// project). Its third step, the governor whose work order started the row,
+/// never applies here: a run member's log names the run as its starter, which
+/// ends that walk.
 fn notice_reaches_a_seat(store: &Store, w: &Worklist) -> bool {
-    noticed_on(w)
-        .and_then(|m| store.task(&m))
-        .is_some_and(|t| crate::cmd_govern::answering_seat(store, &t).is_some())
+    let Some(task) = noticed_on(w).and_then(|m| store.task(&m)) else { return false };
+    let index = crate::resolve::Index::new(store.projects());
+    let lists = worklist::Running::read(store);
+    let governors = store.governors();
+    crate::governors::seat_for(&governors, &index, lists.list_for(&task), task.project.as_deref()).is_some()
 }
 
 /// Whether a sentence asks anybody for anything, by the rule a turn's last
