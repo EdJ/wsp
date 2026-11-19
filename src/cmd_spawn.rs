@@ -3150,9 +3150,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             spawn_args.extend(crate::cmd_role::settings_args(&kind, scope, work.primary));
         }
         // A retro seat is told to search every project's rows; it gets the
-        // read-only verbs that do it (compounding-614).
+        // read-only verbs that do it (compounding-614). A member seat gets
+        // `wsp check <its row> --set`, which wsp limits itself (wsp-681).
         let row_tags = work.task.as_deref().and_then(|t| store.find_task(t)).map(|t| t.tags).unwrap_or_default();
-        spawn_args.extend(crate::cmd_role::retro_spawn_args(&kind, verifying, &row_tags, &store.state));
+        let member_row = work
+            .task
+            .as_deref()
+            .filter(|_| args.has("agent") && !args.has("govern") && !verifying && checking.is_none() && leg_name.is_none() && piece_rec.is_none());
+        spawn_args.extend(crate::cmd_role::seat_spawn_args(&kind, member_row, verifying, &row_tags, &store.state));
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args };
         let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when

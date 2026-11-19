@@ -13,6 +13,7 @@
 //! | `wsp reap <pid>…` | any pid that passes the guards | pids in trees of rows on a list it governs, and its barrier tree | refused |
 //! | `wsp done <row>` | rows at review | refused | refused |
 //! | `wsp daemon reload` | yes | refused | refused |
+//! | `wsp check <row> --set --why …` | any row | rows on a list it governs, any change | its own row: raise a budget, add or correct a `cd`, narrow to its files, add a step |
 //!
 //! **The role is read from the seat wsp recorded**, never from anything the
 //! caller says: the caller's seat (`WSP_SEAT_ID`, or herdr's pane) is looked up
@@ -43,6 +44,8 @@ pub(crate) const PRIMARY_SETTINGS: &str = include_str!("../claude-code/primary.s
 pub(crate) const GOVERNOR_SETTINGS: &str = include_str!("../claude-code/governor.settings.json");
 
 pub(crate) const RETRO_SETTINGS: &str = include_str!("../claude-code/retro.settings.json");
+/// The settings a member seat is started with, `<row>` its own row (wsp-681).
+pub(crate) const MEMBER_SETTINGS: &str = include_str!("../claude-code/member.settings.json");
 const RETRO_FILE: &str = "wsp-retro.settings.json";
 const PRIMARY_FILE: &str = "wsp-primary.settings.json";
 const GOVERNOR_FILE: &str = "wsp-governor.settings.json";
@@ -130,6 +133,84 @@ fn refuse(store: &Store, verb: &str, role: &Role, why: &str) -> i32 {
 fn list_of_row(store: &Store, row: &str) -> Option<String> {
     let t = store.task(row)?;
     crate::worklist::Running::read(store).list_for(&t).map(str::to_string)
+}
+
+/// The list a row is on, if any.
+pub(crate) fn list_of(store: &Store, row: &str) -> Option<String> {
+    list_of_row(store, row)
+}
+
+// ---- wsp check --set (wsp-681) ------------------------------------------------
+
+/// The row the caller's seat is bound to, as wsp recorded it (never from what
+/// the caller says): the binding of its pane.
+pub(crate) fn own_row(store: &Store) -> Option<String> {
+    let pane = crate::cmd_agent::my_pane()?;
+    store.bindings().get(&pane)?.get("task_id")?.as_str().map(str::to_string)
+}
+
+/// Who may make what a member may not, for a row on `list`.
+pub(crate) fn who_may(list: Option<&str>) -> String {
+    match list {
+        Some(l) => format!("the governor of {l}, or Ed"),
+        None => "Ed, or the primary seat".into(),
+    }
+}
+
+/// Who a change to a row's checks is logged as.
+pub(crate) fn who_set(role: &Role) -> String {
+    match role {
+        Role::Seat => "the row's member seat".into(),
+        r => r.name(),
+    }
+}
+
+/// Whether `role` may write `row`'s checks, as a pure decision. `own` is the
+/// row the caller's seat is bound to, `list` and `project` the row's, and
+/// `refused` what of the change a member may not make ([`crate::check::edits`]).
+///
+/// The primary and a person set anything. A governor sets the checks of the
+/// rows on the list (or project) it governs, whatever the change. A member sets
+/// its own row's only, and only what [`crate::check::edits`] lets it.
+pub(crate) fn checks_allowed(
+    role: &Role,
+    row: &str,
+    own: Option<&str>,
+    list: Option<&str>,
+    project: Option<&str>,
+    refused: &[String],
+) -> Result<(), String> {
+    match role {
+        Role::Outside | Role::Primary => Ok(()),
+        Role::Governor(scope) if list == Some(scope.as_str()) || project == Some(scope.as_str()) => Ok(()),
+        Role::Governor(scope) => Err(format!(
+            "{row} is {}; the governor of {scope} sets the checks of rows on {scope} only — it needs {}",
+            list.map(|l| format!("on list {l}")).unwrap_or_else(|| "on no list".into()),
+            who_may(list)
+        )),
+        Role::Seat if own != Some(row) => Err(format!(
+            "a member sets the checks of its own row only ({}); {row}'s are set by {}",
+            own.unwrap_or("this seat is bound to none"),
+            who_may(list)
+        )),
+        Role::Seat if !refused.is_empty() => Err(format!(
+            "a member may raise a step's budget, add or correct a leading `cd <dir> &&`, narrow a step to the files its commits touched, or add a step; {}: only {} may do that",
+            refused.join("; "),
+            who_may(list)
+        )),
+        Role::Seat => Ok(()),
+    }
+}
+
+/// Whether `role` may write a project's checks: never a member, verifier or
+/// check seat, and a governor only its own project's.
+pub(crate) fn project_checks_allowed(role: &Role, project: &str) -> Result<(), String> {
+    match role {
+        Role::Outside | Role::Primary => Ok(()),
+        Role::Governor(scope) if scope == project => Ok(()),
+        Role::Governor(scope) => Err(format!("the governor of {scope} does not set project {project}'s checks; Ed or the primary seat does")),
+        Role::Seat => Err(format!("a member, verifier or check seat does not set project {project}'s checks; Ed or the primary seat does")),
+    }
 }
 
 // ---- despawn ----------------------------------------------------------------
@@ -925,6 +1006,50 @@ pub(crate) fn retro_wanted(verifying: bool, row_tags: &[String]) -> bool {
     !verifying && row_tags.iter().any(|g| g == "retro")
 }
 
+/// The settings of a member seat on `row` (wsp-681): the allow rule for
+/// `wsp check <row> --set` on its own row, as a permission and as the
+/// classifier's own rule, and, on a retro row, the retro seat's besides. One
+/// file, because a seat is started with one `--settings`.
+pub(crate) fn member_settings(row: &str, retro: bool) -> String {
+    let mut v: Value = serde_json::from_str(&MEMBER_SETTINGS.replace("<row>", row)).unwrap_or_else(|_| json!({}));
+    if retro {
+        let r: Value = serde_json::from_str(RETRO_SETTINGS).unwrap_or_else(|_| json!({}));
+        for key in ["/permissions/allow", "/autoMode/allow"] {
+            let more: Vec<Value> = r.pointer(key).and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(a) = v.pointer_mut(key).and_then(Value::as_array_mut) {
+                a.extend(more.into_iter().filter(|m| m.as_str() != Some("$defaults")));
+            }
+        }
+    }
+    serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+}
+
+/// Where a member seat's settings file for `row` lives, under wsp's state.
+pub(crate) fn member_settings_path(state: &std::path::Path, row: &str) -> std::path::PathBuf {
+    state.join("claude-code").join(format!("wsp-member-{row}.settings.json"))
+}
+
+/// What a spawn adds for its seat's own settings: a member seat on a row gets
+/// its member settings (with the retro seat's on a retro row), a retro row's
+/// other seats nothing, as before, and anyone else nothing. `member_row` is the
+/// row of a member seat, `None` for any other spawn.
+pub(crate) fn seat_spawn_args(kind: &str, member_row: Option<&str>, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
+    let Some(row) = member_row.filter(|_| kind == "claude" && !verifying) else {
+        return retro_spawn_args(kind, verifying, row_tags, state);
+    };
+    let body = member_settings(row, retro_wanted(verifying, row_tags));
+    let path = member_settings_path(state, row);
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, &body).is_err() {
+            return retro_spawn_args(kind, verifying, row_tags, state);
+        }
+    }
+    vec!["--settings".into(), path.display().to_string()]
+}
+
 /// What a spawn adds for a retro seat: the settings pair when the row is
 /// tagged `retro` and the seat is not its verifier, nothing otherwise.
 pub(crate) fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
@@ -1221,7 +1346,7 @@ mod tests {
             allow(PRIMARY_SETTINGS),
             ["Bash(wsp despawn:*)", "Bash(wsp done:*)", "Bash(wsp reap:*)", "Bash(wsp daemon reload)"]
         );
-        assert_eq!(allow(GOVERNOR_SETTINGS), ["Bash(wsp despawn:*)", "Bash(wsp reap:*)"]);
+        assert_eq!(allow(GOVERNOR_SETTINGS), ["Bash(wsp despawn:*)", "Bash(wsp reap:*)", "Bash(wsp check:*)"]);
         assert!(settings_args("opencode", Some("x"), false).is_empty());
         assert!(settings_args("claude", None, false).is_empty(), "a member gets neither file");
         assert_eq!(allow(RETRO_SETTINGS), ["Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
@@ -1262,5 +1387,58 @@ mod tests {
         assert_eq!(retro_settings_args("claude", &state), args);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), RETRO_SETTINGS);
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_member_seat_is_started_allowed_check_set_on_its_own_row_only_and_the_classifier_is_told() {
+        let v: Value = serde_json::from_str(&member_settings("wsp-9", false)).unwrap();
+        let allow: Vec<&str> = v["permissions"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(allow, ["Bash(wsp check wsp-9 --set:*)"], "its own row, and nothing else");
+        let prose: Vec<&str> = v["autoMode"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(prose[0], "$defaults");
+        assert!(!prose[1].contains("<row>") && prose[1].contains("wsp-9") && prose[1].contains("Ed"), "{prose:?}");
+        // A retro row's member gets the retro rules in the same one file.
+        let r: Value = serde_json::from_str(&member_settings("wsp-9", true)).unwrap();
+        let allow: Vec<&str> = r["permissions"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(allow, ["Bash(wsp check wsp-9 --set:*)", "Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
+        assert_eq!(r["autoMode"]["allow"].as_array().unwrap().iter().filter(|x| x.as_str() == Some("$defaults")).count(), 1);
+        // The governor's file tells the classifier too.
+        let g: Value = serde_json::from_str(GOVERNOR_SETTINGS).unwrap();
+        assert!(g["autoMode"]["allow"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("wsp check <row> --set")));
+
+        let state = std::env::temp_dir().join(format!("wsp-member-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = seat_spawn_args("claude", Some("wsp-9"), false, &[], &state);
+        assert_eq!(args, ["--settings".to_string(), member_settings_path(&state, "wsp-9").display().to_string()]);
+        assert_eq!(std::fs::read_to_string(member_settings_path(&state, "wsp-9")).unwrap(), member_settings("wsp-9", false));
+        assert!(seat_spawn_args("claude", Some("wsp-9"), true, &[], &state).is_empty(), "a verifier is no member");
+        assert!(seat_spawn_args("claude", None, false, &[], &state).is_empty(), "no member row, no file");
+        assert!(seat_spawn_args("opencode", Some("wsp-9"), false, &[], &state).is_empty());
+        let retro = vec!["retro".to_string()];
+        assert_eq!(seat_spawn_args("claude", None, false, &retro, &state), retro_settings_args("claude", &state), "a retro seat as before");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn check_set_by_role_a_member_its_own_row_within_limits_a_governor_its_lists_rows() {
+        let none: &[String] = &[];
+        let deleted = vec!["`build` is deleted".to_string()];
+        assert!(checks_allowed(&Role::Outside, "r-1", None, Some("fleet"), None, &deleted).is_ok());
+        assert!(checks_allowed(&Role::Primary, "r-1", None, Some("fleet"), None, &deleted).is_ok());
+        let gov = Role::Governor("fleet".into());
+        assert!(checks_allowed(&gov, "r-1", None, Some("fleet"), None, &deleted).is_ok(), "a governor deletes on its list's row");
+        assert!(checks_allowed(&gov, "r-1", None, None, Some("fleet"), &deleted).is_ok(), "and on its project's");
+        let no = checks_allowed(&gov, "r-1", None, Some("other"), None, none).unwrap_err();
+        assert!(no.contains("on list other") && no.contains("the governor of other, or Ed"), "{no}");
+        assert!(checks_allowed(&Role::Seat, "r-1", Some("r-1"), Some("fleet"), None, none).is_ok(), "a member, its own row");
+        let no = checks_allowed(&Role::Seat, "r-1", Some("r-2"), Some("fleet"), None, none).unwrap_err();
+        assert!(no.contains("its own row only (r-2)") && no.contains("the governor of fleet, or Ed"), "{no}");
+        let no = checks_allowed(&Role::Seat, "r-1", Some("r-1"), Some("fleet"), None, &deleted).unwrap_err();
+        assert!(no.contains("`build` is deleted") && no.contains("only the governor of fleet, or Ed may"), "{no}");
+        assert!(project_checks_allowed(&Role::Seat, "pj").is_err());
+        assert!(project_checks_allowed(&Role::Governor("pj".into()), "pj").is_ok());
+        assert!(project_checks_allowed(&Role::Governor("x".into()), "pj").is_err());
+        assert!(project_checks_allowed(&Role::Outside, "pj").is_ok());
+        assert_eq!(who_set(&Role::Seat), "the row's member seat");
     }
 }

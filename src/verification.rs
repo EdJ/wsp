@@ -1012,7 +1012,7 @@ pub(crate) fn verdict_core(store: &Store, member: Task, judged: Judged, me: Opti
         if !calls.is_empty() {
             state = State::Blocks;
             caption = "a check line calls the row's own check".to_string();
-            let why = format!("its ## Checks has line(s) that call its own check, which is always refused as already running:\n- {}\nFix them with `wsp check {} --set -`.", calls.join("\n- "), member.id);
+            let why = format!("its ## Checks has line(s) that call its own check, which is always refused as already running:\n- {}\nFix them with `wsp check {} --set --why \"…\" -`.", calls.join("\n- "), member.id);
             text = format!("{}\n\n{why}", text.trim());
             owes = Some(why);
             println!("{}", Paint::new().red("■ a check line calls the row's own check, so the hold is recorded as a block"));

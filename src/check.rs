@@ -1463,7 +1463,7 @@ pub(crate) fn owed(ran: &[Ran], sha: &str) -> String {
     if let Done::Malformed(why) = &r.done {
         return format!(
             "wsp check could not start `{}` at {}: {why}. The line is malformed, not the work — nothing was sent back. \
-             Fix it with `wsp check <id> --set -` (one `- name: command` item per check, the command alone in backticks if a note follows).",
+             Fix it with `wsp check <id> --set --why \"…\" -` (one `- name: command` item per check, the command alone in backticks if a note follows).",
             r.step.name,
             &sha[..sha.len().min(12)],
         );
@@ -1620,7 +1620,7 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
             }
             if let Some(r) = ran.iter().find(|r| matches!(r.done, Done::Failed { timed_out: true, .. })) {
                 owes = format!(
-                    "`{}` took its whole budget: declared {}s, measured {}s. Raise the step's limit past its run time (`wsp check <id> --set -`) or make it faster; it is not queued to rerun.\n\n{owes}",
+                    "`{}` took its whole budget: declared {}s, measured {}s. Raise its limit past its run time (`wsp check <id> --set --why … -`) or make it faster; it is not queued to rerun.\n\n{owes}",
                     r.step.name,
                     r.step.limit.as_secs(),
                     secs(r.took)
@@ -1669,7 +1669,7 @@ const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed
 
 // ---- the verb -----------------------------------------------------------------
 
-const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check --affected [<task>] [--run]   those and the targets the crate and module graphs reach\n       wsp check <project> --barrier [--plan|--barrier-tree] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set --from FILE   (or `-`) declare its ## Checks";
+const USAGE: &str = "wsp check <task> [--plan] [--at <commit>] [--since <commit>] [--json]\n       wsp check --inner [<task>] [--run]   the steps this tree's changes call for\n       wsp check --affected [<task>] [--run]   those and the targets the crate and module graphs reach\n       wsp check <project> --barrier [--plan|--barrier-tree] [--at <commit>]\n       wsp check <project> --tiers   its declared steps by tier\n       wsp check <task|project> --set [--why \"…\"] --from FILE   (or `-`) declare its ## Checks; a change to a row's says why";
 
 pub fn check(store: &Store, args: &Args) -> i32 {
     let p = Paint::new();
@@ -2242,6 +2242,14 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
 /// of a project (when the name is one) or of a task. The list is the whole
 /// section: it replaces what was there.
 fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
+    let role = crate::cmd_role::role(store);
+    let own = crate::cmd_role::own_row(store);
+    set_as(store, args, needle, usage, &role, own.as_deref())
+}
+
+/// [`set`] for a caller whose role and own row are already read: `own` is the
+/// row the caller's seat is bound to (wsp-681).
+pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role: &crate::cmd_role::Role, own: Option<&str>) -> i32 {
     // `--from FILE`, or `-` for the stream: the list keeps its lines, which is
     // the whole of it, so it is not folded the way a log entry is.
     let src = args.get("from").or_else(|| args.rest.get(1).cloned().filter(|a| a == "-"));
@@ -2282,7 +2290,11 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
         eprintln!("  one item per check, `- name: command`; a note after the command goes outside its backticks");
         return 2;
     }
+    let why = args.get("why").map(|w| w.trim().to_string()).filter(|w| !w.is_empty());
     let what = if let Some(mut proj) = store.project(needle) {
+        if let Err(no) = crate::cmd_role::project_checks_allowed(role, &proj.id) {
+            return refuse_set(store, role, &proj.id, &no);
+        }
         if steps.iter().any(|s| s.end) && !steps.iter().any(|s| s.barrier) {
             eprintln!("wsp: warning: an `at end` step but no `at barrier` step — the cold build runs the barrier steps with it, and a group's end runs none");
         }
@@ -2308,7 +2320,24 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
             }
             return 2;
         }
+        let before = t.section(SECTION).unwrap_or_default();
+        let edits = edits(&before, &text, &touched_by(store, &t));
+        let refused: Vec<String> = edits.iter().filter_map(|e| e.refused.clone()).collect();
+        let list = crate::cmd_role::list_of(store, &t.id);
+        if let Err(no) = crate::cmd_role::checks_allowed(role, &t.id, own, list.as_deref(), t.project.as_deref(), &refused) {
+            return refuse_set(store, role, &t.id, &no);
+        }
+        if !edits.is_empty() && !before.trim().is_empty() && why.is_none() {
+            eprintln!("wsp: not written — a change to {}'s checks says why: `wsp check {} --set --why \"…\" -`; the reason is logged on the row beside each change, and its verifier reads it", t.id, t.id);
+            return 2;
+        }
         crate::model::set_section_in(&mut t.body, SECTION, &text);
+        if !before.trim().is_empty() {
+            let who = crate::cmd_role::who_set(role);
+            for e in &edits {
+                t.log(&e.log_line(&who, why.as_deref().unwrap_or_default()));
+            }
+        }
         if let Err(e) = store.save_task(&t) {
             eprintln!("wsp: {e}");
             return 1;
@@ -2318,6 +2347,229 @@ fn set(store: &Store, args: &Args, needle: &str, usage: &str) -> i32 {
     store.git_commit(&format!("wsp: {what} declares {} check(s)", steps.len()));
     println!("{what}: {} check(s) — {}", steps.len(), steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
     0
+}
+
+fn refuse_set(store: &Store, role: &crate::cmd_role::Role, id: &str, why: &str) -> i32 {
+    eprintln!("wsp: not written — {why}");
+    crate::store::log_line(store, &format!("refused check {id} --set by {}: {why}", role.name()));
+    2
+}
+
+// ---- what a `--set` changes (wsp-681) ----------------------------------------
+//
+// A plan row writes its checks before anyone has run them, so they are often a
+// little wrong: a budget under a cold compile, a step missing its `cd`, a step
+// far broader than the row's files. The member's seat sees the fix at once. It
+// may make that fix itself, and only that: raise a budget, add or correct a
+// leading `cd <dir> &&`, narrow a step to the files its commits touched, add a
+// step. Deleting a step, lowering a budget or replacing a command with an
+// unrelated one is its governor's (or Ed's). Every change is logged on the row,
+// old line to new line, who and why, and the verifier is shown them.
+
+/// The start of the row's log line for one change to its checks.
+pub(crate) const CHECKS_CHANGED: &str = "checks changed by";
+
+/// One change a `--set` makes to a row's declared checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Edit {
+    /// The line as it was; `None` for a step added.
+    pub old: Option<String>,
+    /// The line as it is; `None` for a step deleted.
+    pub new: Option<String>,
+    /// What the change does, in words.
+    pub said: String,
+    /// Why a member may not make it; `None` when it may.
+    pub refused: Option<String>,
+}
+
+impl Edit {
+    pub(crate) fn log_line(&self, who: &str, why: &str) -> String {
+        let line = |l: &Option<String>, none: &str| l.as_ref().map(|l| format!("`{l}`")).unwrap_or_else(|| none.to_string());
+        format!("{CHECKS_CHANGED} {who}: {} → {} ({}); why: {why}", line(&self.old, "(none)"), line(&self.new, "(deleted)"), self.said)
+    }
+}
+
+/// The items of a section's text with the step each declares.
+fn items_of(text: &str) -> Vec<(String, Step)> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("- ").or_else(|| l.strip_prefix("* "))
+        })
+        .filter_map(|item| step_of(item, Of::Task).map(|s| (item.trim().to_string(), s)))
+        .collect()
+}
+
+/// A command's leading `cd <dir> &&`, and what it runs there.
+pub(crate) fn split_cd(command: &str) -> (Option<&str>, &str) {
+    let c = command.trim();
+    if let Some((dir, rest)) = c.strip_prefix("cd ").and_then(|r| r.split_once("&&")) {
+        let dir = dir.trim();
+        if !dir.is_empty() && !dir.contains(char::is_whitespace) {
+            return (Some(dir), rest.trim());
+        }
+    }
+    (None, c)
+}
+
+fn words(c: &str) -> Vec<&str> {
+    c.split_whitespace().collect()
+}
+
+/// Flags that only narrow a test run to less of it.
+const NARROWING: [&str; 6] = ["--", "--lib", "--test", "--exact", "-p", "--package"];
+
+/// Whether `token`, an argument of a command run in `dir`, names files the row
+/// touched: a path that is one of them or holds one, or a test filter whose
+/// first segment is the module or file name of one (`check::`, `layering`).
+pub(crate) fn touches(token: &str, dir: Option<&str>, touched: &[String]) -> bool {
+    let t = token.trim_matches(|c| c == '"' || c == '\'').trim_end_matches('/');
+    let t = t.strip_prefix("./").unwrap_or(t);
+    if t.is_empty() || t == "." {
+        return false;
+    }
+    let under = |f: &str, p: &str| f == p || f.starts_with(&format!("{p}/"));
+    let rooted = dir.map(|d| format!("{}/{t}", d.trim_end_matches('/')));
+    let first = t.split("::").next().unwrap_or_default();
+    touched.iter().any(|f| {
+        under(f, t)
+            || rooted.as_deref().is_some_and(|r| under(f, r))
+            || (!t.contains('/')
+                && !first.is_empty()
+                && (module_of(f).is_some_and(|m| m.rsplit('/').next() == Some(first))
+                    || f.rsplit('/').next().and_then(|n| n.split('.').next()) == Some(first)))
+    })
+}
+
+/// Whether `new` runs what `old` runs, narrowed to the files the row touched:
+/// the same program, every word of `old` kept or a path of it replaced by a
+/// narrower one, and every word added a touched path or filter, or a flag that
+/// only narrows.
+pub(crate) fn narrows(old: &str, new: &str, dir: Option<&str>, touched: &[String]) -> bool {
+    let (o, n) = (words(old), words(new));
+    if o.is_empty() || n.is_empty() || o[0] != n[0] {
+        return false;
+    }
+    let added: Vec<(usize, &str)> = n.iter().enumerate().filter(|(_, w)| !o.contains(w)).map(|(i, w)| (i, *w)).collect();
+    if added.is_empty() {
+        return false;
+    }
+    let pathy = |w: &str| w.contains('/') || w == ".";
+    for r in o.iter().filter(|w| !n.contains(w)) {
+        let r = r.trim_end_matches('/');
+        let narrower = |a: &str| r == "." || a.trim_end_matches('/').starts_with(&format!("{r}/"));
+        if !pathy(r) || !added.iter().any(|(_, a)| narrower(a)) {
+            return false;
+        }
+    }
+    added.iter().all(|&(i, w)| {
+        let after_p = i > 0 && matches!(n[i - 1], "-p" | "--package");
+        touches(w, dir, touched)
+            || NARROWING.contains(&w)
+            || (after_p && touched.iter().any(|f| f.strip_prefix("crates/").and_then(|r| r.split('/').next()).is_some_and(|c| w == c || w.ends_with(&format!("-{c}")))))
+    })
+}
+
+/// What a change from one step to another does, and what of it a member may
+/// not do.
+fn compare(old: &Step, new: &Step, touched: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut said, mut refused) = (Vec::new(), Vec::new());
+    let (o, n) = (secs(old.limit), secs(new.limit));
+    if n > o {
+        said.push(format!("raises its budget {o}s → {n}s"));
+    } else if n < o {
+        refused.push(format!("`{}` lowers its budget {o}s → {n}s", old.name));
+    }
+    let ((od, oc), (nd, nc)) = (split_cd(&old.command), split_cd(&new.command));
+    match (od, nd) {
+        (a, b) if a == b => {}
+        (None, Some(d)) => said.push(format!("adds `cd {d} &&`")),
+        (Some(a), Some(b)) => said.push(format!("corrects its cd {a} → {b}")),
+        (Some(a), None) => refused.push(format!("`{}` drops its `cd {a} &&`", old.name)),
+        (None, None) => {}
+    }
+    if words(oc) != words(nc) {
+        match narrows(oc, nc, nd, touched) {
+            true => said.push(format!("narrows `{oc}` to `{nc}`")),
+            false => refused.push(format!("`{}` replaces `{oc}` with `{nc}`, which is not it narrowed to the files the row touched", old.name)),
+        }
+    }
+    if old.name != new.name {
+        said.push(format!("renames {} → {}", old.name, new.name));
+    }
+    (said, refused)
+}
+
+/// Every change from the `before` text of a row's checks to the `after`, with
+/// what a member may not make. Steps are paired by name, then by the command
+/// they run once a `cd` is set aside; a step of `before` with no pair is
+/// deleted, one of `after` with none is added.
+pub(crate) fn edits(before: &str, after: &str, touched: &[String]) -> Vec<Edit> {
+    let (old, new) = (items_of(before), items_of(after));
+    let mut used = vec![false; new.len()];
+    let mut out = Vec::new();
+    for (line, o) in &old {
+        let by_name = (0..new.len()).find(|&j| !used[j] && new[j].1.name == o.name);
+        let by_command = || (0..new.len()).find(|&j| !used[j] && words(split_cd(&new[j].1.command).1) == words(split_cd(&o.command).1));
+        let Some(j) = by_name.or_else(by_command) else {
+            out.push(Edit {
+                old: Some(line.clone()),
+                new: None,
+                said: format!("deletes `{}`", o.name),
+                refused: Some(format!("`{}` is deleted", o.name)),
+            });
+            continue;
+        };
+        used[j] = true;
+        let (nline, n) = &new[j];
+        if nline == line {
+            continue;
+        }
+        let (said, refused) = compare(o, n, touched);
+        if said.is_empty() && refused.is_empty() {
+            continue;
+        }
+        let mut all = said.clone();
+        all.extend(refused.iter().cloned());
+        out.push(Edit {
+            old: Some(line.clone()),
+            new: Some(nline.clone()),
+            said: all.join("; "),
+            refused: (!refused.is_empty()).then(|| refused.join("; ")),
+        });
+    }
+    for (j, (line, n)) in new.iter().enumerate() {
+        if !used[j] {
+            out.push(Edit { old: None, new: Some(line.clone()), said: format!("adds `{}`", n.name), refused: None });
+        }
+    }
+    out
+}
+
+/// The files the row's commits touched: in its own tree, the commits that name
+/// it, and at its landing, what the landing changed.
+pub(crate) fn touched_by(store: &Store, t: &Task) -> Vec<String> {
+    let grep = format!("--grep=(^|[^[:alnum:]-]){}([^0-9]|$)", t.id);
+    let mut out: Vec<String> = crate::cmd_checkout::member_tree(store, &t.id)
+        .and_then(|tree| git(&tree, &["log", "HEAD", "-E", &grep, "--name-only", "--format=", "--max-count=200"]))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Ok(tg) = target(store, t, None) {
+        out.extend(changed_paths(&tg, t, true));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The changes to a row's checks its log records, oldest first: the lines
+/// [`Edit::log_line`] wrote, from the who onward.
+pub(crate) fn changes_logged(t: &Task) -> Vec<String> {
+    let log = t.section("Log").unwrap_or_default();
+    log.lines().filter_map(|l| l.split_once(CHECKS_CHANGED).map(|(_, rest)| rest.trim().to_string())).collect()
 }
 
 /// A run that could not start: its entry is taken back and the reason said
@@ -3759,5 +4011,113 @@ mod tests {
     #[test]
     fn the_usage_line_names_inner_and_tiers() {
         assert!(USAGE.contains("--inner [<task>] [--run]") && USAGE.contains("--affected [<task>] [--run]") && USAGE.contains("--tiers"));
+    }
+
+    // ---- wsp-681: what a seat may change of its own checks -----------------
+
+    const BEFORE: &str = "- tests (60s): ls .\n- build (5m): true\n";
+
+    fn set_by(store: &Store, env: &util::Isolated, role: &crate::cmd_role::Role, own: Option<&str>, row: &str, text: &str, why: Option<&str>) -> i32 {
+        let file = env.path("set.md");
+        std::fs::write(&file, text).unwrap();
+        let from = file.display().to_string();
+        let mut flags = vec![("set", "true"), ("from", from.as_str())];
+        if let Some(w) = why {
+            flags.push(("why", w));
+        }
+        set_as(store, &Args::synth("check", &[row], &flags), row, USAGE, role, own)
+    }
+
+    fn declared(store: &Store) -> String {
+        store.find_task("pj-001").unwrap().section(SECTION).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_member_raises_a_budget_adds_a_cd_and_narrows_a_path_on_its_own_row_and_each_is_logged() {
+        let (env, store, _) = world("set-member", "", "exit 0\n");
+        let seat = crate::cmd_role::Role::Seat;
+        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", BEFORE, None), 0, "its first declaration needs no why");
+        let after = "- tests (180s): cd . && ls check.sh\n- build (5m): true\n";
+        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", after, None), 2, "a change says why");
+        assert_eq!(declared(&store).trim(), BEFORE.trim(), "nothing was written without one");
+        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", after, Some("vitest took 74s cold")), 0);
+        assert_eq!(declared(&store).trim(), after.trim());
+        let t = store.find_task("pj-001").unwrap();
+        let logged = changes_logged(&t);
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        let l = &logged[0];
+        assert!(l.starts_with("the row's member seat:"), "who: {l}");
+        assert!(l.contains("`tests (60s): ls .` → `tests (180s): cd . && ls check.sh`"), "old → new: {l}");
+        assert!(l.contains("raises its budget 60s → 180s") && l.contains("adds `cd . &&`") && l.contains("narrows `ls .` to `ls check.sh`"), "{l}");
+        assert!(l.ends_with("why: vitest took 74s cold"), "{l}");
+        // Adding a step is a member's too.
+        let more = format!("{after}- lint (30s): true\n");
+        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", &more, Some("the lint the row asked for")), 0);
+        assert!(changes_logged(&store.find_task("pj-001").unwrap())[1].contains("adds `lint`"));
+    }
+
+    #[test]
+    fn a_member_deleting_a_step_lowering_a_budget_replacing_a_command_or_setting_another_row_is_refused_with_who_may() {
+        let (env, store, _) = world("set-refused", "", "exit 0\n");
+        let seat = crate::cmd_role::Role::Seat;
+        assert_eq!(set_by(&store, &env, &crate::cmd_role::Role::Outside, None, "pj-001", BEFORE, None), 0);
+        let why = Some("it passes now");
+        for (bad, says) in [
+            ("- tests (60s): ls .\n", "`build` is deleted"),
+            ("- tests (30s): ls .\n- build (5m): true\n", "lowers its budget 60s → 30s"),
+            ("- tests (60s): echo ok\n- build (5m): true\n", "replaces `ls .` with `echo ok`"),
+            ("- tests (60s): ls README.md\n- build (5m): true\n", "replaces `ls .` with `ls README.md`"),
+        ] {
+            assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj-001", bad, why), 2, "{bad}");
+            assert_eq!(declared(&store).trim(), BEFORE.trim(), "{bad} was written");
+            let e = edits(BEFORE, bad, &touched_by(&store, &store.find_task("pj-001").unwrap()));
+            let refused: Vec<String> = e.iter().filter_map(|e| e.refused.clone()).collect();
+            assert!(refused.iter().any(|r| r.contains(says)), "{bad}: {refused:?}");
+            let no = crate::cmd_role::checks_allowed(&seat, "pj-001", Some("pj-001"), None, Some("pj"), &refused).unwrap_err();
+            assert!(no.contains(says) && no.contains("only Ed, or the primary seat may"), "the sentence names who may: {no}");
+        }
+        let raise = "- tests (90s): ls .\n- build (5m): true\n";
+        assert_eq!(set_by(&store, &env, &seat, Some("pj-002"), "pj-001", raise, why), 2, "another row's checks");
+        assert_eq!(set_by(&store, &env, &seat, None, "pj-001", raise, why), 2, "a seat bound to no row");
+        assert_eq!(set_by(&store, &env, &seat, Some("pj-001"), "pj", raise, why), 2, "a project's checks");
+        assert_eq!(declared(&store).trim(), BEFORE.trim());
+        assert!(changes_logged(&store.find_task("pj-001").unwrap()).is_empty(), "a refusal logs no change");
+    }
+
+    #[test]
+    fn a_governor_deletes_lowers_and_replaces_on_its_own_rows_and_on_no_other() {
+        let (env, store, _) = world("set-governor", "", "exit 0\n");
+        assert_eq!(set_by(&store, &env, &crate::cmd_role::Role::Outside, None, "pj-001", BEFORE, None), 0);
+        let after = "- tests (30s): echo ok\n";
+        let other = crate::cmd_role::Role::Governor("elsewhere".into());
+        assert_eq!(set_by(&store, &env, &other, None, "pj-001", after, Some("x")), 2, "not its list's row");
+        let gov = crate::cmd_role::Role::Governor("pj".into());
+        assert_eq!(set_by(&store, &env, &gov, None, "pj-001", after, Some("the build step is the barrier's")), 0);
+        assert_eq!(declared(&store).trim(), after.trim());
+        let logged = changes_logged(&store.find_task("pj-001").unwrap());
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged.iter().all(|l| l.starts_with("the governor of pj:")), "{logged:?}");
+        assert!(logged.iter().any(|l| l.contains("deletes `build`")) && logged.iter().any(|l| l.contains("lowers its budget")), "{logged:?}");
+    }
+
+    #[test]
+    fn narrowing_is_to_the_files_the_row_touched_and_a_filter_names_their_module() {
+        let touched = vec!["src/check.rs".to_string(), "web/src/pane/Pane.test.tsx".to_string(), "crates/trees/src/a.rs".to_string()];
+        assert!(narrows("cargo test", "cargo test check::", None, &touched));
+        assert!(narrows("cargo test", "cargo test check::tests::x", None, &touched));
+        assert!(!narrows("cargo test", "cargo test cmd_role::", None, &touched), "a module the row did not touch");
+        assert!(narrows("npx vitest run", "npx vitest run src/pane/Pane.test.tsx", Some("web"), &touched), "relative to its cd");
+        assert!(narrows("npx vitest run web/src", "npx vitest run web/src/pane", None, &touched), "a path replaced by a narrower one");
+        assert!(!narrows("npx vitest run web/src", "npx vitest run", None, &touched), "a path dropped is wider");
+        assert!(narrows("cargo test", "cargo test -p wsp-trees", None, &touched));
+        assert!(!narrows("cargo test", "true", None, &touched));
+        assert!(!narrows("cargo test", "cargo test --no-fail-fast", None, &touched), "a flag that is no narrowing");
+        assert_eq!(split_cd("cd web && npm test"), (Some("web"), "npm test"));
+        assert_eq!(split_cd("npm test"), (None, "npm test"));
+        let e = edits("- web (60s): cd web && npm test\n", "- web (60s): npm test\n", &touched);
+        assert!(e[0].refused.as_deref().is_some_and(|r| r.contains("drops its `cd web &&`")), "{e:?}");
+        let e = edits("- web (60s): cd web && npm test\n", "- web (60s): cd spikes/web && npm test\n", &touched);
+        assert!(e[0].refused.is_none() && e[0].said.contains("corrects its cd web → spikes/web"), "{e:?}");
+        assert!(edits(BEFORE, BEFORE, &touched).is_empty());
     }
 }

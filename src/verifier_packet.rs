@@ -129,6 +129,28 @@ pub(crate) fn summary_at(log: &str, sha: &str) -> Option<String> {
     before.or(reviews.last()).map(|(_, r)| r.clone())
 }
 
+/// What the verifier is shown of the row's checks changed after they were first
+/// written (wsp-681): each line before and after, who changed it, what the
+/// change does and why, from the row's log. Empty when none changed. A check
+/// loosened to pass is in front of the agent judging the work.
+pub(crate) fn checks_changed(t: &Task) -> String {
+    let changes = crate::check::changes_logged(t);
+    if changes.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "## Checks changed since they were written\n\n{} change(s) to {}'s `## Checks`, each old → new, who, what it does and why. \
+         Say in your verdict whether each one corrects the line or lets the work pass a check it should not.\n\n",
+        changes.len(),
+        t.id
+    );
+    for c in changes {
+        out.push_str(&format!("- {c}\n"));
+    }
+    out.push('\n');
+    out
+}
+
 /// The lines of the overview that state when it is done.
 fn stop_lines(overview: &str) -> Vec<&str> {
     overview.lines().filter(|l| l.contains("Done when") || l.contains("Stop")).collect()
@@ -180,6 +202,7 @@ pub(crate) fn build(store: &Store, t: &Task) -> Option<String> {
         summary_at(&log, &sha).unwrap_or_else(|| "(no review line is recorded for this commit)".into())
     ));
     out.push_str(&format!("## Declared checks at this commit\n\n```\n{}\n```\n\n", crate::check::plan_text(store, t, &tg).trim_end()));
+    out.push_str(&checks_changed(t));
 
     out.push_str(&format!(
         "## Diff\n\nNet diff of the {} file(s) this row touched, `{}..{}`.\n\n",
@@ -415,5 +438,36 @@ mod tests {
         assert_eq!(workspace(&dir, &sha, &f(&["web/src/a.ts"])).as_deref(), Some("web"));
         assert_eq!(workspace(&dir, &sha, &f(&["b.rs"])), None, "a Rust row has no packet");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-681: a check changed after it was written is in front of the agent
+    /// judging the work, in the packet and, for a row with none, in the order.
+    #[test]
+    fn the_verifier_sees_each_check_line_changed_before_and_after_with_its_reason() {
+        let (_env, store) = world("checks-changed");
+        react_fixture(&store);
+        for id in ["pj-001", "pj-002"] {
+            let mut t = store.find_task(id).unwrap();
+            assert_eq!(checks_changed(&t), "", "none changed, nothing said");
+            let e = crate::check::Edit {
+                old: Some("tests (60s): npm test".into()),
+                new: Some("tests (180s): cd web && npm test".into()),
+                said: "raises its budget 60s → 180s; adds `cd web &&`".into(),
+                refused: None,
+            };
+            t.log(&e.log_line("the row's member seat", "vitest took 74s cold"));
+            store.save_task(&t).unwrap();
+        }
+        let t = store.find_task("pj-001").unwrap();
+        let packet = build(&store, &t).unwrap();
+        assert!(packet.contains("## Checks changed since they were written"), "{packet}");
+        assert!(packet.contains("`tests (60s): npm test` → `tests (180s): cd web && npm test`"), "{packet}");
+        assert!(packet.contains("the row's member seat") && packet.contains("why: vitest took 74s cold"), "{packet}");
+        let order = crate::cycle::verifier_order(&store, &t);
+        assert_eq!(order.matches("## Checks changed").count(), 1, "said once, in the packet");
+        let rust = store.find_task("pj-002").unwrap();
+        let order = crate::cycle::verifier_order(&store, &rust);
+        assert!(order.contains("## Checks changed") && order.contains("why: vitest took 74s cold"), "a row with no packet: {order}");
+        assert!(crate::cycle::verifier_order_line(&store, &rust).contains("why: vitest took 74s cold"));
     }
 }

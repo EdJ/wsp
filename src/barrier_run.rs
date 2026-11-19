@@ -351,7 +351,24 @@ pub(crate) fn head_text(tasks: &[Task], g: &Group) -> String {
         let tail = if unheld.is_empty() { String::new() } else { format!(" — not held: {}", unheld.join("; ")) };
         out.push_str(&format!("- {m} · {title} · {} {caption}{tail}\n", p.state.as_str()));
     }
+    let changed = checks_changed_in(tasks, g);
+    if !changed.is_empty() {
+        out.push_str(&format!(
+            "- checks changed after they were written (wsp-681), on: {} — each row's log has the lines old → new, who and why\n",
+            changed.join(", ")
+        ));
+    }
     out
+}
+
+/// The members of `g` whose `## Checks` were changed after they were first
+/// written, as their logs record it.
+pub(crate) fn checks_changed_in(tasks: &[Task], g: &Group) -> Vec<String> {
+    g.members
+        .iter()
+        .filter(|m| tasks.iter().find(|t| &t.id == *m).is_some_and(|t| !crate::check::changes_logged(t).is_empty()))
+        .cloned()
+        .collect()
 }
 
 /// What the agent is given of a run, when there was one for this entry.
@@ -697,6 +714,11 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
         if g.stop_checks.is_empty() { String::new() } else { format!(", only {} stop check(s), which passed", g.stop_checks.len()) },
         util::contract(packet),
     );
+    let changed = checks_changed_in(&store.tasks(), g);
+    let sentence = match changed.is_empty() {
+        true => sentence,
+        false => format!("{sentence} Checks changed after they were written, on: {} (each row's log has old → new, who and why).", changed.join(", ")),
+    };
     let caption = format!("all {} hold; {count} checks green, no stop prose", g.members.len());
     let dir = store.state_file("barrier");
     let file = dir.join(format!("{list}-verdict.md"));

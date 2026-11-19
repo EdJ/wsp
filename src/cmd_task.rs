@@ -1882,7 +1882,7 @@ pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&st
             for b in &bad {
                 eprintln!("  - {b}");
             }
-            eprintln!("  fix them with `wsp check {} --set -` (a note after the command goes outside its backticks)", t.id);
+            eprintln!("  fix them with `wsp check {} --set --why \"…\" -` (a note after the command goes outside its backticks)", t.id);
             return 2;
         }
         let calls = crate::check::calls_itself_in(&t.id, &crate::check::task_steps(&t));
@@ -1891,7 +1891,7 @@ pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&st
             for b in &calls {
                 eprintln!("  - {b}");
             }
-            eprintln!("  fix them with `wsp check {} --set -`", t.id);
+            eprintln!("  fix them with `wsp check {} --set --why \"…\" -`", t.id);
             return 2;
         }
     }

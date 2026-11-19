@@ -1487,7 +1487,7 @@ fn holding_barrier(
         let calls = crate::check::calls_itself_in(&t.id, &crate::check::task_steps(&t));
         if !calls.is_empty() {
             waiting.push(format!(
-                "{}'s check line calls its own check ({}) — `wsp check {} --set -` to fix it, then `wsp reopen {} \"what is owed\"`",
+                "{}'s check line calls its own check ({}) — `wsp check {} --set --why \"…\" -` to fix it, then `wsp reopen {} \"what is owed\"`",
                 s.id, calls.join("; "), s.id, s.id
             ));
         }
@@ -3455,12 +3455,21 @@ pub(crate) fn is_barrier(t: &Task, list: &str, at: usize) -> bool {
 /// what `wsp brief` shows in its seat. Composed from the member and the run it
 /// is in when it is asked, since a verifier has no row to keep it on.
 pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
-    let order = verifier_base(store, member);
     // A React row's verifier is given its packet (`compounding-104`); any other
     // row's order is what it was. Whole and multi-line, as `wsp brief` shows it.
+    // The checks changed since they were written are in the packet, or, with
+    // none, in the order (wsp-681).
     match crate::verifier_packet::build(store, member) {
-        Some(packet) => format!("{order}\n\n{packet}"),
-        None => order,
+        Some(packet) => format!("{}\n\n{packet}", verifier_base(store, member)),
+        None => with_checks_changed(verifier_base(store, member), member),
+    }
+}
+
+/// The order with the row's changed checks after it, when there are any.
+fn with_checks_changed(order: String, member: &Task) -> String {
+    match crate::verifier_packet::checks_changed(member) {
+        c if c.is_empty() => order,
+        c => format!("{order}\n\n{}", c.trim_end()),
     }
 }
 
@@ -3471,10 +3480,9 @@ pub(crate) fn verifier_order(store: &Store, member: &Task) -> String {
 /// row's packet is written to a file under the store, whole, and the line names
 /// it and says to read it first.
 pub(crate) fn verifier_order_line(store: &Store, member: &Task) -> String {
-    let line = crate::util::fold(&verifier_base(store, member));
     match crate::verifier_packet::file(store, member) {
-        Some(path) => format!("{line} {}", crate::verifier_packet::pointer(&path)),
-        None => line,
+        Some(path) => format!("{} {}", crate::util::fold(&verifier_base(store, member)), crate::verifier_packet::pointer(&path)),
+        None => crate::util::fold(&with_checks_changed(verifier_base(store, member), member)),
     }
 }
 
