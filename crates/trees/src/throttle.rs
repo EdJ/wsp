@@ -2968,7 +2968,10 @@ mod tests {
     #[test]
     fn a_spawner_with_no_cargo_on_its_path_leaves_the_seats_path_alone() {
         let rig = rig("throttle-no-cargo");
-        assert!(seat_env_in(&rig.state, "/usr/bin:/bin").is_empty());
+        // A PATH of an empty directory: no machine's /usr/bin (Arch has a cargo there).
+        let empty = rig.state.join("empty-path");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(seat_env_in(&rig.state, &empty.display().to_string()).is_empty(), "no tool on {}", empty.display());
     }
 
     #[test]
