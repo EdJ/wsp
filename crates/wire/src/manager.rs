@@ -263,15 +263,22 @@ pub(crate) fn sup_in_range(sup: Option<&Path>, range: WireRange, problems: &mut 
         notes.push("compound-sup not found ($COMPOUND_SUP or PATH) — nothing to check against the manager's wire range".into());
         return;
     };
-    // The VERSION it speaks is the top of the range it accepts.
-    match wsp_host::inproc::ask_wire_range(sup).and_then(Result::ok).map(|(_, v)| v) {
-        Some(v) if v < range.min || v > range.max => problems.push(format!(
-            "{} speaks wire {v}, outside the manager's range {}..{} — rebuild whichever is behind (`cargo build`, then `wsp install`)",
-            util::contract(sup),
-            range.min,
-            range.max
-        )),
-        Some(v) => notes.push(format!("compound-sup speaks wire {v}, inside the manager's {}..{}", range.min, range.max)),
+    // The manager speaks one version from its range to compound-sup, so the
+    // check is that the two ranges meet.
+    match wsp_host::inproc::ask_wire_range(sup).and_then(Result::ok) {
+        Some((lo, hi)) => {
+            let accepts = if lo == hi { format!("{hi}") } else { format!("{lo}..{hi}") };
+            if lo > range.max || range.min > hi {
+                problems.push(format!(
+                    "{} accepts wire {accepts}, outside the manager's range {}..{} — rebuild whichever is behind (`cargo build`, then `wsp install`)",
+                    util::contract(sup),
+                    range.min,
+                    range.max
+                ));
+            } else {
+                notes.push(format!("compound-sup accepts wire {accepts}, which meets the manager's {}..{}", range.min, range.max));
+            }
+        }
         None => notes.push(format!(
             "{} does not answer `wire-version` — its wire cannot be checked against the manager's {}..{}",
             util::contract(sup),
@@ -346,7 +353,7 @@ mod tests {
         assert!(health(&state, Some(&sup), version, &mut problems, &mut notes));
         assert!(problems.is_empty(), "{problems:?}");
         assert!(notes.iter().any(|n| n.contains("answers hello") && n.contains("testhost")), "{notes:?}");
-        assert!(notes.iter().any(|n| n.contains("inside the manager's")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("meets the manager's")), "{notes:?}");
 
         // A version that is not the manager's, and a sup outside its range.
         let (mut problems, mut notes) = (vec![], vec![]);
@@ -354,6 +361,13 @@ mod tests {
         health_of(&local, &read_record(&state).unwrap().1, Some(&off), "9.9.9", &mut problems, &mut notes);
         assert!(problems.iter().any(|p| p.contains("manager is version")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("outside the manager's range")), "{problems:?}");
+
+        // A newer sup that still accepts the manager's version is no problem.
+        let (mut problems, mut notes) = (vec![], vec![]);
+        let newer = fake_sup(&root, &format!("{range} {}", range + 5));
+        health_of(&local, &read_record(&state).unwrap().1, Some(&newer), version, &mut problems, &mut notes);
+        assert!(!problems.iter().any(|p| p.contains("outside the manager's range")), "{problems:?}");
+        assert!(notes.iter().any(|n| n.contains("meets the manager's")), "{notes:?}");
 
         // Another token is a refusal, said as one.
         let (mut problems, mut notes) = (vec![], vec![]);
