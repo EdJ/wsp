@@ -1126,7 +1126,13 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
         #[cfg(test)]
         crate::cycle::tests::RESEATED.with(|s| s.borrow_mut().push(scope.clone()));
     }
-    crate::cycle::launch_out(store, &["govern", &scope, "--reseat"]);
+    // A successor that never started is a failed reseat, said with its reason
+    // and backed off like one (`wsp-151`): without this the claim timed out in
+    // silence and was taken again, and a done list's held sentences read
+    // "nobody coming" only once the list closed.
+    if let Err(why) = crate::cycle::try_launch(store, &["govern", &scope, "--reseat"]) {
+        cmd_govern::reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` could not be started: {why}"));
+    }
 }
 
 /// What is in a scope's seat: somebody, nobody, or a reading nobody can give.
