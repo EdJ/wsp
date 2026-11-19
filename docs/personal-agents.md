@@ -168,11 +168,10 @@ settles an open question: each list's overview says what the person confirms bef
 
 A list has one `after`. `pa2-mandate` and `pa4-quorum` also need `mp3-commit` (its rights table and audit); their
 overviews say so. wsp-225, `pa2-mandate`'s first row, names wsp-192, `mp3-commit`'s gate row, in its `after` beside
-wsp-224, as a record of that wait and no more: a run does not hold a member on a row another list holds
-(src/after.rs), so nothing enforces it, and "`mp3-commit` is complete" stays something the person checks before
-planning `pa2-mandate`. `pa4-quorum` carries no wait of its own: it is after `pa3-filing`, which is after
-`pa2-mandate`, and so is covered through `pa2-mandate` only as far as `pa2-mandate` is, which is by that same check.
-The knowledge-layers lists rest on `pa1-tell`.
+wsp-224. That edge is a record and the run does not act on it: a run does not hold a member on a row another list
+holds (src/after.rs). So `pa2-mandate` stays at init until `mp3-commit` has landed and the person plans it (wsp-157
+says so). `pa4-quorum` carries no wait of its own: it is after `pa3-filing`, which is after `pa2-mandate`, and so is
+covered through `pa2-mandate` by that same hold. The knowledge-layers lists rest on `pa1-tell`.
 
 **Shape of each list.** A contract row first, in a group of its own (R5: docs/components.md, applied in
 docs/state-core.md section 6); then the pure rule in `wsp-machines`; then the server's path for it; then the CLI,
