@@ -161,19 +161,32 @@ settles an open question: each list's overview says what the person confirms bef
 | list | phase | gate (the spec's "done when") | groups | rows | after |
 |---|---|---|---|---|---|
 | `pa1-tell` | 1. Tell and ask between people's agents | "@Ed" reaches Ed's agent from another machine with Ed's machines off, is handed to Ed when he returns, and Ed's agent cannot be impersonated | 7 | wsp-215 … wsp-224, compound-react-031 | `mp2-workspaces` |
-| `pa2-mandate` | 2. The mandate | an agent asked for a private row refuses and says why | 5 | wsp-225 … wsp-232 | `pa1-tell` |
-| `pa3-filing` | 3. Filing and surfacing | a week of messages to Ed needs Ed only for what names him or needs a decision | 5 | wsp-233 … wsp-239, compound-react-032 | `pa2-mandate` |
-| `pa4-quorum` | 4. Quorum | a schedule question settles among three agents with no person asked, and a trunk question always reaches the people | 5 | wsp-240 … wsp-246, compound-react-033 | `pa3-filing` |
-| `pa5-org-scale` | 5. Org scale | none in the spec; wsp-251 proposes and measures one (fifty agents in five groups) | 3 | wsp-247 … wsp-251 | `pa4-quorum` |
+| `pa2-mandate` | 2. The mandate | an agent asked for a private row refuses and says why | 7 | wsp-225 … wsp-232, wsp-300 | `pa1-tell` |
+| `pa3-filing` | 3. Filing and surfacing | a week of messages to Ed needs Ed only for what names him or needs a decision | 6 | wsp-233 … wsp-239, compound-react-032 | `pa2-mandate` |
+| `pa4-quorum` | 4. Quorum | a schedule question settles among three agents with no person asked, and a trunk question always reaches the people | 7 | wsp-240 … wsp-246, compound-react-033 | `pa3-filing` |
+| `pa5-org-scale` | 5. Org scale | none in the spec; wsp-251 proposes and measures one (fifty agents in five groups) | 5 | wsp-247 … wsp-251 | `pa4-quorum` |
 
 A list has one `after`. `pa2-mandate` and `pa4-quorum` also need `mp3-commit` (its rights table and audit); their
 overviews say so. The knowledge-layers lists rest on `pa1-tell`.
 
-**Shape of each list.** A contract row first, in a group of its own (R5, docs/state-core.md section 6); then the pure
-rule in `wsp-machines` beside the CLI; then the server; then the agent's order and web-chrome; and last a gate row
+**Shape of each list.** A contract row first, in a group of its own (R5: docs/components.md, applied in
+docs/state-core.md section 6); then the pure rule in `wsp-machines`; then the server's path for it; then the CLI,
+which is driven against that server and so comes after it; then the agent's order and web-chrome; and last a gate row
 that proves the phase's "done when" against the real binaries in a sandbox (`tests/personal_agents.rs`), followed by
-a step only the person can do on the live instance. Groups run on `claude opus high`. The three design rows
-(wsp-225 the mandate, wsp-233 the surfacing rule, wsp-240 the proposal) run on `claude fable high`.
+a step only the person can do on the live instance. No group before the last stops for the person: what they confirm
+is in each list's "before group 1". Groups run on `claude opus high`. The three design rows (wsp-225 the mandate,
+wsp-233 the surfacing rule, wsp-240 the proposal) run on `claude fable high`.
+
+**Seams and waits.** Every row names its seam. Two rows share a group only where their seams differ, and a row whose
+done-when rests on another's work is `after` it: a CLI row after the server path it drives (wsp-220 after wsp-219,
+wsp-227 after wsp-300, wsp-242 after wsp-243), and rows on the server's command path one after another (all of
+`pa5-org-scale`). Where two rows write the same transition, one owns it and the other says so: handled-by-filing is
+wsp-235's and wsp-234 sends it; the agent's mandate table denies by default, and the row that builds a command adds
+its line.
+
+**Size.** The size check flagged 14 rows. Five are kept whole with the reason on the row (wsp-217, wsp-219, wsp-227,
+wsp-228, wsp-230). Nine cross layers and carry planned legs (wsp-221, wsp-223, wsp-234, wsp-236, wsp-243, wsp-245,
+wsp-247, wsp-249, wsp-250).
 
 **What is reused, not built again** (docs/state-core.md, docs/agent-manager.md, the multiplayer lists):
 
