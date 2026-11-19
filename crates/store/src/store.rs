@@ -4877,8 +4877,11 @@ mod tests {
     #[test]
     fn a_fresh_store_commits_with_no_global_git_identity() {
         let env = crate::util::isolated("git-identity");
+        // No identity, and none inferred: git on macOS otherwise builds one
+        // from the login name and hostname, and `git var` succeeds.
         let global = env.home().join("empty-gitconfig");
-        std::fs::write(&global, "").unwrap();
+        let no_identity = "[user]\n\tuseConfigOnly = true\n";
+        std::fs::write(&global, no_identity).unwrap();
 
         std::fs::create_dir_all(env.home().join("store")).unwrap();
         let store = without_identity(Store::at(env.home().join("store"), env.state()), &env.state(), &global);
@@ -4903,7 +4906,7 @@ mod tests {
 
         assert_eq!(log, format!("{GIT_NAME} <{GIT_EMAIL}>"), "the store's commit has its own identity");
         assert_eq!(name, "someone", "a key already set is kept");
-        assert_eq!(std::fs::read_to_string(&global).unwrap(), "", "the global config is never written");
+        assert_eq!(std::fs::read_to_string(&global).unwrap(), no_identity, "the global config is never written");
     }
 
     /// **`init` on a store whose commits already work changes nothing.** A
@@ -4913,9 +4916,11 @@ mod tests {
     fn an_existing_store_that_commits_keeps_its_signing_and_identity() {
         let env = crate::util::isolated("git-identity-works");
         let global = env.home().join("gitconfig");
-        // A signer that works: says it signed, writes a signature.
+        // A signer that works: says it signed, writes a signature. The status
+        // line follows a newline, as in gpg's output: git 2.35 looks for
+        // "\n[GNUPG:] SIG_CREATED " and misses it on stderr's first line.
         let signer = env.home().join("signer");
-        std::fs::write(&signer, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] SIG_CREATED ' >&2\necho sig\n").unwrap();
+        std::fs::write(&signer, "#!/bin/sh\ncat >/dev/null\nprintf '\\n[GNUPG:] SIG_CREATED \\n' >&2\necho sig\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
