@@ -666,6 +666,12 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         git(&["init", "-q"]);
+        // The store's own commits need an identity of the repository's: on a
+        // machine whose git cannot make one up (Linux, empty global config),
+        // the batch's commit is refused otherwise. Unsigned for the same reason.
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["add", "-A"]);
         git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]);
         let before: usize = git(&["rev-list", "--count", "HEAD"]).parse().unwrap();

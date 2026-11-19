@@ -482,7 +482,7 @@ pub(crate) fn sayings(store: &Store) -> BTreeMap<String, String> {
 /// nothing asked about is `doing`, so a `--json` read of finished work never
 /// opens a socket.
 ///
-/// Never in a test: herdr is found by socket, and a test asking it would read
+/// Never in a test: backend is found by socket, and a test asking it would read
 /// whatever this machine's agents are doing.
 pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> {
     let mut out = BTreeMap::new();

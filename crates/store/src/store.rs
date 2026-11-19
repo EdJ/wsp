@@ -271,7 +271,7 @@ fn stamp_of(m: &fs::Metadata) -> Option<Stamp> {
 /// [`Machine`]; see `Store::machines_live` for why the halves are apart.
 ///
 /// A struct rather than a bare `Value` because four different things read this
-/// — the tunnel supervisor that writes it, `herdr::call` picking a socket, the
+/// — the tunnel supervisor that writes it, `backend::call` picking a socket, the
 /// panel, and the reap guard that must not mistake unreachable for empty — and
 /// a field name mistyped in one of them would read as `false` rather than as
 /// an error.
@@ -396,7 +396,7 @@ impl Store {
     pub fn open() -> Store {
         // The default store is the developer's own, at `~/wsp`, and a test that
         // opens it is reading whoever is working today — which is how two tests
-        // of a fake herdr backend came to fail on a laptop being switched on.
+        // of a fake backend backend came to fail on a laptop being switched on.
         // The argument, and the helper, are in [`crate::util::isolated`];
         // this is the line that makes a test that reads the live store
         // impossible to write by accident rather than merely discouraged. It
@@ -650,7 +650,7 @@ impl Store {
     /// no faster parse to write. The cost is the reading.
     ///
     /// It is paid four times a second in the panel somebody is looking at.
-    /// Every herdr `pane.updated` marks that panel dirty — two a second per
+    /// Every backend `pane.updated` marks that panel dirty — two a second per
     /// working agent — and its 250 ms gate then rebuilds the frame from a
     /// fresh reading of all 285 files. That is what "the panel feels laggy"
     /// was, and the focused panel measured 4.1% of a core against 1.2% for the
@@ -2179,7 +2179,7 @@ impl Store {
     //
     // Three agents ran in this tree on 2026-08-15 and the window is a
     // millisecond wide, so this has probably already happened and been read as
-    // "herdr lost my claim". A lock file makes the whole cycle indivisible.
+    // "backend lost my claim". A lock file makes the whole cycle indivisible.
 
     fn lock_path(&self) -> PathBuf {
         self.state.join(".lock")
@@ -2317,6 +2317,28 @@ impl Store {
         });
     }
 
+    /// The file the daemon writes at the top of every pass of its loop,
+    /// holding the epoch second the pass began (wsp-035). `cycle.log` is
+    /// written only when a tick has something to say, so an idle fleet's log
+    /// is quiet for hours under a daemon that is ticking; this is written
+    /// whether or not anything happens, and is what `wip` under
+    /// `WSP_HOST=manager` (no `ps`) reads the daemon's liveness by. A plain
+    /// file, not a field of `daemon.json`: written every tick, it takes no lock.
+    pub const DAEMON_TICK: &'static str = "daemon.tick";
+
+    /// Stamp [`Store::DAEMON_TICK`] as of `now`. Best effort: a stamp that
+    /// could not be written is a daemon that reads as quiet, which is said,
+    /// never a tick lost.
+    pub fn stamp_daemon_tick(&self, now: i64) {
+        let _ = std::fs::write(self.state_file(Self::DAEMON_TICK), format!("{now}\n"));
+    }
+
+    /// The epoch second of the last pass the daemon stamped, or `None` where no
+    /// daemon new enough to write one has run against this store.
+    pub fn daemon_tick(&self) -> Option<i64> {
+        std::fs::read_to_string(self.state_file(Self::DAEMON_TICK)).ok()?.trim().parse().ok()
+    }
+
     /// Where a store with nothing said about it keeps its state. The daemon
     /// needs it to read another process's environment the way [`Store::open`]
     /// read its own — a `wsp daemon` with no `WSP_STATE` is on this one.
@@ -2366,12 +2388,12 @@ impl Store {
     // ---- claims -----------------------------------------------------------
     //
     // A binding says which *pane* is on a task, and a pane is the most
-    // perishable identifier herdr has: it dies with its workspace, and one
+    // perishable identifier backend has: it dies with its workspace, and one
     // cascade of `pane.exited` once cleared every binding on this machine at a
     // stroke.
     //
     // A claim says which *workspace* the task is being worked in, keyed on
-    // things herdr persists in its own session file: the workspace id, and as a
+    // things backend persists in its own session file: the workspace id, and as a
     // fallback its label and cwd. The fallback is load-bearing in both
     // directions — it finds a workspace rebuilt under a new id, and it is the
     // only thing that can tell a workspace apart from a later one that was
@@ -2402,7 +2424,7 @@ impl Store {
     // A row here is not a claim to work: an agent with a row and no claim is
     // exactly what `cmd_govern::occupant` is going to look for when it stops
     // asking which workspace somebody is in — *unassigned* is a fact about
-    // wsp's own record, where "the same workspace" was a fact about herdr's
+    // wsp's own record, where "the same workspace" was a fact about backend's
     // furniture.
 
     /// agent id -> agent record
@@ -2643,7 +2665,7 @@ impl Store {
     // rides the brief instead, like every other fact a successor needs, and it
     // is cleared by `despawn` when the pane it names actually goes.
     //
-    // State rather than store: a pane id is herdr's and dies with the session,
+    // State rather than store: a pane id is backend's and dies with the session,
     // the same argument the seat record itself makes.
 
     /// scope -> handover record: `{from, to, since}`, plus `{failed,
@@ -3021,7 +3043,7 @@ impl Store {
     // ---- what a pane is called, at full length ----------------------------
     //
     // A label on the wire is cut to `cmd_agent::LABEL_MAX`, and the rule is
-    // right: a herdr sidebar is 26 columns, and a paragraph is not a name. What
+    // right: a backend sidebar is 26 columns, and a paragraph is not a name. What
     // was wrong is that the cut copy was the *only* copy — the pane label, the
     // workspace name and the `task` token all held 44 characters and the store
     // held nothing longer, so `panel --full`, which has a hundred columns to
@@ -3044,9 +3066,9 @@ impl Store {
     //
     // **And the sentence itself, which is not a statement about a label.**
     // `said` is what the agent typed and `task` is the task its seat held when
-    // it did (absent when it held none). It used to be kept only once herdr
+    // it did (absent when it held none). It used to be kept only once backend
     // had taken the name, which read the record as a reading of what one
-    // renderer drew — so on a seat no herdr names, which since `compound-112`
+    // renderer drew — so on a seat no backend names, which since `compound-112`
     // is every seat on the ordinary machine, `wsp say` refused and the
     // sentence went nowhere (wsp-115, wsp-122). The two halves are two facts
     // with two invalidations, and neither writer touches the other's keys:
@@ -3138,7 +3160,7 @@ impl Store {
     // binding with no task in it is a state every reader of bindings —
     // `doctor`'s quiet sweep, `reconcile`, a room's rename — would have to
     // learn to skip. Where a claim is made, `spawn` copies the record onto it,
-    // which is what carries it to a new seat across a herdr restart
+    // which is what carries it to a new seat across a backend restart
     // (`cmd_agent::reconcile`) and a `wsp resume`.
 
     /// seat -> `{ seat, scope }`: the seat a `wsp spawn` was run from, and
@@ -3176,9 +3198,42 @@ impl Store {
         dropped
     }
 
+    /// Mark `seat`'s record ended at `at` (wsp-094): `wsp despawn` on a seat
+    /// that is already gone, so the reading stops drawing it and the daemon's
+    /// sweep forgets it. A seat with no record gets one holding only the end.
+    /// The next `seat.started` of the same id clears it.
+    pub fn end_spawned(&self, seat: &str, at: i64) {
+        self.update_json("spawned.json", |s| {
+            let rec = s.entry(seat.to_string()).or_insert_with(|| json!({}));
+            if !rec.is_object() {
+                *rec = json!({});
+            }
+            rec["ended"] = json!({ "at": at });
+        });
+    }
+
+    /// Forget every trace of `seats` that keeps them in a reading
+    /// (wsp-094): their `spawned.json` and `seat-since.json` entries. For
+    /// seats that are gone with nothing to say; `seat-memory.json` is a
+    /// report's record over thirty days and is not touched.
+    pub fn forget_seats(&self, seats: &[String]) -> usize {
+        if seats.is_empty() {
+            return 0;
+        }
+        let mut dropped = 0;
+        for file in ["spawned.json", "seat-since.json"] {
+            self.update_json(file, |m| {
+                let before = m.len();
+                m.retain(|k, _| !seats.contains(k));
+                dropped += before - m.len();
+            });
+        }
+        dropped
+    }
+
     // ---- since when a seat has been in its state -----------------------
     //
-    // `wsp-250`. herdr numbers a state change (`state_change_seq`) and does
+    // `wsp-250`. backend numbers a state change (`state_change_seq`) and does
     // not date it, and compound's seat directory dates only its last write, so
     // nothing on the port says when a seat began its turn or stopped. wsp
     // dates it itself, the first time a census it reads sees the change: every
@@ -3192,7 +3247,7 @@ impl Store {
     /// same state.
     ///
     /// `from` is the source a seat was read from — a backend, and the machine
-    /// when it is not this one (`herdr`, `herdr@mb2`, `compound`) — and is
+    /// when it is not this one (`backend`, `backend@mb2`, `compound`) — and is
     /// what decides whether a seat missing from `seen` is gone: its entry is
     /// dropped only when `answered` says its own source answered this reading
     /// without it. A far machine that was silent, or not asked at all because
@@ -3300,16 +3355,16 @@ impl Store {
     //
     // Nothing here dials anything. The daemon's tunnel supervisor is the only
     // writer (wsp-045); everybody else — the panel, the machines view,
-    // `herdr::call` picking a socket — reads what it last wrote. A reader that
+    // `backend::call` picking a socket — reads what it last wrote. A reader that
     // probed for itself would be a second opinion on reachability, and two
     // opinions is exactly the ambiguity that makes an offline machine look
     // like an empty one.
 
-    /// Where the daemon forwards a machine's herdr socket to.
+    /// Where the daemon forwards a machine's backend socket to.
     ///
     /// Named here rather than by whoever gets there first, because the process
     /// that creates it (the daemon) and the process that connects to it (any
-    /// `herdr::call` on an `@machine` id) are different processes that never
+    /// `backend::call` on an `@machine` id) are different processes that never
     /// speak — a convention each spelled out for itself would be a bug nobody
     /// could see. Under the state dir and not `/tmp`, so it goes when the
     /// state does.
@@ -3318,7 +3373,7 @@ impl Store {
     /// macOS, and `~/.local/state/wsp/sock/<name>.sock` leaves room for a long
     /// home directory and a long machine name without either being the thing
     /// that breaks.
-    // Unused until the tunnel supervisor lands (wsp-045) and `herdr::call`
+    // Unused until the tunnel supervisor lands (wsp-045) and `backend::call`
     // learns to route on `@machine` (wsp-046). Here now because it is the
     // agreement between those two, and an agreement written down after the
     // fact is one that was guessed at twice.
@@ -3933,8 +3988,8 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 ///
 /// So: durable for anything a person would have to type again, and this for
 /// state that is only true while a process is up and is rewritten by that
-/// process within a tick. The surface's last frame is the case it was added
-/// for — see `panel::surface_frame`.
+/// process within a tick, or is a cache the next reading rebuilds — the task
+/// heads file is the case — see `Store::save_heads`.
 pub fn write_atomic_unsynced(path: &Path, contents: &str) -> std::io::Result<()> {
     replace(path, contents, false)
 }
@@ -4082,7 +4137,7 @@ mod tests {
 
     /// The daemon marker is state and not work: a daemon starting must not look
     /// to every panel on the machine like something changed in the store, or
-    /// every herdr restart would repaint twenty-two of them for nothing. And it
+    /// every backend restart would repaint twenty-two of them for nothing. And it
     /// keys on the state directory, which is what makes a sandbox's daemon and
     /// the live one two daemons rather than a fight — the argument is in
     /// [`crate::daemon`].
@@ -4850,15 +4905,51 @@ mod tests {
         crate::testkit::store(tag)
     }
 
+    /// A store whose git children run git itself, not whatever wraps it on
+    /// PATH. The fleet's shim (`~/.local/state/wsp/shims/git`) runs
+    /// `git -c commit.gpgsign=false`, and a `-c` beats every config file and
+    /// `GIT_CONFIG_*` a test sets, so a test about signing never sees its own
+    /// signing config. Git's exec-path holds the real binary (`git-core/git`):
+    /// put first on the children's PATH, it is what `git` resolves to there,
+    /// whatever sits in front of it in the process's own PATH. Asked once,
+    /// through whatever `git` is; without a `git` there, PATH is left alone.
+    fn real_git(store: Store) -> Store {
+        static PATH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        let path = PATH.get_or_init(|| {
+            let out = std::process::Command::new("git").arg("--exec-path").output().ok()?;
+            let dir = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            if !out.status.success() || !dir.join("git").is_file() {
+                return None;
+            }
+            let rest = std::env::var_os("PATH").unwrap_or_default();
+            std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&rest))).ok()
+        });
+        match path {
+            Some(p) => store.with_git_env("PATH", Some(p.as_os_str())),
+            None => store,
+        }
+    }
+
     /// A store whose git children see a machine with no git identity at all:
     /// an empty global config, no system config, no identity in the
-    /// environment. Set on the store's own children, so the process
-    /// environment other tests read is never touched.
+    /// environment, and no identity guessed from the machine. Set on the
+    /// store's own children, so the process environment other tests read is
+    /// never touched.
+    ///
+    /// Without `user.useConfigOnly` git makes an identity up from the login
+    /// name and the host name (`jesper@Jespers-MacBook-Pro.local`), so on any
+    /// host whose name has a dot "no identity" would still commit. It goes in
+    /// through `GIT_CONFIG_*` rather than the global file, which the tests
+    /// assert is never written; a test that sets `GIT_CONFIG_KEY_0` itself
+    /// replaces it.
     fn without_identity(store: Store, home: &std::path::Path, global: &std::path::Path) -> Store {
-        let mut store = store
+        let mut store = real_git(store)
             .with_git_env("HOME", Some(home.as_os_str()))
             .with_git_env("GIT_CONFIG_GLOBAL", Some(global.as_os_str()))
-            .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")));
+            .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")))
+            .with_git_env("GIT_CONFIG_COUNT", Some(std::ffi::OsStr::new("1")))
+            .with_git_env("GIT_CONFIG_KEY_0", Some(std::ffi::OsStr::new("user.useConfigOnly")))
+            .with_git_env("GIT_CONFIG_VALUE_0", Some(std::ffi::OsStr::new("true")));
         for k in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"] {
             store = store.with_git_env(k, None);
         }
@@ -4915,11 +5006,7 @@ mod tests {
         let global = env.home().join("gitconfig");
         // A signer that works: says it signed, writes a signature.
         let signer = env.home().join("signer");
-        std::fs::write(&signer, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] SIG_CREATED ' >&2\necho sig\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        wsp_testkit::script(&signer, "#!/bin/sh\ncat >/dev/null\necho '[GNUPG:] SIG_CREATED ' >&2\necho sig\n");
         std::fs::write(
             &global,
             format!(
@@ -4929,7 +5016,7 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(env.home().join("store")).unwrap();
-        let store = Store::at(env.home().join("store"), env.state())
+        let store = real_git(Store::at(env.home().join("store"), env.state()))
             .with_git_env("HOME", Some(env.state().as_os_str()))
             .with_git_env("GIT_CONFIG_GLOBAL", Some(global.as_os_str()))
             .with_git_env("GIT_CONFIG_NOSYSTEM", Some(std::ffi::OsStr::new("1")));

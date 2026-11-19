@@ -81,7 +81,7 @@ impl Index {
     /// [`effective_tags`](Index::effective_tags) answers *what* is inherited
     /// and drops *where from* on the floor, which is the half you need when the
     /// answer is "you cannot take that off here". A task under `render` reads
-    /// `rust herdr` and owns neither; being told the tag comes from `wsp` is
+    /// `rust backend` and owns neither; being told the tag comes from `wsp` is
     /// the difference between a refusal and a refusal you can act on.
     pub fn tag_source(&self, project: &str, tag: &str) -> Option<String> {
         let mut guard: HashSet<String> = HashSet::new();
@@ -911,14 +911,14 @@ mod tests {
     }
 
     /// The walk that makes the tag picker honest. A task under `render` reads
-    /// `rust herdr` in `wsp show` and owns neither: `render` owns nothing
+    /// `rust backend` in `wsp show` and owns neither: `render` owns nothing
     /// either, and both come from `wsp`, two levels up. Answering "inherited"
     /// without answering "from where" leaves the picker able to refuse and
     /// unable to say what to do instead.
     #[test]
     fn a_tag_is_traced_to_the_project_that_actually_carries_it() {
         let mut wsp = Project::new("wsp");
-        wsp.tags = vec!["rust".into(), "herdr".into()];
+        wsp.tags = vec!["rust".into(), "backend".into()];
         let mut render = Project::new("render");
         render.parent = Some("wsp".into());
         let mut data = Project::new("data");
@@ -927,11 +927,11 @@ mod tests {
         let index = Index::new(vec![wsp, render, data]);
 
         assert_eq!(index.tag_source("render", "rust").as_deref(), Some("wsp"));
-        assert_eq!(index.tag_source("render", "herdr").as_deref(), Some("wsp"));
+        assert_eq!(index.tag_source("render", "backend").as_deref(), Some("wsp"));
         // Nearest wins: `data` carries `rust` of its own, so that is where a
         // task under it would be sent to change it.
         assert_eq!(index.tag_source("data", "rust").as_deref(), Some("data"));
-        assert_eq!(index.tag_source("data", "herdr").as_deref(), Some("wsp"));
+        assert_eq!(index.tag_source("data", "backend").as_deref(), Some("wsp"));
         // A tag nobody up the chain carries is the task's own, or nobody's.
         assert_eq!(index.tag_source("render", "dsp"), None);
         assert_eq!(index.tag_source("nosuch", "rust"), None);

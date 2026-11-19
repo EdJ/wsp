@@ -1,48 +1,22 @@
-//! The processes on this machine, as `ps` lists them.
+//! The processes on this machine, as `ps` lists them: the reading of its
+//! output. The `ps` itself is the host's (`wsp_wire::host::Host::table`, and
+//! its `processes` and `parents`), so this module runs nothing.
 
-use crate::calls::Command;
-
-/// Every process this machine is running, as `(pid, ppid, the rest of the
+/// A `ps -A -E -o pid=,ppid=,command=` table as `(pid, ppid, the rest of the
 /// line)` — where "the rest" includes the environment.
 ///
-/// `ps -E` is how a process's environment is readable without a dependency or a
-/// `/proc`, and the environment is the only place a plugin's child says which
-/// herdr started it: its command line is `wsp daemon`, identical to the live
-/// one's. `ppid` comes back in the same call so the ancestors of this process
-/// can be ruled out of anything we are about to kill — a shell whose command
-/// line happens to mention the session is not a child of it.
-///
-/// Shared with `daemon`, which asks the same output the same two
-/// questions — what is running, and which store its environment points it at —
-/// and would otherwise keep a second copy of the parsing that was already
-/// silently wrong once (see [`ps_line`]).
-pub fn processes() -> Vec<(u32, u32, String)> {
-    let Ok(out) = Command::new("ps")
-        .args(["-A", "-E", "-o", "pid=,ppid=,command="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(ps_line)
-        .collect()
+/// Shared by everything that asks the same output the same two questions —
+/// what is running, and which store its environment points it at — which would
+/// otherwise keep second copies of the parsing that was already silently wrong
+/// once (see [`ps_line`]).
+pub fn read_processes(table: &str) -> Vec<(u32, u32, String)> {
+    table.lines().filter_map(ps_line).collect()
 }
 
-/// Every process as `(pid, ppid, "")`: the parent links alone, for a caller that
-/// only walks [`ancestors`]. Without `-E` the table is a fifth of the work to
-/// read, and an environment is what a caller of [`processes`] is there for.
-pub fn parents() -> Vec<(u32, u32, String)> {
-    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
+/// A `ps -A -o pid=,ppid=` table as `(pid, ppid, "")`: the parent links alone,
+/// for a caller that only walks [`ancestors`].
+pub fn read_parents(table: &str) -> Vec<(u32, u32, String)> {
+    table
         .lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
@@ -88,11 +62,35 @@ pub fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
     out
 }
 
+/// What a finished `ps -o lstart=,stat= -p <pid>` says. A defunct (zombie)
+/// process, its `stat` starting with `Z`, still has a pid and a start time but
+/// is no run: it reads as no process at all, so a barrier whose run died
+/// unreaped is not waited on forever. It says there is no such
+/// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
+/// too large for the system gets a complaint there with the same exit). Any
+/// other end — killed by a signal, or another exit status — says nothing about
+/// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
+/// itself fails with exit 1 and prints nothing cannot be told from a missing
+/// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
+pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
+    if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
+        return Err(());
+    }
+    let s = String::from_utf8_lossy(stdout);
+    let mut words = s.split_whitespace().collect::<Vec<_>>();
+    let Some(stat) = words.pop() else { return Ok(None) };
+    if stat.starts_with('Z') {
+        return Ok(None);
+    }
+    let s = words.join("_");
+    Ok((!s.is_empty()).then_some(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `herdr session stop` ends the server, not what it started: the daemon it
+    /// `backend session stop` ends the server, not what it started: the daemon it
     /// left was reparented to launchd and went on holding the live store. The
     /// environment is the only handle — the command line is `wsp daemon`, the
     /// same as the real one's — so the match has to be exact at the end of the
@@ -106,11 +104,11 @@ mod tests {
     #[test]
     fn a_padded_ps_line_is_still_a_process() {
         assert_eq!(
-            ps_line("  1628     1 /Users/e/wsp daemon HERDR_SESSION=wsp-w24"),
+            ps_line("  1628     1 /Users/e/wsp daemon WSP_BACKEND_SESSION=wsp-w24"),
             Some((
                 1628,
                 1,
-                "/Users/e/wsp daemon HERDR_SESSION=wsp-w24".to_string()
+                "/Users/e/wsp daemon WSP_BACKEND_SESSION=wsp-w24".to_string()
             ))
         );
         assert_eq!(

@@ -2,7 +2,7 @@
 name = "wsp-wire"
 version = "0.1.0"
 edition = "2021"
-description = "wsp's wire: the Place port and its backends (herdr, compound, supervisor), tunnel, far, launchd"
+description = "wsp's wire: the Place port and its backends (backend, compound, supervisor), tunnel, far, launchd"
 
 [lib]
 path = "src/lib.rs"
@@ -10,12 +10,16 @@ path = "src/lib.rs"
 [dependencies]
 serde_json = "1"
 wsp-base = { path = "../base" }
+wsp-host = { path = "../host" }
+wsp-host-api = { path = "../host-api" }
 wsp-store = { path = "../store" }
 
 [dev-dependencies]
+wsp-manager = { path = "../manager" }
 wsp-base = { path = "../base", features = ["test-support"] }
+wsp-host = { path = "../host", features = ["test-support"] }
 wsp-store = { path = "../store", features = ["test-support"] }
 wsp-testkit = { path = "../testkit" }
 
 [features]
-test-support = []
+test-support = ["wsp-host/test-support"]

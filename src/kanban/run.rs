@@ -3,13 +3,12 @@
 //! Everything impure: raw mode, the poll, and turning an [`Action`] into a
 //! command. The same bargain [`crate::detail`] makes — no event stream, because
 //! a board is a reader and a second subscriber per workspace would double
-//! herdr's fan-out for a pane that can wait a tenth of a second.
+//! backend's fan-out for a pane that can wait a tenth of a second.
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::herdr;
 use crate::input::{self, Key};
 use crate::panel::{self, to_ansi};
 use crate::resolve::Index;
@@ -150,7 +149,7 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
                 // to hand it to, and a board that closed anyway would take the
                 // task off the screen instead of putting it on one.
                 Action::Open { id } => {
-                    let ws = herdr::Env::read().workspace_id;
+                    let ws: Option<String> = None;
                     let focus = crate::detail::Focus::Task(id.clone());
                     // No pane of our own to split off: the board hands the
                     // task to the *sidebar's* detail pane and closes, so the
@@ -169,7 +168,7 @@ fn board_loop(store: &Store, scope: &Scope, mut show_done: bool) -> i32 {
                     }
                 }
                 Action::Edit { id } => {
-                    let ws = herdr::Env::read().workspace_id;
+                    let ws: Option<String> = None;
                     let msg = panel::pop_out(
                         &["edit".to_string(), id.clone()],
                         &id,

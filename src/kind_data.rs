@@ -79,7 +79,7 @@ impl Kind for DataKind {
     }
 
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &crate::agent_commands::pressing())
     }
 
     fn running(&self, _spawn: &Spawn) -> Option<bool> {

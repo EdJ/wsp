@@ -10,9 +10,9 @@ barrier_replay -> main: Args  # engine -> top
 check -> main: Args  # engine -> top
 closing -> main: Args  # engine -> top
 cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
-cmd_agent -> daemon: a_backend_answered, dead, health, running, surface_drawing  # seats -> top
+cmd_agent -> daemon: a_backend_answered, dead, health, running  # seats -> top
 cmd_agent -> main: Args  # seats -> top
-cmd_agent -> panel: BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL, glyph, install_if_adopted, reap_panels, surface_frame  # seats -> surface
+cmd_agent -> panel: BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL, glyph  # seats -> surface
 cmd_agent -> timeline: session_fixed, session_secs  # seats -> timeline
 cmd_attempts -> main: Args  # timeline -> top
 cmd_attend -> agent_commands: *, self  # engine -> seats
@@ -36,7 +36,7 @@ cmd_resume -> panel: stty  # seats -> surface
 cmd_sandbox -> main: Args  # seats -> top
 cmd_spawn -> main: Args  # seats -> top
 cmd_stamp -> main: Args  # seats -> top
-cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, unname_after_task, worked_line  # engine -> seats
+cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, worked_line  # engine -> seats
 cmd_task -> cmd_resume: thread_for_task  # engine -> seats
 cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
 cmd_task -> main: Args  # engine -> top
@@ -67,7 +67,6 @@ legs -> main: Args  # engine -> top
 memory -> cmd_spawn: local_backends  # base -> seats
 memory -> place: *, Seat, Seated, State  # base -> wire
 packet -> main: Args  # engine -> top
-panel -> daemon: surface_drawing, wsp_panes  # surface -> top
 panel -> main: Args  # surface -> top
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats

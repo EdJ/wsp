@@ -6,7 +6,7 @@
 //! splitting the data from its drawing would put one change in two files every
 //! time.
 //!
-//! Nothing here talks to herdr or the store, and nothing here *names* herdr:
+//! Nothing here talks to backend or the store, and nothing here *names* backend:
 //! [`collect`] takes a [`Snapshot`] in, whose pane rows are wsp's own
 //! [`AgentRef`], so the same rows come out on a laptop with nothing running and
 //! a renderer handed them is not handed the runner's structs.
@@ -106,12 +106,12 @@ pub(super) const WL_BARRIER_AT: usize = 86;
 /// up. The store holds the other half of it. A pane still holding a task that
 /// is `doing` has stopped part-way through and is waiting on you; one holding a
 /// task at `blocked` is waiting on a decision that is at least written down; one
-/// holding nothing is waiting for work. One reading from herdr, three different
+/// holding nothing is waiting for work. One reading from backend, three different
 /// answers.
 ///
 /// **The two `Blocked`s in this file are not the same thing, and the second one
 /// arrived late.** [`AgentState::Blocked`] here means the *task* carries a
-/// written question. herdr also has an `agent_status: "blocked"`, which means a
+/// written question. backend also has an `agent_status: "blocked"`, which means a
 /// dialog on that pane has the keyboard right now — a permission request, a
 /// trust prompt — and until robustness-083 it fell through to
 /// [`AgentState::Quiet`] and drew as the dimmest row on the screen. It is the
@@ -147,11 +147,11 @@ pub(crate) enum AgentState {
     /// row the whole section exists to show.
     Spare,
     Working,
-    /// herdr says it does not know, or has not said at all, so nothing here is
+    /// backend says it does not know, or has not said at all, so nothing here is
     /// going to pretend to. Mostly a pane whose agent has not spoken since it
     /// started.
     ///
-    /// Narrower than it was: `done` and herdr's own `blocked` both used to land
+    /// Narrower than it was: `done` and backend's own `blocked` both used to land
     /// here, and neither is an absence of information — one is a finished turn
     /// and the other a dialog waiting for a keypress. Drawing the two states we
     /// know most about as the one we know nothing about is what this row is for
@@ -209,7 +209,7 @@ pub(super) struct Census {
     pub(super) held: Option<String>,
 }
 
-/// Read the three halves together: what herdr says the pane is doing, what the
+/// Read the three halves together: what backend says the pane is doing, what the
 /// store says it is holding while it does it, and whether it is sitting in a
 /// project's slot.
 ///
@@ -220,8 +220,8 @@ pub(super) struct Census {
 /// wsp-063 and the mark did not, so the surface a person actually looks at
 /// went on drawing the seat as `←` — the loudest row on the screen, meaning
 /// nothing, all night.
-pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) -> AgentState {
-    match herdr_state {
+pub(crate) fn agent_state(backend_state: &str, holds: Option<Status>, seat: bool) -> AgentState {
+    match backend_state {
         // A working custodian is working: it is reading a diff or writing a
         // task up, and there is as little to do about it as about any other
         // busy agent. The seat only decides what its *silence* means.
@@ -229,16 +229,16 @@ pub(crate) fn agent_state(herdr_state: &str, holds: Option<Status>, seat: bool) 
         // Before the idle arms: a far seat on a silent machine is held, and the
         // panel must not read it as spare or as having nothing to say.
         "unreachable" => AgentState::Unreachable,
-        // `done` is a third value herdr sends and nothing here knew about. It
+        // `done` is a third value backend sends and nothing here knew about. It
         // is a turn ending rather than an agent leaving: 120s of the event
         // stream held three `working -> done` and three `done -> idle`, and
         // forty one-second samples of `pane.list` never caught a pane in it at
         // all. So it means what `idle` means, and mapping it to `Quiet` —
-        // "herdr says neither working nor idle, so nothing here will pretend to
+        // "backend says neither working nor idle, so nothing here will pretend to
         // know" — would draw the one moment we know most about as the one we
         // know nothing about. Which the panel is now far likelier to sample,
         // since a status change is what it refetches on.
-        // herdr's own `blocked`: a dialog has the keyboard on that pane. Read
+        // backend's own `blocked`: a dialog has the keyboard on that pane. Read
         // before the seat, because a custodian stopped on a permission prompt is
         // not resting between agents — it is the one case where a governor's
         // silence is a fault, and the case a night of sequencing dies in.
@@ -306,7 +306,7 @@ pub(super) enum Row {
         /// the two are not the same thing and the difference is exactly what
         /// `t` has to draw. `wsp show` and the detail pane merge them, which is
         /// right for reading and wrong for editing: a task under `render` reads
-        /// `rust herdr` and owns neither, so a picker that offered only its own
+        /// `rust backend` and owns neither, so a picker that offered only its own
         /// tags showed `rust` as *absent* on a task every other surface says is
         /// tagged `rust` — and removing it looked broken rather than
         /// impossible.
@@ -342,7 +342,7 @@ pub(super) enum Row {
     Section { key: String, label: String, count: usize, collapsed: bool },
     /// `state` is what the pane is waiting for, and is carried on every agent
     /// row rather than only the ones standing alone: the tree used to draw an
-    /// agent from herdr's two words, so a pane stopped in front of you and a
+    /// agent from backend's two words, so a pane stopped in front of you and a
     /// pane stopped behind a question both came out as the same grey `○` —
     /// the answer the agents view had all along, two lines further down.
     ///
@@ -1236,7 +1236,7 @@ impl Ui {
 
 /// Everything `collect` reads, gathered into one value.
 ///
-/// `collect` used to call the store and herdr itself, which meant the only way
+/// `collect` used to call the store and backend itself, which meant the only way
 /// to see a frame was to have both running. Taking the inputs as data instead
 /// lets a fixture stand one up and render it offline — the whole point of the
 /// snapshot backend.
@@ -1261,7 +1261,7 @@ pub struct Snapshot {
     pub agents: std::collections::BTreeMap<String, serde_json::Value>,
     /// task id -> claim record. Read for one field, `claimed_at`: how long a
     /// pane has been holding what it holds is the difference between an agent
-    /// working and an agent stuck, and it is the one fact herdr cannot supply.
+    /// working and an agent stuck, and it is the one fact backend cannot supply.
     pub claims: std::collections::BTreeMap<String, serde_json::Value>,
     /// The raised hands, oldest first: somebody has asked to be looked at, and
     /// said why. Machine-local state like the claims beside it, and the one
@@ -1435,7 +1435,7 @@ pub(super) fn task_rows(
         let a = agent_for_task(&t.id);
         let needs_you = crate::cmd_govern::needs_a_person(
             // See `live::AgentRef::stopped`: `state == "idle"` was one of the
-            // three words herdr has for a pane running no turn, and it is not
+            // three words backend has for a pane running no turn, and it is not
             // the common one.
             a.as_ref().map(|a| a.stopped()).unwrap_or(false),
             t.status() == Status::Doing,
@@ -1483,7 +1483,7 @@ pub(super) fn task_rows(
         let a = agent_for_task(&t.id);
         let needs_you = crate::cmd_govern::needs_a_person(
             // See `live::AgentRef::stopped`: `state == "idle"` was one of the
-            // three words herdr has for a pane running no turn, and it is not
+            // three words backend has for a pane running no turn, and it is not
             // the common one.
             a.as_ref().map(|a| a.stopped()).unwrap_or(false),
             t.status() == Status::Doing,
@@ -3676,7 +3676,7 @@ mod tests {
         assert_eq!(status_mark(Status::Parked), (Style::Dim, glyph::PARKED));
     }
 
-    /// herdr's `blocked` is a dialog holding the keyboard on that pane, and it
+    /// backend's `blocked` is a dialog holding the keyboard on that pane, and it
     /// used to fall through to `Quiet` — the dimmest row on the screen, meaning
     /// "nothing here will pretend to know", for the one state a person clears
     /// in a single keystroke.
@@ -3704,7 +3704,7 @@ mod tests {
         assert_ne!(
             agent_state("blocked", Some(Status::Doing), false),
             AgentState::Quiet,
-            "the state this was drawn as, for as long as herdr has been sending it"
+            "the state this was drawn as, for as long as backend has been sending it"
         );
         // And the task-blocked reading is untouched: same attention, different
         // action, so they may not be folded into one another.
@@ -4118,7 +4118,7 @@ mod tests {
         assert_eq!(seated, ["w1:p2"], "the pane that took the seat, and only that one");
     }
 
-    /// What `Z` is for. The label herdr holds is 44 characters because a
+    /// What `Z` is for. The label backend holds is 44 characters because a
     /// sidebar is 26 columns wide; the row is built at full length and the
     /// renderer cuts it to whatever the pane it is drawn in has, which for
     /// `panel --full` is the width of the whole workspace.
@@ -4157,7 +4157,7 @@ mod tests {
 
         // And the guard that makes the long copy safe to keep: it describes one
         // label, so a pane wearing anything else is drawn as what it wears. A
-        // name that disagrees with herdr's is worse than a short one.
+        // name that disagrees with backend's is worse than a short one.
         snap.panes[0].label = "claude".to_string();
         let ui = collect(&snap, &View { agents: true, ..Default::default() });
         let title = ui

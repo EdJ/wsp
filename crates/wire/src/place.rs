@@ -1,7 +1,7 @@
 //! The place-work port: what wsp asks of whatever is running its agents.
 //!
 //! The contract robustness-024 was opened to write. `wsp spawn` is on it —
-//! `place_herdr` is the first backend and the fake behind a socket is the
+//! `place_backend` is the first backend and the fake behind a socket is the
 //! second — and the rest of the call sites are robustness-018's, still to move.
 //! Read it as the answer to one question: **when wsp puts an agent on a piece
 //! of work, what does it actually need from the thing underneath?**
@@ -11,7 +11,7 @@
 //! > start an agent on this task, in this directory; give me a handle; tell me
 //! > its state; let me send it a prompt; tell me when it stops.
 //!
-//! herdr satisfies that by creating a workspace and splitting a pane. A bare
+//! backend satisfies that by creating a workspace and splitting a pane. A bare
 //! process supervisor satisfies it by forking. A web runtime satisfies it
 //! however it does. **None of them has to pretend to have panes**, and that is
 //! the whole of what this file is for — today `place work` means
@@ -30,16 +30,16 @@
 //!
 //! # What this port is not
 //!
-//! There are **two** herdr ports, not one (decision on robustness-026). This is
+//! There are **two** backend ports, not one (decision on robustness-026). This is
 //! the place-work port. The other is the arrange-panes port — `pane.split`,
 //! `pane.close`, `pane.focus`, `pane.layout`, `pane.swap`, `pane.send_text`,
 //! `tab.create`, `tab.close`, `tab.focus`, `workspace.focus` — which belongs to
 //! robustness-027. Those ten verbs are what a program does when it *lives inside*
 //! a multiplexer as a pane, and every one of their call sites is in `panel/` or
-//! `detail/` bar one, so they are the arrange-panes port's herdr adapter rather
+//! `detail/` bar one, so they are the arrange-panes port's backend adapter rather
 //! than anything wsp needs from a backend.
 //!
-//! The split is between what wsp *means*, not between herdr methods:
+//! The split is between what wsp *means*, not between backend methods:
 //! [`Place::stop`] and the arrange port's close are both `pane.close` on this
 //! backend, and are still two verbs, because one ends somebody's work and the
 //! other tidies a viewport. A method can serve both ports; a verb cannot.
@@ -54,26 +54,26 @@
 //!
 //! # The three fates of the seven verbs `place work` means today
 //!
-//! robustness-022 measured the place-work group at seven herdr methods. They do
+//! robustness-022 measured the place-work group at seven backend methods. They do
 //! not have one fate, they have three, and telling them apart is most of the
 //! design:
 //!
-//! | herdr method | fate |
+//! | backend method | fate |
 //! |---|---|
 //! | `workspace.create` | ported — [`Place::open`] |
 //! | `agent.start` | ported — [`Place::start`] |
 //! | `agent.prompt` | ported — [`Place::tell`] |
-//! | `workspace.rename` | **demoted** into the herdr adapter |
-//! | `pane.rename` | **demoted** into the herdr adapter, and split |
+//! | `workspace.rename` | **demoted** into the backend adapter |
+//! | `pane.rename` | **demoted** into the backend adapter, and split |
 //! | `workspace.report_metadata` | **deleted** |
 //! | `pane.report_metadata` | **deleted** |
 //!
 //! **Deleted** is the easy pair and robustness-018's correction already had it
 //! right, understated: the metadata is not merely display-only, it is
-//! *write-only*. `Workspace.tokens` is parsed at `herdr.rs:328` and read
+//! *write-only*. `Workspace.tokens` is parsed at `backend.rs:328` and read
 //! nowhere in the tree, and `Pane` has no `tokens` field at all — so wsp pushes
 //! six workspace tokens and four pane tokens per sync and never asks for one
-//! back. They exist to draw herdr's sidebar, which under the four-part
+//! back. They exist to draw backend's sidebar, which under the four-part
 //! partition is the renderer's job (part 4) and not a capability any backend
 //! owes us.
 //!
@@ -84,11 +84,11 @@
 //! reconcile's rebinding when an id has changed (`1344`),
 //! `resolve::claimed_project` (`resolve.rs:410`) and the `project_for_label`
 //! fallback (`resolve.rs:466`). Stop writing it and claims resolve to the wrong
-//! workspace. But *why* is it a secondary key? Because herdr's ids are
+//! workspace. But *why* is it a secondary key? Because backend's ids are
 //! perishable and wsp had nothing durable to hold. The first duty of this port
 //! is a durable handle ([`Seat`]) — so the label-as-key is not ported and not
-//! deleted, it is demoted: **the herdr adapter owes a durable seat, and if
-//! herdr cannot supply one, re-finding it by label is how the adapter keeps its
+//! deleted, it is demoted: **the backend adapter owes a durable seat, and if
+//! backend cannot supply one, re-finding it by label is how the adapter keeps its
 //! promise.** That is the adapter's private business, exactly where the 16-key
 //! cap and the 24h TTL already live.
 //!
@@ -100,8 +100,8 @@
 //! # What the daemon's refresh loop was for, and what happens to it
 //!
 //! `REFRESH` in `daemon.rs:17` is 15 minutes, and it exists solely because
-//! herdr expires metadata: `sync.rs:12` says 6h "refreshed by the daemon well
-//! inside herdr's 24h ceiling". Delete the tokens and that justification goes
+//! backend expires metadata: `sync.rs:12` says 6h "refreshed by the daemon well
+//! inside backend's 24h ceiling". Delete the tokens and that justification goes
 //! with them.
 //!
 //! One measured thing must not go with it silently. `force` does two jobs in
@@ -117,10 +117,10 @@
 //! Not here. `say` is not a port verb, and the answer robustness-026 gives is
 //! confirmed: the sentence belongs to the agent module's ephemeral state.
 //!
-//! The reason it looks like a herdr call today is an accident of ownership —
-//! herdr owns the label the sidebar draws, so the sentence was put where it
+//! The reason it looks like a backend call today is an accident of ownership —
+//! backend owns the label the sidebar draws, so the sentence was put where it
 //! would be seen. It writes nothing to the store, and is read back out of
-//! `pane.list`. Three things that look like three different herdr calls
+//! `pane.list`. Three things that look like three different backend calls
 //! (`report_metadata`, `name_bound`, `say`) are one thing: a projection of
 //! wsp state onto whatever surface is drawing.
 //!
@@ -145,10 +145,10 @@
 //! to exist on the only backend there is.
 //!
 //! Every agent-side verb — `wsp claim`, `wsp say`, `wsp release` — has to name
-//! the seat it is standing in, and reads `HERDR_PANE_ID` to do it
+//! the seat it is standing in, and reads `WSP_BACKEND_PANE_ID` to do it
 //! (`cmd_agent::my_pane`). The port's first answer was that wsp would put the
 //! seat's own name into [`Order::env`] under [`SEAT_ENV`] and any backend would
-//! carry it. **herdr cannot.** `workspace.create` takes the environment and
+//! carry it. **backend cannot.** `workspace.create` takes the environment and
 //! *returns* the pane id, so the name does not exist until after the only moment
 //! it could have been put there.
 //!
@@ -159,17 +159,17 @@
 //!   did exactly this one level in — minting the agent's name rather than
 //!   discovering it — but what made that work was `claude -n`: the backend
 //!   *accepts* the minted name. `workspace.create` has no such parameter
-//!   (checked against `herdr api schema --json`, protocol 17: `label`, `cwd`,
+//!   (checked against `backend api schema --json`, protocol 17: `label`, `cwd`,
 //!   `env`, `focus`) and answers with an id of its own. So a minted seat would
 //!   have to be translated back to a pane id on every call and on every census
-//!   row, from a table that has to survive a restart — for an id herdr already
-//!   delivers. herdr's own place to hang such a table is pane metadata, which
+//!   row, from a table that has to survive a restart — for an id backend already
+//!   delivers. backend's own place to hang such a table is pane metadata, which
 //!   the port deleted as write-only and which expires in 24h anyway. **Minting
 //!   pays where the backend takes the minted id, and buys a translation table
 //!   where it does not.**
-//! - **The agent asks the backend** which seat it is in. herdr has one method
+//! - **The agent asks the backend** which seat it is in. backend has one method
 //!   that could answer and it answers a different question. Measured 2026-08-17
-//!   against herdr 0.7.5, called from a shell in `w31:p1`: `pane.current` with
+//!   against backend 0.7.5, called from a shell in `w31:p1`: `pane.current` with
 //!   no params replied `w1:pJ` — the **focused** pane, in another workspace, on
 //!   somebody else's work. Its only parameter is `caller_pane_id`, which is the
 //!   answer being asked for. A socket connection carries no identity, so this
@@ -177,13 +177,13 @@
 //!   works only while a human happens to be looking at it, which the focus
 //!   decision of 2026-08-17 rules out on its own.
 //!
-//! What is left is what herdr already does, said in the port's words: **the
+//! What is left is what backend already does, said in the port's words: **the
 //! backend delivers the seat to whatever runs in it, and the adapter says under
 //! what name.** [`Place::here`] is that reading, and it is the one place that
-//! knows. herdr's name is `HERDR_PANE_ID`; a backend with no convention of its
+//! knows. backend's name is `WSP_BACKEND_PANE_ID`; a backend with no convention of its
 //! own uses [`SEAT_ENV`], which a supervisor can set without difficulty because
 //! it mints the seat and *then* forks — it has the name in hand at the moment
-//! the child's environment is fixed. herdr's peculiarity is that one call makes
+//! the child's environment is fixed. backend's peculiarity is that one call makes
 //! the seat and the shell together, and that is what nothing else has to repeat.
 //!
 //! So [`Order::env`] carries what wsp wants the agent to know and not the seat,
@@ -201,7 +201,7 @@
 //! # Two verbs, because the claim goes between them
 //!
 //! [`Place::open`] and [`Place::start`] are separate, and it is not because
-//! herdr happens to have two methods. `wsp spawn`'s order is **workspace,
+//! backend happens to have two methods. `wsp spawn`'s order is **workspace,
 //! claim, agent, sentence**, and the claim has to land before the agent starts,
 //! because a Claude Code session runs `wsp brief` from its `SessionStart` hook
 //! and reads the claim on the way in. Started first, it would open knowing
@@ -209,7 +209,7 @@
 //!
 //! The claim is keyed on the seat, so the seat has to exist before the agent
 //! does. Any backend must honour that window; it is wsp's ordering rule rather
-//! than herdr's shape.
+//! than backend's shape.
 //!
 //! # Ending it: one verb here, and the claim released after it
 //!
@@ -218,7 +218,7 @@
 //! The caller exists: wsp puts agents on work one at a time, and a loop that can
 //! start work and not end it makes despawning part of the loop rather than an
 //! edge case. Measured the same evening, ending the agent that wrote this file:
-//! `wsp release --pane w26:p1` and then `herdr workspace close w26` — two
+//! `wsp release --pane w26:p1` and then `backend workspace close w26` — two
 //! commands, one of them not wsp. The coordination seat drops out of wsp and
 //! into the backend for the one verb wsp did not have.
 //!
@@ -247,8 +247,8 @@
 //!
 //! # What is deliberately absent
 //!
-//! - **`available()`.** It is a herdr question — is there a socket — and every
-//!   guard on it (`cmd_spawn.rs:284`, `cmd_agent.rs:618`) prints a herdr
+//! - **`available()`.** It is a backend question — is there a socket — and every
+//!   guard on it (`cmd_spawn.rs:284`, `cmd_agent.rs:618`) prints a backend
 //!   sentence. With a backend the question is answered by the backend existing,
 //!   and unreachability is a [`Refusal::Unreachable`] from the call that wanted
 //!   it, which arrives at the same moment the guard would have.
@@ -262,30 +262,30 @@
 //!   backend. That was late rather than wrong: the caller was already there and
 //!   is `wsp despawn`, above. What has not changed is the rule — the next verb
 //!   will need a caller of its own, and this is not a licence to port the rest
-//!   of herdr's eighty-nine methods on the same reasoning.
+//!   of backend's eighty-nine methods on the same reasoning.
 //! - **retries and timeouts.** `spawn` used to retry `agent_pane_busy` for five
-//!   seconds and retype with a `ctrl-u` after six, because herdr types the
-//!   agent's name at a shell prompt that may not be ready. That is a herdr shell
-//!   race and it now sits inside `place_herdr`'s [`Place::start`]. It is also
+//!   seconds and retype with a `ctrl-u` after six, because backend types the
+//!   agent's name at a shell prompt that may not be ready. That is a backend shell
+//!   race and it now sits inside `place_backend`'s [`Place::start`]. It is also
 //!   the answer to the one loose end in robustness-022's measurement: the single
 //!   `pane.send_text` outside `panel/` and `detail/` is that retype, and it did
 //!   not become an eighth port verb.
 //!
 //! # Ids are opaque, and that is load-bearing
 //!
-//! A [`Seat`] is a string wsp does not read. herdr's are `w0:p3` and
+//! A [`Seat`] is a string wsp does not read. backend's are `w0:p3` and
 //! `w0:p3@mb2`; strata's D-55 uses an index plus a generation so an id is never
 //! silently reused. A seam that passes ids around as strings works; a seam that
-//! assumes herdr's *shape* of id does not — so nothing here parses one, and
-//! `herdr::split_host` stays the one place the `@` suffix means anything.
+//! assumes backend's *shape* of id does not — so nothing here parses one, and
+//! `backend::split_host` stays the one place the `@` suffix means anything.
 //!
 //! So is a machine's address. `Machine::backend_at` is the port's word for
 //! *where this machine's backend listens*, and it is opaque for the same reason
-//! an id is: herdr's is a unix socket path, and something reached over TCP would
+//! an id is: backend's is a unix socket path, and something reached over TCP would
 //! write a host and a port in the same field without a line of wsp changing.
 //! Nothing outside an adapter reads it — the model stores it, `tunnel.rs` hands
-//! it to `ssh -L` because a unix socket on both ends is already herdr's dialect,
-//! and `place_herdr::mirrored_socket` is what an empty one means.
+//! it to `ssh -L` because a unix socket on both ends is already backend's dialect,
+//! and `place_backend::mirrored_socket` is what an empty one means.
 //!
 //! The `@` suffix belongs to the `Remote` decorator (decision on robustness-017):
 //! it holds the connections, strips the machine on the way out and qualifies
@@ -315,123 +315,14 @@ pub fn seat_from_env() -> Option<Seat> {
     std::env::var(SEAT_ENV).ok().filter(|s| !s.is_empty()).map(Seat::new)
 }
 
-/// The marker that turns a spawned Claude Code into somebody else's child, and
-/// the one variable measured to break a spawn outright.
-///
-/// A session that finds `CLAUDE_CODE_CHILD_SESSION` in its environment believes
-/// it is a sub-session of the one that set it and **writes no transcript at
-/// all**. The only evidence is one line in the pane, truncated where it matters:
-/// `⚠ Transcript saving is off — inherited CLAUDE_CODE…`. Nothing fails, nothing
-/// is logged, and an agent spawned this way works perfectly and leaves no
-/// record. Claude Code knows the leak class — it probes `tmux show-environment`
-/// to tell a real marker from one that is merely ambient in the multiplexer —
-/// and herdr is not tmux, so under herdr the marker is always believed.
-///
-/// Measured 2026-08-17 against Claude Code 2.1.233, three panes of one sandbox,
-/// each started with `agent.start` and prompted:
-///
-/// | pane | what it inherited | transcript |
-/// |---|---|---|
-/// | as spawned today | the caller's whole session | **none** |
-/// | this one name emptied | — | 36,752 bytes |
-/// | every name in [`shed`] emptied | — | 36,882 bytes |
-///
-/// So it is shed whether or not the caller has it, unlike the rest: the leak
-/// does not need wsp to be the carrier. A herdr server started by hand from
-/// inside an agent's pane hands the marker to every seat it will ever open, and
-/// a `wsp` run from a clean shell against that server can see nothing wrong with
-/// its own environment to strip.
-pub const CHILD_MARKER: &str = "CLAUDE_CODE_CHILD_SESSION";
-
-/// What a seat's occupant must **not** find: a variable that names the Claude
-/// Code session the caller is sitting in, rather than anything about the seat.
-///
-/// The other half of [`SEAT_ENV`]. That one is the handle a spawn owes the
-/// child; this is the identity a spawn owes it *not* to pass on, and both are
-/// facts about placing work rather than about any backend.
-///
-/// A prefix rather than the four names anybody could list today, for the reason
-/// `cmd_sandbox::forgettable` gives about `HERDR_`: a variable Claude Code adds
-/// next month is a fact about the caller's session too, and this defect exists
-/// precisely because [`CHILD_MARKER`] was a name nobody knew to unset. What the
-/// prefix catches beyond the marker is worth naming, because none of it is
-/// harmless: `CLAUDE_CODE_SESSION_ID` is the caller's own session id, and
-/// `CLAUDE_CODE_MESSAGING_SOCKET` and `..._TOKEN` are the caller's control
-/// channel and the credential for it, handed to an unrelated agent.
-///
-/// **Every `CLAUDE_` name is shed except the ones [`KEPT`] lists**, rather than
-/// the prefix plus whatever names somebody has found. The named list was
-/// always one release behind: `CLAUDE_PID` was added by name because the
-/// control socket is `/tmp/cc-socks/<CLAUDE_PID>.sock`, and then
-/// `CLAUDE_JOB_DIR` leaked for a day unnoticed (`wsp-130`). It names the
-/// caller's background job, so every seat a job-spawned governor opened showed
-/// that job's name in its status bar instead of its own `-n`, and recorded its
-/// exit in the dead governor's job. `CLAUDE_EFFORT` went the same way: it is the
-/// caller's live effort level, so a seat spawned without `--effort` ran at its
-/// spawner's rather than its settings' default.
-///
-/// The inversion is argued from which failure is worse. Every `CLAUDE_` name
-/// found in a spawning agent's environment (2026-09-30: `CLAUDECODE`,
-/// `CLAUDE_PID`, `CLAUDE_JOB_DIR`, `CLAUDE_EFFORT`, seven `CLAUDE_CODE_*`) was
-/// put there by the Claude Code that ran `wsp`, and describes that session. A
-/// leak is silent — the marker costs the transcript, the job dir costs the
-/// exit record, and nothing fails. Over-shedding a genuine preference empties
-/// it on the seat, which shows on the first spawn and is repaired by one name
-/// in [`KEPT`]. A setting like `CLAUDE_CONFIG_DIR` says where this machine
-/// keeps its configuration and is *supposed* to be inherited; that is what the
-/// list is for. Preferences are kept by name; everything else is identity.
-pub fn shed(key: &str) -> bool {
-    let claude = (key == "CLAUDECODE" || key.starts_with("CLAUDE_")) && !KEPT.contains(&key);
-    claude || PI_SESSION.contains(&key)
-}
-
-/// What pi's bash tool hands every command it runs: the pi session that ran
-/// it. Shed for the reason the `CLAUDE_` names are — it describes the caller,
-/// not the seat — and for one more: `pi/wsp-session.ts` reads `PI_SESSION_ID`
-/// as *this pi was started by another pi's shell* and stays silent, so a pi
-/// governor's spawn that passed it on would start a member that never reports.
-/// By name rather than by prefix, because pi's other `PI_` names
-/// (`PI_CODING_AGENT_DIR`, `PI_OFFLINE`, …) are this machine's preferences and
-/// are meant to be inherited.
-pub const PI_SESSION: &[&str] =
-    &["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"];
-
-/// The `CLAUDE_` names a seat inherits: preferences about this machine, not
-/// facts about the session that spawned it. [`shed`] says why it is this way
-/// round.
-pub const KEPT: &[&str] = &["CLAUDE_CONFIG_DIR"];
-
-/// The same rule against this process's environment: what a caller would have
-/// to `unset` before spawning by hand, which is the workaround this replaces.
-///
-/// [`CHILD_MARKER`] is always in the list and the rest is only what is actually
-/// here, so a spawn from a shell with none of this in it is one name long.
-///
-/// **It enumerates the live process environment, so no two of its results may
-/// be compared to each other** — nor two of anything built on it, which is
-/// every [`shed_env`] and every [`crate::cmd_spawn::seat_env`]. cargo runs
-/// tests as threads in one process and several of them set `CLAUDE_CODE_*`
-/// names (`place_super`, `cmd_sandbox`); one landing between two calls puts a
-/// key in one result and not the other. `robustness-099` was such an assertion
-/// in `cmd_spawn`, and what it cost was not itself: it was green in four debug
-/// runs, red under `--release`, and passed alone — this project's signature for
-/// a real ordering bug, spent on a test that had none, on the run an install is
-/// gated on. Assert a property of one result, or the contribution of the thing
-/// actually under test; never one snapshot against another.
-pub fn shed_keys() -> Vec<String> {
-    let mut keys: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| shed(k) && k != CHILD_MARKER)
-        .collect();
-    keys.sort();
-    keys.insert(0, CHILD_MARKER.into());
-    keys
-}
+/// What a spawned seat must not inherit — the marker, the rule and the list —
+/// moved down to `wsp-host` with the in-process host that applies them (wsp-020).
+pub use wsp_host::shed::{shed, shed_keys, CHILD_MARKER, KEPT, PI_SESSION};
 
 /// The same list as the entries an [`Order`] carries to shed them.
 ///
 /// **Emptied rather than removed, because removal is not on the wire.** A seat's
-/// environment is a string-to-string map on the call that creates it — herdr's
+/// environment is a string-to-string map on the call that creates it — backend's
 /// `workspace.create` takes one and `agent.start` takes none — so the only strip
 /// a port can express is an override, and an empty value is the strongest one
 /// there is. That it is strong enough was measured rather than assumed; the
@@ -441,50 +332,9 @@ pub fn shed_env() -> BTreeMap<String, String> {
     shed_keys().into_iter().map(|k| (k, String::new())).collect()
 }
 
-/// A durable handle to somewhere an agent can run.
-///
-/// **Durable** is the requirement and it is the one the port will not bend on:
-/// a seat outlives the agent standing in it and the backend restarting. wsp
-/// writes it into a claim and expects to find the same place behind it
-/// tomorrow.
-///
-/// herdr does not quite supply this, and the shortfall is not the one this
-/// comment used to claim. Measured 2026-08-19 (`robustness-084`, and see
-/// [`crate::place_herdr`] for the transcript): a pane number inside a surviving
-/// workspace never comes round again, but a *workspace* id does — herdr's
-/// counter is process-local, and a restart reserves only one above the highest
-/// workspace that survived. So an id above that mark is handed out again, and
-/// with it every pane id qualified by it. A handle can therefore fail in both
-/// directions: name nothing, or name somebody else. That is why claims carry a
-/// `workspace_label` and a cwd — not to re-find an id that changed, but to tell
-/// the workspace we meant from the one that took its name. Under this port the
-/// shortfall is the herdr adapter's to make good, by whatever means, and wsp
-/// stops carrying the workaround. It is also why
-/// nothing here is a `pane` or a `workspace`: today's two ids, of two different
-/// lifetimes, become one handle of one lifetime.
-///
-/// Opaque on purpose. Constructed from whatever the backend says, compared, and
-/// never parsed.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Seat(String);
-
-impl Seat {
-    pub fn new(id: impl Into<String>) -> Seat {
-        Seat(id.into())
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl std::fmt::Display for Seat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// The seat handle, moved down to `wsp-host` with the host that answers in it
+/// (wsp-020).
+pub use wsp_host::port::Seat;
 
 /// What to open a seat for: a name, a place on disk, an environment, and
 /// optionally a machine.
@@ -498,7 +348,7 @@ impl std::fmt::Display for Seat {
 pub struct Order {
     pub label: String,
     /// Where the work lives. `None` means the backend's own default, which for
-    /// herdr is wherever it would have opened a shell.
+    /// backend is wherever it would have opened a shell.
     pub cwd: Option<String>,
     /// Handed to whatever runs in the seat. wsp puts `WSP_PROJECT`, `WSP_TASK`
     /// and the store's own variables here.
@@ -543,18 +393,28 @@ pub struct Order {
     /// as permanent, `arrange` recorded the opposite as settled, and both files
     /// read as closed. Scaffolding with no stated trigger is how that happened.
     ///
-    /// It is not herdr's `focus` parameter wearing a different name: what wsp
+    /// It is not backend's `focus` parameter wearing a different name: what wsp
     /// means is *do not drag the screen away from what somebody is reading*, and
     /// a backend with no screen honours it by ignoring it. `false` by default,
     /// so a seat opened by something with no opinion does not steal attention —
     /// which is the same rule read from the other end, and stays true wherever
     /// the flag ends up living.
     pub show: bool,
+    /// Whether an agent is started into the seat straight after it opens
+    /// (`spawn`, a rotation, a resume), rather than the seat being a terminal
+    /// a person works in.
+    ///
+    /// Under a host with events (`WSP_HOST=manager`) such a seat runs no bare
+    /// shell first (wsp-079): the shell was the seat's epoch 1, the agent's
+    /// start stopped it and ran epoch 2, so every healthy start read as a stop
+    /// and a restart. The agent is the seat's first and only start. `false` by
+    /// default, so an `open` with no opinion still holds a shell.
+    pub agent_next: bool,
 }
 
 /// Which agent to start, and what to call it.
 ///
-/// `kind` is passed through rather than enumerated. herdr refuses an unknown
+/// `kind` is passed through rather than enumerated. backend refuses an unknown
 /// kind with its whole catalogue in the message, which is a better list than
 /// one kept here and left to go stale — and a second backend's catalogue is its
 /// own. `name` is what the backend should call the running agent; wsp passes
@@ -573,155 +433,52 @@ pub struct Agent {
     pub kind: String,
     pub name: String,
     pub args: Vec<String>,
+    /// The row and attempt `seat.spawn` is keyed by (3.3). `None` for a seat
+    /// with no row: the host then keys it by its own freshly minted seat id,
+    /// attempt 0, which is unique by construction.
+    pub key: Option<Key>,
 }
 
-/// What an agent in a seat is doing, as far as the backend can tell.
-///
-/// The README says why a backend's own vocabulary is not enough: "`idle` is an
-/// answer to a question nobody asked". This enum is the answers wsp acts on,
-/// each with a caller today.
-///
-/// **The distinction this is for is [`State::turn_in_flight`], and it is the
-/// only one that separates work happening from a slot producing nothing.**
-/// Everything else here is about what wsp may *do* to a seat. That one is about
-/// whether anything is happening in it, and until robustness-083 nothing in wsp
-/// asked it — a census counted processes, and a process that had stopped
-/// mid-task counted the same as one three hours into a turn.
-///
-/// The two that look like luxuries are the two that have cost the most:
-///
-/// - [`State::Starting`] is separate from [`State::Idle`] because herdr reports
-///   `agent_status: idle` while an agent is still coming up, and `agent.prompt`
-///   refuses in that window with `agent_not_ready`. Waiting for "idle" returned
-///   in half a second every time and the work order went into a pane still
-///   drawing its banner. Every existing caller that tests `state == "idle"`
-///   before telling an agent something is one reading of this away from the
-///   same bug.
-/// - [`State::Unknown`] exists because **an absence is not a fact**. It is the
-///   README's `·`, and it is the same rule as `sync`'s "`Err` is not an empty
-///   list" and `reconcile`'s unreachable-is-not-empty: one `pane.list` that
-///   timed out once unbound every agent on the seat. A backend that does not
-///   know must be able to say so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum State {
-    /// The seat exists and nothing is running in it. A terminal somebody
-    /// opened, or a seat opened and never started.
-    Empty,
-    /// An agent is coming up and will refuse a prompt.
-    Starting,
-    /// Waiting for input. The only state in which [`Place::tell`] is expected
-    /// to succeed.
-    Idle,
-    /// Busy. Nothing to do about it and nothing to ask it. **The only state in
-    /// which a turn is in flight** — see [`State::turn_in_flight`].
-    Working,
-    /// Stopped in front of a question only a person can answer: a permission
-    /// prompt, a trust dialog. Running, and going nowhere until somebody
-    /// answers.
-    ///
-    /// Separate from [`State::Idle`] because the two want opposite handling and
-    /// were indistinguishable until robustness-083: an idle agent is told the
-    /// next thing, a blocked one is *answered*, and a sentence sent to it lands
-    /// in the modal rather than in the composer. It is also the state a Claude
-    /// Code reaches by responding to a work order with a permission request,
-    /// which is why `fork-015` could not have `agent.prompt` wait for
-    /// `working` — a prompt plainly taken passes through here and never
-    /// through there.
-    Blocked,
-    /// There was an agent here and it has stopped. The seat may still exist.
-    ///
-    /// herdr cannot distinguish this from [`State::Empty`] in a listing — an
-    /// exited agent leaves a pane whose `agent` field is empty, which is what a
-    /// plain shell looks like — so its adapter answers `Empty` from a census
-    /// and `Gone` from the event stream, where a released agent is named. A
-    /// supervisor that watched a pid exit answers it exactly, which is the point
-    /// of writing the port in wsp's vocabulary rather than herdr's.
-    Gone,
-    /// The seat is on a far machine that has gone silent: the link is down or
-    /// the beat is unanswered past the lease (`docs/remote-agents.md` section 3).
-    /// The agent is held, not dead — its claim stays, a reap leaves it alone and
-    /// a tell to it is held until the link returns. Not [`State::Gone`], which
-    /// is what a blip used to read as, and not [`State::Unknown`], which is a
-    /// backend that cannot say: here wsp knows exactly why it cannot see.
-    Unreachable,
-    /// The backend did not say, or could not be asked.
-    #[default]
-    Unknown,
+pub use wsp_host_api::{FirstOrder, Key, OrderId, RowId};
+
+/// What the host said of an order, heard as its events (`order.acked`,
+/// `order.refused`) rather than read off a seat's state
+/// (`docs/agent-manager.md` 4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heard {
+    /// `order.acked`: the order was delivered and a turn began on it.
+    Acked,
+    /// `order.refused`, or the seat stopped before an answer: why, worded.
+    Refused(String),
+    /// Nothing about the order within the wait.
+    Unanswered,
 }
 
-impl State {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            State::Empty => "empty",
-            State::Starting => "starting",
-            State::Idle => "idle",
-            State::Working => "working",
-            State::Blocked => "blocked",
-            State::Gone => "gone",
-            State::Unreachable => "unreachable",
-            State::Unknown => "unknown",
-        }
-    }
-
-    /// Whether [`Place::tell`] is worth attempting.
-    ///
-    /// The one question every caller of `state == "idle"` is actually asking,
-    /// written once. `Unknown` is false: telling an agent we cannot see is how
-    /// a prompt lands in somebody's shell.
-    pub fn will_take_a_prompt(&self) -> bool {
-        matches!(self, State::Idle)
-    }
-
-    /// Whether something is running here, whatever it is doing.
-    pub fn is_running(&self) -> bool {
-        matches!(self, State::Starting | State::Idle | State::Working | State::Blocked)
-    }
-
-    /// Whether a turn is actually running — the reading robustness-083 was
-    /// opened for, and the one nothing in wsp had.
-    ///
-    /// [`State::is_running`] answers "is there a process here", which is what
-    /// every census in wsp asked and is not the question. Seven agents on
-    /// 2026-08-18 answered yes to it with their turns abandoned by an API
-    /// overload: process alive, conversation intact, nothing happening, and
-    /// `doctor` reporting `herdr up, 12 agents`. **An agent that is not turning
-    /// will not start turning on its own**, whatever put it there.
-    ///
-    /// So this is deliberately not `!is_running()` and deliberately does not
-    /// try to say *why* a turn ended. Idle after finishing, idle after an
-    /// overload and blocked on a permission are three different repairs and one
-    /// identical fact: the slot is costing something and producing nothing.
-    /// Telling them apart is a job for whoever reads the census, and wsp does
-    /// not have to understand the cause to raise a hand — see
-    /// `cmd_agent::Bound`.
-    ///
-    /// [`State::Unknown`] answers false, on the rule the rest of this file is
-    /// built on: an absence is not a fact, and least of all a fact about work
-    /// getting done.
-    pub fn turn_in_flight(&self) -> bool {
-        matches!(self, State::Working)
-    }
-
-    /// The same fact from the other side: **there is an agent here and it is
-    /// doing nothing.**
-    ///
-    /// Not merely `!turn_in_flight()`, and the difference is [`State::Unknown`]
-    /// and [`State::Empty`]. An agent nobody can see is not an agent that has
-    /// stopped, and a seat with nothing in it has not stopped either — it is a
-    /// different report with a different verb under it. Only a seat known to
-    /// hold something known not to be turning belongs here.
-    ///
-    /// Written once because four censuses ask it — `wip`'s `needs you`,
-    /// `overlap`'s, the panel's `←`, and `doctor`'s quiet check — and until
-    /// robustness-083 each of them asked it as `agent_status == "idle"`. That
-    /// is one of *three* words herdr has for a pane running no turn, and the
-    /// other two are not corner cases: `done` was four of twelve agents on this
-    /// machine when it was measured, and `blocked` is a permission prompt,
-    /// which is the failure most worth interrupting somebody for.
-    pub fn stopped(&self) -> bool {
-        self.is_running() && !self.turn_in_flight()
-    }
+/// What a host's events say of an agent [`Place::start`] just put in a seat
+/// (wsp-037): heard, never read off [`Place::state`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Up {
+    /// Ready: `seat.started` heard, and where readiness is a turn, its first
+    /// turn begun.
+    Ready,
+    /// `seat.stopped` for this start before it was ready.
+    Stopped,
+    /// Neither within the wait.
+    Unready,
 }
+
+/// A fresh id for a first order: the seat, the time and a counter, so a
+/// re-start of the same seat is a new order and never the answer to the last.
+pub fn new_order_id(seat: &Seat) -> OrderId {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    OrderId(format!("{seat}-first-{nanos:x}-{n}"))
+}
+
+/// What a seat is doing, moved down to `wsp-host` with the host that reads it
+/// off the screen (wsp-020).
+pub use wsp_host::port::State;
 
 /// The census row. `session` is the agent's own session id where the backend
 /// knows one — Claude Code's, which a binding already records and which is what
@@ -746,11 +503,11 @@ pub struct Seated {
 /// tell them apart is the one that made the calls and got the errors.
 ///
 /// wsp has that judgement today and gets it by **parsing the id** —
-/// `cmd_agent::machine_of` reads herdr's `@mb2` suffix and partitions the live
+/// `cmd_agent::machine_of` reads backend's `@mb2` suffix and partitions the live
 /// list on it. That works only while wsp knows one backend's shape of id, which
 /// is exactly what a [`Seat`] is not allowed to have and what the `Remote`
 /// decorator makes private. This type is where the fact comes from instead: the
-/// fan-out *already knows* which machine answered — `herdr::each` is the line
+/// fan-out *already knows* which machine answered — `backend::each` is the line
 /// that knows — and until now it threw the answer away and let a caller
 /// reconstruct it from the ids that came back.
 ///
@@ -760,7 +517,7 @@ pub struct Seated {
 ///
 /// **A partial answer is good news.** A census across four machines with one
 /// down is three machines' worth of fact, and reading it as a failed call would
-/// empty the panel every time a laptop closed — the rule `herdr::everywhere`
+/// empty the panel every time a laptop closed — the rule `backend::everywhere`
 /// already states as *this machine's failure is an error and a far machine's is
 /// not*. [`Refusal::Unreachable`] is kept for the case it names, nobody answered
 /// at all, and [`Place::census`] says when that is returned.
@@ -835,7 +592,7 @@ impl Census {
     /// **The judgement everything that reaps turns on**, and it is deliberately
     /// only half of one: this says *heard from*, and whether an answer of
     /// nothing is evidence that the work stopped is a policy the caller owns.
-    /// `reconcile --reap` says it is not — a herdr restoring a session answers
+    /// `reconcile --reap` says it is not — a backend restoring a session answers
     /// with an empty list for a second or two, and reaping on that is
     /// render-040, every binding in the store gone — so the reap's rule is
     /// this **and** a seat of its own on the same machine. That is one rule in
@@ -870,7 +627,7 @@ impl Census {
 /// equivalent: a seat that has gone quiet looks exactly like a seat nobody
 /// asked about. A backend that cannot push must poll behind [`Place::watch`]
 /// and raise these itself — which is what the daemon does today, on a 20s tick,
-/// because herdr's `pane.agent_status_changed` cannot be subscribed to globally
+/// because backend's `pane.agent_status_changed` cannot be subscribed to globally
 /// and one entry missing its `pane_id` refuses every other entry with it
 /// (`daemon.rs:19`). That fallback becomes the adapter's, and stops being
 /// something every caller has to know about.
@@ -888,109 +645,9 @@ pub enum Event {
     Closed(Seat),
 }
 
-/// Why a call did not happen, in wsp's terms.
-///
-/// The point of naming these is that a caller should never match on a backend's
-/// error string. `agent_not_ready`, `agent_pane_busy` and `pane_not_found` are
-/// herdr's words for three of these, and `spawn` matching on `agent_pane_busy`
-/// is the kind of coupling that survives a port unless the port has a word of
-/// its own. It has one now, and the match is in `place_herdr` and nowhere else.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Refusal {
-    /// No backend answered. This is what `herdr::available()` becomes: not a
-    /// question asked in advance, but the answer to the call that wanted it.
-    Unreachable(String),
-    /// No such seat. It may have been closed under us.
-    NoSeat(Seat),
-    /// The agent is not in a state to be told anything.
-    NotReady(State),
-    /// The sentence was delivered and the agent never acted on it.
-    ///
-    /// Only a backend that *watched* can say this, and saying it is the whole
-    /// value: it is [`Place::tell`]'s `Ok` and [`Place::nudge`]'s reason
-    /// arriving in one answer, so a caller learns in the reply what it
-    /// otherwise had to go and find out by looking. Not a failure on its own —
-    /// the work order is sitting where the agent can see it, and a submit is
-    /// what it is waiting for.
-    NotTaken,
-    /// Typed, read back off the seat's screen, and still sitting in its prompt
-    /// after [`submit`] pressed submit again — `wsp-252`.
-    ///
-    /// [`Refusal::NotTaken`] said from a backend that **looked**, which is the
-    /// half of that answer it never had: where the text went. Every spawn that
-    /// failed this way on 2026-10-08 was reported as "either sitting unsent or
-    /// dropped — wsp cannot see which", and every one of them, looked at, was
-    /// sitting there. The repair is a return in the seat, and not a resend,
-    /// which would put a second copy behind the first.
-    Unsubmitted(Seat),
-    /// This backend cannot do that at all — a seat for a person on a backend
-    /// with no terminal, say. Distinct from a failure, and not a bug.
-    Unsupported(&'static str),
-    /// The backend said no, in its own words.
-    Backend(String),
-    /// The seat's own supervisor answered `failed` to a delivery
-    /// (`compound-sup deliver`), with its reason. Not [`Refusal::Backend`]: a
-    /// supervisor that owns the retry has already retried, so this is the one
-    /// answer wsp escalates (wsp-477).
-    Failed(String),
-}
-
-/// What became of a sentence [`Place::tell`] delivered.
-///
-/// `Ok` has always meant *delivered* and never *taken* — the paragraph on
-/// [`Place::tell`] is older than this enum and is unchanged by it. What this
-/// adds is the answer to the second question where a backend has one, because
-/// worklist-010 was a verb that could not tell **delivered and watched** from
-/// **delivered and unwatchable** and so said neither, and then said something
-/// false instead.
-///
-/// Two variants and not three. A backend with no way to watch, and a backend
-/// that watched and could not tell, are the same fact to every caller: nothing
-/// here confirms a turn, nothing here is owed, and a retry is the wrong move.
-/// Telling *those* two apart would be a fact about the backend rather than
-/// about the message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Delivery {
-    /// Delivered, and the agent moved in answer to it — watched by something in
-    /// a position to see it.
-    ///
-    /// Moved, rather than *is working*: an agent that answers a work order by
-    /// asking for a permission has plainly taken it and is `blocked`. That is
-    /// why `cmd_spawn::hand_over` still takes its own reading afterwards — a
-    /// folder-trust modal is the same status and the opposite outcome, and this
-    /// says the sentence landed on something awake, not what it decided.
-    Started,
-    /// Delivered, with no turn observed and none claimed.
-    ///
-    /// Either the backend does not watch, or it watched an agent that was
-    /// already mid-turn: a sentence queued behind a turn in progress changes no
-    /// status, so there is nothing for a watch to see and the agent has not read
-    /// it yet. **This is not a failure and must never be reported as one** —
-    /// that report is worklist-010, where a governor retried a message that had
-    /// arrived and sent the same paragraph three times.
-    Unconfirmed,
-    /// The seat's supervisor acknowledged the delivery (`delivered`): the
-    /// sentence reached the agent exactly once, and the supervisor owns any
-    /// retry. Nothing is owed and nothing is looked for after it (wsp-477).
-    Acked,
-}
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Refusal::Unreachable(w) => write!(f, "no backend answered: {w}"),
-            Refusal::NoSeat(s) => write!(f, "no seat {s}"),
-            Refusal::NotReady(s) => write!(f, "not ready — {}", s.as_str()),
-            Refusal::NotTaken => write!(f, "the sentence arrived and no turn started"),
-            Refusal::Unsubmitted(s) => write!(f, "typed into {s} and not submitted — it is sitting in the prompt"),
-            Refusal::Unsupported(w) => write!(f, "this backend cannot {w}"),
-            Refusal::Backend(w) => write!(f, "{w}"),
-            Refusal::Failed(w) => write!(f, "the seat's supervisor could not deliver it: {w}"),
-        }
-    }
-}
-
-pub type Result<T> = std::result::Result<T, Refusal>;
+/// Why a call did not happen and what became of a delivery, moved down to
+/// `wsp-host` with the host that answers in them (wsp-020).
+pub use wsp_host::port::{Delivery, Refusal, Result};
 
 
 /// A turn's end as a seat's hooks recorded it — [`Place::stopped`].
@@ -1050,7 +707,7 @@ pub trait Place {
     /// is downstream of this one reading.
     ///
     /// Answered from what the backend arranged before the process started, never
-    /// by asking it. The module docs carry both halves of that: why herdr cannot
+    /// by asking it. The module docs carry both halves of that: why backend cannot
     /// be asked, and why a backend that had to be is one that has not delivered
     /// the handle. [`seat_from_env`] is the whole implementation for a backend
     /// with no name of its own for the seat.
@@ -1063,10 +720,10 @@ pub trait Place {
     /// The room a seat is recorded under: the key a custodial slot is written
     /// against ([`crate::cmd_govern::take`]), and a build tree after it.
     ///
-    /// Defaulted to the seat itself, because only herdr has anything above a
+    /// Defaulted to the seat itself, because only backend has anything above a
     /// seat. A supervisor's or compound's seat is its own room, and that is
     /// what `wsp govern` has always recorded for one from inside it
-    /// (`cmd_govern::room_and_pane`). This used to be herdr's `pane.list`, asked
+    /// (`cmd_govern::room_and_pane`). This used to be backend's `pane.list`, asked
     /// outside the port. It answered nothing for a `cpd-` seat, so a rotation
     /// onto compound confirmed its successor's turn and then refused to move
     /// the slot (`wsp-128`): the seat stayed with a pane that was about to be
@@ -1088,6 +745,40 @@ pub trait Place {
     /// shell that is not ready, clear a half-typed line, wait on a container —
     /// happens in here and is never the caller's business.
     fn start(&self, seat: &Seat, agent: &Agent) -> Result<()>;
+
+    /// Start an agent with its first order in the one `seat.spawn`, and come
+    /// back when the host's events say what became of it: `seat.started`,
+    /// then `order.acked` or `order.refused` for `order`, within `wait`
+    /// (`docs/agent-manager.md` 4.3). Nothing here reads [`Place::state`] or a
+    /// screen: the answer is heard, not polled for.
+    ///
+    /// `None`: this backend has no host whose events it can wait by (the
+    /// in-process host), and nothing was started; the caller starts, waits for
+    /// ready and tells, as before. `Err` is the start refused, or the host
+    /// silent, said as such.
+    fn start_ordered(&self, _seat: &Seat, _agent: &Agent, _order: &FirstOrder, _wait: Duration) -> Option<Result<Heard>> {
+        None
+    }
+
+    /// Go on waiting, up to `wait`, for the answer to an order
+    /// [`Place::start_ordered`] sent: after a [`Place::nudge`], say. `None`
+    /// where this backend has no events to wait by.
+    fn await_order(&self, _seat: &Seat, _order: &OrderId, _wait: Duration) -> Option<Result<Heard>> {
+        None
+    }
+
+    /// What the host's events say of the agent [`Place::start`] just put in
+    /// `seat`, waited for up to `wait`: ready (`seat.started`, and with
+    /// `by_turn` its first turn begun), stopped, or neither (wsp-037). A state
+    /// read just after a manager's `seat.started` is not yet true, and a start
+    /// judged by one was taken for dead, stopped and started again.
+    ///
+    /// `None` where this backend has no events to wait by: the caller polls
+    /// [`Place::state`] as before. `Err` is the events not heard (the host
+    /// went), which says nothing about the seat.
+    fn await_up(&self, _seat: &Seat, _by_turn: bool, _wait: Duration) -> Option<Result<Up>> {
+        None
+    }
 
     /// Give the agent in a seat a sentence to act on.
     ///
@@ -1127,7 +818,7 @@ pub trait Place {
     /// has says the spawn went well. Measured through robustness-035: four of
     /// six agents in one burst, then three of three in a quiet moment, then
     /// three of three again on the bare socket with no wsp in the call — so it
-    /// is the backend's failure and herdr 0.8.0's own wait between the text and
+    /// is the backend's failure and backend 0.8.0's own wait between the text and
     /// the Enter narrowed the window rather than closing it. A return pressed
     /// afterwards started the turn in 0.15s every time.
     ///
@@ -1163,7 +854,7 @@ pub trait Place {
     /// End whatever agent is in a seat, and let the seat go.
     ///
     /// **Not the arrange-panes port's `close`.** They are spelled with the same
-    /// herdr method and they are not the same verb: this one ends somebody's
+    /// backend method and they are not the same verb: this one ends somebody's
     /// work, and that one tidies a viewport. A backend is entitled to implement
     /// the two identically; a caller that confuses them shuts down an agent to
     /// close a detail pane.
@@ -1178,16 +869,29 @@ pub trait Place {
     /// treats it as the first half already done, and goes on to the claim.
     fn stop(&self, seat: &Seat) -> Result<()>;
 
+    /// [`Place::stop`], and the pids that ended where the host says so: the
+    /// manager's `seat.stopped` under `WSP_HOST=manager`. Empty where the
+    /// backend does not name them.
+    fn end(&self, seat: &Seat) -> Result<Vec<u32>> {
+        self.stop(seat).map(|()| Vec::new())
+    }
+
+    /// Whether the host is the manager, whose pids a report names in place of
+    /// the ones wsp would find by `ps`.
+    fn hosted(&self) -> bool {
+        false
+    }
+
     /// What is happening in one seat, right now.
     ///
     /// Separate from [`Place::census`] because `spawn` polls a single seat
     /// every 150ms for up to 30 seconds, and a census is a fan-out across every
     /// reachable machine.
     ///
-    /// It is also the reading a backend is expected to be exact about. herdr's
+    /// It is also the reading a backend is expected to be exact about. backend's
     /// census can be exact too, but only because it asks twice — the asymmetry
     /// is between the calls it has, not between one seat and many; see
-    /// `place_herdr`.
+    /// `place_backend`.
     fn state(&self, seat: &Seat) -> Result<State>;
 
     /// Whether a turn *began* at this seat at or after `since` (epoch seconds),
@@ -1266,7 +970,7 @@ pub trait Place {
     /// instead of an absence of rows. **A partial answer is an answer** — one
     /// machine down out of four is three machines' worth of fact — so
     /// [`Refusal::Unreachable`] is returned only when *nothing* answered, which
-    /// is the sentence it already carries and the moment `herdr::available()`
+    /// is the sentence it already carries and the moment `backend::available()`
     /// used to be asked in advance.
     fn census(&self) -> Result<Census>;
 
@@ -1472,7 +1176,7 @@ mod tests {
         ] {
             assert!(shed(key), "{key} names the spawning session and would have reached the seat");
         }
-        for key in ["CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "WSP_TASK", "HERDR_SOCKET_PATH", "PATH", SEAT_ENV] {
+        for key in ["CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "WSP_TASK", "WSP_BACKEND_SOCKET_PATH", "PATH", SEAT_ENV] {
             assert!(!shed(key), "{key} is not an identity and the seat is poorer without it");
         }
     }
@@ -1481,7 +1185,7 @@ mod tests {
     /// strip is an empty value rather than an absence.
     ///
     /// Both halves are forced by where the leak can come from. wsp is not the
-    /// only carrier — a herdr started by hand inside an agent's pane hands the
+    /// only carrier — a backend started by hand inside an agent's pane hands the
     /// marker to every seat it will ever open, and a `wsp` run from a clean
     /// shell against that server sees nothing of its own to strip. And a seat's
     /// environment is a map on the call that creates it, so there is no way to
@@ -1492,7 +1196,7 @@ mod tests {
         assert_eq!(
             env.get(CHILD_MARKER).map(String::as_str),
             Some(""),
-            "a spawn from a clean shell onto a dirty herdr still has to say this"
+            "a spawn from a clean shell onto a dirty backend still has to say this"
         );
         assert!(env.values().all(String::is_empty), "an override is the only strip on the wire");
         assert!(env.keys().all(|k| shed(k)), "the order carries nothing the rule did not name");
@@ -1508,9 +1212,9 @@ mod tests {
     /// somebody's shell.
     ///
     /// *How* a particular backend is read is the adapter's, and the reading that
-    /// used to live here now lives in `place_herdr`, next to the wire that
-    /// produces it — it was wrong about herdr twice while it was in this file,
-    /// and both times because it could be handed a shape herdr does not send.
+    /// used to live here now lives in `place_backend`, next to the wire that
+    /// produces it — it was wrong about backend twice while it was in this file,
+    /// and both times because it could be handed a shape backend does not send.
     #[test]
     fn only_an_agent_known_to_be_idle_is_told_anything() {
         assert!(State::Idle.will_take_a_prompt());
@@ -1528,7 +1232,7 @@ mod tests {
     /// progress. On 2026-08-18 an API overload left seven agents alive with
     /// their turns abandoned, and every one of them answered yes to it — process
     /// alive, conversation intact, nothing happening, and `doctor` saying
-    /// `herdr up, 12 agents`. These are the two readings side by side, because
+    /// `backend up, 12 agents`. These are the two readings side by side, because
     /// the whole failure was that only one of them existed.
     #[test]
     fn a_process_that_exists_is_not_a_turn_that_is_running() {
@@ -1926,7 +1630,6 @@ mod tests {
 
 /// Which seat this process is standing in, or none.
 ///
-/// The one reading of it, and it is now the port's rather than herdr's:
 /// `place::Place::here` is the verb, and which variable carries the answer is
 /// the adapter's business. Every agent-side verb — `claim`, `say`, `release` —
 /// is downstream of this, and so is `despawn`'s refusal to end the seat it is
@@ -1936,32 +1639,11 @@ mod tests {
 /// a binding's key, the `--pane` a person types are all the same string, and
 /// converting them all is `place::Seat`'s own migration rather than this one's.
 ///
-/// No socket is opened: [`Herdr::here`] reads what herdr set before this process
-/// existed, which is a rule of the port and not an optimisation. Constructing
-/// the backend costs four durations and a clock reference.
-///
-/// # Which backend is this process standing in
-///
-/// Two backends can seat an agent and each has its own name for the seat it
-/// hands its occupant — `HERDR_PANE_ID` for a pane, `place::SEAT_ENV` for a
-/// supervisor. Neither adapter is allowed to read the other's:
-/// `place_herdr::here` says why in as many words, and the mirror image holds —
-/// two answers to *which seat is this* is a way to be in two seats, and under
-/// herdr a stale `WSP_SEAT_ID` would bind a task to a pane that backend never
-/// issued.
-///
-/// So the choice is made here, one level up, and it is made by **which name the
-/// seat arrived under** rather than by asking anything. A process started by a
-/// supervisor has the supervisor's variable and nothing else; a shell in a pane
-/// has herdr's. The order matters only for the case that should not exist —
-/// both set — and the supervisor wins it because it is the backend that forked
-/// this process, whatever multiplexer the shell it came from was in.
+/// No socket is opened: the supervisor's `here` reads `place::SEAT_ENV`, set
+/// before this process existed, which is a rule of the port and not an
+/// optimisation.
 pub fn my_pane() -> Option<String> {
-    let seat = match crate::place_super::Supervisor::new().here() {
-        Some(s) => Some(s),
-        None => crate::place_herdr::Herdr::new().here(),
-    };
-    seat.map(|s| s.to_string())
+    crate::place_super::Supervisor::new().here().map(|s| s.to_string())
 }
 
 /// Every backend wsp can spawn onto, for the readers that do not get to ask —
@@ -1973,30 +1655,19 @@ pub fn my_pane() -> Option<String> {
 /// see `robustness-022`'s three fates.
 ///
 /// The same "one copy" argument [`backend`] makes: a reader that built its
-/// own array would be a second list to update when a fifth implementor
+/// own array would be a second list to update when another implementor
 /// lands.
-pub fn local_backends() -> [Box<dyn Place>; 2] {
-    [Box::new(crate::place_herdr::Herdr::new()), Box::new(crate::place_compound::Compound::new())]
+pub fn local_backends() -> [Box<dyn Place>; 1] {
+    [Box::new(crate::place_compound::Compound::new())]
 }
 
 /// The name a whole backend's own silence is filed under — `wsp stamp`
 /// (`compound-064` item 2), paired with [`local_backends`] by position, so
 /// this file stays the one place that ordering is named rather than
-/// re-assumed at a call site. `""` is herdr's own local machine
-/// ([`Census::heard`]'s spelling, unchanged); `"compound"` distinguishes
-/// the second backend's total refusal from a machine of that name, since a
-/// backend is not a machine and the two silences must not collide in a
-/// listing.
-/// `herdr` rather than `""`: the empty string is unique among BACKENDS but
+/// re-assumed at a call site. `"compound"` rather than `""`: the empty string
 /// collides with the MACHINE namespace, where `cmd_stamp::named` reads it as
-/// "this machine". Since `compound-112` herdr is normally absent, so its total
-/// refusal is the ordinary case, and under `""` it drew as the whole machine
-/// having gone silent while `heard` was true and compound had answered in full
-/// — `cmd_stamp`'s own doc asks for a name that cannot be mistaken for a
-/// machine's, and this is that name. Only herdr's WHOLESALE refusal is labelled
-/// here; when its census answers, `place_herdr` names each row by machine
-/// itself.
-pub const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
+/// "this machine", and a backend is not a machine.
+pub const LOCAL_BACKEND_NAMES: [&str; 1] = ["compound"];
 
 /// The scope this workspace is the custodian of — a project or a worklist — if
 /// it is the custodian of one.
@@ -2018,8 +1689,8 @@ pub const LOCAL_BACKEND_NAMES: [&str; 2] = ["herdr", "compound"];
 /// — this one did, the night the rule changed — answers with the first in id
 /// order and heals the next time anybody takes a seat.
 ///
-/// No workspace is no seat, never a seat. A pane herdr answered for without a
-/// workspace id, or a caller outside herdr entirely, would otherwise match a
+/// No workspace is no seat, never a seat. A pane backend answered for without a
+/// workspace id, or a caller outside backend entirely, would otherwise match a
 /// record whose own field failed to parse — and the answer to "am I the seat"
 /// would come back yes for a process that is not in a workspace at all.
 ///
@@ -2097,7 +1768,7 @@ pub fn governs(governors: &std::collections::BTreeMap<String, serde_json::Value>
 /// one, the workspace itself otherwise.
 ///
 /// The bridge between the shape most callers still carry — a workspace and
-/// maybe a pane, straight off a herdr record or a stored claim — and the one
+/// maybe a pane, straight off a backend record or a stored claim — and the one
 /// [`governs`] now asks for. `pane` wins when it is not empty because it is
 /// the more exact of the two; `workspace` alone is the room-wide question
 /// `wsp govern -w` and a bare `--clear` ask, and is exactly what a caller

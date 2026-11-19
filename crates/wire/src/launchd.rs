@@ -2,9 +2,9 @@
 //!
 //! # What this replaces, and what it was costing
 //!
-//! `wsp daemon` was started by herdr's `[[startup]]` — one line in
-//! `herdr-plugin/herdr-plugin.toml`, and the whole of how a machine got a
-//! daemon. herdr is gone on this machine, so the daemon is gone with it:
+//! `wsp daemon` was started by backend's `[[startup]]` — one line in
+//! the removed plugin manifest, and the whole of how a machine got a
+//! daemon. backend is gone on this machine, so the daemon is gone with it:
 //! `wsp watch --status` read `ticked 6d23h ago, the process is gone`, every
 //! wake spool was still holding, and nothing anywhere said *why*. The first
 //! symptom is silence, and silence from a watchdog is the one silence nobody
@@ -32,7 +32,7 @@
 //! from `/etc/paths`, and a launchd job does not run a login shell. The second
 //! backend is found by `PATH` (`place_compound::Compound`'s census), so a
 //! daemon launched without one is a daemon that cannot see half of this fleet.
-//! `executor/herdr-server.plist` argues the same thing for the executor's
+//! `executor/backend-server.plist` argues the same thing for the executor's
 //! plugins; this is the same argument, one file nearer the trunk.
 //!
 //! # What an install does about a job that is already there
@@ -54,10 +54,10 @@
 //!
 //! # Why a second daemon is still turned away
 //!
-//! herdr's `[[startup]]` is not being removed here, only demoted: a machine
-//! where `wsp install` has never run still gets a daemon when herdr starts, and
+//! backend's `[[startup]]` is not being removed here, only demoted: a machine
+//! where `wsp install` has never run still gets a daemon when backend starts, and
 //! that is the safety net for the machine this lands on. So launchd's job and
-//! herdr's can both be pointed at the same store, and `crate::daemon`'s one-
+//! backend's can both be pointed at the same store, and `crate::daemon`'s one-
 //! daemon-per-store rule is what makes that safe rather than a second copy of
 //! t-260817-052. Nothing here coordinates with it, and nothing here should: the
 //! refusal names the pid and `launchd` stays down, which is the outcome the
@@ -66,7 +66,7 @@
 //! # Why `KeepAlive` is not `true`
 //!
 //! Because `wsp daemon` exits **0** when it declines to run — a second daemon
-//! on one store is not a failure, and herdr's startup hook used to rely on
+//! on one store is not a failure, and backend's startup hook used to rely on
 //! that. A plain `<true/>` would restart it immediately, it would decline
 //! again, and launchd would spend the rest of the day running `wsp daemon` in a
 //! loop. `SuccessfulExit: false` restarts a crash and a `kill -9` and leaves a
@@ -83,7 +83,7 @@ use crate::util;
 
 /// The job's name in launchd and in `~/Library/LaunchAgents`.
 ///
-/// Not `edjames.wsp`, which is the herdr plugin's id: this is a different
+/// Not `edjames.wsp`, which is the backend plugin's id: this is a different
 /// mechanism on a machine that may have several logins, and a launchd label is
 /// what `launchctl print` and `bootout` take, so it has to be the string in the
 /// plist and nowhere else.
@@ -117,7 +117,7 @@ pub fn definition(bin: &Path, state: &Path, path_var: &str) -> String {
 /// makes before it will replace a binary a sandbox does not own. Both exist
 /// because `WSP_HOME` and `WSP_STATE` make a complete wsp instance and nothing
 /// else: the daemon this writes would be pointed at `~/wsp` and at a socket
-/// belonging to the live herdr, and would then sync and reap against it, which
+/// belonging to the live backend, and would then sync and reap against it, which
 /// is the leak `robustness-021` was filed for. A throwaway `WSP_HOME` is the
 /// most common way that happens.
 pub fn sandboxed() -> bool {
@@ -130,7 +130,7 @@ pub fn sandboxed() -> bool {
 
 /// The same rule over values handed in, so it can be asked without the test
 /// mutating this process's environment. `WSP_HOME` and `WSP_STATE` are the two
-/// that make a complete wsp instance; `WSP_BIN` is what `herdr-plugin/run.sh`
+/// that make a complete wsp instance; `WSP_BIN` is what the launcher
 /// checks before `~/.local/bin/wsp`, and its presence means the same thing here
 /// — somebody handed this process a wsp that is not the machine's.
 fn sandboxed_in(home: Option<&OsStr>, state: Option<&OsStr>, bin: Option<&OsStr>) -> bool {
@@ -264,7 +264,7 @@ pub fn plan(want: &str, path: &Path) -> Plan {
 
 /// The `gui/$UID` domain, which is where a user agent belongs.
 ///
-/// `gui` rather than `system` for the reason `executor/herdr-server.plist`
+/// `gui` rather than `system` for the reason `executor/backend-server.plist`
 /// gives: it is the login session, and it is the only domain from which an
 /// agent can reach the login keychain. `$UID` is asked of `id` rather than the
 /// environment, because `UID` is a bash export and this has to work the same
@@ -372,8 +372,15 @@ fn ensure_as(
     state: &Path,
     path_var: &str,
 ) -> Result<Done, String> {
-    let want = plist_as(label, bin, state, path_var);
-    let change = plan(&want, path);
+    ensure_text(label, path, &plist_as(label, bin, state, path_var), false)
+}
+
+/// Write `want` at `path` if it is not already there, and make sure `label` is
+/// loaded from it. `restart` is for a binary that was replaced under a job whose
+/// plist did not change: the job is kicked so the new file runs, which is the
+/// one case [`ensure`] leaves alone on purpose (the daemon re-`exec`s itself).
+fn ensure_text(label: &str, path: &Path, want: &str, restart: bool) -> Result<Done, String> {
+    let change = plan(want, path);
     let domain = domain()?;
     let target = format!("{domain}/{label}");
 
@@ -388,11 +395,22 @@ fn ensure_as(
     // is held to.
     let was_loaded = loaded(&target);
     if change == Plan::Unchanged && was_loaded {
+        if restart {
+            let out = Command::new("launchctl")
+                .args(["kickstart", "-k", &target])
+                .output()
+                .map_err(|e| format!("cannot run launchctl: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("launchctl kickstart failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            settle(&target, Duration::from_secs(15))?;
+            return Ok(Done { path: path.to_path_buf(), wrote: false, loaded: true });
+        }
         return Ok(Done { path: path.to_path_buf(), wrote: false, loaded: false });
     }
 
     if change == Plan::Write {
-        crate::store::write_atomic(path, &want)
+        crate::store::write_atomic(path, want)
             .map_err(|e| format!("cannot write {}: {e}", util::contract(path)))?;
     }
     // Booted out only when it is there to be booted out: a job that is not
@@ -415,6 +433,162 @@ fn ensure_as(
     bootstrap_retrying(&domain, path, 6, Duration::from_secs(1))?;
     settle(&target, Duration::from_secs(8))?;
     Ok(Done { path: path.to_path_buf(), wrote: change == Plan::Write, loaded: true })
+}
+
+// ---- the manager's agent (docs/agent-manager.md 2.4; wsp-024) ----------------
+
+/// The manager's job: `<label>.manager`, beside the daemon's `com.wsp.daemon`.
+pub const MANAGER_LABEL: &str = "com.wsp.manager";
+
+/// How long launchd waits before restarting a manager that keeps dying (2.4).
+/// Shorter than the daemon's: the manager owns no seat's life, and a client is
+/// waiting on its port.
+pub const MANAGER_THROTTLE: u32 = 5;
+
+/// Where the manager's plist goes under `home`. A function of `home` rather
+/// than of the environment, so a test writes into a temp HOME.
+pub fn manager_plist_path_in(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents").join(format!("{MANAGER_LABEL}.plist"))
+}
+
+pub fn manager_plist_path() -> PathBuf {
+    manager_plist_path_in(&util::home())
+}
+
+/// What the manager is, in the line `wsp install` prints.
+pub const MANAGER_KIND: &str = "a launchd agent";
+
+/// [`manager_plist_path`] under the name both launchers share
+/// ([`crate::systemd::manager_definition_path`]).
+pub fn manager_definition_path() -> PathBuf {
+    manager_plist_path()
+}
+
+/// [`manager_plist`] under the name both launchers share
+/// ([`crate::systemd::manager_definition`]).
+pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+    manager_plist(bin, exec_dir, port, path_var)
+}
+
+/// The manager's launchd log: `<exec_dir>/log/launchd.log`, beside the
+/// manager's own `manager.log`. It holds what the process says before its own
+/// log is open, and what it says as it dies.
+pub fn manager_log(exec_dir: &Path) -> PathBuf {
+    exec_dir.join("log").join("launchd.log")
+}
+
+/// The manager's plist as text. `KeepAlive` is a plain `true`, unlike the
+/// daemon's: the manager has no clean exit to leave alone, and a manager that
+/// declines to start (another one answers its port) is restarted every
+/// [`MANAGER_THROTTLE`] seconds until the other is gone, which is what 2.4
+/// asks for.
+///
+/// `--port` is written out, so the machine record and the process cannot
+/// disagree about it.
+pub fn manager_plist(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+    let arg = |s: &str| format!("    <string>{}</string>", escape(s));
+    let log = manager_log(exec_dir);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{MANAGER_LABEL}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+{bin}
+    <string>--exec-dir</string>
+{exec_dir}
+    <string>--port</string>
+    <string>{port}</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>{MANAGER_THROTTLE}</integer>
+
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+{path}
+  </dict>
+
+  <key>StandardOutPath</key>
+{log}
+  <key>StandardErrorPath</key>
+{log}
+</dict>
+</plist>
+"#,
+        bin = arg(&bin.display().to_string()),
+        exec_dir = arg(&exec_dir.display().to_string()),
+        path = arg(path_var),
+        log = arg(&log.display().to_string()),
+    )
+}
+
+/// Write the manager's plist at `path` and make its log directory, without
+/// loading anything. What a test calls, and the first half of
+/// [`ensure_manager`].
+pub fn write_manager_plist(path: &Path, bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> Result<bool, String> {
+    let want = manager_plist(bin, exec_dir, port, path_var);
+    let _ = std::fs::create_dir_all(exec_dir.join("log"));
+    if plan(&want, path) == Plan::Unchanged {
+        return Ok(false);
+    }
+    crate::store::write_atomic(path, &want).map_err(|e| format!("cannot write {}: {e}", util::contract(path)))?;
+    Ok(true)
+}
+
+/// Write the manager's plist if it differs and load the job. `restarted` says
+/// the binary beside it was just replaced, so a job that is already right is
+/// kicked to run it.
+pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, restarted: bool) -> Result<Done, String> {
+    let _ = std::fs::create_dir_all(exec_dir.join("log"));
+    ensure_text(
+        MANAGER_LABEL,
+        &manager_plist_path(),
+        &manager_plist(bin, exec_dir, port, path_var),
+        restarted,
+    )
+}
+
+/// Unload the manager's job and remove its plist. Nothing to unload and
+/// nothing to remove is success; the second value says whether there was a
+/// plist.
+pub fn remove_manager() -> Result<bool, String> {
+    let path = manager_plist_path();
+    let target = format!("{}/{MANAGER_LABEL}", domain()?);
+    if loaded(&target) {
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        wait_gone(&target, Duration::from_secs(15));
+        if loaded(&target) {
+            return Err(format!("{MANAGER_LABEL} is still loaded after bootout"));
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot remove {}: {e}", util::contract(&path))),
+    }
 }
 
 /// Put the machine's daemon job back: `bootstrap` when launchd no longer has
@@ -592,9 +766,35 @@ fn bootstrap(domain: &str, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::Permissions;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
+
+    /// The manager's plist, written for a temp HOME and read back as text:
+    /// launchd is never asked (wsp-024). The label, a plain `KeepAlive`, the
+    /// 5 s throttle, the binary and the log under `<exec_dir>/log/`.
+    #[test]
+    fn the_managers_plist_is_written_under_a_temp_home_and_names_what_2_4_asks() {
+        let home = scratch("manager-home");
+        let exec = home.join(".local/state/wsp-manager");
+        let bin = home.join(".local/bin/wsp-manager");
+        let path = manager_plist_path_in(&home);
+        assert!(path.starts_with(&home));
+        assert!(path.ends_with("Library/LaunchAgents/com.wsp.manager.plist"));
+
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, "/usr/bin:/bin"), Ok(true));
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert!(got.contains("<key>Label</key>\n  <string>com.wsp.manager</string>"), "{got}");
+        assert!(got.contains("<key>KeepAlive</key>\n  <true/>"), "{got}");
+        assert!(got.contains("<key>ThrottleInterval</key>\n  <integer>5</integer>"), "{got}");
+        assert!(got.contains("<key>LimitLoadToSessionType</key>\n  <string>Aqua</string>"), "{got}");
+        assert!(got.contains(&format!("<string>{}</string>\n    <string>--exec-dir</string>", bin.display())), "{got}");
+        let log = exec.join("log/launchd.log");
+        assert_eq!(got.matches(&format!("<string>{}</string>", log.display())).count(), 2, "{got}");
+        assert!(exec.join("log").is_dir(), "the log's directory is made, or launchd cannot open the log");
+        assert!(got.contains("<string>7487</string>"), "{got}");
+
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, "/usr/bin:/bin"), Ok(false), "a second write is no write");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-launchd-{}-{}", name, std::process::id()));
@@ -658,7 +858,7 @@ mod tests {
             })
             .unwrap_or_default();
         let pids: Vec<u32> = stale.iter().map(|(pid, _)| *pid).chain(dirs.iter().map(|(pid, _)| *pid)).collect();
-        let running = crate::util::alive(&pids);
+        let running = crate::host::Host::alive(&crate::host::LOCAL, &pids);
         for (pid, label) in stale {
             if !running.contains(&pid) {
                 let _ = Command::new("launchctl")
@@ -706,12 +906,7 @@ mod tests {
         // chosen for.
         let ran = dir.join("ran.log");
         let bin = dir.join("fake-wsp");
-        std::fs::write(
-            &bin,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", ran.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&bin, &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", ran.display()));
 
         let first = ensure_as(&label, &path, &bin, &dir, "/usr/bin:/bin").expect("the first install");
         assert!(first.wrote, "nothing was written on the first run");
@@ -889,7 +1084,7 @@ mod tests {
     }
 
     /// A sandbox writes nothing and loads nothing. Its daemon would be pointed
-    /// at `~/wsp` and the live herdr's socket, and would then sync and reap
+    /// at `~/wsp` and the live backend's socket, and would then sync and reap
     /// against both — which is the leak `robustness-021` was filed for, and the
     /// one thing `WSP_HOME` makes easy to do by accident.
     ///

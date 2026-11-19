@@ -387,10 +387,20 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     original_seats(store, seats);
     // `wsp-453`: what a finished row's tree still has running goes with its
     // seat, or by the next tick where the seat went some other way. Not in a
-    // test, which would signal the machine's own processes.
-    if !cfg!(test) {
+    // test, which would signal the machine's own processes, unless the test
+    // asked for it ([`tests::SCANS`]) over a tree of its own.
+    if scans_finished() {
         stop_finished(store, seats);
     }
+}
+
+/// Whether the tick scans finished trees: always, but in a test only where it
+/// asked to on its thread.
+fn scans_finished() -> bool {
+    #[cfg(test)]
+    return tests::SCANS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
 }
 
 /// [`crate::check_tree::left_in_finished`], asked of a fleet's seats.
@@ -400,22 +410,35 @@ fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::ch
     crate::place_super::one_ps(|| crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged))
 }
 
+/// How long [`stop_finished`] gives a `TERM` before it looks again and sends
+/// `KILL`. Short in a test, whose one process exits on `TERM` at once.
+const TERM_GRACE_MS: u64 = if cfg!(test) { 100 } else { 1500 };
+
 /// Stop what the finished rows left running (`wsp-453`): `TERM`, a moment,
 /// then `KILL` for what is still there, and a `cycle.log` line for each tree.
 /// Run by the tick, so a row that reaches review has nothing of its own
 /// running by the next one. Returns the lines said.
+///
+/// **Under `WSP_HOST=manager` the scan is wip's too** (`wsp-034`): `wip` there
+/// runs no scan of its own and draws [`finished_wip_lines_held`], so what this
+/// scan found is left in `finished-wip.json` before anything is signalled, an
+/// empty list where nothing was. Under `inproc` `wip` scans for itself and the
+/// file is its alone, as it was.
 pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let Some(found) = left_in_finished_by(store, seats) else { return Vec::new() };
+    if crate::fold::under_manager() {
+        hold_wip_lines(store, &wip_lines_of(&found));
+    }
     let mut said = say_spared(store, &found);
     let found: Vec<_> = found.into_iter().filter(|l| !l.pids.is_empty()).collect();
     if found.is_empty() {
         return said;
     }
     let all = |l: &[crate::check_tree::Left]| l.iter().flat_map(|t| t.pids.clone()).collect::<Vec<u32>>();
-    crate::check_tree::signal("-TERM", &all(&found));
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    crate::check_tree::signal("TERM", &all(&found));
+    std::thread::sleep(std::time::Duration::from_millis(TERM_GRACE_MS));
     let still = left_in_finished_by(store, seats).unwrap_or_default();
-    crate::check_tree::signal("-KILL", &all(&still));
+    crate::check_tree::signal("KILL", &all(&still));
     for t in &found {
         let kill: Vec<u32> = still.iter().filter(|s| s.tree == t.tree).flat_map(|s| s.pids.clone()).collect();
         let path = util::contract(std::path::Path::new(&t.tree));
@@ -451,6 +474,36 @@ fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
 /// How long the lines `wsp wip` draws for finished trees are good for.
 const WIP_LINES_FOR_SECS: i64 = 30;
 
+/// The lines a finished-tree scan left in `finished-wip.json`, as the last
+/// scan left them, and nothing when they are stale: no scan here. `wip` under
+/// `WSP_HOST=manager` runs no `ps` (`docs/agent-manager.md` 4.3) and draws
+/// these; the daemon's tick scans and writes them ([`stop_finished`]).
+pub(crate) fn finished_wip_lines_held(store: &Store) -> Vec<String> {
+    let now = util::epoch_secs();
+    std::fs::read_to_string(store.state_file("finished-wip.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| now - v["at"].as_i64().unwrap_or(0) < WIP_LINES_FOR_SECS)
+        .and_then(|v| v["lines"].as_array().map(|l| l.iter().filter_map(|l| l.as_str().map(str::to_string)).collect()))
+        .unwrap_or_default()
+}
+
+/// The lines `wsp wip` draws for the trees in `found` that still have
+/// processes the tree started.
+fn wip_lines_of(found: &[crate::check_tree::Left]) -> Vec<String> {
+    found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect()
+}
+
+/// Leave `lines` in `finished-wip.json` for the next [`WIP_LINES_FOR_SECS`],
+/// written whole and renamed into place.
+fn hold_wip_lines(store: &Store, lines: &[String]) {
+    let file = store.state_file("finished-wip.json");
+    let tmp = file.with_extension(format!("json.{}", std::process::id()));
+    if std::fs::write(&tmp, serde_json::json!({ "at": util::epoch_secs(), "lines": lines }).to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &file);
+    }
+}
+
 /// The lines `wsp wip` draws for finished trees that still have processes.
 ///
 /// **One scan for every caller in the half minute** (`wsp-480`): it is an
@@ -458,7 +511,8 @@ const WIP_LINES_FOR_SECS: i64 = 30;
 /// thermally limited one, and compound's host asks `wsp wip` every three
 /// seconds. The scan leaves its lines in `finished-wip.json`; a `wip` within
 /// [`WIP_LINES_FOR_SECS`] of it draws those. The tick, which stops what the
-/// lines name, scans for itself and never reads this.
+/// lines name, scans for itself and never reads this; under
+/// `WSP_HOST=manager` it writes it ([`stop_finished`]).
 pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
     let file = store.state_file("finished-wip.json");
     let now = util::epoch_secs();
@@ -471,13 +525,9 @@ pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
         }
     }
     let Some(found) = left_in_finished_by(store, &crate::cycle::Fleet) else { return Vec::new() };
-    let lines: Vec<String> =
-        found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect();
+    let lines = wip_lines_of(&found);
     if !cfg!(test) {
-        let tmp = file.with_extension(format!("json.{}", std::process::id()));
-        if std::fs::write(&tmp, serde_json::json!({ "at": now, "lines": lines }).to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, &file);
-        }
+        hold_wip_lines(store, &lines);
     }
     lines
 }
@@ -699,7 +749,7 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
             let outcome = crate::cycle::despawn_seat(&seat).and_then(|()| confirm_gone(seats, &pids));
             let line = match &outcome {
                 Ok(()) => format!("{ORIGINAL_ENDED} {seat} {ORIGINAL_ENDED_TAIL}"),
-                Err(why) => format!("{ORIGINAL_NOT_ENDED} {seat} — {}", util::truncate(why, 160)),
+                Err(why) => format!("{ORIGINAL_NOT_ENDED} {seat} — {}", util::truncate(&why_not_ended(why), 200)),
             };
             if once(store, &row.id, &line) {
                 crate::store::log_line(store, &format!("{}: {}", row.id, line.trim_start_matches("wsp: ")));
@@ -836,11 +886,32 @@ fn record_ended(store: &Store, id: &str, h: &Holds) {
     }
 }
 
+/// Why an ending failed, with what was not empty where the error is only
+/// "Directory not empty" (`wsp-067`), which names nothing.
+///
+/// **Not always the tree** (`wsp-085`). A despawn that answers "is still
+/// standing, so nothing was released" failed before any tree was touched: it
+/// is the backend's end, removing the seat's own directory while the agent's
+/// last hooks still wrote into it (`wsp-092` moves such a directory aside
+/// now). This said "the tree is in use" for cpd-413 and cpd-1000 on m1-fixes-3,
+/// and sent the reader to the member's tree for a cause that was never there.
+pub(crate) fn why_not_ended(why: &str) -> String {
+    if !(why.contains("Directory not empty") || why.contains("os error 66") || why.contains("os error 39")) {
+        return why.to_string();
+    }
+    if why.contains("still standing, so nothing was released") {
+        format!("{why} — the seat's own directory was written as it was removed (its agent's last hooks), so the seat was not ended; its tree was not touched")
+    } else {
+        format!("{why} — the tree is in use: a process still writes in it, so it could not be removed")
+    }
+}
+
 /// A failed ending: on the row, in `cycle.log`, and to the governor — once,
 /// because the row's line is what the next pass reads as "already tried".
 fn not_ended(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, why: &str) {
+    let why = &why_not_ended(why);
     let commit = &h.commit;
-    let line = format!("{NOT_ENDED} {member} ({seat}) at {commit} — {}", util::truncate(why, 160));
+    let line = format!("{NOT_ENDED} {member} ({seat}) at {commit} — {}", util::truncate(why, 200));
     if !once(store, member, &line) {
         return;
     }
@@ -1055,7 +1126,7 @@ pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<S
             };
             match ending {
                 Ok(()) => format!("{EXIT_ENDED} {} ({kind}, {seat}), no pid of it running and its tree kept", util::iso_at(at)),
-                Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why, 160)),
+                Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why_not_ended(&why), 200)),
             }
         }
     };
@@ -1126,6 +1197,16 @@ fn said_exit(store: &Store, seat: &str, row: &str, kind: &str, line: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ending_refused_with_directory_not_empty_says_the_tree_is_in_use() {
+        let why = why_not_ended("could not remove tree: Directory not empty (os error 66)");
+        assert!(why.contains("Directory not empty") && why.contains("the tree is in use"), "{why}");
+        // The backend's end, refused on the seat's own directory, is not the tree (`wsp-085`).
+        let why = why_not_ended("wsp: cpd-413 is still standing, so nothing was released: Directory not empty (os error 66)");
+        assert!(why.contains("the seat's own directory") && !why.contains("the tree is in use"), "{why}");
+        assert_eq!(why_not_ended("no such seat"), "no such seat");
+    }
     use crate::cycle::tests::{DESPAWN_FAILS, ENDED as DESPAWNED, SAID, TOLD};
     use crate::model::Group;
     use crate::verification::Ending;
@@ -1182,6 +1263,91 @@ mod tests {
         fn absent(&self, seat: &str) -> bool {
             self.absent.iter().any(|s| s == seat)
         }
+    }
+
+    thread_local! {
+        /// Set by a test that wants the tick's finished-tree scan
+        /// ([`super::scans_finished`]) over a tree of its own.
+        pub(super) static SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `WSP_HOST` for one test, put back however it ends. Taken after
+    /// [`util::isolated`], whose lock it is held under.
+    struct HostVar;
+    impl HostVar {
+        fn set(v: &str) -> HostVar {
+            std::env::set_var(wsp_wire::host_tcp::ENV, v);
+            HostVar
+        }
+    }
+    impl Drop for HostVar {
+        fn drop(&mut self) {
+            std::env::remove_var(wsp_wire::host_tcp::ENV);
+            SCANS.with(|s| s.set(false));
+        }
+    }
+
+    /// `wsp-034`: under `WSP_HOST=manager` `wip` runs no scan and draws
+    /// `finished-wip.json`, so the daemon's tick, which scans, writes it. A row
+    /// at review with no seat and no claim has its tree's own binary standing
+    /// in it: a tick under `inproc` stops it and leaves no file (wip scans for
+    /// itself there, as before); a tick under the manager stops it and leaves
+    /// the line `wip` draws.
+    #[test]
+    fn a_tick_under_the_manager_leaves_wip_its_finished_tree_heading() {
+        let env = util::isolated("ending-finished-wip");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("fin-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        // `lsof` names the real path, and the tree's own binary is read off
+        // `ps -o comm=`, which is the name it was run under: a `sleep` named
+        // as the tree's build (a copied system binary is refused a start).
+        let base = std::fs::canonicalize(env.home()).unwrap();
+        let tree = base.join(".worktrees").join(&row);
+        std::fs::create_dir_all(&tree).unwrap();
+        let stand = || {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("/bin/sleep").arg0(tree.join("target/debug/stand")).arg("60").current_dir(&tree).spawn().unwrap()
+        };
+        let gone = |c: &mut std::process::Child| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < until {
+                if c.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = c.kill();
+            false
+        };
+        // The manager's seats: none, so nobody holds the row.
+        let seats = Fake { census: Some(vec![]), ..Fake::default() };
+        let held = store.state_file("finished-wip.json");
+
+        let mut child = stand();
+        let host = HostVar::set("inproc");
+        SCANS.with(|s| s.set(true));
+        tick(&store, &seats);
+        drop(host);
+        assert!(gone(&mut child), "the tick stops what the finished tree started");
+        assert!(!held.exists(), "under inproc the file is wip's own scan's, as before");
+        assert!(crate::ending::finished_wip_lines_held(&store).is_empty());
+
+        let mut child = stand();
+        let host = HostVar::set("manager");
+        SCANS.with(|s| s.set(true));
+        tick(&store, &seats);
+        drop(host);
+        assert!(gone(&mut child), "the tick under the manager stops it too");
+        let lines = finished_wip_lines_held(&store);
+        assert_eq!(lines.len(), 1, "wip draws the tick's one line: {lines:?}");
+        assert!(lines[0].starts_with(&format!("{row} is finished and has no seat, and 1 process ")), "{}", lines[0]);
+        assert!(lines[0].ends_with("the tick stops them"), "{}", lines[0]);
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert_eq!(log.matches(&format!("stopped in finished row {row} ")).count(), 2, "{log}");
     }
 
     fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
@@ -1612,8 +1778,11 @@ mod tests {
         );
         assert_eq!(drain(&TOLD).iter().filter(|t| t.contains("verifier of m-1") && t.contains("203")).count(), 1);
         drain(&DESPAWNED);
+        // The pane did close: every backend says so. Another despawn would not
+        // end pid 203, so it is not tried (`wsp-092` retries a seat still there).
+        seats.absent = vec!["cpd-2".into()];
         pass(&store, &seats);
-        assert!(!drain(&DESPAWNED).contains(&"cpd-2".to_string()), "a failure is not tried again every tick");
+        assert!(!drain(&DESPAWNED).contains(&"cpd-2".to_string()), "a failure on a gone pane is not tried again every tick");
         assert!(drain(&TOLD).iter().all(|t| !t.contains("verifier of m-1")), "nor told again");
     }
 
@@ -1902,7 +2071,7 @@ mod tests {
         let after = crate::place_super::tree_of(root.id());
         let running = crate::cycle::Fleet.running(&tree);
         // By pid, never by pattern — this test's own sleep and nothing else.
-        let _ = wsp_base::calls::Command::new("kill").arg(child.to_string()).status();
+        crate::host::Host::signal(&crate::host::LOCAL, &[child], "TERM");
         assert!(after.contains(&child), "still in the group with its parent gone: {after:?}");
         assert_eq!(running, vec![child], "the seat's root is gone and its agent is not");
     }
@@ -1966,7 +2135,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             ended.push((*id, child.try_wait().unwrap().is_some()));
             // The group, for the `sleep` under the shell.
-            let _ = wsp_base::calls::Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+            crate::host::Host::signal_group(&crate::host::LOCAL, child.id(), "KILL");
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -2157,6 +2326,10 @@ mod tests {
         f.survives = vec![202];
         exited(&store, "cpd-2", "m-1", "verifier");
         exits(&store, &f);
+        // The despawn did close the pane, and every backend says so: only pid
+        // 202 outlived it, which another despawn would not end (`wsp-092`
+        // retries a failed ending only while the seat is still there).
+        f.absent.push("cpd-2".into());
         exits(&store, &f);
         crate::cycle::passes_finished(&store, &f);
         assert_eq!(drain(&DESPAWNED), vec!["cpd-2".to_string()], "tried once");

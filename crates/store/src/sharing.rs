@@ -93,9 +93,14 @@
 //! the contention was handing a child process the 20ms it needed. Rescheduling
 //! the tests quietly would move that ground while other tasks stand on it.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use wsp_base::calls::Command;
+
+/// Which of these pids are running: the host's answer (`wire::host::Host::alive`),
+/// passed in because this layer sits below the host and asks it nothing itself.
+/// A host that cannot tell keeps every pid, so a failed read reaps no claim.
+pub type Alive<'a> = &'a dyn Fn(&[u32]) -> BTreeSet<u32>;
 
 /// How many warm trees a repository gets.
 ///
@@ -142,7 +147,7 @@ impl Warm {
 /// Keyed on the repository rather than on the agent or the task, which is the
 /// whole change: an agent is new every spawn and a task is new every day, so
 /// either key guarantees a cold build. The repository is the thing that stays.
-pub fn warm(state: &Path, repo: &Path, slots: usize) -> Option<Warm> {
+pub fn warm(state: &Path, repo: &Path, slots: usize, alive: Alive) -> Option<Warm> {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     claim(&state.join("warm"), &crate::util::slugify(name), slots, alive)
 }
@@ -153,7 +158,7 @@ pub fn warm(state: &Path, repo: &Path, slots: usize) -> Option<Warm> {
 /// away. Held ones are left where they are: a build standing in a tree is the
 /// one thing that must not have it removed underneath it, and the next `--rm`
 /// will find it free.
-pub fn warm_each(state: &Path, repo: &Path, slots: usize) -> Vec<Warm> {
+pub fn warm_each(state: &Path, repo: &Path, slots: usize, alive: Alive) -> Vec<Warm> {
     let name = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     let root = state.join("warm");
     let repo = crate::util::slugify(name);
@@ -165,7 +170,7 @@ pub fn warm_each(state: &Path, repo: &Path, slots: usize) -> Vec<Warm> {
 /// For `wsp verify --rm`, which knows exactly which tree it wants: the one this
 /// agent's last build went to, read back off the pointer that build left. A
 /// held tree comes back `None` and stays where it is.
-pub fn warm_named(dir: &Path) -> Option<Warm> {
+pub fn warm_named(dir: &Path, alive: Alive) -> Option<Warm> {
     let root = dir.parent()?;
     let name = dir.file_name()?.to_str()?;
     let (repo, slot) = name.rsplit_once('-')?;
@@ -177,7 +182,7 @@ fn claim(
     root: &Path,
     repo: &str,
     slots: usize,
-    alive: impl Fn(&[u32]) -> HashSet<u32>,
+    alive: impl Fn(&[u32]) -> BTreeSet<u32>,
 ) -> Option<Warm> {
     (0..slots).find_map(|slot| claim_at(root, repo, slot, &alive))
 }
@@ -187,7 +192,7 @@ fn claim_at(
     root: &Path,
     repo: &str,
     slot: usize,
-    alive: impl Fn(&[u32]) -> HashSet<u32>,
+    alive: impl Fn(&[u32]) -> BTreeSet<u32>,
 ) -> Option<Warm> {
     let _ = std::fs::create_dir_all(root);
     let lock = root.join(format!("{repo}-{slot}.lock"));
@@ -258,7 +263,7 @@ impl Drop for Share {
 /// bargain every other machine-local fact wsp keeps makes. It costs a `wsp
 /// sandbox` its own budget, and that is the right way round: a sandbox exists
 /// so that nothing it does reaches what the real agents read.
-pub fn take(state: &Path) -> Share {
+pub fn take(state: &Path, alive: Alive) -> Share {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let dir = state.join("building");
     let _ = std::fs::create_dir_all(&dir);
@@ -335,7 +340,7 @@ fn share_of(cores: usize, live: usize) -> usize {
 ///
 /// `alive` is passed in for the one reason that matters here: the arithmetic is
 /// worth a test and spawning processes to make one is not.
-fn live_slots(dir: &Path, alive: impl Fn(&[u32]) -> HashSet<u32>) -> usize {
+fn live_slots(dir: &Path, alive: impl Fn(&[u32]) -> BTreeSet<u32>) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     let mut found: Vec<(u32, PathBuf)> = Vec::new();
     for e in entries.flatten() {
@@ -372,36 +377,13 @@ fn live_slots(dir: &Path, alive: impl Fn(&[u32]) -> HashSet<u32>) -> usize {
     n
 }
 
-/// Which of these pids still exist.
-///
-/// One `ps` for the whole list rather than one signal per pid: the list is
-/// short, but it is read at the start of every build and a process per entry is
-/// a cost that grows with the thing being counted.
-///
-/// A `ps` that did not run is not evidence that the processes are gone, so the
-/// failure keeps everything. A build counted that has already finished costs
-/// the next one some jobs; a tree taken from a build still standing in it costs
-/// correctness.
-fn alive(pids: &[u32]) -> HashSet<u32> {
-    if pids.is_empty() {
-        return HashSet::new();
-    }
-    let csv = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-    let out = Command::new("ps").args(["-o", "pid=", "-p", &csv]).output();
-    let Ok(out) = out else { return pids.iter().copied().collect() };
-    out.stdout
-        .split(|b| *b == b'\n')
-        .filter_map(|l| String::from_utf8_lossy(l).trim().parse().ok())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Everything is alive, which is the ordinary case and the one a test of
     /// the claim itself wants out of the way.
-    fn all(pids: &[u32]) -> HashSet<u32> {
+    fn all(pids: &[u32]) -> BTreeSet<u32> {
         pids.iter().copied().collect()
     }
 
@@ -443,7 +425,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("101"), "").unwrap();
         std::fs::write(dir.join("102"), "").unwrap();
-        let live = live_slots(&dir, |_| HashSet::from([101]));
+        let live = live_slots(&dir, |_| BTreeSet::from([101]));
         assert_eq!(live, 1, "only the live pid counts");
         assert!(!dir.join("102").exists(), "the dead one is cleaned up, not left to be recounted");
         assert!(dir.join("101").exists());
@@ -455,7 +437,7 @@ mod tests {
         let dir = iso.path("building");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.txt"), "").unwrap();
-        assert_eq!(live_slots(&dir, |_| HashSet::new()), 0);
+        assert_eq!(live_slots(&dir, |_| BTreeSet::new()), 0);
         assert!(dir.join("notes.txt").exists(), "somebody else's file is left where it was");
     }
 
@@ -470,7 +452,7 @@ mod tests {
         let asked = std::env::var_os("CARGO_BUILD_JOBS");
         std::env::remove_var("CARGO_BUILD_JOBS");
         {
-            let share = take(&state);
+            let share = take(&state, &all);
             assert!(slot.exists(), "a running build is visible to the next one");
             assert!(share.live >= 1 && share.jobs >= 1);
             assert!(share.jobs <= share.cores);
@@ -532,7 +514,7 @@ mod tests {
         let root = iso.path("warm");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("wsp-0.lock"), "424242\n").unwrap();
-        let got = claim(&root, "wsp", 1, |_| HashSet::new()).expect("a dead lock is not a holder");
+        let got = claim(&root, "wsp", 1, |_| BTreeSet::new()).expect("a dead lock is not a holder");
         assert!(got.dir.ends_with("wsp-0"));
     }
 
@@ -543,7 +525,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("wsp-0.lock"), "424242\n").unwrap();
         assert!(
-            claim(&root, "wsp", 1, |_| HashSet::from([424242])).is_none(),
+            claim(&root, "wsp", 1, |_| BTreeSet::from([424242])).is_none(),
             "somebody else is building in it"
         );
     }
@@ -556,16 +538,16 @@ mod tests {
             let held = claim(&root, "wsp", 3, all).unwrap();
             held.dir.clone()
         };
-        let again = warm_named(&dir).expect("the pointer names a free tree");
+        let again = warm_named(&dir, &all).expect("the pointer names a free tree");
         assert_eq!(again.dir, dir);
-        assert!(warm_named(&dir).is_none(), "and it is held while somebody holds it");
+        assert!(warm_named(&dir, &all).is_none(), "and it is held while somebody holds it");
     }
 
     #[test]
     fn a_pointer_at_something_that_is_not_a_warm_tree_names_nothing() {
         let iso = crate::util::isolated("warm-nonsense");
-        assert!(warm_named(&iso.path("warm/wsp-nine")).is_none(), "no slot number in it");
-        assert!(warm_named(&iso.path("warm")).is_none());
+        assert!(warm_named(&iso.path("warm/wsp-nine"), &all).is_none(), "no slot number in it");
+        assert!(warm_named(&iso.path("warm"), &all).is_none());
     }
 
     #[test]
@@ -573,7 +555,7 @@ mod tests {
         let iso = crate::util::isolated("warm-repos");
         let root = iso.path("warm");
         let mine = claim(&root, "wsp", 1, all).unwrap();
-        let theirs = claim(&root, "herdr", 1, all).unwrap();
+        let theirs = claim(&root, "backend", 1, all).unwrap();
         assert_ne!(mine.dir, theirs.dir, "a tree warm for one crate is cold for another");
     }
 }

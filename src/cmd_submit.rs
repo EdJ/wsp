@@ -19,7 +19,9 @@
 //! list: `go`/`hold` run as those verbs, a hold names its cause, and
 //! `followup` stays a flag to the person. A leg's submit is `wsp leg done`
 //! with the file as its baton (its done-when is optional); the row's last leg
-//! submits as a member. `wsp verified`, a check seat's `worklist go`/`hold`
+//! submits as a member, and its leg is closed with it — done at review, back to
+//! pending at a block. A running leg's seat submits its leg whatever
+//! `$WSP_SEAT_KIND` says (`wsp-011`). `wsp verified`, a check seat's `worklist go`/`hold`
 //! and `wsp leg done` run the same rules on what they are given.
 //!
 //! # Every refusal at once
@@ -135,6 +137,13 @@ pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Op
             return 1;
         }
     };
+    // The seat of a running leg submits its leg whatever kind its environment
+    // says (`wsp-011`): a leg seat taken for a member closed the row and left
+    // its leg `running` with no seat, and nothing reseated it.
+    let kind = match kind {
+        Kind::Member if leg_of(&t, me.as_deref()).is_some() => Kind::Leg,
+        k => k,
+    };
     match kind {
         Kind::Verifier => return submit_verifier(store, args, &t, me),
         Kind::Leg => {
@@ -167,6 +176,14 @@ pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Op
         return 1;
     }
     let Some(exit) = checked.exit.as_ref() else { return 1 };
+    // The last leg's submit ends the row, which is refused while a sibling
+    // still runs — said here, before anything moves.
+    if let Some(name) = leg_of(&t, me.as_deref()) {
+        if let Err(why) = crate::legs::end_by_review(&crate::legs::legs(&t), &name, "", &util::now_iso()) {
+            eprintln!("wsp: {} leg {name} not submitted — {why}", t.id);
+            return 1;
+        }
+    }
     if args.has("dry-run") {
         for line in plan_lines(&t, &checked, exit) {
             println!("{line}");
@@ -352,6 +369,23 @@ fn item_lines(text: &str, name: &str) -> Vec<usize> {
         }
     }
     out
+}
+
+/// The exit a bare `wsp review`'s words stand for, as [`validate`] reads it:
+/// the words as they are when they are an exit already (a `summary:` or
+/// `verdict:` first, as `$WSP_EXIT` is written), else the first line as the
+/// summary and the rest as the account, with `owed: nothing` when no `owed:`
+/// is there. The sections are left at their own lines, so a `done-when:` after
+/// a caption is read as `wsp submit` reads it (`wsp-137`).
+pub(crate) fn exit_of_review(account: &str) -> String {
+    let account = account.trim();
+    let first = account.lines().find(|l| !l.trim().is_empty()).and_then(section_heading);
+    if matches!(first, Some("summary" | "verdict")) {
+        return format!("{account}\n");
+    }
+    let (caption, rest) = account.split_once('\n').unwrap_or((account, ""));
+    let owed = if account.lines().any(|l| section_heading(l) == Some("owed")) { "" } else { "\n\nowed: nothing" };
+    format!("summary: {}\n\n{}{owed}\n", caption.trim(), rest.trim())
 }
 
 /// The line a heading `name:` is on.
@@ -823,6 +857,9 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
                 return code;
             }
         }
+    }
+    if let Some(line) = close_my_leg(store, &id, &fold(text), matches!(outcome, Outcome::Blocked(_)), me) {
+        said.push(line);
     }
     // What the file asks for besides the outcome.
     for a in e.asks.iter().filter(|a| !a.decides()) {
@@ -1359,6 +1396,33 @@ pub(crate) fn leg_baton(store: &Store, t: &Task, baton: &str) -> Result<Option<S
     })
 }
 
+/// The running leg of `t` whose seat is `me`, if `me` is one.
+fn leg_of(t: &Task, me: Option<&str>) -> Option<String> {
+    crate::legs::actor_of(&crate::legs::legs(t), me)
+}
+
+/// The last leg's end, when its exit has moved the row: in review, the leg is
+/// done ([`crate::leg_seat::on_review`], with the seat that submitted rather
+/// than the pane `review` reads for itself, which may name no leg); blocked,
+/// the leg goes back to pending, so the run seats it again once the row is
+/// answered rather than reading it as running in a seat that is closing.
+/// Nothing, for a seat that is no leg's. The line for the row's log.
+fn close_my_leg(store: &Store, id: &str, account: &str, blocked: bool, me: Option<&str>) -> Option<String> {
+    let t = store.find_task(id)?;
+    let name = leg_of(&t, me)?;
+    if blocked {
+        crate::leg_seat::reset(store, id, &name)?;
+        return Some(format!("submit: leg {name} is pending again — its exit blocked the row, and the run seats it once the row is answered"));
+    }
+    match crate::leg_seat::on_review(store, id, account, me) {
+        Ok(()) => {
+            store.git_commit(&format!("wsp: {id} leg {name} done by its submit"));
+            None
+        }
+        Err(why) => Some(format!("submit: leg {name} could not be closed: {}", fold(&why))),
+    }
+}
+
 /// `wsp submit <row>` from a leg's seat: `wsp leg done`, with the exit file as
 /// the baton. `None` when this seat's leg is the row's last, which submits as
 /// a member.
@@ -1481,6 +1545,81 @@ mod tests {
 
     fn log(store: &Store) -> String {
         store.task("wsp-101").unwrap().section("Log").unwrap_or_default()
+    }
+
+    /// Give wsp-101 the legs `build` (done) and `finish`, running in `seat`.
+    fn legged(store: &Store, seat: &str) {
+        use crate::legs::{Leg, State};
+        let mut t = store.task("wsp-101").unwrap();
+        let mut finish = Leg::pending("finish", "submit the row");
+        finish.state = State::Running;
+        finish.pane = Some(seat.into());
+        finish.started = Some("2026-11-17T06:00:00Z".into());
+        let build = Leg { state: State::Done, caption: Some("built".into()), ..Leg::pending("build", "build it") };
+        crate::legs::write(&mut t, &[build, finish]);
+        store.save_task(&t).unwrap();
+    }
+
+    fn submit_in(env: &crate::util::Isolated, store: &Store, text: &str, kind: &str, seat: &str) -> i32 {
+        let file = env.path("exit.md");
+        std::fs::write(&file, text).unwrap();
+        let path = file.display().to_string();
+        let args = Args::parse(["submit", "wsp-101", "--from", path.as_str()].iter().map(|s| s.to_string()).collect());
+        submit_from(store, &args, Some(kind), Some(seat.into()))
+    }
+
+    /// `wsp-011`, the wsp-001 shape: the last leg's seat submits with its kind
+    /// read as `member` (and with no pane `review` can find for itself). The
+    /// row goes to review and the leg reads done, not `running` with no seat.
+    #[test]
+    fn a_last_legs_submit_taken_for_a_members_closes_its_leg() {
+        let (env, store, _tree) = member("submit-leg-last", ARTEFACTS);
+        legged(&store, "cpd-121");
+        for kind in ["member", "leg"] {
+            assert_eq!(submit_in(&env, &store, &exit_with("- unit (1m): true\n", "- note: nothing\n"), kind, "cpd-121"), 0, "{}", log(&store));
+            let t = store.task("wsp-101").unwrap();
+            assert_eq!(t.status(), Status::Review);
+            let finish = crate::legs::legs(&t).into_iter().find(|l| l.name == "finish").unwrap();
+            assert_eq!(finish.state, crate::legs::State::Done, "kind {kind}: {}", t.section("Legs").unwrap_or_default());
+            assert!(finish.closed.is_some());
+            // Again, from the start, with the seat's kind said right.
+            let mut t = store.task("wsp-101").unwrap();
+            t.status_raw = "doing".into();
+            store.save_task(&t).unwrap();
+            crate::ending::forget_exit(&store, "cpd-121");
+            legged(&store, "cpd-121");
+        }
+    }
+
+    /// The last leg's exit that blocks the row puts the leg back to pending, so
+    /// the run seats it again once the row is answered.
+    #[test]
+    fn a_last_legs_blocking_submit_leaves_its_leg_pending() {
+        let (env, store, _tree) = member("submit-leg-block", ARTEFACTS);
+        legged(&store, "cpd-122");
+        let blocking = exit_with("- unit (1m): true\n", "- person: decide between the two layers?\n")
+            .replace("- held: the work — work.txt", "- not held: the work — it waits on which layer owns it");
+        assert_eq!(submit_in(&env, &store, &blocking, "member", "cpd-122"), 0, "{}", log(&store));
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status(), Status::Blocked);
+        let finish = crate::legs::legs(&t).into_iter().find(|l| l.name == "finish").unwrap();
+        assert_eq!((finish.state, finish.pane), (crate::legs::State::Pending, None));
+        assert!(log(&store).contains("leg finish is pending again"), "{}", log(&store));
+    }
+
+    #[test]
+    fn a_last_legs_submit_while_a_sibling_runs_is_refused_before_anything_moves() {
+        let (env, store, _tree) = member("submit-leg-sibling", ARTEFACTS);
+        legged(&store, "cpd-123");
+        let mut t = store.task("wsp-101").unwrap();
+        let mut ls = crate::legs::legs(&t);
+        ls[0].state = crate::legs::State::Running;
+        ls[0].pane = Some("cpd-124".into());
+        ls[1].after = Some(vec![]);
+        crate::legs::write(&mut t, &ls);
+        store.save_task(&t).unwrap();
+        assert_eq!(submit_in(&env, &store, &exit_with("- unit (1m): true\n", "- note: nothing\n"), "member", "cpd-123"), 1);
+        assert_eq!(store.task("wsp-101").unwrap().status(), Status::Doing, "nothing moved");
     }
 
     #[test]
@@ -1690,5 +1829,43 @@ mod tests {
         store.save_worklist(&w).unwrap();
         assert!(!crate::worklist::verified_by_a_run(&store, "wsp-101"));
         assert!(crate::cmd_task::exit_warnings(&store, &args, "did it").is_empty());
+    }
+
+    /// `wsp-137`, wsp-039's shape: one account, with its `done-when:` after a
+    /// caption (or after a `summary:` line, as `$WSP_EXIT` is written), read by
+    /// review's check and by `wsp submit --dry-run` — and the two agree. The
+    /// account comes in on a file, as `wsp review <id> --from FILE` reads it,
+    /// so a fold that loses its headings is caught here; a truly missing
+    /// `done-when:` still warns.
+    #[test]
+    fn reviews_check_and_submits_dry_run_read_one_account_alike() {
+        let (env, store, _tree) = member("submit-review-agree", ARTEFACTS);
+        let mut t = store.task("wsp-101").unwrap();
+        t.body = "## Overview\nDo the work.\n\nDone when:\n- the work is in work.txt\n".into();
+        store.save_task(&t).unwrap();
+        let review_of = |account: &str| {
+            let file = env.path("account.md");
+            std::fs::write(&file, account).unwrap();
+            let path = file.display().to_string();
+            let args = Args::synth("review", &["wsp-101", "--from", &path], &[]);
+            let (folded, kept, _) = crate::cmd_task::review_payload(&args, "usage").unwrap();
+            assert!(!folded.contains('\n'), "the log still gets one line");
+            crate::cmd_task::exit_warnings(&store, &args, &kept)
+        };
+        let submit_of = |exit: &str| dry_run(&store, closing::Kind::Member, "wsp-101", exit).err().unwrap_or_default();
+        let body = "It wrote work.txt and left nothing.\n\ndone-when:\n- held: the work is in work.txt — work.txt:1\n\nchecks:\n- unit (120s): true\n\nasks:\n- note: nothing to decide\n";
+        // The exit as written to $WSP_EXIT: the same file to both.
+        let exit = format!("summary: the work is in\n\n{body}\nowed: nothing\n");
+        assert_eq!(submit_of(&exit), Vec::<String>::new(), "submit takes it");
+        assert_eq!(review_of(&exit), Vec::<String>::new(), "and review warns of nothing");
+        // A caption first, the way a bare review is written.
+        let captioned = format!("wsp-101: the work is in\n\n{body}");
+        assert_eq!(review_of(&captioned), Vec::<String>::new(), "no false `no done-when:`");
+        assert_eq!(review_of(&captioned), submit_of(&exit_of_review(&captioned)));
+        // No done-when at all: both say so.
+        let bare = "wsp-101: the work is in\n\nIt wrote work.txt.\n";
+        let warned = review_of(bare);
+        assert!(warned.iter().any(|l| l.contains("no `done-when:`")), "{warned:#?}");
+        assert_eq!(warned, submit_of(&exit_of_review(bare)));
     }
 }

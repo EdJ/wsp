@@ -44,6 +44,7 @@ use crate::cmd_verify::git;
 use crate::place::Place;
 use crate::store::Store;
 use crate::util;
+use crate::host::{Host, LOCAL};
 
 /// The check a directory under `.worktrees/` is the tree of, if it is one.
 ///
@@ -269,12 +270,12 @@ fn seated(backends: &[&dyn Place]) -> Option<Vec<u32>> {
 /// What is running with `dir` as its working directory, other than this process
 /// and its parents, and other than a seat's of `backends`.
 fn running_among(dir: &Path, backends: &[&dyn Place]) -> Vec<u32> {
-    let Ok(out) = wsp_base::calls::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output() else { return Vec::new() };
+    let Some(out) = LOCAL.cwds(None) else { return Vec::new() };
     let Some(seats) = seated(backends) else { return Vec::new() };
     let dir = util::real(&dir.display().to_string());
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
+    let mut keep = crate::base::procs::ancestors(&LOCAL.processes());
     keep.extend(seats);
-    strays(&String::from_utf8_lossy(&out.stdout), &dir, &keep)
+    strays(&out, &dir, &keep)
 }
 
 /// [`running_among`] the backends wsp can spawn onto here.
@@ -284,13 +285,8 @@ pub fn running_in(dir: &Path) -> Vec<u32> {
 }
 
 /// The backends of `all` that answer on this machine now.
-fn here_of(all: &[Box<dyn Place>; 2]) -> Vec<&dyn Place> {
-    let herdr_here = crate::herdr::available_now();
-    all.iter()
-        .zip(crate::place::LOCAL_BACKEND_NAMES)
-        .filter(|(_, name)| *name != "herdr" || herdr_here)
-        .map(|(b, _)| b.as_ref())
-        .collect()
+fn here_of(all: &[Box<dyn Place>]) -> Vec<&dyn Place> {
+    all.iter().map(|b| b.as_ref()).collect()
 }
 
 /// Every process of every live seat here, and this process's ancestors: what
@@ -298,7 +294,7 @@ fn here_of(all: &[Box<dyn Place>; 2]) -> Vec<&dyn Place> {
 /// failed says nothing about whose processes are whose.
 pub fn live_seat_pids() -> Option<Vec<u32>> {
     let all = crate::place::local_backends();
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::processes());
+    let mut keep = crate::base::procs::ancestors(&LOCAL.processes());
     keep.extend(seated(&here_of(&all))?);
     Some(keep)
 }
@@ -306,14 +302,7 @@ pub fn live_seat_pids() -> Option<Vec<u32>> {
 /// Send `sig` to `pids`, and say nothing of it: a process that has gone is the
 /// outcome wanted.
 pub fn signal(sig: &str, pids: &[u32]) {
-    if !pids.is_empty() {
-        let _ = wsp_base::calls::Command::new("kill")
-            .arg(sig)
-            .args(pids.iter().map(|p| p.to_string()))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    LOCAL.signal(pids, sig);
 }
 
 /// Stop the dev servers and watchers a check left running in its tree (a Vite
@@ -328,12 +317,12 @@ fn stop_running(dir: &Path) -> (Vec<u32>, Vec<u32>) {
         return (Vec::new(), Vec::new());
     }
     let found = running_in(dir);
-    signal("-TERM", &found);
+    signal("TERM", &found);
     let mut killed = Vec::new();
     if !found.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         killed = running_in(dir);
-        signal("-KILL", &killed);
+        signal("KILL", &killed);
     }
     (found, killed)
 }
@@ -351,9 +340,9 @@ pub struct Left {
 }
 
 /// Hosts and servers: a process of one of these names is never the tree's to
-/// stop, whatever its working directory (`wsp-478`: the herdr server and a
+/// stop, whatever its working directory (`wsp-478`: the backend server and a
 /// `wsp` were TERMed for standing in a finished tree they were started from).
-const HOSTS: &[&str] = &["herdr", "wsp", "ssh", "sshd", "ssh-agent", "mosh-server", "tmux", "screen"];
+const HOSTS: &[&str] = &["wsp", "ssh", "sshd", "ssh-agent", "mosh-server", "tmux", "screen"];
 
 /// A server a tree builds and runs itself: spared where it is installed, and
 /// the tree's to stop where its executable lives under the tree
@@ -375,9 +364,8 @@ pub enum Verdict {
 
 /// Every process as `(pid, ppid, executable)`, from `ps -o comm=`.
 pub fn exes() -> Vec<(u32, u32, String)> {
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,comm="]).output() else { return Vec::new() };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
+    let Some(out) = LOCAL.table("pid=,ppid=,comm=", false) else { return Vec::new() };
+    out.lines()
         .filter_map(|l| {
             let (pid, rest) = l.trim_start().split_once(char::is_whitespace)?;
             let (ppid, rest) = rest.trim_start().split_once(char::is_whitespace)?;
@@ -473,7 +461,7 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     // stopping it sends the row back with exit 137. Asked before the executable
     // and the tool names, so a node under a node, or an esbuild under the tree's
     // `node_modules`, is spared as the cargo is. Only a `wsp` is asked, the nearest
-    // host above; a pane's herdr does not spare what it holds.
+    // host above; a pane's backend does not spare what it holds.
     if let Some(wsp) = wsp_above(ppid, in_tree, table) {
         return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check runs in this tree"));
     }
@@ -497,7 +485,7 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     }
     // Up through its parents, to the first that decides it: a host makes it
     // the host's; one that stood in the tree makes it the tree's. Further up is
-    // not asked: every pane has a herdr above it.
+    // not asked: every pane has a backend above it.
     let mut at = ppid;
     for _ in 0..table.len() {
         if at <= 1 {
@@ -614,7 +602,7 @@ pub fn left_in_finished(
     staged: &dyn Fn(&crate::model::Task) -> bool,
 ) -> Option<Vec<Left>> {
     let mut live = BTreeSet::new();
-    let mut keep = crate::base::procs::ancestors(&crate::base::procs::parents());
+    let mut keep = crate::base::procs::ancestors(&LOCAL.parents());
     for (seat, label) in census {
         live.insert(label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string());
         keep.extend(pids(&seat).unwrap_or_default());
@@ -627,8 +615,7 @@ pub fn left_in_finished(
                 matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done) && !staged(&t)
             })
     };
-    let out = wsp_base::calls::Command::new("lsof").args(["-d", "cwd", "-Fpn"]).output().ok()?;
-    let lsof = String::from_utf8_lossy(&out.stdout);
+    let lsof = LOCAL.cwds(None)?;
     let found = finished_trees(&lsof, &finished, &keep);
     // The executables are read only for processes there are to sort (`wsp-480`).
     if found.is_empty() {
@@ -639,9 +626,8 @@ pub fn left_in_finished(
 
 /// The resident memory of `pids` in kilobytes.
 pub fn rss_kb(pids: &[u32]) -> u64 {
-    let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-o", "rss=", "-p", &list]).output() else { return 0 };
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum()
+    let Some(out) = LOCAL.rows_of(pids, "rss=") else { return 0 };
+    out.lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum()
 }
 
 /// The sentence `wsp wip` says of a finished tree with processes in it.
@@ -767,6 +753,35 @@ pub fn sweep_of(store: &Store, only: Option<&str>, standing: &dyn Fn(&Path) -> O
     out
 }
 
+/// Who of `census` — `(seat, label, cwd)` — stands in `dir`, the tree of a
+/// check that is over: the check's own seats, which nothing else will end
+/// (`wsp-089`: one opened with no check to go on stood thirteen hours after
+/// its barrier passed, and the sweep kept the tree for it every tick), and the
+/// first other seat as the reason to keep the tree. A seat is the check's own
+/// by its label, `<list> · barrier <N>`, never by its cwd: other seats stand in
+/// a check's tree by cwd too (`wsp-388`). `ended` are seats already ended.
+pub fn standing_in(
+    census: &[(String, String, String)],
+    dir: &Path,
+    check: Option<(&str, usize)>,
+    ended: &[String],
+) -> (Vec<String>, Option<String>) {
+    let dir = util::real(&dir.display().to_string());
+    let own_label = check.map(|(list, at)| format!("{list} · barrier {at}"));
+    let mut own = Vec::new();
+    for (seat, label, cwd) in census.iter().filter(|(id, _, _)| !ended.contains(id)) {
+        if !util::real(cwd).starts_with(&dir) {
+            continue;
+        }
+        let label = label.trim().trim_start_matches('(').trim_end_matches(')');
+        match &own_label {
+            Some(l) if label == l || label.strip_prefix(l.as_str()).is_some_and(|r| r.starts_with(" ·")) => own.push(seat.clone()),
+            _ => return (own, Some(format!("{seat} is standing in it"))),
+        }
+    }
+    (own, None)
+}
+
 /// The kept trees already said in `cycle.log` by this process, with why: a
 /// kept tree is found again every tick, and said again only when the reason
 /// changes or the daemon starts over.
@@ -785,16 +800,31 @@ pub fn tidy(store: &Store, ended: &[String]) {
     }
     // Asked once, and only once a tree has been found to ask it about.
     let seen = std::cell::OnceCell::new();
+    let backend = crate::place_compound::Compound::new();
     let standing = |dir: &Path| -> Option<String> {
-        let dir = util::real(&dir.display().to_string());
-        match seen.get_or_init(cmd_checkout::who_is_standing) {
-            Ok(rows) => rows
-                .iter()
-                .filter(|(id, _)| !ended.contains(id))
-                .find(|(_, cwd)| util::real(cwd).starts_with(&dir))
-                .map(|(id, _)| format!("{id} is standing in it")),
-            Err(why) => Some(why.clone()),
+        let census = seen.get_or_init(|| {
+            backend
+                .census()
+                .map(|c| c.seats().map(|s| (s.seat.as_str().to_string(), s.label.clone(), s.cwd.clone())).collect::<Vec<_>>())
+                .map_err(|e| format!("compound did not say who is standing in it: {e}"))
+        });
+        let rows = match census {
+            Ok(rows) => rows,
+            Err(why) => return Some(why.clone()),
+        };
+        // The sweep asks only of a tree whose check is over.
+        let check = dir.file_name().and_then(|n| named(store, &n.to_string_lossy()));
+        let (own, other) = standing_in(rows, dir, check.as_ref().map(|(l, at)| (l.as_str(), *at)), ended);
+        if other.is_some() {
+            return other;
         }
+        for seat in own {
+            match backend.stop(&crate::place::Seat::new(&seat)) {
+                Ok(()) => crate::store::log_line(store, &format!("ended {seat}, a barrier check seat left standing in {} after its check was over", util::contract(dir))),
+                Err(e) => return Some(format!("{seat}, its check's own seat, is standing in it and would not end: {e}")),
+            }
+        }
+        None
     };
     let found = believing(|| sweep(store, &standing));
     for tree in found {
@@ -1149,11 +1179,11 @@ mod tests {
         verdict(pid, Path::new("/r/.worktrees/c-1"), in_tree, table)
     }
 
-    /// `wsp-478`: the herdr server and a `wsp` stood in a finished tree by
+    /// `wsp-478`: the backend server and a `wsp` stood in a finished tree by
     /// working directory alone and were TERMed.
     #[test]
-    fn a_herdr_or_wsp_standing_in_a_finished_tree_is_spared() {
-        let table = [proc(31702, 1, "/opt/homebrew/bin/herdr"), proc(23862, 1, "/Users/e/.local/bin/wsp")];
+    fn a_backend_or_wsp_standing_in_a_finished_tree_is_spared() {
+        let table = [proc(31702, 1, "/opt/homebrew/bin/tmux"), proc(23862, 1, "/Users/e/.local/bin/wsp")];
         for pid in [31702, 23862] {
             assert!(matches!(judged(pid, &[31702, 23862], &table), Verdict::Spare(_)), "{pid}");
         }
@@ -1199,7 +1229,7 @@ mod tests {
             proc(85319, 1, "/Users/e/Applications/web-chrome.app/Contents/MacOS/web-chrome"),
             proc(85320, 85319, "/usr/local/bin/helper"),
             proc(85321, 85320, "/usr/local/bin/node"),
-            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
             proc(61, 60, "/bin/sh"),
             proc(62, 61, "/usr/local/bin/node"),
         ];
@@ -1219,7 +1249,7 @@ mod tests {
     #[test]
     fn a_cargo_that_a_wsp_check_started_in_a_finished_tree_is_spared() {
         let table = [
-            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
             proc(61, 60, "/bin/sh"),
             proc(19582, 61, "/usr/local/bin/wsp"),
             proc(20694, 19582, "/Users/e/.cargo/bin/cargo"),
@@ -1231,7 +1261,7 @@ mod tests {
             let v = judged(pid, &all, &table);
             assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
         }
-        assert_eq!(judged(62, &all, &table), Verdict::Stop, "a cargo only under a pane's herdr is still the tree's");
+        assert_eq!(judged(62, &all, &table), Verdict::Stop, "a cargo only under a pane's backend is still the tree's");
     }
 
     /// `wsp-653`: the process table at 04:22:45Z, a web-chrome row's `npx vitest`
@@ -1239,7 +1269,7 @@ mod tests {
     #[test]
     fn everything_a_wsp_check_runs_in_a_finished_tree_is_spared_whatever_runs_it() {
         let table = [
-            proc(60, 1, "/opt/homebrew/bin/herdr"),
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
             proc(61, 60, "/bin/sh"),
             proc(85802, 61, "/usr/local/bin/wsp"),
             proc(85960, 85802, "/bin/sh"),
@@ -1258,26 +1288,45 @@ mod tests {
             assert!(matches!(&v, Verdict::Spare(_)), "{pid}: {v:?}");
         }
         for pid in [70, 71] {
-            assert_eq!(judged(pid, &all, &table), Verdict::Stop, "{pid}: a node only under a pane's herdr is still the tree's");
+            assert_eq!(judged(pid, &all, &table), Verdict::Stop, "{pid}: a node only under a pane's backend is still the tree's");
         }
     }
 
     #[test]
     fn what_a_host_started_is_the_hosts() {
-        let table = [proc(30, 1, "/opt/homebrew/bin/herdr"), proc(31, 30, "/usr/bin/some-pane")];
+        let table = [proc(30, 1, "/opt/homebrew/bin/tmux"), proc(31, 30, "/usr/bin/some-pane")];
         assert!(matches!(judged(31, &[30, 31], &table), Verdict::Spare(_)));
     }
 
     #[test]
     fn sorting_a_tree_splits_what_it_started_from_what_only_stands_there() {
         let lsof = "p31702\nn/r/.worktrees/c-1\np40\nn/r/.worktrees/c-1/web\n";
-        let table = [proc(31702, 1, "/opt/homebrew/bin/herdr"), proc(40, 1, "/usr/local/bin/vite")];
+        let table = [proc(31702, 1, "/opt/homebrew/bin/tmux"), proc(40, 1, "/usr/local/bin/vite")];
         let lefts = vec![Left { row: "c-1".into(), tree: "/r/.worktrees/c-1".into(), pids: vec![31702, 40], spared: vec![] }];
         let out = sorted(lsof, lefts, &table);
         assert_eq!(out[0].pids, vec![40]);
         assert_eq!(out[0].spared.len(), 1);
         assert_eq!(out[0].spared[0].0, 31702);
         assert!(spared_line(&out[0], 31702, &out[0].spared[0].1).starts_with("spared 31702 in finished row c-1"));
+    }
+
+    /// `wsp-089`. In a tree whose check is over, the check's own seat — by its
+    /// label — is named for ending and keeps nothing; another seat standing
+    /// there by cwd keeps the tree, as it always did.
+    #[test]
+    fn a_passed_checks_own_seat_is_ended_and_another_keeps_the_tree() {
+        let dir = Path::new("/nowhere/r/.worktrees/run-check-1");
+        let at = |s: &str, l: &str, c: &str| (s.to_string(), l.to_string(), c.to_string());
+        let own = [at("w9:p2", "run · barrier 1", "/nowhere/r/.worktrees/run-check-1"), at("w1:p1", "t-9", "/elsewhere")];
+        assert_eq!(standing_in(&own, dir, Some(("run", 1)), &[]), (vec!["w9:p2".to_string()], None));
+        let wrapped = [at("w9:p2", "(run · barrier 1 · opus)", "/nowhere/r/.worktrees/run-check-1/sub")];
+        assert_eq!(standing_in(&wrapped, dir, Some(("run", 1)), &[]).0, vec!["w9:p2".to_string()]);
+        let tenth = [at("w9:p3", "run · barrier 10", "/nowhere/r/.worktrees/run-check-1")];
+        assert_eq!(standing_in(&tenth, dir, Some(("run", 1)), &[]), (vec![], Some("w9:p3 is standing in it".to_string())), "barrier 10 is not 1's");
+        let member = [at("w2:p1", "t-1", "/nowhere/r/.worktrees/run-check-1")];
+        assert_eq!(standing_in(&member, dir, Some(("run", 1)), &[]).1.as_deref(), Some("w2:p1 is standing in it"));
+        assert_eq!(standing_in(&member, dir, Some(("run", 1)), &["w2:p1".to_string()]), (vec![], None), "an ended seat is nobody");
+        assert_eq!(standing_in(&own, dir, None, &[]).1.as_deref(), Some("w9:p2 is standing in it"), "no check named: nothing is ended");
     }
 
     /// With no backend answering there is nothing to tell a seat from a

@@ -1,0 +1,44 @@
+# wsp-client
+
+The state core's client (`docs/state-core.md` section 6's `wsp-client` row; state-core step 1, wsp-074), with only
+what step 1 needs: dial and hello, request, and subscribe with reconnect. It is the one way a process outside the
+daemon talks to the API: the CLI (wsp-076) and web-chrome (wsp-078, by path dependency). Nothing calls it until
+group 7.
+
+It depends on `wsp-api`, `wsp-store-contract` and `serde_json`. `wsp-server` (a loopback server) and
+`wsp-store-conformance` (`MemStore`) are dev-dependencies, so a process that only calls does not link the server. It
+never links the store, the wire, the host, the manager or the sqlite crate. `tests/layering.rs` walks its path
+dependencies to hold this.
+
+## Holds
+
+- `src/lib.rs`: `Client::dial(state_dir, by, wait)`, `Client::{request, request_keyed, set_timeout, server, head,
+  subscribe}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`), `REQUEST_TIMEOUT`. `request(verb, args)` builds the
+  envelope from a verb name and JSON `args` (so a verb this build does not know still goes out, and the server
+  answers `unsupported`), and returns the `Reply` whose id matches; a refusal is a `Reply` with `err`. One timeout
+  covers send to reply; on a timeout or a lost connection the connection is dropped, and the next request dials
+  again.
+- `src/dial.rs`: `Silent` and `open`. `open` reads `api.json` and `api.token`, gives each address an even share of
+  what is left of `wait`, and says `hello`. `Silent` is `NoListenFile`, `BadListenFile`, `NoToken`, `Unreachable`
+  (each address, with why), `NoWelcome`, `Refused` (the server's code, `unauthorised` for a wrong token) or
+  `NotAServer`; its `Display` names which. `Tcp` is the dial-side twin of `wsp-server`'s carrier (newline JSON, a
+  16 MB line cap), crate-private.
+- `src/subscribe.rs`: `Feed` and `Item`. A feed owns a connection of its own and dials when first read, so
+  `subscribe` itself never fails. `next_within(wait)` hands out `Item::State { state, at }`, `Item::Event(e)` and
+  `Item::Resumed { from }`; `Iterator::next` blocks until the next one. An event id at or before the last handed
+  out is dropped (`duplicates()`). A beat resets the quiet count; each beat period of silence counts a missed beat
+  (`missed_beats()`), and `MISSED_BEATS` in a row, or a closed or malformed connection, drops it. It then dials
+  again with a backoff (25 ms doubling to 1 s; `why_silent()` says why it cannot) and subscribes `from` its last
+  id, and announces that as one `Resumed { from }`, but only when something had been handed out. A `too_old` reply
+  leads to `subscribe {}` on the same connection and a fresh `State`, after which events count from its id.
+  The server drops a connection it hears nothing on for `MISSED_BEATS` beats, so once a beat the feed sends the cheap
+  read `events { from: <its last>, limit: 0 }` and reads its reply past. `set_beat` tells the feed the server's beat period (`BEAT_SECS` unless a test sets it).
+
+## Tests
+
+`tests/client.rs`, against a loopback `wsp-server` over `MemStore` (ephemeral port, a short beat): `dial` silent
+for no `api.json`, a wrong token, no token file, a bad file, a stopped server, and a listener that never welcomes;
+`request` for each read verb, and a request after the server was away; `subscribe` for the snapshot then each event
+once, a restart mid-stream (`Resumed`, then every later event once, ids contiguous), a feed that never connected
+(no `Resumed`), `too_old` (a fresh `State`), and, against a fake server, a repeated id dropped and a silent
+connection dialled again.

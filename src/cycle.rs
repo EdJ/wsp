@@ -11,9 +11,9 @@
 //! # Driven by the verbs, not by a daemon
 //!
 //! The wake path in [`crate::wake`] already existed and had been dead for three
-//! days when this row was written: its only launcher was herdr's `[[startup]]`,
+//! days when this row was written: its only launcher was backend's `[[startup]]`,
 //! and the fleet had moved to compound. Ed's answer to "how does the daemon
-//! run without herdr" was the better question — *do we need one?* — and the
+//! run without backend" was the better question — *do we need one?* — and the
 //! answer is no. Every event a run advances on is a wsp verb run in some
 //! agent's own process: a member's `review` and `land`, a verifier's
 //! `verified`, the barrier agent's `go` or `hold`. So the verb is
@@ -274,7 +274,7 @@ pub(crate) trait Seats {
     /// Which of these are still running. A parameter for the same reason
     /// [`Seats::state`] is: a test names pids that were never processes.
     fn running(&self, pids: &[u32]) -> Vec<u32> {
-        crate::util::alive(pids).into_iter().collect()
+        crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect()
     }
 
     /// Every seat the backends here hold, with its label — for the sweeps that
@@ -316,17 +316,17 @@ pub(crate) trait Seats {
 /// database overruling a screen that has stopped repainting. `wsp-160`.
 ///
 /// **A backend that is not running here is not asked** (`wsp-148`, live on
-/// 2026-10-06). herdr is out of the picture (Ed, 2026-10-06), and while the
+/// 2026-10-06). backend is out of the picture (Ed, 2026-10-06), and while the
 /// fleet still asked it, its `Unreachable` with no server was read as "cannot
-/// say" — so every dead governor seat was `Unreadable` for as long as herdr
+/// say" — so every dead governor seat was `Unreadable` for as long as backend
 /// stayed down, which is always now, and the reconciler refilled none of them:
-/// compound, jolt-app and wsp. herdr owns its panes, so no server here means no
-/// herdr pane here to be in, and a seat recorded on one is a seat compound has
+/// compound, jolt-app and wsp. backend owns its panes, so no server here means no
+/// backend pane here to be in, and a seat recorded on one is a seat compound has
 /// no record of: nobody is in it, and a reseat fills it on compound. Only a
-/// bare id — one qualified `@machine` is that machine's herdr's to answer.
+/// bare id — one qualified `@machine` is that machine's backend's to answer.
 ///
-/// [`crate::herdr::available_now`] rather than the cached answer, because the
-/// daemon lives for days: a cache latched `false` would go on skipping herdr
+/// [`crate::backend::available_now`] rather than the cached answer, because the
+/// daemon lives for days: a cache latched `false` would go on skipping backend
 /// after it came back, and skipping is the direction that seats a successor
 /// beside a live pane. One connect, once a minute, per seat asked about.
 ///
@@ -460,8 +460,8 @@ fn launch(store: &Store, argv: &[&str]) {
         // Nobody's pane: a spawn started from here must not read itself as
         // the agent whose verb triggered it.
         .env_remove(crate::base::seat::SEAT_ENV)
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("WSP_BACKEND_PANE_ID")
+        .env_remove("WSP_BACKEND_WORKSPACE_ID")
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)
@@ -484,10 +484,42 @@ pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
 /// one. The event flags are what the trigger saw, and they only decide what a
 /// governor is told: the steps themselves are read off the store.
 pub fn advance(store: &Store, args: &Args) -> i32 {
+    // A wake [`wake_after`] scheduled: slept here, before any lock or step, so
+    // the wait holds nothing.
+    if let Some(secs) = args.get("after").and_then(|a| a.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_secs(secs.min(WAKE_CAP_SECS)));
+    }
     cap_deliveries();
     // Everything an advance does spawns or tells, so none of it carries on
     // past a busy state lock (`wsp-663`, `docs/step-lock.md`).
     crate::store::strictly(|| advance_in(store, args))
+}
+
+/// The longest `--after` an `advance` sleeps: well past the longest backoff
+/// (two minutes), so a wake that names more is a mistake and not a plan.
+const WAKE_CAP_SECS: u64 = 10 * 60;
+
+/// The event a [`wake_after`] advance carries. Any event keeps it off the bare
+/// form, which is a person asking again and forgives what gave up.
+const RETRY_EVENT: &str = "retry";
+
+/// A start that failed was told "starting it again in `secs`": step `list`
+/// once that wait is over, so the promise holds (`wsp-087`).
+///
+/// **The retry used to come on the daemon's next pass**: m1-fixes-3's wsp-079
+/// was told "in 30 s" at 09:36:11 and started again at 09:37:25, the next tick
+/// after the wait, 44 s late. The backoff gates ([`crate::starts::held`] and
+/// the check entry's wait) free a start once *more* than `secs` have passed,
+/// so the wake is one second after the wait, never on its edge. A detached
+/// process like every other step [`launch`] starts, and the daemon's tick
+/// still steps the list too: whichever comes first starts it, and the step
+/// lock keeps it to one.
+fn wake_after(store: &Store, list: &str, secs: i64) {
+    let after = (secs.max(0) + 1).to_string();
+    let argv = ["worklist", "advance", list, "--event", RETRY_EVENT, "--after", after.as_str()];
+    #[cfg(test)]
+    tests::WAKES.with(|w| w.borrow_mut().push(argv.iter().map(|a| a.to_string()).collect()));
+    launch(store, &argv);
 }
 
 /// How long an `advance` waits on one `compound-sup deliver` (`wsp-666`).
@@ -935,6 +967,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // fans out. With no cap the order changes nothing — each start is keyed on
     // its own record.
     let gone = |seat: &str| seats.absent(seat) || seats.state(seat) == Some(State::Gone);
+    let absent = |seat: &str| seats.absent(seat);
     for s in pos.members.iter().filter(|s| !barrier_only && s.owes_a_verifier()) {
         let Some(member) = store.find_task(&s.id) else { continue };
         // On the kind the work ran on — `wsp-134` d1 (C) — which in a
@@ -955,7 +988,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         if crate::check::gate(store, &member) == crate::check::Gate::Wait {
             continue;
         }
-        if let Some(opened) = open_verifier(store, &member, &on, &gone, &|| gate.admits(&label)) {
+        if let Some(opened) = open_verifier(store, &member, &on, &gone, &absent, &|| gate.admits(&label)) {
             // A member split into sub-tasks no run started (`wsp-311`): its
             // governor hears it once for each landing, as the pass opens.
             if !opened.again {
@@ -972,7 +1005,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                 ));
             }
             if let Some(seat) = &opened.superseded {
-                log_line(store, &format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id));
+                match opened.lost.as_deref() == Some(seat.as_str()) {
+                    true => log_line(store, &format!("{} group {at}: {}'s verifier seat {seat} still stands with its agent gone — ending it", w.id, member.id)),
+                    false => log_line(store, &format!("{} group {at}: {} landed again — ending the pass reading in {seat}", w.id, member.id)),
+                }
                 end_passes(store, seats, &member.id, |p| p.state == crate::verification::State::Superseded);
             }
             if spawn(store, &member.id, &on, Undo::Verifier, (&w.id, &at.to_string())) {
@@ -1120,7 +1156,13 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         let (cap, raised) = raised_cap(&g.kind, own_cap, gate.cap);
         let going_before = members_going(store, &g.members, "", &store.claims());
         let mut began = 0usize;
-        for s in &pos.members {
+        // What every seat needs, before any is opened: a want that is the same
+        // for every row parks the list on this line, with nothing tried.
+        let blocked = if unstarted { list_wide_blocker(store, &g.members) } else { None };
+        if let Some(why) = &blocked {
+            park_list_for(store, &w.id, why);
+        }
+        for s in pos.members.iter().filter(|_| blocked.is_none()) {
             if let Some(on) = holds.get(&s.id) {
                 log_line(store, &format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
                 continue;
@@ -1148,6 +1190,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
                     started.push(s.id.clone());
                 }
                 began += 1;
+                // A refusal every row would meet parked the list: no more tries.
+                if !took && store.worklist(&w.id).is_some_and(|l| l.status() == WorklistStatus::Parked) {
+                    break;
+                }
             }
         }
         // Said when it made a difference, and not on every pass.
@@ -2530,11 +2576,56 @@ pub(crate) fn legs_owed(store: &Store, seats: &dyn Seats) -> Vec<String> {
     out
 }
 
+/// Whether a tick ends this seat now (`wsp-092`): one not tried yet, or one
+/// whose ending failed while the seat is still there. Until 2026-11-18 a failure
+/// was never tried again, and `cpd-1025`, whose end had lost a race with its own
+/// last hook, kept wsp-076's claim and its queued rework leg for nine minutes,
+/// until a person ended it by hand and it went at once.
+///
+/// **Not a seat positively gone** ([`Seats::absent`]): its pane closed and what
+/// failed was a pid that outlived it, which another despawn does not change.
+/// A backend that cannot be reached is not "gone", so that seat is tried again.
+pub(crate) fn end_due(ending: &crate::verification::Ending, seats: &dyn Seats, seat: &str) -> bool {
+    use crate::verification::Ending;
+    match ending {
+        Ending::Standing => true,
+        Ending::Failed(_) => !seats.absent(seat),
+        Ending::Ended => false,
+    }
+}
+
+/// Whether an ending is worth writing on its entry: not a failure after a
+/// failure, which is the same answer and would be a commit every tick.
+fn end_changed(was: &crate::verification::Ending, now: &crate::verification::Ending) -> bool {
+    use crate::verification::Ending;
+    !matches!((was, now), (Ending::Failed(_), Ending::Failed(_)))
+}
+
+/// What a log line of an ending adds when it was a retry's.
+fn again(was: &crate::verification::Ending) -> &'static str {
+    match was {
+        crate::verification::Ending::Failed(_) => ", on a later try",
+        _ => "",
+    }
+}
+
+/// How a failed ending's log line ends: what happens next.
+const TRIED_AGAIN: &str = "tried again each tick while the seat is there, and not said again";
+
+/// How a failed ending's tell ends.
+fn told_again(seat: &str) -> String {
+    format!(
+        "It is tried again each tick, quietly, while the seat is there — \
+         `wsp despawn --pane {seat}` if it will not go, and by pid if a process outlived it."
+    )
+}
+
 /// Every leg that is done and still seated, ended — once each, and never in a
 /// turn. The tick's half of ending a leg, as [`passes_finished`] is a verifier's:
 /// `wsp leg done` is the agent's own last act, and ending the seat inside that
 /// turn cuts it short. The outcome is written on the entry before anything can
-/// ask again, `ended` or `end failed: …`, and a failure is not retried.
+/// ask again, `ended` or `end failed: …`, and a failure is tried again on the
+/// next tick while the seat is still there ([`end_due`]), told once.
 ///
 /// **From `/`** ([`despawn_seat`]), so the tree a sibling stands in is not kept
 /// because the ending process is standing in it. Returns the seats it ended.
@@ -2544,7 +2635,7 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     for t in store.tasks_shared().iter().filter(|t| crate::legs::staged(t)) {
         for l in crate::legs::legs(t) {
             let Some(seat) = l.pane.clone() else { continue };
-            if l.state != crate::legs::State::Done || l.ending != Ending::Standing {
+            if l.state != crate::legs::State::Done || !end_due(&l.ending, seats, &seat) {
                 continue;
             }
             if seats.state(&seat).is_some_and(|s| s.turn_in_flight()) {
@@ -2562,7 +2653,7 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                 Ok(()) => Ending::Ended,
                 Err(why) => Ending::Failed(why.clone()),
             };
-            let wrote = store.locked(|| {
+            let wrote = end_changed(&l.ending, &ending) && store.locked(|| {
                 let Some(mut row) = store.find_task(&t.id) else { return false };
                 let mut all = crate::legs::legs(&row);
                 let Some(q) = all.iter_mut().find(|q| q.name == l.name && q.pane.as_deref() == Some(seat.as_str())) else { return false };
@@ -2575,16 +2666,16 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
             }
             match outcome {
                 Ok(()) => {
-                    log_line(store, &format!("ended {seat}, which ran leg {} of {}", l.name, t.id));
+                    log_line(store, &format!("ended {seat}, which ran leg {} of {}{}", l.name, t.id, again(&l.ending)));
                     ended.push(seat);
                 }
+                Err(_) if l.ending != Ending::Standing => {}
                 Err(why) => {
-                    log_line(store, &format!("could not end {seat}, which ran leg {} of {}: {why} — not tried again", l.name, t.id));
+                    log_line(store, &format!("could not end {seat}, which ran leg {} of {}: {why} — {TRIED_AGAIN}", l.name, t.id));
                     if let Some(w) = list_of(store, t) {
                         tell(store, &w, &format!(
-                            "wsp could not end leg {} of {} in {seat}: {}. It is not tried again — \
-                             `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
-                            l.name, t.id, util::truncate(&why, 200)
+                            "wsp could not end leg {} of {} in {seat}: {}. {}",
+                            l.name, t.id, util::truncate(&why, 200), told_again(&seat)
                         ));
                     }
                 }
@@ -2978,7 +3069,7 @@ pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     for t in store.tasks_shared().iter().filter(|t| crate::pieces::staged(t)) {
         for p in crate::pieces::record(t).pieces {
             let Some(seat) = p.pane.clone() else { continue };
-            if p.state != crate::pieces::State::Done || p.ending != Ending::Standing {
+            if p.state != crate::pieces::State::Done || !end_due(&p.ending, seats, &seat) {
                 continue;
             }
             if seats.state(&seat).is_some_and(|s| s.turn_in_flight()) {
@@ -2996,7 +3087,7 @@ pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
                 Ok(()) => Ending::Ended,
                 Err(why) => Ending::Failed(why.clone()),
             };
-            let wrote = store.locked(|| {
+            let wrote = end_changed(&p.ending, &ending) && store.locked(|| {
                 let Some(mut row) = store.find_task(&t.id) else { return false };
                 let mut rec = crate::pieces::record(&row);
                 let Some(q) = rec.pieces.iter_mut().find(|q| q.n == p.n && q.pane.as_deref() == Some(seat.as_str())) else { return false };
@@ -3009,16 +3100,16 @@ pub(crate) fn pieces_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
             }
             match outcome {
                 Ok(()) => {
-                    log_line(store, &format!("ended {seat}, which ran piece {} of {}", p.n, t.id));
+                    log_line(store, &format!("ended {seat}, which ran piece {} of {}{}", p.n, t.id, again(&p.ending)));
                     ended.push(seat);
                 }
+                Err(_) if p.ending != Ending::Standing => {}
                 Err(why) => {
-                    log_line(store, &format!("could not end {seat}, which ran piece {} of {}: {why} — not tried again", p.n, t.id));
+                    log_line(store, &format!("could not end {seat}, which ran piece {} of {}: {why} — {TRIED_AGAIN}", p.n, t.id));
                     if let Some(w) = list_of(store, t) {
                         tell(store, &w, &format!(
-                            "wsp could not end piece {} of {} in {seat}: {}. It is not tried again — \
-                             `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
-                            p.n, t.id, util::truncate(&why, 200)
+                            "wsp could not end piece {} of {} in {seat}: {}. {}",
+                            p.n, t.id, util::truncate(&why, 200), told_again(&seat)
                         ));
                     }
                 }
@@ -3165,7 +3256,21 @@ pub(crate) fn retry_owed_land(store: &Store, list: &str, at: usize, member: &Tas
     log_line(store, &format!("{list} group {at}: {} {said}", member.id));
 }
 
-pub(crate) fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dyn Fn(&str) -> bool, admit: &dyn Fn() -> bool) -> Option<Opened> {
+/// `gone` is a seat whose agent went without wsp; `absent` is one whose pane has
+/// closed too. Only the second has nothing left to end (`wsp-085`): on
+/// m1-fixes-3 wsp-080's verifier cpd-419 read `Gone` after one turn, its pass was
+/// written `ended` though its pane stood on in the member's tree, and so no
+/// ending ever came for it — not the next verifier's, not the list's close,
+/// which found it "standing in" wsp-080's tree. A seat still standing is
+/// superseded instead, and ended at once like any other.
+pub(crate) fn open_verifier(
+    store: &Store,
+    member: &Task,
+    on: &Policy,
+    gone: &dyn Fn(&str) -> bool,
+    absent: &dyn Fn(&str) -> bool,
+    admit: &dyn Fn() -> bool,
+) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::commit_of(member);
     let landed_again = |p: &v::Pass| match (&now_landing, &p.read) {
@@ -3199,12 +3304,16 @@ pub(crate) fn open_verifier(store: &Store, member: &Task, on: &Policy, gone: &dy
                     return None;
                 }
                 own[i].state = State::Superseded;
+                // A dead agent in a pane that still stands is ended like a
+                // superseded one; only a closed pane has nothing left to end.
+                let closed = dead && own[i].pane.as_deref().is_some_and(absent);
                 if dead {
-                    // Nothing left to end: the seat went without wsp.
-                    own[i].ending = Ending::Ended;
                     lost = own[i].pane.clone();
                 }
-                superseded = own[i].pane.clone().filter(|_| !ended && !dead);
+                if closed {
+                    own[i].ending = Ending::Ended;
+                }
+                superseded = own[i].pane.clone().filter(|_| !ended && !closed);
             }
             Some(p) if p.state == State::Holds => {
                 if !landed_again(p) {
@@ -3808,9 +3917,59 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
         store.git_commit(&format!("wsp: spawn failed on {id}"));
     }
     if matches!(undo, Undo::Member) {
-        member_start_failed(store, owned.0, id, &why);
+        if is_list_wide(&why) {
+            list_wide_refusal(store, owned.0, id, &why);
+        } else {
+            member_start_failed(store, owned.0, id, &why);
+        }
     }
     false
+}
+
+/// What a refusal says when its cause is the same for every row of the list,
+/// not the row's own: the pack builder is not built.
+const LIST_WIDE: &[&str] = &["the pack builder is not built", "WSP_PACK_BIN="];
+
+/// Whether a spawn was refused for a cause no other row of the list escapes.
+fn is_list_wide(why: &str) -> bool {
+    LIST_WIDE.iter().any(|m| why.contains(m))
+}
+
+/// What every seat of a group needs and does not have yet, in one line, or
+/// `None`. Checked before any seat is opened: a start that fails this fails for
+/// every row, five times over, with a seat's minute each (wsp-017).
+fn list_wide_blocker(store: &Store, rows: &[String]) -> Option<String> {
+    #[cfg(test)]
+    {
+        let _ = (store, rows);
+        return tests::PACK_MISSING.with(|p| p.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        let needs = rows.iter().any(|id| store.find_task(id).is_some_and(|t| t.status() == Status::Todo && crate::packet_gen::eligible(&t).is_ok()));
+        if !needs {
+            return None;
+        }
+        crate::packet_gen::pack_bin().err()
+    }
+}
+
+/// Park the list for a cause shared by every row, after one try. The row is
+/// already back at `todo`; its seat is ended and the governor is told.
+fn list_wide_refusal(store: &Store, list: &str, id: &str, why: &str) {
+    despawn(store, id);
+    let why = util::truncate(why, 300);
+    park_list_for(store, list, &why);
+}
+
+/// Park `list` with the cause, log it and tell its seat.
+fn park_list_for(store: &Store, list: &str, why: &str) {
+    let Some(mut w) = store.worklist(list) else { return };
+    let said = format!("every seat of this run needs what is missing, so nothing is started: {why}");
+    if crate::cmd_worklist::park_for_cause(store, &mut w, &said) {
+        log_line(store, &format!("{list}: parked — {why}"));
+        tell(store, &w, &format!("wsp parked the {list} run without trying each row: {why}. Fix it, then `wsp worklist resume {list}`."));
+    }
 }
 
 /// `wsp spawn <id> --agent …`, and its refusal if it refused.
@@ -3919,8 +4078,10 @@ pub(crate) fn check_start_failed(store: &Store, w: &Worklist, at: usize, why: &s
         check_gave_up(store, w, at, u.tries, &why);
         return;
     }
-    let wait = crate::barrier::span(crate::barrier::wait_after(u.tries).unwrap_or_default());
+    let secs = crate::barrier::wait_after(u.tries).unwrap_or_default();
+    let wait = crate::barrier::span(secs);
     log_line(store, &format!("{} group {at}: its check did not start on try {} of {} — {ended}; starting it again in {wait}", w.id, u.tries, crate::barrier::TRIES));
+    wake_after(store, &w.id, secs);
     tell(store, w, &format!(
         "The {} run's barrier check on group {at} did not start (try {} of {}): {why}. \
          wsp ended the pane it left and starts the check again in {wait}.",
@@ -4042,8 +4203,10 @@ fn member_start_failed(store: &Store, list: &str, id: &str, why: &str) {
         start_gave_up(store, w.as_ref(), id, id, m.tries, &why, &format!("`wsp worklist advance {list}`"));
         return;
     }
-    let wait = crate::barrier::span(m.again_in.unwrap_or_default());
+    let secs = m.again_in.unwrap_or_default();
+    let wait = crate::barrier::span(secs);
     log_line(store, &format!("{list}: {id} did not start on try {} of {} — starting it again in {wait}", m.tries, crate::barrier::TRIES));
+    wake_after(store, list, secs);
     if let Some(w) = &w {
         tell(store, w, &format!(
             "wsp could not start an agent on {id} in the {list} run (try {} of {}): {why}. \
@@ -4727,7 +4890,7 @@ pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let owned = crate::ending::exit_owns(store);
     let due = |p: &crate::verification::Pass| p.state != State::Running && !p.pane.as_ref().is_some_and(|s| owned.contains(s));
     for t in store.tasks_shared().iter().filter(|t| t.body.contains("## Verification")) {
-        let done = passes(t).iter().any(|p| p.standing() && due(p));
+        let done = passes(t).iter().any(|p| p.pane.as_deref().is_some_and(|seat| end_due(&p.ending, seats, seat)) && due(p));
         if done {
             out.extend(end_passes(store, seats, &t.id, due));
         }
@@ -4739,15 +4902,18 @@ pub(crate) fn passes_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
 ///
 /// The outcome is written on the pass before anything else can ask again:
 /// `ended`, or `end failed: …`. A failure is said in `cycle.log` and told to
-/// the run's governor, and it is not retried — wsp-176 item 1, a verifier
-/// whose despawn failed was tried again every tick, each attempt a line and
-/// none of them a different answer. A seat that will not end is a person's to
-/// look at, and the entry is where they find which one.
+/// the run's governor **once** — wsp-176 item 1, a verifier whose despawn
+/// failed was tried again every tick, each attempt a line and none of them a
+/// different answer. It is still tried again, quietly, on the next tick while
+/// the seat is there ([`end_due`], `wsp-092`): a seat whose end failed on a
+/// passing race kept its claim, and a rework leg queued behind it, until a
+/// person ended it by hand.
 ///
 /// **Ended means gone, as for the member** (`wsp-193`): the seat's process
 /// tree is read before the despawn, and the pass is `ended` only once none of
-/// it is running. A pid still running after it is `end failed`, on the same
-/// once-only terms. A seat with no pid to confirm by is not ended at all —
+/// it is running. A pid still running after it is `end failed`, told on the
+/// same once-only terms; a pane that is gone is not tried again for it. A
+/// seat with no pid to confirm by is not ended at all —
 /// see [`crate::ending::verifier_pids`] — and stays standing to be asked again.
 ///
 /// Returns the seats it ended.
@@ -4767,7 +4933,10 @@ pub(crate) fn end_passes_keeping(
 ) -> Vec<String> {
     use crate::verification::{passes, write, Ending};
     let Some(t) = store.find_task(member) else { return Vec::new() };
-    let due: Vec<_> = passes(&t).into_iter().filter(|p| p.standing() && which(p)).collect();
+    let due: Vec<_> = passes(&t)
+        .into_iter()
+        .filter(|p| p.pane.as_deref().is_some_and(|seat| end_due(&p.ending, seats, seat)) && which(p))
+        .collect();
     let mut ended = Vec::new();
     for p in due {
         let Some(seat) = p.pane.clone() else { continue };
@@ -4780,9 +4949,13 @@ pub(crate) fn end_passes_keeping(
             }
         };
         // Read before the despawn: it clears the binding the session is found by.
-        let ran = crate::cmd_agent::ran_of_seat(store, &seat, &p.at);
-        let secs = crate::cmd_agent::secs_of_seat(store, &seat, &p.at);
-        let fixed = crate::cmd_agent::fixed_of_seat(store, &seat);
+        // Under `WSP_HOST=manager` no transcript is read (wsp-028): the spend is
+        // the pass's own and the folded `seat.spent`'s, and what it did the
+        // `seat.did` digests'.
+        let transcripts = !crate::fold::under_manager();
+        let ran = transcripts.then(|| crate::cmd_agent::ran_of_seat(store, &seat, &p.at)).flatten();
+        let secs = transcripts.then(|| crate::cmd_agent::secs_of_seat(store, &seat, &p.at)).flatten();
+        let fixed = transcripts.then(|| crate::cmd_agent::fixed_of_seat(store, &seat)).flatten();
         let spent = crate::verification::Spent::ending(p.spent.as_ref(), ran.as_ref(), secs);
         let spent = crate::verification::Spent::with_session(spent, fixed);
         let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
@@ -4791,7 +4964,7 @@ pub(crate) fn end_passes_keeping(
             Ok(()) => Ending::Ended,
             Err(why) => Ending::Failed(why.clone()),
         };
-        let wrote = store.locked(|| {
+        let wrote = end_changed(&p.ending, &ending) && store.locked(|| {
             let Some(mut t) = store.find_task(member) else { return false };
             let mut ps = passes(&t);
             let Some(q) = ps.iter_mut().find(|q| q.at == p.at && q.pane == p.pane) else { return false };
@@ -4806,17 +4979,18 @@ pub(crate) fn end_passes_keeping(
         }
         match outcome {
             Ok(()) => {
-                log_line(store, &format!("ended {seat}, which verified {member} ({})", p.state.as_str()));
+                log_line(store, &format!("ended {seat}, which verified {member} ({}){}", p.state.as_str(), again(&p.ending)));
                 ended.push(seat);
             }
+            Err(_) if p.ending != Ending::Standing => {}
             Err(why) => {
-                log_line(store, &format!("could not end {seat}, which verified {member}: {why} — not tried again"));
+                log_line(store, &format!("could not end {seat}, which verified {member}: {why} — {TRIED_AGAIN}"));
                 let list = store.find_task(member).and_then(|t| list_of(store, &t));
                 if let Some(w) = list {
                     tell(store, &w, &format!(
-                        "wsp could not end the verifier of {member} in {seat}: {}. It is not tried again — \
-                         `wsp despawn --pane {seat}` if it is still standing, and by pid if a process outlived it.",
-                        util::truncate(&why, 200)
+                        "wsp could not end the verifier of {member} in {seat}: {}. {}",
+                        util::truncate(&why, 200),
+                        told_again(&seat)
                     ));
                 }
             }
@@ -5456,6 +5630,8 @@ pub(crate) mod tests {
         pub(crate) static STALL: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Set, and the pack builder is missing for every start in this thread.
+        pub(super) static PACK_MISSING: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
         /// The ends that asked for the tree to be kept (`--keep-tree`).
@@ -5491,6 +5667,9 @@ pub(crate) mod tests {
         /// Set, and the next step on this thread runs it once it holds its list:
         /// the advances that arrive while a step runs.
         pub(crate) static DURING_STEP: std::cell::Cell<Option<fn(&Store, &Worklist)>> = const { std::cell::Cell::new(None) };
+        /// The wakes a failed start scheduled on this thread (`wsp-087`), as
+        /// the argv [`wake_after`] launches: a process a test cannot run.
+        pub(crate) static WAKES: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
     }
 
     fn spawned() -> Vec<(String, String)> {
@@ -6485,10 +6664,12 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// The other verdict. A verifier that blocked has said what has to change;
     /// its job is finished either way, and it is the member's agent who does the
-    /// changing. **And a seat that will not end is said once and left**: the
-    /// failure is on the pass and with the governor, and no tick tries again.
+    /// changing. **And a seat that will not end is said once and tried again
+    /// quietly** (`wsp-092`): the failure is on the pass and with the governor,
+    /// and the next tick ends it once the end goes through, so no claim is kept
+    /// on a seat whose end lost a passing race.
     #[test]
-    fn a_verifier_that_blocked_is_ended_by_a_tick_and_a_failed_ending_is_told_once_and_not_retried() {
+    fn a_verifier_that_blocked_is_ended_by_a_tick_and_a_failed_ending_is_told_once_and_tried_again() {
         use crate::repair::Pass;
         use crate::verification::{Ending, State as V};
 
@@ -6509,9 +6690,20 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(told.iter().filter(|t| t.contains("could not end the verifier of m-1")).count(), 1, "{told:?}");
 
         crate::repair::tick(&store, &Exits, &mut Pass::new());
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "the seat is still there, so the next tick tries again");
+        assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "and does not tell again");
+        assert!(matches!(&passes_on(&store, "m-1")[0].ending, Ending::Failed(_)), "still failed");
+        let lines = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert_eq!(lines().matches("could not end cpd-9").count(), 1, "nor log it again: {}", lines());
+
         END_FAIL.with(|f| *f.borrow_mut() = None);
-        assert!(drained(&ENDED).is_empty(), "a failed ending is not tried again every tick");
-        assert!(!drained(&TOLD).iter().any(|t| t.contains("could not end")), "nor told again");
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
+        assert_eq!(drained(&ENDED), vec!["cpd-9".to_string()], "the race is over and the end goes through");
+        assert_eq!(passes_on(&store, "m-1")[0].ending, Ending::Ended, "and the pass says so");
+        assert!(lines().contains("ended cpd-9, which verified m-1 (blocks), on a later try"), "{}", lines());
+
+        crate::repair::tick(&store, &Exits, &mut Pass::new());
+        assert!(drained(&ENDED).is_empty(), "ended once: nothing is standing any more");
     }
 
     /// `wsp-325`: the seat's transcript is read when its pass is ended, and the
@@ -7696,6 +7888,59 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(spawned().is_empty() && drained(&ENDED).is_empty(), "a check that is running is left alone");
     }
 
+    /// The wake a failed start on `run` scheduled, as [`wake_after`] launches it.
+    fn woken_after(secs: &str) -> Vec<String> {
+        ["worklist", "advance", "run", "--event", RETRY_EVENT, "--after", secs].iter().map(|a| a.to_string()).collect()
+    }
+
+    /// wsp-087, m1-fixes-3's wsp-079: a member's start failed "never ready",
+    /// the run said "starting it again in 30 s", and the retry came on the
+    /// daemon's next pass, 74 s later. The failure now schedules a step for one
+    /// second after the delay its line named, and that step finds the start free.
+    #[test]
+    fn a_member_start_never_ready_is_retried_at_the_delay_its_line_names() {
+        let (_env, store) = scratch("start-wake");
+        task(&store, "m-1", Status::Todo);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let _ = (drained(&SAID), drained(&WAKES));
+        FAIL.with(|f| *f.borrow_mut() = Some("claude started but never became ready for input within 60 s (no seat.started heard)".into()));
+        step(&store, &w, &Blind);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "the start that failed");
+
+        let said = drained(&SAID);
+        let line = said.iter().find(|l| l.contains("m-1 did not start on try 1 of 3")).unwrap_or_else(|| panic!("{said:?}"));
+        assert!(line.ends_with("starting it again in 30 s"), "{line}");
+        assert_eq!(drained(&WAKES), vec![woken_after("31")], "a step for just past the delay the line named, not the next pass");
+
+        age_start(&store, "m-1", 29);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "inside the 30 s it is still held");
+        age_start(&store, "m-1", 31);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".to_string(), "claude".to_string())], "the woken step starts it again");
+    }
+
+    /// And the barrier check's seat, the other start the run retries on a told
+    /// delay: the same wake, and the step at it finds the entry due.
+    #[test]
+    fn a_check_start_never_ready_is_retried_at_the_delay_its_line_names() {
+        let (_env, store, w) = barrier_open("checkwake");
+        check_seated(&store, 1, "cpd-9");
+        let _ = (drained(&SAID), drained(&WAKES), drained(&TOLD));
+        check_start_failed(&store, &w, 1, "claude started but never became ready for input within 60 s (last read Idle)");
+        let said = drained(&SAID);
+        assert!(said.iter().any(|l| l.contains("its check did not start on try 1 of 3") && l.ends_with("starting it again in 30 s")), "{said:?}");
+        assert_eq!(drained(&WAKES), vec![woken_after("31")]);
+
+        age_check(&store, 29);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "inside the 30 s it waits");
+        age_check(&store, 31);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("run · barrier 1".to_string(), "claude".into())], "the woken step starts it again");
+    }
+
     #[test]
     fn a_spawn_that_fails_in_the_step_is_retried_and_the_person_is_flagged_when_the_tries_run_out() {
         let (_env, store, w) = barrier_open("checkspent");
@@ -7966,6 +8211,43 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ps[0].ending, Ending::Ended, "nothing is left to end, and nothing tries");
         assert!(drained(&ENDED).is_empty(), "a seat that went is not despawned");
         assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())]);
+    }
+
+    /// **A verifier whose agent went but whose seat still stands is ended, not
+    /// written off** (`wsp-085`, m1-fixes-3 group 2). wsp-080's verifier cpd-419
+    /// read `Gone` after one turn and no verdict; its pass was written `ended`
+    /// as if its pane had closed, so nothing ever ended it, and the list closed
+    /// with cpd-419 still standing in wsp-080's tree. Now it is superseded and
+    /// ended at once, the fresh verifier's verdict is the row's record, and the
+    /// group's end finds nothing of it left to end.
+    #[test]
+    fn a_verifier_whose_agent_went_in_a_seat_still_standing_is_ended_and_the_next_one_verifies() {
+        use crate::verification::{Ending, State as V};
+        let (_env, store) = scratch("verifierdeadseat");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        crate::verification::name_seat(&store, "m-1", "cpd-419");
+        assert_eq!(spawned().len(), 1);
+        let _ = drained(&ENDED);
+
+        let _ = drained(&SAID);
+        step(&store, &w, &Fixed::new(&[("cpd-419", State::Gone)]));
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+        assert_eq!(drained(&ENDED), vec!["cpd-419".to_string()], "the seat that still stands is ended at once");
+        assert_eq!(ps[0].ending, Ending::Ended, "by that ending, not written off");
+        assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and a fresh one starts");
+        let said = drained(&SAID);
+        assert!(said.iter().any(|l| l.contains("cpd-419 still stands with its agent gone")), "{said:?}");
+
+        crate::verification::name_seat(&store, "m-1", "cpd-1000");
+        crate::verification::record(&store, "m-1", V::Holds, "holds", Some("cpd-1000"), None).unwrap();
+        assert!(verified(&store.tasks(), "m-1"), "the restart's verdict is the row's verified record");
+
+        end_group(&store, &Fixed::new(&[("cpd-419", State::Gone), ("cpd-1000", State::Idle)]), &store.worklist("run").unwrap(), 1);
+        let ended = drained(&ENDED);
+        assert!(!ended.contains(&"cpd-419".to_string()), "nothing of the lost seat is left at close: {ended:?}");
     }
 
     /// A seat that is idle, has taken no turn, and answers what its prompt holds.
@@ -8349,6 +8631,37 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// The cap is on the work, and a member already going counts against it.
+    #[test]
+    fn a_group_start_with_no_pack_builder_makes_no_spawn_attempt_and_names_it() {
+        let (_env, store) = scratch("nopack");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        PACK_MISSING.with(|p| *p.borrow_mut() = Some("the pack builder is not built: set WSP_PACK_BIN".into()));
+        step(&store, &w, &Blind);
+        PACK_MISSING.with(|p| *p.borrow_mut() = None);
+        assert!(spawned().is_empty(), "nothing is started while a seat cannot be given a packet");
+        let w = store.worklist(&w.id).unwrap();
+        assert_eq!(w.status(), WorklistStatus::Parked);
+        assert!(w.section("Log").unwrap_or_default().contains("the pack builder is not built"), "{}", w.section("Log").unwrap_or_default());
+    }
+
+    #[test]
+    fn a_list_wide_spawn_refusal_parks_the_list_after_one_try() {
+        let (_env, store) = scratch("listwide");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        FAIL.with(|f| *f.borrow_mut() = Some("m-1 is not given a packet: the pack builder is not built".into()));
+        step(&store, &w, &Blind);
+        FAIL.with(|f| *f.borrow_mut() = None);
+        assert_eq!(spawned().len(), 1, "one try, and the second row is not tried");
+        assert_eq!(store.worklist(&w.id).unwrap().status(), WorklistStatus::Parked);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
+    }
+
     #[test]
     fn a_capped_group_starts_no_more_than_its_cap() {
         let (_env, store) = scratch("cap");

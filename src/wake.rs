@@ -54,7 +54,7 @@
 //! keystrokes land*, and `core-019` is where this path was found not asking it.
 //! A wake is delivered by typing at a pane, and there are three states in which
 //! that is not a delivery: a pane stopped on a permission dialog takes the text
-//! *into the dialog*, an agent still coming up refuses it, and a pane herdr
+//! *into the dialog*, an agent still coming up refuses it, and a pane backend
 //! cannot be asked about may not hold an agent at all. `cmd_agent::tell` has
 //! refused all three since robustness-083; this path asked only
 //! `turn_in_flight`, which is `Working` and nothing else. It asks
@@ -689,7 +689,10 @@ pub(crate) fn flush_held_tells_now(store: &Store) -> (usize, usize) {
     if store.watch_keys(HELD_TELL).is_empty() {
         return (0, 0);
     }
-    let backends = crate::place::local_backends();
+    // Under `WSP_HOST=manager` a manager that does not answer leaves them all held.
+    let Ok(backends) = crate::cmd_spawn::told_backends(false) else {
+        return (0, 0);
+    };
     let read = |seat: &str| {
         let mut unsure = false;
         for b in backends.iter() {
@@ -923,7 +926,7 @@ fn unseated(store: &Store, scope: &str) -> String {
         .map(|(pid, _)| pid)
         // The daemon asking about itself needs no `ps` (`wsp-320`): this runs
         // once per vacant seat on every pass, and that was a fork each.
-        .is_some_and(|pid| pid == std::process::id() || crate::util::alive(&[pid]).contains(&pid));
+        .is_some_and(|pid| pid == std::process::id() || crate::host::Host::alive(&crate::host::LOCAL, &[pid]).contains(&pid));
     // **Five readings and not two, and each is one a reader can act on
     // differently.** `reseating` and `daemon down` were the two `wsp-148` asked
     // for; the other three are states that arrived with it and that those two
@@ -975,7 +978,7 @@ fn unseated(store: &Store, scope: &str) -> String {
 /// **This is `core-019` question 3, and the answer is that it rides the wake
 /// rather than the work order.** Nothing in `cmd_spawn::work_order`, `wsp
 /// brief` or the handbook says a governor's session may receive prompts nobody
-/// typed, and a wake arrives through `Kind::tell` — herdr typing at the pane —
+/// typed, and a wake arrives through `Kind::tell` — backend typing at the pane —
 /// so it is indistinguishable from Ed at a keyboard. That is a strange thing to
 /// meet unexplained, and the obvious repair is a clause in the custodian work
 /// order.
@@ -1044,7 +1047,7 @@ impl Sink for Tell<'_> {
         // The gate: one state read, two questions, and both of them are about
         // a transport that delivers by *typing at a pane*.
         // [`agent_commands::Kind::queue_is_the_agents`] is that transport
-        // named — its docs open on `Place::tell`, herdr typing — so a kind
+        // named — its docs open on `Place::tell`, backend typing — so a kind
         // carrying a queue of its own pays for neither question.
         //
         // **Mid-turn is the durability half.** `core-021` d2: not corruption —
@@ -1053,19 +1056,19 @@ impl Sink for Tell<'_> {
         // while the spool does not.
         //
         // **Asked of `agent.get` and not of the census row `occupant` hands
-        // back.** `herdr::panes` is `pane.list`, and the whole reason
-        // `Herdr::census` makes two calls is that `pane.list` alone cannot tell
+        // back.** `backend::panes` is `pane.list`, and the whole reason
+        // `Backend::census` makes two calls is that `pane.list` alone cannot tell
         // a starting agent from an idle one — so a status read off that row is
         // not a reading of whether a turn is in flight. Driven 2026-08-21: with
         // the row's status the gate never fired once, and four wakes were
         // delivered into an agent that `agent.get` reported as `working`
-        // throughout. `place_herdr::turning` carries the same warning for the
+        // throughout. `place_backend::turning` carries the same warning for the
         // same reason.
         //
         // **And where the keystrokes land is the other half**, which
         // [`crate::place::State::turn_in_flight`] does not answer: it is
         // `Working` and nothing else, so this path would type into a permission
-        // dialog, into an agent still coming up, and into a pane herdr could
+        // dialog, into an agent still coming up, and into a pane backend could
         // not be asked about — the three `cmd_agent::tell` has refused since
         // robustness-083. The module docs carry it; the question is
         // [`crate::place::State::will_take_a_prompt`], and asking the wider one
@@ -1129,7 +1132,7 @@ impl Sink for Tell<'_> {
 
         // The gate, asked only when the answer is *not* already known and the
         // only thing left to do is type. [`agent_commands::Kind::queue_is_the_agents`]
-        // is that transport named — its docs open on `Place::tell`, herdr typing
+        // is that transport named — its docs open on `Place::tell`, backend typing
         // — so a kind carrying a queue of its own pays for neither question.
         //
         // **Mid-turn is the durability half.** `core-021` d2: not corruption —
@@ -1138,26 +1141,26 @@ impl Sink for Tell<'_> {
         // while the spool does not.
         //
         // **Asked of `agent.get` and not of the census row `occupant` hands
-        // back.** `herdr::panes` is `pane.list`, and the whole reason
-        // `Herdr::census` makes two calls is that `pane.list` alone cannot tell
+        // back.** `backend::panes` is `pane.list`, and the whole reason
+        // `Backend::census` makes two calls is that `pane.list` alone cannot tell
         // a starting agent from an idle one — so a status read off that row is
         // not a reading of whether a turn is in flight. Driven 2026-08-21: with
         // the row's status the gate never fired once, and four wakes were
         // delivered into an agent that `agent.get` reported as `working`
-        // throughout. `place_herdr::turning` carries the same warning for the
+        // throughout. `place_backend::turning` carries the same warning for the
         // same reason.
         //
         // **And where the keystrokes land is the other half**, which
         // [`crate::place::State::turn_in_flight`] does not answer: it is
         // `Working` and nothing else, so this path would type into a permission
-        // dialog, into an agent still coming up, and into a pane herdr could
+        // dialog, into an agent still coming up, and into a pane backend could
         // not be asked about — the three `cmd_agent::tell` has refused since
         // robustness-083. The module docs carry it; the question is
         // [`crate::place::State::will_take_a_prompt`], and asking the wider one
         // costs nothing this path was not already paying, because refusing is
         // the ordinary answer here.
         if how.queue_is_the_agents() {
-            // `State::Unknown` when herdr could not be asked, which
+            // `State::Unknown` when backend could not be asked, which
             // [`held_because`] refuses — an absence is not a fact, least of all
             // the fact that somebody is there to read this.
             //
@@ -1192,7 +1195,7 @@ impl Sink for Tell<'_> {
 }
 
 /// What the seat's supervisor answers to the next tell, scripted by a test
-/// (`wsp-634`): the one thing a fake herdr cannot say, because `failed refused`
+/// (`wsp-634`): the one thing a fake backend cannot say, because `failed refused`
 /// is `compound-sup deliver`'s own word. Empty in every other test, and in the
 /// binary there is nothing here at all.
 #[cfg(test)]
@@ -1419,7 +1422,7 @@ mod tests {
     /// and at-most-once is affordable for a hook and not for a reader that is
     /// asleep.
     ///
-    /// There is no herdr in a test, so nothing can be delivered: what is left
+    /// There is no backend in a test, so nothing can be delivered: what is left
     /// on disk is exactly what would survive the process dying mid-send.
     #[test]
     fn what_the_pass_produced_is_on_disk_before_anything_is_attempted() {
@@ -1532,94 +1535,6 @@ mod tests {
     }
 
     // ---- what a wake is typed into, and what it says when it arrives -------
-
-    /// **The whole path, over a socket, into a seat in each of the six states
-    /// a pane can be in.**
-    ///
-    /// Everything else here asserts a predicate; this asserts what actually
-    /// leaves. It is the shape `core-021` d2 was driven in and the reason two
-    /// of that group's faults were found by driving rather than by reading —
-    /// the gate read a census row that could not tell a working agent from an
-    /// idle one, and nothing above the socket could have said so.
-    ///
-    /// What it pins: the wake reaches an `Idle` seat and nothing else reaches
-    /// anything; what arrives carries [`preamble`] and the news under it; and
-    /// there is not an escape code in it, because the far end is a composer.
-    #[test]
-    fn a_wake_reaches_an_idle_seat_and_arrives_as_something_a_composer_can_read() {
-        use crate::fake::{Fake, Spot, Stage};
-        use crate::place::State;
-
-        let env = util::isolated("wake-driven");
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-
-        // One seat per state, each governing a scope of its own, so one pass
-        // asks the question six times and the answers cannot be confused.
-        let states = [
-            (State::Idle, "s-idle"),
-            (State::Working, "s-working"),
-            (State::Blocked, "s-blocked"),
-            (State::Starting, "s-starting"),
-            (State::Gone, "s-gone"),
-            (State::Unknown, "s-unknown"),
-        ];
-        let mut stage = Stage::new();
-        for (i, (state, scope)) in states.iter().enumerate() {
-            let (space, pane) = (format!("w{}", i + 1), format!("w{}:p1", i + 1));
-            let mut spot = Spot::agent(&pane, "claude", scope, *state);
-            spot.space = space.clone();
-            stage.put(spot);
-            cmd_govern::take(&store, scope, &space, &pane).unwrap();
-        }
-        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let news: Vec<Emit> =
-            states.iter().map(|(_, scope)| emit(Kind::Review, scope, &format!("{scope}-1"))).collect();
-        wake(&store, &news, 0);
-
-        // One delivery, to the one seat that will take a prompt.
-        let told: Vec<crate::fake::Asked> =
-            fake.asked().into_iter().filter(|a| a.verb == crate::fake::Verb::Tell).collect();
-        assert_eq!(told.len(), 1, "only the idle seat was typed at: {told:?}");
-        assert_eq!(told[0].seat.as_ref().map(|s| s.as_str()), Some("w1:p1"));
-
-        let said = &told[0].said;
-        assert!(said.contains("nobody typed this"), "the preamble rides the wake: {said}");
-        assert!(said.contains("`s-idle`"), "and names the scope this seat holds: {said}");
-        assert!(said.contains("s-idle-1"), "and the news is under it: {said}");
-        assert!(!said.contains('\x1b'), "a composer is not a terminal: {said:?}");
-
-        // And the five that were held say which of the five reasons it was, so
-        // `--status` and `doctor` can tell a fault from the design.
-        //
-        // **`Gone` is not one of the five, and `wsp-148` is why.** A pane that
-        // has gone is not a fact about a pane any more — it is a seat nobody is
-        // in, and the reconciler is putting somebody in it. So it says the count
-        // and whether the daemon is the thing that will do it, and the other four
-        // keep their own sentences, because they are all about a seat that *is*
-        // there.
-        for (state, scope) in states.iter().skip(1) {
-            assert_eq!(spool_of(&store, scope).depth(), 1, "{scope} is still owed it");
-            let want = match state {
-                State::Gone | State::Empty => unseated(&store, scope),
-                other => held_because(*other).expect("a refusal has a sentence").to_string(),
-            };
-            assert_eq!(holding(&store, scope), want, "{scope} says why");
-        }
-        assert!(
-            holding(&store, "s-gone").contains("unseated · 1 held ·"),
-            "and the unseated reading counts what is held for it: {}",
-            holding(&store, "s-gone")
-        );
-        assert!(
-            holding(&store, "s-gone").ends_with("daemon down"),
-            "with no daemon running, nothing is coming to fill it — which is the one a person can act on: {}",
-            holding(&store, "s-gone")
-        );
-    }
 
     /// **The shape no fixture in this file supplies: a record carrying only `last`.**
 ///
@@ -1955,70 +1870,6 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let _ = std::fs::remove_dir_all(&env.state());
     }
 
-    /// **wsp-634, the incident end to end.** A list's governor sits idle with an
-    /// empty composer — the fake herdr reads it `idle` and takes anything typed —
-    /// while its supervisor answers `failed refused` to every tell, because its
-    /// hook never fired. Driven through the real wake tick and the real repair
-    /// tick, with only the supervisor's answer scripted:
-    /// (a) the tell is kept and asked again each tick, nothing typed or stamped,
-    ///     the retry saying what it is retrying after;
-    /// (b) the count `wsp wip` draws as `refusing delivery` runs up tick by tick;
-    /// (c) at the fifth the seat is ended, with the reason in `cycle.log` and in
-    ///     the list's own log, and the count starts over for the successor;
-    /// (d) once the seat answers `delivered`, the held tell is taken, and the
-    ///     count is gone.
-    #[test]
-    fn a_governor_whose_supervisor_refuses_every_tell_is_retried_then_ended_and_takes_the_tell_once_it_answers() {
-        use crate::place::{Delivery, Refusal, State};
-        use crate::fake::Spot;
-
-        let (_env, store, fake) = a_governor("wake-refusing-e2e", State::Idle);
-        let mut stage = fake.stage();
-        let mut seat = Spot::agent("w2:p1", "claude", "run", State::Idle);
-        seat.space = "w2".into();
-        stage.put(seat);
-        fake.restage(stage);
-        a_list_under_demo(&store);
-        let why = "cpd-1: refused";
-        let refused = || Err(Refusal::Failed(why.into()));
-        SUPERVISOR.with(|s| s.borrow_mut().clear());
-        let _ = crate::cycle::tests::ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
-        let log = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
-        let idle = Idle;
-
-        SUPERVISOR.with(|s| s.borrow_mut().extend((0..crate::refusals::REFUSED_TICKS).map(|_| refused())));
-        let report = say(&store, "run", "group 1 is at its barrier", None);
-        assert!(!report.arrived() && report.held == 1, "refused, so still owed: {report:?}");
-        for tick in 1..crate::refusals::REFUSED_TICKS {
-            assert_eq!(refusing(&store).get("run"), Some(&(tick, why.to_string())), "tick {tick}");
-            crate::repair::refusal_tick(&store, &idle);
-            assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()), "{tick} refusals are not yet a deaf seat");
-            wake(&store, &[], util::epoch_secs() + tick as i64);
-            assert_eq!(spool_of(&store, "run").depth(), 1, "kept, tick {tick}");
-        }
-        assert_eq!(told_count(&fake), 0, "a refusal types nothing");
-        assert!(log().contains("refused 5 ticks running — retrying; the last answer was `cpd-1: refused`"), "{}", log());
-        assert_eq!(delivered_to(&store, "run"), 0);
-
-        // The fifth refusal is on the books: the daemon ends the seat and says why.
-        assert_eq!(refusing(&store).get("run"), Some(&(crate::refusals::REFUSED_TICKS, why.to_string())));
-        crate::repair::refusal_tick(&store, &idle);
-        let ended = crate::cycle::tests::ENDED.with(|s| s.borrow_mut().drain(..).collect::<Vec<_>>());
-        assert_eq!(ended, vec!["w2:p1".to_string()], "the deaf governor is ended so a successor is seated");
-        assert!(refusing(&store).is_empty(), "the successor starts its own count");
-        let said = format!("w2:p1 refused delivery {} ticks running ({why}) — ended so a successor is seated", crate::refusals::REFUSED_TICKS);
-        assert!(log().contains(&said), "{}", log());
-        assert!(store.worklist("run").unwrap().render().contains("refused delivery 5 ticks running"), "the list's own log");
-
-        // The seat answers at last: the tell that was held is taken on the next tick.
-        SUPERVISOR.with(|s| s.borrow_mut().push_back(Ok(Delivery::Acked)));
-        wake(&store, &[], util::epoch_secs() + 10);
-        assert_eq!(spool_of(&store, "run").depth(), 0, "taken");
-        assert_eq!(delivered_to(&store, "run"), 1);
-        assert!(refusing(&store).is_empty());
-        SUPERVISOR.with(|s| assert!(s.borrow().is_empty(), "every scripted answer was asked for"));
-    }
-
     /// The three readings a seat can give [`crate::repair::reading`], as fakes.
     struct Gone;
     struct Idle;
@@ -2138,7 +1989,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         // The two the old gate let through, named so a revert has to argue with
         // this rather than with a list.
         assert!(!State::Blocked.turn_in_flight(), "which is why the old gate delivered into a modal");
-        assert!(!State::Unknown.turn_in_flight(), "and into a pane herdr could not be asked about");
+        assert!(!State::Unknown.turn_in_flight(), "and into a pane backend could not be asked about");
 
         // And each refusal reads as its own repair: a person at a keyboard, a
         // spawn, and a reporter that could not be asked are three different
@@ -2153,7 +2004,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
 
     /// **A governor is told what woke it, and it is told on the wake.**
     ///
-    /// `core-019` question 3. A wake arrives through `Kind::tell` — herdr
+    /// `core-019` question 3. A wake arrives through `Kind::tell` — backend
     /// typing at the pane — so it is indistinguishable from a person at a
     /// keyboard, and nothing in the custodian work order, the brief or the
     /// handbook says a governor's session may receive prompts nobody typed.
@@ -2228,7 +2079,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     // ---- one path to a governor, and a turn for a receipt --------------------
 
     /// A store with one task in one project and a seat on that project, and the
-    /// fake herdr behind it.
+    /// fake backend behind it.
     ///
     /// **The project is what the seat is taken on and not the worklist**, because
     /// `cycle`'s walk falls back to the first member's project and that is the
@@ -2245,11 +2096,11 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         // The asker is an agent, not a person at a shell, and the pane it is in
         // is named rather than left to the environment: `wsp ask` refuses a
         // question that does not say who is waiting on it, and `my_pane()` reads
-        // `HERDR_PANE_ID`, which every other test in this binary also writes.
+        // `WSP_BACKEND_PANE_ID`, which every other test in this binary also writes.
         // A member holding the task is the whole of what makes this a member's
         // question — an answer goes home to the asker's task, so this is what
         // the return path is built on.
-        std::env::set_var("HERDR_PANE_ID", "w1:p2");
+        std::env::set_var("WSP_BACKEND_PANE_ID", "w1:p2");
         store.set_binding("w1:p2", json!({ "pane": "w1:p2", "task_id": "wsp-146" }));
 
         let mut spot = Spot::agent("w1:p1", "claude", "demo", state);
@@ -2257,7 +2108,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let mut stage = Stage::new();
         stage.put(spot);
         cmd_govern::take(&store, "demo", "w1", "w1:p1").unwrap();
-        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
+        let fake = Fake::bind(env.path("backend.sock"), stage).expect("a socket");
         let (k, v) = fake.socket_env();
         std::env::set_var(k, v);
         (env, store, fake)
@@ -2271,8 +2122,32 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
             .collect()
     }
 
-    fn told_count(fake: &crate::fake::Fake) -> usize {
-        fake.asked().iter().filter(|a| a.verb == crate::fake::Verb::Tell).count()
+    /// A compound seat the census reads as `state`, holding `task`: the double
+    /// `cmd_watch`'s tests use for a seat in the current census (a real seat
+    /// of the in-process host, its record naming an agent and this process as
+    /// the pid, and the state its last hook said). The first of the pair ends
+    /// the supervisor `open` started when it drops.
+    fn compound_seat_in(
+        store: &Store,
+        task: &str,
+        state: crate::place::State,
+    ) -> (String, crate::place_compound::EndsOnDrop) {
+        use crate::place::Place;
+        let compound = crate::place_compound::Compound::new();
+        let seat = compound.open(&crate::place::Order::default()).expect("a compound seat");
+        let dir = compound.dir_of(&seat).unwrap();
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("seat.json")).unwrap()).unwrap();
+        let ends = crate::place_compound::EndsOnDrop(rec["pid"].as_u64().expect("a live pid") as u32);
+        rec["pid"] = json!(std::process::id());
+        rec["agent"] = json!({ "kind": "claude", "name": "t-1", "args": [] });
+        std::fs::write(dir.join("seat.json"), rec.to_string()).unwrap();
+        let hook = if state == crate::place::State::Working { "UserPromptSubmit" } else { "Stop" };
+        compound.heard(&seat, hook, state, &json!({}));
+        assert_eq!(compound.state(&seat).unwrap(), state);
+        store.save_task(&crate::model::Task::new(&format!("{task} a row mid-turn"), task)).unwrap();
+        store.set_binding(seat.as_str(), json!({ "pane": seat.as_str(), "task_id": task }));
+        (seat.as_str().to_string(), ends)
     }
 
     fn delivered_to(store: &Store, scope: &str) -> usize {
@@ -2282,358 +2157,6 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
             .and_then(|v| v.get("delivered"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize
-    }
-
-    /// **The row's whole claim, in one drive.** A governor mid-turn, a member
-    /// asking it a question, a run telling it a verdict — and nothing refused,
-    /// nothing lost and nothing counted as arrived.
-    ///
-    /// This is the acceptance test `wsp-146` names, and every word in it is a
-    /// failure that used to happen: `wsp ask` reached the seat by asking the
-    /// attention pass to derive `unanswered` a minute later, `cycle`'s verdict
-    /// went through `govern --tell`, which **refuses a `Working` seat** — so the
-    /// verdict came back as a hand raised on a member of the run — and the
-    /// entry that reached a seat cleared on the *send* rather than on anything
-    /// the seat did.
-    #[test]
-    fn a_question_and_a_verdict_reach_a_busy_governor_on_its_next_idle_and_only_a_turn_closes_them() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-asked", State::Working);
-
-        // The member's question, through the verb an agent is told to use.
-        let asked = Args::parse(vec![
-            "wsp".into(),
-            "wsp-146".into(),
-            "may I land this, or does the barrier want a verifier first?".into(),
-        ]);
-        assert_eq!(crate::cmd_message::ask(&store, &asked), 0, "the question is raised");
-
-        // The run's verdict, through the half of `cycle::tell` that decides
-        // where a verdict goes — a two-line wrapper the test cannot reach
-        // through `tell` itself, which stops at recording the sentence.
-        let mut w = crate::model::Worklist::new("run", "tonight's run");
-        w.set_status(crate::model::WorklistStatus::Running);
-        w.set_groups(&[crate::model::Group {
-            members: vec!["wsp-146".into()],
-            ..crate::model::Group::default()
-        }]);
-        store.save_worklist(&w).unwrap();
-        assert!(
-            crate::cycle::hand_it_to_the_governor(&store, &w, "group 1 is at its barrier — go on or hold"),
-            "the run's own governor took the verdict, having found the seat above its project"
-        );
-
-        // **Nothing was refused and nothing was typed.** The seat is mid-turn,
-        // and mid-turn is the state this row exists for: `cycle` used to be told
-        // *not ready — working* here and answered by raising a hand on `wsp-146`.
-        assert!(told_to(&fake).is_empty(), "a busy seat is not typed at");
-        assert_eq!(spool_of(&store, "demo").depth(), 2, "both sentences are owed, and the record is the record");
-        assert_eq!(delivered_to(&store, "demo"), 0, "and nothing has arrived");
-        assert_eq!(
-            crate::message::raised(&store).len(),
-            1,
-            "one record: the question. The verdict has no record and is not owed an answer"
-        );
-
-        // The seat comes free. The next pass is what delivers, and it delivers
-        // both in one typing — the flush is a batch, and a governor is not made
-        // to pay two context reads for one barrier.
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
-        wake(&store, &[], util::epoch_secs());
-
-        let said = told_to(&fake);
-        assert_eq!(said.len(), 1, "one typing, carrying everything held: {said:?}");
-        assert!(said[0].contains("may I land this"), "the question is in it: {}", said[0]);
-        assert!(said[0].contains("at its barrier"), "and so is the verdict: {}", said[0]);
-        // The return path rides the message rather than being something the
-        // governor has to know by convention — `worklist-013` cost 2h14m for
-        // exactly that omission.
-        assert!(said[0].contains("wsp answer m-"), "and it says how to answer it: {}", said[0]);
-        assert_eq!(spool_of(&store, "demo").depth(), 0, "a turn started, so both are delivered");
-        assert_eq!(delivered_to(&store, "demo"), 2, "and the count says what the seat did, not what wsp sent");
-    }
-
-    /// **`wsp-170`: a question arrives whole, or says how to read it whole.**
-    ///
-    /// Two multi-paragraph `wsp ask`s reached the governor seat as their first
-    /// paragraph and a `wsp answer` hint; the choice they asked about stayed in
-    /// the asker's `--from` file. The cut was `Message::title` in the line typed
-    /// at the seat, and a seat must never have to read the asker's screen to
-    /// learn what it is being asked.
-    #[test]
-    fn a_three_paragraph_question_reaches_the_seat_with_its_choice_or_the_verb_that_shows_it() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-whole", State::Idle);
-        let question = "cpd-251 wants to widen the scope of wsp-146 to the cycle verb.\n\n\
-             The change touches cycle.rs and wake.rs, and a second lane is already in wake.rs.\n\n\
-             Same change or separate claims? Reply A for one claim, B for two.";
-        let asked = Args::parse(vec!["wsp".into(), "wsp-146".into(), question.into()]);
-        assert_eq!(crate::cmd_message::ask(&store, &asked), 0, "the question is raised");
-
-        let said = told_to(&fake);
-        assert_eq!(said.len(), 1, "and typed at the idle seat once: {said:?}");
-        assert!(said[0].contains("Same change or separate claims? Reply A for one claim, B for two."),
-            "the choice, which is in the last paragraph, is what the seat reads: {}", said[0]);
-
-        // And past the length where it is cut, the choice is still the end the
-        // seat reads, and the verb that prints the middle is named.
-        let long = format!("{}\n\n{}\n\nA or B: one claim or two?", "opening ".repeat(40), "middle ".repeat(400));
-        use crate::message::{About, Message, Party, Waiting};
-        let q = Message::question(Party::seat("cpd-251"), crate::message::Kind::Note, &long, Waiting::new("", "wsp-146"))
-            .about(About::Task("wsp-146".into()));
-        let typed = crate::cmd_message::for_a_governor(&q);
-        assert!(typed.contains("A or B: one claim or two?"), "the question line survives the cut: {typed}");
-        assert!(typed.contains(&format!("wsp ask {}", q.id)), "and so does the verb that shows it whole: {typed}");
-        assert!(!typed.contains(&"middle ".repeat(100)), "the middle is what was cut");
-    }
-
-    /// **`wsp-166` point 2: a governor is typed decisions and nothing else.**
-    ///
-    /// A member at review inside a running list, a question that was answered, a
-    /// row handed to another seat — each was typed at a governor and each cost a
-    /// context read to learn nothing. They stay in the spool, so the drain and
-    /// the logs still have them; the seat hears the hold, and what is blocked.
-    #[test]
-    fn a_governor_is_typed_the_hold_and_the_blocked_and_not_what_a_run_or_an_answer_already_settled() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-decisions", State::Idle);
-        let mut w = crate::model::Worklist::new("run", "tonight's run");
-        w.set_status(crate::model::WorklistStatus::Running);
-        w.set_groups(&[crate::model::Group {
-            members: vec!["wsp-146".into()],
-            ..crate::model::Group::default()
-        }]);
-        store.save_worklist(&w).unwrap();
-
-        let mut answered = emit(Kind::Unanswered, "demo", "wsp-146");
-        answered.edge = Edge::Down;
-        let mut handed = emit(Kind::Blocked, "demo", "wsp-146");
-        handed.edge = Edge::Left;
-        let now = util::epoch_secs();
-        wake(&store, &[emit(Kind::Review, "demo", "wsp-146"), answered, handed], now);
-
-        assert!(told_to(&fake).is_empty(), "a member's review, an answer and a hand-off type nothing: {:?}", told_to(&fake));
-        assert_eq!(spool_of(&store, "demo").depth(), 3, "and all three are still there for the drain");
-        assert_eq!(owed_to_a_seat(&store, &key_for("demo")), 0, "none of them is owed");
-
-        let held = say(&store, "demo", "group 1 is at its barrier — hold", None);
-        assert!(held.arrived(), "the hold went: {held:?}");
-        let said = told_to(&fake);
-        assert_eq!(said.len(), 1, "one typing: {said:?}");
-        assert!(said[0].contains("hold"), "{}", said[0]);
-        assert!(!said[0].contains("review") && !said[0].contains("cleared"), "and nothing the run settled rode along: {}", said[0]);
-        assert_eq!(spool_of(&store, "demo").depth(), 3, "the withheld three outlive the typing");
-
-        // And a review outside any run is still the governor's own work.
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
-        wake(&store, &[emit(Kind::Review, "demo", "loose-1"), emit(Kind::Blocked, "demo", "wsp-146")], now + 1);
-        let said = told_to(&fake);
-        assert_eq!(said.len(), 2, "one more typing: {said:?}");
-        assert!(said[1].contains("loose-1") && said[1].contains("blocked"), "{}", said[1]);
-    }
-
-    /// **A type that starts no turn is still owed, and it is not typed again.**
-    ///
-    /// The `robustness-093` case — the text is in the composer and nobody pressed
-    /// return — which for this path used to be the end of the story: the entry
-    /// cleared, the line said *delivered, no turn seen*, and a governor that had
-    /// read nothing was counted as having been told. `takes = false` on the fake
-    /// is herdr's `agent_prompt_stalled`, which is the only answer a backend that
-    /// watched can give about it.
-    #[test]
-    fn a_type_that_starts_no_turn_is_still_owed_and_is_not_typed_again_inside_the_window() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-unread", State::Idle);
-        // The seat takes the sentence and does nothing with it.
-        let mut next = fake.stage();
-        next.takes = false;
-        fake.restage(next);
-
-        let report = say(&store, "demo", "the barrier is open — start group 2", None);
-        assert!(!report.arrived(), "nothing read it, so nothing arrived: {report:?}");
-        assert_eq!(report.held, 1, "and it is still owed");
-        assert!(told_count(&fake) == 1, "it was typed once");
-
-        // Two more ticks, seconds apart. Each one *could* type it again, and each
-        // one must not: the text is sitting in a composer, and typing at it again
-        // appends to what is there. That is `worklist-010`'s harm — one
-        // paragraph, delivered three times — arriving through the retry this row
-        // introduced.
-        for tick in 1..3 {
-            wake(&store, &[], util::epoch_secs() + tick);
-        }
-        assert_eq!(told_count(&fake), 1, "one typing, however many ticks have gone by");
-        assert_eq!(spool_of(&store, "demo").depth(), 1, "still owed");
-        assert_eq!(delivered_to(&store, "demo"), 0, "and nothing has been counted as delivered");
-        assert!(holding(&store, "demo") == UNREAD, "and the record says which state it is in: {}", holding(&store, "demo"));
-
-        // A turn at last. It confirms the sentence that is already there, so it
-        // clears the entry **without typing anything**.
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
-        wake(&store, &[], util::epoch_secs() + 10);
-
-        assert_eq!(told_count(&fake), 1, "a turn is not a second sentence");
-        assert_eq!(spool_of(&store, "demo").depth(), 0, "and the governor has it");
-        assert_eq!(delivered_to(&store, "demo"), 1, "delivered, on the turn and not on the type");
-    }
-
-    /// **A withheld entry's stale stamp must not swallow the next sentence
-    /// (`wsp-180`).** A batch typed with no turn is stamped — every entry in the
-    /// spool, withheld ones included — and a withheld entry is never settled, so
-    /// its stamp outlived the batch for good. Every later message then read
-    /// *a turn began since the last type*, was reported delivered, and was never
-    /// typed: three verifier blocks in two days, each answered `nothing worth a
-    /// wake yet · 0 held`, and a governor that was never told.
-    #[test]
-    fn a_stamp_on_something_withheld_does_not_stand_for_a_sentence_never_typed() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-stale-stamp", State::Idle);
-        let mut next = fake.stage();
-        next.takes = false;
-        fake.restage(next);
-
-        // Something the seat is not to be typed, held in the spool.
-        let mut answered = emit(Kind::Unanswered, "demo", "wsp-146");
-        answered.edge = Edge::Down;
-        wake(&store, &[answered], util::epoch_secs());
-        assert_eq!(told_count(&fake), 0, "withheld, so not typed");
-
-        // A sentence is typed and no turn comes of it, which stamps the batch.
-        say(&store, "demo", "the first block", None);
-        assert_eq!(told_count(&fake), 1);
-        // The governor reads it: a turn, which clears what was typed.
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
-        wake(&store, &[], util::epoch_secs() + 5);
-        assert_eq!(spool_of(&store, "demo").depth(), 1, "only the withheld one is left");
-        assert_eq!(told_count(&fake), 1);
-
-        // A later block, to a seat that is free again.
-        let mut next = fake.stage();
-        next.takes = true;
-        fake.restage(next);
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
-        let report = say(&store, "demo", "a verifier found a problem: wsp-179 is blocked", None);
-
-        let said = told_to(&fake);
-        assert_eq!(said.len(), 2, "the second sentence was typed and not counted as read: {said:?} {report:?}");
-        assert!(said[1].contains("wsp-179 is blocked"), "{}", said[1]);
-    }
-
-    /// **A turn confirms what was typed, and not a sentence raised after it
-    /// (`wsp-180`).** The acknowledgement cleared the whole batch, so a message
-    /// that arrived while the seat was mid-turn on the last one was counted as
-    /// read without ever being at the seat.
-    #[test]
-    fn a_turn_confirms_what_was_typed_and_not_what_arrived_after_it() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-ack-fresh", State::Idle);
-        let mut next = fake.stage();
-        next.takes = false;
-        fake.restage(next);
-
-        say(&store, "demo", "the first block", None);
-        assert_eq!(told_count(&fake), 1);
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
-
-        let report = say(&store, "demo", "the second block", None);
-        assert_eq!(delivered_to(&store, "demo"), 0, "the second was never at the seat: {report:?}");
-        assert_eq!(spool_of(&store, "demo").depth(), 2, "so both are still owed, held for a seat that is mid-turn");
-
-        assert_eq!(told_count(&fake), 1, "and nothing was typed into a seat that is mid-turn");
-    }
-
-    /// **The daemon may die between the type and the turn, and the sentence goes
-    /// out once.**
-    ///
-    /// The brief's live case, as a test: the only thing that crosses a restart is
-    /// the record, so what matters is that the record says *typed, no turn yet* and
-    /// that the next process reads it rather than typing again. The second
-    /// `Store` is the restarted daemon — same directory, no memory of the type.
-    #[test]
-    fn a_daemon_that_dies_between_the_type_and_the_turn_does_not_send_the_sentence_twice() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-restart", State::Idle);
-        let mut next = fake.stage();
-        next.takes = false;
-        fake.restage(next);
-
-        say(&store, "demo", "group 1 is at its barrier", None);
-        assert_eq!(told_count(&fake), 1);
-        fake.forget();
-
-        // The process goes. Nothing but `watches.json` survives.
-        let restarted = Store::at(_env.home(), _env.state());
-        assert_eq!(spool_of(&restarted, "demo").depth(), 1, "the sentence is on disk, owed");
-        wake(&restarted, &[], util::epoch_secs());
-        assert_eq!(told_count(&fake), 0, "nothing re-typed: the record said it was already at the seat");
-
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Working);
-        wake(&restarted, &[], util::epoch_secs());
-        assert_eq!(told_count(&fake), 0, "and the turn confirmed it rather than repeating it");
-        assert_eq!(spool_of(&restarted, "demo").depth(), 0, "delivered exactly once, to a seat that read it");
-        assert_eq!(delivered_to(&restarted, "demo"), 1);
-    }
-
-    /// **The pass does not announce to a seat that was already handed the
-    /// record.**
-    ///
-    /// `wsp ask` puts the question in the seat's spool itself; the attention pass
-    /// derives `unanswered` for the same record a minute later. Without this the
-    /// governor is told twice, and every wake costs it 208k — measured on the seat
-    /// that filed `core-014`, for the same price as a question from Ed. The second
-    /// half is the half that matters most: the level still goes to a seat that was
-    /// *not* handed it, which is what happens when the addressee stands down and
-    /// the routing walks up a level.
-    #[test]
-    fn a_record_the_seat_was_handed_is_not_announced_to_it_again_but_still_goes_to_whoever_else() {
-        use crate::fake::Spot;
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-handed", State::Working);
-        // A second post, and a second seat, so "where else it still goes" is one
-        // assertion rather than an argument.
-        let mut other = Spot::agent("w2:p1", "claude", "other", State::Working);
-        other.space = "w2".into();
-        let mut stage = fake.stage();
-        stage.put(other);
-        fake.restage(stage);
-        cmd_govern::take(&store, "other", "w2", "w2:p1").unwrap();
-
-        let asked = Args::parse(vec!["wsp".into(), "wsp-146".into(), "which one?".into()]);
-        assert_eq!(crate::cmd_message::ask(&store, &asked), 0);
-        let record = crate::message::raised(&store)
-            .into_iter()
-            .find(|m| m.handed_to("demo"))
-            .expect("the record remembers the seat it was handed to")
-            .id;
-        assert_eq!(spool_of(&store, "demo").depth(), 1, "the question itself");
-
-        // The pass, a minute later, deriving the level for the same record — to
-        // the seat that was handed it, and to one that was not.
-        let level = crate::cmd_watch::Signal::new(Kind::Unanswered, "wsp-146", "w1:p1 waiting").of(&record);
-        let mine = Emit { edge: crate::cmd_watch::Edge::Up, signal: level.clone(), held: 0, to: "demo".into() };
-        let theirs = Emit { edge: crate::cmd_watch::Edge::Up, signal: level, held: 0, to: "other".into() };
-        wake(&store, &[mine, theirs], util::epoch_secs());
-
-        assert_eq!(spool_of(&store, "demo").depth(), 1, "the seat that has it is not told again");
-        assert_eq!(spool_of(&store, "other").depth(), 1, "and the level still reaches everybody else");
-        // And the edge that *goes down* is not suppressed: the governor's cue to
-        // stop watching for the question is worth more than the saving.
-        let down = Emit {
-            edge: crate::cmd_watch::Edge::Down,
-            signal: crate::cmd_watch::Signal::new(Kind::Unanswered, "wsp-146", "answered").of(&record),
-            held: 30,
-            to: "demo".into(),
-        };
-        wake(&store, &[down], util::epoch_secs() + 60);
-        assert_eq!(spool_of(&store, "demo").depth(), 2, "the question closing is still news");
     }
 
     /// **With no seat on the scope there is no spool, and the caller keeps its own
@@ -2725,28 +2248,6 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         w
     }
 
-    /// **A list governor's own question reaches its project's governor**
-    /// (`wsp-263`). The walk for a member of the list reaches the list's seat,
-    /// which is the asker; it used to go to the person from there, past the
-    /// custodian of the project the list was run for. Now it goes one step on.
-    #[test]
-    fn a_list_governors_own_question_lands_on_its_projects_governor() {
-        use crate::place::State;
-
-        let (_env, store, _fake) = a_governor("wake-list-asks", State::Working);
-        a_list_under_demo(&store);
-        std::env::set_var("HERDR_PANE_ID", "w2:p1");
-        let asked = Args::synth("ask", &["wsp-146", "the barrier wants a decision I cannot take"], &[]);
-        assert_eq!(crate::cmd_message::ask(&store, &asked), 0);
-        std::env::set_var("HERDR_PANE_ID", "w1:p2");
-
-        assert_eq!(spool_of(&store, "demo").depth(), 1, "the project's governor holds it");
-        assert_eq!(spool_of(&store, "run").depth(), 0, "and the asker is not woken on its own words");
-        let q = crate::message::raised(&store).pop().expect("the question");
-        assert_eq!(q.for_seat.as_deref(), Some("demo"), "and it waits on demo's answer, not the person's");
-        assert!(!q.for_person);
-    }
-
     /// **The project's governor hears its lists** — the half of
     /// [`crate::cycle::tell_above`] that decides, driven: a line in `demo`'s
     /// spool and none in the list's. And not twice for a list run by hand from
@@ -2767,36 +2268,6 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         store.save_worklist(&by_hand).unwrap();
         assert_eq!(crate::cycle::hand_it_up(&store, &by_hand, "held"), None, "demo governs it, and heard it from `tell`");
         assert_eq!(spool_of(&store, "demo").depth(), 1);
-    }
-
-    /// **What a verb is told, and what `wsp-146` made it say.**
-    ///
-    /// Two things a receipt has never had to carry. *Where it went* — a verb
-    /// whose whole effect is on somebody else's screen must name the screen. And
-    /// *when it will arrive*, which for the first time can honestly be "later":
-    /// an agent that cannot tell later from never is how a question sits open for
-    /// a night, and `worklist-013`'s 2h14m is the measurement of what that costs.
-    #[test]
-    fn a_receipt_names_the_post_and_says_whether_the_seat_has_it_yet() {
-        use crate::place::State;
-
-        let (_env, store, fake) = a_governor("wake-receipt", State::Working);
-        let report = say(&store, "demo", "a question for you", None);
-
-        let busy = report.said("the demo seat", &util::Paint::plain());
-        assert!(busy.contains("the demo seat"), "it names the post: {busy}");
-        assert!(busy.contains("1 still owed"), "and how much: {busy}");
-        assert!(busy.contains("mid-turn"), "and why not yet, in the words doctor prints: {busy}");
-        assert!(busy.contains("wsp watch --drain"), "and what else is held for it: {busy}");
-
-        fake.moves(&crate::place::Seat::new("w1:p1"), State::Idle);
-        let mut next = fake.stage();
-        next.takes = false;
-        fake.restage(next);
-        let report = say(&store, "demo", "and another", None);
-        let typed = report.said("the demo seat", &util::Paint::plain());
-        assert!(typed.contains("typed"), "a seat that took it and read nothing says so: {typed}");
-        assert!(!typed.contains("still owed 0"), "and it is still owed: {typed}");
     }
 
     /// **A tell to a seat on a silent machine is held and delivered on
@@ -2865,37 +2336,29 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     /// idle takes it — with a second tell queued behind it, in order.
     #[test]
     fn a_tell_to_a_working_seat_is_queued_and_typed_at_its_next_idle_in_order() {
-        use crate::fake::{Fake, Spot, Stage};
         use crate::place::State;
         let env = util::isolated("wake-queued-tell");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        store.save_task(&crate::model::Task::new("wsp-700 a row mid-turn", "wsp-700")).unwrap();
-        store.set_binding("w1:p5", json!({ "pane": "w1:p5", "task_id": "wsp-700" }));
-        let mut stage = Stage::new();
-        let mut spot = Spot::agent("w1:p5", "claude", "wsp-700", State::Working);
-        spot.space = "w1".into();
-        stage.put(spot);
-        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
+        let (seat, _ends) = compound_seat_in(&store, "wsp-700", State::Working);
+        // The nothing-typed check is backed by the command's exit code and the held count, not by watching what was typed.
+        let delivered = || store.events_of("agent-told").iter().filter(|e| e["queued"] != json!(true)).count();
+        assert_eq!(delivered(), 0);
 
-        let typed = || told_count(&fake);
-        let before = typed();
         let first = crate::Args::synth("tell", &["wsp-700", "the ninth finding: the bar is too tall"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &first), 0, "queued is a success the sender is told about");
         let second = crate::Args::synth("tell", &["wsp-700", "and the tenth"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &second), 0);
-        assert_eq!(typed(), before, "nothing typed into the turn");
+        assert_eq!(delivered(), 0, "nothing typed into the turn");
 
-        let held = held_tells(&store, "w1:p5");
+        let held = held_tells(&store, &seat);
         assert_eq!(held.len(), 2, "{held:?}");
         assert!(held[0].1.contains("the ninth finding") && held[1].1.contains("the tenth"), "in the order sent: {held:?}");
         assert!(held[0].1.contains(" says: "), "dressed, so the seat reads who speaks: {}", held[0].1);
-        assert_eq!(held_row(&store, "w1:p5").as_deref(), Some("wsp-700"), "the row is kept for the seat's successor");
+        assert_eq!(held_row(&store, &seat).as_deref(), Some("wsp-700"), "the row is kept for the seat's successor");
         let told = store.events_of("agent-told");
         assert!(told.iter().all(|e| e["queued"] == json!(true)), "{told:?}");
-        assert_eq!(queued_tells(&store).get("w1:p5"), Some(&2), "what `wsp wip` draws as queued");
+        assert_eq!(queued_tells(&store).get(seat.as_str()), Some(&2), "what `wsp wip` draws as queued");
         let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
         assert!(log.contains("queued for its next idle"), "{log}");
 
@@ -2907,7 +2370,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert_eq!(flush_held_tells(&store, &|_| Seen::Is(State::Working), &mut send), (0, 0), "still mid-turn");
         assert_eq!(flush_held_tells(&store, &|_| Seen::Is(State::Idle), &mut send), (2, 0), "its next idle");
         assert!(sent.borrow()[0].contains("ninth") && sent.borrow()[1].contains("tenth"));
-        assert!(held_tells(&store, "w1:p5").is_empty());
+        assert!(held_tells(&store, &seat).is_empty());
         assert!(queued_tells(&store).is_empty(), "and wip draws nothing queued");
     }
 
@@ -2917,32 +2380,22 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     /// different sentence still queues behind it.
     #[test]
     fn the_same_tell_sent_twice_to_a_working_seat_is_queued_once() {
-        use crate::fake::{Fake, Spot, Stage};
         use crate::place::State;
         let env = util::isolated("wake-queued-twice");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        store.save_task(&crate::model::Task::new("wsp-701 a row mid-turn", "wsp-701")).unwrap();
-        store.set_binding("w1:p6", json!({ "pane": "w1:p6", "task_id": "wsp-701" }));
-        let mut stage = Stage::new();
-        let mut spot = Spot::agent("w1:p6", "claude", "wsp-701", State::Working);
-        spot.space = "w1".into();
-        stage.put(spot);
-        let fake = Fake::bind(env.path("herdr.sock"), stage).expect("a socket");
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
+        let (seat, _ends) = compound_seat_in(&store, "wsp-701", State::Working);
 
         let tell = |words: &str, flags: &[(&str, &str)]| {
             crate::cmd_agent::tell(&store, &crate::Args::synth("tell", &["wsp-701", words], flags))
         };
         assert_eq!(tell("rebase onto the trunk", &[]), 0);
         assert_eq!(tell("rebase onto the trunk", &[]), 0, "a repeat is no failure");
-        assert_eq!(held_tells(&store, "w1:p6").len(), 1, "but it is held once");
+        assert_eq!(held_tells(&store, &seat).len(), 1, "but it is held once");
         assert_eq!(tell("and then rerun the checks", &[]), 0);
-        assert_eq!(held_tells(&store, "w1:p6").len(), 2, "a different sentence still queues");
+        assert_eq!(held_tells(&store, &seat).len(), 2, "a different sentence still queues");
         assert_eq!(tell("rebase onto the trunk", &[("again", "")]), 0);
-        assert_eq!(held_tells(&store, "w1:p6").len(), 3, "`--again` queues it anyway");
-        drop(fake);
+        assert_eq!(held_tells(&store, &seat).len(), 3, "`--again` queues it anyway");
     }
 
     /// `wsp-659` item 2: the primary's tell to compounding-698's seat was

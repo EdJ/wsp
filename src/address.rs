@@ -54,7 +54,7 @@ impl Address {
 
 /// The address a word spells, or `None` for a bare word (a row or seat id).
 ///
-/// Only the six spellings above: a herdr pane id (`w1:p6`) has a colon too,
+/// Only the six spellings above: a backend pane id (`w1:p6`) has a colon too,
 /// and a prefix that is not one of these words leaves it a pane id.
 pub fn parse(word: &str) -> Option<Address> {
     let word = word.trim();
@@ -338,7 +338,7 @@ mod tests {
     fn a_bare_word_and_a_pane_id_are_not_addresses() {
         assert_eq!(parse("wsp-520"), None);
         assert_eq!(parse("cpd-3"), None);
-        assert_eq!(parse("w1:p6"), None, "a herdr pane keeps its colon");
+        assert_eq!(parse("w1:p6"), None, "a backend pane keeps its colon");
         assert_eq!(parse("primary"), Some(Address::Primary));
         assert_eq!(parse("list:run"), Some(Address::List("run".into())));
     }

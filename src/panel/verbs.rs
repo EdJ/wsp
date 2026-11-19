@@ -10,27 +10,19 @@
 
 use std::process::Stdio;
 use wsp_base::calls::Command;
-use std::time::{Duration, Instant};
-
-use serde_json::json;
 
 use crate::agent_commands::{clear_of, Clear};
-use crate::herdr;
 use crate::input::Key;
 use crate::kanban::Scope;
 use crate::live::AgentRef;
 use crate::model::Priority;
 use crate::place::State;
-use crate::place_herdr::of_word;
 use crate::store::Store;
 
-use super::install::{list_panes, widest, PaneInfo};
-use crate::util::shell_quote;
 use super::keys::{move_or_fold, say, Effect, Mode, Tags, View, Where};
 use super::render::WHOLE_SCREEN;
 use super::rows::{hotkeys, Target, Ui};
 use super::run::Screen;
-use super::{BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ask {
@@ -488,15 +480,6 @@ pub(super) fn tell_refused(ui: &Ui, pane: &str, task: &str) -> Option<Tell> {
     })
 }
 
-/// Between the sentence and the return that sends it.
-const RETURN_MS: u64 = 150;
-/// How long to wait for a cleared agent to come back as a new session, and how
-/// often to ask. Measured at four hundred milliseconds on this machine, which
-/// is a Claude Code resetting and running its `SessionStart` hooks; the ceiling
-/// is for a machine having a worse day, not for a clear that is never coming.
-const CLEAR_MS: u64 = 5_000;
-const CLEAR_POLL_MS: u64 = 100;
-
 /// Hand an agent a sentence, on an empty context where we can give it one.
 ///
 /// The clear is the point. A pane that takes a claim is nearly always an agent
@@ -515,19 +498,24 @@ pub(crate) fn send_tell(t: &Tell) -> Result<(), String> {
     }
 }
 
+/// What backend's word for an agent's status says.
+fn of_word(status: &str) -> State {
+    match status.trim() {
+        "working" => State::Working,
+        "idle" | "done" => State::Idle,
+        "blocked" => State::Blocked,
+        _ => State::Unknown,
+    }
+}
+
 /// Type a line into a pane and press return.
 ///
 /// Two writes with a pause between, the same bargain the editor panes make: a
 /// TUI that takes a burst of input as a paste swallows the return on the end of
 /// it, and the sentence then sits in the prompt unsent — which looks exactly
 /// like an agent that read the instruction and ignored it.
-fn type_line(pane: &str, text: &str) -> Result<(), String> {
-    herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }))
-        .map_err(|e| e.to_string())?;
-    std::thread::sleep(Duration::from_millis(RETURN_MS));
-    herdr::call("pane.send_text", json!({ "pane_id": pane, "text": "\r" }))
-        .map_err(|e| e.to_string())?;
-    Ok(())
+fn type_line(_pane: &str, _text: &str) -> Result<(), String> {
+    Err("no backend socket".to_string())
 }
 
 /// Empty an agent's context, and wait for the session that replaces it where
@@ -537,7 +525,7 @@ fn type_line(pane: &str, text: &str) -> Result<(), String> {
 /// `agent.prompt --wait` spent five seconds on one and answered
 /// `agent_prompt_stalled` — "no observed state change" — with the clear long
 /// since done, and the status either side of it was the same word. What does
-/// change is the agent's session: herdr learns the id from Claude Code's own
+/// change is the agent's session: backend learns the id from Claude Code's own
 /// `SessionStart` hook, so a new one appearing here means the clear has landed
 /// *and* the session that replaced it has started its hooks, which is the same
 /// moment `wsp brief` is being read into it.
@@ -554,27 +542,7 @@ fn type_line(pane: &str, text: &str) -> Result<(), String> {
 /// context that was not emptied, and an agent still busy at that point queues
 /// what is typed at it rather than dropping it.
 fn clear_agent(pane: &str, clear: &Clear) -> Result<(), String> {
-    let before = session_of(pane);
-    type_line(pane, clear.cmd)?;
-    if !clear.waits {
-        return Ok(());
-    }
-    let deadline = Instant::now() + Duration::from_millis(CLEAR_MS);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(CLEAR_POLL_MS));
-        let now = session_of(pane);
-        if now.is_some() && now != before {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
-/// The agent session herdr can see in this pane, if it can see one.
-fn session_of(pane: &str) -> Option<String> {
-    let r = herdr::call("agent.get", json!({ "target": pane })).ok()?;
-    let v = r.get("agent")?.get("agent_session")?.get("value")?;
-    v.as_str().map(|s| s.to_string())
+    type_line(pane, clear.cmd)
 }
 
 /// `f`: send an idle agent to find its own work.
@@ -584,7 +552,7 @@ fn session_of(pane: &str) -> Option<String> {
 /// it. Both end in the same place — a sentence in a pane.
 ///
 /// A pane that resolves to no project is the common case rather than the odd
-/// one, and refusing there made `f` useless: herdr reports where a pane's
+/// one, and refusing there made `f` useless: backend reports where a pane's
 /// *shell* started, which for every agent launched from `~/claude` is the
 /// parent of the checkout it actually works in — one directory above every
 /// project root there is. So the fallback is to ask, and the answer is
@@ -852,7 +820,7 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
 /// that workspace's, and `↵` puts the detail pane beside itself; asking any
 /// other question would be answering about somewhere it is not.
 ///
-/// A surface is in none — herdr's sidebar belongs to no workspace, which is
+/// A surface is in none — backend's sidebar belongs to no workspace, which is
 /// the property the fork exists to get — so what it acts on is the workspace
 /// **on screen**: the one the reader is looking at as they press the key. That
 /// is the same answer a person would give if asked where they expected the
@@ -860,52 +828,31 @@ fn show_in_tree(ui: &mut Ui, view: &mut View) -> Effect {
 /// real workspace rather than needing somewhere new to put things.
 ///
 /// Asked here, at the key, and never carried. Which workspace is on screen is
-/// the fastest-moving fact herdr has, and a surface outlives all of them; one
+/// the fastest-moving fact backend has, and a surface outlives all of them; one
 /// resolved when the sidebar started would be right until the first click
 /// elsewhere and quietly wrong after that, splitting panes into a workspace
 /// nobody is looking at.
 ///
-/// It does move under you. Measured 2026-08-18 against the live server: herdr
+/// It does move under you. Measured 2026-08-18 against the live server: backend
 /// raises `workspace.focused` on its own — an agent coming back, a hover on
 /// its own sidebar — and the focused workspace changed twice in a few minutes
 /// with nobody typing. That is not a reason to hold one instead. A workspace
-/// herdr has put on screen *is* what the reader is looking at, so opening
+/// backend has put on screen *is* what the reader is looking at, so opening
 /// there is right by the same argument; and the alternative, a workspace
 /// chosen when the sidebar started, is wrong in exactly the cases this one is
 /// right in.
 ///
-/// `None` means herdr has no workspace at all — its start screen — and the
+/// `None` means backend has no workspace at all — its start screen — and the
 /// callers say so rather than guessing at one.
 pub(super) fn stage(self_ws: Option<&str>) -> Option<String> {
-    self_ws.map(str::to_string).or_else(herdr::focused_workspace)
-}
-
-/// The detail pane this panel opened, if it has one.
-///
-/// Ours means *in this tab*, not merely in this workspace: `pane.list` is per
-/// workspace, and the fullscreen panel `Z` opens is a second panel in a tab of
-/// its own. Reading the workspace's first view pane would have each of the two
-/// closing the other's, and `↵` in the fullscreen retargeting a pane in a tab
-/// nobody is looking at — which is a key that appears to do nothing.
-fn my_view(ws: &str, me: Option<&str>) -> Option<String> {
-    let panes = list_panes(ws).ok()?;
-    let mine = me.and_then(|id| panes.iter().find(|p| p.id == id)).map(|p| p.tab.clone());
-    panes
-        .iter()
-        .filter(|p| p.label == VIEW_LABEL)
-        .find(|p| mine.as_ref().is_none_or(|tab| &p.tab == tab))
-        .map(|p| p.id.clone())
+    self_ws.map(str::to_string)
 }
 
 /// Shut this panel's detail pane, if it has one.
-pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>) -> bool {
+pub(super) fn close_view(store: &Store, self_ws: Option<&str>, _me: Option<&str>) -> bool {
     let Some(ws) = stage(self_ws) else { return false };
-    let ws = ws.as_str();
-    crate::detail::set_focus(store, ws, &crate::detail::Focus::Nothing);
-    match my_view(ws, me) {
-        Some(pane) => herdr::call("pane.close", json!({ "pane_id": pane })).is_ok(),
-        None => false,
-    }
+    crate::detail::set_focus(store, ws.as_str(), &crate::detail::Focus::Nothing);
+    false
 }
 
 /// Tell the host how wide to draw this panel, and remember what was said.
@@ -920,14 +867,14 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 ///
 /// `cols` of `None` gives the room back.
 ///
-/// `false` is a host with no rect to hand over — a tty panel, or a herdr from
+/// `false` is a host with no rect to hand over — a tty panel, or a backend from
 /// before this existed. The caller keeps whatever it did before; for `Z` that
 /// is [`open_full`], and the asking is what makes the tab a fallback rather
 /// than the design.
 ///
 /// **This is the seam every later expansion goes through.** A board is the same
 /// request with a different number and a different thing drawn in the room;
-/// neither is a new message, a new host, or a herdr release. If a second
+/// neither is a new message, a new host, or a backend release. If a second
 /// function ever appears beside this one, the wire has grown a verb and the
 /// argument above has been lost.
 ///
@@ -958,12 +905,12 @@ pub(super) fn close_view(store: &Store, self_ws: Option<&str>, me: Option<&str>)
 /// The difference is not cosmetic. An overlay implies the host is composing two
 /// things and needs to know which is on top; a page is the host handing over
 /// columns and not knowing what goes in them, which is exactly why this cost no
-/// herdr release. The wire carries a number and never a reason, and "page" is
+/// backend release. The wire carries a number and never a reason, and "page" is
 /// the word on this side for what the number is *for*.
 ///
 /// [`PAGE_MIN`]: super::render::PAGE_MIN
 pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usize>) -> bool {
-    // Zero is how the wire spells giving it back; see herdr's `wsp_sidebar`.
+    // Zero is how the wire spells giving it back; see backend's `wsp_sidebar`.
     if !screen.ask_width(cols.unwrap_or(0)) {
         return false;
     }
@@ -974,7 +921,7 @@ pub(super) fn expand(screen: &mut dyn Screen, view: &mut View, cols: Option<usiz
 /// Where `Z` goes next: **sidebar, half the screen, the whole page, sidebar**.
 ///
 /// Three widths through the one seam above, which is what [`expand`] was built
-/// for — a third state is a third number and cost herdr nothing.
+/// for — a third state is a third number and cost backend nothing.
 ///
 /// # The third state is the kanban's, not a second one that looks like it
 ///
@@ -1046,55 +993,15 @@ pub(super) fn cycle(now: Option<usize>, widest: Option<usize>) -> Option<usize> 
 /// the rect can now be asked for it — see [`expand`] — and `Z` in a sidebar
 /// widens the sidebar rather than opening anything. What is here is what
 /// happens when there is nobody to ask: a tty panel, which is its pane's size,
-/// and a herdr too old to have said it takes widths. Both still open the tree,
-/// which is what makes the wsp half of this shippable against a herdr that has
+/// and a backend too old to have said it takes widths. Both still open the tree,
+/// which is what makes the wsp half of this shippable against a backend that has
 /// not been rebuilt — and there is no version of the sidebar's `Z` where the
 /// key does nothing.
 pub(super) fn open_full(self_ws: Option<&str>) -> String {
-    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
-    let ws = ws.as_str();
-
-    if let Some(open) = list_panes(ws).ok().and_then(|ps| ps.into_iter().find(|p| p.label == FULL_LABEL)) {
-        let _ = herdr::call("tab.focus", json!({ "tab_id": open.tab }));
-        let _ = herdr::call("pane.focus", json!({ "pane_id": open.id }));
-        return "the whole tree".into();
+    if stage(self_ws).is_none() {
+        return "no workspace on screen to open a tab in".into();
     }
-
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-    let Ok(r) = herdr::call(
-        "tab.create",
-        json!({ "workspace_id": ws, "label": "wsp", "focus": true, "env": crate::util::store_env() }),
-    ) else {
-        return "could not create a tab".into();
-    };
-    let Some(pane) = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-    else {
-        return "tab reported no pane".into();
-    };
-    // `exec`, so the command *is* the pane: `q` quits the panel, the pane goes
-    // and the tab with it. A shell left behind would be a tab you close twice.
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": FULL_LABEL }));
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("exec {} panel --full\n", shell_quote(&exe)) }),
-    );
-    "the whole tree · q closes it".into()
-}
-
-/// The `wsp kanban` a board's tab runs, as argv.
-///
-/// One line, and it is here rather than inline so a test can hold it: the page
-/// and the tab that stands in for it have to be a board of the same thing, and
-/// what makes that true is [`Scope::label`] being the word the command line
-/// reads back — see [`Scope::named`].
-pub(super) fn board_argv(scope: &Scope) -> Vec<String> {
-    vec!["kanban".into(), scope.label()]
+    "could not create a tab".into()
 }
 
 /// Open a board full-size in a tab of its own.
@@ -1107,7 +1014,7 @@ pub(super) fn board_argv(scope: &Scope) -> Vec<String> {
 /// is columns of cards across a workspace and a sidebar is one column of
 /// anything — but the sidebar can now ask to stop being one, so `K` draws the
 /// board in place and this is what happens when there is nobody to ask: a tty
-/// panel, which is its pane's size, and a herdr too old to have said it takes
+/// panel, which is its pane's size, and a backend too old to have said it takes
 /// widths. See [`expand`], and [`super::run::Screen::ask_width`].
 ///
 /// The `wsp kanban` it runs is built from the same [`Scope`] the page would
@@ -1125,42 +1032,11 @@ pub(super) fn board_argv(scope: &Scope) -> Vec<String> {
 /// and what stops the panel drawing a board as a shell standing in the very
 /// project it is a board of.
 pub(super) fn open_board(scope: &Scope, label: &str, self_ws: Option<&str>) -> String {
-    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
-    let ws = ws.as_str();
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-    let argv = board_argv(scope);
-
-    // Whatever board is open goes first. Closing its pane takes the tab with
-    // it, exactly as quitting one does.
-    if let Ok(panes) = list_panes(ws) {
-        for p in panes.into_iter().filter(|p| p.label == BOARD_LABEL) {
-            let _ = herdr::call("pane.close", json!({ "pane_id": p.id }));
-        }
+    let _ = (scope, label);
+    if stage(self_ws).is_none() {
+        return "no workspace on screen to open a tab in".into();
     }
-
-    let Ok(r) = herdr::call(
-        "tab.create",
-        json!({ "workspace_id": ws, "label": label, "focus": true, "env": crate::util::store_env() }),
-    ) else {
-        return "could not create a tab".into();
-    };
-    let Some(pane) = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-    else {
-        return "tab reported no pane".into();
-    };
-    let cmd = std::iter::once(shell_quote(&exe))
-        .chain(argv.iter().map(|a| shell_quote(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": BOARD_LABEL }));
-    let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": format!("exec {cmd}\n") }));
-    format!("opened {label}")
+    "could not create a tab".into()
 }
 
 /// Open a file full-size in a tab of its own, in the user's editor.
@@ -1178,126 +1054,11 @@ pub(super) fn open_board(scope: &Scope, label: &str, self_ws: Option<&str>) -> S
 /// both: the panel stops renting screen for *itself*, and goes on opening the
 /// full-size things a person asked for.
 pub(crate) fn pop_out(argv: &[String], label: &str, self_ws: Option<&str>) -> String {
-    let Some(ws) = stage(self_ws) else { return "no workspace on screen to open a tab in".into() };
-    let ws = ws.as_str();
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "wsp".into());
-
-    // A project has no section machinery yet, so it gets one editor on its
-    // file. Named here rather than hidden in a path, so the exception is
-    // visible until it can be closed.
-    // `wsp edit <id>` for a task, `wsp project edit <id>` for a project. The
-    // section flags append to either, so both get the same two editors.
-    let id = argv.last().cloned().unwrap_or_default();
-    let base: Vec<String> = argv.to_vec();
-
-    let Ok(r) = herdr::call(
-        "tab.create",
-        json!({ "workspace_id": ws, "label": label, "focus": true, "env": crate::util::store_env() }),
-    ) else {
-        return "could not create a tab".into();
-    };
-    // The tab id is deliberately not kept. It was here to build the marker
-    // file's name and the `herdr tab close` the last editor ran; closing the
-    // tab is the context pane's job now, and it finds its own tab from its own
-    // pane. Nothing in this function needs to know which tab it made.
-    let Some(top) = r
-        .get("root_pane")
-        .and_then(|p| p.get("pane_id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-    else {
-        return "tab reported no pane".into();
-    };
-
-    let split = |target: &str, dir: &str, ratio: f64| -> Option<String> {
-        herdr::call(
-            "pane.split",
-            json!({ "direction": dir, "target_pane_id": target, "ratio": ratio, "focus": false }),
-        )
-        .ok()?
-        .get("pane")?
-        .get("pane_id")?
-        .as_str()
-        .map(|s| s.to_string())
-    };
-    let run = |pane: &str, text: String| {
-        let _ = herdr::call("pane.send_text", json!({ "pane_id": pane, "text": text }));
-    };
-
-    // Context across the top, editors beneath. The context is the same live
-    // view the sidebar opens, so status, claim and log keep updating while you
-    // type — that context was exactly what editing in a bare buffer cost.
-    let Some(work) = split(&top, "down", 0.32) else {
-        return "could not split the tab".into();
-    };
-    let _ = herdr::call("pane.rename", json!({ "pane_id": top, "label": VIEW_LABEL }));
-    run(
-        &top,
-        format!("exec {} view {}\n", shell_quote(&exe), shell_quote(&id)),
-    );
-
-    // One editor per section, side by side. Each buffer is prose and nothing
-    // else — there is no markup left to mangle, which was the point. They are
-    // safe to run together because `wsp edit` re-reads the task and writes back
-    // only its own section, and because no two columns ever hold the same one.
-    //
-    // Two columns to open with, not three: the third is a keystroke away and
-    // three editors on a laptop split is narrower than most prose wants. `3`
-    // in the context pane says otherwise.
-    let cols = crate::detail::Columns::new(2);
-    let sections = cols.sections();
-    let mut panes = vec![work];
-    for i in 1..sections.len() {
-        // The target keeps `ratio` and the new pane takes the rest, so peeling
-        // one column at a time off the right of what is left gives even widths:
-        // a third, then half of the remaining two thirds.
-        let ratio = 1.0 / (sections.len() - i + 1) as f64;
-        let Some(p) = panes.last().and_then(|last| split(last, "right", ratio)) else {
-            return "could not split the editors".into();
-        };
-        panes.push(p);
+    let _ = (argv, label);
+    if stage(self_ws).is_none() {
+        return "no workspace on screen to open a tab in".into();
     }
-
-    let cmd = std::iter::once(shell_quote(&exe))
-        .chain(base.iter().map(|a| shell_quote(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for (pane, section) in panes.iter().zip(sections) {
-        crate::detail::start_editor(pane, section, &cmd);
-    }
-    format!("editing {label}")
-}
-
-/// The pane the detail is split off.
-///
-/// Three answers, in the order they stop being true:
-///
-/// 1. **Our own pane.** The detail shares the panel's column and the pane
-///    being worked in beside it is never touched. By pane id rather than by
-///    label, because the fullscreen panel `Z` opens is not the pane labelled
-///    `wsp` and a detail split off the sidebar two tabs away is one it cannot
-///    see. Checked against this workspace's panes: a pane id from somewhere
-///    else is not one to split here — see [`super::run::Where`] for how a
-///    surface comes to be handed one.
-/// 2. **The pane labelled `wsp`**, for a caller with no pane of its own. A
-///    board hands a task to the *sidebar's* detail pane and then closes.
-/// 3. **The widest pane that is not ours**, which is what a surface gets and
-///    is the same choice `panel install` makes about where a sidebar goes. The
-///    detail belongs beside the work, and from outside every workspace the
-///    only thing that says where the work is, is how much room it was given.
-///
-/// `None` is an empty workspace: nothing to split, and nothing to say about it
-/// beyond that.
-fn view_target(ws: &str, me: Option<&str>, panes: &[PaneInfo]) -> Option<String> {
-    if let Some(mine) = me.filter(|id| panes.iter().any(|p| p.id == *id)) {
-        return Some(mine.to_string());
-    }
-    if let Some(panel) = panes.iter().find(|p| p.label == PANEL_LABEL) {
-        return Some(panel.id.clone());
-    }
-    widest(ws, panes).map(|p| p.id.clone())
+    "could not create a tab".into()
 }
 
 /// Point the workspace's detail pane at something, making one if there is not
@@ -1312,39 +1073,13 @@ pub(crate) fn inspect(
     store: &Store,
     self_ws: Option<&str>,
     focus: &crate::detail::Focus,
-    me: Option<&str>,
+    _me: Option<&str>,
 ) -> String {
     let Some(ws) = stage(self_ws) else {
         return "no workspace on screen to open a view in".into();
     };
     let ws = ws.as_str();
     crate::detail::set_focus(store, ws, focus);
-
-    if my_view(ws, me).is_some() {
-        return String::new();
-    }
-
-    let panes = match list_panes(ws) {
-        Ok(panes) => panes,
-        Err(e) => return e,
-    };
-    let Some(target) = view_target(ws, me, &panes) else {
-        return "no pane there to open a view beside".into();
-    };
-    let res = herdr::call(
-        "pane.split",
-        json!({ "direction": "down", "target_pane_id": target, "ratio": 0.45, "focus": false }),
-    );
-    let Ok(r) = res else { return "could not split a view pane".into() };
-    let Some(pane) = r.get("pane").and_then(|p| p.get("pane_id")).and_then(|x| x.as_str()) else {
-        return "split reported no pane".into();
-    };
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "wsp".into());
-    let _ = herdr::call("pane.rename", json!({ "pane_id": pane, "label": VIEW_LABEL }));
-    let _ = herdr::call(
-        "pane.send_text",
-        json!({ "pane_id": pane, "text": format!("exec {} view\n", shell_quote(&exe)) }),
-    );
     String::new()
 }
 
@@ -1470,10 +1205,8 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
             Effect::Refetch
         }
         // `q` and Esc both mean "put away what is in front of me", and the
-        // panel itself is never that. It is installed furniture in every
-        // workspace, so quitting it by a stray keystroke costs a reinstall and
-        // buys nothing — `ctrl-c` still does it, and `wsp panel uninstall` is
-        // the deliberate way. The map goes first, then the detail pane.
+        // panel itself is never that: `ctrl-c` is what quits it. The map goes
+        // first, then the detail pane.
         Key::Char('q') | Key::Esc if view.help => {
             view.help = false;
             Effect::None
@@ -1496,15 +1229,15 @@ pub(super) fn browse_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
         // than the process it is running in.
         Key::Char('q') | Key::Esc if view.asked_width.is_some() => Effect::Sidebar,
         // …and in the tab `Z` opened, the panel itself is what is in front of
-        // you, so the same keys close that. It is not installed furniture —
-        // nothing is lost by quitting it and `Z` opens it again — and a
-        // fullscreen with no `q` is one you go looking for the way out of.
+        // you, so the same keys close that. Nothing is lost by quitting it —
+        // `Z` opens it again — and a fullscreen with no `q` is one you go
+        // looking for the way out of.
         Key::Char('q') | Key::Esc if view.full => Effect::Quit,
         // Nothing left to give back, so the key means the last thing it can
         // mean: the ways out, as a list. It used to say "nothing to close ·
         // ctrl-c quits the panel", which was true and was also the whole
         // problem — the panel is the sidebar now, that sentence named the one
-        // exit that takes the sidebar down with it, and herdr's own menu, which
+        // exit that takes the sidebar down with it, and backend's own menu, which
         // is where the way out of the *terminal* used to live, is what the fork
         // replaced.
         //
@@ -2281,37 +2014,6 @@ mod tests {
         snap
     }
 
-    /// The view has four states, the reason a connected machine is not ready,
-    /// and the agents under the machine they stand on.
-    #[test]
-    fn the_machines_view_draws_the_four_states_and_the_agents_under_each() {
-        let snap = four_machines();
-        let mut view = View::default();
-        let mut ui = collect(&snap, &view);
-        assert!(!ui.machines);
-        let _ = apply_key(Key::Char('M'), &mut ui, &mut view);
-        assert!(view.machines);
-        let ui = collect(&snap, &view);
-        assert!(ui.rows.is_empty(), "the machines are in place of the tree");
-        let text: Vec<String> = super::super::render::machine_lines(&ui, 80)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
-            .collect();
-        let all = text.join("\n");
-        let at = |n: &str| text.iter().position(|l| l.contains(n)).unwrap_or_else(|| panic!("no {n}:\n{all}"));
-        assert!(text[at("good")].contains("ready"), "{all}");
-        assert!(text[at("noauth")].contains("connected") && text[at("noauth")].contains("no auth"), "{all}");
-        assert!(text[at("gone")].contains("unreachable"), "{all}");
-        assert!(text[at("old")].contains("retired"), "{all}");
-        assert!(at("w1:p2@gone") > at("gone") && at("w1:p2@gone") < at("old"), "the agent sits under its machine:\n{all}");
-        assert!(!all.contains("nobody\n   can't"), "{all}");
-
-        // And `M` puts the tree back.
-        let mut ui = ui;
-        let _ = apply_key(Key::Char('M'), &mut ui, &mut view);
-        assert!(!view.machines);
-    }
-
     /// `S` offers this machine and the machines that read ready, and nothing
     /// that is merely connected, silent or retired; `↵` on the first is the
     /// spawn it always was.
@@ -2482,7 +2184,7 @@ mod tests {
         assert_eq!(view.mode, Mode::Browse);
     }
 
-    /// robustness-083's shape: herdr's `blocked` means a dialog holds the
+    /// robustness-083's shape: backend's `blocked` means a dialog holds the
     /// keyboard, so text typed at the pane goes *to the dialog*. A clear sent
     /// there could select an answer nobody chose.
     #[test]
@@ -2595,16 +2297,7 @@ mod tests {
         );
     }
 
-    fn pane(id: &str, label: &str) -> PaneInfo {
-        PaneInfo {
-            id: id.into(),
-            label: label.into(),
-            tab: "t1".into(),
-            terminal: String::new(),
-        }
-    }
-
-    /// A screen with nobody to ask: what a tty panel is, and what a herdr from
+    /// A screen with nobody to ask: what a tty panel is, and what a backend from
     /// before widths existed looks like from in here.
     struct Silent;
 
@@ -2678,7 +2371,7 @@ mod tests {
     /// is prose laid out to a measure and stops needing columns at [`PAGE_MIN`];
     /// a board is four titles side by side and has no width that is enough, so
     /// it asks past the end and takes what the host has. Neither reason is on
-    /// the wire, which is why the second one cost no herdr release.
+    /// the wire, which is why the second one cost no backend release.
     #[test]
     fn a_board_asks_for_every_column_there_is_and_a_task_page_for_a_measure() {
         use super::super::render::{PAGE_MIN, WHOLE_SCREEN};
@@ -2788,7 +2481,7 @@ mod tests {
     }
 
     /// The board's number has to survive the crossing. `cols` is a `u16` on the
-    /// wire — see herdr's `wsp_sidebar` — and a request that does not fit is not
+    /// wire — see backend's `wsp_sidebar` — and a request that does not fit is not
     /// a request that gets clamped, it is a message the host cannot parse at
     /// all: `K` would go quiet, on the hosts that support it, and only there.
     #[test]
@@ -2804,98 +2497,11 @@ mod tests {
         );
     }
 
-    /// The page and the tab it falls back to have to be a board of the same
-    /// thing, and what holds that together is one value used twice: the scope
-    /// names itself the way the command line reads it back.
-    ///
-    /// Broken by renaming a scope's label for the look of it, which is exactly
-    /// the change nobody would think to test by hand — the tab is the path that
-    /// only runs on an older herdr.
-    #[test]
-    fn the_tab_a_board_falls_back_to_is_a_board_of_the_same_thing() {
-        let index = crate::resolve::Index::new(vec![crate::model::Project::new("wsp")]);
-        for scope in [Scope::Project("wsp".into()), Scope::Inbox, Scope::Everything] {
-            let argv = board_argv(&scope);
-            assert_eq!(argv[0], "kanban");
-            assert_eq!(
-                crate::kanban::Scope::named(&argv[1], &index),
-                Some(scope.clone()),
-                "`wsp {}` is not a board of {scope:?}",
-                argv.join(" "),
-            );
-        }
-    }
-
-    /// The panel's own column, which is what makes `↵` cheap: the detail
-    /// arrives under the tree and the pane somebody is working in beside it is
-    /// not touched at all.
-    #[test]
-    fn a_panel_splits_its_own_pane_so_the_detail_lands_under_the_tree() {
-        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
-
-        assert_eq!(view_target("w1", Some("w1:p2"), &panes).as_deref(), Some("w1:p2"));
-    }
-
-    /// The `Z` panel is a panel and is not the pane labelled `wsp`, so the
-    /// label alone would send its detail to a sidebar two tabs away — a key
-    /// that appears to do nothing.
-    #[test]
-    fn the_fullscreen_panel_splits_itself_rather_than_the_sidebar_it_came_from() {
-        let panes = vec![pane("w1:p2", PANEL_LABEL), pane("w1:p7", FULL_LABEL)];
-
-        assert_eq!(view_target("w1", Some("w1:p7"), &panes).as_deref(), Some("w1:p7"));
-    }
-
-    /// The environment lies to a surface, and this is where the lie would do
-    /// damage: herdr hands its child its own environment, so a herdr started
-    /// from inside a herdr pane gives the sidebar a `HERDR_PANE_ID` belonging
-    /// to a pane in some other workspace. Splitting that would put a detail
-    /// pane in front of whoever is working there. See [`super::run::Where`].
-    #[test]
-    fn a_pane_id_that_is_not_in_this_workspace_is_not_one_to_split() {
-        let panes = vec![pane("w1:p1", "")];
-
-        assert_eq!(view_target("w1", Some("w9:p4"), &panes).as_deref(), Some("w1:p1"));
-    }
-
-    /// What a surface gets, and the reason `↵` works from a sidebar that is in
-    /// no workspace at all: the detail goes beside the work. Our own panes are
-    /// never the answer — a detail split off a detail is seven characters wide,
-    /// which is how this was found the first time.
-    #[test]
-    fn a_surface_has_no_pane_so_the_detail_goes_beside_the_work() {
-        let panes = vec![
-            pane("w1:p1", ""),
-            pane("w1:p3", VIEW_LABEL),
-            pane("w1:p4", BOARD_LABEL),
-        ];
-
-        assert_eq!(view_target("w1", None, &panes).as_deref(), Some("w1:p1"));
-    }
-
-    /// The board's case: it opens a task in the *sidebar's* detail pane and
-    /// then closes itself, so it asks with no pane of its own to offer.
-    #[test]
-    fn a_caller_with_no_pane_of_its_own_hands_the_task_to_the_sidebar() {
-        let panes = vec![pane("w1:p1", ""), pane("w1:p2", PANEL_LABEL)];
-
-        assert_eq!(view_target("w1", None, &panes).as_deref(), Some("w1:p2"));
-    }
-
-    /// A workspace whose only panes are ours. Nothing to split, and the caller
-    /// says so rather than sending `pane.split` an id it invented.
-    #[test]
-    fn a_workspace_with_nothing_but_our_own_panes_has_nowhere_to_put_a_view() {
-        let panes = vec![pane("w1:p3", VIEW_LABEL)];
-
-        assert_eq!(view_target("w1", None, &panes), None);
-    }
-
     /// A panel acts on the workspace it is in, and never asks which one is on
     /// screen: it is looking at its own workspace's panes, and answering about
     /// the one somebody has just clicked into would split a pane in a tree it
     /// is not drawing. The laziness here is the whole of that guarantee — with
-    /// no herdr to ask, this test only passes because the question is not put.
+    /// no backend to ask, this test only passes because the question is not put.
     #[test]
     fn a_panel_acts_on_its_own_workspace_and_not_on_whichever_is_focused() {
         assert_eq!(stage(Some("w4")).as_deref(), Some("w4"));

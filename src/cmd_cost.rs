@@ -31,7 +31,9 @@ pub struct Fig {
     pub cache_write: Option<u64>,
     pub usd: Option<u64>,
     pub turns: usize,
-    pub seconds: i64,
+    /// The seconds the seat was seated; `None` where they were not read (a
+    /// barrier seat with no reading: not measured, which is not zero).
+    pub seconds: Option<i64>,
     pub exact: bool,
     pub measured: bool,
 }
@@ -55,7 +57,7 @@ pub struct Entry {
     pub fig: Fig,
 }
 
-fn of_reading(r: &Value, turns_hint: usize, seconds: i64) -> Fig {
+fn of_reading(r: &Value, turns_hint: usize, seconds: Option<i64>) -> Fig {
     let n = |k: &str| r.get(k).and_then(Value::as_u64);
     Fig {
         input: n("input"),
@@ -70,7 +72,7 @@ fn of_reading(r: &Value, turns_hint: usize, seconds: i64) -> Fig {
     }
 }
 
-fn of_clause(ran: &str, s: &crate::agent_kind::Spend, turns: usize, seconds: i64) -> Fig {
+fn of_clause(ran: &str, s: &crate::agent_kind::Spend, turns: usize, seconds: Option<i64>) -> Fig {
     if s.nothing() {
         return Fig { turns, seconds, ..Fig::default() };
     }
@@ -88,7 +90,7 @@ fn of_clause(ran: &str, s: &crate::agent_kind::Spend, turns: usize, seconds: i64
 }
 
 /// The figures for a seat: its reading, else the clause, else unmeasured.
-fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, seconds: i64) -> Fig {
+fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, seconds: Option<i64>) -> Fig {
     if let Some(r) = crate::cmd_burn::reading(seat) {
         return of_reading(&r, clause.map_or(0, |c| c.2), seconds);
     }
@@ -96,6 +98,18 @@ fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, 
         Some((ran, s, turns)) => of_clause(ran, s, turns, seconds),
         None => Fig { seconds, ..Fig::default() },
     }
+}
+
+/// A barrier check seat's seated seconds (`wsp-066`): from its first act (the
+/// first stamp in its transcript, else the check's opening) to its end (when the
+/// ledger says `stop()` banked it, else now while its seat still runs). `None`
+/// where the seat was never read: no live record and no ledger line.
+fn check_seconds(seat: &str, opened: &str) -> Option<i64> {
+    let r = crate::cmd_burn::reading(seat)?;
+    let s = |k: &str| r.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+    let end = s("ended").map(util::epoch_of).filter(|t| *t > 0).unwrap_or_else(util::epoch_secs);
+    let start = s("transcript").or(s("session_id")).and_then(crate::timeline::first_act).unwrap_or_else(|| util::epoch_of(opened));
+    (start > 0 && end >= start).then_some(end - start)
 }
 
 /// One governor seat of a list: the workspace, the group it counts toward, the
@@ -202,7 +216,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
         gov_seats.insert(seat.clone());
         let mut e = entry(g, None, "governor", &seat);
         e.through = through;
-        e.fig = fig_of(&seat, None, seconds);
+        e.fig = fig_of(&seat, None, Some(seconds));
         out.push(e);
     }
     for (i, g) in groups.iter().enumerate() {
@@ -212,7 +226,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             e.tier = c.on.clone().unwrap_or_default();
             e.shared = !counted.insert(pane.to_string());
             if !e.shared {
-                e.fig = fig_of(pane, None, 0);
+                e.fig = fig_of(pane, None, check_seconds(pane, &c.at));
             }
             out.push(e);
         }
@@ -234,7 +248,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
                 e.shared = true;
             } else {
                 let clause = p.spent.as_ref().map(|s| (s.ran.as_str(), &s.spend, s.turns));
-                e.fig = fig_of(pane, clause, seconds);
+                e.fig = fig_of(pane, clause, Some(seconds));
             }
             out.push(e);
         }
@@ -254,9 +268,9 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             e.tier = Row(a.clone()).tier();
             e.dropped = a.outcome.as_str() == "dropped";
             if a.pane.is_empty() {
-                e.fig = of_clause(&a.ran, &a.spend, a.turns, a.seconds());
+                e.fig = of_clause(&a.ran, &a.spend, a.turns, Some(a.seconds()));
             } else if counted.insert(a.pane.clone()) {
-                e.fig = fig_of(&a.pane, Some((&a.ran, &a.spend, a.turns)), a.seconds());
+                e.fig = fig_of(&a.pane, Some((&a.ran, &a.spend, a.turns)), Some(a.seconds()));
             } else {
                 e.shared = true;
             }
@@ -278,6 +292,8 @@ struct Sum {
     seconds: i64,
     seats: usize,
     unmeasured: usize,
+    /// Seats whose seated seconds were not read: `seconds` is a floor then.
+    seconds_unread: usize,
     inexact: usize,
 }
 
@@ -287,7 +303,8 @@ impl Sum {
         for e in es.filter(|e| !e.shared && !e.by_governor) {
             s.seats += 1;
             s.turns += e.fig.turns;
-            s.seconds += e.fig.seconds;
+            s.seconds += e.fig.seconds.unwrap_or(0);
+            s.seconds_unread += usize::from(e.fig.seconds.is_none());
             if !e.fig.measured {
                 s.unmeasured += 1;
                 continue;
@@ -308,7 +325,7 @@ impl Sum {
             "input_tokens": self.input, "output_tokens": self.output,
             "cache_tokens": self.cache_read, "cache_write_tokens": self.cache_write,
             "usd_micros": self.usd, "turns": self.turns, "seconds": self.seconds,
-            "seats": self.seats, "unmeasured": self.unmeasured, "inexact": self.inexact,
+            "seats": self.seats, "unmeasured": self.unmeasured, "seconds_unread": self.seconds_unread, "inexact": self.inexact,
         })
     }
 }
@@ -322,7 +339,7 @@ fn entry_json(e: &Entry) -> Value {
         "measured": f.measured, "exact": f.exact,
         "input_tokens": f.input, "output_tokens": f.output,
         "cache_tokens": f.cache_read, "cache_write_tokens": f.cache_write,
-        "usd_micros": f.usd, "turns": f.turns, "seconds": f.seconds,
+        "usd_micros": f.usd, "turns": if f.measured || f.turns > 0 { json!(f.turns) } else { Value::Null }, "seconds": f.seconds,
     })
 }
 
@@ -368,7 +385,7 @@ fn line(p: &Paint, what: &str, tier: &str, f: &Fig, note: &str) -> String {
             "{}  {}  {}  {}  {}  {}  {}",
             util::pad(&tok(f.input), 6), util::pad(&tok(f.output), 6), util::pad(&tok(f.cache_read), 6),
             util::pad(&tok(f.cache_write), 6), util::pad(&f.turns.to_string(), 5), util::pad(&usd, 8),
-            util::pad(&util::duration_human(f.seconds), 6)
+            util::pad(&f.seconds.map_or("—".to_string(), util::duration_human), 6)
         )
     } else {
         util::pad("unmeasured", 6 + 2 + 6 + 2 + 6 + 2 + 6 + 2 + 5 + 2 + 8 + 2 + 6)
@@ -386,7 +403,7 @@ fn sum_line(p: &Paint, what: &str, s: &Sum) -> String {
     }
     let f = Fig {
         input: Some(s.input), output: Some(s.output), cache_read: Some(s.cache_read), cache_write: Some(s.cache_write),
-        usd: Some(s.usd), turns: s.turns, seconds: s.seconds, exact: true, measured: true,
+        usd: Some(s.usd), turns: s.turns, seconds: Some(s.seconds), exact: true, measured: true,
     };
     p.bold(&line(p, what, "", &f, "")) + &format!("  {}", p.dim(&note))
 }
@@ -467,7 +484,7 @@ pub fn verifier_rows(t: &crate::model::Task) -> Vec<Value> {
             let pane = p.pane.as_deref()?;
             let seconds = p.decided.as_deref().map_or(0, |d| (util::epoch_of(d) - util::epoch_of(&p.at)).max(0));
             let clause = p.spent.as_ref().map(|s| (s.ran.as_str(), &s.spend, s.turns));
-            let f = fig_of(pane, clause, seconds);
+            let f = fig_of(pane, clause, Some(seconds));
             Some(json!({
                 "task": t.id, "role": "verifier", "leg": null, "at": p.at, "pane": pane,
                 "ran_at": p.spent.as_ref().map(|s| s.ran.clone()).unwrap_or_default(),

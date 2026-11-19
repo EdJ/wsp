@@ -15,7 +15,7 @@
 //! | `wsp daemon reload` | yes | refused | refused |
 //!
 //! **The role is read from the seat wsp recorded**, never from anything the
-//! caller says: the caller's seat (`WSP_SEAT_ID`, or herdr's pane) is looked up
+//! caller says: the caller's seat (`WSP_SEAT_ID`, or backend's pane) is looked up
 //! in the governors record, which names the primary seat and each list's
 //! governor. A seat that is bound to a row, or that wsp spawned (its environment
 //! carries `WSP_SEAT_ID`), and is neither of those, is a member, verifier or
@@ -361,10 +361,10 @@ pub(crate) fn parse_ps(line: &str) -> Option<Proc> {
 }
 
 pub(crate) fn processes() -> Vec<Proc> {
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,pcpu=,time=,command="]).output() else {
+    let Some(out) = crate::host::Host::table(&crate::host::LOCAL, "pid=,ppid=,etime=,pcpu=,time=,command=", false) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(parse_ps).collect()
+    out.lines().filter_map(parse_ps).collect()
 }
 
 /// Every process's working directory, from `lsof -d cwd -Fpn`.
@@ -597,10 +597,10 @@ pub(crate) fn end_pids(pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
     if cfg!(test) || pids.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    crate::check_tree::signal("-TERM", pids);
+    crate::check_tree::signal("TERM", pids);
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    let still: Vec<u32> = util::alive(pids).into_iter().collect();
-    crate::check_tree::signal("-KILL", &still);
+    let still: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect();
+    crate::check_tree::signal("KILL", &still);
     (pids.to_vec(), still)
 }
 
@@ -630,7 +630,7 @@ fn observe(store: &Store, procs: &[Proc], now: i64) -> BTreeMap<u32, u64> {
 }
 
 fn signal(sig: &str, pid: u32) {
-    let _ = wsp_base::calls::Command::new("kill").args([sig, &pid.to_string()]).status();
+    crate::host::Host::signal(&crate::host::LOCAL, &[pid], sig);
 }
 
 /// Why `role` may not run `wsp reap` (`list` is the read-only form), if it may
@@ -672,11 +672,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
         return refuse(store, "reap", &role, "no backend answered, so whose processes are whose is not known — nothing stopped");
     };
     let procs = processes();
-    let cwds = wsp_base::calls::Command::new("lsof")
-        .args(["-d", "cwd", "-Fpn"])
-        .output()
-        .map(|o| parse_cwds(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
+    let cwds = crate::host::Host::cwds(&crate::host::LOCAL, None).map(|o| parse_cwds(&o)).unwrap_or_default();
     let idle = observe(store, &procs, util::epoch_secs());
 
     let claims = store.claims();
@@ -728,7 +724,7 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
                     store,
                     &format!("reap {pid} by {}: {} — {}", role.name(), proof.text, util::truncate(&p.command, 100)),
                 );
-                signal("-TERM", pid);
+                signal("TERM", pid);
                 stopped.push((pid, proof));
             }
             Err(why) => {
@@ -740,10 +736,10 @@ pub fn reap(store: &Store, args: &Args) -> i32 {
     }
     if !stopped.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let still = util::alive(&stopped.iter().map(|(p, _)| *p).collect::<Vec<_>>());
+        let still = crate::host::Host::alive(&crate::host::LOCAL, &stopped.iter().map(|(p, _)| *p).collect::<Vec<_>>());
         for (pid, proof) in &stopped {
             if still.contains(pid) {
-                signal("-KILL", *pid);
+                signal("KILL", *pid);
                 println!("{pid}  killed ({})", proof.text);
             } else {
                 println!("{pid}  stopped ({})", proof.text);
@@ -1042,7 +1038,7 @@ mod tests {
             ex(101, 1, "/Users/u/.local/bin/compound-sup"),
             ex(102, 101, "/bin/zsh"),
             ex(103, 1, "/Users/u/.local/bin/compound-sup"),
-            ex(104, 1, "/opt/herdr"),
+            ex(104, 1, "/opt/backend"),
             ex(105, 1, "/Users/u/.local/bin/compound-sup"),
         ];
         let procs = vec![
@@ -1050,7 +1046,7 @@ mod tests {
             proc(101, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --label cpd-7 -- /bin/zsh"),
             proc(102, 9000, 0.0, "/bin/zsh"),
             proc(103, 9000, 0.0, "/Users/u/.local/bin/compound-sup serve"),
-            proc(104, 9000, 0.0, "/opt/herdr"),
+            proc(104, 9000, 0.0, "/opt/backend"),
             proc(105, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --socket /x -- /bin/zsh"),
         ];
         let got = left_by_a_seat(&[100, 101, 102, 103, 104, 105], &table, &procs, t);

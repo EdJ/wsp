@@ -1326,7 +1326,7 @@ pub struct Machine {
     /// Where this machine's backend listens, in whatever words that backend
     /// uses. [`crate::place`]'s term, and opaque here for the same reason a
     /// [`crate::place::Seat`] is: nothing in the model reads it, and the
-    /// adapter is the only thing entitled to know what it means. For herdr it
+    /// adapter is the only thing entitled to know what it means. For backend it
     /// is an absolute path *on that machine* — what `ssh -L <here>:<there>`
     /// forwards — and for a backend reached over TCP it would be a host and a
     /// port without anything here changing.
@@ -1337,9 +1337,9 @@ pub struct Machine {
     /// daemon's tick.
     ///
     /// Empty means *the backend's own default*, and the backend supplies it:
-    /// `place_herdr::mirrored_socket` is herdr's, the mirrored-path assumption
+    /// `place_backend::mirrored_socket` is backend's, the mirrored-path assumption
     /// that is right while paths mirror and is exactly what a Linux executor
-    /// breaks. It used to be defaulted here, which put a `crate::herdr` call in
+    /// breaks. It used to be defaulted here, which put a `crate::backend` call in
     /// the file that is meant to be nothing but durable entities (robustness-019).
     pub backend_at: String,
     /// Where trees and per-row state live on the far side
@@ -1471,7 +1471,7 @@ impl Machine {
             // twice.
             ssh: doc.opt("ssh").unwrap_or_else(|| name.clone()),
             name,
-            // No default, and no reading of the old `herdr_sock` key either: a
+            // No default, and no reading of the old `backend_sock` key either: a
             // fallback here would be this file naming a backend again, which is
             // the whole of what robustness-019 was about. Nothing on disk carries
             // the old key — the field was a day old and no store had a machines
@@ -2493,6 +2493,16 @@ pub struct Worklist {
     /// `retro_at:` / `retro_seat:` — when the retro for this list's clear ran,
     /// and the seat that ran it, so one clear is one retro (`wsp-472`).
     pub retro: Option<(String, String)>,
+    /// `held_until:` — while the list is held, the time before which nothing is
+    /// owed by anybody: a hold whose remaining condition is a day (`wsp-095`).
+    /// Written by `wsp worklist hold --until` and read only while held.
+    pub held_until: Option<String>,
+    /// `held_on:` — while the list is held, the rows it waits on: nothing is
+    /// owed by the person until they are done (`wsp-095`). `hold --on`.
+    pub held_on: Vec<String>,
+    /// `held_for:` — while the list is held, the person's act that is owed once
+    /// the time and the rows above have come, in words (`wsp-095`). `hold --for`.
+    pub held_for: Option<String>,
     pub body: String,
 }
 
@@ -2514,6 +2524,9 @@ impl Worklist {
             alone: None,
             no_retro: false,
             retro: None,
+            held_until: None,
+            held_on: Vec::new(),
+            held_for: None,
             body: String::new(),
         }
     }
@@ -2531,6 +2544,12 @@ impl Worklist {
     /// alone, which is the point of the status holding only what somebody
     /// decided.
     pub fn set_status(&mut self, s: WorklistStatus) {
+        // A hold's wait is the hold's: it goes when the list stops being held.
+        if s != WorklistStatus::Held {
+            self.held_until = None;
+            self.held_on.clear();
+            self.held_for = None;
+        }
         self.status_raw = s.as_str().to_string();
     }
 
@@ -2586,6 +2605,9 @@ impl Worklist {
             }),
             no_retro: doc.opt("no_retro").is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes")),
             retro: doc.opt("retro_at").filter(|a| !a.trim().is_empty()).map(|at| (at.trim().to_string(), doc.opt("retro_seat").unwrap_or_default().trim().to_string())),
+            held_until: doc.opt("held_until").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
+            held_on: doc.list("held_on"),
+            held_for: doc.opt("held_for").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
             body: doc.body.clone(),
         }
     }
@@ -2629,6 +2651,15 @@ impl Worklist {
         if let Some((at, seat)) = &self.retro {
             d.set_str("retro_at", at);
             d.set_str("retro_seat", seat);
+        }
+        if let Some(u) = &self.held_until {
+            d.set_str("held_until", u);
+        }
+        if !self.held_on.is_empty() {
+            d.set_list("held_on", &self.held_on);
+        }
+        if let Some(f) = &self.held_for {
+            d.set_str("held_for", f);
         }
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();

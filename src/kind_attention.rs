@@ -6,9 +6,9 @@
 //!
 //! # A kind that is not in a pane's catalogue
 //!
-//! herdr starts only the agents in its own catalogue, and `attention` is not
+//! backend starts only the agents in its own catalogue, and `attention` is not
 //! one, so this kind runs on the backends that exec the kind's program —
-//! compound (the default) and `--headless` — and `--herdr` is refused before a
+//! compound (the default) and `--headless` — and `--backend` is refused before a
 //! seat is opened ([`crate::cmd_spawn`]).
 //!
 //! The program is not `attention` itself but `wsp attend <task>`

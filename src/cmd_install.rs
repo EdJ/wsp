@@ -14,9 +14,9 @@
 //! other three:
 //!
 //! - **The daemon is covered.** The copy installs a *binary*; nothing told the
-//!   machine to run the daemon that uses it. That used to be herdr's
+//!   machine to run the daemon that uses it. That used to be backend's
 //!   `[[startup]]`, so the daemon's lifetime was tied to a terminal emulator's,
-//!   and when herdr stopped being on this machine the daemon stopped with it —
+//!   and when backend stopped being on this machine the daemon stopped with it —
 //!   silently, because nothing in wsp said *why* the unattended pass had
 //!   stopped. `wsp install` now writes and loads a launchd user agent; see
 //!   [`crate::launchd`] for the plist and [`launcher`] for the four ways it
@@ -122,10 +122,7 @@ fn default_dest() -> PathBuf {
 /// wants the durable name, and this is a sentence about something happening
 /// right now, which wants the precise one.
 fn who() -> String {
-    match crate::herdr::Env::read().pane_id {
-        Some(p) if !p.trim().is_empty() => p,
-        _ => agent_key(),
-    }
+    agent_key()
 }
 
 // ---- the lock ----------------------------------------------------------
@@ -583,7 +580,7 @@ fn carried_by(dst: &Path) -> Option<String> {
 /// What `doctor` says about the binary every pane re-execs into.
 ///
 /// Notes rather than problems, all of them, and the reason is the same one
-/// `cmd_agent::seat_health` gives for not calling a machine without herdr broken: being
+/// `cmd_agent::seat_health` gives for not calling a machine without backend broken: being
 /// a few commits behind is the ordinary state of an installed binary between
 /// one deliberate install and the next, and a check that shows red every hour
 /// of every day is a check that gets skipped along with the ones that mean
@@ -1068,7 +1065,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     let dst = args.get("to").map(|s| util::expand(&s)).unwrap_or_else(default_dest);
 
     // A sandbox is the one place this verb cannot be exercised honestly. `wsp
-    // sandbox` hands an instance its own store, state and herdr session so that
+    // sandbox` hands an instance its own store, state and backend session so that
     // a verb which writes can be run for real — and what this one writes is the
     // single file no sandbox has a copy of. Without `--to` it would reach
     // straight out of the sandbox and replace the binary every live pane
@@ -1081,6 +1078,10 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
         return 2;
     }
 
+    if args.has("uninstall-manager") {
+        return uninstall_manager(store, json_out, &p);
+    }
+
     // `wsp install --daemon`: the other half of this verb on its own, for any
     // build. A second full install is refused when the live build is newer than
     // the verify tree's, and that left no wsp verb to load a daemon launchd had
@@ -1089,7 +1090,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     // and loaded.
     if args.has("daemon") {
         let dst = default_dest();
-        let agent = launcher(store, &dst, dry, json_out, &p);
+        let agent = launcher(store, None, None, &dst, dry, json_out, &p);
         if json_out {
             println!("{}", json!({"ok": !agent_failed(&agent), "daemon": agent}));
         } else if agent.get("reason").is_some() {
@@ -1124,6 +1125,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
         return 2;
     }
 
+    let build_tree = tree.clone();
     let ours = provenance(&src, tree);
     let live = util::stamp(&dst);
     let last = history(&dst).into_iter().next();
@@ -1276,7 +1278,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
         if !json_out {
             println!("{} {}", p.green("✓"), "already live — the build you made");
         }
-        let agent = launcher(store, &dst, dry, json_out, &p);
+        let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, dry, json_out, &p);
         let pi = pi_extension(&dst, &dst, dry, json_out, &p);
         if json_out {
             println!(
@@ -1324,7 +1326,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     }
 
     if dry {
-        let agent = launcher(store, &dst, true, json_out, &p);
+        let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, true, json_out, &p);
         // Asked of the build that would be installed, since nothing has been.
         let pi = pi_extension(&src, &dst, true, json_out, &p);
         if json_out {
@@ -1414,7 +1416,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     drop(lock);
 
     if json_out {
-        let agent = launcher(store, &dst, false, true, &p);
+        let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, false, true, &p);
         let pi = pi_extension(&dst, &dst, false, true, &p);
         println!(
             "{}",
@@ -1467,7 +1469,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
         p.dim("panels, detail panes and the daemon re-exec into it within a tick — `wsp peek` to look at one")
     );
     keeps_the_old_one(store, &ours, &p);
-    let agent = launcher(store, &dst, false, json_out, &p);
+    let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, false, json_out, &p);
     pi_extension(&dst, &dst, false, json_out, &p);
     exit_for(&agent)
 }
@@ -1475,7 +1477,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
 /// Did the daemon step fail — a refusal to run is not one (`installed: false`
 /// with a `reason`), a launchd that left the job unloaded or not running is.
 fn agent_failed(agent: &Value) -> bool {
-    agent.get("error").is_some()
+    agent.get("error").is_some() || agent.get("manager").is_some_and(|m| m.get("error").is_some())
 }
 
 /// The install's exit status for what [`launcher`] said. The binary is on disk
@@ -1491,7 +1493,7 @@ fn exit_for(agent: &Value) -> i32 {
 /// pi has no hooks to merge a snippet into; its hooks are an extension file,
 /// and a file this verb can simply put there. The Claude Code snippet stays by
 /// hand because `settings.json` is somebody's whole configuration, and this is
-/// one file under a name of its own beside herdr's.
+/// one file under a name of its own beside backend's.
 ///
 /// The copy written is the one `bin` carries, asked for with `wsp agent
 /// pi-extension` — the binary just installed, or under `-n` the one that would
@@ -1577,8 +1579,8 @@ use crate::systemd as backend;
 /// Write and load the launchd agent (a systemd user unit on Linux) that keeps `wsp daemon` alive.
 ///
 /// **A second job this verb does not have a flag for**, and every choice below
-/// follows from that. `wsp-145` replaced herdr's `[[startup]]` — a machine whose
-/// herdr had gone had no daemon at all, silently, for a week — and an install is
+/// follows from that. `wsp-145` replaced backend's `[[startup]]` — a machine whose
+/// backend had gone had no daemon at all, silently, for a week — and an install is
 /// the one moment on this machine where somebody has said out loud that what is
 /// on disk is what they want running. A flag would make the half that matters
 /// optional, and the failure it prevents is invisible: `wsp watch --status`
@@ -1589,7 +1591,7 @@ use crate::systemd as backend;
 ///
 /// - **Not a sandbox.** `WSP_HOME`/`WSP_STATE` make a complete wsp instance and
 ///   nothing else; the daemon this would start would be pointed at the live
-///   store and the live herdr, and would sync and reap against both. Same
+///   store and the live backend, and would sync and reap against both. Same
 ///   refusal as the copy above it, same reason, and it is the same check
 ///   `crate::launchd::sandboxed` makes for everything else that must not reach
 ///   out of one.
@@ -1608,7 +1610,7 @@ use crate::systemd as backend;
 /// Returns what happened for `--json` to fold into its one body, and prints
 /// nothing under `--json` for the same reason every other `--json` on this verb
 /// is a single object: a second one on the same stdout breaks every reader.
-fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::util::Paint) -> Value {
+fn daemon_agent(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::util::Paint) -> Value {
     let nothing = json!({"installed": false, "reason": "not this machine's daemon"});
     if dst != default_dest() || crate::launchd::sandboxed() {
         return nothing;
@@ -1670,6 +1672,177 @@ fn launcher(store: &Store, dst: &Path, dry: bool, json_out: bool, p: &crate::uti
     }
 }
 
+/// Both launchd agents this install means by *this machine is covered*: the
+/// daemon's ([`daemon_agent`]) and the manager's ([`manager_agent`], wsp-024).
+/// The manager's answer rides in the daemon's body under `manager`, so `--json`
+/// stays one object and a failure of either is a non-zero exit.
+fn launcher(
+    store: &Store,
+    src: Option<&Path>,
+    tree: Option<&Path>,
+    dst: &Path,
+    dry: bool,
+    json_out: bool,
+    p: &crate::util::Paint,
+) -> Value {
+    let mut agent = daemon_agent(store, dst, dry, json_out, p);
+    // A sandbox, or an install with `--to`: the daemon step said so and the
+    // manager is no more the sandbox's than the daemon is.
+    if agent.get("reason").is_some() {
+        return agent;
+    }
+    let manager = manager_agent(store, src, tree, dst, dry, json_out, p);
+    agent["manager"] = manager;
+    agent
+}
+
+/// Put `wsp-manager` beside `wsp`, write its launcher (a LaunchAgent,
+/// `<label>.manager`, on macOS; the `wsp-manager` systemd user unit on Linux),
+/// load it, and copy its token into the local machine record's secret file
+/// (`docs/agent-manager.md` 2.4, 3.3).
+///
+/// The binary is the one built beside `src` — `cargo build --workspace` puts
+/// both there at one commit — or, when it is not there, built from `tree`.
+/// With no `src` (`--daemon`) the one already beside `dst` is used. A manager
+/// replaced under a job whose plist did not change is kicked to run it.
+fn manager_agent(
+    store: &Store,
+    src: Option<&Path>,
+    tree: Option<&Path>,
+    dst: &Path,
+    dry: bool,
+    json_out: bool,
+    p: &crate::util::Paint,
+) -> Value {
+    use crate::launchd as l;
+    use crate::manager as m;
+    use backend as b;
+
+    let mgr = dst.with_file_name(m::BINARY);
+    let exec_dir = m::default_exec_dir();
+    let port = m::DEFAULT_PORT;
+    let var = l::path_for(std::env::var_os("PATH").as_deref());
+    let path = b::manager_definition_path();
+
+    if dry {
+        let change = match b::plan(&b::manager_definition(&mgr, &exec_dir, port, &var), &path) {
+            l::Plan::Unchanged => "unchanged",
+            l::Plan::Write => "would write",
+        };
+        if !json_out {
+            println!(
+                "{} {} · {} — `wsp install` loads it, and the manager comes back on its own",
+                p.dim("manager"),
+                p.dim(&util::contract(&path)),
+                p.dim(change)
+            );
+        }
+        return json!({"installed": false, "label": b::MANAGER_LABEL,
+                      "path": util::contract(&path), "plist": change});
+    }
+
+    let done = (|| -> Result<(b::Done, bool), String> {
+        let restarted = match src {
+            Some(src) => put_manager(src, tree, &mgr)?,
+            None if mgr.is_file() => false,
+            None => return Err(format!("{} is not there — `wsp install` puts it beside wsp", util::contract(&mgr))),
+        };
+        let done = b::ensure_manager(&mgr, &exec_dir, port, &var, restarted)?;
+        m::install_record(&store.state, &m::Local::new(&exec_dir, port), Duration::from_secs(15))?;
+        Ok((done, restarted))
+    })();
+
+    if !json_out {
+        match &done {
+            Ok((d, restarted)) => println!("{}", manager_installed_line(p, &d.path, d.wrote, d.loaded, *restarted, b::MANAGER_KIND)),
+            Err(why) => println!("{} the manager is not running — {why} (`wsp install --daemon` tries again)", p.red("✗")),
+        }
+    }
+    match done {
+        Ok((d, restarted)) => json!({"installed": true, "label": b::MANAGER_LABEL,
+                                    "path": util::contract(&d.path),
+                                    "plist": if d.wrote { "written" } else { "unchanged" },
+                                    "loaded": d.loaded, "binary_replaced": restarted}),
+        Err(why) => json!({"installed": false, "label": b::MANAGER_LABEL,
+                           "path": util::contract(&path), "error": why}),
+    }
+}
+
+/// The line `wsp install` prints once the manager's launcher is in place; `kind`
+/// is what the launcher is on this OS (`launchd::MANAGER_KIND`,
+/// `systemd::MANAGER_KIND`).
+fn manager_installed_line(p: &crate::util::Paint, path: &Path, wrote: bool, loaded: bool, restarted: bool, kind: &str) -> String {
+    format!(
+        "{} {} · {} — the manager is {kind} now, and it comes back on its own",
+        p.green("✓"),
+        util::contract(path),
+        match (wrote, loaded, restarted) {
+            (_, true, _) => "loaded, and it is running now",
+            _ => "already loaded",
+        },
+    )
+}
+
+/// Copy the `wsp-manager` that was built beside `src` to `dst`, building it
+/// from `tree` first when it is not there. `true` when `dst` changed.
+fn put_manager(src: &Path, tree: Option<&Path>, dst: &Path) -> Result<bool, String> {
+    let name = crate::manager::BINARY;
+    let beside = src.with_file_name(name);
+    if !beside.is_file() {
+        let Some(tree) = tree else {
+            return Err(format!(
+                "no {name} beside {} — `cargo build --workspace --release` builds it with wsp",
+                util::contract(src)
+            ));
+        };
+        let target = src.parent().and_then(Path::parent).ok_or("the build has no target directory")?;
+        let out = wsp_base::calls::Command::new("cargo")
+            .args(["build", "--release", "-p", "wsp-manager", "--target-dir"])
+            .arg(target)
+            .current_dir(tree)
+            .output()
+            .map_err(|e| format!("cannot run cargo to build {name}: {e}"))?;
+        if !out.status.success() || !beside.is_file() {
+            return Err(format!(
+                "building {name} in {} failed: {}",
+                util::contract(tree),
+                String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("").trim()
+            ));
+        }
+    }
+    let bytes = fs::read(&beside).map_err(|e| format!("cannot read {}: {e}", util::contract(&beside)))?;
+    if fs::read(dst).is_ok_and(|have| have == bytes) {
+        return Ok(false);
+    }
+    place(&bytes, dst)?;
+    Ok(true)
+}
+
+/// `wsp install --uninstall-manager`: unload the manager's job, remove its
+/// plist and the local machine record with the token's copy. The binary and
+/// the manager's own `<exec_dir>` (journal, token) are left where they are.
+fn uninstall_manager(store: &Store, json_out: bool, p: &crate::util::Paint) -> i32 {
+    if crate::launchd::sandboxed() {
+        eprintln!("wsp: this is a sandbox — the manager's agent is not the sandbox's to remove");
+        return 2;
+    }
+    let removed = backend::remove_manager();
+    crate::manager::remove_record(&store.state);
+    if json_out {
+        match &removed {
+            Ok(had) => println!("{}", json!({"ok": true, "label": backend::MANAGER_LABEL, "removed": had})),
+            Err(why) => println!("{}", json!({"ok": false, "label": backend::MANAGER_LABEL, "error": why})),
+        }
+    } else {
+        match &removed {
+            Ok(true) => println!("{} {} unloaded and removed", p.green("✓"), backend::MANAGER_LABEL),
+            Ok(false) => println!("{}", p.dim("the manager's agent was not installed")),
+            Err(why) => eprintln!("{} {why}", p.red("✗")),
+        }
+    }
+    if removed.is_ok() { 0 } else { 1 }
+}
+
 /// Name the long-lived processes that will **not** pick this up.
 ///
 /// **`worklist-033`.** The line above is true and is the whole of what this
@@ -1705,7 +1878,7 @@ fn stale_watchers(store: &Store, ours: &Built) -> Vec<crate::cmd_watch::Register
         .into_iter()
         .filter(|w| w.watching() && !w.daemon && !w.build.is_empty() && w.build != live)
         .collect();
-    let alive = crate::util::alive(&watches.iter().map(|w| w.pid).collect::<Vec<_>>());
+    let alive = crate::host::Host::alive(&crate::host::LOCAL, &watches.iter().map(|w| w.pid).collect::<Vec<_>>());
     watches.into_iter().filter(|w| alive.contains(&w.pid)).collect()
 }
 
@@ -1765,6 +1938,17 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
+                order: 195,
+                text: r##"  wsp install → ~/Library/LaunchAgents/com.wsp.manager.plist
+                                    …and puts `wsp-manager` beside wsp (the one
+                                    built beside it), writes and loads its agent
+                                    (KeepAlive, 5 s throttle, log in its
+                                    <exec_dir>/log/) and copies its token into
+                                    <state>/manager/local.secret. `wsp install
+                                    --uninstall-manager` unloads and removes it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
                 order: 200,
                 text: r##"  wsp install --why - | --why --from FILE
                                     …with the reason read from a stream or a
@@ -1781,6 +1965,21 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 
 #[cfg(test)]
 mod tests {
+    /// The Linux arm of `wsp install` says what the manager's launcher is: a
+    /// systemd user unit there, a launchd agent on macOS. Pure, so both are
+    /// read on either OS.
+    #[test]
+    fn the_install_line_names_the_launcher_of_the_os() {
+        let p = crate::util::Paint::new();
+        let path = std::path::Path::new("/nonexistent/wsp-manager.service");
+        let linux = manager_installed_line(&p, path, true, true, false, crate::systemd::MANAGER_KIND);
+        assert!(linux.contains("the manager is a systemd user unit now"), "{linux}");
+        assert!(linux.contains("loaded, and it is running now"), "{linux}");
+        let mac = manager_installed_line(&p, path, false, false, false, crate::launchd::MANAGER_KIND);
+        assert!(mac.contains("the manager is a launchd agent now"), "{mac}");
+        assert!(mac.contains("already loaded"), "{mac}");
+    }
+
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1789,6 +1988,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The manager is copied from beside the wsp that was built, once: a second
+    /// copy of the same bytes changes nothing, so a job already running it is
+    /// not kicked (wsp-024).
+    #[test]
+    fn the_manager_beside_the_build_is_copied_and_a_second_copy_changes_nothing() {
+        let d = scratch("manager-copy");
+        let built = d.join("target/release");
+        fs::create_dir_all(&built).unwrap();
+        fs::write(built.join("wsp"), b"wsp").unwrap();
+        fs::write(built.join("wsp-manager"), b"manager at one commit").unwrap();
+        let dst = d.join("bin/wsp-manager");
+
+        assert_eq!(put_manager(&built.join("wsp"), None, &dst), Ok(true));
+        assert_eq!(fs::read(&dst).unwrap(), b"manager at one commit");
+        assert_eq!(fs::metadata(&dst).unwrap().permissions().mode() & 0o111, 0o111);
+        assert_eq!(put_manager(&built.join("wsp"), None, &dst), Ok(false));
+
+        fs::write(built.join("wsp-manager"), b"manager at the next").unwrap();
+        assert_eq!(put_manager(&built.join("wsp"), None, &dst), Ok(true));
+
+        // Not built, and no tree to build it in: said, not skipped.
+        fs::remove_file(built.join("wsp-manager")).unwrap();
+        let why = put_manager(&built.join("wsp"), None, &dst).unwrap_err();
+        assert!(why.contains("no wsp-manager beside"), "{why}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     fn built(commit: Option<&str>, dirty: bool, at: u64) -> Built {
@@ -2265,8 +2491,7 @@ mod tests {
         let dir = scratch("stamp");
         let fake = |name: &str, says: &str| {
             let p = dir.join(name);
-            fs::write(&p, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&p, &format!("#!/bin/sh\necho '{says}'\n"));
             p
         };
 
@@ -2334,7 +2559,7 @@ mod tests {
         let commit = |n: &str| {
             fs::write(repo.join("src/lib.rs"), format!("// {n}\n")).unwrap();
             run(&["add", "-A"]);
-            run(&["commit", "--quiet", "-m", n]);
+            run(&["commit", "--quiet", "--no-gpg-sign", "-m", n]);
             git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap().trim().to_string()
         };
         commit("one");
@@ -2342,8 +2567,7 @@ mod tests {
         // A binary that says what it is, in a tree that has since moved on.
         let bin = |name: &str, says: &str| {
             let b = dir.join(name);
-            fs::write(&b, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
-            fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).unwrap();
+            wsp_testkit::script(&b, &format!("#!/bin/sh\necho '{says}'\n"));
             b
         };
         let src = bin("stamped", "wsp 0.1.0 (be58dac)");
@@ -2468,7 +2692,7 @@ mod tests {
         let commit = |n: &str| {
             fs::write(repo.join("f.txt"), format!("{n}\n")).unwrap();
             run(&["add", "f.txt"]);
-            run(&["commit", "--quiet", "-m", n]);
+            run(&["commit", "--quiet", "--no-gpg-sign", "-m", n]);
             git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap().trim().to_string()
         };
         let first = commit("one");

@@ -128,7 +128,7 @@
 //!    reads it and reports a watch whose pid has died or whose last tick is
 //!    stale — a *reporter* that has stopped is exactly the fact no other
 //!    surface in wsp could state.
-//! 4. **It is running and blind.** A backend not answering — herdr, or, since
+//! 4. **It is running and blind.** A backend not answering — since
 //!    `compound-115`, `place_compound` — means half the predicates cannot be
 //!    evaluated at all, so [`Kind::Blind`] goes up, once per silent source, and
 //!    it is the one signal exempt from priming: a watch that is blind from its
@@ -149,7 +149,7 @@
 //!
 //! # What it costs when nothing is happening
 //!
-//! One tick is one store sweep plus three herdr calls. Measured on this machine
+//! One tick is one store sweep plus one census. Measured on this machine
 //! on 2026-08-19 against the live store — see the task — and the number is in
 //! `wsp watch --now`'s own timing rather than assumed. At the default sixty
 //! seconds it is free; the reason to say the number rather than assume it is
@@ -168,9 +168,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use crate::cmd_agent::{self, Bound, Probe, Wip};
+use crate::cmd_agent::{self, Bound, Wip};
 use crate::cmd_govern;
-use crate::herdr;
 use crate::model::{Status, Task};
 use crate::place::State;
 use crate::resolve::Index;
@@ -296,7 +295,7 @@ pub(crate) enum Kind {
     /// `wsp flag --ask claim` arrive here, and the word itself says what is
     /// owed.
     Unanswered,
-    /// A binding whose pane herdr no longer lists, or whose pane is alive with
+    /// A binding whose seat no backend lists any more, or whose seat is alive with
     /// the agent gone. Covers *an agent died* and *an agent never started*,
     /// which look identical from here and want the same first move.
     AgentGone,
@@ -383,27 +382,26 @@ impl Kind {
         )
     }
 
-    /// Whether evaluating this predicate needs herdr to answer.
+    /// Whether evaluating this predicate needs the census to answer.
     ///
     /// **Read by [`Ledger::advance`], and it is the difference between a level
     /// that went away and one nobody could look at.** [`Poll::sample`] derives
-    /// the agent half from a census, so when herdr is unreachable that half of
+    /// the agent half from a census, so when a backend is unreachable that half of
     /// every tick is simply absent — no rows, no bindings, nothing. A diff
     /// taken against that reads every stall on the machine as having resolved,
-    /// and the next tick after herdr comes back reads them all as new.
+    /// and the next tick after it comes back reads them all as new.
     ///
-    /// One herdr restart is therefore two edges per standing signal, neither of
+    /// One backend restart is therefore two edges per standing signal, neither of
     /// which happened. On a stream a person discounts it, having just seen
     /// `blind` go up; through a hook it is a phone buzzing twice for every
-    /// stalled agent on the box, at whatever hour herdr was restarted. That is
+    /// stalled agent on the box, at whatever hour it was restarted. That is
     /// `robustness-088`'s named failure — *noise is worse than the silence it
     /// replaces* — arriving by the one route that has nobody reading it.
     ///
-    /// So: silence is not evidence, which is the judgement `sync` already makes
-    /// before it reaps. A level of a kind that could not be read this tick is
+    /// So: silence is not evidence. A level of a kind that could not be read this tick is
     /// **held**, not cleared, and it goes down on the first tick that can
     /// actually see it.
-    fn needs_herdr(&self) -> bool {
+    fn needs_census(&self) -> bool {
         match self {
             Kind::NeedsAPerson | Kind::AgentGone | Kind::SeatStalled => true,
             // The store answers these whether or not anything else does, which
@@ -417,7 +415,7 @@ impl Kind {
     /// How much of the receiver's time this may take, as
     /// [`crate::message::Kind`].
     ///
-    /// *"A derived signal → `note`, except herdr's `blocked` — a modal holding
+    /// *"A derived signal → `note`, except `blocked` — a modal holding
     /// the keyboard, fixed by one keypress — which `quiet_note` already
     /// promotes past the hour and which is the one derived signal that earns
     /// `direction`."* That promotion is carried on the signal rather than on
@@ -1094,7 +1092,7 @@ impl Spool {
 pub(crate) struct Signal {
     pub(crate) kind: Kind,
     /// A task id, mostly. A pane for a binding whose task is gone, the source's
-    /// own name (`herdr`, `compound`, …) for [`Kind::Blind`], and **a seat's
+    /// own name (`compound`, …) for [`Kind::Blind`], and **a seat's
     /// scope** for
     /// [`Kind::SeatStalled`] — a project id or a worklist slug, which share one
     /// key space with each other and with nothing else here.
@@ -1102,7 +1100,7 @@ pub(crate) struct Signal {
     /// *Mostly* is load-bearing and was nearly a defect. [`Poll::sample`]
     /// addresses on the way out from a map keyed by task id, so a subject that
     /// is not a task silently keeps the [`EVERYONE`] it was built with. That is
-    /// right for `herdr` and for a record wsp cannot place — nobody in
+    /// right for a backend's name and for a record wsp cannot place — nobody in
     /// particular owns either — and it is exactly wrong for a stalled seat,
     /// whose whole point is that it must reach somebody *other than itself*. So
     /// [`stalled_seats`] addresses its levels where it builds them, after that
@@ -1128,7 +1126,7 @@ pub(crate) struct Signal {
     ///
     /// `None` is [`Kind::loudness`] — `note`, because a derived level is
     /// nobody's request. It is overridden for exactly two readings and both are
-    /// facts about the *reading* rather than about the predicate: herdr's
+    /// facts about the *reading* rather than about the predicate: a seat's
     /// `blocked`, a modal on the keyboard that one keypress fixes, which
     /// `quiet_note` already promotes past the hour for the same reason; and a
     /// question, which carries the asker's own [`crate::message::Kind`] because
@@ -1147,7 +1145,7 @@ pub(crate) struct Signal {
     /// used to walk [`crate::governors::seat_for`] per *edge*, at the moment the edge
     /// was sent, which addresses a raise and its clearing by two different
     /// readings of a routing that moves under both. Driven on 2026-08-20
-    /// against a fake herdr: one flag, one seat swap in between, and the log
+    /// against a fake backend: one flag, one seat swap in between, and the log
     /// reads
     ///
     ///     attention-raised   to=phase-four  flag demo-001  held=0
@@ -1588,7 +1586,7 @@ impl Ledger {
         let mut out = Vec::new();
         let seen: BTreeSet<String> = now.iter().map(Signal::key).collect();
         // Half the predicates could not be evaluated at all this tick, so their
-        // absence from `now` says nothing. See [`Kind::needs_herdr`] for what
+        // absence from `now` says nothing. See [`Kind::needs_census`] for what
         // treating it as news costs.
         let blind = now.iter().any(|s| s.kind == Kind::Blind);
 
@@ -1626,7 +1624,7 @@ impl Ledger {
         let gone: Vec<String> = self
             .up
             .iter()
-            .filter(|(k, h)| !seen.contains(*k) && !(blind && h.signal.kind.needs_herdr()))
+            .filter(|(k, h)| !seen.contains(*k) && !(blind && h.signal.kind.needs_census()))
             .map(|(k, _)| k.clone())
             .collect();
         for k in gone {
@@ -1987,7 +1985,7 @@ pub(crate) fn in_scope(
 /// to think anybody is waiting on it.
 ///
 /// Pure, and separate from [`Poll::sample`] for the reason every other
-/// predicate in this file is not: this one has no herdr in it at all. The
+/// predicate in this file is not: this one has no census in it at all. The
 /// record answers whether a question is open and the census answers whether its
 /// asker is still turning, and both are in hand, so the whole of what a
 /// governor is told about an unanswered question can be driven by a test on a
@@ -2085,8 +2083,8 @@ fn asking(m: &crate::message::Message, subject: &str, rows: &[cmd_agent::WipRow]
 ///
 /// Pure, and separate from [`Poll::sample`] for [`asking`]'s reason: every input
 /// is a reading somebody else already took, so the predicate, its exemptions and
-/// the escalating address can all be driven by a test on a machine with no herdr
-/// socket — which is where `wsp verify` runs.
+/// the escalating address can all be driven by a test on a machine with no seats
+/// on it — which is where `wsp verify` runs.
 ///
 /// `worklist-041`. [`cmd_govern::needs_a_person`] is `stopped && doing &&
 /// !seat`, so a seat is exempt however stopped it is, and the exemption is
@@ -2328,7 +2326,7 @@ fn stalled_seats(
     out
 }
 
-/// The polling implementation: one store sweep and three herdr calls per tick.
+/// The polling implementation: one store sweep and one census per tick.
 pub(crate) struct Poll<'a> {
     store: &'a Store,
     scope: Scope,
@@ -2427,7 +2425,6 @@ impl<'a> Poll<'a> {
 
 impl Source for Poll<'_> {
     fn sample(&mut self) -> Vec<Signal> {
-        let probe = Probe::live();
         // Every backend's census, folded in one place — `cmd_agent::fleet_census`
         // — rather than here. This used to fold its own, and so did `wip` and so
         // did the reading that judged a binding, and the three were three
@@ -2435,18 +2432,11 @@ impl Source for Poll<'_> {
         // `wsp-119`, and the disagreement it cost was a signal about a compound
         // seat and a census row about the same compound seat, seconds apart.
         //
-        // Constructed through the probe rather than through `Wip::live` so the
-        // pane listing and the agent listing come from one probe. `Wip::live`
-        // would ask herdr for the agents a second time, and two listings taken
-        // a round-trip apart is how a pane comes to be in one and not the other.
-        // Herdr's silence is folded in rather than dropped, so `unheard()` below
-        // can say which source a governor is blind through — `compound-064`,
-        // `compound-115`, arriving here as its third place.
-        let census = cmd_agent::fleet_census(&probe);
-        let panes = match &probe {
-            Probe::Up { panes, .. } => panes.clone(),
-            _ => Vec::new(),
-        };
+        // A silent backend is folded in rather than dropped, so `unheard()`
+        // below can say which source a governor is blind through —
+        // `compound-064`, `compound-115`, arriving here as its third place.
+        let census = cmd_agent::fleet_census();
+        let panes: Vec<cmd_agent::Pane> = Vec::new();
         // Every seat, empty ones included: `wip` drops a seat with nothing in
         // it because `wip` is about who is working, and (d) below must not,
         // because "a seat is there and its agent is not" is exactly what it has
@@ -2490,8 +2480,8 @@ impl Source for Poll<'_> {
             lists: Vec::new(),
             // Read for state, never published — but this is the reading that
             // ticks, so it is the one that dates a seat's change when nobody
-            // runs `wsp wip` (`wsp-250`). It forgets nothing: the probe folds
-            // every herdr machine into one answer and drops a far machine's
+            // runs `wsp wip` (`wsp-250`). It forgets nothing: the census folds
+            // every machine into one answer and drops a far machine's
             // silence, so it cannot say whose machine went without a seat.
             // `wsp wip`, which asks each machine apart, does the forgetting.
             since: cmd_agent::seat_clocks(
@@ -2534,7 +2524,7 @@ impl Source for Poll<'_> {
         let mut spoken_for: BTreeSet<String> = BTreeSet::new();
 
         // (a) The store half: two statuses, both levels, both about work rather
-        // than about an agent. Neither needs herdr, so both keep answering
+        // than about an agent. Neither needs the census, so both keep answering
         // while the watch is blind — which is the point of saying blind at all.
         for t in wip.tasks.iter().filter(|t| mine(t)) {
             match t.status() {
@@ -2622,12 +2612,12 @@ impl Source for Poll<'_> {
             }
             // The one reading that changes the answer's urgency, and it is read
             // off the published row's own typed state rather than by asking
-            // herdr again — or, as this did before, by parsing the row's
-            // *string* back through herdr's word table. That string is wsp's
-            // own vocabulary (`State::as_str`), not herdr's, and reading it as
-            // herdr's is exactly the mistake `compound-064` refused: a
+            // the backend again — or, as this did before, by parsing the row's
+            // *string* back through one backend's word table. That string is
+            // wsp's own vocabulary (`State::as_str`), and reading it as one
+            // backend's is exactly the mistake `compound-064` refused: a
             // `place_compound` or `place_super` seat's word read through
-            // herdr's table. `state_typed` is the port's own answer, already
+            // another backend's table. `state_typed` is the port's own answer, already
             // resolved by whichever backend the seat is, so there is nothing
             // here to get wrong. A modal has the keyboard: the repair is a
             // keypress, and waiting five minutes to mention it would be
@@ -2676,7 +2666,7 @@ impl Source for Poll<'_> {
         //
         // **No `if up` around this, and that gate was the second half of the
         // fault** (`wsp-119`). It stood for "we know something", and on a machine
-        // with no herdr socket it meant the whole arm stood down — which, after
+        // where the old backend was absent it meant the whole arm stood down — which, after
         // `compound-112`'s flip, is every ordinary machine, and every agent on
         // it a compound seat. The honest gate is the one inside
         // [`cmd_agent::bound_state`]: a seat no source listed is
@@ -2698,20 +2688,19 @@ impl Source for Poll<'_> {
                     "{pane} · the seat is there and the agent is gone — the claim and the \
                      worktree are still held · `wsp despawn <id>` gives it up"
                 ),
-                Bound::Gone => format!("{pane} · the pane is gone — wsp sync reaps the binding"),
+                Bound::Gone => format!("{pane} · the seat is gone — `wsp release <id>` ends the claim"),
                 _ => continue,
             };
             out.push(Signal::new(Kind::AgentGone, &t.id, &detail).settling());
         }
 
-        // Per source, not a single latch: a machine with herdr up and
-        // compound unreadable (or the reverse) should say so honestly rather
-        // than reporting nothing wrong, or reporting one blindness as the
-        // other's. `""` is herdr's own name in a `Census` (`Census::heard`'s
-        // spelling); every other source is named the way `LOCAL_BACKEND_NAMES`
-        // files it.
+        // Per source, not a single latch: one backend up and another
+        // unreadable should say so honestly rather than reporting nothing
+        // wrong, or reporting one blindness as the other's. A source is named
+        // the way `LOCAL_BACKEND_NAMES` files it, and an unnamed one is
+        // `backend`.
         for (source, why) in census.unheard() {
-            let subject = if source.is_empty() { "herdr" } else { source };
+            let subject = if source.is_empty() { "backend" } else { source };
             out.push(Signal::new(
                 Kind::Blind,
                 subject,
@@ -2721,7 +2710,7 @@ impl Source for Poll<'_> {
 
         // Addressed on the way out, in one place, so no branch above can build
         // a level that does not know who answers for it. A subject that is not
-        // a task — `herdr`, for [`Kind::Blind`], and a message record the
+        // a task — a backend's name, for [`Kind::Blind`], and a message record the
         // machine pass could not place — has no chain to walk and is
         // everybody's by construction, which is right: wsp being unable to see
         // the agents is not one seat's problem.
@@ -2959,7 +2948,7 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
     if watches.is_empty() {
         return;
     }
-    let live = crate::util::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let live = crate::host::Host::alive(&crate::host::LOCAL, &watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     let now = util::epoch_secs();
     for w in &watches {
         // **A seat's wake record fails in a way no liveness check can see.**
@@ -3425,8 +3414,8 @@ pub(crate) trait Sink {
     /// tells a person to `run wsp daemon yourself` when the daemon has wedged,
     /// and a daemon started that way has a tty, so every wake it delivered
     /// would have arrived in a governor's composer as `\x1b[2m…\x1b[0m`.
-    /// Nothing was ever wrong in production only because herdr starts the
-    /// daemon with stdout on `/dev/null` — a fact about how it happens to be
+    /// Nothing was ever wrong in production only because the daemon was
+    /// started with stdout on `/dev/null` — a fact about how it happens to be
     /// launched, holding up a fact about what a composer can read.
     fn paint(&self) -> Paint {
         Paint::new()
@@ -3507,7 +3496,7 @@ impl Sink for Stdout {
 ///
 /// **`0 standing` on a seat does not distinguish *nothing left to answer for*
 /// from *nobody is answering*, and this file cannot tell them apart.** Driven
-/// on a fake herdr: a seated pane alive with its turn abandoned, its member
+/// on a fake backend: a seated pane alive with its turn abandoned, its member
 /// working normally, `wsp watch --now` printing *nothing is up* and `wsp
 /// doctor* printing *no problems*. The healthy seat and the dead one produce
 /// the identical reading, and the difference between them is whether the seat
@@ -3721,9 +3710,8 @@ fn scope_of(store: &Store, named: Option<String>) -> Result<Scope, String> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // Off `my_pane()` and not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID`
-        // (`compound-105`): a compound-hosted seat has neither, only the one
-        // string `my_pane()` already resolves either way, and `governs`
+        // Off `my_pane()` (`compound-105`): a compound-hosted seat has only
+        // the one string `my_pane()` resolves, and `governs`
         // matches an exact pane on its own — the separate `workspace == here`
         // check this used to need is exactly what `compound-095` made
         // redundant.
@@ -4255,10 +4243,7 @@ fn drain(store: &Store, spec: &Spec) -> i32 {
 /// at. A watch started outside a pane has only its pid, which is still enough
 /// to answer the one question the register exists for.
 fn watch_key() -> String {
-    match herdr::Env::read().pane_id {
-        Some(p) if !p.is_empty() => p,
-        _ => format!("pid:{}", std::process::id()),
-    }
+    format!("pid:{}", std::process::id())
 }
 
 fn register(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u64, written: &[Spooled]) {
@@ -4334,7 +4319,7 @@ fn idle_memory(store: &Store) -> crate::memory::IdleMemory {
         .filter_map(|b| b.census().ok())
         .flat_map(|c| c.seats().cloned().collect::<Vec<_>>())
         .collect();
-    crate::memory::read(&store.state, &agents, &store.bindings())
+    crate::memory::read(&store.state, &agents, &store.bindings(), || crate::host::Host::seat_memory(&crate::host::LOCAL))
 }
 
 fn status(store: &Store, args: &Args) -> i32 {
@@ -4344,8 +4329,8 @@ fn status(store: &Store, args: &Args) -> i32 {
     // is the command a governor runs when it has noticed a silence. `wsp-145`:
     // for six days this screen said `ticked 6d23h ago, the process is gone`
     // without saying anything about *why* the process was gone, and the answer
-    // was that herdr had gone with it and nothing was starting the daemon
-    // again. Silence from a watchdog is the one silence nobody investigates, so
+    // was that what used to start the daemon had gone and nothing was
+    // starting it again. Silence from a watchdog is the one silence nobody investigates, so
     // the cause goes above the table rather than below it.
     let loud = crate::daemon::loud(
         crate::daemon::running(&store.state).as_deref(),
@@ -4394,7 +4379,7 @@ fn status(store: &Store, args: &Args) -> i32 {
         println!("{}", p.dim("nobody is watching · `wsp watch` starts one"));
         return 0;
     }
-    let live = crate::util::alive(&watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
+    let live = crate::host::Host::alive(&crate::host::LOCAL, &watches.iter().filter(|w| w.watching()).map(|w| w.pid).collect::<Vec<_>>());
     for w in &watches {
         // A seat's wake record answers a different question from a watcher's,
         // so it gets a different sentence rather than a watcher's sentence with
@@ -4936,15 +4921,15 @@ mod tests {
         assert!(l.advance(&later, &Routing::Unknown, 3000, 0).is_empty());
     }
 
-    /// **Silence is not evidence.** A tick that could not reach herdr has no
+    /// **Silence is not evidence.** A tick that could not reach a backend has no
     /// agent half at all, so the levels derived from it are absent — and a diff
     /// that read absence as resolution would report every stall on the machine
-    /// as cleared, then report them all as new when herdr came back.
+    /// as cleared, then report them all as new when the backend came back.
     ///
-    /// One herdr restart, two edges per standing signal, none of which
+    /// One backend restart, two edges per standing signal, none of which
     /// happened. Through `wsp watch` a person discounts it, having just seen
     /// `blind` go up on the line above; through `attention`'s hook it is a
-    /// phone buzzing twice per stalled agent at whatever hour herdr restarted.
+    /// phone buzzing twice per stalled agent at whatever hour it restarted.
     #[test]
     fn going_blind_holds_the_levels_it_can_no_longer_read_rather_than_clearing_them() {
         let mut l = Ledger::default();
@@ -4952,9 +4937,9 @@ mod tests {
         let seeing = vec![sig(Kind::NeedsAPerson, "a-1"), sig(Kind::Review, "a-2")];
         assert_eq!(l.advance(&seeing, &Routing::Unknown, 60, 0).len(), 2);
 
-        // herdr goes away. The store half still answers, so `review` is a real
+        // The backend goes away. The store half still answers, so `review` is a real
         // reading and stays; the agent half is unreadable, so it is held.
-        let blind = vec![sig(Kind::Review, "a-2"), sig(Kind::Blind, "herdr")];
+        let blind = vec![sig(Kind::Review, "a-2"), sig(Kind::Blind, "compound")];
         let out = l.advance(&blind, &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "only `blind` itself is news");
         assert_eq!(out[0].signal.kind, Kind::Blind);
@@ -4975,7 +4960,7 @@ mod tests {
         let mut l = Ledger::default();
         l.prime(&[], 0);
         l.advance(&[sig(Kind::NeedsAPerson, "a-1")], &Routing::Unknown, 60, 0);
-        l.advance(&[sig(Kind::Blind, "herdr")], &Routing::Unknown, 120, 0);
+        l.advance(&[sig(Kind::Blind, "compound")], &Routing::Unknown, 120, 0);
 
         let out = l.advance(&[], &Routing::Unknown, 180, 0);
         let cleared: Vec<Kind> = out.iter().map(|e| e.signal.kind).collect();
@@ -5048,7 +5033,7 @@ mod tests {
     #[test]
     fn a_watch_that_is_blind_from_its_first_tick_says_so_even_while_priming() {
         let mut l = Ledger::default();
-        let out = l.prime(&[sig(Kind::Review, "a-1"), sig(Kind::Blind, "herdr")], 0);
+        let out = l.prime(&[sig(Kind::Review, "a-1"), sig(Kind::Blind, "compound")], 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].signal.kind, Kind::Blind);
     }
@@ -5192,7 +5177,7 @@ mod tests {
     /// already saying so does not say it twice because its binary changed.
     #[test]
     fn a_re_prime_says_blind_only_when_the_reader_has_not_been_told() {
-        let blind = vec![sig(Kind::Blind, "herdr")];
+        let blind = vec![sig(Kind::Blind, "compound")];
         let mut first = Ledger::default();
         assert_eq!(first.prime(&blind, 0).len(), 1, "a watch blind from its first tick says so");
 
@@ -5464,7 +5449,7 @@ mod tests {
 
     /// **The half the row did not name, and the worse one.** `flag` clears, so
     /// a seat swap did not merely lose the hand quietly — it said out loud that
-    /// it had been lowered. Driven on 2026-08-20 against a fake herdr, two
+    /// it had been lowered. Driven on 2026-08-20 against a fake backend, two
     /// seats and a worklist finishing under them: `cleared  demo-001  flag ·
     /// was up 0s`, while `wsp flag` went on listing it and the other seat now
     /// held it.
@@ -5634,7 +5619,7 @@ mod tests {
     // ---- a seat that has stopped answering ---------------------------------
     //
     // `worklist-041`. Every input to [`stalled_seats`] is a reading somebody
-    // else took, so the whole predicate is driven here with no herdr socket in
+    // else took, so the whole predicate is driven here with no backend in
     // the room — which is the point of it being a function rather than an arm.
 
     use crate::model::{Group, Worklist, WorklistStatus};
@@ -6116,20 +6101,20 @@ mod tests {
     }
 
     /// Silence is not evidence, and the census is the half that goes missing.
-    /// A tick that could not reach herdr says nothing about whether a seat is
+    /// A tick that could not reach a backend says nothing about whether a seat is
     /// turning, so a level of this kind is **held** across it rather than read
-    /// as a run that resumed — one herdr restart would otherwise be a false
+    /// as a run that resumed — one backend restart would otherwise be a false
     /// all-clear per stalled run, at whatever hour it was restarted.
     #[test]
     fn a_stalled_seat_is_held_across_a_tick_that_could_not_see_the_agents() {
-        assert!(Kind::SeatStalled.needs_herdr());
+        assert!(Kind::SeatStalled.needs_census());
 
         let s = Signal::new(Kind::SeatStalled, "nightly", "no turn here").settling();
         let mut l = Ledger::default();
         l.advance(&[s], &Routing::Machine, 0, 0);
         assert_eq!(l.standing(), 1);
 
-        let blind = Signal::new(Kind::Blind, "herdr", "no herdr socket");
+        let blind = Signal::new(Kind::Blind, "compound", "no answer");
         let out = l.advance(&[blind], &Routing::Machine, 60, 0);
         assert_eq!(l.standing(), 2, "the stall is held, not cleared");
         assert!(out.iter().all(|e| e.edge == Edge::Up), "nothing was reported as over: {out:?}");
@@ -6290,21 +6275,17 @@ mod tests {
         assert!(!said(&scope("wsp", true)).contains("already wakes"), "advice that does not work is worse than none");
     }
 
-    // ---- reading the agent half through the port, not through herdr alone ---
+    // ---- reading the agent half through the port --------------------------
     //
-    // `compound-115`. Before this, [`Poll::sample`] read `Probe::live()` alone
-    // for its agent listing, so a governor on a machine with no herdr socket
-    // was blind to every seat `wsp` itself had opened. `util::isolated` already
-    // points `HERDR_SOCKET_PATH` at a socket nothing is listening on, so this
-    // is that machine without any extra setup — the case `compound-112`'s flip
-    // is about to make the common one.
+    // `compound-115`. Before this, [`Poll::sample`] read one backend's listing
+    // alone, so a governor on a machine without that backend was blind to
+    // every seat `wsp` itself had opened.
 
-    /// A `compound`-hosted agent, stopped on a task nobody governs, is still
-    /// [`Kind::NeedsAPerson`] with no herdr socket up at all — and the `blind`
-    /// this watch says so about is herdr's alone, because the second source it
-    /// now reads answered for itself.
+    /// A `compound`-hosted agent, stopped on a task nobody governs, is
+    /// [`Kind::NeedsAPerson`] — and the watch is blind through nothing, because
+    /// the one source it reads answered for itself.
     #[test]
-    fn a_compound_hosted_stall_is_seen_with_no_herdr_socket_up() {
+    fn a_compound_hosted_stall_is_seen() {
         let env = util::isolated("watch-compound-agent");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -6344,18 +6325,18 @@ mod tests {
             .filter(|s| s.kind == Kind::Blind)
             .map(|s| s.subject.as_str())
             .collect();
-        assert_eq!(blind, vec!["herdr"], "herdr is the only source that said nothing: {now:?}");
+        assert!(blind.is_empty(), "compound answered, so nothing is blind: {now:?}");
 
         assert!(
             now.iter().any(|s| s.kind == Kind::NeedsAPerson && s.subject == "cpd-1"),
-            "a compound seat's own stall reaches the watch without herdr: {now:?}"
+            "a compound seat's own stall reaches the watch: {now:?}"
         );
     }
 
     // ---- one reading of a seat, whoever is holding it (`wsp-119`) ----------
     //
     // Arm (d) used to be wrapped in `if up` and to ask [`cmd_agent::bound_state`]
-    // two herdr pane listings, so on a machine with no herdr socket — which is
+    // two pane listings from one backend, so on a machine without it — which is
     // every machine `compound-112`'s flip leaves — the whole arm stood down and
     // the two defects were one: nothing was ever said about a compound seat,
     // and a seat that *was* reported on was reported on by a different reader
@@ -6422,8 +6403,8 @@ mod tests {
     /// exists.** A compound seat whose agent was killed by a limit, with its
     /// claim and its worktree still held.
     ///
-    /// It raised nothing at all: the seat is not a herdr pane, so `bound_state`
-    /// found it in neither listing, and the arm that would have said so was
+    /// It raised nothing at all: `bound_state` read one backend's
+    /// listings and found it in neither, and the arm that would have said so was
     /// behind `if up` besides. The level that leaves here has to say *what
     /// happened* — a reader who is told "no turn running" goes and runs
     /// `wsp tell` against a seat with nobody in it, which is `worklist-013`'s
@@ -6919,7 +6900,7 @@ mod tests {
         });
         assert_eq!(held.depth(), 2);
 
-        // …and while that tick is still working — a poll, a herdr call, a
+        // …and while that tick is still working — a poll, a census, a
         // delivery — a governor drains from another process.
         let drained = recorded(&store, key);
         store.update_watch(key, |rec| Spool::settle(rec, Spool::watermark(&drained.held)));

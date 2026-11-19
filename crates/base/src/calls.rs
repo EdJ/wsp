@@ -26,7 +26,7 @@
 //! **Children come from the one wrapper.** [`Command`] is a drop-in for
 //! `std::process::Command` that times `output`, `status` and (at `wait`) a
 //! spawned child, and adds it to the process-wide accumulator under the
-//! program's file name. `ps`, `lsof`, `git`, `herdr`, `cargo` show up by name
+//! program's file name. `ps`, `lsof`, `git`, `backend`, `cargo` show up by name
 //! with count and total wall ms; a straggler that still uses
 //! `std::process::Command` is invisible to the split but not to the CPU totals,
 //! which come from `getrusage` and miss nothing.
@@ -402,7 +402,7 @@ fn held() -> &'static Mutex<std::collections::HashSet<u32>> {
 }
 
 /// The children this process knows are its own and that nothing waits on, by
-/// pid, with what each runs: the only ones [`reap_defunct`] may wait for.
+/// pid, with what each runs: the only ones [`reap_defunct_with`] may wait for.
 /// One gets here when no thread could be started to wait on it.
 fn orphans() -> &'static Mutex<BTreeMap<u32, String>> {
     static ORPHANS: std::sync::OnceLock<Mutex<BTreeMap<u32, String>>> = std::sync::OnceLock::new();
@@ -414,7 +414,7 @@ fn let_go(pid: u32) {
 }
 
 /// Wait for `pid` on a thread of its own, so it is reaped whenever it ends and
-/// nobody blocks on it; with no thread to be had, leave it to [`reap_defunct`].
+/// nobody blocks on it; with no thread to be had, leave it to [`reap_defunct_with`].
 fn wait_aside(pid: u32, line: String, wait: impl FnOnce() + Send + 'static) {
     let spawned = std::thread::Builder::new().name("reap".into()).spawn(wait);
     if spawned.is_err() {
@@ -448,26 +448,20 @@ extern "C" {
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
 }
 
-/// Every child of this process, by pid, with its command line.
+/// Every child of this process, by pid, with its command line, read from
+/// `table`: what the host's `own_children` reads, `ps -axo pid=,ppid=,command=`
+/// with the pid of that `ps`, which is a child of this process too and on its
+/// own list. `None` (no `ps`) is no children.
 ///
 /// For [`adopt`] at a daemon's start: an `exec` keeps the process and its
 /// children and drops every thread, so the reaping threads of the image before
 /// a reload are gone, and what they were waiting on is waited on by nothing.
-pub fn children() -> Vec<(u32, String)> {
+/// The table comes from the daemon (wsp-111): `ps` runs in `wsp-host`.
+pub fn children_of(table: Option<(u32, String)>) -> Vec<(u32, String)> {
     let me = std::process::id();
-    // Spawned rather than `output()`, for its pid: `ps` is a child of this
-    // process too, and is on its own list.
-    let ps = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let Ok(ps) = ps else { return Vec::new() };
-    let itself = ps.id();
-    let Ok(out) = ps.wait_with_output() else { return Vec::new() };
+    let Some((itself, out)) = table else { return Vec::new() };
     let mut kids = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in out.lines() {
         let line = line.trim_start();
         let Some((pid, rest)) = line.split_once(char::is_whitespace) else { continue };
         let rest = rest.trim_start();
@@ -478,6 +472,22 @@ pub fn children() -> Vec<(u32, String)> {
         }
     }
     kids
+}
+
+/// [`children_of`] with the table read here, as `wsp-host`'s `own_children`
+/// reads it: for this module's tests, which cannot link the host.
+#[cfg(test)]
+fn children() -> Vec<(u32, String)> {
+    let ps = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(ps) = ps else { return Vec::new() };
+    let itself = ps.id();
+    let Ok(out) = ps.wait_with_output() else { return Vec::new() };
+    children_of(Some((itself, String::from_utf8_lossy(&out.stdout).into_owned())))
 }
 
 /// Take on children this process has but no `Child` of this image holds,
@@ -502,7 +512,7 @@ pub fn adopt(kids: &[(u32, String)]) {
     }
 }
 
-/// What one pass of [`reap_defunct`] did and saw.
+/// What one pass of [`reap_defunct_with`] did and saw.
 #[derive(Debug, Default)]
 pub struct Reaped {
     /// Orphans waited for now, with what each ran.
@@ -524,7 +534,11 @@ pub struct Reaped {
 /// and taking it fails that caller with `ECHILD` (wsp-667). Such a child is
 /// reported instead, once it has stayed defunct across two passes, so a spawn
 /// that leaks shows up by name and is fixed where it is made.
-pub fn reap_defunct() -> Reaped {
+///
+/// `defunct` reads the table strays are named from, after the orphans are
+/// waited for: `ps -axo pid=,ppid=,stat=,comm=`, the host's `own_defunct`
+/// (wsp-111: `ps` runs in `wsp-host`); `None` names none.
+pub fn reap_defunct_with(defunct: impl FnOnce() -> Option<String>) -> Reaped {
     let mut done = Reaped::default();
     {
         let mut orphans = lock(orphans());
@@ -540,26 +554,35 @@ pub fn reap_defunct() -> Reaped {
             }
         });
     }
-    done.strays = strays();
+    done.strays = strays(defunct());
     done
 }
 
+/// [`reap_defunct_with`] with the table read here, as `wsp-host`'s
+/// `own_defunct` reads it: for this module's tests, which cannot link the host.
+#[cfg(test)]
+fn reap_defunct() -> Reaped {
+    reap_defunct_with(|| {
+        let out = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
+
 /// Defunct children of this process held by nothing here, seen on the last
-/// pass as well, and not said before.
-fn strays() -> Vec<(u32, String)> {
+/// pass as well, and not said before, read from `table` (`None`: none, and
+/// the last pass's sightings kept).
+fn strays(table: Option<String>) -> Vec<(u32, String)> {
     static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static TOLD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     let me = std::process::id();
-    let Ok(out) = std::process::Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output() else {
-        return Vec::new();
-    };
+    let Some(out) = table else { return Vec::new() };
     let mut now = Vec::new();
     let mut said = Vec::new();
     let held = lock(held()).clone();
     let orphans: Vec<u32> = lock(orphans()).keys().copied().collect();
     let mut seen = lock(&SEEN);
     let mut told = lock(&TOLD);
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in out.lines() {
         let mut f = line.split_whitespace();
         let (Some(pid), Some(ppid), Some(stat)) = (f.next(), f.next(), f.next()) else { continue };
         let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else { continue };
@@ -749,7 +772,7 @@ pub fn exit(code: i32) -> ! {
 
 /// The seat id, if this process is in a seat.
 fn seat_id() -> Option<String> {
-    ["WSP_SEAT_ID", "HERDR_PANE_ID"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    ["WSP_SEAT_ID", "WSP_BACKEND_PANE_ID"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
 /// primary, governor, member, verifier, check, daemon or none — from the
@@ -1290,6 +1313,7 @@ mod tests {
     /// A child run through the wrapper is counted by program name, once per run,
     /// with its wall time; and a drain empties the accumulator.
     /// The accumulator is process-wide, so the tests that drain it take turns.
+    /// `close` drains it, so a test that closes a phase takes this too (wsp-132).
     static KIDS_TEST: Mutex<()> = Mutex::new(());
 
     /// **The daemon's leak.** A child dropped without a wait (the detached
@@ -1659,6 +1683,8 @@ mod tests {
 
     #[test]
     fn phases_add_when_a_name_comes_round_again() {
+        // `close` drains the process-wide tally: take turns (wsp-132).
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut t = Tick {
             at: 0,
             started: Instant::now(),
@@ -1680,10 +1706,11 @@ mod tests {
     }
 
     /// `wsp-665`: a phase says which programs it ran, and the tick's `children`
-    /// stays the sum of them. The test drains the process-wide tally, so it is
-    /// the only test that reads it.
+    /// stays the sum of them. The test drains the process-wide tally, so it
+    /// takes turns with the other tests that do (`KIDS_TEST`, wsp-132).
     #[test]
     fn a_phase_keeps_the_children_it_ran_and_the_tick_the_total() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let _ = drain_children();
         let mut t = Tick {
             at: 0,

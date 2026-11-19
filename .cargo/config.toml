@@ -11,3 +11,9 @@ rustc-wrapper = ".cargo/rustc-wrap"
 # replaces this (cargo takes one source of rustflags), so nothing here sets one.
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-adhoc_codesign"]
+
+# State-core step 0 (docs/state-core.md section 9): C compiled by a build script (libsqlite3-sys's
+# sqlite3.c) goes through `.cargo/cc-wrap`, sccache's `cc` when installed, bare `cc` when not.
+# No `force`: a CC in the environment still wins. `relative` makes the path absolute from this file.
+[env]
+CC = { value = ".cargo/cc-wrap", relative = true }

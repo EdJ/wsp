@@ -5,7 +5,7 @@
 //! a title, and only something holding [`Mode`] can tell those apart.
 //!
 //! [`apply_input`] is pure: state in, [`Effect`] out. Nothing in this file
-//! talks to a terminal or to herdr, which is what lets the storyboard push
+//! talks to a terminal or to backend, which is what lets the storyboard push
 //! scripted input through the same path the live panel runs.
 //!
 //! Every input goes through that one door — a key, a click, the wheel, and the
@@ -125,10 +125,10 @@ pub(crate) struct View {
     /// This panel *is* the tab: the one `Z` opened, drawn at the width of the
     /// workspace.
     ///
-    /// What it changes is the way out. The sidebar is installed furniture and
-    /// refuses to be quit by a stray `q` — losing it costs a reinstall and buys
-    /// nothing. This one is a tab somebody opened a moment ago and will close
-    /// again, so `q`, `esc` and `Z` all close it, and the footer says so.
+    /// What it changes is the way out. The sidebar refuses to be quit by a
+    /// stray `q` — losing it buys nothing. This one is a tab somebody opened a
+    /// moment ago and will close again, so `q`, `esc` and `Z` all close it,
+    /// and the footer says so.
     pub(super) full: bool,
     /// Include `done` tasks, and the projects that hold only those.
     pub(super) show_done: bool,
@@ -139,7 +139,7 @@ pub(crate) struct View {
     /// Put the agents in place of the tree: every pane running an agent, in one
     /// list, ordered by what it is waiting for. The tree answers what the work
     /// is; this answers who is on it and which of them has stopped — the
-    /// question herdr's own sidebar exists for, asked without leaving the panel.
+    /// question backend's own sidebar exists for, asked without leaving the panel.
     pub(super) agents: bool,
     /// Put the machines in place of the tree: ready, connected but not ready
     /// and why, unreachable since, retired — the agents under each
@@ -446,12 +446,12 @@ pub(super) fn where_key(k: Key, ui: &mut Ui, view: &mut View, mut w: Where) -> E
 /// It is also the answer to a guard rather than a hole in one, and that is
 /// worth saying here because the next reader will otherwise find a `q` that
 /// refuses to quit sitting beside a menu that offers to, and take one of them
-/// for a mistake. The rule in [`View::full`] is that the sidebar is installed
-/// furniture and must not be lost to a stray keystroke. That was the whole
-/// story while the panel was a pane and herdr's own menu was still there; the
-/// fork made this surface *be* herdr's sidebar, so the guard that stopped the
+/// for a mistake. The rule in [`View::full`] is that the sidebar must not be
+/// lost to a stray keystroke. That was the whole
+/// story while the panel was a pane and backend's own menu was still there; the
+/// fork made this surface *be* backend's sidebar, so the guard that stopped the
 /// stray `q` also removed the last door out of the terminal — Ed, on the day:
-/// *"annoying, since we lost the herdr menu."*
+/// *"annoying, since we lost the backend menu."*
 ///
 /// A menu is what the guard was protecting *for*: opening a list and picking a
 /// row is deliberate, two-step and readable, which is exactly what a stray
@@ -469,14 +469,14 @@ pub(crate) struct Menu {
 }
 
 impl Menu {
-    /// The menu reached from nowhere in particular — herdr's
+    /// The menu reached from nowhere in particular — backend's
     /// `render_global_launcher_menu`, and the half of the pair this task built.
     /// The other half is a menu about the row under the pointer, and it is a
     /// different `Vec<Item>` handed to this same struct: same reducer, same
     /// box, same click. That is the whole reason the payload is a list rather
     /// than a mode of its own.
     pub(crate) fn global() -> Menu {
-        Menu { items: vec![Item::QuitHerdr, Item::ReloadConfig, Item::Keys], sel: 0 }
+        Menu { items: vec![Item::QuitBackend, Item::ReloadConfig, Item::Keys], sel: 0 }
     }
 
     /// What is on it, for the test that holds the menu to the shape it was
@@ -499,17 +499,17 @@ impl Menu {
 /// so the payload names something the panel already knows how to do. Picking is
 /// [`choose`], which is the one place a row becomes a deed.
 ///
-/// **What is not here, and why.** herdr's own global menu offered five things:
+/// **What is not here, and why.** backend's own global menu offered five things:
 /// `settings`, `keybinds`, `reload config`, `what's new`, and `detach`. Two of
-/// them draw herdr's own screens — a settings form and a release-notes pane —
+/// them draw backend's own screens — a settings form and a release-notes pane —
 /// and there is no socket call that opens either, so a row for them would be a
-/// row that cannot work; `what's new` needs herdr's update state, which nothing
-/// on this side of the pipe is told. `keybinds` is herdr's key map, and wsp has
+/// row that cannot work; `what's new` needs backend's update state, which nothing
+/// on this side of the pipe is told. `keybinds` is backend's key map, and wsp has
 /// its own and a better claim to yours: [`Item::Keys`] is that one. What is
 /// left is the two that are one call each, and they are the two that were
 /// actually lost.
 ///
-/// **`close` is not one word.** There is a pane, a tab, a workspace, and herdr
+/// **`close` is not one word.** There is a pane, a tab, a workspace, and backend
 /// itself, and a menu row that said `close` would be a promise nobody could
 /// read. Every row here names its object. The workspace is deliberately absent:
 /// closing *this* workspace is a question about the row under the cursor, not
@@ -518,14 +518,14 @@ impl Menu {
 /// for, not to the global one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Item {
-    /// End herdr: every workspace, every pane, and every agent running in one.
+    /// End backend: every workspace, every pane, and every agent running in one.
     ///
     /// First because Ed asked for it first — *"a sidebar menu, where close can
     /// be the first option"* — and because it is the thing whose absence built
     /// the menu. Never without a `y`: it is the one row here that cannot be
     /// un-pressed, and the question it raises counts what is running.
-    QuitHerdr,
-    /// Have herdr read its config file again.
+    QuitBackend,
+    /// Have backend read its config file again.
     ReloadConfig,
     /// The key map, docked under the tree — the same thing `?` does.
     ///
@@ -540,8 +540,8 @@ impl Item {
     /// own is four different promises — see the enum's own docs.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Item::QuitHerdr => "quit herdr",
-            Item::ReloadConfig => "reload herdr's config",
+            Item::QuitBackend => "quit all",
+            Item::ReloadConfig => "reload backend's config",
             Item::Keys => "the key map",
         }
     }
@@ -552,7 +552,7 @@ impl Item {
 pub(super) fn choose(item: Item, ui: &Ui, view: &mut View) -> Effect {
     view.mode = Mode::Browse;
     match item {
-        Item::QuitHerdr => {
+        Item::QuitBackend => {
             // The question carries the consequence, the way `X`'s does, and
             // the consequence here is not on the screen anywhere: what quitting
             // costs is the agents, and the count is the one number that makes
@@ -563,14 +563,14 @@ pub(super) fn choose(item: Item, ui: &Ui, view: &mut View) -> Effect {
             // that is cut before its own count is a question that has thrown
             // away the reason it was asked.
             let question = match ui.census.len() {
-                0 => "quit herdr? nothing running".to_string(),
-                1 => "quit herdr? 1 agent running".to_string(),
-                n => format!("quit herdr? {n} agents running"),
+                0 => "quit all? nothing running".to_string(),
+                1 => "quit all? 1 agent running".to_string(),
+                n => format!("quit all? {n} agents running"),
             };
-            view.mode = Mode::Confirm { question, deed: Box::new(Effect::Herdr(Chore::Quit)) };
+            view.mode = Mode::Confirm { question, deed: Box::new(Effect::Backend(Chore::Quit)) };
             Effect::None
         }
-        Item::ReloadConfig => Effect::Herdr(Chore::ReloadConfig),
+        Item::ReloadConfig => Effect::Backend(Chore::ReloadConfig),
         // Shown rather than toggled. A row picked out of a list is a request
         // for the thing named on it, and a `?` that put the map away because it
         // happened to be up already would be the one row here that did the
@@ -1081,30 +1081,30 @@ pub(crate) enum Effect {
     /// Type into an agent's pane. The only effect that changes nothing at all
     /// in the store — what it changes is what an agent is about to do.
     Tell(Tell),
-    /// Something asked of herdr itself rather than of the work.
+    /// Something asked of backend itself rather than of the work.
     ///
     /// Every other effect that *does* something runs `wsp`, because the CLI is
     /// the one implementation and the panel is a caller of it. These have no
     /// CLI to run and never will: they are about the terminal the work happens
     /// in, and wsp keeps no record of a terminal. So they go where
-    /// [`Effect::Focus`] already goes — straight down herdr's socket from the
+    /// [`Effect::Focus`] already goes — straight down backend's socket from the
     /// loop — and the loop is where the one call lives.
-    Herdr(Chore),
+    Backend(Chore),
 }
 
-/// What the panel asks of herdr on its own account.
+/// What the panel asks of backend on its own account.
 ///
-/// Two, and the shortness is the point: wsp is not a remote control for herdr,
+/// Two, and the shortness is the point: wsp is not a remote control for backend,
 /// and every arm here is a thing the fork took away rather than a thing worth
 /// adding. See [`Item`] for what was left out and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Chore {
-    /// `server.stop`: herdr sets `should_quit` and exits, taking every pane and
-    /// every agent with it. What herdr's own menu called `detach`, named for
-    /// what it does here rather than for what herdr calls it — herdr's row only
+    /// `server.stop`: backend sets `should_quit` and exits, taking every pane and
+    /// every agent with it. What backend's own menu called `detach`, named for
+    /// what it does here rather than for what backend calls it — backend's row only
     /// quits when it is configured to, and this call always does.
     Quit,
-    /// `server.reload_config`: herdr re-reads its config file.
+    /// `server.reload_config`: backend re-reads its config file.
     ReloadConfig,
 }
 
@@ -2020,7 +2020,7 @@ pub(crate) fn apply_key(k: Key, ui: &mut Ui, view: &mut View) -> Effect {
 /// were all verified by pointing at a real pane and looking.
 ///
 /// This is that alphabet with nothing left in the loop but the parts that are
-/// genuinely about a terminal: reading the pane's size, and telling herdr where
+/// genuinely about a terminal: reading the pane's size, and telling backend where
 /// the reader now is. See [`apply_input`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Input {
@@ -2043,7 +2043,7 @@ pub(crate) enum Input {
 /// `keyboard` is the panel's answer to "is this the pane being worked in", and
 /// it is `&mut` because a click changes it: pointing at a pane is a statement
 /// that you are working in it, and the pane has answered by taking focus. The
-/// loop still owns the round-trip that tells herdr — that is a socket call on a
+/// loop still owns the round-trip that tells backend — that is a socket call on a
 /// clock, not a state transition — and this owns the fact.
 ///
 /// It lives beside [`apply_key`] rather than in the loop for the reason the

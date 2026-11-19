@@ -12,7 +12,7 @@
 //! The two sources:
 //!
 //! - **The screen.** [`State::Blocked`] — a permission or trust prompt holding
-//!   the keyboard. That is the backend's reading and not this module's: herdr
+//!   the keyboard. That is the backend's reading and not this module's: backend
 //!   scrapes it, and compound asks `compound-render`'s detector, whose opencode
 //!   rule matches opencode 1.18's `△ Permission required` dialog (checked live
 //!   against a real one on 2026-10-06). A prompt is waiting on **a person**,
@@ -295,17 +295,9 @@ pub(crate) fn last_turn(jsonl: &str) -> (Option<Words>, bool) {
 /// [`last_turn`] over the file at `path`, reading at most its last
 /// [`TRANSCRIPT_TAIL`] bytes. `None` where it cannot be read.
 pub(crate) fn read_last_turn(path: &std::path::Path) -> Option<(Option<Words>, bool)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let from = len.saturating_sub(TRANSCRIPT_TAIL);
-    f.seek(SeekFrom::Start(from)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    // A tail that starts mid-line drops the partial one.
-    let text = if from > 0 { text.split_once('\n').map(|(_, r)| r.to_string()).unwrap_or_default() } else { text.into_owned() };
-    Some(last_turn(&text))
+    use crate::host::Host;
+    // Read through the host, which drops a partial first line.
+    Some(last_turn(&crate::host::LOCAL.transcript_tail(path, TRANSCRIPT_TAIL)?))
 }
 
 /// A screen line that is the agent's frame and not its words.
@@ -496,9 +488,15 @@ impl Asks {
     /// three reads taken once here: compound polls `wsp wip --json`, and a
     /// read of every project per open question is a cost paid on every poll.
     pub(crate) fn read(store: &Store) -> Asks {
+        Asks::of_messages(store, store.messages(), &|pid| crate::host::Host::is_alive(&crate::host::LOCAL, pid))
+    }
+
+    /// [`Asks::read`] over `messages` read elsewhere (`wip`'s API path reads
+    /// them from a `state` reply), with `alive` saying whether a waiter's pid
+    /// still runs.
+    pub(crate) fn of_messages(store: &Store, messages: BTreeMap<String, crate::message::Message>, alive: &dyn Fn(u32) -> bool) -> Asks {
         let mut asks = Asks::default();
-        let open: Vec<_> = store
-            .messages()
+        let open: Vec<_> = messages
             .into_values()
             .filter(|m| m.wants_answering() && !m.is_reply() && m.waiting.is_some())
             .collect();
@@ -531,7 +529,7 @@ impl Asks {
             // A wait stands only while its process does: a waiter killed with
             // Esc leaves the mark behind, and the seat is then at its prompt
             // like any asker.
-            if m.for_person && m.awaited.as_ref().is_some_and(|a| a.alive()) {
+            if m.for_person && m.awaited.as_ref().is_some_and(|a| alive(a.pid)) {
                 if !w.pane.is_empty() {
                     asks.awaited_pane.insert(w.pane.clone(), m.id.clone());
                 }
@@ -759,17 +757,17 @@ impl Shells {
         if roots.is_empty() {
             return Shells::default();
         }
-        match wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,etime=,time=,command="]).output() {
-            Ok(out) => {
+        match crate::host::Host::shells(&crate::host::LOCAL) {
+            Some(ps) => {
                 let now = util::epoch_secs();
                 let mut memory = Memory::load();
-                let shells = Shells::of(&String::from_utf8_lossy(&out.stdout), &roots, now, &mut memory, self_wait);
+                let shells = Shells::of(&ps, &roots, now, &mut memory, self_wait);
                 memory.save(now);
                 shells
             }
             // Not "waiting": a `ps` that did not run is no evidence of a shell,
             // and the cost of reading none is a seat told, which is a sentence.
-            Err(_) => Shells::default(),
+            None => Shells::default(),
         }
     }
 
@@ -847,6 +845,19 @@ impl Shells {
         self.by_seat.get(seat).map(|o| Wait { why: Why::Shell(o.n), on: On::Itself, own: Some(o.clone()) })
     }
 
+    /// The shells each seat's manager counted under its agent (`seats`'s
+    /// `shells`, `docs/agent-manager.md` 4.3), for the idle seats asked: no
+    /// `ps` here. A count alone: the manager does not yet say the work under a
+    /// shell, its age or its quiet, so the bounds [`Shells`] names are the
+    /// manager's to keep.
+    pub(crate) fn counted<'a>(seats: impl IntoIterator<Item = &'a str>, counts: &BTreeMap<String, u32>) -> Shells {
+        let by_seat = seats
+            .into_iter()
+            .filter_map(|s| counts.get(s).filter(|n| **n > 0).map(|n| (s.to_string(), Own { n: *n as usize, ..Own::default() })))
+            .collect();
+        Shells { by_seat }
+    }
+
     #[cfg(test)]
     pub(crate) fn own(seat: &str, own: Own) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), own)]) }
@@ -869,11 +880,10 @@ pub(crate) fn end_self_waits(seat: &str, self_wait: &dyn Fn(&str) -> bool) -> Ve
     }
     let s = crate::place::Seat::new(seat);
     let Some(root) = crate::place::local_backends().iter().find_map(|b| b.root(&s)) else { return Vec::new() };
-    let Ok(out) = wsp_base::calls::Command::new("ps").args(["-A", "-o", "pid=,ppid=,command="]).output() else { return Vec::new() };
-    let pids = self_wait_shells(&String::from_utf8_lossy(&out.stdout), root, self_wait);
-    for pid in &pids {
-        let _ = wsp_base::calls::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
-    }
+    use crate::host::{Host, LOCAL};
+    let Some(out) = LOCAL.table("pid=,ppid=,command=", false) else { return Vec::new() };
+    let pids = self_wait_shells(&out, root, self_wait);
+    LOCAL.signal(&pids, "TERM");
     pids
 }
 

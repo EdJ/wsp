@@ -1,0 +1,22 @@
+[package]
+name = "wsp-api"
+version = "0.1.0"
+edition = "2021"
+description = "The state core's API on the wire (docs/state-core.md section 4): the envelope, the verbs, hello and its token, the Connection trait; types only, no IO"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# A reply's payloads and the in-memory pair's framing.
+serde_json = "1"
+wsp-store-contract = { path = "../store-contract" }
+
+[features]
+# The in-memory `Connection` pair, for the tests of whatever speaks the protocol.
+test-support = []
+
+[dev-dependencies]
+# The tests use the in-memory pair, which is behind `test-support`.
+wsp-api = { path = ".", features = ["test-support"] }

@@ -498,8 +498,8 @@ impl About {
 
 /// The sender, and it is a small enum rather than a string.
 ///
-/// **The field that matters most.** wsp cannot make herdr attribute
-/// `agent.prompt` — that is `robustness-094` and it is herdr's — so what wsp
+/// **The field that matters most.** wsp cannot make backend attribute
+/// `agent.prompt` — that is `robustness-094` and it is backend's — so what wsp
 /// can do is carry the sender in the payload, which inverts today's default:
 ///
 /// > Today, unattributed text reads as Ed. Under this design, **attributed text
@@ -823,6 +823,21 @@ pub struct Message {
     /// cleared when it times out; a waiter killed mid-wait leaves it set, and
     /// [`Awaited::pid`] is how a reader tells that one from a live wait.
     pub awaited: Option<Awaited>,
+    /// **A decision waiting on a named other party** (`wsp-098`): `wsp ask <row>
+    /// --of ed`, written `"of": "ed"`. An ask from the person to somebody with
+    /// no access to this store; `None` is every other question. Lower-case.
+    pub of: Option<String>,
+    /// The step the answer unlocks, written `"then"`: what is owed once the
+    /// party has answered, and the action of the item then. Only with `of`.
+    pub then: Option<String>,
+    /// On an answered `--of` ask: who answered (`"answered_by": "ed"`) and who
+    /// typed it in for them (`"relayed_by": "person"`).
+    pub answered_by: Option<String>,
+    pub relayed_by: Option<String>,
+    /// When the person did the `--then` step of an answered `--of` ask
+    /// (`"step_done_at"`), written by `wsp answer <id> --step-done`. Its own field:
+    /// `seen` is "read, still raised" and says nothing about the step.
+    pub step_done_at: Option<String>,
 }
 
 /// A `wsp ask --wait` in progress, as the question records it.
@@ -837,11 +852,6 @@ pub struct Awaited {
 impl Awaited {
     pub fn here() -> Awaited {
         Awaited { pid: std::process::id(), at: util::now_iso() }
-    }
-
-    /// Whether the waiter is still there to be handed the answer.
-    pub fn alive(&self) -> bool {
-        crate::util::alive(&[self.pid]).contains(&self.pid)
     }
 }
 
@@ -869,6 +879,11 @@ impl Message {
             caption: None,
             choices: None,
             awaited: None,
+            of: None,
+            then: None,
+            answered_by: None,
+            relayed_by: None,
+            step_done_at: None,
         }
     }
 
@@ -1161,6 +1176,11 @@ impl Message {
         if let Some(a) = &self.awaited {
             v["awaited"] = json!({ "pid": a.pid, "at": a.at });
         }
+        for (k, f) in [("of", &self.of), ("then", &self.then), ("answered_by", &self.answered_by), ("relayed_by", &self.relayed_by), ("step_done_at", &self.step_done_at)] {
+            if let Some(x) = f {
+                v[k] = Value::from(x.as_str());
+            }
+        }
         // How it ended, once it has (`wsp-308`): the same `{how, by, kind,
         // reason, at, answer}` `wsp yours --json` carries, so `wsp ask <id>
         // --json` of a closed question says why without a reader walking `via`.
@@ -1232,6 +1252,11 @@ impl Message {
                 let pid = u32::try_from(a.get("pid").and_then(Value::as_u64)?).ok()?;
                 Some(Awaited { pid, at: a.get("at").and_then(Value::as_str).unwrap_or_default().to_string() })
             }),
+            of: v.get("of").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            then: v.get("then").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            answered_by: v.get("answered_by").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            relayed_by: v.get("relayed_by").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
+            step_done_at: v.get("step_done_at").and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string),
         }
     }
 
@@ -1554,6 +1579,31 @@ pub fn await_by(store: &Store, id: &str, waiter: Awaited) -> Result<Message, Ref
         }
         m.awaited = Some(waiter);
         store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
+/// Record on an answered `--of` ask who answered and who typed it in
+/// (`wsp-098`). Under the lock, after [`answer`] closed it.
+pub fn relay(store: &Store, id: &str, answered_by: &str, relayed_by: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        m.answered_by = Some(answered_by.to_string());
+        m.relayed_by = Some(relayed_by.to_string());
+        store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
+/// The `--then` step of an answered `--of` ask is done (`wsp answer <id>
+/// --step-done`): records `step_done_at`. Refused unless the party has answered.
+pub fn step_done(store: &Store, id: &str) -> Result<Message, Refused> {
+    store.locked(|| {
+        let mut m = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        if m.answered_by.is_some() && m.step_done_at.is_none() {
+            m.step_done_at = Some(util::now_iso());
+            store.save_message(&m)?;
+        }
         Ok(m)
     })
 }

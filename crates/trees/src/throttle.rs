@@ -64,14 +64,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use crate::host::Host;
 use std::process::Stdio;
 use wsp_base::calls::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::store::Store;
+use crate::host::LOCAL;
 use crate::util;
 use crate::base::args::Args;
 
@@ -307,8 +309,7 @@ pub fn parse_hid_idle(ioreg: &str) -> Option<u64> {
 }
 
 fn hid_idle_secs() -> Option<u64> {
-    let out = Command::new("ioreg").args(["-c", "IOHIDSystem", "-d", "4"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_hid_idle(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_hid_idle(&LOCAL.idle()?)
 }
 
 /// `CPU_Speed_Limit 	= 31` in `pmset -g therm` output: percent of the rated
@@ -322,8 +323,7 @@ fn speed_limit() -> Option<u32> {
     if cfg!(test) {
         return None;
     }
-    let out = Command::new("pmset").args(["-g", "therm"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_speed_limit(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_speed_limit(&LOCAL.thermal()?)
 }
 
 /// Three load averages out of `/proc/loadavg` (`0.5 0.4 0.3 1/200 99`) or
@@ -334,11 +334,7 @@ pub fn parse_loadavg(s: &str) -> Option<(f64, f64, f64)> {
 }
 
 fn load_average() -> Option<(f64, f64, f64)> {
-    if let Some(l) = fs::read_to_string("/proc/loadavg").ok().and_then(|s| parse_loadavg(&s)) {
-        return Some(l);
-    }
-    let out = Command::new("sysctl").args(["-n", "vm.loadavg"]).stderr(Stdio::null()).output().ok()?;
-    parse_loadavg(&String::from_utf8_lossy(&out.stdout))
+    parse_loadavg(&LOCAL.load()?)
 }
 
 /// The three load averages now (`wsp-597`: a seat's death is logged with them).
@@ -673,8 +669,7 @@ fn mem_free() -> Option<u32> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-    let out = Command::new("memory_pressure").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_mem_free(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_mem_free(&LOCAL.memory_pressure()?)
     }
 }
 
@@ -747,8 +742,7 @@ fn swap_now() -> Option<(u32, u32)> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-    let out = Command::new("sysctl").args(["-n", "vm.swapusage"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_swapusage(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_swapusage(&LOCAL.swap()?)
     }
 }
 
@@ -762,8 +756,7 @@ fn pageouts_now() -> Option<u64> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-    let out = Command::new("vm_stat").stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| parse_pageouts(&String::from_utf8_lossy(&out.stdout))).flatten()
+    parse_pageouts(&LOCAL.pageouts()?)
     }
 }
 
@@ -899,8 +892,8 @@ pub fn weight(tool: &str, args: &[String]) -> Weight {
 }
 
 fn alive(pid: u32) -> bool {
-    pid != 0
-        && Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    // Could not ask reads as not alive, as it did before the Host.
+    crate::host::LOCAL.probe(pid).unwrap_or(false)
 }
 
 fn fnv(s: &str) -> String {
@@ -1646,6 +1639,37 @@ impl View {
         }
     }
 
+    /// [`View::read`] with the machine's facts handed in ([`Given`]): the
+    /// person's idle time is not read, so `auto` reads as in force.
+    pub fn given(state: &Path, g: Given) -> View {
+        View::of_beat(state, g, None, &alive)
+    }
+
+    /// [`View::given`] with the person's idle time handed in as well (a beat's
+    /// `hid_idle_secs`, read under `auto` only, as [`View::read`] reads it),
+    /// and each build holder's liveness asked of `alive`: for `wip` through
+    /// the API, which reads the machine from the manager's beat and runs no
+    /// child (wsp-076).
+    pub fn of_beat(state: &Path, g: Given, idle_secs: Option<u64>, alive: &dyn Fn(u32) -> bool) -> View {
+        let settings = Settings::load(state);
+        let idle = match settings.mode {
+            Mode::Auto => idle_secs,
+            _ => None,
+        };
+        let in_force = in_force(settings.mode, idle, settings.away_minutes);
+        View {
+            settings,
+            idle,
+            in_force,
+            cores: g.cores.max(1),
+            load: Some((g.load1, g.load1, g.load1)),
+            thermal: g.speed_limit,
+            builds: builds(state, alive),
+            checks: checks(state, alive),
+            shims: shim_dir(state),
+        }
+    }
+
     pub fn load_warning(&self) -> bool {
         self.load.is_some_and(|(one, five, _)| load_high(one, five, self.cores))
     }
@@ -1902,7 +1926,11 @@ pub fn health(store: &Store, notes: &mut Vec<String>) {
     }
 }
 
-static WARNED: AtomicBool = AtomicBool::new(false);
+/// Whether the load warning is up, per store (keyed by its state directory),
+/// so [`warn`] logs only the edge. Per store rather than one flag for the
+/// process: tests that each open their own isolated store in one test binary
+/// do not see each other's edge (wsp-116).
+static WARNED: std::sync::Mutex<BTreeMap<PathBuf, bool>> = std::sync::Mutex::new(BTreeMap::new());
 
 /// The daemon's half: drop holds whose process is gone, and log the load
 /// warning when it starts and when it clears. Not under test; [`reap`] and
@@ -1912,9 +1940,39 @@ pub fn tidy(store: &Store) {
         return;
     }
     reap(&store.state, &alive);
-    let v = View::read(&store.state);
+    warn(store, &View::read(&store.state));
+}
+
+/// The facts a manager's beat carries, in place of this process's own
+/// `sysctl` and `pmset` (`docs/agent-manager.md` 4.3; wsp-028).
+#[derive(Clone, Copy, Debug)]
+pub struct Given {
+    /// The one-minute load. The beat carries no five-minute one, so the
+    /// warning's "for a while" is the one-minute load alone here.
+    pub load1: f64,
+    pub cores: usize,
+    /// The thermal state as a `CPU_Speed_Limit`: the top of its band.
+    pub speed_limit: Option<u32>,
+}
+
+/// [`tidy`] over `given` rather than a reading of its own: no `sysctl`, no
+/// `pmset`, no `ioreg`. Under test as well, because nothing here probes.
+pub fn tidy_given(store: &Store, given: Option<Given>) {
+    if !cfg!(test) {
+        reap(&store.state, &alive);
+    }
+    // Nothing folded yet is no reading, and no warning edge either way.
+    let Some(g) = given else { return };
+    warn(store, &View::given(&store.state, g));
+}
+
+fn warn(store: &Store, v: &View) {
     let warning = v.warning(store.seat_cap());
-    if warning.is_some() != WARNED.swap(warning.is_some(), Ordering::SeqCst) {
+    let was = {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        warned.insert(store.state.clone(), warning.is_some()).unwrap_or(false)
+    };
+    if warning.is_some() != was {
         match warning {
             Some(w) => crate::store::log_line(store, &w),
             None => crate::store::log_line(store, "load and clock are back under the warning line"),
@@ -2408,7 +2466,6 @@ mod tests {
     /// A `cargo` that records the job cap it was given and the niceness it ran
     /// at, then takes `$FAKE_SLEEP` seconds.
     fn rig(name: &str) -> Rig {
-        use std::os::unix::fs::PermissionsExt;
         let iso = crate::util::isolated(name);
         // `wsp verify` runs these tests under a shim of its own, so the process
         // is born holding a tree and a job cap; the fake tool must see only
@@ -2422,8 +2479,7 @@ mod tests {
             "#!/bin/sh\necho \"$$ jobs=${{CARGO_BUILD_JOBS:-none}} nice=$(ps -o ni= -p $$ | tr -d ' ') held=${{{HELD}:+yes}} args=$*\" >> {out}\n[ -n \"$FAKE_SLEEP\" ] && sleep \"$FAKE_SLEEP\"\nexit 0\n",
             out = out.display()
         );
-        fs::write(bin.join("cargo"), script).unwrap();
-        fs::set_permissions(bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&bin.join("cargo"), &script);
         let tree = iso.path("tree");
         fs::create_dir_all(&tree).unwrap();
         fs::write(tree.join(".git"), "gitdir: x").unwrap();
@@ -2463,11 +2519,7 @@ mod tests {
     /// The niceness the test process itself runs at: `nice -n 12 cargo test`
     /// hands every fake cargo that base, throttled or not.
     fn base_nice() -> i32 {
-        let out = Command::new("ps")
-            .args(["-o", "ni=", "-p", &std::process::id().to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        crate::host::LOCAL.rows_of(&[std::process::id()], "ni=").unwrap().trim().parse().unwrap()
     }
 
     fn nice_of(line: &str) -> i32 {
@@ -2802,11 +2854,9 @@ mod tests {
     /// reason is the row's log; a verifier and a check are not asked.
     #[test]
     fn a_members_full_nextest_is_refused_and_allowed_with_a_reason_that_lands_in_the_log() {
-        use std::os::unix::fs::PermissionsExt;
         let rig = rig("throttle-member-suite");
         mode(&rig, Mode::Off, 1);
-        fs::write(rig.bin.join("cargo"), "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(rig.bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&rig.bin.join("cargo"), "#!/bin/sh\nexit 0\n");
         let idle = || None;
         let said = std::cell::RefCell::new(Vec::<String>::new());
         let say = |m: &str| said.borrow_mut().push(m.to_string());
@@ -2875,11 +2925,9 @@ mod tests {
 
     #[test]
     fn the_exit_code_of_the_build_is_the_exit_code_of_the_shim() {
-        use std::os::unix::fs::PermissionsExt;
         let rig = rig("throttle-exit");
         mode(&rig, Mode::Off, 1);
-        fs::write(rig.bin.join("cargo"), "#!/bin/sh\nexit 101\n").unwrap();
-        fs::set_permissions(rig.bin.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&rig.bin.join("cargo"), "#!/bin/sh\nexit 101\n");
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         assert_eq!(run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["test"])), 101);
     }
@@ -2914,7 +2962,10 @@ mod tests {
     #[test]
     fn a_spawner_with_no_cargo_on_its_path_leaves_the_seats_path_alone() {
         let rig = rig("throttle-no-cargo");
-        assert!(seat_env_in(&rig.state, "/usr/bin:/bin").is_empty());
+        // A PATH of an empty directory: no machine's /usr/bin (Arch has a cargo there).
+        let empty = rig.state.join("empty-path");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(seat_env_in(&rig.state, &empty.display().to_string()).is_empty(), "no tool on {}", empty.display());
     }
 
     #[test]
@@ -3034,7 +3085,7 @@ mod tests {
         let (thermal, say) = (|| Some(40u32), |_: &str| {});
         let here = |_: u32| true;
         let mut holds: Vec<Hold> = (0..4).map(|_| take_check_slot(&gate(&state, &thermal, &here, &say))).collect();
-        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiter = {
             let (state, started) = (state.clone(), started.clone());
             std::thread::spawn(move || {

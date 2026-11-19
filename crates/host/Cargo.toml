@@ -1,0 +1,21 @@
+[package]
+name = "wsp-host"
+version = "0.1.0"
+edition = "2021"
+description = "The in-process host: every OS operation a seat needs (processes, signals, the screen, delivery, hook files, transcripts, host facts); store-free, so the agent manager can link it (docs/agent-manager.md 6.2, M1)"
+
+[lib]
+path = "src/lib.rs"
+
+# wsp-base and wsp-host-api (the TCP carrier and the beat's facts speak its
+# types): never wsp-store or wsp-wire (tests/layering.rs,
+# `the_host_crate_links_neither_the_store_nor_the_wire`).
+[dependencies]
+serde_json = "1"
+wsp-base = { path = "../base" }
+wsp-host-api = { path = "../host-api" }
+
+[features]
+# `test_sups`, and the per-thread stand-in `compound-render`, for the tests of
+# whatever spawns through this crate (wsp-wire's and the root's).
+test-support = []
