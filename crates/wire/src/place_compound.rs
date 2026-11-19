@@ -3860,10 +3860,22 @@ mod tests {
             Some(v) => format!("#!/bin/sh\ncase \"$1\" in\n  wire-version) echo {v}; exit 0 ;;\n  *) exit 2 ;;\nesac\n"),
             None => "#!/bin/sh\nexit 2\n".to_string(),
         };
-        fs::write(&path, body).unwrap();
-        let mut perm = fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-        fs::set_permissions(&path, perm).unwrap();
+        // Written by a child process, never by this one: a test thread that
+        // forks while this process holds the script open for writing hands the
+        // fd to its child, and on Linux exec of the script then fails with
+        // ETXTBSY until that child execs (4 runs in 20 in parallel, 0 in 20
+        // single-threaded, on Omarchy).
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), body.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success(), "writing {}", path.display());
         path
     }
 
