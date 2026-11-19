@@ -158,6 +158,10 @@ Filed by wsp-155 on 2026-11-19, as five worklists, one per phase, each left at *
 by the daemon within a minute). The spec above is copied as it stood; this section is the only addition. Nothing here
 settles an open question: each list's overview says what the person confirms before its first group.
 
+Reviewed with the other two breakdowns by wsp-157 (2026-11-20): `pa1-tell`, `pa3-filing`, `pa4-quorum` and
+`pa5-org-scale` are planned at low priority, and each starts by itself once its `after` is complete. `pa2-mandate`
+stays at init, for the reason below, and so holds the three after it.
+
 | list | phase | gate (the spec's "done when") | groups | rows | after |
 |---|---|---|---|---|---|
 | `pa1-tell` | 1. Tell and ask between people's agents | "@Ed" reaches Ed's agent from another machine with Ed's machines off, is handed to Ed when he returns, and Ed's agent cannot be impersonated | 7 | wsp-215 … wsp-224, compound-react-031 | `mp2-workspaces` |

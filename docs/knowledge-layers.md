@@ -165,6 +165,8 @@ Run the method's own test, once per scope, before building any vector store: it 
 
 Plan `wsp-156`, 2026-11-19. It changes no code. The rows are sub-tasks of wsp-156, and the lists are at status **init**: none starts until a person sets it planned.
 
+Reviewed with the other two breakdowns by wsp-157 (2026-11-20). Planned at low priority: `kl1-files`, `kl2-search`, `kl3-contextual`, `kl5-provenance`, `kl6-tending` and `kl7-pgvector`; each starts by itself once its `after` is complete. At init, for the person to plan: the six measure lists, each after the person's step in front of it, and `kl4-scopes`, which rests on `mp3-commit` and `pa2-mandate` through wsp-274, waits that the run does not act on across lists (src/after.rs). Because `kl2-search` and `kl3-contextual` are planned, a no-go from `kl1-measure` or `kl2-measure` has to set the list it rules on back to init: wsp-202 and wsp-210 do that before their reviews. `kl7-pgvector`'s wsp-298 also rests on wsp-206 in `kl2-search`, which the run does not hold it on; its list waits on `mp5-scale`, which stays at init.
+
 ### The lists
 
 Each phase is two lists. The first builds, and it ends at a step only the person can do: installing the trunk, and what the measure needs after that (documents written, providers set, a month gone by). The second is the phase's measure, one row, and it waits on the first. So no list stands at a person's step with its governor seated (the handbook's rule, wsp-091), as `s2-state-core` and `s2-state-core-2` are cut. The next phase waits on the measure.
@@ -222,7 +224,7 @@ Nothing parallel to docs/state-core.md or docs/agent-manager.md is built.
 ### Assumptions to confirm
 
 These shaped the rows. None is the spec's own words.
-1. A scope is multiplayer phase 2's workspace, and the org has one. If mp2 gave the org none, wsp-193 adds `Scope::Org`.
+1. A scope is multiplayer phase 2's workspace or the org. mp2 gives the org no workspace (wsp-168 makes `private:<engineer>` and `group:<group>` only), so wsp-193 adds the org scope in wsp-knowledge alone, with the same text form, and the contract's `WorkspaceId` is not changed (wsp-157's review).
 2. A scope's repo of record is a checkout on the store's host. People edit in a clone and push, and agents read through the server, which scopes every read from the token.
 3. Agents reach knowledge through `wsp knowledge` verbs over the API's `knowledge.*` verbs. The spec's `knowledge.search` and `knowledge.read` "as tools" are those. No MCP face is built in these lists.
 4. A private scope's documents that the mandate shares are a second index of their own (`<scope>.shared`), so a personal agent answering for someone else never opens the private one.

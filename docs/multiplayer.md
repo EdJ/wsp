@@ -165,15 +165,15 @@ Phases 0 to 3 are the goal: three engineers, private workspaces, commits to one 
 
 ## Breakdown
 
-Planned 2026-11-19 (wsp-154; phases 1 to 3 by the lead the same day). The text above is the spec as it stood, unchanged. Six worklists, one per phase, hold the work. Nothing is started. The phasing figure is not in the spec's text, so the gates of phases 0, 4 and 5 are read from their sections and are to confirm.
+Planned 2026-11-19 (wsp-154; phases 1 to 3 by the lead the same day). The text above is the spec as it stood, unchanged. Six worklists, one per phase, hold the work. Nothing is started. Reviewed with the other two breakdowns by wsp-157 (2026-11-20): every list is planned at low priority but `mp5-scale`, which stays at init until state-core steps 3 to 5 have lists and have landed. Each planned list starts by itself once its `after` is complete, so a list's "before group 1" is owed by then. `mp1-identity`'s group 4 rests on `mp0-reach`'s compound-react-014, an `after` the run does not act on across lists (src/after.rs), so the barrier after its group 3 holds it. The phasing figure is not in the spec's text, so the gates of phases 0, 4 and 5 are read from their sections and are to confirm.
 
 | phase | list | status | waits on | gate | gate row |
 |---|---|---|---|---|---|
-| 0 reach | `mp0-reach` | init | `s2-state-core-2` | off the office LAN, a client reaches the server over the tailnet with no ssh tunnel | wsp-252 |
-| 1 identity | `mp1-identity` | init | `s2-state-core-2` | posing as another engineer is refused | wsp-167 |
+| 0 reach | `mp0-reach` | planned | `s2-state-core-2` | off the office LAN, a client reaches the server over the tailnet with no ssh tunnel | wsp-252 |
+| 1 identity | `mp1-identity` | planned | `s2-state-core-2` | posing as another engineer is refused | wsp-167 |
 | 2 workspaces | `mp2-workspaces` | planned | `mp1-identity` | B cannot see A's private rows | wsp-180 |
 | 3 commit | `mp3-commit` | planned | `mp2-workspaces` | three engineers run compound together | wsp-192 |
-| 4 budgets | `mp4-budgets` | init | `mp3-commit` | a spawn past its budget is refused naming whose it is, and spend follows the commit | wsp-263 |
+| 4 budgets | `mp4-budgets` | planned | `mp3-commit` | a spawn past its budget is refused naming whose it is, and spend follows the commit | wsp-263 |
 | 5 scale | `mp5-scale` | init | `mp4-budgets` | a busy group does not delay another group's subscribers or barriers | wsp-273 |
 
 **The rows.**
