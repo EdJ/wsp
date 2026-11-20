@@ -2134,6 +2134,108 @@ fn heard_over(
     )))
 }
 
+/// The orders door as the spawn's first order uses it (wsp-126): `order.send`
+/// and the wait for its answer. [`Stored`] is `crate::orders`; a test hands in
+/// an open store.
+trait FirstOrders {
+    fn send(&self, seat: &wsp_store_contract::SeatId, text: &str) -> Result<wsp_store_contract::OrderId, crate::orders::Error>;
+    fn answer(&self, id: &wsp_store_contract::OrderId, wait: Duration) -> Result<Option<wsp_store_contract::Order>, crate::orders::Error>;
+}
+
+/// [`FirstOrders`] through `crate::orders`, in the daemon or through the API.
+struct Stored<'a> {
+    store: &'a Store,
+    from: wsp_store_contract::Principal,
+}
+
+impl Stored<'_> {
+    /// The spawn sends as the seat it runs in, or else as the person: the two
+    /// principals the API takes an `order.send` from.
+    fn new(store: &Store) -> Stored<'_> {
+        let from = match crate::place::my_pane() {
+            Some(pane) => wsp_store_contract::Principal::Seat(wsp_store_contract::SeatId(pane)),
+            None => wsp_store_contract::Principal::Person("person".into()),
+        };
+        Stored { store, from }
+    }
+}
+
+impl FirstOrders for Stored<'_> {
+    fn send(&self, seat: &wsp_store_contract::SeatId, text: &str) -> Result<wsp_store_contract::OrderId, crate::orders::Error> {
+        crate::orders::send(self.store, seat, text, &self.from, true)
+    }
+    fn answer(&self, id: &wsp_store_contract::OrderId, wait: Duration) -> Result<Option<wsp_store_contract::Order>, crate::orders::Error> {
+        crate::orders::answer(self.store, id, wait)
+    }
+}
+
+/// The spawn's first order under `WSP_ORDERS=store` (wsp-126): the seat is
+/// started, and its work order is an order in the store, `order.send { first:
+/// true }`, which the daemon's delivery worker types into it under the
+/// order's own id (`crate::deliver`). Not carried in the `seat.spawn`: the
+/// orders machine takes an order only for a seat the store holds, and a seat
+/// is in the store from its `seat.started`, which the fold mirrors. At the
+/// manager the two are the same thing (a `seat.spawn`'s first order is
+/// delivered after its `seat.started`, as an `order.deliver` is).
+///
+/// Nothing is owed and nothing is pressed or resent here: a refusal is the
+/// machine's (`queued` again, and delivered when the seat reads idle), and
+/// `failed` at its cap is the order's state, which wip and untaken read.
+#[allow(clippy::too_many_arguments)]
+fn start_stored(
+    place: &dyn Place,
+    how: &dyn agent_commands::Kind,
+    spawn: &crate::agent_commands::Spawn,
+    agent: &Agent,
+    kind: &str,
+    text: &str,
+    wait: &Patience,
+    door: &dyn FirstOrders,
+) -> Result<(), Unordered> {
+    start_agent(place, how, spawn, agent, kind, wait).map_err(Unordered::Start)?;
+    order_stored(spawn.seat, kind, text, wait, door)
+}
+
+/// [`start_stored`]'s order, the seat started: sent once the store holds the
+/// seat (within `ready`), then its answer awaited for as long as the old path
+/// waited for a turn (`ready`, and `taken` per press it would have made).
+fn order_stored(seat: &Seat, kind: &str, text: &str, wait: &Patience, door: &dyn FirstOrders) -> Result<(), Unordered> {
+    use wsp_store_contract::{OrderState, Refusal as Refused, SeatId, Subject};
+    let to = SeatId(seat.as_str().to_string());
+    let deadline = wait.clock.now() + wait.ready;
+    let id = loop {
+        match door.send(&to, text) {
+            Ok(id) => break id,
+            // Not mirrored yet: the fold puts the seat in the store from its
+            // `seat.started`, a moment after the start was heard here.
+            Err(crate::orders::Error::Refused(Refused::NotFound { subject: Subject::Seat(_) }))
+                if wait.clock.now() < deadline =>
+            {
+                wait.clock.rest(wait.poll)
+            }
+            Err(e) => return Err(Unordered::Refused(format!("the store did not take {seat}'s work order: {e}"))),
+        }
+    };
+    let within = wait.ready + wait.taken * (wait.nudges + 1);
+    match door.answer(&id, within) {
+        Ok(Some(o)) if matches!(o.state, OrderState::Acknowledged | OrderState::Done) => Ok(()),
+        Ok(Some(o)) if o.state == OrderState::Failed => Err(Unordered::Refused(format!(
+            "order not received: {seat}'s work order {} failed after {} attempts: {}",
+            id.0,
+            o.attempts,
+            o.why.unwrap_or_default()
+        ))),
+        Ok(Some(o)) => Err(Unordered::Refused(format!("{seat}'s work order {} was {:?}", id.0, o.state))),
+        Ok(None) => Err(Unordered::Unanswered(format!(
+            "{kind} started in {seat} and its work order {} was not acknowledged within {}s: \
+             the delivery worker holds it and delivers it when the seat reads idle",
+            id.0,
+            within.as_secs()
+        ))),
+        Err(e) => Err(Unordered::Unanswered(format!("{seat}'s work order {} went unheard: {e}", id.0))),
+    }
+}
+
 /// Say how to reach an agent a spawn could not, where the kind knows a way.
 ///
 /// The failure this softens is measured rather than imagined: `spawn`'s work
@@ -3473,7 +3575,20 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         // told rather than put in argv goes in the `seat.spawn` itself, and
         // the spawn waits for it to be heard taken (4.3): no readiness poll,
         // no screen read, no look for a turn. `None` is the in-process host.
+        // Under `WSP_ORDERS=store` the work order is an order in the store,
+        // sent once the seat has started and delivered by the daemon's worker
+        // (wsp-126, [`start_stored`]).
         let heard = match (&order, in_args) {
+            (Some(text), false) if crate::orders::mode() == crate::orders::Mode::Store => Some(start_stored(
+                place,
+                how,
+                &spawn,
+                &agent,
+                &kind,
+                text,
+                &spawn_patience(far_start),
+                &Stored::new(store),
+            )),
             (Some(text), false) => start_ordered(place, &spawn, &agent, &kind, text, &spawn_patience(far_start)),
             _ => None,
         };
@@ -5732,12 +5847,23 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     /// Pressed by the backend that holds the seat, and no other: a press is a
     /// keystroke, and every backend that is not this seat's answers `NoSeat`.
+    ///
+    /// Not under `WSP_ORDERS=store` (wsp-126): an order's retries are the
+    /// orders machine's and the delivery worker's, so nothing is pressed.
     fn press(&self, seat: &str) -> bool {
+        if crate::orders::mode() == crate::orders::Mode::Store {
+            return false;
+        }
         let seat_id = Seat::new(seat);
         crate::cycle::Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
     }
 
+    /// Not under `WSP_ORDERS=store`, for [`Self::press`]'s reason: nothing
+    /// answers for it, and an order sent again is the worker's.
     fn resend(&self, seat: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+        if crate::orders::mode() == crate::orders::Mode::Store {
+            return None;
+        }
         crate::cmd_message::type_at(seat, text)
     }
 
@@ -7896,6 +8022,152 @@ mod tests {
         // retry's numbers move, for a wait that never reads them.
         let wait = Patience { ready: READY, taken: TAKEN, nudges: PRESSES, poll: STEP, gone: GRACE, clock, ..retrying(clock) };
         hand_over(place, &Speaks, &spawn, "you have been claimed onto robustness-035", &wait)
+    }
+
+    /// The orders door on an open store, as the daemon's own process has it.
+    struct OpenDoor(wsp_server::SharedStore);
+
+    impl FirstOrders for OpenDoor {
+        fn send(&self, seat: &wsp_store_contract::SeatId, text: &str) -> Result<wsp_store_contract::OrderId, crate::orders::Error> {
+            let cmd = wsp_store_contract::Command::OrderSend { to: seat.clone(), text: text.to_string(), first: true };
+            crate::orders::send_in(&self.0, cmd, &crate::orders::tests::ed())
+        }
+        fn answer(&self, id: &wsp_store_contract::OrderId, wait: Duration) -> Result<Option<wsp_store_contract::Order>, crate::orders::Error> {
+            crate::orders::answer_in(&self.0, id, wait)
+        }
+    }
+
+    /// The daemon's delivery worker on `db`, asking through `ask`, until the
+    /// flag is set and the head moves.
+    fn delivering(
+        db: &wsp_server::SharedStore,
+        ask: Box<crate::deliver::Ask>,
+    ) -> (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let worker = crate::deliver::Worker::new(db.clone(), "wsp", ask);
+        (std::thread::spawn(move || worker.run(&flag)), stop)
+    }
+
+    /// A spawn's wait on its first order under the store, long enough for
+    /// nothing in these tests to run it out.
+    fn stored_wait() -> Patience<'static> {
+        Patience { ready: Duration::from_secs(30), taken: Duration::ZERO, poll: Duration::from_millis(10), ..Patience::default() }
+    }
+
+    /// **Under `WSP_ORDERS=store` the first order is one order in the store,
+    /// acknowledged, and the seat was asked under its id** (wsp-126). The seat
+    /// is not in the store when the spawn first sends (the fold mirrors it a
+    /// moment after `seat.started`), so the send waits for it; the worker then
+    /// types the order once under the machine's id and the spawn hears it
+    /// acknowledged. Nothing is owed in a file.
+    #[test]
+    fn under_store_an_acked_first_order_is_one_acknowledged_order_under_the_id_the_seat_was_asked() {
+        use wsp_store_contract::{OrderState, SeatId, SeatState};
+        let env = util::isolated("spawn-first-stored");
+        let store = Store::open();
+        let db = crate::orders::tests::db(&env.state().join("db"), wsp_server::Mode::Owned);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
+        let heard = asked.clone();
+        let (worker, stop) = delivering(
+            &db,
+            Box::new(move |seat, id, text| {
+                heard.lock().unwrap().push((seat.0.clone(), id.0.clone(), text.to_string()));
+                Ok(Delivery::Acked)
+            }),
+        );
+        let later = db.clone();
+        let fold = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::orders::tests::seat(&later, "cpd-81", SeatState::Started);
+        });
+
+        let said = order_stored(&Seat::new("cpd-81"), "claude", "your work", &stored_wait(), &OpenDoor(db.clone()));
+        fold.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::orders::tests::seat(&db, "cpd-81", SeatState::Working);
+        worker.join().unwrap();
+
+        assert_eq!(said, Ok(()));
+        let orders = crate::orders::orders_of_in(&db, &SeatId("cpd-81".into()), &[]).unwrap();
+        assert_eq!(orders.len(), 1, "one order: {orders:?}");
+        assert_eq!((orders[0].state, orders[0].first), (OrderState::Acknowledged, true));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [("cpd-81".to_string(), orders[0].id.0.clone(), "your work".to_string())],
+            "asked once, under the store's id"
+        );
+        assert!(!store.state_file("first-orders.json").exists(), "nothing owed in a file");
+    }
+
+    /// **A first order the seat refused is delivered again by the worker once
+    /// the seat reads idle**, under the same id, and the spawn hears it
+    /// acknowledged; one refused to the cap is `failed`, which the spawn says
+    /// as `order not received` (wsp-126).
+    #[test]
+    fn under_store_a_refused_first_order_is_delivered_at_idle_and_one_refused_to_the_cap_is_failed() {
+        use crate::place::Refusal as Said;
+        use wsp_store_contract::{OrderState, SeatId, SeatState};
+        let env = util::isolated("spawn-first-refused");
+        let db = crate::orders::tests::db(&env.state().join("db"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&db, "cpd-82", SeatState::Started);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (heard, busy) = (asked.clone(), db.clone());
+        let (worker, stop) = delivering(
+            &db,
+            Box::new(move |_seat, id, _text| {
+                let mut a = heard.lock().unwrap();
+                a.push(id.0.clone());
+                if a.len() == 1 {
+                    // The seat began something else: it reads working, and
+                    // the order waits for its idle.
+                    crate::orders::tests::seat(&busy, "cpd-82", SeatState::Working);
+                    return Err(Said::Failed("the prompt did not take it".into()));
+                }
+                Ok(Delivery::Acked)
+            }),
+        );
+        let (watch, seen) = (db.clone(), asked.clone());
+        let idle = std::thread::spawn(move || {
+            let to = SeatId("cpd-82".into());
+            let end = Instant::now() + Duration::from_secs(20);
+            loop {
+                let o = crate::orders::orders_of_in(&watch, &to, &[]).unwrap();
+                if o.first().is_some_and(|o| o.state == OrderState::Queued && o.attempts == 1) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let asks = seen.lock().unwrap().len();
+                    crate::orders::tests::seat(&watch, "cpd-82", SeatState::Idle);
+                    return asks;
+                }
+                assert!(Instant::now() < end, "never queued again: {o:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let said = order_stored(&Seat::new("cpd-82"), "claude", "your work", &stored_wait(), &OpenDoor(db.clone()));
+        assert_eq!(idle.join().unwrap(), 1, "not asked again while the seat reads working");
+        assert_eq!(said, Ok(()));
+        let orders = crate::orders::orders_of_in(&db, &SeatId("cpd-82".into()), &[]).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!((orders[0].state, orders[0].attempts), (OrderState::Acknowledged, 1));
+        assert_eq!(*asked.lock().unwrap(), [orders[0].id.0.clone(), orders[0].id.0.clone()], "the same id twice");
+
+        // Refused at every attempt: `failed` at the machine's cap.
+        crate::orders::tests::seat(&db, "cpd-83", SeatState::Started);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::orders::tests::seat(&db, "cpd-82", SeatState::Working);
+        worker.join().unwrap();
+        let (worker, stop) = delivering(&db, Box::new(|_, _, _| Err(Said::Failed("no".into()))));
+        let said = order_stored(&Seat::new("cpd-83"), "claude", "your work", &stored_wait(), &OpenDoor(db.clone()));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::orders::tests::seat(&db, "cpd-83", SeatState::Working);
+        worker.join().unwrap();
+        match said {
+            Err(Unordered::Refused(why)) => assert!(why.starts_with("order not received") && why.contains("3 attempts"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let failed = crate::orders::orders_of_in(&db, &SeatId("cpd-83".into()), &[OrderState::Failed]).unwrap();
+        assert_eq!(failed.len(), 1, "failed at the cap");
     }
 
     /// **Where the order is, said where it can be read** (`wsp-252`). Ten

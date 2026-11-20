@@ -8451,6 +8451,40 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&ENDED).is_empty() && spawned().is_empty());
     }
 
+    /// **Under `WSP_ORDERS=store` a verifier's seat is replaced once its first
+    /// order is `failed`, and nothing is pressed or resent** (wsp-126): the
+    /// order's retries are the orders machine's, so an order typed and unsent
+    /// is left to them, and the replacement waits on the order's state, not on
+    /// a press's line in `cycle.log`.
+    #[test]
+    fn under_store_a_failed_first_order_replaces_the_verifier_once_and_nothing_is_pressed() {
+        use crate::verification::State as V;
+        let (_env, store) = scratch("untakenstored");
+        let w = verifier_waiting(&store, "cpd-640");
+        let seats = Untaken::holding(Some(true));
+
+        crate::untaken::as_stored(&[]);
+        step(&store, &w, &seats);
+        age_the_log(&store);
+        step(&store, &w, &seats);
+        assert!(seats.pressed.borrow().is_empty() && seats.resent.borrow().is_empty(), "no press, no resend");
+        assert!(drained(&ENDED).is_empty() && spawned().is_empty(), "and no replacement while the order is not failed");
+
+        crate::untaken::as_stored(&[("cpd-640", "the prompt did not take it")]);
+        step(&store, &w, &seats);
+        assert_eq!(drained(&ENDED), vec!["cpd-640".to_string()], "the seat whose order failed is ended");
+        assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and another starts");
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+
+        step(&store, &w, &seats);
+        assert!(drained(&ENDED).is_empty() && spawned().is_empty(), "replaced once");
+        assert!(seats.pressed.borrow().is_empty() && seats.resent.borrow().is_empty());
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        assert!(log.contains("did not receive its first order") && log.contains("replacing cpd-640:"), "{log}");
+        assert!(!log.contains("pressed submit in cpd-640,"), "{log}");
+    }
+
     /// `wsp-136` item 3. `end_behind` ends the check on the barrier *before* the
     /// one just passed, so the check whose `go` finished the run was left
     /// holding a claim for ever — there being no next pass to reach it from, and

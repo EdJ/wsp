@@ -38,6 +38,15 @@
 //! daemon's tick stdout is `daemon.log` and a record written there is a record
 //! this would never find — every tick would press again.
 //!
+//! # Under `WSP_ORDERS=store` (wsp-126)
+//!
+//! The first order is an order in the store, and its retries are the orders
+//! machine's: a refusal is `queued` again and delivered by the daemon's worker
+//! once the seat reads idle, and the cap is `failed`. So nothing here presses or
+//! resends. A seat whose first order is `failed` is replaced, once, on sight,
+//! with no wait on `cycle.log`'s press and resend lines. A seat whose agent
+//! never came up is replaced as before: it has no order to fail.
+//!
 //! # What it will not do
 //!
 //! Press at a prompt it cannot read. A return into a prompt nobody has read may
@@ -93,9 +102,62 @@ enum Replace {
 /// barrier in [`crate::cycle::step`], so a seat replaced here is reopened in
 /// the same step.
 pub(crate) fn look(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, g: &Group, pos: &Position) {
+    #[cfg(test)]
+    if let Some(failed) = FAILED.with(|f| f.borrow().clone()) {
+        let read = move |seat: &str| failed.iter().find(|(s, _)| s == seat).map(|(_, why)| why.clone());
+        return look_with(store, seats, w, at, g, pos, Some(&read));
+    }
+    match crate::orders::mode() {
+        crate::orders::Mode::Store => look_with(store, seats, w, at, g, pos, Some(&|seat: &str| failed_first(store, seat))),
+        crate::orders::Mode::Files => look_with(store, seats, w, at, g, pos, None),
+    }
+}
+
+/// A seat's first order that is `failed`, and why, read through the orders
+/// door: `None` when it has none, or nothing answers.
+fn failed_first(store: &Store, seat: &str) -> Option<String> {
+    let seat = wsp_store_contract::SeatId(seat.to_string());
+    let failed = crate::orders::orders_of(store, &seat, &[wsp_store_contract::OrderState::Failed]).ok()?;
+    failed.into_iter().find(|o| o.first).map(|o| o.why.unwrap_or_default())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for the store's failed first orders, seat → why:
+    /// set, and [`look`] reads as under `WSP_ORDERS=store` with these.
+    static FAILED: std::cell::RefCell<Option<Vec<(String, String)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`look`] under the store mode, its failed first orders these (this thread only).
+#[cfg(test)]
+pub(crate) fn as_stored(failed: &[(&str, &str)]) {
+    FAILED.with(|f| *f.borrow_mut() = Some(failed.iter().map(|(s, w)| (s.to_string(), w.to_string())).collect()));
+}
+
+/// [`look`], with `failed` the store's failed first orders under
+/// `WSP_ORDERS=store`, and `None` under the files.
+fn look_with(
+    store: &Store,
+    seats: &dyn Seats,
+    w: &Worklist,
+    at: usize,
+    g: &Group,
+    pos: &Position,
+    failed: Option<&dyn Fn(&str) -> Option<String>>,
+) {
     let now = util::epoch_secs();
     let mut log: Option<String> = None;
     for o in owed(store, w, at, g, pos) {
+        // The store's answer is final: a failed first order is the seat
+        // replaced, once, with nothing to wait out.
+        if let Some(why) = failed.and_then(|f| f(&o.seat)) {
+            let log = log.get_or_insert_with(|| std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default());
+            if newest(log, &replaced(&o.seat)).is_none() {
+                let head = format!("{} group {at}: {} in {} did not receive its first order", w.id, o.who, o.seat);
+                replace(store, seats, w, at, &o, &head, &format!("its first order failed: {why}"));
+            }
+            continue;
+        }
         let state = seats.state(&o.seat);
         let not_up = matches!(state, Some(State::Empty | State::Starting));
         if now - o.since < if not_up { crate::barrier::NOT_UP_AFTER } else { AFTER } {
@@ -111,6 +173,11 @@ pub(crate) fn look(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, g:
             }
             let head = format!("{} group {at}: {} in {} still reads {} after {} min", w.id, o.who, o.seat, state.map_or("", |s| s.as_str()), (now - o.since) / 60);
             replace(store, seats, w, at, &o, &head, &format!("its agent never came up: the seat reads {}", state.map_or("", |s| s.as_str())));
+            continue;
+        }
+        // Under the store an order is retried by the machine, not pressed or
+        // resent here.
+        if failed.is_some() {
             continue;
         }
         if now - o.since < AFTER || seats.turn_began_since(store, &o.seat, o.since) != Some(false) {
