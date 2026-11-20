@@ -171,9 +171,10 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 /// `Task` `wip` reads with the store's own parser: `body` is the task file's
 /// text for every task `texts` holds (those [`wip_reads_in_full`]
 /// says `wip` opens), and `head` is the [`TaskHead`] as the store's index keeps
-/// it (`TaskHead::to_json`) for the rest, which `wip` reads bodiless; beside
-/// `head`, `prose` is the task's body after its front matter (wsp-305), so `ls
-/// --all` and `show` read every row's legs, log and passes.
+/// it (`TaskHead::to_json`) on every row (wsp-695), so a read that leaves a
+/// done row's `body` out still has the row; where there is no `body`, `prose`
+/// is the task's body after its front matter (wsp-305), so `ls --all` and
+/// `show` read every row's legs, log and passes.
 ///
 /// A row at review that is finished (`wsp-105`: verified, not reverted, no
 /// held barrier still judging it) carries `attention` = `needs-you`,
@@ -224,14 +225,10 @@ pub fn rows(
                     }
                 }
             }
+            f.insert(HEAD.into(), TaskHead::of(t).to_json().to_string());
             match texts.get(&t.id) {
-                Some(text) => {
-                    f.insert(BODY.into(), text.clone());
-                }
-                None => {
-                    f.insert(HEAD.into(), TaskHead::of(t).to_json().to_string());
-                    f.insert(key::PROSE.into(), t.body.clone());
-                }
+                Some(text) => drop(f.insert(BODY.into(), text.clone())),
+                None => drop(f.insert(key::PROSE.into(), t.body.clone())),
             }
             Entity::Row(c::Row {
                 id: RowId(t.id.clone()),
@@ -250,7 +247,9 @@ pub fn rows(
 
 /// A row's `fields` key holding the task file's text.
 pub const BODY: &str = key::BODY;
-/// A row's `fields` key holding the task's head, for a task `wip` reads bodiless.
+/// A row's `fields` key holding the task's head, on every row: what `wip`
+/// reads of a task it reads bodiless, and what a done row keeps in
+/// `wip_snapshot` (wsp-695).
 pub const HEAD: &str = key::HEAD;
 /// A row's `fields` key holding its `claims.json` record (JSON text), verbatim:
 /// an `Entity::Claim` keeps the seat alone, and `wip` joins the record's
@@ -1270,13 +1269,52 @@ mod tests {
             let files = wip.iter().find(|t| t.id == id).unwrap();
             let open = id != "wsp-5";
             assert_eq!(row.fields.contains_key(BODY), open, "{id} body");
-            assert_eq!(row.fields.contains_key(HEAD), !open, "{id} head");
+            assert!(row.fields.contains_key(HEAD), "{id} head: every row carries one");
             let back = task_of(&row).expect("a task");
             assert_eq!(format!("{back:?}"), format!("{files:?}"), "{id}");
         }
         assert!(task_of(&row_of(&es, "wsp-2")).unwrap().body.contains("some prose"));
         let text = std::fs::read_to_string(s.task_path("wsp-2")).unwrap();
         assert_eq!(row_of(&es, "wsp-2").fields[BODY], text, "the file's text, verbatim");
+    }
+
+    /// wsp-695, the shape the mirror really writes: a done row `wip` reads in
+    /// full (a `## Verification`) carries `body` and `head`, a plain done row
+    /// `head` and `prose`. Folded into SQLite and cut by `wip_snapshot`, every
+    /// done row comes back as its head alone, which `task_of` reads as the
+    /// bodiless task, and an open row comes back whole, as the files read it.
+    #[test]
+    fn wip_snapshot_gives_every_done_row_as_the_mirror_writes_it_a_head_task_of_reads() {
+        use c::{Commands, Reads};
+        let s = seed("mirror-wip-cut");
+        let mut verified = Task::new("verified and done", "wsp-6");
+        verified.project = Some("wsp".into());
+        verified.status_raw = "done".into();
+        verified.body = "## Overview\n\nlong prose\n\n## Verification\n- 2026-11-20 holds · read abc123 · pane cpd-9\n  ## Verdict: holds\n".into();
+        s.save_task(&verified).unwrap();
+        let es = read_rows_etc(&s, "here");
+        let full = row_of(&es, "wsp-6");
+        assert!(full.fields.contains_key(BODY) && full.fields.contains_key(HEAD), "read in full: body and head");
+        assert!(!row_of(&es, "wsp-5").fields.contains_key(BODY), "a plain done row has no body");
+
+        let db = wsp_store_sqlite::SqliteStore::open(s.state.join("state.db"), Arc::new(wsp_server::Mirror)).unwrap();
+        let rows: Vec<Entity> = es.into_iter().filter(|e| matches!(e, Entity::Row(_))).collect();
+        db.apply(Command::Mirror { put: rows, gone: Vec::new() }, IdempotencyKey("t".into()), Principal::Wsp("test".into())).unwrap();
+        let (cut, _) = db.wip_snapshot().unwrap();
+        let wip = s.tasks_read_where(wip_reads_in_full);
+        for t in s.tasks() {
+            let row = &cut.rows[&RowId(t.id.clone())];
+            let back = task_of(row).unwrap_or_else(|| panic!("{}: the cut left a row task_of cannot read", t.id));
+            if Status::parse(&t.status_raw) == Some(Status::Done) {
+                assert!(!row.fields.contains_key(BODY) && !row.fields.contains_key(key::PROSE), "{} kept its text", t.id);
+                assert_eq!(format!("{back:?}"), format!("{:?}", TaskHead::of(&t).bodiless()), "{}: the head", t.id);
+            } else {
+                let files = wip.iter().find(|w| w.id == t.id).unwrap();
+                assert_eq!(format!("{back:?}"), format!("{files:?}"), "{}: open, whole", t.id);
+            }
+        }
+        let head = TaskHead::from_json(&serde_json::from_str(&cut.rows[&RowId("wsp-6".into())].fields[HEAD]).unwrap()).unwrap();
+        assert!(head.has_section(crate::verification::SECTION), "the head still says the row has a Verification");
     }
 
     /// An ask carries its message's record, and the store's reader rebuilds the
