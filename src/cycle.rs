@@ -1401,7 +1401,7 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
         check,
         names.join(", ")
     ));
-    tell_barrier(store, w, &check, &names);
+    tell_barrier(store, w, at, &check, &names);
 }
 
 /// The marker a reopened row carries, so the check can be told what changed
@@ -1413,7 +1413,7 @@ pub(crate) const SENT_BACK: &str = "sent back:";
 /// **`wsp tell` run as a process, for [`crate::cmd_task::reopen`]'s reason**:
 /// its refusals are the answer worth having, and a second implementation here
 /// would be a second answer that could disagree with the verb.
-fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
+fn tell_barrier(store: &Store, w: &Worklist, at: usize, check: &str, members: &[String]) {
     let text = format!(
         "The {} run sent {} back after your barrier check {} opened, so the group is not the one you \
          were given. Read `wsp worklist next {}` again before deciding, and if it already holds, \
@@ -1424,11 +1424,38 @@ fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
         w.id,
         w.id
     );
-    tell_seat(store, check, &text, "the group moved under it");
+    let key = format!("barrier:{}:{at}", w.id);
+    tell_seat(store, check, &text, "the group moved under it", &key);
+}
+
+/// The seat a tell to `to` reaches: the pane of the row `to` names (its
+/// claim's, where the row has more than one), or `to` itself, a seat.
+fn seat_of(store: &Store, to: &str) -> String {
+    let panes = store.panes_for_task(to);
+    let holder = store
+        .claims()
+        .get(to)
+        .and_then(|claim| crate::address::claim_holder(claim, &panes, &store.agents_held()));
+    holder.or_else(|| panes.first().cloned()).unwrap_or_else(|| to.to_string())
 }
 
 /// `wsp tell <seat> -` with `text`, said in `cycle.log` as `told <seat>: <what>`.
-fn tell_seat(store: &Store, check: &str, text: &str, what: &str) {
+///
+/// **Under the orders machine, an order** (wsp-125): [`crate::refusals::Door::send`]
+/// under `key` and the seat, so the tick that tells and any tick that tells the
+/// same thing again hold one order (the caller's key is per list, group and
+/// what it is about). Nothing waits for the answer; the order's state is the
+/// record of whether the seat heard.
+fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) {
+    if let Some(door) = crate::refusals::door(store) {
+        let seat = seat_of(store, check);
+        match door.send(&seat, text, &format!("{key}:{seat}")) {
+            Ok(sent) if sent.fresh => log_line(store, &format!("told {check}: {what} (order {})", sent.id.0)),
+            Ok(_) => {}
+            Err(e) => log_line(store, &format!("told {check}: not delivered — {e}")),
+        }
+        return;
+    }
     if cfg!(test) {
         #[cfg(test)]
         crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text.to_string())));
@@ -1501,6 +1528,7 @@ fn end_second_seats(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, m
                              commit — anything there you did not write is {p}'s, and is yours to keep or drop."
                         ),
                         &format!("{p} was ended and the tree of {id} is its"),
+                        &format!("second-seat:{}:{at}:{id}:{p}", w.id),
                     );
                 }
                 Err(why) => log_line(store, &format!(
@@ -11449,5 +11477,28 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(log.matches("wsp: not adding held to run group 1: elsewhere holds it").count(), 1, "said once: {log}");
         assert!(!log.contains("fin"), "a done row owes nothing, so nothing is said: {log}");
         assert!(!log.contains("wsp: prerequisite"), "{log}");
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// **wsp-125: under the orders machine a barrier check is told by an
+    /// order**, keyed per list, group and seat: the same tell on the next tick
+    /// is the same order, another group is another, and nothing runs `wsp tell`.
+    #[test]
+    fn under_the_orders_machine_a_barrier_check_told_twice_is_one_order() {
+        let env = util::isolated("cycle-tell-orders");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let opened = crate::refusals::tests::open(&store, &["cpd-9"]);
+        let orders = || opened.0.orders_for(&wsp_store_contract::SeatId("cpd-9".into()), &[]).unwrap().len();
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:2");
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:2");
+        assert_eq!(orders(), 1, "one order across two ticks");
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:3");
+        assert_eq!(orders(), 2, "another group is another order");
+        assert!(tests::MEMBER_TOLD.with(|t| t.borrow().is_empty()), "no `wsp tell` past the orders machine");
     }
 }

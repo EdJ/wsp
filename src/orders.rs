@@ -260,6 +260,20 @@ pub fn send_keyed(
     }
 }
 
+/// [`send_keyed`] through an open store named by the caller rather than the
+/// daemon's (`crate::refusals::Door`'s tests, wsp-125).
+pub fn send_keyed_in(
+    db: &SharedStore,
+    seat: &SeatId,
+    text: &str,
+    from: &Principal,
+    first: bool,
+    key: &str,
+) -> Result<OrderId, Error> {
+    let cmd = Command::OrderSend { to: seat.clone(), text: text.to_string(), first };
+    send_in_keyed(db, cmd, caller_key(key), from)
+}
+
 /// Order `id` in whatever state it is in now, without waiting; `None` when no
 /// store holds it. In the daemon a read of its open store; anywhere else the
 /// API's `orders` read.

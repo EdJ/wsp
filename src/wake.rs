@@ -337,6 +337,7 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
     // Taken before the flush, because a flush empties the copy in hand and the
     // number is what says *everything up to here has gone*.
     let mut tell = Tell::new(store, seats, scope);
+    tell.batch = typed_batch.clone();
     let sent: Vec<u64> =
         Stream::new(&spec, &mut tell).tick(at, &mut spool).iter().map(|h| h.seq).collect();
     let written = sent.len();
@@ -772,6 +773,10 @@ pub(crate) struct Tell<'a> {
     /// When that happened, carried out of the sink so a receipt can say how long
     /// the seat has been sitting on it.
     pub(crate) typed_at: Option<i64>,
+    /// The spool entries this attempt says, by `seq`: under the orders machine
+    /// the order's key, so the same emit set on the next tick is the same order
+    /// (wsp-125).
+    batch: Vec<u64>,
 }
 
 impl<'a> Tell<'a> {
@@ -795,7 +800,7 @@ impl<'a> Tell<'a> {
     }
 
     fn new(store: &'a Store, seats: &'a dyn Seats, scope: &str) -> Tell<'a> {
-        Tell { store, seats, scope: scope.to_string(), why: NOT_YET.into(), typed: false, typed_at: None }
+        Tell { store, seats, scope: scope.to_string(), why: NOT_YET.into(), typed: false, typed_at: None, batch: Vec::new() }
     }
 }
 
@@ -810,6 +815,9 @@ const NOT_YET: &str = "nothing worth a wake yet";
 const FAILED_DELIVERY: &str = "delivery to the seat failed: ";
 
 const NO_SEAT: &str = "no seat on this scope";
+
+/// An order is out for the seat and it has not acknowledged it (wsp-125).
+const ORDERED: &str = "sent to the seat as an order, not yet acknowledged";
 
 /// A `failed` reason that says nothing reached the seat, so the sentence is
 /// still wholly owed and trying again is safe (wsp-477).
@@ -1038,6 +1046,13 @@ impl Sink for Tell<'_> {
             self.why = NOT_FOUND.into();
             return false;
         };
+        // **Under the orders machine the spool is an order** (wsp-125): sent,
+        // not typed, and confirmed by the order reaching `acknowledged` rather
+        // than by a turn seen since. The delivery worker owns the gate, the
+        // typing and the retries.
+        if let Some(door) = crate::refusals::door(self.store) {
+            return self.order(&door, &seat.pane, said);
+        }
         let backends = crate::place::local_backends();
         let Some((place, found)) = cmd_govern::occupant(self.store, &backends, &seat) else {
             self.why = NOT_FOUND.into();
@@ -1215,6 +1230,63 @@ fn scripted_answer() -> Option<crate::place::Result<crate::place::Delivery>> {
 }
 
 impl Tell<'_> {
+    /// The order's key for this batch at `seat`: per scope and emit set, and per
+    /// seat, so a successor in the seat is sent its own order and not handed back
+    /// the one its predecessor failed.
+    fn order_key(&self, seat: &str) -> String {
+        let seqs: Vec<String> = self.batch.iter().map(u64::to_string).collect();
+        format!("wake:{}:{seat}:{}", self.scope, seqs.join(","))
+    }
+
+    /// The batch as an order (wsp-125): [`crate::refusals::Door::send`] under
+    /// [`Tell::order_key`], so the tick that sent it and every tick after it with
+    /// the same emits hold one order, and then that order's state read without
+    /// waiting. `acknowledged` (or `done`, past it) clears the batch; `failed` is
+    /// the supervisor's final answer, raised once, and the seat is ended as
+    /// deaf by [`crate::repair::refusal_tick`] from its failed orders — nothing
+    /// is counted in `refused-deliveries.json`.
+    fn order(&mut self, door: &crate::refusals::Door, seat: &str, said: &[String]) -> bool {
+        use wsp_store_contract::OrderState as S;
+        let text = format!("{}\n{}", preamble(&self.scope), said.join("\n"));
+        let sent = match door.send(seat, &text, &self.order_key(seat)) {
+            Ok(sent) => sent,
+            Err(e) => {
+                self.why = format!("the orders machine did not take it: {e}");
+                return false;
+            }
+        };
+        if sent.fresh {
+            crate::store::log_line(self.store, &format!("told {}: order {} queued for {seat}", self.scope, sent.id.0));
+        }
+        let Ok(Some(order)) = door.order(&sent.id) else {
+            self.why = format!("order {} could not be read", sent.id.0);
+            return false;
+        };
+        match order.state {
+            S::Acknowledged | S::Done => {
+                crate::store::log_line(
+                    self.store,
+                    &format!("told {}: delivered, order {} acknowledged by the seat", self.scope, sent.id.0),
+                );
+                true
+            }
+            S::Failed => {
+                let why = order.why.unwrap_or_else(|| "its attempts ran out".into());
+                self.why = format!("the seat's supervisor failed to deliver it: {why}");
+                self.escalate(&why);
+                false
+            }
+            S::Cancelled => {
+                self.why = format!("order {} was cancelled", sent.id.0);
+                false
+            }
+            S::Queued | S::Typed | S::Delivered => {
+                self.why = format!("{ORDERED} (order {}, {})", sent.id.0, format!("{:?}", order.state).to_lowercase());
+                false
+            }
+        }
+    }
+
     /// What became of a typing, as the batch's fate: `true` clears it.
     fn settle(&mut self, outcome: crate::place::Result<crate::place::Delivery>, before: i64) -> bool {
         match outcome {
@@ -1868,6 +1940,63 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         assert!(tell.settle(Ok(Delivery::Acked), before + 40));
         assert!(refusing(&store).is_empty(), "a seat that takes a tell is not refusing");
         let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **wsp-125: under the orders machine a governor's spool is an order.** One
+    /// order for one emit set however many ticks hold it, cleared on the tick
+    /// that reads it `acknowledged` — no turn asked after — and nothing counted
+    /// in `refused-deliveries.json` on the way.
+    #[test]
+    fn under_the_orders_machine_a_spool_is_one_order_per_emit_set_and_clears_when_acknowledged() {
+        use wsp_store_contract::SeatId;
+        let env = util::isolated("wake-orders");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        cmd_govern::take(&store, "demo", "w1", "w1:p1").unwrap();
+        let opened = crate::refusals::tests::open(&store, &["w1:p1"]);
+        let orders = || opened.0.orders_for(&SeatId("w1:p1".into()), &[]).unwrap();
+
+        let e = emit(Kind::NeedsAPerson, "demo", "a-1");
+        let first = deliver_to(&store, &Idle, "demo", &[&e], 60);
+        assert_eq!((first.settled, first.held), (0, 1), "sent, not yet acknowledged: {first:?}");
+        assert!(first.why.contains(ORDERED), "{}", first.why);
+        let second = deliver_to(&store, &Idle, "demo", &[], 80);
+        assert_eq!((second.settled, second.held), (0, 1));
+        let out = orders();
+        assert_eq!(out.len(), 1, "one order across two ticks: {out:?}");
+        assert!(out[0].text.contains("a-1") && out[0].text.contains("nobody typed this"), "{}", out[0].text);
+
+        crate::refusals::tests::ack(&opened.0, &out[0].id);
+        let third = deliver_to(&store, &Idle, "demo", &[], 100);
+        assert!(third.arrived(), "acknowledged is the confirmation: {third:?}");
+        assert_eq!(third.held, 0);
+        assert_eq!(orders().len(), 1, "and confirming it sent nothing more");
+        assert!(refusing(&store).is_empty());
+        assert!(!store.state.join("refused-deliveries.json").exists());
+    }
+
+    /// **wsp-125: a failed order is the supervisor's final answer**: held,
+    /// raised once on the scope, and not counted in `refused-deliveries.json` —
+    /// the reconciler reads the failed order itself.
+    #[test]
+    fn under_the_orders_machine_a_failed_order_is_held_and_raised_and_counted_nowhere() {
+        use wsp_store_contract::SeatId;
+        let env = util::isolated("wake-orders-failed");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        cmd_govern::take(&store, "demo", "w1", "w1:p1").unwrap();
+        let opened = crate::refusals::tests::open(&store, &["w1:p1"]);
+        let e = emit(Kind::NeedsAPerson, "demo", "a-1");
+        deliver_to(&store, &Idle, "demo", &[&e], 60);
+        let out = opened.0.orders_for(&SeatId("w1:p1".into()), &[]).unwrap();
+        crate::refusals::tests::fail(&opened.0, &out[0].id, "refused");
+        let r = deliver_to(&store, &Idle, "demo", &[], 80);
+        assert_eq!((r.settled, r.held), (0, 1));
+        assert!(r.why.contains("failed to deliver it: refused"), "{}", r.why);
+        deliver_to(&store, &Idle, "demo", &[], 100);
+        let raised = crate::message::raised(&store).iter().filter(|m| m.text.starts_with(FAILED_DELIVERY)).count();
+        assert_eq!(raised, 1, "raised once");
+        assert!(!store.state.join("refused-deliveries.json").exists());
     }
 
     /// The three readings a seat can give [`crate::repair::reading`], as fakes.

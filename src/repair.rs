@@ -643,6 +643,9 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
 /// successor on the next pass. The reason goes in `cycle.log` and in the list's
 /// own log, where the person who comes back to the list reads it.
 pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
+    if let Some(door) = crate::refusals::door(store) {
+        return deaf_tick(store, seats, &door);
+    }
     let governors = store.governors();
     for (scope, (n, why)) in crate::refusals::refusing(store) {
         if n < crate::refusals::REFUSED_TICKS {
@@ -665,6 +668,38 @@ pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
         );
         stamp(store, &line);
         if let Some(mut w) = store.worklist(&scope) {
+            w.log(&line);
+            let _ = store.save_worklist(&w);
+        }
+        if let Err(e) = crate::cycle::end_seat_when_idle(store, &seat.pane) {
+            stamp(store, &format!("{scope}: could not arrange {}'s ending: {e}. `wsp despawn --pane {} --force` ends it", seat.pane, seat.pane));
+        }
+    }
+}
+
+/// [`refusal_tick`] under the orders machine (wsp-125, part 3 of the person's
+/// answer on wsp-115): a governor is deaf when its orders reach `failed` at the
+/// machine's cap ([`crate::refusals::Door::deaf`]), not when
+/// `refused-deliveries.json` counts five, and that file is neither read nor
+/// written. The ending is wsp-634's: not mid-turn, said in `cycle.log` and the
+/// list's log, the seat ended once and its successor seated by [`seat_vacant`].
+fn deaf_tick(store: &Store, seats: &dyn Seats, door: &crate::refusals::Door) {
+    let governors = store.governors();
+    for scope in governors.keys() {
+        let Some(seat) = cmd_govern::seat_held(scope, &governors) else { continue };
+        let Some(why) = door.deaf(&seat.pane) else { continue };
+        if seats.state(&seat.pane) == Some(State::Working) {
+            continue;
+        }
+        if !crate::refusals::first_ending(store, &seat.pane) {
+            continue;
+        }
+        let line = format!(
+            "{scope}: {} refused delivery until its order failed at the cap ({why}) — ended so a successor is seated",
+            seat.pane
+        );
+        stamp(store, &line);
+        if let Some(mut w) = store.worklist(scope) {
             w.log(&line);
             let _ = store.save_worklist(&w);
         }
@@ -720,6 +755,17 @@ fn held_save(store: &Store, all: &std::collections::BTreeMap<String, Held>) {
 /// (`wsp wip`'s `stuck`).
 pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::stuck::Kind, i64)> {
     let now = util::epoch_secs();
+    // Under the orders machine the record is the folded `seat.stuck` (wsp-125).
+    if crate::refusals::door(store).is_some() {
+        return store
+            .bindings()
+            .keys()
+            .filter_map(|seat| {
+                let s = crate::cmd_agent::stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
+                Some((seat.clone(), (s.kind, s.secs)))
+            })
+            .collect();
+    }
     held_all(store).into_iter().map(|(s, h)| (s, (h.kind, (now - h.at).max(0)))).collect()
 }
 
@@ -735,6 +781,11 @@ pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (
 /// The shell is the manager's to end; until the protocol carries that ask, the
 /// seat is told and the shell left.
 pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
+    if let Some(door) = crate::refusals::door(store) {
+        return stuck_ordered(store, seats, &door, &|seat| {
+            crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), None)
+        }, &|_| Vec::new());
+    }
     let before = held_all(store);
     stuck_tick_with(
         store,
@@ -753,6 +804,9 @@ pub(crate) fn stuck_tick_with(
     read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>,
     end: &dyn Fn(&str) -> Vec<u32>,
 ) {
+    if let Some(door) = crate::refusals::door(store) {
+        return stuck_ordered(store, seats, &door, read, end);
+    }
     let before = held_all(store);
     let mut all = before.clone();
     let mut candidates: Vec<String> = store.bindings().keys().cloned().collect();
@@ -798,6 +852,58 @@ pub(crate) fn stuck_tick_with(
     }
     if all != before {
         held_save(store, &all);
+    }
+}
+
+/// The stall's key in the orders machine: per seat and per the stall's start, so
+/// a stall told on one tick and still open on the next is the same order.
+fn stall_key(seat: &str, at: i64) -> String {
+    format!("stuck:{seat}:{at}")
+}
+
+/// [`stuck_tick_with`] under the orders machine (wsp-125, part 4 of the
+/// person's answer on wsp-115). `stuck-commands.json` is not read or written:
+/// the stall's record is the folded `seat.stuck` (`manager/<host>.stuck.json`,
+/// wsp-028) that `read` reports, and whether the seat was told is its stall
+/// order's state. The tell is [`crate::refusals::Door::send`] under
+/// [`stall_key`], so the tick that finds the stall queues one order and every
+/// tick after it while the stall is open sends nothing more, and says nothing
+/// more in `cycle.log`.
+///
+/// A shell `end` ends is said in `cycle.log` and not in the order: the order's
+/// words are fixed by the tick that queued it, which runs before the ending so
+/// that a repeat tick ends nothing. The daemon's own `end` ends nothing.
+fn stuck_ordered(
+    store: &Store,
+    seats: &dyn Seats,
+    door: &crate::refusals::Door,
+    read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>,
+    end: &dyn Fn(&str) -> Vec<u32>,
+) {
+    for seat in store.bindings().keys() {
+        if !seats.state(seat).is_some_and(|s| s.turn_in_flight()) {
+            continue;
+        }
+        let Some(s) = read(seat).into_iter().find(|s| s.open) else { continue };
+        let text = format!("wsp: your command has been {} for {}s — {}. ({})", s.kind.word(), s.secs, s.kind.advice(), s.command);
+        let sent = match door.send(seat, &text, &stall_key(seat, s.at)) {
+            Ok(sent) => sent,
+            Err(e) => {
+                stamp(store, &format!("{seat}: a command has been {} for {}s and the seat could not be told: {e}", s.kind.word(), s.secs));
+                continue;
+            }
+        };
+        if !sent.fresh {
+            continue;
+        }
+        stamp(store, &format!("{seat}: a command has been {} for {}s: {} (told, order {})", s.kind.word(), s.secs, s.command, sent.id.0));
+        if s.kind == crate::stuck::Kind::SelfWait {
+            let pids = end(seat);
+            if !pids.is_empty() {
+                let pids = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+                stamp(store, &format!("{seat}: ended the shell waiting on itself (pid {pids})"));
+            }
+        }
     }
 }
 
@@ -2331,6 +2437,62 @@ pub(crate) mod tests {
         assert!(said.contains("cpd-1 refused delivery 5 ticks running (cpd-1: refused) — ended so a successor is seated"), "{said}");
         let log = store.worklist("run").unwrap().render();
         assert!(log.contains("refused delivery 5 ticks running"), "the list's own log: {log}");
+    }
+
+    /// **wsp-125: under the orders machine a governor is deaf when its orders
+    /// fail at the cap**, and it is ended as wsp-634 ends one — not mid-turn,
+    /// once, the reason in both logs — with nothing counted in
+    /// `refused-deliveries.json`.
+    #[test]
+    fn under_the_orders_machine_a_governor_whose_orders_fail_at_the_cap_is_ended_once() {
+        let (_env, store) = in_flight("deaf-orders");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        let opened = crate::refusals::tests::open(&store, &["cpd-1"]);
+        let door = crate::refusals::door(&store).unwrap();
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        let sent = door.send("cpd-1", "a wake", "wake:run:cpd-1:1").unwrap();
+        refusal_tick(&store, &idle);
+        assert!(ended().is_empty(), "an order still out is not a deaf seat");
+
+        crate::refusals::tests::fail(&opened.0, &sent.id, "cpd-1: refused");
+        refusal_tick(&store, &Fake::new(&[("cpd-1", Some(State::Working))]));
+        assert!(ended().is_empty(), "a seat mid-turn is hearing something");
+
+        refusal_tick(&store, &idle);
+        refusal_tick(&store, &idle);
+        assert_eq!(ended(), vec!["cpd-1".to_string()], "ended once, though its order stays failed");
+        let said = stamped().join("\n");
+        assert!(said.contains("cpd-1 refused delivery until its order failed at the cap (cpd-1: refused) — ended so a successor is seated"), "{said}");
+        let log = store.worklist("run").unwrap().render();
+        assert!(log.contains("failed at the cap"), "the list's own log: {log}");
+        assert!(!store.state.join("refused-deliveries.json").exists(), "nothing counted in the file");
+    }
+
+    /// **wsp-125: a stall under the orders machine is one order.** Told on the
+    /// tick that finds it, nothing more sent or said while it stays open, and
+    /// `stuck-commands.json` never written: the record is the folded stall.
+    #[test]
+    fn under_the_orders_machine_a_stall_told_once_and_still_open_sends_nothing_more() {
+        let (_env, store) = in_flight("stuck-orders");
+        let opened = crate::refusals::tests::open(&store, &["cpd-1"]);
+        let working = Orders { state: Some(State::Working), typed: false, sent: Default::default(), pressed: Default::default() };
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 400)], &|_| vec![4242]);
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 460)], &|_| panic!("ended once"));
+        assert!(working.sent.borrow().is_empty(), "nothing typed past the orders machine: {:?}", working.sent.borrow());
+        let orders = opened.0.orders_for(&wsp_store_contract::SeatId("cpd-1".into()), &[]).unwrap();
+        assert_eq!(orders.len(), 1, "one order for one stall: {orders:?}");
+        assert!(orders[0].text.contains("waiting on itself"), "{}", orders[0].text);
+        let said = stamped();
+        let told = said.iter().filter(|l| l.contains("cpd-1: a command has been")).count();
+        assert_eq!(told, 1, "said once: {said:?}");
+        assert!(said.iter().any(|l| l.contains("pid 4242")), "{said:?}");
+        assert!(!store.state.join(STUCK_FILE).exists(), "stuck-commands.json is not written");
+
+        // Another stall, another start: another order.
+        let later = crate::stuck::Stall { at: 2000, ..stall(true, 30) };
+        stuck_tick_with(&store, &working, &|_| vec![later.clone()], &|_| Vec::new());
+        assert_eq!(opened.0.orders_for(&wsp_store_contract::SeatId("cpd-1".into()), &[]).unwrap().len(), 2);
+        assert!(!store.state.join(STUCK_FILE).exists());
     }
 
     /// A [`Fake`] that also says which seats are **positively** not there — every
