@@ -105,9 +105,9 @@ All pass with those five unset. The fix is to clear the seat environment under t
 
 ## 4. Related: other replies past MAX_LINE (filed by wsp-697, never planned to a group)
 
-These go with the read work, so they're yours too if you want them.
+These go with the read work, so they're yours too if you want them, except wsp-702 (the subscribe snapshot), which Ed's side is now running because web-chrome's census feed is held on the poll until it lands.
 
-- **Ed's wsp-702 (high):** `subscribe {}`'s opening snapshot is 51,520,142 B. The client reconnects every 25 ms forever, costing the server about 1 s and 49 MB of encoding per round. Fix: send the snapshot as several frames, each under `MAX_LINE`, and back off after a loss that delivered nothing. Done when it delivers on the full store (state the largest frame's size), and a test pins the backoff.
+- **Taken back by Ed's side (2026-11-20 evening), don't run it:** Ed's wsp-702 (high): `subscribe {}`'s opening snapshot is 51,520,142 B. The client reconnects every 25 ms forever, costing the server about 1 s and 49 MB of encoding per round. Fix: send the snapshot as several frames, each under `MAX_LINE`, and back off after a loss that delivered nothing. Done when it delivers on the full store (state the largest frame's size), and a test pins the backoff.
 - **Ed's wsp-703 (after the `wip` read):** `state` (51.5 MB) and `rows {}` (40.6 MB) are sent anyway and the client drops the connection with `ConnError::Io`. Fix: refuse an oversized reply with a named code, and page `rows` (or offer heads only, which 2b may already give). Done when the full store answers with the code, and paged `rows` returns every row with each page under `MAX_LINE`.
 - **Ed's wsp-704:** the `events {from: 1000, limit: 1000}` page is 19.4 MB. Fix: cap a page by bytes as well as `MAX_EVENTS`, and say where it stopped. Done when paging from 0 returns every event, each page under the limit, with none lost or repeated.
 
