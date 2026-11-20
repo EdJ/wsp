@@ -48,8 +48,9 @@
 //! and [`Host::jobs`]: `job.run`, `job.stop` and `jobs` on [`Tcp`], and
 //! `wsp-host`'s runner in this process on [`InProcess`]. `WSP_JOBS=inproc|manager`
 //! chooses between them ([`choose_jobs`], [`jobs_chosen`]; `inproc` by
-//! default), apart from `WSP_HOST`. Nothing calls them yet; the callers move
-//! at M3's group 5.
+//! default), apart from `WSP_HOST`. The callers move at M3's group 5, the
+//! first `throttle run` (wsp-052), which also asks [`Host::job_host`] for the
+//! name a job's place carries and [`Host::facts`] for the beat it decides on.
 //!
 //! Not in the host yet: the far machine's ssh (`far.rs`'s [`crate::far::Wire`], M2's subject), and the
 //! doctor's checks of installed hook snippets, which read config rather than a
@@ -377,6 +378,20 @@ pub trait Host: Sync {
     /// `jobs`: the job table, running and ended.
     fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
         Err(refused(wsp_host_api::Refusal::Unsupported, "this host runs no jobs"))
+    }
+    /// The host its jobs run on, as its `hello` names itself: what a job's
+    /// `HostDir` names (M3 under T2, wsp-052). `None` where this host is not
+    /// asked by name (the in-process runner places a `dir` on this machine).
+    fn job_host(&self) -> Option<HostId> {
+        None
+    }
+    /// The host's facts as its manager's last beat read them (`seats`'s reply
+    /// carries them): what the throttle decides on under `WSP_JOBS=manager`
+    /// (d1 Q11, wsp-052), in place of its own `sysctl`, `pmset`, `ioreg` and
+    /// `vm_stat`. `None` with no beat yet, from a silent manager, and from the
+    /// in-process host, whose caller reads its own probes as before.
+    fn facts(&self) -> Option<wsp_host_api::HostFacts> {
+        None
     }
 }
 

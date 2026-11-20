@@ -1189,6 +1189,12 @@ impl Host for Tcp {
             ))),
         }
     }
+    fn job_host(&self) -> Option<wsp_host_api::HostId> {
+        self.hello().ok().map(|h| h.host)
+    }
+    fn facts(&self) -> Option<HostFacts> {
+        self.seats_within(SILENT).ok().and_then(|l| l.host)
+    }
     fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
         let said = self.ask(Message::Jobs(Jobs {}), SPAWN_WAIT, |m| matches!(m, Message::JobsList(_))).map_err(JobError::Silent)?;
         match said.into_iter().next() {

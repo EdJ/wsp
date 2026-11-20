@@ -4374,7 +4374,10 @@ impl Wip {
 /// `ioreg`, `pmset` and a `kill` per build holder, for [`Wip::from_api`]: the
 /// person's idle time (so `auto` is in force or away as on the files path),
 /// the clock and the cores as the beat read them, each holder's pid asked of
-/// kill(2). With no beat the idle time is unreadable, as where `ioreg` fails.
+/// kill(2), and under `WSP_JOBS=manager` a build's hold read from the
+/// manager's job table instead (wsp-052; the files path's `status_line` reads
+/// the beat there too). With no beat the idle time is unreadable, as where
+/// `ioreg` fails.
 ///
 /// The beat says 100 where `pmset` records no `CPU_Speed_Limit`, which the
 /// files path reads as no clock at all (Apple silicon prints none): an

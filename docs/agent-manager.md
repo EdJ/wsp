@@ -1236,6 +1236,40 @@ child. A timeout says `timed_out`, and a `dir` outside the root is refused `no_t
 manager is "host silent" within a second with nothing run, that `WSP_JOBS` is chosen independently of `WSP_HOST`,
 and that a job whose manager restarts mid-run is resent under its key and runs once.
 
+#### M3 group 5: `throttle run` under `WSP_JOBS=manager` (wsp-052, 2026-11-20)
+
+`wsp throttle run` (crates/trees/src/throttle.rs) is the first caller to move. Under `inproc`, and on a host with no
+manager record (the i5 before M2), nothing changes: `run_in` runs the build in this process as before. Under
+`manager`, `run_raw` takes `run_raw_on`, and `run_on` keeps the decision here (d1 Q11):
+- **The decision reads the beat.** The person's idle time, the clock and the cores come from `Host::facts`, which is
+  the facts on the manager's `seats` reply (hello carries none), and not from `ioreg`, `pmset` or `sysctl`. Through
+  the same reading (`View::of_host`, `Given::of_facts`), `wsp throttle`, `wip`'s files-path line, `doctor` and the
+  daemon's `sweep:throttle` see the same machine. With no beat yet there is no load and no clock, and `auto` holds.
+- **An admitted run is one `job.run`.** That is a heavy build or a `cargo run`, at the shim's cwd as a
+  `HostDir {host: the manager's own name (Host::job_host), path: relative to its tree root}`. The tree root is the
+  home directory, which is the manager's default. Class `check` is for `cargo check` and `clippy`, and `build` is
+  for the rest. The argv is `nice -n 12` when niced, then `env -i` with the allowlist (`PATH`, `HOME`, `TERM`,
+  `CARGO_TERM_COLOR`, `CARGO_*`, `RUST*`, `SCCACHE_*`, `WSP_*` with no `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
+  `CRED` or `COOKIE` in the name), then the hold and the job cap the decision set, then the real tool. The output
+  goes to the shim's stdout as `job.output` arrives (the job's log is one stream, so stderr is in it). The exit is
+  the job's. A tool's own signal is the shell's 128+n. A job ended by a stop or its bound exits 143, and one the
+  shim's ^C stopped exits 130. The job is not detached, so a shim killed with its agent stops it. A run refused
+  `full` waits and asks again under the same key. Any other refusal, and a silent manager, run nothing here
+  instead.
+- **^C is `job.stop`.** The job is in its own process group, not the terminal's, so the shim catches SIGINT
+  while the job runs and stops it.
+- **Holds carry the job's key and are read from the job table** (`live_by`). A running job holds. An ended job does
+  not, with no `kill -0`. A job not in the table yet holds for 60 s from the hold's mtime, and the holder refreshes
+  it while it waits for a slot or for `full`. A hold that is no job's (a check's slot, an in-process run), or one
+  whose table could not be read, is judged by its pid as before. wsp-053 moves the check slots.
+
+Tests (crates/trees/src/throttle.rs, `manager_tests`) run a loopback manager with `sh` standing in for cargo. One
+run is one row in `jobs`, and its output, exit, cap, hold and nice reach the caller with no token in the
+environment. A slot left in this process's own name, whose job has ended, is taken at once with no pid asked. A
+beat that says the person left, the person is here, or the clock is limited drives the decision. `run_raw` run as
+its own process ships the build as its job, and its call log has none of `sysctl`, `pmset`, `ioreg`, `vm_stat`, `ps`
+or `kill`. SIGINT to that process stops the job (exit 130, the tool gone, the job ended in the table).
+
 #### M3 under T2 (wsp-093, 2026-11-18)
 
 Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**

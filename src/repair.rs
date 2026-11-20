@@ -423,20 +423,13 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::pickup::tick(store);
 }
 
-/// A beat's facts as the throttle reads them. A thermal state is the top of
-/// its band of `CPU_Speed_Limit` (`wsp_host::facts::parse_thermal`'s bands).
+/// A beat's facts as the throttle reads them: the same reading `throttle run`
+/// decides on under `WSP_JOBS=manager` ([`crate::throttle::Given::of_facts`],
+/// wsp-052): the beat's `CPU_Speed_Limit`, else the top of its thermal state's
+/// band. The holds the sweep reaps are judged by the manager's job table
+/// there, not by `kill -0`.
 pub(crate) fn throttle_given(f: &wsp_host_api::HostFacts) -> crate::throttle::Given {
-    use wsp_host_api::Thermal;
-    crate::throttle::Given {
-        load1: f.load_centi as f64 / 100.0,
-        cores: f.cpus as usize,
-        speed_limit: Some(match f.thermal {
-            Thermal::Nominal => 100,
-            Thermal::Fair => 99,
-            Thermal::Serious => 79,
-            Thermal::Critical => 49,
-        }),
-    }
+    crate::throttle::Given::of_facts(f)
 }
 
 /// The step on every running list: what the tick does first, and again once an

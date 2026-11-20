@@ -74,6 +74,8 @@ use serde_json::{json, Value};
 
 use crate::store::Store;
 use crate::host::LOCAL;
+use crate::host::{HostDir, HostId, JobAt, JobClass, JobError, JobKey, JobRow, JobRun, JobState};
+use wsp_host_api::{HostFacts, Thermal};
 use crate::util;
 use crate::base::args::Args;
 
@@ -973,6 +975,52 @@ fn holder_pid(v: &Value) -> u32 {
     v.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32
 }
 
+/// The job a hold's build runs as, under `WSP_JOBS=manager` (wsp-052): its
+/// key, written into the hold before the job is asked for.
+fn job_of(v: &Value) -> Option<JobKey> {
+    serde_json::from_value(v.get("job")?.clone()).ok()
+}
+
+/// How long a hold whose job the manager's table does not hold yet is still
+/// its holder's: the moment between taking the hold and `job.run`, and a run
+/// refused `full` that waits. The holder keeps the file fresh while it waits
+/// ([`touch`]), so only a holder gone before its job started outlives this.
+const JOB_START_GRACE: Duration = Duration::from_secs(60);
+
+fn age_of(path: &Path) -> Duration {
+    fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).unwrap_or_default()
+}
+
+/// A hold's file marked fresh, for [`JOB_START_GRACE`].
+fn touch(path: &Path) {
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Whether a hold's holder still holds it. A hold whose build is a job
+/// (`WSP_JOBS=manager`) is judged by the manager's job table, `table`: its job
+/// running holds, its job ended does not, and a job not in the table yet holds
+/// for [`JOB_START_GRACE`] after the file was last marked. No `kill -0` is sent
+/// for it. Any other hold (today's in-process run, a check's slot), and a
+/// job's hold where the table could not be read, is its holder's pid asked of
+/// `alive`, as before.
+pub(crate) fn live_by<'a>(table: Option<Vec<JobRow>>, alive: &'a dyn Fn(u32) -> bool) -> impl Fn(&Path, &Value) -> bool + 'a {
+    move |path: &Path, v: &Value| match (job_of(v), &table) {
+        (Some(key), Some(t)) => match t.iter().find(|r| r.key == key) {
+            Some(r) => r.state == JobState::Running,
+            None => age_of(path) < JOB_START_GRACE,
+        },
+        _ => alive(holder_pid(v)),
+    }
+}
+
+/// The holds' liveness now: under `WSP_JOBS=manager`, the manager's job table
+/// read once; otherwise each holder's pid.
+fn live_now<'a>(state: &Path, alive: &'a dyn Fn(u32) -> bool) -> impl Fn(&Path, &Value) -> bool + 'a {
+    live_by(manager_jobs(state).ok().flatten().and_then(|h| h.jobs().ok()), alive)
+}
+
 /// A hold taken. Dropping it releases the file, if it is still ours.
 pub struct Hold {
     path: PathBuf,
@@ -995,9 +1043,15 @@ enum Taken {
     HeldBy(Value),
 }
 
-/// Try for the hold at `path`. A file whose owner is dead, or that never got
-/// its contents and is old, is taken over under a mutex.
+/// Try for the hold at `path`. A file whose owner is gone ([`live_by`] says how
+/// that is judged), or that never got its contents and is old, is taken over
+/// under a mutex.
 fn take(path: &Path, rec: &Value, alive: &dyn Fn(u32) -> bool) -> Taken {
+    take_by(path, rec, &live_by(None, alive))
+}
+
+/// [`take`], the current holder judged by `live` ([`live_by`]).
+fn take_by(path: &Path, rec: &Value, live: &dyn Fn(&Path, &Value) -> bool) -> Taken {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
@@ -1016,7 +1070,7 @@ fn take(path: &Path, rec: &Value, alive: &dyn Fn(u32) -> bool) -> Taken {
         fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).unwrap_or_default()
     };
     let stale = |v: &Option<Value>| match v {
-        Some(v) => !alive(holder_pid(v)),
+        Some(v) => !live(path, v),
         None => age() > Duration::from_secs(5),
     };
     let seen = current();
@@ -1294,7 +1348,89 @@ pub fn full_suite_seats(state: &Path) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// Today's run: the build runs in this process, niced and capped as decided.
 pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
+    run_on(ctx, None, tool, args)
+}
+
+/// Where `throttle run` sends an admitted build under `WSP_JOBS=manager`
+/// (wsp-052): the manager on the host this shim runs on.
+pub struct Jobs<'a> {
+    pub host: &'a dyn crate::host::Host,
+    /// The host the job runs on, as its manager names itself: this one. A
+    /// job's place is never a path read on another machine.
+    pub on: HostId,
+    /// The manager's tree root, which the job's `dir` is relative to.
+    pub tree_root: PathBuf,
+    /// The caller's environment, which the job's is drawn from ([`job_env`]).
+    pub env: Vec<(String, String)>,
+    /// Where the job's output goes as it comes: the shim's own stdout.
+    pub out: &'a (dyn Fn(&str) + Sync),
+}
+
+/// A job's bound when nothing else bounds it: today's in-process run has
+/// none, and a day stands in for none (the manager's own job retention).
+const JOB_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// The job class of a run: one that only reads the code (`check`, `clippy`)
+/// is the manager's `check`, any other is a `build`.
+pub fn job_class(tool: &str, args: &[String]) -> JobClass {
+    match (tool, subcommand(args)) {
+        ("cargo", Some("check" | "c" | "clippy")) => JobClass::Check,
+        _ => JobClass::Build,
+    }
+}
+
+/// The names of the caller's environment a job gets: `PATH`, `HOME`, `TERM`,
+/// `CARGO_TERM_COLOR`, `CARGO_*`, `RUST*`, `SCCACHE_*`, and the `WSP_*` names
+/// that hold no secret. Nothing else crosses, a token least of all.
+pub fn job_env_allows(name: &str) -> bool {
+    let secret = ["TOKEN", "SECRET", "KEY", "PASS", "AUTH", "CRED", "COOKIE"].iter().any(|w| name.contains(w));
+    match name {
+        "PATH" | "HOME" | "TERM" | "CARGO_TERM_COLOR" => true,
+        _ if secret => false,
+        _ => ["CARGO_", "RUST", "SCCACHE_", "WSP_"].iter().any(|p| name.starts_with(p)),
+    }
+}
+
+/// The job's environment: the allowed names of `caller`, then what this run
+/// sets (its hold, its job cap) over them, in name order.
+pub fn job_env(caller: &[(String, String)], set: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env: BTreeMap<String, String> = caller.iter().filter(|(k, _)| job_env_allows(k)).cloned().collect();
+    env.extend(set.iter().cloned());
+    env.into_iter().collect()
+}
+
+/// The job's argv: `nice -n N` when niced, then `env -i K=V …` so the job
+/// runs with [`job_env`] and nothing of the manager's own, then the tool.
+pub fn job_argv(real: &Path, args: &[String], env: &[(String, String)], nice: Option<i32>) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(n) = nice {
+        argv.extend(["nice".to_string(), "-n".to_string(), n.to_string()]);
+    }
+    argv.extend(["env".to_string(), "-i".to_string()]);
+    argv.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
+    argv.push(real.display().to_string());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+/// The run's key, made once: unique per run (wsp-040), under its row when
+/// there is one.
+fn job_key_now(task: &str, tool: &str, args: &[String]) -> JobKey {
+    let row = if task.is_empty() { "throttle" } else { task };
+    let what = subcommand(args).unwrap_or(tool);
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    crate::host::job_key(row, 0, &format!("throttle:{what}@{at}.{}", std::process::id()))
+}
+
+/// [`run_in`], and under `WSP_JOBS=manager` (`jobs`) an admitted run, heavy
+/// or `cargo run`, is the manager's job: the decision (the tree, the slot,
+/// the nice and the job cap) is taken here as before, and the holds carry the
+/// job's key so their liveness is read from the job table. A light run and a
+/// run inside a hold exec here as they do today, with no slot and nothing to
+/// kill.
+pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i32 {
     let settings = Settings::load(ctx.state);
     let shims = shim_dir(ctx.state);
     let Some(real) = real_tool(tool, &ctx.path_var, &shims) else {
@@ -1335,22 +1471,33 @@ pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
     // nice stays the person's.
     let hot = || settings.is_hot((ctx.thermal)());
     let mut _holds = Vec::new();
+    let key = jobs.map(|_| job_key_now(&ctx.task, tool, args));
+    // The job table, read at each try, where the holds are jobs.
+    let table = || jobs.and_then(|j| j.host.jobs().ok());
+    let mut set: Vec<(String, String)> = Vec::new();
     if weight == Weight::Heavy {
         let tree = tree_of(&ctx.cwd);
-        let rec = record(&ctx.task, tool, args, &tree);
+        let mut rec = record(&ctx.task, tool, args, &tree);
+        if let Some(k) = &key {
+            rec["job"] = serde_json::to_value(k).unwrap_or(Value::Null);
+        }
         // The tree first and the slot second: a build waiting on its own tree
         // must not be sitting on a slot somebody else could use.
         if tool == "cargo" {
-            let mut grab = || take(&tree_path(ctx.state, &tree), &rec, ctx.alive);
+            let mut grab = || take_by(&tree_path(ctx.state, &tree), &rec, &live_by(table(), ctx.alive));
             _holds.push(wait_for(ctx, "its tree", &mut grab, None));
         }
         if force() || hot() {
+            let fresh: Vec<PathBuf> = _holds.iter().map(|h: &Hold| h.path.clone()).collect();
             let mut grab = || {
+                // A job's tree hold stays its own while it waits here.
+                fresh.iter().for_each(|p| touch(p));
+                let live = live_by(table(), ctx.alive);
                 // Read at each try: a wait that began cool ends hot.
                 let n = settings.slots_at(ctx.cores, hot());
                 let mut seen = Value::Null;
                 for i in 0..n {
-                    match take(&slot_path(ctx.state, i), &rec, ctx.alive) {
+                    match take_by(&slot_path(ctx.state, i), &rec, &live) {
                         Taken::Yours(h) => return Taken::Yours(h),
                         Taken::HeldBy(v) => seen = v,
                     }
@@ -1360,6 +1507,7 @@ pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
             _holds.push(wait_for(ctx, "a build slot", &mut grab, Some(&|| !force() && !hot())));
         }
         cmd.env(HELD, tree.display().to_string());
+        set.push((HELD.to_string(), tree.display().to_string()));
     }
     let mut niced = None;
     let limited = hot();
@@ -1371,10 +1519,106 @@ pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
             let wanted = settings.jobs_at(ctx.cores, limited);
             let wanted = if force() && limited { wanted.min(settings.job_cap(ctx.cores)) } else { wanted };
             let theirs = (ctx.env)(var).and_then(|v| v.parse::<usize>().ok());
-            cmd.env(var, theirs.map_or(wanted, |t| t.min(wanted)).to_string());
+            let cap = theirs.map_or(wanted, |t| t.min(wanted)).to_string();
+            cmd.env(var, &cap);
+            set.push((var.clone(), cap));
         }
     }
-    finish(cmd, niced)
+    match (jobs, key) {
+        (Some(j), Some(key)) => {
+            let argv = job_argv(&real, args, &job_env(&j.env, &set), niced);
+            as_job(ctx, j, key, job_class(tool, args), argv, &_holds)
+        }
+        _ => finish(cmd, niced),
+    }
+}
+
+/// Set by ^C while a job runs: the shim's own process is not in the job's
+/// process group, so the terminal's ^C reaches only the shim, which turns it
+/// into `job.stop`.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_: i32) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// The relative place of `cwd` under `root`, `/` between its parts.
+fn place_under(cwd: &Path, root: &Path) -> Option<String> {
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let rel = cwd.strip_prefix(&root).ok()?;
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    Some(if parts.is_empty() { ".".to_string() } else { parts.join("/") })
+}
+
+/// One `job.run` of `argv` at the shim's cwd on this host, its output to
+/// [`Jobs::out`] as it comes, ^C turned into `job.stop`, and the shim's exit
+/// the job's: its exit status (a tool's signal is the shell's 128+n), 130 for
+/// a run ^C stopped, and 128+15 for a job its bound or a stop ended. A run
+/// the manager refuses `full` waits and is asked again under the same key,
+/// queued, not failed; any other refusal, and a silent manager, run nothing
+/// here instead.
+fn as_job(ctx: &Ctx, j: &Jobs, key: JobKey, class: JobClass, argv: Vec<String>, holds: &[Hold]) -> i32 {
+    let Some(path) = place_under(&ctx.cwd, &j.tree_root) else {
+        (ctx.say)(&format!(
+            "wsp: {} is not under the manager's tree root {}, so the build cannot run as its job (WSP_JOBS=manager)",
+            ctx.cwd.display(),
+            j.tree_root.display()
+        ));
+        return 126;
+    };
+    let run = JobRun {
+        key: key.clone(),
+        class,
+        argv,
+        at: JobAt::Dir(HostDir { host: j.on.clone(), path }),
+        timeout_secs: JOB_TIMEOUT_SECS,
+        hung_after_secs: None,
+        detach: false,
+    };
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    // SAFETY: the handler stores to an atomic, which is async-signal-safe.
+    unsafe {
+        signal(2, on_interrupt as *const () as usize);
+    }
+    let out = j.out;
+    let host = j.host;
+    let mut said_full = false;
+    loop {
+        let (ended, stopped) = std::thread::scope(|s| {
+            let worker = s.spawn(|| host.run_job(&run, &mut |o| out(&o.text)));
+            let mut stopped = false;
+            while !worker.is_finished() {
+                if !stopped && INTERRUPTED.load(Ordering::SeqCst) {
+                    stopped = true;
+                    let _ = host.stop_job(&run.key, crate::host::JOB_GRACE + Duration::from_secs(5));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (worker.join().unwrap_or_else(|_| Err(JobError::Unanswered("the job's watcher panicked".into()))), stopped)
+        });
+        return match ended {
+            Err(JobError::Refused { why: wsp_host_api::Refusal::Full, detail }) if !stopped && !INTERRUPTED.load(Ordering::SeqCst) => {
+                if !said_full {
+                    let class = format!("{class:?}").to_lowercase();
+                    (ctx.say)(&format!("wsp: waiting for a {class} job slot at the manager ({detail}). Queued, not failed; this is wsp's build throttle"));
+                    said_full = true;
+                }
+                holds.iter().for_each(|h| touch(&h.path));
+                std::thread::sleep(ctx.poll);
+                continue;
+            }
+            _ if stopped || INTERRUPTED.load(Ordering::SeqCst) => 130,
+            Ok(e) => e.exit.unwrap_or(128 + 15),
+            Err(e) => {
+                (ctx.say)(&format!("wsp: the build was not run here instead: {e}"));
+                126
+            }
+        };
+    }
 }
 
 /// Keep trying until `attempt` is ours, saying who has it at the start and
@@ -1541,6 +1785,14 @@ pub fn run_raw(argv: &[String]) -> i32 {
         return 2;
     };
     let store = Store::open();
+    match manager_jobs(&store.state) {
+        Ok(None) => {}
+        Ok(Some(host)) => return run_raw_on(&store, host, tool, args),
+        Err(why) => {
+            eprintln!("wsp: {why}; the build was not run");
+            return 126;
+        }
+    }
     let idle = hid_idle_secs;
     let thermal = speed_limit;
     let say = |m: &str| eprintln!("{m}");
@@ -1568,6 +1820,82 @@ pub fn run_raw(argv: &[String]) -> i32 {
         body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
     };
     run_in(&ctx, tool, args)
+}
+
+/// The host `throttle run`'s admitted builds go to: under `WSP_JOBS=manager`,
+/// the manager this host's record names (loopback, on the host the shim runs
+/// on). `None` under `inproc`, and on a host with no manager record (the i5
+/// before M2), which keeps today's in-process run. A manager that is recorded
+/// and does not answer is "host silent", an error, and nothing is run here in
+/// its place.
+pub fn manager_jobs(state: &Path) -> Result<Option<&'static dyn crate::host::Host>, String> {
+    use crate::host::{HostError, JobsChoice};
+    match JobsChoice::from_env().map_err(|e| e.to_string())? {
+        JobsChoice::Inproc => Ok(None),
+        JobsChoice::Manager => match crate::host::choose_jobs(JobsChoice::Manager, state, env!("CARGO_PKG_VERSION")) {
+            Ok(h) => Ok(Some(h)),
+            Err(HostError::NoRecord(_)) => Ok(None),
+            Err(e) => Err(format!("WSP_JOBS=manager: {e}")),
+        },
+    }
+}
+
+/// The decision's readings out of a beat, asked of `facts` at each read: the
+/// person's idle time and the clock, as `ioreg` and `pmset` gave them before.
+pub fn beat_idle(facts: &dyn Fn() -> Option<HostFacts>) -> impl Fn() -> Option<u64> + '_ {
+    move || facts().and_then(|f| f.hid_idle_secs)
+}
+
+/// The clock out of a beat, as [`beat_idle`]: under 100% when limited.
+pub fn beat_thermal(facts: &dyn Fn() -> Option<HostFacts>) -> impl Fn() -> Option<u32> + '_ {
+    move || facts().as_ref().and_then(limit_of)
+}
+
+/// [`run_raw`] under `WSP_JOBS=manager`: the decision reads the manager's
+/// beat (d1 Q11: wsp keeps the decision), the holds the job table, and an
+/// admitted build is one `job.run` at the shim's cwd under the manager's tree
+/// root (the home directory, the manager's default).
+fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, args: &[String]) -> i32 {
+    let Some(on) = host.job_host() else {
+        eprintln!("wsp: WSP_JOBS=manager and the manager did not say its host; the build was not run");
+        return 126;
+    };
+    let facts = || host.facts();
+    let (idle, thermal) = (beat_idle(&facts), beat_thermal(&facts));
+    let cores = facts().map(|f| (f.cpus as usize).max(1)).unwrap_or_else(cores_unprobed);
+    let say = |m: &str| eprintln!("{m}");
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let out = |text: &str| {
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(text.as_bytes());
+        let _ = o.flush();
+    };
+    let ctx = Ctx {
+        state: &store.state,
+        cwd: std::env::current_dir().unwrap_or_default(),
+        path_var: std::env::var("PATH").unwrap_or_default(),
+        task: std::env::var("WSP_TASK").unwrap_or_default(),
+        cores,
+        idle: &idle,
+        thermal: &thermal,
+        // Asked only of a hold that is no job's (a check's slot, an
+        // in-process run's): a job's hold is read from the table.
+        alive: &alive,
+        say: &say,
+        poll: Duration::from_secs(1),
+        held: std::env::var_os(HELD).is_some_and(|v| !v.is_empty()),
+        env: &env,
+        log: &|task, line| {
+            if let Some(mut t) = store.find_task(task) {
+                t.log(line);
+                t.touch();
+                let _ = store.save_task(&t);
+            }
+        },
+        body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
+    };
+    let jobs = Jobs { host, on, tree_root: util::home(), env: std::env::vars().collect(), out: &out };
+    run_on(&ctx, Some(&jobs), tool, args)
 }
 
 // ---- the shims, and the seat's PATH -----------------------------------------
@@ -1659,7 +1987,12 @@ pub struct Checks {
 }
 
 impl View {
+    /// The throttle as it stands. Under `WSP_JOBS=manager` the machine is the
+    /// manager's beat and each hold is judged by its job table ([`View::of_host`]).
     pub fn read(state: &Path) -> View {
+        if let Ok(Some(host)) = manager_jobs(state) {
+            return View::of_host(state, host);
+        }
         let settings = Settings::load(state);
         let idle = match settings.mode {
             Mode::Auto => hid_idle_secs(),
@@ -1679,6 +2012,21 @@ impl View {
         }
     }
 
+    /// [`View::read`] under `WSP_JOBS=manager` (wsp-052): the load, cores,
+    /// clock and the person's idle time from the manager's last beat, each
+    /// hold from its job table. No `sysctl`, `pmset`, `ioreg` or `kill` here;
+    /// with no beat yet, no load and no clock are read, and `auto` holds.
+    pub fn of_host(state: &Path, host: &dyn crate::host::Host) -> View {
+        let f = host.facts();
+        let given = match &f {
+            Some(f) => Given { speed_limit: limit_of(f), ..Given::of_facts(f) },
+            None => Given { load1: 0.0, cores: cores_unprobed(), speed_limit: None },
+        };
+        let mut v = View::of_live(state, given, f.as_ref().and_then(|f| f.hid_idle_secs), &live_by(host.jobs().ok(), &alive));
+        v.load = f.as_ref().map(loads_of);
+        v
+    }
+
     /// [`View::read`] with the machine's facts handed in ([`Given`]): the
     /// person's idle time is not read, so `auto` reads as in force.
     pub fn given(state: &Path, g: Given) -> View {
@@ -1690,7 +2038,13 @@ impl View {
     /// and each build holder's liveness asked of `alive`: for `wip` through
     /// the API, which reads the machine from the manager's beat and runs no
     /// child (wsp-076).
+    /// Under `WSP_JOBS=manager` a hold whose build is a job is judged by the
+    /// manager's job table rather than `alive` ([`live_by`], wsp-052).
     pub fn of_beat(state: &Path, g: Given, idle_secs: Option<u64>, alive: &dyn Fn(u32) -> bool) -> View {
+        View::of_live(state, g, idle_secs, &live_now(state, alive))
+    }
+
+    fn of_live(state: &Path, g: Given, idle_secs: Option<u64>, live: &dyn Fn(&Path, &Value) -> bool) -> View {
         let settings = Settings::load(state);
         let idle = match settings.mode {
             Mode::Auto => idle_secs,
@@ -1704,8 +2058,8 @@ impl View {
             cores: g.cores.max(1),
             load: Some((g.load1, g.load1, g.load1)),
             thermal: g.speed_limit,
-            builds: builds(state, alive),
-            checks: checks(state, alive),
+            builds: builds_by(state, live),
+            checks: checks_by(state, live),
             shims: shim_dir(state),
         }
     }
@@ -1867,6 +2221,10 @@ impl View {
 }
 
 fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
+    builds_by(state, &live_by(None, alive))
+}
+
+fn builds_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> Vec<Build> {
     let read = |name: &str| -> Vec<(String, Value)> {
         let mut v: Vec<(String, Value)> = fs::read_dir(builds_dir(state))
             .into_iter()
@@ -1875,7 +2233,7 @@ fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
             .filter(|e| e.file_name().to_string_lossy().starts_with(name))
             .filter_map(|e| {
                 let v: Value = serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok()?;
-                alive(holder_pid(&v)).then(|| (e.file_name().to_string_lossy().to_string(), v))
+                live(&e.path(), &v).then(|| (e.file_name().to_string_lossy().to_string(), v))
             })
             .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1894,11 +2252,15 @@ fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
 }
 
 fn checks(state: &Path, alive: &dyn Fn(u32) -> bool) -> Checks {
+    checks_by(state, &live_by(None, alive))
+}
+
+fn checks_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> Checks {
     let mut out = Checks::default();
     for e in fs::read_dir(builds_dir(state)).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(v) = fs::read_to_string(e.path()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
-        if !alive(holder_pid(&v)) {
+        if !live(&e.path(), &v) {
             continue;
         }
         if let Some(n) = name.strip_prefix("check-").and_then(|n| n.parse::<usize>().ok()) {
@@ -1973,7 +2335,7 @@ pub fn tidy(store: &Store) {
     if cfg!(test) {
         return;
     }
-    reap(&store.state, &alive);
+    reap_by(&store.state, &live_now(&store.state, &alive));
     warn(store, &View::read(&store.state));
 }
 
@@ -1989,11 +2351,50 @@ pub struct Given {
     pub speed_limit: Option<u32>,
 }
 
+impl Given {
+    /// A beat's facts as the throttle reads them: the one-minute load, the
+    /// cores, and the clock as its `CPU_Speed_Limit`, or, from a manager that
+    /// sends no percent, the top of its thermal state's band
+    /// (`wsp_host::facts::parse_thermal`'s bands).
+    pub fn of_facts(f: &HostFacts) -> Given {
+        Given {
+            load1: f.load_centi as f64 / 100.0,
+            cores: (f.cpus as usize).max(1),
+            speed_limit: Some(f.speed_limit_pct.unwrap_or(match f.thermal {
+                Thermal::Nominal => 100,
+                Thermal::Fair => 99,
+                Thermal::Serious => 79,
+                Thermal::Critical => 49,
+            })),
+        }
+    }
+}
+
+/// The clock a beat says, as `pmset` would have: a limit under 100%, and no
+/// cell for an unlimited clock (the beat says 100 where `pmset` records none).
+fn limit_of(f: &HostFacts) -> Option<u32> {
+    Given::of_facts(f).speed_limit.filter(|&p| p < 100)
+}
+
+/// The three load averages a beat says; a five- or fifteen-minute one it does
+/// not carry reads as the shorter one.
+fn loads_of(f: &HostFacts) -> (f64, f64, f64) {
+    let centi = |c: u32| c as f64 / 100.0;
+    let one = centi(f.load_centi);
+    let five = f.load5_centi.map(centi).unwrap_or(one);
+    (one, five, f.load15_centi.map(centi).unwrap_or(five))
+}
+
+/// The cores as this process knows them without asking anything.
+fn cores_unprobed() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 /// [`tidy`] over `given` rather than a reading of its own: no `sysctl`, no
 /// `pmset`, no `ioreg`. Under test as well, because nothing here probes.
 pub fn tidy_given(store: &Store, given: Option<Given>) {
     if !cfg!(test) {
-        reap(&store.state, &alive);
+        reap_by(&store.state, &live_now(&store.state, &alive));
     }
     // Nothing folded yet is no reading, and no warning edge either way.
     let Some(g) = given else { return };
@@ -2015,6 +2416,11 @@ fn warn(store: &Store, v: &View) {
 }
 
 pub fn reap(state: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
+    reap_by(state, &live_by(None, alive))
+}
+
+/// [`reap`], each hold judged by `live` ([`live_by`]).
+fn reap_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> usize {
     let mut n = 0;
     for e in fs::read_dir(builds_dir(state)).into_iter().flatten().flatten() {
         let path = e.path();
@@ -2022,7 +2428,7 @@ pub fn reap(state: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
             continue;
         }
         let dead = match fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
-            Some(v) => !alive(holder_pid(&v)),
+            Some(v) => !live(&path, &v),
             None => false,
         };
         if dead && fs::remove_file(&path).is_ok() {
@@ -3169,5 +3575,391 @@ mod tests {
         let out = v.render();
         assert!(out.contains("checks: 4 at once machine-wide (the clock is limited)"), "{out}");
         assert!(out.contains("check slot 2/4") && out.contains("waiting for a check slot"), "{out}");
+    }
+}
+
+/// `throttle run` under `WSP_JOBS=manager` (wsp-052), on a loopback manager
+/// with `sh` standing in for the tool: an admitted run is one `job.run`, its
+/// output and exit reach the caller, ^C stops the job, a slot whose job ended
+/// is free with no `kill -0`, and the decision reads the beat's facts with
+/// none of `sysctl`, `pmset`, `ioreg`, `vm_stat`, `ps` or `kill` from wsp.
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    use wsp_host_api::{Role, Token};
+    use wsp_manager::{Config, Manager, TOKEN_FILE};
+
+    fn s(w: &[&str]) -> Vec<String> {
+        w.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// The stand-in tool: says what it was given, and its niceness, on its
+    /// stdout; writes its pid and sleeps when told to; exits as told. What it
+    /// reads crosses `env -i`, so its knobs are `WSP_` names.
+    const FAKE: &str = "#!/bin/sh\n\
+        echo \"built by job: jobs=${CARGO_BUILD_JOBS:-none} held=${WSP_BUILD_HELD:+yes} token=${WSP_TOKEN:-none} other=${OTHER:-none} nice=$(nice) args=$*\"\n\
+        [ -n \"$WSP_FAKE_PIDFILE\" ] && echo $$ > \"$WSP_FAKE_PIDFILE\"\n\
+        [ -n \"$WSP_FAKE_SLEEP\" ] && sleep \"$WSP_FAKE_SLEEP\"\n\
+        exit ${WSP_FAKE_EXIT:-0}\n";
+
+    struct Rig {
+        iso: crate::util::Isolated,
+        bin: PathBuf,
+        state: PathBuf,
+        root: PathBuf,
+        tree: PathBuf,
+        exec: PathBuf,
+    }
+
+    fn rig(name: &str) -> Rig {
+        let iso = crate::util::isolated(name);
+        std::env::remove_var(HELD);
+        std::env::remove_var("CARGO_BUILD_JOBS");
+        let bin = iso.path("bin");
+        fs::create_dir_all(&bin).unwrap();
+        wsp_testkit::script(&bin.join("cargo"), FAKE);
+        let root = iso.path("root");
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join(".git"), "gitdir: x").unwrap();
+        let state = iso.state();
+        let exec = iso.path("exec");
+        Rig { iso, bin, state, root, tree, exec }
+    }
+
+    fn manager(rig: &Rig) -> Manager {
+        let mut cfg = Config::new(&rig.exec, "test-host");
+        cfg.port = 0;
+        cfg.tree_root = rig.root.clone();
+        cfg.beat = Duration::from_millis(200);
+        let since = Instant::now();
+        loop {
+            match Manager::start(cfg.clone()) {
+                Ok(m) => return m,
+                Err(wsp_manager::StartError::Locked { .. }) if since.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("the manager starts on loopback: {e}"),
+            }
+        }
+    }
+
+    fn tcp(rig: &Rig, m: &Manager) -> crate::host::Tcp {
+        let token = Token(fs::read_to_string(rig.exec.join(TOKEN_FILE)).unwrap().trim().to_string());
+        crate::host::Tcp::new(m.addrs()[0], token, Role::Cli, "test")
+    }
+
+    fn mode(rig: &Rig, m: Mode, slots: usize) {
+        Settings { mode: m, slots: Some(slots), jobs: Some(2), ..Settings::default() }.save(&rig.state).unwrap();
+    }
+
+    fn ctx<'a>(rig: &'a Rig, alive: &'a dyn Fn(u32) -> bool, say: &'a dyn Fn(&str)) -> Ctx<'a> {
+        Ctx {
+            state: &rig.state,
+            cwd: rig.tree.clone(),
+            path_var: format!("{}:/usr/bin:/bin", rig.bin.display()),
+            task: "wsp-9".into(),
+            cores: 8,
+            idle: &|| Some(0),
+            thermal: &|| None,
+            alive,
+            say,
+            poll: Duration::from_millis(20),
+            held: false,
+            env: &|_| None,
+            log: &|_, _| {},
+            body: &|_| String::new(),
+        }
+    }
+
+    fn caller_env() -> Vec<(String, String)> {
+        vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), "/nowhere".into()),
+            ("WSP_TOKEN".into(), "s3cret".into()),
+            ("OTHER".into(), "x".into()),
+            ("CARGO_HOME".into(), "/c".into()),
+        ]
+    }
+
+    /// The niceness this process runs at, which the manager in it hands on.
+    fn base_nice() -> i32 {
+        let out = std::process::Command::new("nice").output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    #[test]
+    fn the_jobs_environment_is_an_allowlist_and_nice_is_an_argv_prefix() {
+        for ok in ["PATH", "HOME", "TERM", "CARGO_TERM_COLOR", "CARGO_HOME", "RUSTFLAGS", "RUSTC_WRAPPER", "SCCACHE_DIR", "WSP_TASK", HELD] {
+            assert!(job_env_allows(ok), "{ok}");
+        }
+        for no in ["WSP_TOKEN", "WSP_MANAGER_TOKEN", "CARGO_REGISTRY_TOKEN", "WSP_API_KEY", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "SSH_AUTH_SOCK", "OTHER", "LD_PRELOAD"] {
+            assert!(!job_env_allows(no), "{no}");
+        }
+        let env = job_env(&caller_env(), &[("CARGO_BUILD_JOBS".into(), "2".into())]);
+        let argv = job_argv(Path::new("/bin/cargo"), &s(&["build"]), &env, Some(NICE));
+        assert_eq!(&argv[..5], &s(&["nice", "-n", "12", "env", "-i"])[..]);
+        assert_eq!(&argv[argv.len() - 2..], &s(&["/bin/cargo", "build"])[..]);
+        let line = argv.join(" ");
+        assert!(line.contains("CARGO_BUILD_JOBS=2") && line.contains("CARGO_HOME=/c") && line.contains("PATH=/usr/bin:/bin"), "{line}");
+        assert!(!line.contains("s3cret") && !line.contains("OTHER"), "a token never crosses: {line}");
+        assert_eq!(job_argv(Path::new("/bin/cargo"), &[], &[], None)[0], "env", "unniced, no prefix");
+        assert_eq!(job_class("cargo", &s(&["clippy"])), JobClass::Check);
+        assert_eq!(job_class("cargo", &s(&["+nightly", "check"])), JobClass::Check);
+        assert_eq!(job_class("cargo", &s(&["test"])), JobClass::Build);
+    }
+
+    #[test]
+    fn an_admitted_run_is_one_job_and_its_output_and_exit_reach_the_caller() {
+        let rig = rig("throttle-job-one");
+        mode(&rig, Mode::On, 2);
+        let m = manager(&rig);
+        let host = tcp(&rig, &m);
+        let asked = Cell::new(0u32);
+        let alive = |_: u32| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let said = RefCell::new(Vec::<String>::new());
+        let say = |l: &str| said.borrow_mut().push(l.to_string());
+        let got = Mutex::new(String::new());
+        let out = |t: &str| got.lock().unwrap().push_str(t);
+        let mut env = caller_env();
+        env.push(("WSP_FAKE_EXIT".into(), "3".into()));
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env, out: &out };
+        assert_eq!(run_on(&ctx(&rig, &alive, &say), Some(&jobs), "cargo", &s(&["build", "-p", "x"])), 3, "the job's exit is the shim's");
+        let text = got.lock().unwrap().clone();
+        assert!(text.contains("built by job:") && text.contains("args=build -p x"), "its output reached the caller: {text:?}");
+        assert!(text.contains("jobs=2") && text.contains("held=yes"), "the decision's cap and hold went with it: {text}");
+        assert!(text.contains("token=none") && text.contains("other=none"), "only the allowlist crossed: {text}");
+        let nice: i32 = text.split("nice=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(nice, (base_nice() + NICE).min(19), "niced by the argv's prefix: {text}");
+        let rows = m.jobs();
+        assert_eq!(rows.len(), 1, "one job.run: {rows:?}");
+        assert_eq!(rows[0].0.row.0, "wsp-9");
+        assert!(rows[0].0.job.starts_with("throttle:build@") && !rows[0].2, "{rows:?}");
+        assert_eq!(asked.get(), 0, "no holder was asked by pid");
+        assert!(!builds_dir(&rig.state).join("slot-0").exists(), "the slot is let go: {:?}", said.borrow());
+        m.stop();
+    }
+
+    #[test]
+    fn a_slot_whose_job_ended_is_free_with_no_kill() {
+        let rig = rig("throttle-job-slot");
+        mode(&rig, Mode::On, 1);
+        let m = manager(&rig);
+        let host = tcp(&rig, &m);
+        let asked = Cell::new(0u32);
+        let alive = |_: u32| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let said = RefCell::new(Vec::<String>::new());
+        let say = |l: &str| said.borrow_mut().push(l.to_string());
+        let out = |_: &str| {};
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env: caller_env(), out: &out };
+        // A run whose job has ended; then its hold left behind, in this
+        // process's own name: `kill -0` would call it held for ever.
+        assert_eq!(run_on(&ctx(&rig, &alive, &say), Some(&jobs), "cargo", &s(&["test"])), 0);
+        let ended = m.jobs()[0].0.clone();
+        let mut rec = json!({"pid": std::process::id(), "task": "wsp-8", "cmd": "cargo test", "tree": "/t", "since": util::epoch_secs()});
+        rec["job"] = serde_json::to_value(&ended).unwrap();
+        fs::create_dir_all(builds_dir(&rig.state)).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec.to_string()).unwrap();
+        let start = Instant::now();
+        assert_eq!(run_on(&ctx(&rig, &alive, &say), Some(&jobs), "cargo", &s(&["build"])), 0);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(!said.borrow().iter().any(|l| l.contains("waiting")), "the ended job's slot was free: {:?}", said.borrow());
+        assert_eq!(asked.get(), 0, "and no pid was asked");
+        assert_eq!(m.jobs().len(), 2);
+        // The views read it the same way: the ended job holds nothing.
+        let left = json!({"pid": std::process::id(), "task": "wsp-8", "cmd": "cargo test", "tree": "/t", "since": util::epoch_secs(), "job": serde_json::to_value(&ended).unwrap()});
+        fs::write(slot_path(&rig.state, 0), left.to_string()).unwrap();
+        let live = live_by(host.jobs().ok(), &alive);
+        assert!(builds_by(&rig.state, &live).is_empty());
+        assert_eq!(reap_by(&rig.state, &live), 1);
+        assert_eq!(asked.get(), 0);
+        m.stop();
+    }
+
+    #[test]
+    fn a_job_not_yet_in_the_table_holds_for_its_grace_and_a_running_one_holds() {
+        let dir = std::env::temp_dir().join(format!("wsp-t-live-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("slot-0");
+        let key = crate::host::job_key("wsp-1", 0, "throttle:build@1");
+        let rec = json!({"pid": 1, "job": serde_json::to_value(&key).unwrap()});
+        fs::write(&p, rec.to_string()).unwrap();
+        let never = |_: u32| -> bool { panic!("no pid is asked of a job's hold") };
+        assert!(live_by(Some(vec![]), &never)(&p, &rec), "not yet started: within its grace");
+        let row = |state| JobRow { key: key.clone(), class: JobClass::Build, pgid: 9, started: wsp_host_api::At(0), state };
+        assert!(live_by(Some(vec![row(JobState::Running)]), &never)(&p, &rec));
+        assert!(!live_by(Some(vec![row(JobState::Ended)]), &never)(&p, &rec));
+        let old = std::time::SystemTime::now() - JOB_START_GRACE - Duration::from_secs(1);
+        fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(old).unwrap();
+        assert!(!live_by(Some(vec![]), &never)(&p, &rec), "past its grace with no job: gone");
+        touch(&p);
+        assert!(live_by(Some(vec![]), &never)(&p, &rec), "a waiting holder keeps it fresh");
+        // A hold that is no job's is its pid's, as before.
+        assert!(live_by(None, &|pid| pid == 7)(&p, &json!({"pid": 7})));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn facts(idle: Option<u64>, limit: Option<u32>) -> HostFacts {
+        HostFacts {
+            load_centi: 150,
+            cpus: 8,
+            memory: wsp_host_api::MemoryPressure::Normal,
+            swap_used_bytes: 0,
+            disks: vec![],
+            thermal: Thermal::Nominal,
+            load5_centi: None,
+            load15_centi: None,
+            speed_limit_pct: limit,
+            hid_idle_secs: idle,
+            free_memory_bytes: None,
+            pageouts: None,
+        }
+    }
+
+    #[test]
+    fn the_decision_reads_the_beats_facts() {
+        let rig = rig("throttle-job-facts");
+        let m = manager(&rig);
+        let host = tcp(&rig, &m);
+        let alive = |_: u32| true;
+        let say = |_: &str| {};
+        let got = Mutex::new(String::new());
+        let out = |t: &str| got.lock().unwrap().push_str(t);
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env: caller_env(), out: &out };
+        let run = |beat: HostFacts, m: Mode| {
+            Settings { mode: m, slots: Some(2), jobs: Some(4), hot_jobs: Some(1), ..Settings::default() }.save(&rig.state).unwrap();
+            let read = move || Some(beat.clone());
+            let (idle, thermal) = (beat_idle(&read), beat_thermal(&read));
+            let mut c = ctx(&rig, &alive, &say);
+            c.idle = &idle;
+            c.thermal = &thermal;
+            got.lock().unwrap().clear();
+            assert_eq!(run_on(&c, Some(&jobs), "cargo", &s(&["build"])), 0);
+            got.lock().unwrap().clone()
+        };
+        let away = run(facts(Some(3600), Some(100)), Mode::Auto);
+        assert!(away.contains("jobs=none") && away.contains(&format!("nice={}", base_nice())), "the beat says the person left: {away}");
+        let here = run(facts(Some(10), Some(100)), Mode::Auto);
+        assert!(here.contains("jobs=4") && here.contains(&format!("nice={}", (base_nice() + NICE).min(19))), "the beat says the person is here: {here}");
+        let hot = run(facts(Some(3600), Some(31)), Mode::Off);
+        assert!(hot.contains("jobs=1") && hot.contains(&format!("nice={}", base_nice())), "the beat's clock is limited: {hot}");
+        // And the view the daemon and `wip` read takes the same beat.
+        let g = Given::of_facts(&facts(None, Some(31)));
+        assert_eq!((g.load1, g.cores, g.speed_limit), (1.5, 8, Some(31)));
+        assert_eq!(limit_of(&facts(None, Some(100))), None, "an unlimited clock draws no cell");
+        m.stop();
+    }
+
+    /// What the child below writes back: the shim's exit and every program
+    /// its process ran.
+    const CHILD: &str = "WSP_TEST_RUN_RAW_CHILD";
+
+    /// Not a test of its own: the parent tests run this binary again on it,
+    /// so that `run_raw` is the whole process and its call log is the shim's.
+    #[test]
+    fn run_raw_child() {
+        let Some(result) = std::env::var_os(CHILD) else { return };
+        let args: Vec<String> = std::env::var("WSP_TEST_ARGV").unwrap().split(' ').map(String::from).collect();
+        let _ = wsp_base::calls::drain_children();
+        let mut argv = vec!["cargo".to_string()];
+        argv.extend(args);
+        let exit = run_raw(&argv);
+        let calls: Vec<String> = wsp_base::calls::drain_children().0.into_keys().collect();
+        fs::write(result, json!({"exit": exit, "calls": calls}).to_string()).unwrap();
+        std::process::exit(0);
+    }
+
+    struct Child {
+        child: std::process::Child,
+        result: PathBuf,
+    }
+
+    /// `wsp throttle run cargo <args>` as its own process, under
+    /// `WSP_JOBS=manager` with this host's record naming the loopback manager.
+    fn shim(rig: &Rig, m: &Manager, args: &str, extra: &[(&str, &str)]) -> Child {
+        wsp_wire::manager::install_record(&rig.state, &wsp_wire::manager::Local::new(&rig.exec, m.addrs()[0].port()), Duration::from_secs(5)).unwrap();
+        let result = rig.iso.path(&format!("result-{}", args.replace(' ', "_")));
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["throttle::manager_tests::run_raw_child", "--exact", "--nocapture", "--test-threads=1"])
+            .current_dir(&rig.tree)
+            .env(CHILD, &result)
+            .env("WSP_TEST_ARGV", args)
+            .env("WSP_JOBS", "manager")
+            .env("HOME", &rig.root)
+            .env("PATH", format!("{}:/usr/bin:/bin", rig.bin.display()))
+            .env_remove(HELD)
+            .env_remove("WSP_TASK")
+            .env_remove("CARGO_BUILD_JOBS")
+            .env_remove("WSP_TEST_MACHINE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        Child { child: cmd.spawn().unwrap(), result }
+    }
+
+    fn finished(c: Child) -> (Value, String) {
+        let out = c.child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        let v = fs::read_to_string(&c.result).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| panic!("the shim wrote no result: {text}"));
+        (v, text)
+    }
+
+    const PROBES: &[&str] = &["sysctl", "pmset", "ioreg", "vm_stat", "ps", "kill", "memory_pressure"];
+
+    #[test]
+    fn run_raw_under_manager_sends_the_build_as_its_job_and_probes_nothing() {
+        let rig = rig("throttle-job-raw");
+        mode(&rig, Mode::On, 2);
+        let m = manager(&rig);
+        let (v, text) = finished(shim(&rig, &m, "build", &[("WSP_FAKE_EXIT", "5")]));
+        assert_eq!(v["exit"], 5, "{text}");
+        assert!(text.contains("built by job:") && text.contains("held=yes"), "its output on the shim's own stdout: {text}");
+        let calls: Vec<String> = v["calls"].as_array().unwrap().iter().filter_map(|c| c.as_str().map(String::from)).collect();
+        assert!(!calls.iter().any(|c| PROBES.contains(&c.as_str())), "the shim ran {calls:?}");
+        let rows = m.jobs();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0.row.0, "throttle", "no row: the key says throttle");
+        m.stop();
+    }
+
+    #[test]
+    fn ctrl_c_stops_the_job() {
+        let rig = rig("throttle-job-int");
+        mode(&rig, Mode::On, 2);
+        let m = manager(&rig);
+        let pidfile = rig.iso.path("job.pid");
+        let c = shim(&rig, &m, "test", &[("WSP_FAKE_PIDFILE", pidfile.to_str().unwrap()), ("WSP_FAKE_SLEEP", "60")]);
+        let since = Instant::now();
+        let pid = loop {
+            if let Some(p) = fs::read_to_string(&pidfile).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
+                break p;
+            }
+            assert!(since.elapsed() < Duration::from_secs(20), "the job never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let shim_pid = c.child.id().to_string();
+        assert!(std::process::Command::new("kill").args(["-INT", &shim_pid]).status().unwrap().success());
+        let stopped = Instant::now();
+        let (v, text) = finished(c);
+        assert_eq!(v["exit"], 130, "{text}");
+        assert!(stopped.elapsed() < Duration::from_secs(15), "{text}");
+        let gone = !std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().unwrap().success();
+        assert!(gone, "the job's tool was ended");
+        let rows = m.jobs();
+        assert!(rows.len() == 1 && !rows[0].2, "and its job has ended: {rows:?}");
+        let calls: Vec<String> = v["calls"].as_array().unwrap().iter().filter_map(|c| c.as_str().map(String::from)).collect();
+        assert!(!calls.iter().any(|c| PROBES.contains(&c.as_str())), "the stop was job.stop, no kill: {calls:?}");
+        m.stop();
     }
 }
