@@ -142,7 +142,18 @@ fn wip_under_the_manager_runs_no_probe_and_a_stopped_manager_reads_silent() {
     let session = tcp.spawn_session(&spawn).expect("the manager spawns the seat");
 
     // Under the manager: the seat, and no probe.
-    let (json, children, took) = wip(&state, "manager");
+    // `wip` gives the manager `SILENT` (1 s) to answer and reads it silent
+    // past that, which a loaded machine overruns (the same wait wsp-693 made
+    // in repair's census test): asked again until the manager is heard,
+    // bounded generously, and only a heard answer is held to having the seat.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (json, children, took) = loop {
+        let got = wip(&state, "manager");
+        if got.0["unreachable"].is_null() {
+            break got;
+        }
+        assert!(Instant::now() < deadline, "wip never heard the manager within 120s: {}", got.0);
+    };
     let agents = json["agents"].as_array().cloned().unwrap_or_default();
     assert!(agents.iter().any(|a| a["pane"] == "cpd-wm1"), "the manager's seat is in wip: {json}");
     assert_eq!(ran(&children, PROBES), Vec::<&str>::new(), "wip under the manager ran {children}");
