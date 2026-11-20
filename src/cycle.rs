@@ -5393,6 +5393,14 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     crate::cmd_agent::notice(store, &first, &text).is_some()
 }
 
+/// wsp's notice on a row on no list, for the seat that answers for it (its
+/// project's custodian, else the person): [`crate::cmd_agent::notice`], here so
+/// the engine modules that tell a row's stall reach it through the run and not
+/// up into the seats (`wsp-690`). Returns whether it was raised.
+pub(crate) fn notice_on_row(store: &Store, member: &str, text: &str) -> bool {
+    crate::cmd_agent::notice(store, member, text).is_some()
+}
+
 /// The member [`tell_now`] puts a run's notice on: the first of the group the
 /// run stands at, where a person looking at the run is looking — not group 1's,
 /// long since finished.

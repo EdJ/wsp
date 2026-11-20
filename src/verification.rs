@@ -1357,7 +1357,7 @@ fn first_line(verdict: &str) -> String {
 /// A send-back the row could not carry, said to whoever decides it — the
 /// list's governor through [`tell_governor`] (the spool, so a busy seat has it
 /// on its next turn), or for a row on no list a hand raised with
-/// [`crate::cmd_agent::notice`], which reaches its project's custodian or else
+/// [`crate::cycle::notice_on_row`], which reaches its project's custodian or else
 /// the person. Before `wsp-690` the refusal was only logged on the row, and
 /// nobody reads a row nothing is running.
 ///
@@ -1386,7 +1386,7 @@ pub(crate) fn tell_if_capped(store: &Store, member: &str, verdict: &str) -> bool
             format!("the {} governor", w.id)
         }
         None => {
-            if crate::cmd_agent::notice(store, member, &text).is_none() {
+            if !crate::cycle::notice_on_row(store, member, &text) {
                 return false;
             }
             "a hand on the row".to_string()
