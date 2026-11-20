@@ -2241,12 +2241,6 @@ pub(crate) mod tests {
         pressed: std::cell::Cell<u32>,
     }
 
-    impl Orders {
-        fn idle(typed: bool) -> Orders {
-            Orders { state: Some(State::Idle), typed, sent: Default::default(), pressed: Default::default() }
-        }
-    }
-
     impl Seats for Orders {
         fn state(&self, _seat: &str) -> Option<State> {
             self.state

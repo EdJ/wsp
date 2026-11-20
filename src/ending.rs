@@ -1202,22 +1202,6 @@ mod tests {
         pub(super) static SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    /// `WSP_HOST` for one test, put back however it ends. Taken after
-    /// [`util::isolated`], whose lock it is held under.
-    struct HostVar;
-    impl HostVar {
-        fn set(v: &str) -> HostVar {
-            std::env::set_var(wsp_wire::host_tcp::ENV, v);
-            HostVar
-        }
-    }
-    impl Drop for HostVar {
-        fn drop(&mut self) {
-            std::env::remove_var(wsp_wire::host_tcp::ENV);
-            SCANS.with(|s| s.set(false));
-        }
-    }
-
     fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
         cell.with(|c| c.borrow_mut().drain(..).collect())
     }
