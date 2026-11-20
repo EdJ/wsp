@@ -1,6 +1,7 @@
 //! `wsp-client` against a loopback `wsp-server` over `MemStore` (wsp-074's done
 //! list): `dial` silent with no `api.json`, a wrong token and a stopped server,
-//! each reason naming which; `request` for each read verb; `subscribe` handing
+//! each reason naming which; `dial_at` (wsp-306) welcomed at given addresses
+//! with the right token, subscribing, and refused with a wrong one; `request` for each read verb; `subscribe` handing
 //! out the snapshot and then each event once, across a server restart (a
 //! `Resumed`, and no id twice) and through a `too_old` (a fresh `State`); and a
 //! duplicate id dropped.
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, to_value, Value};
-use wsp_api::{Answer, Code, Listen, Outcome, Reply, LISTEN_FILE, MISSED_BEATS, TOKEN_FILE};
+use wsp_api::{Answer, ApiToken, Code, Listen, Outcome, Reply, LISTEN_FILE, MISSED_BEATS, TOKEN_FILE};
 use wsp_client::{Client, Feed, Item, Silent};
 use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
@@ -222,6 +223,45 @@ fn an_address_that_never_welcomes_is_silent_within_the_wait() {
     let t = Instant::now();
     assert!(matches!(Client::dial(&d, ed(), wait), Err(Silent::NoWelcome(_))));
     assert!(t.elapsed() < wait + Duration::from_millis(500), "{:?}", t.elapsed());
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn dial_at_dials_given_addresses_with_a_given_token_and_a_wrong_one_is_refused() {
+    let d = dir("at");
+    let store = mirror_store();
+    let server = start(Arc::new(store.handle()), &d);
+    // What a caller on another machine holds: the addresses and the token
+    // (fetched over ssh), and no state dir. api.json goes, so that nothing
+    // here, the feed's own dial included, can be reading it.
+    let listen: Listen = serde_json::from_str(&fs::read_to_string(d.join(LISTEN_FILE)).unwrap()).unwrap();
+    let token = ApiToken(fs::read_to_string(d.join(TOKEN_FILE)).unwrap().trim().to_string());
+    assert!(listen.addrs.iter().all(|a| !a.ends_with(":0")), "an ephemeral port: {:?}", listen.addrs);
+    fs::remove_file(d.join(LISTEN_FILE)).unwrap();
+    let wait = Duration::from_millis(800);
+
+    // The right token is welcomed, and a feed from it subscribes.
+    let c = Client::dial_at(listen.addrs.clone(), token.clone(), ed(), WAIT).unwrap_or_else(|s| panic!("silent: {s}"));
+    assert_eq!((c.server(), c.head()), ("wsp", store.head().unwrap()));
+    let mut f = feed(&c, None);
+    let (state, at) = store.snapshot().unwrap();
+    assert_eq!(f.next_within(WAIT), Some(Item::State { state, at }));
+    rows(&store, 0, 2);
+    let got = until(&mut f, at.0 + 2);
+    assert_eq!(ids(&got), vec![at.0 + 1, at.0 + 2], "{got:?}");
+
+    // A wrong token is refused unauthorised.
+    let t = Instant::now();
+    match Client::dial_at(listen.addrs.clone(), ApiToken("not-the-token".into()), ed(), wait) {
+        Err(Silent::Refused(r)) => assert_eq!(r.code, Code::Unauthorised),
+        other => panic!("expected Refused, got {:?}", other.map(|_| ())),
+    }
+    assert!(t.elapsed() < wait);
+
+    // No address at all is said, not dialled.
+    assert!(matches!(Client::dial_at(vec![], token, ed(), wait), Err(Silent::BadListenFile(_))));
+    drop(f);
+    server.stop();
     let _ = fs::remove_dir_all(&d);
 }
 

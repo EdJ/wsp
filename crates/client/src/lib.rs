@@ -4,6 +4,8 @@
 //!
 //! - [`Client::dial`] reads `api.json` and `api.token`, dials, says `hello`;
 //!   nothing answering is [`Silent`], never a panic or a hang.
+//! - [`Client::dial_at`] does the same against addresses and a token the
+//!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
@@ -15,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use wsp_api::{Call, ConnError, Connection, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
+use wsp_api::{ApiToken, Call, ConnError, Connection, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
 use wsp_store_contract::Principal;
 
 mod dial;
@@ -55,12 +57,21 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What it takes to dial again: the state dir, who for, and how long to wait.
+/// What it takes to dial again: where the server is, who for, and how long to wait.
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
-    pub(crate) state_dir: PathBuf,
+    pub(crate) at: Where,
     pub(crate) by: Principal,
     pub(crate) wait: Duration,
+}
+
+/// Where the server is: named by a state dir's `api.json` and `api.token`
+/// (read again on each dial, so a restarted server's new port is found), or
+/// given outright.
+#[derive(Debug, Clone)]
+pub(crate) enum Where {
+    StateDir(PathBuf),
+    Addrs { addrs: Vec<String>, token: ApiToken },
 }
 
 /// A welcomed connection to the server, for requests.
@@ -77,8 +88,22 @@ impl Client {
     /// Dial the server `state_dir` names (its `api.json` and `api.token`) and
     /// say `hello` as `by`, within `wait` in all. [`Silent`] says why not.
     pub fn dial(state_dir: &Path, by: Principal, wait: Duration) -> Result<Client, Silent> {
-        let target = Target { state_dir: state_dir.to_path_buf(), by, wait };
-        let open = dial::open(&target.state_dir, &target.by, wait)?;
+        Client::dial_target(Target { at: Where::StateDir(state_dir.to_path_buf()), by, wait })
+    }
+
+    /// Dial the server at `addrs` (`host:port`, tried in order, as `api.json`
+    /// lists them) and say `hello` with `token` as `by`, within `wait` in all:
+    /// [`Client::dial`] for a server whose state dir is not on this machine.
+    /// No address is [`Silent::BadListenFile`]; a wrong token is
+    /// [`Silent::Refused`]. A lost connection, here or in a [`Feed`], dials the
+    /// same addresses again.
+    pub fn dial_at(addrs: Vec<String>, token: ApiToken, by: Principal, wait: Duration) -> Result<Client, Silent> {
+        Client::dial_target(Target { at: Where::Addrs { addrs, token }, by, wait })
+    }
+
+    fn dial_target(target: Target) -> Result<Client, Silent> {
+        let wait = target.wait;
+        let open = dial::open(&target)?;
         Ok(Client {
             target,
             conn: Some(open.conn),
@@ -125,7 +150,7 @@ impl Client {
         let request = Request { v: PROTOCOL, id, key, by: self.target.by.clone(), call };
         let deadline = Instant::now() + self.timeout;
         if self.conn.is_none() {
-            let open = dial::open(&self.target.state_dir, &self.target.by, self.target.wait).map_err(Error::Silent)?;
+            let open = dial::open(&self.target).map_err(Error::Silent)?;
             self.conn = Some(open.conn);
         }
         let conn = self.conn.as_mut().expect("dialled above");

@@ -1,5 +1,6 @@
 //! Finding the server and saying `hello` (docs/state-core.md 4.1, D19): read
-//! `api.json` and `api.token` under the state dir, dial the addresses in order
+//! `api.json` and `api.token` under the state dir (or take the addresses and
+//! token [`crate::Client::dial_at`] was given), dial the addresses in order
 //! within one budget, send [`Hello`] and wait for [`Welcome`]. Anything else is
 //! [`Silent`], which names what failed.
 //!
@@ -18,6 +19,8 @@ use wsp_api::{
     TOKEN_FILE,
 };
 use wsp_store_contract::Principal;
+
+use crate::{Target, Where};
 
 /// Why nothing answered. Never a panic or a hang: the CLI falls back and
 /// web-chrome reconnects.
@@ -61,22 +64,41 @@ pub(crate) struct Open {
     pub(crate) welcome: Welcome,
 }
 
-/// Dial the server `state_dir` names and say hello as `by`, in `wait` at most.
-pub(crate) fn open(state_dir: &Path, by: &Principal, wait: Duration) -> Result<Open, Silent> {
-    let deadline = Instant::now() + wait;
+/// Dial the server `target` names and say hello as its `by`, in its `wait` at most.
+pub(crate) fn open(target: &Target) -> Result<Open, Silent> {
+    match &target.at {
+        Where::StateDir(dir) => {
+            let (addrs, token) = read_state_dir(dir)?;
+            open_at(&addrs, token, &target.by, target.wait)
+        }
+        Where::Addrs { addrs, token } => {
+            if addrs.is_empty() {
+                return Err(Silent::BadListenFile("no address was given".into()));
+            }
+            open_at(addrs, token.clone(), &target.by, target.wait)
+        }
+    }
+}
+
+/// The addresses `api.json` lists under `state_dir`, and its `api.token`.
+fn read_state_dir(state_dir: &Path) -> Result<(Vec<String>, ApiToken), Silent> {
     let listen = std::fs::read_to_string(state_dir.join(LISTEN_FILE)).map_err(|e| Silent::NoListenFile(e.to_string()))?;
     let listen: Listen = serde_json::from_str(&listen).map_err(|e| Silent::BadListenFile(e.to_string()))?;
     if listen.addrs.is_empty() {
         return Err(Silent::BadListenFile("it lists no address".into()));
     }
     let token = std::fs::read_to_string(state_dir.join(TOKEN_FILE)).map_err(|e| Silent::NoToken(e.to_string()))?;
-    let token = ApiToken(token.trim().to_string());
+    Ok((listen.addrs, ApiToken(token.trim().to_string())))
+}
 
+/// Dial `addrs` in order and say hello with `token` as `by`, in `wait` at most.
+fn open_at(addrs: &[String], token: ApiToken, by: &Principal, wait: Duration) -> Result<Open, Silent> {
+    let deadline = Instant::now() + wait;
     let mut tried = Vec::new();
-    for (i, text) in listen.addrs.iter().enumerate() {
+    for (i, text) in addrs.iter().enumerate() {
         // Each address gets an even share of what is left, so one that swallows
         // its packets does not take the whole budget.
-        let share = deadline.saturating_duration_since(Instant::now()) / (listen.addrs.len() - i) as u32;
+        let share = deadline.saturating_duration_since(Instant::now()) / (addrs.len() - i) as u32;
         let addr = match text.to_socket_addrs().ok().and_then(|mut a| a.next()) {
             Some(a) => a,
             None => {
