@@ -12,10 +12,11 @@ serde_json = "1"
 wsp-base = { path = "../base" }
 wsp-host = { path = "../host" }
 wsp-host-api = { path = "../host-api" }
+# `WSP_HOST=inproc` runs the manager's own code in this process (host_inproc.rs, wsp-030).
+wsp-manager = { path = "../manager" }
 wsp-store = { path = "../store" }
 
 [dev-dependencies]
-wsp-manager = { path = "../manager" }
 wsp-base = { path = "../base", features = ["test-support"] }
 wsp-host = { path = "../host", features = ["test-support"] }
 wsp-store = { path = "../store", features = ["test-support"] }

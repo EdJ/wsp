@@ -215,6 +215,10 @@ pub(crate) struct Client {
 pub(crate) struct Shared {
     pub(crate) cfg: Config,
     pub(crate) token: Token,
+    /// The loopback address it listens on, port included: where the hooks of
+    /// a seat it forks post (`WSP_MANAGER_ADDR`), so a manager on a port of
+    /// its own (wsp's in-process one, wsp-030) hears its seats' turns.
+    pub(crate) hook_addr: Option<SocketAddr>,
     pub(crate) log: log::Log,
     /// Held while appending and while a subscriber's replay is queued, so an
     /// event is never both replayed and sent live, nor missed between.
@@ -343,9 +347,11 @@ impl Manager {
         ));
 
         let (cfg_dir, host_id) = (cfg.exec_dir.clone(), cfg.host.clone());
+        let hook_addr = addrs.iter().find(|a| a.ip().is_loopback()).or(addrs.first()).copied();
         let shared = Arc::new(Shared {
             cfg,
             token,
+            hook_addr,
             log,
             journal: Mutex::new(journal),
             clients: Mutex::new(Default::default()),

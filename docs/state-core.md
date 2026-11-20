@@ -585,7 +585,7 @@ p50 9.4 s.
 | **M3. Tree jobs under the manager** | check, build, verify and barrier processes run as manager jobs. check_tree's sweep and leaked_agents go. | lsof → 0; wsp-478-kind → 0 | jobs in-process behind a flag |
 | **M4. Trees placed** (T2: Ed's answer to agent-manager Q6, confirmed by Jesper 2026-11-18, provisional pending Ed's confirmation; agent-manager 6.2, "M3 under T2") | checkout and land on the agents' hosts, with a fenced push to the trunk | a list on two hosts with no copies | T1 (rows on the Mac) |
 | **0** (prep, could ride fleet-fixes' tail) | `rusqlite` behind the C-cached wrapper (section 9); the contract crate's types; the conformance suite against an in-memory fake | a cold tree builds SQLite in < 5 s from cache. **Met for SQLite's own build** (wsp-048, 2026-11-18): the `libsqlite3-sys` build script takes 1.2 s debug and 1.1 s release from cache. **Not met as the whole command's wall**: `cargo build -p wsp-store-sqlite` took 7.7 s debug and 6.1 s release at load 8–15 (section 9, "Step 0's result") | nothing to roll back |
-| **1. Server and store, read path; compound subscribes** | The daemon opens SQLite and **mirrors** today's files into it each tick (a projection; files still the truth). `api.sock` serves `state`/reads/`subscribe`. compound's host subscribes; `wip --json` reads through the API | host polling calls → 0; `wip --json` < 100 ms wall, < 0.1 CPU-s; no `ps`/`lsof` in read verbs; daemon tick no slower | the host goes back to `poll` (one flag); the CLI reads files |
+| **1. Server and store, read path; compound subscribes** | The daemon opens SQLite and **mirrors** today's files into it each tick (a projection; files still the truth). `api.sock` serves `state`/reads/`subscribe`. compound's host subscribes; `wip --json` reads through the API | host polling calls → 0; `wip --json` < 100 ms wall, < 0.1 CPU-s; no `ps`/`lsof` in read verbs; daemon tick no slower. **Not met** (wsp-077, 2026-11-20): see "Step 1's result" below | the host goes back to `poll` (one flag); the CLI reads files |
 | **2. Orders machine** | Orders become commands; delivery via compound-sup's deliver verb and ack (wsp-477) under a `deliver:<seat>` lease; `repair:unsent` deleted | screen renders per tick → 0; `typed-unsent`/`first-orders`/`stuck-commands` files gone; incidents of "typed but unsent" and wait-loop stalls → 0 over a fortnight | `repair:unsent` restored behind a flag |
 | **3. Seats via executors, local and remote alike** | compound-sup speaks 5.1 locally and far; spawn/stop through it; beats carry machine facts; ps/lsof/cwd inference deleted (check_tree's `lsof`, `procs::processes` callers, `memory.rs` per call, `seat-since.json`) | `ps` per tick 34 → 0 (wsp side); `lsof` → 0; leaked/second-idle seats (wsp-411 kind) and wrong-owner kills (wsp-478 kind) → 0; spawn p50 7.2 s no worse | herdr/legacy `Place` backends stay compiled until the fortnight passes |
 | **4. Rows and lists machines** | Section 2.5 option C: machine sections out of Markdown into the store; `cycle`/`ending`/`closing` as machines; store git commits only for prose | store commits/day 1,701 → people's edits only (expect < 100); `worklist advance` CPU (2,056 per 4.5 h) halved; git per tick → tree work only | export back to Markdown (`wsp show --md` for every row) |
@@ -710,6 +710,125 @@ installs the trunk and web-chrome's app, and a day passes on both before the mea
 - (6) Whether web-chrome later folds `State` itself (4.4's `store` half) rather than re-reading on each event.
   Recommended: not in step 1. Re-reading on events already takes polling to 0. Folding means new parsers in compound for
   the contract's entities, which belongs with step 4, when `--json` may change shape.
+
+### Step 1's result (wsp-077, 2026-11-20)
+
+**Verdict: none of the four done-when lines is met, and the rollback is proven for one half of its two flags.** The
+API path is built and serving, and the stamp poll did stop. But `wip --json` through the API costs **11× the wall and
+20× the CPU of the files path** on this machine, so the step made the call it was meant to make cheap dearer. The
+lines are marked below, each with its follow-up row.
+
+**What the measure could not be.** The stop in front of this group asked for a full day on the installed trunk and
+on web-chrome's app. The person passed it on 2026-11-20 on judgement, not on the full day, and named the gaps to record
+without blocking on them. They hold, and they bound every figure here:
+- **There is no pre-group-6 day on this host.** This is Omarchy (Linux, 32 CPUs). The daemon that wrote the first
+  record of `calls.jsonl` (2026-11-19T07:29:08Z) was already serving the API (`api.log`: `started … on 127.0.0.1:7488`
+  at 07:29:20Z). So every figure below is an *after*. The before figures are 1.5's (the Mac, before M0) and the Mac's
+  own `calls.jsonl`, which is not reachable from here (`wsp machine ls`: this seat only). They are not comparable for
+  tick or CPU timings, as the person said.
+- **Not a full day on the app.** The person's note says web-chrome polled `wsp stamp` until 2026-11-20T06:30Z because
+  the Mac held a stale `api.token`. The Mac's own calls are the ones that carry that, and they are not read here.
+  What this host's log holds are the calls that reached it over ssh (parent `sshd-session`), which is where the
+  Mac's target-mode reads land. Measured from 06:30Z the window is 20 minutes long at the time of the last read.
+- **Windows, all UTC.** The log covers 2026-11-19T07:29:08Z to 2026-11-20T06:50Z (23 h 21 min). The installed binary
+  is `ff9afa6`, replaced on disk at 2026-11-19T08:55Z; the daemon running it has run since 11:49:13Z (the person's note:
+  it restarted 12:49 CET). The trunk is 29 commits ahead of it (`wsp doctor`), among them wsp-304 and wsp-305.
+
+**How each figure was taken.**
+- *Day figures*: `wsp calls --since 24h` (`--polls` for the reads), and a script over the same two files
+  (`calls.jsonl`, `polls.jsonl`) for what `wsp calls` does not split: by parent, by hour, children by verb and flag,
+  and the `"k":"tick"` lines. CPU is user+sys of the process and its waited children, as the log records it.
+- *A/B, `wip --json`*: the installed `wsp` against itself with `WSP_READ=files`, alternating, `WSP_NO_CALLS=1` so the
+  fleet's log is not touched, CPU by `wait4` as M0's result took it. Run twice: n=16 at load 9.4, and n=20 at load
+  4.8. Same store, same minute, so the two paths read the same fleet.
+- *Events per hour*: the `event` table of `state.db`, opened read-only, grouped by hour and subject.
+- *Daemon CPU*: `/proc/<pid>/task/*/stat` of the running daemon (pid 2477339, 18.97 h old).
+- *Server's share*: a raw client (`hello`, then `state`) timed the reply alone.
+
+#### The measures
+
+| measure | before | after | how |
+|---|---|---|---|
+| `wsp stamp` calls from the app's host | Mac, 1.5: 2,059 per 4.5 h (458/h, p50 216 ms). This host, 08:00–10:21Z on 11-19: 1,588 (677/h, p50 6 ms), all `sshd-session` | 44 in the whole rest of the log: 42 at 17:03–17:17Z, 2 at 20:58Z. **None since 20:58:54Z (9.9 h). None since 06:30Z.** | `wsp calls --since 24h --polls`; the script, by parent and time |
+| the reads that remain (remote host), per hour | 800 calls/h in the stamp era (stamps and reads), 11 CPU-s/h | **366 calls/h, 29 CPU-s/h** over the 20.5 h since; **an idle hour is 298 calls/h** (`machine ls` 119, `throttle` 119, `spend` 60), 2.4 CPU-s/h | the script, `sshd-session`-parented calls |
+| events per hour (the mirror's) | | 360/h at idle, all of them `mirror.put` of the machine; 430–1,630/h when the fleet is busy | `state.db`, `event` table |
+| `wip --json`, the day | 1.5: p50 1,597 ms, 1.54 CPU-s, 299 calls per 4.5 h | **p50 498 ms, p95 631 ms; CPU p50 0.452 s, p95 0.583 s**, n=2,355. 256 ms at 08Z on 11-19, 600 ms from 02Z on 11-20. Since 06:30Z: p50 695 ms, p95 989 ms, CPU 0.637 s | `wsp calls --polls`, by hour |
+| `wip --json` A/B, API against files | | API: wall p50 **693 ms** (p95 978), CPU p50 **0.628 s** (p95 0.928), n=20. Files: wall p50 **61 ms** (p95 72), CPU p50 **0.032 s** (p95 0.039), n=20. The first run, n=16: API 774 ms and 0.702 s, files 65 ms and 0.035 s | `ab.py`, alternating |
+| `ps`/`lsof` children of read verbs | | `wip` 0 of 2,937 calls, `wip --json` 0 of 2,355, `show` 0 of 1,883, `ls` 0 of 39, `worklist show` 2 of 3,431. **`ls --json` runs one `ps` in 1,129 of 1,139 calls, with 5.5 `compound-reader`; `worklist show --json` runs `ps` in 216 of 381.** `lsof`: 0 in all. | the script, `children` by verb and flag |
+| daemon tick | 1.5 (Mac, before M0): p50 2.2 s, p95 54 s. M0's live day (Mac): 85 ms / 1.60 s | whole log, this host: **p50 20 ms, p95 640 ms** (4,137 ticks at the first read). First 4.33 h (776 ticks): p50 17 ms, p95 381 ms. Last 18.97 h (3,381 ticks): p50 20 ms, p95 664 ms | the `"k":"tick"` lines |
+| daemon CPU | none on this host | process 433 s in 18.97 h (**22.8 CPU-s/h**). **Mirror thread 51.6 s (2.7 CPU-s/h, 12%)**; `fold:omarchy` 140.7 s (7.4/h); the tick thread's own user+sys 8.1/h | `/proc/<pid>/task` |
+
+Where the 693 ms goes: the server answers `state` in 22 ms, but the reply is **6.84 MB** (5.94 MB of it the 366
+task rows with their prose, 0.61 the 74 lists, 0.31 the 132 asks), and the client takes the other ~670 ms and 0.6
+CPU-s. The split between decoding it and `Wip::from_api` was not profiled (gdb could not attach). One suspect is
+visible in the code: `from_api` runs `mirror::task_of` on **every** row and only then lets `wip_reads_in_full` drop
+the finished ones, where the files path does not read those bodies (`tasks_read_where`). The cost also rose
+through the day, 256 → 600 ms, as the store grew, which fits a per-call cost in the whole state.
+
+**The outputs are not identical either.** The A/B's two outputs differ by 19.5 KB (42.9 KB against 23.3 KB; the n=16 run
+51.7 against 32.1). The API's `agents` has 29 entries and the files path's 14: the API draws **15 `gone` seats with
+no date** (`cpd-33`, `cpd-41`, … `cpd-130`, no `task`, `since` set to the read's own clock), which the files path
+retires. `GONE_FOR` leaves an undated seat drawn, by design ("every refusal leaves the row drawn"), which suggests the
+mirror does not carry these seats' dates; that was not traced. Section 7 asked for byte-identical output through
+step 1, shown by a test over a sandbox; that test (`tests/wip_api.rs`) passed when the row landed, and a live fleet
+with old seats shows the gap.
+
+#### Against step 1's four done-when lines
+
+- **Host polling calls → 0: not met.** The stamp half holds on this host: 1,588 stamps in the 2 h 21 min before
+  10:21Z yesterday, 44 in the 20 h after, 0 for the last 9.9 h and 0 since 06:30Z. It is not shown for the app's own
+  host (the Mac's log is out of reach), where the person's note says it polled until 06:30Z. And the figure the row
+  names is *reads per hour against events per hour*, which is not quiet: an idle hour still runs 298 reads against 360
+  events, because every one of those events is the machine's 10 s beat arriving as a `mirror.put`, and the installed
+  app rings the census on it. The reads run on events, but not on events that changed anything. Host polling CPU did
+  not fall either: 11 CPU-s/h before the stamps stopped, 29 after, because the census's `wip` (493 CPU-s in the 20.5 h)
+  is now the dear call. Both fixes for the beat are on the trunk and not installed: wsp-304 (the daemon sends
+  `machine.beat`, not `mirror.put`) and compound-react-046 (web-chrome's `Seen` rings nothing on it). Follow-ups:
+  the idle re-measure after installing both, and the Mac's side.
+- **`wip --json` < 100 ms and < 0.1 CPU-s: not met.** p50 693 ms and 0.628 CPU-s on the API path, against 61 ms and
+  0.032 on the files path in the same A/B. The files path, the rollback, is the one under the line. Follow-up: the
+  API read, and separately the 15 undated seats.
+- **No `ps` or `lsof` in read verbs: not met.** `wip`, `show` and the plain `ls` and `worklist show` hold (`lsof` is 0
+  everywhere). `ls --json` and `worklist show --json`, the census's two reads, run a `ps` per call and, with it, the
+  `compound-reader` reads. They are in the brief's four verbs in their `--json` form, and web-chrome's census calls
+  them. wsp-308 (wsp-view takes State alone) moves the census's readers into the fold and covers this for web-chrome;
+  the CLI's own `--json` read is not covered by it. Follow-up.
+- **Daemon tick no slower: not met, because it cannot be shown.** There is no pre-API day on this host. The two halves
+  of the log are the same code and differ by what the fleet was doing: p50 17 against 20 ms, p95 381 against 664 ms,
+  and the second half contains the busy 21Z–02Z stretch (p95 up to 1.19 s) the first does not. The quiet hours inside
+  each half agree (p50 16–18 ms in both; p95 180–384 ms in 08–10Z on 11-19 and 339–372 ms in 15–20Z), so nothing here says
+  the tick got slower, and nothing says it did not. The mirror thread's own cost is measured now: 2.7 CPU-s/h, 12% of
+  the daemon's 22.8. Follow-up: an A/B on this machine, a day with `WSP_API=off` and a day without, which is the
+  rollback flag doing the job of a before.
+
+#### Rollback, tried once each
+
+- **`WSP_READ=files`: works.** `WSP_READ=files wsp wip --json` read the files and answered in 65 ms (run 1) and 61 ms
+  (run 2). To show it dials nothing, both paths ran in a network namespace with no network (`unshare -rn`): the default
+  path printed `wsp: wip reads the files: nothing answered: 127.0.0.1:7488: connection failed: Network is unreachable`
+  and answered from the files (26 ms, five runs), and `WSP_READ=files` printed nothing and answered. Same output, exit 0
+  each. The silent API's fallback is therefore also proven, and it is well inside its 200 ms.
+- **`WEB_CHROME_FEED=poll`: not tried.** The app runs on the Mac, and nothing here can run it: no app process, no
+  display server, and the one build there (`spikes/web-chrome/src-tauri/target/debug`, dated 2026-11-19) is not known to be the
+  installed app. The code says it works (feed.rs's `Mode::Poll`
+  "runs host-core's poll as before and never dials"), but that is the code, not a call. Follow-up: one call on the
+  Mac, below.
+
+#### Follow-ups
+
+Filed as rows in project wsp (not sub-tasks of wsp-077, which is a member and has none), each with a Done-when line. wsp-316 and wsp-317 are the API read, wsp-318 the `--json` reads' children, wsp-319 and wsp-321 wait on the person (the install, the Mac), and wsp-320 is a day on each side of `WSP_API=off`.
+- **wsp-316**: `Wip::from_api` and the `state` reply: p50 < 100 ms and < 0.1 CPU-s in this A/B at n ≥ 15, output
+  unchanged. Until it lands, `WSP_READ=files` is the faster default by 11× and 20×, and the person may want it set at
+  install.
+- **wsp-317**: the API's `wip --json` draws 15 undated `gone` seats the files path retires; the mirror
+  carries the seat's date so both paths agree on a live fleet, shown by a test with an old seat.
+- **wsp-318**: `ls --json` and `worklist show --json` run no `ps` and no `compound-reader` in the CLI's own read.
+- **wsp-319**: install the trunk (wsp-304) and the app (compound-react-046), then
+  re-measure an idle hour: reads per hour against `machine.beat`-free events per hour.
+- **wsp-320**: the tick's before, by a day with `WSP_API=off` against a day with it, same machine; and the
+  daemon's CPU-s/h on both.
+- **wsp-321**: on the Mac, the stamp count from its own `calls.jsonl` since 06:30Z, and `WEB_CHROME_FEED=poll` tried
+  once (the app launched with it, one stamp seen in `wsp calls --polls`, then without it, none).
 
 ### Step 2's breakdown (wsp-115, 2026-11-18)
 

@@ -1908,22 +1908,6 @@ impl Place for Compound<'_> {
         self.record(seat).ok()?.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32)
     }
 
-    fn turn_began_since(&self, seat: &Seat, since: i64) -> Option<bool> {
-        let dir = self.dir_of(seat).ok()?;
-        // No log is *cannot say*, not *no turn*: a seat that predates the file.
-        let began = self.host.turn_began(&dir, since);
-        // A far seat's hooks fire over there and write nothing here, so a log
-        // that shows no turn is *cannot say* for it, not *no turn*: the caller
-        // then reads the seat's live state, which a far screen answers
-        // (wsp-589). Only a turn actually seen is a turn.
-        let far = self.record(seat).ok().is_some_and(|r| !str_of(&r, "machine").is_empty());
-        match (far, began) {
-            (true, Some(true)) => Some(true),
-            (true, _) => None,
-            (false, began) => began,
-        }
-    }
-
     fn census(&self) -> Result<Census> {
         // One machine, and it is this one — a compound session is a local
         // pty and there is no fan-out here for `Census` to speak for.
@@ -2897,37 +2881,6 @@ mod tests {
         assert!(!place.state(&seat).unwrap().will_take_a_prompt(), "a sentence would land in the dialog");
     }
 
-    /// **`wsp-166`: a turn that starts and ends between two samples is still a
-    /// turn.** The seat goes idle, working, idle inside one tick, so every
-    /// reading of `state` says `Idle` — and the log is what says it happened.
-    #[test]
-    fn a_turn_shorter_than_a_tick_is_found_in_the_log_though_no_sample_saw_it() {
-        let scratch = Scratch::new("turn-since");
-        let place = scratch.place();
-        let seat = place.open(&Order::default()).unwrap();
-        let dir = place.dir_of(&seat).unwrap();
-        let _ends = EndsOnDrop(place.record(&seat).unwrap()["pid"].as_u64().expect("a live pid") as u32);
-        let _ = write_atomic(
-            &dir.join(SEAT_FILE),
-            &json!({ "pid": std::process::id(), "agent": { "kind": "claude", "name": "a", "args": [] } })
-                .to_string(),
-        );
-        place.heard(&seat, "SessionStart", said_by("SessionStart").unwrap(), &json!({}));
-        let typed = util::epoch_secs();
-        assert_eq!(place.turn_began_since(&seat, typed), Some(false), "nothing since the type");
-
-        for hook in ["UserPromptSubmit", "Stop"] {
-            place.heard(&seat, hook, said_by(hook).unwrap(), &json!({}));
-        }
-        assert_eq!(place.state(&seat).unwrap(), State::Idle, "every sample reads idle");
-        assert_eq!(place.turn_began_since(&seat, typed), Some(true), "and a turn began");
-        assert_eq!(
-            place.turn_began_since(&seat, util::epoch_secs() + 5),
-            Some(false),
-            "a turn before the type is not an answer to it"
-        );
-    }
-
     /// **`compound-107`: `said.json` cannot tell "one hook ever fired" from
     /// "many fired, and this is just the latest" — this file can.**
     ///
@@ -3133,16 +3086,6 @@ mod tests {
         assert!(place.state(&seat).unwrap().will_take_a_prompt(), "an idle screen takes a prompt");
         fs::write(&render, "#!/bin/sh\ncase \"$1\" in state) echo unknown;; *) echo '001|hi';; esac\n").unwrap();
         assert_eq!(place.state(&seat).unwrap(), State::Starting, "a screen that says nothing keeps it starting");
-
-        // The hooks log is local and a far agent never writes it.
-        assert_eq!(place.turn_began_since(&seat, now), None, "no log: cannot say");
-        let _ = fs::write(dir.join(HOOKS_FILE), format!("{}\n", json!({ "at": util::iso_at(now - 5), "hook": "SessionStart" })));
-        assert_eq!(place.turn_began_since(&seat, now), None, "a far log showing no turn is cannot-say, not no-turn");
-        let _ = fs::write(
-            dir.join(HOOKS_FILE),
-            format!("{}\n", json!({ "at": util::iso_at(now + 1), "hook": "UserPromptSubmit" })),
-        );
-        assert_eq!(place.turn_began_since(&seat, now), Some(true), "a turn seen is a turn");
 
         RENDER.with(|r| *r.borrow_mut() = None);
         let _ = fs::remove_dir_all(&root);

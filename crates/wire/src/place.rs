@@ -894,21 +894,6 @@ pub trait Place {
     /// `place_backend`.
     fn state(&self, seat: &Seat) -> Result<State>;
 
-    /// Whether a turn *began* at this seat at or after `since` (epoch seconds),
-    /// for a backend that keeps a record of turns rather than only a present
-    /// tense. `None` is *this backend cannot say*, and the caller falls back to
-    /// sampling [`Place::state`].
-    ///
-    /// **Why a sample is not enough.** `wsp-166`: a governor's reply to a typed
-    /// batch is one to two seconds long, the pass samples every twenty, and a
-    /// turn that starts and ends between two samples is never seen — so the
-    /// batch it answered stayed owed and was typed again every `RETYPED` for
-    /// a night. A compound seat's hooks write down every turn start, so the
-    /// question has an exact answer there.
-    fn turn_began_since(&self, _seat: &Seat, _since: i64) -> Option<bool> {
-        None
-    }
-
     /// The last moment anything was written about this seat, in epoch seconds
     /// — the clock a census reads to say *how long* a seat has been gone, which
     /// nothing else here keeps. `None` is *this backend has no record to read
@@ -1020,8 +1005,7 @@ impl Default for Pressing<'static> {
 /// and cannot watch, so `Ok` said *delivered* and nothing looked again.
 ///
 /// **What counts as taken.** A turn that began at the seat since the send
-/// ([`Place::turn_began_since`], or a turn in flight where the backend keeps no
-/// record), or — for an agent that was already mid-turn, whose sentence is
+/// (a turn in flight at the seat), or — for an agent that was already mid-turn, whose sentence is
 /// queued and starts nothing — the prompt reading empty. An idle agent's empty
 /// prompt is not taken on its own: the screen may not have drawn the text yet,
 /// and calling that a delivery is the false success this replaces.
@@ -1042,10 +1026,6 @@ pub fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing) -> Res
         return place.tell(seat, text);
     }
     let busy = place.state(seat).is_ok_and(|s| s.turn_in_flight());
-    // Taken before the type: a turn's start is stamped in whole seconds while
-    // the type is still returning, so a stamp taken after could postdate the
-    // very turn it is looking for. `wake` takes its own the same way.
-    let since = crate::util::epoch_secs();
     let first = match place.tell(seat, text) {
         Ok(Delivery::Started) => return Ok(Delivery::Started),
         // The supervisor's own acknowledgement: it owns the retry, so wsp
@@ -1055,10 +1035,7 @@ pub fn submit(place: &dyn Place, seat: &Seat, text: &str, how: &Pressing) -> Res
         Err(Refusal::NotTaken) => Err(Refusal::NotTaken),
         Err(e) => return Err(e),
     };
-    let turned = || match place.turn_began_since(seat, since) {
-        Some(began) => began,
-        None => !busy && place.state(seat).is_ok_and(|s| s.turn_in_flight()),
-    };
+    let turned = || !busy && place.state(seat).is_ok_and(|s| s.turn_in_flight());
     for (i, window) in how.windows.iter().enumerate() {
         let deadline = how.clock.now() + *window;
         loop {
@@ -1494,9 +1471,6 @@ mod tests {
         fn typed(&self, _: &Seat) -> Option<bool> {
             self.readable.then(|| self.holding.get())
         }
-        fn turn_began_since(&self, _: &Seat, _: i64) -> Option<bool> {
-            Some(self.turned.get())
-        }
         fn stop(&self, _: &Seat) -> Result<()> {
             unreachable!()
         }
@@ -1606,7 +1580,6 @@ mod tests {
             fn tell(&self, _: &Seat, _: &str) -> Result<Delivery> { Ok(Delivery::Unconfirmed) }
             fn nudge(&self, s: &Seat) -> Result<()> { self.0.nudge(s) }
             fn typed(&self, s: &Seat) -> Option<bool> { self.0.typed(s) }
-            fn turn_began_since(&self, s: &Seat, t: i64) -> Option<bool> { self.0.turn_began_since(s, t) }
             fn stop(&self, s: &Seat) -> Result<()> { self.0.stop(s) }
             fn state(&self, s: &Seat) -> Result<State> { self.0.state(s) }
             fn census(&self) -> Result<Census> { self.0.census() }

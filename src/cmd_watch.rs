@@ -2478,18 +2478,8 @@ impl Source for Poll<'_> {
             checking: Default::default(),
             check_on: Default::default(),
             lists: Vec::new(),
-            // Read for state, never published — but this is the reading that
-            // ticks, so it is the one that dates a seat's change when nobody
-            // runs `wsp wip` (`wsp-250`). It forgets nothing: the census folds
-            // every machine into one answer and drops a far machine's
-            // silence, so it cannot say whose machine went without a seat.
-            // `wsp wip`, which asks each machine apart, does the forgetting.
-            since: cmd_agent::seat_clocks(
-                self.store,
-                seats.iter().map(|s| (s, None)),
-                &BTreeSet::new(),
-                crate::util::epoch_secs(),
-            ),
+            // Read for state, never published: what the fold dated (`wsp-250`).
+            since: cmd_agent::seat_clocks(self.store, seats.iter()),
             // Read for state, never published, for `mandates`' reason.
             spawned: Default::default(),
             unsent: Default::default(),

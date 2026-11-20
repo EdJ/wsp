@@ -73,7 +73,7 @@ pub use wsp_host::inproc::*;
 
 /// M1's second implementation, over the manager's connection (wsp-025), and
 /// `WSP_HOST`'s choice between the two.
-pub use crate::host_tcp::{choose, choose_jobs, chosen, jobs_chosen, Choice, HostError, JobsChoice, Subscription, Tcp};
+pub use crate::host_tcp::{choose, choose_jobs, chosen, jobs_chosen, record, record_of, Choice, HostError, JobsChoice, Subscription, Tcp};
 
 /// What a tree job is, as `job.run` carries it, and what comes back
 /// (`docs/agent-manager.md` 3.2): the trait's job methods take and give these,
@@ -329,11 +329,6 @@ pub trait Host: Sync {
     /// The newest two messages of an opencode session (`role`, `created`,
     /// `completed`), newest first, off `opencode db`.
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>>;
-
-    // ---- turn
-    /// Whether [`HOOKS_FILE`] shows the seat's own prompt submitted at or
-    /// after `since`; `None` when there is no log to say.
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool>;
 
     // ---- beat (host facts)
     // Each is the probe's own text; what it means is read by the caller's
@@ -595,9 +590,6 @@ impl Host for InProcess {
     }
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
         self.host.opencode_newest(session)
-    }
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        self.host.turn_began(dir, since)
     }
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
         self.host.wire_health(problems, notes)

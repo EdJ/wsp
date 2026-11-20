@@ -1113,7 +1113,7 @@ impl Sink for Tell<'_> {
             // cannot see: `wsp-166` measured cpd-250's replies at one to two
             // seconds against a twenty-second tick, so most were never seen
             // and the batch was typed again every [`RETYPED`] all night.
-            let read = state.turn_in_flight() || place.turn_began_since(&addressee, at) == Some(true);
+            let read = state.turn_in_flight() || crate::fold::turn_began_since(self.store, addressee.as_str(), at) == Some(true);
             // **A turn confirms what was typed and nothing raised after it.** An
             // entry with no stamp has never been at the seat, so clearing the
             // batch on a turn would report it read; it falls through to the gate

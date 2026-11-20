@@ -13,7 +13,6 @@ cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
 cmd_agent -> daemon: a_backend_answered, dead, health, running  # seats -> top
 cmd_agent -> main: Args  # seats -> top
 cmd_agent -> panel: BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL, glyph  # seats -> surface
-cmd_agent -> timeline: session_fixed, session_secs  # seats -> timeline
 cmd_attempts -> main: Args  # timeline -> top
 cmd_attend -> agent_commands: *, self  # engine -> seats
 cmd_attend -> cmd_agent: learn_sessions  # engine -> seats
@@ -50,7 +49,7 @@ cmd_worklist -> cmd_govern: slots  # engine -> seats
 cmd_worklist -> cmd_report: at_last_barrier, declared, dir, gate_done, line, output, report  # engine -> timeline
 cmd_worklist -> main: Args  # engine -> top
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
-cycle -> cmd_agent: did_of_seat, fixed_of_seat, notice, ran_of_seat, secs_of_seat  # engine -> seats
+cycle -> cmd_agent: did_of_seat, notice  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
 cycle -> main: Args  # engine -> top
 cycle -> room: Gate  # engine -> seats

@@ -502,9 +502,6 @@ impl Host for Counting<'_> {
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
         self.inner.opencode_newest(session)
     }
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        self.inner.turn_began(dir, since)
-    }
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
         self.inner.wire_health(problems, notes)
     }
@@ -1152,7 +1149,7 @@ fn wsp_host_manager_with_no_manager_running_is_host_silent() {
     let state = dir.join("state");
     record(&state, &dir.join("exec"), free_port());
 
-    // The default is the manager (wsp-029); `inproc` is the rollback, and asks nobody.
+    // The default is the manager (wsp-029); `inproc` runs one in this process (wsp-030).
     assert_eq!(Choice::parse(None), Ok(Choice::Manager));
     assert_eq!(Choice::parse(Some("")), Ok(Choice::Manager));
     assert_eq!(Choice::default(), Choice::Manager);
@@ -1418,6 +1415,36 @@ fn a_seat_started_in_process_is_adopted_by_the_manager_then_told_and_stopped_thr
     m.stop();
     drop(sweep);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// wsp-030 (wsp-019's decision): `WSP_HOST=inproc` runs the manager's own
+/// code in this process, on loopback under `<state>/inproc/manager`, and is
+/// reached as the installed one is: a `Tcp` that has heard its `hello`, the
+/// same address on every call, and a subscription at its head that hears its
+/// events. No machine record is read or written.
+#[test]
+fn wsp_host_inproc_runs_the_manager_in_this_process_and_is_heard_as_one() {
+    let (dir, _) = place("inproc-manager");
+    let state = dir.join("state");
+    let (local, token) = host::record_of(Choice::Inproc, &state).expect("the in-process manager");
+    assert!(local.addr.is_loopback(), "{local:?}");
+    assert_eq!(local.host, wsp_wire::host_inproc::host_id());
+    assert_eq!(local.exec_dir, wsp_wire::host_inproc::exec_dir(&state));
+    assert!(!wsp_wire::manager::record_path(&state).exists(), "no machine record is written");
+    assert_eq!(host::record_of(Choice::Inproc, &state).unwrap().0, local, "one manager per state dir");
+
+    assert!(host::choose(Choice::Inproc, &state, "test").is_ok());
+    let tcp = Tcp::new(local.socket(), token.clone(), Role::Cli, "test");
+    assert_eq!(tcp.seats().expect("it answers `seats`"), vec![]);
+
+    let mut sub = Subscription::at_head(local.socket(), token, Role::Daemon, "test").expect("subscribed at its head");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut heard = false;
+    while !heard && Instant::now() < deadline {
+        heard = matches!(sub.next(Duration::from_secs(1)), Ok(Some(_)));
+    }
+    assert!(heard, "a subscription to the in-process manager hears its events");
+    sub.close();
 }
 
 /// wsp-029, 6.2's rollback: with `WSP_HOST=inproc` again, a seat the manager
