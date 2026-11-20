@@ -73,7 +73,7 @@ pub use wsp_host::inproc::*;
 
 /// M1's second implementation, over the manager's connection (wsp-025), and
 /// `WSP_HOST`'s choice between the two.
-pub use crate::host_tcp::{choose, choose_jobs, chosen, jobs_chosen, Choice, HostError, JobsChoice, Subscription, Tcp};
+pub use crate::host_tcp::{choose, choose_jobs, chosen, jobs_chosen, record, record_of, Choice, HostError, JobsChoice, Subscription, Tcp};
 
 /// What a tree job is, as `job.run` carries it, and what comes back
 /// (`docs/agent-manager.md` 3.2): the trait's job methods take and give these,

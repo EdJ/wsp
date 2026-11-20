@@ -34,7 +34,9 @@
 //! a backend with no seats).
 //!
 //! **Choosing** is `WSP_HOST=inproc|manager` ([`Choice`], [`chosen`]); the
-//! default is `manager` since wsp-029, and `WSP_HOST=inproc` is 6.2's rollback.
+//! default is `manager` since wsp-029. `WSP_HOST=inproc` runs the same
+//! manager code inside this process ([`crate::host_inproc`], wsp-030): the
+//! same `Tcp`, the same events, a different place it runs.
 //! Tree jobs are chosen apart, by `WSP_JOBS=inproc|manager` ([`JobsChoice`],
 //! [`jobs_chosen`]; `inproc` until M3's callers have moved), so they roll back
 //! on their own.
@@ -109,6 +111,9 @@ pub enum HostError {
     Choice(String),
     /// `WSP_JOBS` names neither choice.
     JobsChoice(String),
+    /// `WSP_HOST=inproc` and the in-process manager could not be started or
+    /// found ([`crate::host_inproc::reach`]).
+    Inproc(String),
 }
 
 impl std::fmt::Display for HostError {
@@ -127,6 +132,7 @@ impl std::fmt::Display for HostError {
             HostError::Refused { why, detail } => write!(f, "the manager refused wsp's hello: {why:?} {detail}"),
             HostError::Choice(v) => write!(f, "{ENV}={v} is neither `inproc` nor `manager`"),
             HostError::JobsChoice(v) => write!(f, "{JOBS_ENV}={v} is neither `inproc` nor `manager`"),
+            HostError::Inproc(why) => write!(f, "{ENV}=inproc and the manager could not run in this process: {why}"),
         }
     }
 }
@@ -144,9 +150,11 @@ impl From<HostError> for Refusal {
 /// `WSP_HOST`: which implementation of [`Host`] this process asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Choice {
-    /// [`crate::host::LOCAL`]: the host run in this process, as at M0; 6.2's
-    /// rollback. It adopts a seat the manager started by the record's socket
-    /// and pid, as one of its own.
+    /// The manager's own code, run in this process
+    /// ([`crate::host_inproc`]; wsp-019's decision, wsp-030): the same
+    /// [`Tcp`] and events as [`Choice::Manager`], to a manager on loopback
+    /// that this process (or another wsp process) started, not the installed
+    /// one. M0's in-process inference is no longer a choice.
     Inproc,
     /// [`Tcp`] to the manager the local machine record names: the default
     /// since wsp-029.
@@ -170,8 +178,9 @@ impl Choice {
     }
 }
 
-/// The host `choice` names, for this machine's `state` dir: the in-process
-/// host, or a [`Tcp`] that has already heard the manager's `hello` (so a
+/// The host `choice` names, for this machine's `state` dir: a [`Tcp`] to the
+/// manager run in this process, or to the installed one the local machine
+/// record names; either has already heard the manager's `hello` (so a
 /// manager that is not there is [`HostError::Silent`] here, before any seat is
 /// asked anything). The `Tcp` is made once per state dir and per manager:
 /// one connection per CLI call, and in a long-lived process (the daemon's
@@ -181,9 +190,22 @@ impl Choice {
 /// (wsp-112). A `Tcp` the record no longer names has its connection closed.
 pub fn choose(choice: Choice, state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
     match choice {
-        Choice::Inproc => Ok(&crate::host::LOCAL),
-        Choice::Manager => Ok(manager_for(state, version)?),
+        Choice::Inproc | Choice::Manager => Ok(manager_for(state, version, record_of(choice, state)?)?),
     }
+}
+
+/// What to dial for `choice`: the in-process manager's address and token, or
+/// the local machine record's.
+pub fn record_of(choice: Choice, state: &Path) -> std::result::Result<(Local, Token), HostError> {
+    match choice {
+        Choice::Inproc => crate::host_inproc::reach(state),
+        Choice::Manager => manager::read_record(state).ok_or_else(|| HostError::NoRecord(manager::record_path(state))),
+    }
+}
+
+/// [`record_of`] by `$WSP_HOST`.
+pub fn record(state: &Path) -> std::result::Result<(Local, Token), HostError> {
+    record_of(Choice::from_env()?, state)
 }
 
 /// The [`Tcp`] to the manager `state`'s record names now: the one made for
@@ -191,11 +213,9 @@ pub fn choose(choice: Choice, state: &Path, version: &str) -> std::result::Resul
 /// new one that has heard `hello`. Each is leaked once, as the `&'static`
 /// a [`Host`] is handed out as; a manager restarted many times in one
 /// process's life is a handful of small structs, its connections closed.
-fn manager_for(state: &Path, version: &str) -> std::result::Result<&'static Tcp, HostError> {
+fn manager_for(state: &Path, version: &str, (local, token): (Local, Token)) -> std::result::Result<&'static Tcp, HostError> {
     static MANAGERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static Tcp>>> = OnceLock::new();
     let managers = MANAGERS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let (local, token): (Local, Token) =
-        manager::read_record(state).ok_or_else(|| HostError::NoRecord(manager::record_path(state)))?;
     let addr = local.socket();
     if let Some(tcp) = managers.lock().unwrap_or_else(|e| e.into_inner()).get(state) {
         if tcp.addr == addr && tcp.token == token {
@@ -487,10 +507,9 @@ impl Tcp {
         self
     }
 
-    /// The manager the local machine record under `state` names.
+    /// The manager `$WSP_HOST` chooses for `state` ([`record`]).
     pub fn from_record(state: &Path, role: Role, version: &str) -> std::result::Result<Tcp, HostError> {
-        let (local, token): (Local, Token) =
-            manager::read_record(state).ok_or_else(|| HostError::NoRecord(manager::record_path(state)))?;
+        let (local, token): (Local, Token) = record(state)?;
         Ok(Tcp::new(local.socket(), token, role, version))
     }
 
@@ -1298,9 +1317,9 @@ impl Subscription {
         Ok(sub)
     }
 
-    /// The one the local machine record names.
+    /// The one `$WSP_HOST` chooses for `state` ([`record`]).
     pub fn from_record(state: &Path, version: &str) -> std::result::Result<Subscription, HostError> {
-        let (local, token) = manager::read_record(state).ok_or_else(|| HostError::NoRecord(manager::record_path(state)))?;
+        let (local, token) = record(state)?;
         Ok(Subscription::new(local.socket(), token, &local.host, state, version))
     }
 

@@ -4202,11 +4202,12 @@ fn daemon_by_stamp(last: Option<i64>, heard: bool, now: i64) -> Option<String> {
     })
 }
 
-/// Whether `wip` reads `seats` from the managers (`WSP_HOST=manager`,
-/// `docs/agent-manager.md` 4.3) rather than surveying in this process. A
-/// `WSP_HOST` that names neither is the in-process reading, as M0's.
+/// Whether `wip` reads `seats` from the managers (`docs/agent-manager.md`
+/// 4.3) rather than surveying in this process: under both choices since
+/// wsp-030 ([`crate::fold::under_manager`]), `inproc` asking the manager run
+/// in-process.
 fn wip_reads_manager() -> bool {
-    crate::host_tcp::Choice::from_env() == Ok(crate::host_tcp::Choice::Manager)
+    crate::fold::under_manager()
 }
 
 impl Wip {

@@ -794,7 +794,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 /// `seat-memory.json`: off the managers' `seats` replies under
 /// `WSP_HOST=manager`, else one `ps` over the local backends' census.
 fn sample_seat_memory(store: &Store, now: i64) {
-    if crate::host_tcp::Choice::from_env() == Ok(crate::host_tcp::Choice::Manager) {
+    if crate::fold::under_manager() {
         let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
         let rss: std::collections::BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
         crate::memory::sample_rss(&store.state, &rss, now);

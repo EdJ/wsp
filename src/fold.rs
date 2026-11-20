@@ -522,19 +522,22 @@ fn apply(store: &Store, host: &str, msg: &Message) {
 // reads [`did_since`] and the stuck tick reads [`stalls`]. A fact not folded
 // yet is no fact: nothing here falls back to the probe it replaces.
 
-/// `WSP_HOST=manager`: the manager's events are the cause, and the phases
-/// they replace do not run.
+/// The manager's events are the cause, and the phases they replace do not
+/// run: under both choices since wsp-030, where `WSP_HOST=inproc` runs the
+/// manager's own code in this process ([`crate::host_tcp::record`]). Kept as a
+/// function until the daemon-tick and verbs legs delete the branches it
+/// guards; it no longer says no.
 pub fn under_manager() -> bool {
-    matches!(crate::host::Choice::from_env(), Ok(crate::host::Choice::Manager))
+    true
 }
 
-/// The host whose manager is folded, under `WSP_HOST=manager` with a machine
-/// record; `None` otherwise.
+/// The host whose manager is folded: the one `$WSP_HOST` chooses, the
+/// in-process manager or the machine record's; `None` when there is none.
 fn folded_host(store: &Store) -> Option<String> {
     if !under_manager() {
         return None;
     }
-    crate::manager::read_record(&store.state).map(|(local, _)| local.host)
+    crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host)
 }
 
 /// The host facts of the newest beat folded, under `WSP_HOST=manager`.
@@ -632,13 +635,15 @@ pub fn follow(store: &Store, db: Option<&SharedStore>, host: &str, sub: &mut Sub
     sub.close();
 }
 
-/// Start the thread for the manager the local machine record names, under
-/// `WSP_HOST=manager` only. `None` under `inproc`, or with no record.
+/// Start the thread for the manager `$WSP_HOST` chooses: under `inproc` the
+/// one run in this process (started here if no wsp process runs it yet),
+/// under `manager` the one the local machine record names. `None` with
+/// neither.
 pub fn start(store: &Store, db: Option<SharedStore>) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
-    if !matches!(crate::host::Choice::from_env(), Ok(crate::host::Choice::Manager)) {
+    if !under_manager() {
         return None;
     }
-    let (local, token) = crate::manager::read_record(&store.state)?;
+    let (local, token) = crate::host_tcp::record(&store.state).ok()?;
     let (root, state) = (store.root.clone(), store.state.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
