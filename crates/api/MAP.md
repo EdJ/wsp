@@ -11,7 +11,7 @@ Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the 
 - `src/lib.rs` — `Frame` (one line, tagged `type`: `hello`, `welcome`, `refused`, `request`, `reply`, `feed`);
   `Hello` (4.1's credential: `token`, `by`, `client`, `protocol`), `Welcome` (`server`, `protocol`, `head`),
   `Refused` (`code`, `text`); `Request` (4.1's envelope `v`, `id`, `key?`, `by`, then `verb` and `args`) and its
-  `Call` (a read `Verb`, a contract `Command`, or `Unknown`); `Verb` (4.2's read verbs and 4.3's `subscribe`) and
+  `Call` (a read `Verb`, a contract `Command`, or `Unknown`); `Verb` (4.2's read verbs, 4.3's `subscribe` and wsp-695's `wip`) and
   `NoArgs`; `Reply` (`id`, `ok` | `err`, `events`), `Outcome`, `Answer` (one per verb), `Failure` and `Code`;
   `ReqId`, `ApiToken`, `Listen`; `PROTOCOL`, `TOKEN_FILE`, `TOKEN_MODE`, `LISTEN_FILE`, `MAX_EVENTS`,
   `READ_VERBS`, `COMMAND_VERBS`; the contract's types re-exported where a frame carries them

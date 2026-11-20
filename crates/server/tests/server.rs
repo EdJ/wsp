@@ -710,6 +710,9 @@ impl Reads for Retained {
     fn snapshot(&self) -> Result<(State, EventId)> {
         self.inner.snapshot()
     }
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        self.inner.wip_snapshot()
+    }
 }
 
 impl Events for Retained {

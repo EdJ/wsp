@@ -86,6 +86,7 @@ pub const READ_VERBS: &[&str] = &[
     "machines",
     "events",
     "subscribe",
+    "wip",
 ];
 
 /// The command verbs, as the contract's [`Command`] names them on the wire: the
@@ -290,6 +291,11 @@ pub enum Verb {
     /// `subscribe { from? }` (4.3): from an id, every event after it; absent,
     /// a snapshot first. Answered [`Answer::Subscribed`], then the feed.
     Subscribe(#[serde(default)] Subscribe),
+    /// What `wip` draws of `state` (wsp-695), as the store's
+    /// `Reads::wip_snapshot` says: open rows whole, the rest as heads, lists
+    /// without their text, only raised asks, the seats and claims; small enough
+    /// for one line under [`MAX_LINE`] where `state`'s whole domain is not.
+    Wip(#[serde(default)] NoArgs),
 }
 
 /// The `args` of a verb that takes none: written `{}`, and read from `{}`,
@@ -382,6 +388,12 @@ pub enum Answer {
     Subscribed,
     /// A command: it was applied, and its events are the reply's `events`.
     Applied,
+    /// `wip`: the part of the snapshot `wip` draws, and the id it is
+    /// consistent at.
+    Wip {
+        state: State,
+        at: EventId,
+    },
 }
 
 /// What `err` carries: `{ code, text }` (4.1), and the contract's refusal

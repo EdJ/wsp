@@ -272,7 +272,7 @@ fn every_frame_type_round_trips() {
 // ---------------------------------------------------------------- verbs
 
 /// Read verbs, then the contract's commands, then the unknown verb.
-const VERBS: usize = 12;
+const VERBS: usize = 13;
 const COMMANDS: usize = 20;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
@@ -290,6 +290,7 @@ fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
         Verb::Machines(_) => (9, "machines"),
         Verb::Events { .. } => (10, "events"),
         Verb::Subscribe(_) => (11, "subscribe"),
+        Verb::Wip(_) => (12, "wip"),
     }
 }
 
@@ -370,6 +371,7 @@ fn requests() -> Vec<Frame> {
         Verb::Subscribe(Subscribe {
             from: Some(EventId(400)),
         }),
+        Verb::Wip(NoArgs {}),
     ];
     let commands = vec![
         Command::RowAdd {
@@ -502,7 +504,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 13;
+const ANSWERS: usize = 14;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -526,6 +528,7 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Events { .. } => (10, "events"),
         Answer::Subscribed => (11, "subscribed"),
         Answer::Applied => (12, "applied"),
+        Answer::Wip { .. } => (13, "wip"),
     }
 }
 
@@ -566,6 +569,14 @@ fn answers() -> Vec<Frame> {
             vec![],
         ),
         ok(12, Answer::Subscribed, vec![]),
+        ok(
+            14,
+            Answer::Wip {
+                state: a_state(),
+                at: EventId(411),
+            },
+            vec![],
+        ),
         ok(13, Answer::Applied, vec![412, 413]),
     ]
 }
@@ -796,8 +807,8 @@ fn wire_spelling_is_pinned() {
         json!({
             "type": "request",
             "v": 1,
-            "id": 15,
-            "key": "k-15",
+            "id": 16,
+            "key": "k-16",
             "by": "seat:cpd-3698",
             "verb": "row.claim",
             "args": {

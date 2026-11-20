@@ -280,6 +280,7 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
     let s = &shared.store;
     let r = match verb {
         Verb::State(_) => s.snapshot().map(|(state, at)| Answer::State { state, at }),
+        Verb::Wip(_) => s.wip_snapshot().map(|(state, at)| Answer::Wip { state, at }),
         Verb::Row { row } => s.row(&row).map(Answer::Row),
         Verb::Rows(filter) => s.rows(&filter).map(Answer::Rows),
         Verb::List { list } => s.list(&list).map(Answer::List),

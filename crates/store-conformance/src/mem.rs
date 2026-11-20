@@ -364,6 +364,25 @@ impl Reads for MemStore {
         let g = self.lock();
         Ok((g.state.clone(), g.head))
     }
+
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        let (s, at) = self.snapshot()?;
+        let bodiless = |mut f: std::collections::BTreeMap<String, String>| {
+            WIP_BODIES.iter().for_each(|k| drop(f.remove(*k)));
+            f
+        };
+        let rows = s
+            .rows
+            .into_iter()
+            .map(|(id, r)| match r.state {
+                RowState::Done => (id, Row { fields: bodiless(r.fields), ..r }),
+                _ => (id, r),
+            })
+            .collect();
+        let lists = s.lists.into_iter().map(|(id, l)| (id, List { fields: bodiless(l.fields), ..l })).collect();
+        let asks = s.asks.into_iter().filter(|(_, a)| a.state == AskState::Raised).collect();
+        Ok((State { rows, lists, seats: s.seats, claims: s.claims, asks, ..State::default() }, at))
+    }
 }
 
 impl Events for MemStore {

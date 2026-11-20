@@ -880,6 +880,9 @@ impl Reads for Nothing {
     fn snapshot(&self) -> Result<(State, EventId)> {
         Ok((self.state.borrow().clone(), EventId(0)))
     }
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        self.snapshot()
+    }
 }
 
 impl Events for Nothing {

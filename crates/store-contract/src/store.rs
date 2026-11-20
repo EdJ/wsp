@@ -55,6 +55,12 @@ use crate::refusal::Result;
 /// `Texts::set_text` writes `text.set` by `Principal::Wsp(STORE_INSTANCE)`.
 pub const STORE_INSTANCE: &str = "store";
 
+/// The `fields` keys that hold a row's or a list's text, which
+/// [`Reads::wip_snapshot`] leaves out of every row that is not open and every
+/// list: `body` is the file's text, `prose` a head-only row's body (as
+/// `src/mirror.rs` writes them).
+pub const WIP_BODIES: [&str; 2] = ["body", "prose"];
+
 /// Which rows `rows` returns; an empty field does not filter.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowFilter {
@@ -93,6 +99,14 @@ pub trait Reads {
     fn machine(&self, name: &MachineName) -> Result<Option<Machine>>;
     /// The whole domain state and the id it is consistent at.
     fn snapshot(&self) -> Result<(State, EventId)>;
+    /// What `wip` draws of [`snapshot`](Reads::snapshot), at the id it is
+    /// consistent at (wsp-695): every row, an open one (any state but `done`)
+    /// whole and any other as its head, which is the row without the
+    /// [`WIP_BODIES`] fields; every list without them too, its groups whole;
+    /// only the asks that are `raised`; and the seats and claims whole. Orders, runs, machines and leases
+    /// are left empty. It is `snapshot()` with exactly that taken out, nothing
+    /// else changed.
+    fn wip_snapshot(&self) -> Result<(State, EventId)>;
 }
 
 /// The event log.
