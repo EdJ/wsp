@@ -276,14 +276,28 @@ impl JobsChoice {
 }
 
 /// The host `choice` runs jobs on: the in-process runner, its files under
-/// `<state>/inproc`; or the manager's [`Tcp`], the one [`choose`] makes (so a
-/// silent manager is [`HostError::Silent`] here, and nothing runs).
+/// `<state>/inproc` and a job's `dir` under the tree root the install wrote
+/// (`<state>/manager/jobs.json`, else the home directory: the root wsp places
+/// a job under, `job_place::installed_tree_root`), so the rollback runs a job
+/// in the tree the manager would have; or the manager's [`Tcp`], the one
+/// [`choose`] makes (so a silent manager is [`HostError::Silent`] here, and
+/// nothing runs).
 pub fn choose_jobs(choice: JobsChoice, state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
-    static INPROC: OnceLock<InProcess> = OnceLock::new();
     match choice {
-        JobsChoice::Inproc => Ok(INPROC.get_or_init(|| InProcess::new().with_jobs(&state.join("inproc"), &crate::util::home()))),
+        JobsChoice::Inproc => Ok(inproc_for(state)),
         JobsChoice::Manager => choose(Choice::Manager, state, version),
     }
+}
+
+/// The in-process runner for `state` and the tree root it names now: one per
+/// pair, leaked once as [`manager_for`]'s are, so a reinstall that moves the
+/// root is read by the next job and not kept from the first.
+fn inproc_for(state: &Path) -> &'static InProcess {
+    static INPROC: OnceLock<Mutex<BTreeMap<(PathBuf, PathBuf), &'static InProcess>>> = OnceLock::new();
+    let root = manager::read_jobs(state).map(|j| j.tree_root).unwrap_or_else(crate::util::home);
+    let mut map = INPROC.get_or_init(|| Mutex::new(BTreeMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    map.entry((state.to_path_buf(), root.clone()))
+        .or_insert_with(|| Box::leak(Box::new(InProcess::new().with_jobs(&state.join("inproc"), &root))))
 }
 
 /// [`choose_jobs`] by `$WSP_JOBS`, read once per process as the `Tcp` is

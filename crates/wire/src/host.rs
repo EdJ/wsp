@@ -411,7 +411,8 @@ pub struct InProcess {
     /// is [`default_exec`].
     exec: Option<PathBuf>,
     /// What a job's `dir` is under, as the manager's `--tree-root`; `None` is
-    /// the home directory, the manager's default.
+    /// the home directory, the manager's default. `choose_jobs` gives it the
+    /// root the install wrote, the one wsp places a job under.
     tree_root: Option<PathBuf>,
     jobs: Mutex<BTreeMap<JobKey, Arc<Slot>>>,
 }

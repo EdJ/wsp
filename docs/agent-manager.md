@@ -1221,7 +1221,8 @@ The `Host` trait (crates/wire/src/host.rs) gains `run_job`, `stop_job` and `jobs
   `BEAT_SECS × MISSED_BEATS`, subscribes from the last id it heard, and sends the same frame with its key unchanged.
   The manager hands the job over and does not run it again. `stop_job` and `jobs` go over the CLI's one connection.
 - **`host::InProcess`** runs wsp-host's runner here (`with_jobs(exec, tree_root)`; by default
-  `~/.local/state/wsp/inproc` and the home directory). It places a `dir` by the manager's rule, uses the same 5 s
+  `~/.local/state/wsp/inproc` and the home directory; `WSP_JOBS=inproc` gives it `<state>/inproc` and the tree root
+  in `<state>/manager/jobs.json`, see "One root on both sides" below). It places a `dir` by the manager's rule, uses the same 5 s
   grace between `TERM` and `KILL`, and keeps a job table per process. A key the runner's files show already ran
   gets back that run's end and is not run again.
 - **`WSP_JOBS=inproc|manager`** is read once per process (`host::jobs_chosen`). The default was `inproc` until wsp-056 made it `manager`. `manager`
@@ -1291,7 +1292,9 @@ or `kill`. SIGINT to that process stops the job (exit 130, the tool gone, the jo
 - **One root on both sides.** The install keeps what it told the manager in `<state>/manager/jobs.json`, beside the
   machine record, and `--uninstall-manager` removes it with the record. wsp places a job under the same root:
   `job_place::tree_root` and `throttle run`'s `Jobs` read it there (`job_place::installed_tree_root`). Without the
-  file, wsp uses the home directory, as before.
+  file, wsp uses the home directory, as before. The rollback's in-process runner (`WSP_JOBS=inproc`,
+  `host::choose_jobs`) reads the same file by the same rule, so a host whose projects are outside home still runs
+  its jobs in their trees after a rollback.
 - **Doctor** names the capacities in the manager's `hello` ("runs N build and M check jobs at once"). It reports a
   problem when they differ from what `jobs.json` says the install wrote.
 
