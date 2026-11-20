@@ -290,7 +290,9 @@ fn fail(msg: &str) -> i32 {
 pub fn wrong_seat(store: &Store, w: &Worklist, s: &Value, pane: Option<&str>) -> Option<String> {
     let pane = pane.filter(|p| !p.is_empty())?;
     let mine = store.bindings().get(pane).and_then(|b| b["task_id"].as_str()).filter(|t| !t.is_empty()).map(str::to_string)?;
-    let record = s["row"].as_str().or_else(|| w.retro.as_ref().map(|(_, r)| r.as_str()));
+    // The list's own retro row follows `wsp mv`; the record's `row` is written once at
+    // start and goes stale when the row moves (`wsp-351`), so the list is read first.
+    let record = w.retro.as_ref().map(|(_, r)| r.as_str()).or_else(|| s["row"].as_str());
     if record == Some(mine.as_str()) {
         return None;
     }
@@ -891,6 +893,17 @@ mod tests {
         assert_eq!(done(&store, &args(&["done", "a", &ok], &[])), 0);
         // and pane-a's seat is still refused on b once a is sent back
         assert_eq!(done(&store, &args(&["done", "b", &ok], &[])), 1);
+
+        // a retro row moved to another id: the list follows it, the record's row is stale
+        let old = rows[0].clone();
+        let moved = format!("{old}-moved");
+        let mut wa = store.worklist("a").unwrap();
+        wa.retro = Some((wa.retro.clone().unwrap().0, moved.clone()));
+        store.save_worklist(&wa).unwrap();
+        store.set_binding("pane-a", json!({ "task_id": moved }));
+        assert_eq!(state("a")["row"], json!(old), "the record still names the old id");
+        assert!(wrong_seat(&store, &store.worklist("a").unwrap(), &state("a"), Some("pane-a")).is_none(), "the moved row's seat writes its own list's retro");
+        assert!(wrong_seat(&store, &store.worklist("b").unwrap(), &state("b"), Some("pane-a")).is_some());
 
         // a hand outside any seat writes either
         std::env::remove_var(crate::base::seat::SEAT_ENV);
