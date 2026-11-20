@@ -1236,12 +1236,16 @@ impl Drop for TreeLock {
 /// the same function.
 pub(crate) use wsp_trees::job_place::{place_of, Place, TreeKind, Whose};
 
-/// What runs a step: one `job.run` per step on a host, the manager of the
-/// place's host (`WSP_JOBS=manager`) or `wsp-host`'s runner in this process
-/// (`WSP_JOBS=inproc`, and a host with no manager). No step is spawned here
-/// past [`crate::host::Host::run_job`] (wsp-057). The barrier chooses its own
-/// in its row.
-pub(crate) type Runner<'a> = Jobs<'a>;
+/// What runs a step, always as one `job.run` through
+/// [`crate::host::Host::run_job`] (wsp-057: wsp spawns no step itself):
+/// `wsp-host`'s job runner in this process (`WSP_JOBS=inproc`, and a host
+/// with no manager), or a host's manager (`WSP_JOBS=manager`). The barrier
+/// chooses its own in its row.
+pub(crate) enum Runner<'a> {
+    /// In this process, the tree taken where it is ([`in_process`]).
+    Inproc,
+    Jobs(Jobs<'a>),
+}
 
 /// A run's steps as jobs: the host whose manager runs them, the place they
 /// run in, and the tree lock the run holds, which names the job running.
@@ -1249,10 +1253,6 @@ pub(crate) struct Jobs<'a> {
     pub host: &'a dyn crate::host::Host,
     pub place: Place,
     pub lock: Option<PathBuf>,
-    /// Whether the lock names the job running: only a manager's, whose job
-    /// table [`TreeLock::dead`] reads. An in-process job's lock is this
-    /// process's, held by its pid.
-    names_job: bool,
     /// What makes this run's keys its own (wsp-040): a job key is unique per run.
     run: String,
     seq: std::sync::atomic::AtomicU32,
@@ -1261,13 +1261,7 @@ pub(crate) struct Jobs<'a> {
 impl<'a> Jobs<'a> {
     pub(crate) fn new(host: &'a dyn crate::host::Host, place: Place, lock: Option<PathBuf>) -> Jobs<'a> {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        Jobs { host, place, lock, names_job: true, run: format!("{}.{nanos}", std::process::id()), seq: std::sync::atomic::AtomicU32::new(0) }
-    }
-
-    /// The same on `wsp-host`'s runner in this process: its lock is held by
-    /// this process's pid and names no job.
-    pub(crate) fn inproc(host: &'a dyn crate::host::Host, place: Place, lock: Option<PathBuf>) -> Jobs<'a> {
-        Jobs { names_job: false, ..Jobs::new(host, place, lock) }
+        Jobs { host, place, lock, run: format!("{}.{nanos}", std::process::id()), seq: std::sync::atomic::AtomicU32::new(0) }
     }
 
     /// `job.run` for `step`: class `check`, at the place, `sh -c` its command
@@ -1300,67 +1294,49 @@ impl<'a> Jobs<'a> {
     /// as the job is sent and once as it ends, so a lock whose job ended long
     /// ago is stale and one between two steps is not.
     fn hold(&self, key: &JobKey) {
-        match &self.lock {
-            Some(lock) if self.names_job => TreeLock::name_job(lock, self.place.host(), key),
-            _ => {}
+        if let Some(lock) = &self.lock {
+            TreeLock::name_job(lock, self.place.host(), key);
         }
     }
+}
 
+impl Runner<'_> {
     /// Keeps the run's tree lock held through a stretch in which it sends no
     /// job (the wsp-067 wait for a missing tree): touched, so it does not age
-    /// past the grace and read free while the run is alive.
+    /// past the grace and read free while the run is alive. In-process, a
+    /// live holder's pid keeps it, and there is nothing to do.
     pub(crate) fn keep_held(&self) {
-        if let Some(lock) = &self.lock {
+        if let Runner::Jobs(Jobs { lock: Some(lock), .. }) = self {
             TreeLock::touch(lock);
         }
     }
 }
 
-impl Jobs<'static> {
+impl Runner<'static> {
     /// What `WSP_JOBS` chooses for a run in `whose`'s `kind` tree at `tree`,
-    /// holding `lock`. Every run is placed by [`place_of`], under both choices:
-    /// `manager` runs on the manager of the place's host, and `inproc` (and a
-    /// host with no manager: only this machine has one until M4) on
-    /// `wsp-host`'s runner in this process (`choose_jobs(Inproc)`), which
-    /// places a job under the same tree root. A tree outside the tree root is
-    /// no place, and is refused under both (wsp-057: no step is spawned here
-    /// in its place). A manager that cannot be reached is an error, and
-    /// nothing is run here in its place.
+    /// holding `lock`: `inproc` runs in this process, each step a job on
+    /// `wsp-host`'s runner with the tree where it is ([`in_process`]), and
+    /// places nothing;
+    /// `manager` takes the place from [`place_of`] and runs on the manager of
+    /// the place's host. A place on a host with no manager (only this
+    /// machine has one until M4) keeps the in-process path. A manager that
+    /// cannot be reached is an error, and nothing is run here in its place.
     pub(crate) fn chosen(store: &Store, whose: Whose<'_>, kind: TreeKind, tree: &Path, lock: Option<&Path>) -> Result<Runner<'static>, String> {
         use crate::host::JobsChoice;
-        let choice = JobsChoice::from_env().map_err(|e| e.to_string())?;
-        // Whether this host has a manager is asked before anything is placed
-        // (wsp-346): a host with none runs its jobs in this process.
-        let managed = choice == JobsChoice::Manager
-            && crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host).as_deref()
-                == Some(wsp_trees::job_place::host_of(whose).as_str());
-        let place = place_of(whose, kind, tree).map_err(|why| {
-            if managed {
-                why
-            } else {
-                format!("{why}; a step runs as a job under the tree root even in this process (WSP_JOBS=inproc, or a host with no manager), so it was not run")
-            }
-        })?;
-        if !managed {
-            let host = crate::host::choose_jobs(JobsChoice::Inproc, &store.state, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
-            return Ok(Jobs::inproc(host, place, lock.map(Path::to_path_buf)));
+        if JobsChoice::from_env().map_err(|e| e.to_string())? == JobsChoice::Inproc {
+            return Ok(Runner::Inproc);
         }
+        // Whether this host has a manager is asked before anything is placed:
+        // a tree outside the tree root is an error only for a manager's job
+        // (wsp-346), and a host with none runs here wherever the tree is.
+        let managed = crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host);
+        if managed.as_deref() != Some(wsp_trees::job_place::host_of(whose).as_str()) {
+            return Ok(Runner::Inproc);
+        }
+        let place = place_of(whose, kind, tree)?;
         let host = crate::host::choose_jobs(JobsChoice::Manager, &store.state, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
-        Ok(Jobs::new(host, place, lock.map(Path::to_path_buf)))
+        Ok(Runner::Jobs(Jobs::new(host, place, lock.map(Path::to_path_buf))))
     }
-}
-
-/// The test's own directory as the tree root (wsp-057): every step is a job
-/// placed under the tree root, read alike by `place_of` and the in-process
-/// runner (`choose_jobs(Inproc)`), and a test's trees are under its own
-/// directory. Written where the install writes it, in the test's state, and
-/// set on the test's thread for `place_of`.
-#[cfg(test)]
-pub(crate) fn tree_root_here(env: &util::Isolated) -> PathBuf {
-    let root = env.home().parent().expect("an isolated directory").to_path_buf();
-    crate::manager::write_jobs(&env.state(), &crate::manager::Jobs { build: 2, check: 4, tree_root: root.clone() }).expect("the tree root written");
-    wsp_trees::job_place::set_tree_root(Some(root.clone()));
-    root
 }
 
 /// The job table of `host`'s manager, for a lock or a run named by a job:
@@ -1509,17 +1485,59 @@ pub(crate) struct Ran {
     pub reused: Option<Green>,
 }
 
-/// Run one step in `dir`, its output to `log`, as one job by `runner`:
-/// `job.run` of class `check` at the place [`place_of`] gave, its limit the
-/// step's and its hung bound [`hung_after`]. What it writes comes back as
-/// `job.output` into `log`, which the tail and the first error are read from;
-/// its timeout and its hang come from `job.ended`. The host's runner admits
-/// it (no check slot is taken here) and ends its group; wsp spawns and probes
-/// no process for it.
+/// Run one step in `dir`, its output to `log`, by `runner`: as one `job.run`
+/// on `wsp-host`'s runner in this process, or on a host's manager.
 pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path, runner: &Runner<'_>) -> Ran {
-    run_as_job(dir, step, log, runner)
+    match runner {
+        Runner::Inproc => run_as_job(dir, step, log, &in_process(dir)),
+        Runner::Jobs(jobs) => run_as_job(dir, step, log, jobs),
+    }
 }
 
+/// The jobs of a step run in this process (`WSP_JOBS=inproc`, and a host with
+/// no manager): `wsp-host`'s runner, its files under `<state>/inproc` as
+/// `choose_jobs(Inproc)`'s are, and the tree placed as its own root, its
+/// parent the root and its name the path. Rule (e), a place relative to the
+/// tree root, is for a job that crosses to a manager; in this process there is
+/// no host boundary, so a tree outside the root runs where it is (wsp-057's
+/// d1, after wsp-346). Its lock is held by this process's pid and names no
+/// job.
+fn in_process(dir: &Path) -> Jobs<'static> {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static HOSTS: OnceLock<Mutex<BTreeMap<(PathBuf, PathBuf), &'static crate::host::InProcess>>> = OnceLock::new();
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let root = real.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let exec = inproc_exec();
+    let host = *HOSTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((exec.clone(), root.clone()))
+        .or_insert_with(|| Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&exec, &root))));
+    let row = if name.is_empty() { "tree".to_string() } else { name.clone() };
+    let at = crate::host::HostDir { host: crate::host::HostId(wsp_trees::job_place::host_of(Whose::Row(&row))), path: name };
+    let place = Place { at: crate::host::JobAt::Dir(at), dir: dir.to_path_buf(), row, kind: TreeKind::Check };
+    Jobs::new(host, place, None)
+}
+
+/// Where [`in_process`]'s runner keeps its jobs' files: `<state>/inproc`, as
+/// `choose_jobs(Inproc)` does. A test's are its process's own, since the tests
+/// that run beside it move `WSP_STATE` and remove their states.
+pub(crate) fn inproc_exec() -> PathBuf {
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("wsp-inproc-jobs-{}", std::process::id()));
+    #[cfg(not(test))]
+    std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(Store::default_state).join("inproc")
+}
+
+/// [`run_step`] as one job: `job.run` of class `check`
+/// at the place [`place_of`] gave, its limit the step's and its hung bound
+/// [`hung_after`]. What it writes comes back as `job.output` into `log`, which
+/// the tail and the first error are read from; its timeout and its hang come
+/// from `job.ended`. The manager admits it (no check slot is taken here) and
+/// ends its group; wsp probes no process for it.
 fn run_as_job(dir: &Path, step: &Step, log: &Path, jobs: &Jobs<'_>) -> Ran {
     use std::io::Write;
     let start = Instant::now();
@@ -3277,11 +3295,11 @@ mod tests {
         let s = step("- intents and more (2s): echo only-the-command; sleep 10");
         assert_eq!(s.limit, Duration::from_secs(2));
         let (dir, log) = scratch_log("labelled");
-        let r = run_step(&dir, &s, &log, &here(&dir));
+        let r = run_step(&dir, &s, &log, &Runner::Inproc);
         assert!(matches!(r.done, Done::Failed { timed_out: true, .. }), "the label's limit is the step's: {:?}", r.done);
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "only-the-command");
         let s = step("- say it: echo said");
-        let r = run_step(&dir, &s, &log, &here(&dir));
+        let r = run_step(&dir, &s, &log, &Runner::Inproc);
         assert_eq!(r.done, Done::Passed);
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "said", "the label is not run");
     }
@@ -3316,7 +3334,7 @@ mod tests {
         let s = step("- echo at nowhere: touch marker");
         assert_eq!(s.command, "echo at nowhere: touch marker");
         let (dir, log) = scratch_log("unread-label");
-        let r = run_step(&dir, &s, &log, &here(&dir));
+        let r = run_step(&dir, &s, &log, &Runner::Inproc);
         assert!(matches!(&r.done, Done::Malformed(w) if w.contains("label")), "{:?}", r.done);
         assert!(!dir.join("marker").exists() && std::fs::read_to_string(&log).unwrap_or_default().is_empty(), "nothing ran");
         assert!(r.done.is_red());
@@ -3347,24 +3365,18 @@ mod tests {
         Step { name: "s".into(), command: command.into(), limit: Duration::from_secs(limit), of: Of::Project, on: Vec::new(), barrier: false, end: false }
     }
 
-    /// A step's runner under `WSP_JOBS=inproc` (wsp-057): `wsp-host`'s job
-    /// runner in this process, its tree root the parent of `dir` and its
-    /// jobs' files beside it, the step placed by `place_of`.
-    fn here(dir: &Path) -> Runner<'static> {
+    /// The two choices a step is run by (wsp-053): in this process (`WSP_JOBS=inproc`, a job on `wsp-host`'s runner, wsp-057),
+    /// and as jobs (`manager`) on a host whose job runner is the manager's
+    /// own (`wsp-host`'s, in this process), its tree root the parent of `dir`
+    /// and its jobs' files beside it.
+    fn both(dir: &Path) -> Vec<(&'static str, Runner<'static>)> {
         let root = dir.parent().unwrap().to_path_buf();
         wsp_trees::job_place::set_tree_root(Some(root.clone()));
         let exec = root.join(format!("{}-jobs", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&exec);
         let host: &'static crate::host::InProcess = Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&exec, &root)));
-        Jobs::inproc(host, place_of(Whose::Row("pj-001"), TreeKind::Check, dir).unwrap(), None)
-    }
-
-    /// The two choices a step is run by (wsp-053, wsp-057): `inproc`, and
-    /// `manager` on a host whose job runner is the manager's own (`wsp-host`'s,
-    /// in this process), which differs only in naming its job in the lock.
-    fn both(dir: &Path) -> Vec<(&'static str, Runner<'static>)> {
-        let inproc = here(dir);
-        let manager = Jobs::new(inproc.host, inproc.place.clone(), None);
-        vec![("inproc", inproc), ("manager", manager)]
+        let place = place_of(Whose::Row("pj-001"), TreeKind::Check, dir).unwrap();
+        vec![("inproc", Runner::Inproc), ("manager", Runner::Jobs(Jobs::new(host, place, None)))]
     }
 
     #[test]
@@ -3419,31 +3431,29 @@ mod tests {
     }
 
     /// Under the default `WSP_JOBS` (`manager`), a host with no manager
-    /// record runs its steps as jobs on `wsp-host`'s runner in this process,
-    /// placed by `place_of`, and its lock names no job; a tree outside the
-    /// tree root is refused, with or without a manager (wsp-346, wsp-057).
+    /// record runs here whatever the tree root is, and places nothing; once
+    /// this host has a manager, a tree outside the root is refused before
+    /// the manager is dialled (wsp-346).
     #[test]
-    fn a_host_with_no_manager_runs_jobs_in_process_and_any_host_refuses_a_tree_outside_the_root() {
+    fn a_host_with_no_manager_stays_in_process_and_one_with_a_manager_refuses_a_tree_outside_the_root() {
         let env = util::isolated("check-chosen-unmanaged");
         let store = Store::open();
         let root = env.path("root");
         std::fs::create_dir_all(&root).unwrap();
         wsp_trees::job_place::set_tree_root(Some(root.clone()));
-        let tree = root.join("trees/m-1");
+        let tree = env.path("trees/m-1");
         let lock = env.path("lock");
         let chosen = |tree: &Path| Runner::chosen(&store, Whose::Row("m-1"), TreeKind::Check, tree, Some(&lock));
 
-        let runner = chosen(&tree).expect("no manager here: in-process jobs");
-        assert!(!runner.names_job && tree.is_dir(), "placed by place_of, and the lock is the pid's");
-        assert_eq!(runner.place, place_of(Whose::Row("m-1"), TreeKind::Check, &tree).unwrap());
-        let refused = chosen(Path::new("/")).err().expect("a tree outside the root is refused in-process too");
-        assert!(refused.contains("not under the tree root") && refused.contains("was not run"), "{refused}");
+        assert!(matches!(chosen(&tree), Ok(Runner::Inproc)), "no manager here: in-process");
+        assert!(!tree.exists(), "an in-process run places nothing");
+        assert!(matches!(chosen(Path::new("/")), Ok(Runner::Inproc)), "whatever the tree root");
 
         let local = crate::manager::Local::new(&env.path("exec"), 1);
         crate::manager::write_record(&store.state, &local, "token").unwrap();
-        assert!(chosen(&tree).is_ok_and(|r| !r.names_job), "the in-process host's record names no manager here");
+        assert!(matches!(chosen(&tree), Ok(Runner::Inproc)), "the in-process host's record names no manager here");
         std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
-        let refused = chosen(&env.path("trees/m-1")).err().expect("a manager here refuses a tree outside its root");
+        let refused = chosen(&tree).err().expect("a manager here refuses a tree outside its root");
         std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
         assert!(refused.contains("not under the tree root"), "{refused}");
         wsp_trees::job_place::set_tree_root(None);
@@ -3456,7 +3466,7 @@ mod tests {
     fn a_step_is_one_job_placed_on_the_rows_host_relative_to_its_tree_root() {
         let (dir, log) = scratch_log("placed");
         let (_, runner) = both(&dir).pop().unwrap();
-        let jobs = &runner;
+        let Runner::Jobs(jobs) = &runner else { unreachable!() };
         let JobAt::Dir(at) = &jobs.place.at else { panic!("{:?}", jobs.place.at) };
         assert_eq!(at.host.0, host_of(Whose::Row("pj-001")));
         assert_eq!(at.path, dir.file_name().unwrap().to_string_lossy(), "relative to the tree root");
@@ -3514,7 +3524,9 @@ mod tests {
         let (dir, log) = scratch_log("lock-wait");
         let lock = env.state().join("lock");
         let (_, mut manager) = both(&dir).pop().unwrap();
-        manager.lock = Some(lock.clone());
+        if let Runner::Jobs(jobs) = &mut manager {
+            jobs.lock = Some(lock.clone());
+        }
         let held = TreeLock::take(lock.clone(), Duration::from_secs(1)).unwrap();
         assert_eq!(run_step(&dir, &sh("true", 10), &log, &manager).done, Done::Passed, "step 1 names its job in the lock");
         let named = TreeLock::job_of(&lock).expect("the lock names the job");
@@ -3551,7 +3563,9 @@ mod tests {
         let mut runners = both(&dir);
         let (_, mut manager) = runners.pop().unwrap();
         let (_, inproc) = runners.pop().unwrap();
-        manager.lock = Some(lock.clone());
+        if let Runner::Jobs(jobs) = &mut manager {
+            jobs.lock = Some(lock.clone());
+        }
         PROBES.with(|p| p.borrow_mut().clear());
         let held = TreeLock::take(lock.clone(), Duration::from_secs(1)).unwrap();
         let steps = [sh("echo a", 10), sh("exit 1", 10), sh("sleep 3", 1)];
@@ -3653,7 +3667,6 @@ mod tests {
     /// `check.sh`, and a task landed on that commit.
     fn world(name: &str, project_checks: &str, script: &str) -> (util::Isolated, Store, String) {
         let env = util::isolated(&format!("check-{name}"));
-        crate::check::tree_root_here(&env);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         crate::testkit::repo(&repo);
@@ -3981,9 +3994,9 @@ mod tests {
         TREE_BACK.with(|h| h.set(Some(Duration::from_millis(300))));
         let (scratch, log) = scratch_log("tree-missing");
         let tree = scratch.join("tree");
-        let runner = here(&tree);
+        std::fs::create_dir_all(&tree).unwrap();
         std::fs::remove_dir_all(&tree).unwrap();
-        let ran = run_all(&tree, &[sh("true", 10), sh("true", 10)], &log, None, &runner, |_| {});
+        let ran = run_all(&tree, &[sh("true", 10), sh("true", 10)], &log, None, &Runner::Inproc, |_| {});
         assert!(matches!(&ran[0].done, Done::TreeMissing(p) if p.ends_with("tree")), "{:?}", ran[0].done);
         assert_eq!(ran[1].done, Done::Skipped, "the next step has no tree either");
         assert!(!ran[0].done.is_red(), "not a failed step");
@@ -4013,11 +4026,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             std::fs::create_dir_all(&back).unwrap();
         });
-        let r = run_again(&tree, &sh("touch ran", 10), &log, None, &here(&tree));
+        let r = run_again(&tree, &sh("touch ran", 10), &log, None, &Runner::Inproc);
         maker.join().unwrap();
         assert_eq!(r.done, Done::Passed, "{}", r.tail);
         assert!(tree.join("ran").exists(), "run once the tree was back");
-        let bad = run_again(&tree, &sh("exit 4", 10), &log, None, &here(&tree));
+        let bad = run_again(&tree, &sh("exit 4", 10), &log, None, &Runner::Inproc);
         assert_eq!(bad.done, Done::Failed { exit: Some(4), timed_out: false });
         assert!(why_failed(&bad).contains("exit 4"));
     }
@@ -4340,10 +4353,10 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "pj-001" };
         let step = counting(&dir, "count");
-        let first = run_all(&dir, &[step.clone()], &log, Some(&reuse), &here(&dir), |_| {});
+        let first = run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(passed(&first) && first[0].reused.is_none());
         assert!(g.lookup(&sha, &step.command, greens::Env::Warm).is_some());
-        let second = run_all(&dir, &[step], &log, Some(&reuse), &here(&dir), |_| {});
+        let second = run_all(&dir, &[step], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(passed(&second));
         assert_eq!(runs_of(&dir, "count"), 1, "the second run did not run the command");
         assert_eq!(second[0].took, Duration::ZERO);
@@ -4356,11 +4369,11 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let step = counting(&dir, "count");
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
-        assert_eq!(tally_line(&run_all(&dir, &[step.clone()], &log, Some(&reuse), &here(&dir), |_| {})), "0 reused, 1 ran");
+        assert_eq!(tally_line(&run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {})), "0 reused, 1 ran");
         git_run(&dir, &["commit", "--quiet", "--allow-empty", "-m", "a rebase that changed nothing"]);
         let sha2 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let reuse = Reuse { greens: &g, sha: &sha2, env: greens::Env::Warm, who: "a" };
-        let again = run_all(&dir, &[step], &log, Some(&reuse), &here(&dir), |_| {});
+        let again = run_all(&dir, &[step], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "count"), 1, "the same inputs at another commit are not run again");
         assert_eq!(tally_line(&again), "1 reused, 0 ran");
         assert!(account(&again).contains("with the same inputs"));
@@ -4372,14 +4385,14 @@ mod tests {
         let (dir, log, sha) = repo_at_head("reuse-other");
         let g = greens::Greens::open(&store, "pj", &dir);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
-        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), &here(&dir), |_| {});
-        run_all(&dir, &[counting(&dir, "two")], &log, Some(&reuse), &here(&dir), |_| {});
+        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), &Runner::Inproc, |_| {});
+        run_all(&dir, &[counting(&dir, "two")], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert_eq!((runs_of(&dir, "one"), runs_of(&dir, "two")), (1, 1));
         std::fs::write(dir.join("f"), "2").unwrap();
         git_run(&dir, &["commit", "--quiet", "-am", "two"]);
         let sha2 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let reuse = Reuse { greens: &g, sha: &sha2, env: greens::Env::Warm, who: "a" };
-        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), &here(&dir), |_| {});
+        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "one"), 2, "a green at the old commit says nothing of the new one");
     }
 
@@ -4390,11 +4403,11 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
         let bad = sh("exit 3", 10);
-        assert!(!passed(&run_all(&dir, &[bad.clone()], &log, Some(&reuse), &here(&dir), |_| {})));
+        assert!(!passed(&run_all(&dir, &[bad.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {})));
         assert!(g.lookup(&sha, &bad.command, greens::Env::Warm).is_none());
         std::fs::write(dir.join("untracked"), "x").unwrap();
         let step = counting(&dir, "count");
-        run_all(&dir, &[step.clone()], &log, Some(&reuse), &here(&dir), |_| {});
+        run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(g.lookup(&sha, &step.command, greens::Env::Warm).is_none(), "a dirty tree proved the diff, not the commit");
         std::fs::remove_file(dir.join("untracked")).unwrap();
         std::fs::remove_file(dir.join("count")).unwrap();
@@ -4403,7 +4416,7 @@ mod tests {
         git_run(&dir, &["commit", "--quiet", "-m", "ignore"]);
         let sha3 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let reuse = Reuse { greens: &g, sha: &sha3, env: greens::Env::Warm, who: "a" };
-        run_all(&dir, &[step.clone()], &log, Some(&reuse), &here(&dir), |_| {});
+        run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(g.lookup(&sha3, &step.command, greens::Env::Warm).is_some(), "ignored files do not make a tree dirty");
     }
 
@@ -4414,11 +4427,11 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let cold = Reuse { greens: &g, sha: &sha, env: greens::Env::Cold, who: "cold" };
         let warm = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "warm" };
-        run_all(&dir, &[counting(&dir, "a")], &log, Some(&cold), &here(&dir), |_| {});
-        run_all(&dir, &[counting(&dir, "a")], &log, Some(&warm), &here(&dir), |_| {});
+        run_all(&dir, &[counting(&dir, "a")], &log, Some(&cold), &Runner::Inproc, |_| {});
+        run_all(&dir, &[counting(&dir, "a")], &log, Some(&warm), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "a"), 1, "the cold green answered the warm ask");
-        run_all(&dir, &[counting(&dir, "b")], &log, Some(&warm), &here(&dir), |_| {});
-        run_all(&dir, &[counting(&dir, "b")], &log, Some(&cold), &here(&dir), |_| {});
+        run_all(&dir, &[counting(&dir, "b")], &log, Some(&warm), &Runner::Inproc, |_| {});
+        run_all(&dir, &[counting(&dir, "b")], &log, Some(&cold), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "b"), 2, "the warm green did not answer the cold ask");
     }
 
@@ -4492,7 +4505,7 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         g.record(&sha, "true", greens::Env::Warm, 101, "wsp-9", false);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "x" };
-        let ran = run_all(&dir, &[sh("true", 10)], &log, Some(&reuse), &here(&dir), |_| {});
+        let ran = run_all(&dir, &[sh("true", 10)], &log, Some(&reuse), &Runner::Inproc, |_| {});
         let text = account(&ran);
         assert!(text.contains("reused (green at this commit, 101s, by wsp-9,"), "{text}");
         assert!(passed(&ran));
@@ -4500,10 +4513,13 @@ mod tests {
 
     /// wsp-057's done-when: `WSP_JOBS=inproc` still runs a check, end to end,
     /// each step a job on `wsp-host`'s runner in this process (its files under
-    /// `<state>/inproc`), and a red step reads red.
+    /// [`inproc_exec`]) in a tree outside the tree root (d1), and a red step
+    /// reads red.
     #[test]
     fn a_check_under_wsp_jobs_inproc_runs_its_steps_as_jobs_in_this_process() {
-        let (env, store, _) = world("inproc-e2e", "- ok: sh check.sh", "exit 0\n");
+        let (_env, store, _) = world("inproc-e2e", "- ok: sh check.sh", "exit 0\n");
+        let jobs = || std::fs::read_dir(inproc_exec().join("jobs")).map(|d| d.count()).unwrap_or(0);
+        let before = jobs();
         std::env::set_var(crate::host_tcp::JOBS_ENV, "inproc");
         let green = check(&store, &Args::synth("check", &["pj-001"], &[]));
         let mut t = store.find_task("pj-001").unwrap();
@@ -4512,8 +4528,7 @@ mod tests {
         let red = check(&store, &Args::synth("check", &["pj-001"], &[("again", "true")]));
         std::env::remove_var(crate::host_tcp::JOBS_ENV);
         assert_eq!((green, red), (0, 1), "a green check passes and a red one fails under inproc");
-        let jobs = std::fs::read_dir(env.state().join("inproc/jobs")).map(|d| d.count()).unwrap_or(0);
-        assert!(jobs > 0, "the steps ran as wsp-host's jobs, not as spawns of wsp's own");
+        assert!(jobs() > before, "the steps ran as wsp-host's jobs, not as spawns of wsp's own");
     }
 
     #[test]

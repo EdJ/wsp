@@ -645,15 +645,14 @@ fn run_unit_locked(
 }
 
 /// What runs barrier `key`'s steps in its tree at `tree`, holding the lock at
-/// `lock`: [`check::Runner::chosen`] for the barrier's own tree, each step a
-/// job: under `inproc` on `wsp-host`'s runner in this process, under `manager`
-/// on the manager of the list's barrier host, the trunk's host by default
-/// ([`check::Whose::Barrier`]).
+/// `lock`: [`check::Runner::chosen`] for the barrier's own tree. Under `inproc`
+/// this process, as before; under `manager` the manager of the list's barrier
+/// host, the trunk's host by default ([`check::Whose::Barrier`]).
 fn runner_for(store: &Store, key: &str, tree: &std::path::Path, lock: &std::path::Path) -> Result<check::Runner<'static>, String> {
     #[cfg(test)]
     if let Some(host) = tests::MANAGER.with(|m| m.get()) {
         let place = check::place_of(check::Whose::Barrier(key), check::TreeKind::Barrier, tree)?;
-        return Ok(check::Jobs::new(host, place, Some(lock.to_path_buf())));
+        return Ok(check::Runner::Jobs(check::Jobs::new(host, place, Some(lock.to_path_buf()))));
     }
     check::Runner::chosen(store, check::Whose::Barrier(key), check::TreeKind::Barrier, tree, Some(lock))
 }
@@ -820,7 +819,7 @@ mod tests {
         under_manager(&store, |host| {
             use crate::host::Host;
             let runner = runner_for(&store, &barrier_key("run", 1), &dir.join("tree"), &dir.join("lock")).unwrap();
-            let jobs = &runner;
+            let check::Runner::Jobs(jobs) = &runner else { panic!("not run as jobs under manager") };
             let crate::host::JobAt::Dir(at) = &jobs.place.at else { panic!("{:?}", jobs.place.at) };
             let barrier = check::Whose::Barrier("run#1");
             assert_eq!(at.host.0, wsp_trees::job_place::host_of(barrier), "the list's barrier host");
@@ -1022,7 +1021,6 @@ mod tests {
     /// with checks of their own and a group whose stop carries one check.
     fn world(name: &str, suite: &str, project_body: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("barrier-run-{name}"));
-        crate::check::tree_root_here(&env);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         crate::testkit::repo(&repo);

@@ -315,7 +315,6 @@ mod tests {
     /// A scratch repository with a project rooted at it, and a row `p-001` with its tree.
     fn scratch(name: &str) -> (util::Isolated, Store, PathBuf, PathBuf) {
         let env = util::isolated(&format!("piece-close-{name}"));
-        crate::check::tree_root_here(&env);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         crate::testkit::repo(&repo);

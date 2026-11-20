@@ -659,7 +659,6 @@ mod tests {
     /// 1 and 2 in batch 1 and 3 in batch 2. Piece 1 has the checks given.
     fn scratch(name: &str, checks: &[&str]) -> (util::Isolated, Store, PathBuf, PathBuf) {
         let env = util::isolated(&format!("piece-seat-{name}"));
-        crate::check::tree_root_here(&env);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         crate::testkit::repo(&repo);
