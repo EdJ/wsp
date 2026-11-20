@@ -1317,6 +1317,151 @@ run), and no process is probed. `tests/host_seam.rs` lost its tree-work exceptio
 `rustc` in tree work's code, or a place built by hand, fails it. Kept under T2 (wsp-093): `place_of` and the rest of
 `job_place`, where M4's `tree.checkout` goes, and treecopy.rs, which M4 retires once no host takes copies.
 
+#### M3's result (wsp-058, 2026-11-20)
+
+**The window.** These verdicts are taken from one window: **2026-11-20T12:08:12Z to 12:16:30Z, 0.14 h, 24
+ticks**. It starts at `wsp install` of the M3 trunk (`afa711e`, wsp-057). The manager restarted at 12:08:12Z,
+and the daemon runs the installed binary (the same inode). This row was started minutes after the install,
+not a day after it. So every figure that rests on a day or a week is **owed**, and is filed as wsp-360. Every
+figure comes from scripts in the row's scratch directory:
+- `measure.py`, which reads `calls.jsonl` and `polls.jsonl` the way `wsp calls --since` and `--polls` do;
+- `pgids.py`, which reads the manager's `manager.log` and `journal.jsonl`;
+- `rollback.sh`.
+
+Their output is kept beside them (`window.txt`, `before.txt`, `before-pgids.txt`, `rollback/`). The before
+figure is the 24 h to the install (2026-11-19T12:08:12Z to 2026-11-20T12:08:12Z, 4,268 ticks). That day ran
+three binaries in turn: `ff9afa6`, then the M1 trunk from 07:58Z, then a later trunk from 10:51Z.
+
+**Under T2 (wsp-093): the measure is one host's.** It was taken on the host the fleet runs on, `omarchy`
+(Linux, under systemd). That host is the trunk's host and has the only manager, which is the role 6.2 gives
+the Mac. Figures per host are left to M4's measure.
+
+**The installed manager is not the trunk's, again.** The install copied the `wsp-manager` it found beside
+`wsp`: `target/release/wsp-manager` from 2026-11-19T07:29Z (sha256 `7de0ac04…`). That is the stale build M1's
+result named, because wsp-324 is still open. Its job runner is wsp-050's (2026-11-17), so the window does
+measure jobs under a manager. But it lacks afa711e's and wsp-030's host commits. The owed day is to be taken
+on a manager built from the trunk, so wsp-360 comes after wsp-324. The rollback proof below used a manager
+built from this tree.
+
+| measure | 6.1 baseline | M3 asks | **M3 trunk, from 12:08:12Z, 0.14 h** | before: 24 h to the install | verdict |
+|---|---|---|---|---|---|
+| `lsof` per tick | 0.9 | 0 | 0 (24 ticks) | 0.34 | met in the window |
+| `lsof` in CLI calls / `throttle run` / polls | — | 0 | 0 / 0 / 0 (238, 8, 90 runs) | 44 / 0 / 0 | met in the window |
+| `ps` per tick | 37.5 | 0 | 9.42 | 7.82 | **missed** |
+| `ps` in CLI calls / `throttle run` / polls | — | 0 | 22 / 0 / 6 | 4,678 / 0 / 2,035 | **missed** |
+| `kill` per tick | 1.3 | 0 | 0 | 0.41 | met in the window |
+| `kill` in CLI calls / `throttle run` / polls | — | 0 | 0 / 0 / 0 | 3,057 / 725 / 686 | met in the window |
+| signals in manager.log on a pgid the manager started | — | every one | 6 of 6 | 354 of 354 (from 2026-11-19T07:29Z) | met in the window |
+| wsp-478-kind incidents | 0 (M0's week) | 0 over a week | 0 | 2 (in 29 h of cycle.log) | **owed**, 2026-11-27; 0 by construction |
+| `throttle run` wall per build (exit 0, ≥ 10 s), p50 | — | no worse | 1 run, 28.1 s | 24.2 s (338 runs), p95 88.4 s | **owed** (full day) |
+| spawn p50 | 9.4 s | ≤ 9.4 s | 1 spawn, 0.89 s | 1.02 s (213), p95 3.12 s | **owed** (full day) |
+| tick p50 / p95 | 19.5 s / 116 s | — | 80 ms / 807 ms | 23 ms / 954 ms | — |
+| `WSP_JOBS=inproc` runs a `wsp check` in-process | — | shown once | holds (`rollback.sh`) | — | met |
+
+How each was taken, and the cause of each miss:
+- **`lsof`, `ps` and `kill`** are the children recorded on each record's `children`. These are counted for
+  the daemon's `"k":"tick"` lines, the CLI's `"k":"call"` lines (with `throttle run` counted apart), and
+  `polls.jsonl`. They are given per tick, per phase and per verb. wsp signals a group through `signal_group`,
+  which runs `kill` as a child, so every signal wsp sends to a group is counted here. The call log cannot see
+  two things. One is std's `Child::kill` on a child whose handle wsp holds: the install, `packet_gen`, and the
+  ssh of tunnel.rs and far.rs. That sends SIGKILL by syscall to wsp's own child. The other is `pid_runs`'s
+  kill(2) with signal 0, which sends nothing. Neither reaches a pgid that wsp did not start.
+  - **`lsof` and `kill` went with wsp-057.** The day before, `kill` came from the throttle's slot probes
+    (`kill -0`): 2,295 in `throttle`, 725 in `throttle run`, 686 in polled `wip`s, and `sweep:throttle`'s 0.41
+    per tick. It also came from `check`'s steps (626). `lsof` came from `ending:verification` and `despawn`.
+    None of these runs any in the window.
+  - **`ps` is missed.** It comes from these phases, per tick: `ending:verification` 2.67, `attention` 1.29,
+    `cycle` 1.08, `repair:refusing` 1.00, `tunnels` 0.96, `repair:frozen` 0.67, `closing` 0.42,
+    `ending:checks` 0.33 (barrier check seats), `seats` 0.33, and `sweep:build-output` 0.33 (whether a pane
+    stands in a tree). In the CLI it comes from `brief`, `spawn`, `despawn`, `tell` and `worklist`, and from
+    polled `ls` and `worklist show`. `sandbox`'s 6 are `wsp sandbox`'s own reap, run by this row's rollback
+    proof. All of these are seat liveness and the fleet's census. wsp-326's decision d1 gave those to an M1
+    follow-up, wsp-330 (todo), and not to M3. That none of them is a probe from tree work rests on
+    `tests/host_seam.rs` (wsp-057), which fails on such a probe, not on a trace. The phases that were tree
+    work the day before (`sweep:check-trees` 0.37 and `sweep:leaked-agents` 0.33 per tick) run none: the
+    first runs no `ps`, and the second is gone. So the line as written, `ps` → 0 on the wsp side, is missed.
+    The part of it that M3's breakdown moved holds.
+- **Signals** are matched by `pgids.py SINCE [UNTIL]`. It reads every line of `manager.log` that sends a
+  signal:
+  - `job K: TERM to its group P` and `KILL to its group P` (a stop or a bound);
+  - `job K ended: …; its group P killed` (every end kills the group, wsp-453);
+  - `seat S stopped (epoch E, …)`.
+
+  A job's line matches when the journal holds a `job.started` with that key and that pgid. A seat's line
+  does not name a group. It matches a `seat.started` for that seat and epoch, whose pid (its compound-sup)
+  leads the seat's group. A seat that exits on its own logs the same line with no signal sent, so the count
+  over-counts signals and never under-counts them. A stopped seat that the manager adopted, but did not
+  start, is listed apart. Any other line that names a signal, `kill`, TERM or KILL is printed as
+  unclassified. The script exits 1 if anything is unmatched or unclassified. It was checked against a log
+  written for the purpose, with a job group the journal lacks, a stopped adopted seat and an unknown SIGKILL
+  line. It named all three and exited 1. In the window, 6 of 6 match (5 job ends and 1 seat stop). Over the
+  manager's whole log before the install, 354 of 354 match (102 job ends and 252 seat stops). One path signals
+  without a line: seats.rs sends KILL to a compound-sup that never gave its handshake, which is a failed
+  spawn. The log holds no such failure.
+- **Incidents** are counted by `wsp calls --incidents`. Since the install, I1, I2 and I4 are 0, and I3 is 1
+  (a prompt read off the screen). The wsp-478 kind is 0, **by construction**: wsp-057 deleted its writer,
+  `ending.rs`'s `stop_finished` (32df421), and with it the sign that the count reads. So the week's count will
+  be 0 whatever happens. What stands in for it is `pgids.py` over the same week, with `kill` at 0 in the
+  call log. Both are owed on 2026-11-27T12:08Z (wsp-360). In the 29 h before the install, cycle.log holds 2
+  such stops: wsp-139 at 2026-11-19T07:49Z and wsp-120 at 2026-11-20T09:01Z.
+- **`throttle run`'s wall** is taken from `throttle run` calls that exit 0. The call log does not name
+  cargo's subcommand, so a build is read as a run of 10 s or more. The day before gives a p50 of 24.2 s, a p95
+  of 88.4 s and a mean of 30.2 s over 338 runs. The part of that day on the in-process path alone, up to the
+  10:51Z install, gives a p50 of 24.5 s (299 runs). The window holds one such run (28.1 s), too few to judge.
+  Under the manager the build is no longer a child of `throttle run`: it shows no children in the window,
+  where every run the day before had `cargo`. So its CPU is the manager's, and this figure is wall time only.
+  In the window, 7 of 8 runs did not exit 0:
+  - 4 exited 101. They are wsp-128's tests failing, and manager.log has them as jobs that exit 101.
+  - 3 exited 126, from cpd-271. **Exit 126 is a build the shim did not run.** It began with group 6's
+    default. The call log holds 17 such exits, none before the 10:51Z install. Some are wsp-353's (the
+    manager's tree root left at `~`). The rest are filed as wsp-361: a cargo run from outside the tree root is
+    refused, with nothing run. The tree root is `/mnt/data/src`, and outside it are a seat's
+    `$WSP_SCRATCH` and the home directory. `cargo --version` in this row's scratch directory reproduces it.
+- **Spawn** is `"verb":"spawn"` with exit 0, live, with the agent, as in M0's live column. The window holds 1
+  spawn (0.89 s).
+- **The rollback** is `rollback.sh`, run at 2026-11-20T12:15:23Z. It starts and ends its own instance:
+  - a `wsp sandbox --fake` store and state, with a one-commit repo, and a project whose `## Checks` has one
+    step. The step prints the command lines of its first eight ancestors;
+  - a row;
+  - a private `wsp-manager` built from this tree. It is named for this host, since a row's jobs go to the
+    manager of `job_place::host_of`. It runs on a free loopback port, with its own exec dir and tree root,
+    and the sandbox's manager record and `jobs.json` name it. The seat's `COMPOUND_RUN_DIR` and manager
+    variables are unset first (wsp-325).
+
+  `wsp check <row> --at <commit>` was run twice. With `WSP_JOBS` unset, the step was a job of the private
+  manager: a `job.started` in its journal, its log in the manager's `jobs/`, and `wsp-manager` the first of
+  its ancestors to be either `wsp-manager` or `wsp check`. With `WSP_JOBS=inproc`, the manager's journal gained
+  no job, and the step's log is under the sandbox's `<state>/inproc/jobs`. Its first such ancestor is `wsp
+  check <row> --at …` itself. Both runs exited 0. The manager was then ended, along with anything naming the
+  sandbox, and the sandbox was removed. **It holds**, 6 checks of 6 (`rollback/run.log`).
+
+**Against the done-when line** (window 2026-11-20T12:08:12Z, 0.14 h, on the M3 trunk's `wsp` and a stale
+manager):
+- **`lsof` → 0 on the wsp side: met in the window.** It is 0 per tick and in every verb, down from 0.34 per
+  tick and 44 in the CLI. The day is owed (wsp-360).
+- **`ps` → 0 on the wsp side: missed.** It is 9.42 per tick, with 22 in CLI calls and 6 in polls. The cause is
+  seat liveness and the census (wsp-330), which wsp-326's d1 left outside M3. Tree work's part of it is 0.
+- **Every `kill` by a manager, on a pgid it started: met in the window.** All 6 signals match a pgid in the
+  journal, and the call log holds no `kill` from wsp. The day before it held 4,468 in calls and polls, and
+  1,759 in ticks. Over the manager's log
+  before the install, 354 of 354 match.
+- **wsp-478-kind incidents → 0 over a week: owed** on 2026-11-27T12:08Z (wsp-360). It is 0 since the install,
+  but the sign's writer is gone, so the count cannot rise. The week's `pgids.py` is the real figure.
+- **`throttle run`'s wall per build no worse: owed.** The window holds one build (28.1 s, against a 24.2 s
+  p50). Builds from outside the tree root are not run at all (wsp-361).
+- **Spawn p50 ≤ 9.4 s: owed.** There was 1 spawn (0.89 s), against 1.02 s the day before.
+- **The rollback works: met.** `WSP_JOBS=inproc` ran a `wsp check` in-process on a sandbox row, with a
+  manager present and unused, and the script ended the sandbox itself.
+
+Filed from here:
+- wsp-360: the figures owed. That is a full 24 h on the trunk's `wsp` *and* manager, no earlier than 24 h
+  after the reinstall wsp-324 makes possible (and no earlier than 2026-11-21T12:08Z), and the week of
+  incidents with `pgids.py` beside it, on 2026-11-27T12:08Z. It comes after wsp-324.
+- wsp-361: `throttle run` refuses a cargo run from outside the manager's tree root.
+- On wsp-324, a note that it bit again at M3.
+
+M4 is broken down by the governor once this row is done (d1 Q14).
+
 #### M3 under T2 (wsp-093, 2026-11-18)
 
 Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**
