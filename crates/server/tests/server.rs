@@ -1,5 +1,5 @@
 //! `wsp-server` on an ephemeral loopback port over `MemStore` (wsp-073's done
-//! list): `hello` and its token, each read verb, commands `unsupported`,
+//! list): `hello` and its token, each read verb, `wip`'s cut (wsp-695), commands `unsupported`,
 //! malformed lines, `subscribe {}` and `subscribe {from}` (across a restart,
 //! and `too_old`), the silent client dropped, two subscribers in one order,
 //! the start refused while another server answers, and the mirror domain:
@@ -390,6 +390,69 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
     };
     c.conn.send(&Frame::Request(other)).unwrap();
     assert!(matches!(c.reply(id).outcome, Outcome::Err(f) if f.code == Code::Forbidden));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
+/// on rows not done, lists without theirs, raised asks only, and `state` beside
+/// it unchanged.
+#[test]
+fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
+    let d = dir("wip");
+    let store = mirror_store();
+    let mut put = everything();
+    let with_body = |mut r: Row| {
+        r.fields.insert("body".into(), "the long prose".into());
+        r.fields.insert("prose".into(), "more of it".into());
+        r.fields.insert("head".into(), "a head".into());
+        Entity::Row(r)
+    };
+    let mut parked = row("wsp-3", "parked");
+    parked.state = RowState::Parked;
+    let mut done = row("wsp-4", "done");
+    done.state = RowState::Done;
+    put.extend([with_body(parked), with_body(done)]);
+    let mut list_fields = std::collections::BTreeMap::new();
+    list_fields.insert("body".to_string(), "list prose".to_string());
+    list_fields.insert("name".to_string(), "the list".to_string());
+    put.push(Entity::List(List { id: ListId("s2".into()), state: ListState::Running, groups: vec![], fields: list_fields }));
+    put.push(Entity::Ask(Ask {
+        id: AskId("a-2".into()),
+        kind: AskKind::Ask,
+        from: ed(),
+        to: None,
+        about: None,
+        text: "settled".into(),
+        state: AskState::Answered,
+        answer: Some("yes".into()),
+        fields: Default::default(),
+    }));
+    apply(&store, put, vec![], "all");
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+    let (full, at) = store.snapshot().unwrap();
+
+    let Answer::Wip { state, at: wip_at } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    assert_eq!((state.clone(), wip_at), store.wip_snapshot().unwrap());
+    assert_eq!(wip_at, at);
+    assert_eq!(state.rows.len(), full.rows.len(), "every row is kept");
+    let fields = |id: &str| state.rows[&RowId(id.into())].fields.clone();
+    assert_eq!(fields("wsp-3").get("body").map(String::as_str), Some("the long prose"), "an open row is whole");
+    assert_eq!(fields("wsp-3").get("prose").map(String::as_str), Some("more of it"));
+    for body in WIP_BODIES {
+        assert_eq!(fields("wsp-4").get(body), None, "a done row loses {body}");
+        assert_eq!(state.lists[&ListId("s2".into())].fields.get(body), None, "a list loses {body}");
+    }
+    assert_eq!(fields("wsp-4").get("head").map(String::as_str), Some("a head"), "a done row keeps its head");
+    assert_eq!(state.lists[&ListId("s2".into())].fields.get("name").map(String::as_str), Some("the list"));
+    assert_eq!(state.asks.keys().cloned().collect::<Vec<_>>(), vec![AskId("a-1".into())], "raised asks only");
+    assert_eq!((state.seats.clone(), state.claims.clone()), (full.seats.clone(), full.claims.clone()));
+    assert!(state.orders.is_empty() && state.machines.is_empty());
+
+    // `state` is unchanged: the done row's body is there.
+    assert_eq!(c.read(Verb::State(NoArgs {})), Answer::State { state: full.clone(), at });
+    assert!(full.rows[&RowId("wsp-4".into())].fields.contains_key("body"));
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }

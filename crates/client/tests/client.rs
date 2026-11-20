@@ -319,6 +319,36 @@ fn request_gets_each_read_verbs_answer_matched_by_id() {
 }
 
 #[test]
+fn wip_reads_the_cut_typed_bodies_only_on_open_rows() {
+    let d = dir("wip");
+    let store = mirror_store();
+    let body = |r: &mut Row| drop(r.fields.insert("body".into(), "long prose".into()));
+    let mut open = row("wsp-1", "open");
+    body(&mut open);
+    let mut done = row("wsp-2", "done");
+    done.state = RowState::Done;
+    body(&mut done);
+    done.fields.insert("head".into(), "the head".into());
+    apply(&store, vec![Entity::Row(open), Entity::Row(done)], vec![], "rows");
+    let server = start(Arc::new(store.handle()), &d);
+    let mut c = dial(&d);
+
+    let (state, at) = c.wip().unwrap();
+    assert_eq!((state.clone(), at), store.wip_snapshot().unwrap());
+    let get = |id: &str| state.rows[&RowId(id.into())].fields.clone();
+    assert_eq!(get("wsp-1").get("body").map(String::as_str), Some("long prose"));
+    assert_eq!(get("wsp-2").get("body"), None);
+    assert_eq!(get("wsp-2").get("head").map(String::as_str), Some("the head"));
+    // `state` is unchanged beside it: the done row keeps its body there.
+    match ok(c.request("state", json!({})).unwrap()) {
+        Answer::State { state, .. } => assert!(state.rows[&RowId("wsp-2".into())].fields.contains_key("body")),
+        other => panic!("{other:?}"),
+    }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_request_after_a_lost_connection_dials_again() {
     let d = dir("redial");
     let store = mirror_store();

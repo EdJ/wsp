@@ -7,6 +7,7 @@
 //! - [`Client::dial_at`] does the same against addresses and a token the
 //!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
+//! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
 //!
@@ -17,8 +18,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use wsp_api::{ApiToken, Call, ConnError, Connection, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
-use wsp_store_contract::Principal;
+use wsp_api::{
+    Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
+    Request, Verb, PROTOCOL,
+};
+use wsp_store_contract::{Principal, State};
 
 mod dial;
 mod subscribe;
@@ -42,6 +46,8 @@ pub enum Error {
     Silent(Silent),
     /// `args` do not fit the verb, so the request could not be made.
     Args(String),
+    /// A typed read ([`Client::wip`]) was answered `err`; the failure whole.
+    Refused(Failure),
 }
 
 impl std::fmt::Display for Error {
@@ -51,6 +57,7 @@ impl std::fmt::Display for Error {
             Error::Lost(e) => write!(f, "{e}"),
             Error::Silent(s) => write!(f, "{s}"),
             Error::Args(why) => write!(f, "the arguments do not fit the verb: {why}"),
+            Error::Refused(why) => write!(f, "refused ({:?}): {}", why.code, why.text),
         }
     }
 }
@@ -142,9 +149,26 @@ impl Client {
         self.send(verb, args, Some(key))
     }
 
+    /// The `wip` verb: open rows whole, every other row and every list
+    /// without its bodies, open asks only, seats and claims whole, and the
+    /// event id that cut is consistent at. A smaller reply than `state` on a
+    /// large store, which is what keeps it under `MAX_LINE`.
+    pub fn wip(&mut self) -> Result<(State, wsp_api::EventId), Error> {
+        let reply = self.send_call(Call::Verb(Verb::Wip(NoArgs {})), None)?;
+        match reply.outcome {
+            Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
+            Outcome::Ok(_) => Err(Error::Lost(ConnError::Malformed("`wip` answered with another verb's answer".into()))),
+            Outcome::Err(f) => Err(Error::Refused(f)),
+        }
+    }
+
     fn send(&mut self, verb: &str, args: Value, key: Option<IdempotencyKey>) -> Result<Reply, Error> {
         let call: Call = serde_json::from_value(json!({ "verb": verb, "args": args }))
             .map_err(|e| Error::Args(e.to_string()))?;
+        self.send_call(call, key)
+    }
+
+    fn send_call(&mut self, call: Call, key: Option<IdempotencyKey>) -> Result<Reply, Error> {
         let id = ReqId(self.next);
         self.next += 1;
         let request = Request { v: PROTOCOL, id, key, by: self.target.by.clone(), call };
