@@ -1068,11 +1068,6 @@ impl Host for Tcp {
         self.local.opencode_newest(session)
     }
 
-    // ---- turn
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        self.local.turn_began(dir, since)
-    }
-
     // ---- beat: the probes' text stays in-process until `HostFacts` replaces it
     fn disk_free(&self, path: &Path) -> Option<String> {
         self.local.disk_free(path)

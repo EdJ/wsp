@@ -502,9 +502,6 @@ impl Host for Counting<'_> {
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
         self.inner.opencode_newest(session)
     }
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        self.inner.turn_began(dir, since)
-    }
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
         self.inner.wire_health(problems, notes)
     }

@@ -330,11 +330,6 @@ pub trait Host: Sync {
     /// `completed`), newest first, off `opencode db`.
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>>;
 
-    // ---- turn
-    /// Whether [`HOOKS_FILE`] shows the seat's own prompt submitted at or
-    /// after `since`; `None` when there is no log to say.
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool>;
-
     // ---- beat (host facts)
     // Each is the probe's own text; what it means is read by the caller's
     // parser, so a fact crosses as the same text at M1 until `HostFacts` carries it.
@@ -595,9 +590,6 @@ impl Host for InProcess {
     }
     fn opencode_newest(&self, session: &str) -> Option<Vec<Value>> {
         self.host.opencode_newest(session)
-    }
-    fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        self.host.turn_began(dir, since)
     }
     fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
         self.host.wire_health(problems, notes)
