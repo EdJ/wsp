@@ -415,7 +415,14 @@ pub fn no_such(what: &str, needle: &str) -> String {
     }
 }
 
+/// The wall clock in seconds. Under a test build, `WSP_TEST_NOW` (epoch
+/// seconds) pins it: the golden test of the `--json` projections
+/// (tests/view_golden.rs, wsp-305) seeds and reads a store at one instant.
 pub fn epoch_secs() -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(n) = std::env::var("WSP_TEST_NOW").ok().and_then(|s| s.parse().ok()) {
+        return n;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
