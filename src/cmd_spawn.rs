@@ -5162,9 +5162,11 @@ fn swept_up(
     Leftovers { tree, legs, builds, far }
 }
 
-/// What stands in a seat's tree, and the stop for it. The live answers are
-/// [`crate::cmd_role::left_in`] and [`crate::cmd_role::end_pids`], which read
-/// nothing under `cfg(test)`; a test brings its own (`wsp-085`).
+/// What stands in a seat's tree, and the stop for it. The live answer is
+/// nothing (wsp-057): a seat's processes are its group, which its manager ends
+/// with the seat, and what escapes the group is reported and stopped by no
+/// one, so wsp neither finds (`lsof`) nor signals a pid here. A test brings
+/// its own (`wsp-085`).
 trait InTree {
     /// The pids the seat started that stand in `dir`.
     fn left_in(&self, dir: &std::path::Path) -> Vec<u32>;
@@ -5175,11 +5177,11 @@ trait InTree {
 struct LiveTree;
 
 impl InTree for LiveTree {
-    fn left_in(&self, dir: &std::path::Path) -> Vec<u32> {
-        crate::cmd_role::left_in(dir)
+    fn left_in(&self, _dir: &std::path::Path) -> Vec<u32> {
+        Vec::new()
     }
-    fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
-        crate::cmd_role::end_pids(pids)
+    fn end(&self, _pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        (Vec::new(), Vec::new())
     }
 }
 

@@ -178,11 +178,21 @@ fn build(store: &Store, label: &str, n: usize, j: &Job, keep: bool, log: &Path) 
     let greens = Greens::open(store, &j.project, &j.repo);
     let who = format!("cold {label} {n}");
     let reuse = Reuse { greens: &greens, sha: &j.sha, env: Env::Cold, who: &who };
-    built.ran = {
-        // The cold build stays in this process: its jobs move with the
-        // barrier's (the barrier row chooses its runner).
-        check::run_every(&tree, &j.steps, log, Some(&reuse), &check::Runner::Inproc, |_| {})
+    // The cold build runs where its list's barrier runs, each step a job
+    // placed by `place_of` (wsp-057): a cold tree outside the tree root is
+    // refused, never spawned here.
+    let runner = match check::Runner::chosen(store, check::Whose::Barrier(label), check::TreeKind::Barrier, &tree, None) {
+        Ok(r) => r,
+        Err(why) => {
+            if !keep {
+                remove_tree(&j.repo, &tree);
+            }
+            drop(lock);
+            built.could_not = Some(format!("could not place the cold build: {why}"));
+            return built;
+        }
     };
+    built.ran = check::run_every(&tree, &j.steps, log, Some(&reuse), &runner, |_| {});
     if !keep {
         remove_tree(&j.repo, &tree);
     }
@@ -362,6 +372,7 @@ mod tests {
     /// A project with a repository and one worklist with one landed member.
     fn world(name: &str, body: &str) -> (util::Isolated, Store, Vec<Landed>) {
         let env = util::isolated(&format!("cold-{name}"));
+        crate::check::tree_root_here(&env);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         crate::testkit::repo(&repo);

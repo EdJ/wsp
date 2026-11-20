@@ -645,14 +645,15 @@ fn run_unit_locked(
 }
 
 /// What runs barrier `key`'s steps in its tree at `tree`, holding the lock at
-/// `lock`: [`check::Runner::chosen`] for the barrier's own tree. Under `inproc`
-/// this process, as before; under `manager` the manager of the list's barrier
-/// host, the trunk's host by default ([`check::Whose::Barrier`]).
+/// `lock`: [`check::Runner::chosen`] for the barrier's own tree, each step a
+/// job: under `inproc` on `wsp-host`'s runner in this process, under `manager`
+/// on the manager of the list's barrier host, the trunk's host by default
+/// ([`check::Whose::Barrier`]).
 fn runner_for(store: &Store, key: &str, tree: &std::path::Path, lock: &std::path::Path) -> Result<check::Runner<'static>, String> {
     #[cfg(test)]
     if let Some(host) = tests::MANAGER.with(|m| m.get()) {
         let place = check::place_of(check::Whose::Barrier(key), check::TreeKind::Barrier, tree)?;
-        return Ok(check::Runner::Jobs(check::Jobs::new(host, place, Some(lock.to_path_buf()))));
+        return Ok(check::Jobs::new(host, place, Some(lock.to_path_buf())));
     }
     check::Runner::chosen(store, check::Whose::Barrier(key), check::TreeKind::Barrier, tree, Some(lock))
 }
@@ -819,7 +820,7 @@ mod tests {
         under_manager(&store, |host| {
             use crate::host::Host;
             let runner = runner_for(&store, &barrier_key("run", 1), &dir.join("tree"), &dir.join("lock")).unwrap();
-            let check::Runner::Jobs(jobs) = &runner else { panic!("not run as jobs under manager") };
+            let jobs = &runner;
             let crate::host::JobAt::Dir(at) = &jobs.place.at else { panic!("{:?}", jobs.place.at) };
             let barrier = check::Whose::Barrier("run#1");
             assert_eq!(at.host.0, wsp_trees::job_place::host_of(barrier), "the list's barrier host");
@@ -875,7 +876,8 @@ mod tests {
     /// The call log of a whole barrier run under `manager` holds no `ps`,
     /// `kill` or `lstart` from wsp (nor any `lsof`: the run reads no process's
     /// working directory): the steps, their bounds and the lock are the
-    /// manager's and its job table's. Under `inproc` wsp still probes.
+    /// manager's and its job table's. Under `inproc` they are `wsp-host`'s
+    /// runner's in this process, and wsp probes nothing either (wsp-057).
     #[test]
     fn a_barrier_run_under_manager_probes_no_process_from_wsp() {
         let (env, store) = world("probes", "exit 1\n", "");
@@ -888,7 +890,7 @@ mod tests {
         drop((store, env));
         let (_b, here) = world("probes-inproc", "exit 1\n", "");
         run_unit(&here, &plan(&here, &here.worklist("run").unwrap(), 1).units[0], "barrier run 1");
-        assert!(!check::PROBES.with(|p| p.borrow().is_empty()), "inproc takes its check slot and ends its own group");
+        assert_eq!(check::PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "inproc runs jobs too, and probes nothing (wsp-057)");
     }
 
     fn step(name: &str, command: &str) -> Step {
@@ -1020,6 +1022,7 @@ mod tests {
     /// with checks of their own and a group whose stop carries one check.
     fn world(name: &str, suite: &str, project_body: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("barrier-run-{name}"));
+        crate::check::tree_root_here(&env);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         crate::testkit::repo(&repo);

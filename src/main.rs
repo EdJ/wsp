@@ -41,7 +41,6 @@ mod build_output;
 mod list_sweep;
 mod scope;
 mod scratch;
-mod leaked_agents;
 mod disk;
 mod arrange;
 mod attention;

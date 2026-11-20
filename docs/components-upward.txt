@@ -71,7 +71,6 @@ repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
 repair -> cmd_govern: *  # engine -> seats
 repair -> cmd_spawn: seat_kind  # engine -> seats
-repair -> leaked_agents: tidy  # engine -> top
 repair -> stuck: Kind, Stall  # engine -> seats
 repair -> wake: owed_to, scopes_owed  # engine -> seats
 stage -> cmd_agent: sentence  # engine -> seats

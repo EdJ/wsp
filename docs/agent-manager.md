@@ -108,8 +108,8 @@ Each line has one of four verdicts:
 | operation | site | verdict | why |
 |---|---|---|---|
 | A seat's process tree from `ps`, then a kill by pgid | crates/wire/src/place_super.rs:844, :886; crates/wire/src/place_compound.rs:1298 | **M** | The manager started the tree, so it ends it and reports the pids. |
-| leaked agents: agents found by `ps` and killed | src/leaked_agents.rs:126 | **D** | Every agent on a host is one of the manager's seats. An agent that is nobody's cannot exist, except one started by hand, and that is not wsp's to kill. |
-| `wsp role reap`: `ps`, `lsof` and kill | src/cmd_role.rs:360, :629, :671 | **D**, or a manager verb if Ed wants a person's reap | The same reason. |
+| leaked agents: agents found by `ps` and killed | src/leaked_agents.rs:126 | **D** (gone, wsp-057) | Every agent on a host is one of the manager's seats. An agent that is nobody's cannot exist, except one started by hand, and that is not wsp's to kill. |
+| `wsp role reap`: `ps`, `lsof` and kill | src/cmd_role.rs:360, :629, :671 | **D**, or a manager verb if Ed wants a person's reap. Gone in wsp-057: `wsp reap <pid>` is removed and `wsp reap --list` reads the manager's seats and jobs (wsp-042's (b)) | The same reason. |
 | a shell waiting on itself, found by `ps` and killed with TERM | src/waiting.rs:872, :875 | **M** | The shell is in the seat's tree. The manager reports `seat.stuck` and wsp decides whether to end it. |
 | strays in a finished tree: `lsof -d cwd`, then kill (wsp-478) | crates/trees/src/check_tree.rs:221, :259, :327, :579, :592 | **D** once tree jobs run under the manager (1.3) | Ownership becomes a record, not a cwd. |
 | a check's own child group, killed on timeout | src/check.rs:1249, :1261, :1272; crates/trees/src/at_stop.rs:98 | **with tree work** (1.3) | The process holds a handle on the child it spawned. This is not inference. |

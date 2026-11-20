@@ -10,7 +10,7 @@
 //! | verb | primary | governor | member, verifier, check |
 //! |---|---|---|---|
 //! | `wsp despawn <row> --why …` | any seat | seats of rows on a list it governs | refused |
-//! | `wsp reap <pid>…` | any pid that passes the guards | pids in trees of rows on a list it governs, and its barrier tree | refused |
+//! | `wsp reap --list` (reads the manager; `wsp reap <pid>` is removed, wsp-057) | yes | yes | yes |
 //! | `wsp done <row>` | rows at review | refused | refused |
 //! | `wsp daemon reload` | yes | refused | refused |
 //! | `wsp check <row> --set --why …` (gated in `check`) | any row | rows on a list it governs, any change | its own row: raise a budget, add or correct a `cd`, narrow to its files, add a step |
@@ -28,8 +28,6 @@
 //! The permission layer is the other half (`claude-code/*.settings.json`): a
 //! member's Claude Code is not allowed to call these verbs without a prompt,
 //! and wsp refuses the call besides.
-
-use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -49,13 +47,6 @@ pub(crate) const MEMBER_SETTINGS: &str = include_str!("../claude-code/member.set
 const RETRO_FILE: &str = "wsp-retro.settings.json";
 const PRIMARY_FILE: &str = "wsp-primary.settings.json";
 const GOVERNOR_FILE: &str = "wsp-governor.settings.json";
-
-/// How old a dev or test tool must be before `wsp reap` will stop it.
-pub(crate) const TOOL_AGE: u64 = 60 * 60;
-/// How long a test binary must have been idle at 0 % CPU.
-pub(crate) const IDLE_FOR: u64 = 15 * 60;
-/// The CPU a `while :` loop must be over to be a busy loop.
-const LOOP_CPU: f32 = 20.0;
 
 /// Who is asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,433 +314,63 @@ pub fn daemon_reload(store: &Store, answering: Option<Vec<u32>>) -> i32 {
 
 // ---- reap -------------------------------------------------------------------
 
-/// One row of `ps`.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Proc {
-    pub pid: u32,
-    pub ppid: u32,
-    /// Seconds since it started.
-    pub age: u64,
-    pub cpu: f32,
-    /// CPU seconds it has used in all.
-    pub cputime: u64,
-    pub command: String,
-}
-
-/// `[[dd-]hh:]mm:ss` (`etime`) or `[hh:]mm:ss[.cc]` (`time`), in seconds.
-pub(crate) fn clock_secs(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (days, rest) = match s.split_once('-') {
-        Some((d, r)) => (d.parse::<u64>().ok()?, r),
-        None => (0, s),
-    };
-    let rest = rest.split('.').next()?;
-    let mut secs = 0u64;
-    for part in rest.split(':') {
-        secs = secs * 60 + part.parse::<u64>().ok()?;
-    }
-    Some(days * 86_400 + secs)
-}
-
-/// One `ps -o pid=,ppid=,etime=,pcpu=,time=,command=` line.
-pub(crate) fn parse_ps(line: &str) -> Option<Proc> {
-    let mut it = line.split_whitespace();
-    let pid = it.next()?.parse().ok()?;
-    let ppid = it.next()?.parse().ok()?;
-    let age = clock_secs(it.next()?)?;
-    let cpu = it.next()?.parse().ok()?;
-    let cputime = clock_secs(it.next()?)?;
-    let command = it.collect::<Vec<_>>().join(" ");
-    Some(Proc { pid, ppid, age, cpu, cputime, command })
-}
-
-pub(crate) fn processes() -> Vec<Proc> {
-    let Some(out) = crate::host::Host::table(&crate::host::LOCAL, "pid=,ppid=,etime=,pcpu=,time=,command=", false) else {
-        return Vec::new();
-    };
-    out.lines().filter_map(parse_ps).collect()
-}
-
-/// Every process's working directory, from `lsof -d cwd -Fpn`.
-pub(crate) fn parse_cwds(lsof: &str) -> BTreeMap<u32, String> {
-    let mut out = BTreeMap::new();
-    let mut pid = None;
-    for line in lsof.lines() {
-        match line.split_at_checked(1) {
-            Some(("p", rest)) => pid = rest.trim().parse::<u32>().ok(),
-            Some(("n", rest)) => {
-                if let Some(p) = pid {
-                    out.entry(p).or_insert_with(|| rest.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The tree a working directory is in: `(its name, its root)`, the directory
-/// under a `.worktrees/` the path goes through.
-pub(crate) fn tree_named(cwd: &str) -> Option<(String, String)> {
-    let mut root = std::path::PathBuf::new();
-    let mut parts = std::path::Path::new(cwd).components();
-    while let Some(c) = parts.next() {
-        root.push(c);
-        if c.as_os_str() == ".worktrees" {
-            let name = parts.next()?;
-            root.push(name);
-            return Some((name.as_os_str().to_string_lossy().into_owned(), root.display().to_string()));
-        }
-    }
-    None
-}
-
-fn word_names(command: &str, names: &[&str]) -> bool {
-    command.split_whitespace().take(6).any(|w| {
-        let base = w.rsplit('/').next().unwrap_or(w);
-        names.contains(&base)
-    })
-}
-
-/// A dev server or test runner, by the program it runs.
-pub(crate) fn is_dev_tool(command: &str) -> bool {
-    word_names(command, &["vite", "vitest", "esbuild", "jest", "webpack", "webpack-dev-server", "playwright", "storybook", "tsx", "next"])
-}
-
-/// A cargo test binary: `target/<profile>/deps/<name>-<hash>`.
-pub(crate) fn is_test_binary(command: &str) -> bool {
-    let prog = command.split_whitespace().next().unwrap_or_default();
-    prog.contains("/target/") && prog.contains("/deps/")
-}
-
-/// A zsh `while :` loop left running.
-pub(crate) fn is_busy_loop(p: &Proc) -> bool {
-    let prog = p.command.split_whitespace().next().unwrap_or_default();
-    prog.rsplit('/').next() == Some("zsh") && p.command.contains("while :") && p.cpu > LOOP_CPU && p.ppid == 1
-}
-
-/// What the guards ask of the store, so the rule is testable without one.
-pub(crate) struct Facts<'a> {
-    /// A row's status, by its tree's name.
-    pub status_of: &'a dyn Fn(&str) -> Option<Status>,
-    /// For a barrier check's tree: whether the check is still in use.
-    pub check_in_use: &'a dyn Fn(&str) -> Option<bool>,
-    /// Whether a live seat or a claim holds the row.
-    pub held: &'a dyn Fn(&str) -> bool,
-    /// Every live seat's processes and this command's ancestors.
-    pub keep: &'a [u32],
-    /// Seconds a process has been idle (CPU time unchanged), at most its age.
-    pub idle_for: &'a dyn Fn(&Proc) -> u64,
-    /// Whether a compound-sup label names a seat that is bound to a row or holds
-    /// a governor's slot.
-    pub seat_live: &'a dyn Fn(&str) -> bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Proof {
-    /// The tree it stands in, if the proof is a tree's.
-    pub tree: Option<String>,
-    pub text: String,
-}
-
-/// Whether `p` may be stopped, and the proof. Never by a pattern on its own:
-/// a loop is a loop by its parent and its CPU, a tool or test binary by the
-/// tree its working directory is in.
-pub(crate) fn prove(p: &Proc, cwd: Option<&str>, f: &Facts) -> Result<Proof, String> {
-    if f.keep.contains(&p.pid) {
-        return Err("it is a live seat's process, or one of this command's own ancestors".into());
-    }
-    if is_busy_loop(p) {
-        return Ok(Proof { tree: None, text: format!("busy loop: zsh `while :` at {:.0}% CPU, parent 1", p.cpu) });
-    }
-    if let Some(label) = session_label(&p.command) {
-        return prove_session(p, &label, cwd, f);
-    }
-    let Some(cwd) = cwd else {
-        return Err("it is no busy loop, and its working directory could not be read".into());
-    };
-    let Some((name, _)) = tree_named(cwd) else {
-        return Err(format!("it is no busy loop, and {cwd} is in no row's tree"));
-    };
-    if (f.held)(&name) {
-        return Err(format!("{name} is held by a live seat or a claim"));
-    }
-    let done_with = match (f.status_of)(&name) {
-        // `held` was refused above, so a doing row here has no seat and no claim:
-        // nobody may be using what stands in its tree.
-        Some(Status::Doing) => format!("{name} is at doing with no seat and no claim"),
-        Some(s) => format!("{name} is at {}", s.as_str()),
-        None => match (f.check_in_use)(&name) {
-            Some(false) => format!("{name} is a barrier check's tree, no longer in use"),
-            Some(true) => return Err(format!("{name} is a barrier check's tree still in use")),
-            None => return Err(format!("{name} is neither a row nor a barrier check's tree")),
-        },
-    };
-    if is_test_binary(&p.command) {
-        let idle = (f.idle_for)(p);
-        if p.cpu > 0.0 || idle < IDLE_FOR {
-            return Err(format!(
-                "a test binary is stopped only when idle at 0% CPU for {} min — idle {} min, at {:.1}%",
-                IDLE_FOR / 60,
-                idle / 60,
-                p.cpu
-            ));
-        }
-        return Ok(Proof { tree: Some(name), text: format!("test binary idle {} min at 0% CPU; {done_with}", idle / 60) });
-    }
-    if is_dev_tool(&p.command) {
-        if p.age < TOOL_AGE {
-            return Err(format!("it is {} min old — a dev or test tool is stopped after an hour", p.age / 60));
-        }
-        return Ok(Proof { tree: Some(name), text: format!("dev/test tool {} min old; {done_with}", p.age / 60) });
-    }
-    Err("it is not a dev or test tool, a test binary, a busy loop or a leaked test session".into())
-}
-
-/// The `cpd-*` label of a compound-sup session: `compound-sup spawn --label cpd-N …`.
-pub(crate) fn session_label(command: &str) -> Option<String> {
-    let words: Vec<&str> = command.split_whitespace().collect();
-    let first = words.first()?.rsplit('/').next()?;
-    if first != "compound-sup" || words.get(1) != Some(&"spawn") {
-        return None;
-    }
-    let at = words.iter().position(|w| *w == "--label")?;
-    let label = words.get(at + 1)?;
-    (label.starts_with("cpd-") && label[4..].chars().all(|c| c.is_ascii_digit()) && label.len() > 4).then(|| label.to_string())
-}
-
-/// A leaked compound-sup test session: its label is no live seat (no binding, no
-/// governor slot, none of the live seats' processes), it is older than an hour,
-/// and the row whose tree it stands in, if any, is not held (a doing row with no
-/// seat and no claim is not held).
-fn prove_session(p: &Proc, label: &str, cwd: Option<&str>, f: &Facts) -> Result<Proof, String> {
-    if (f.seat_live)(label) {
-        return Err(format!("{label} is a live seat — bound to a row or holding a governor's slot"));
-    }
-    if p.age < TOOL_AGE {
-        return Err(format!("it is {} min old — a leaked session is stopped after an hour", p.age / 60));
-    }
-    let mut tree = None;
-    if let Some((name, _)) = cwd.and_then(tree_named) {
-        if (f.held)(&name) {
-            return Err(format!("{name} is held by a live seat or a claim"));
-        }
-        tree = Some(name);
-    }
-    Ok(Proof { tree, text: format!("leaked test session {label}, {} min old, no live row", p.age / 60) })
-}
-
-/// Whether a governor of `scope` may reap what `proof` found: only pids in the
-/// trees of rows on its list, and that list's barrier tree.
-pub(crate) fn in_scope(
-    role: &Role,
-    proof: &Proof,
-    list_of: &dyn Fn(&str) -> Option<String>,
-    check_list: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), String> {
-    match role {
-        Role::Outside | Role::Primary => Ok(()),
-        Role::Seat => Err("a member, verifier or check seat does not reap".into()),
-        Role::Governor(scope) => {
-            let Some(tree) = &proof.tree else {
-                return Err(format!("it is in no row's tree; the governor of {scope} reaps pids in trees of rows on {scope} only — it needs the primary seat"));
-            };
-            let list = check_list(tree).or_else(|| list_of(tree));
-            match list {
-                Some(l) if &l == scope => Ok(()),
-                Some(l) => Err(format!("{tree} is on list {l}; the governor of {scope} reaps pids in trees of rows on {scope} (and its barrier tree) only — it needs the governor of {l}, or the primary seat")),
-                None => Err(format!("{tree} is on no list; the governor of {scope} reaps pids in trees of rows on {scope} only — it needs the primary seat")),
-            }
-        }
-    }
-}
-
-/// Of the pids standing in a tree by working directory (`in_tree`, less every live
-/// seat's), those a despawn ends with the seat: what the tree started
-/// ([`crate::check_tree::verdict`]: a dev tool, or a child of something that stood
-/// there), and a `compound-sup spawn --label cpd-N` test session, which a seat's
-/// own test run leaves behind and which `verdict` spares as an installed server.
-/// Never a host or a login shell, and never by a pattern on a name alone: each
-/// pid is in the tree by its working directory.
-pub(crate) fn left_by_a_seat(in_tree: &[u32], table: &[(u32, u32, String)], procs: &[Proc], tree: &std::path::Path) -> Vec<u32> {
-    let session = |pid: u32| procs.iter().find(|p| p.pid == pid).is_some_and(|p| session_label(&p.command).is_some());
-    in_tree
-        .iter()
-        .copied()
-        .filter(|&pid| match crate::check_tree::verdict(pid, tree, in_tree, table) {
-            crate::check_tree::Verdict::Stop => true,
-            crate::check_tree::Verdict::Spare(_) => session(pid),
-        })
-        .collect()
-}
-
-/// The pids a seat started that stand in `dir`, to be ended with the tree.
-/// Read before the tree is removed: a removed directory is not reliably a
-/// working directory `lsof` can name.
-pub(crate) fn left_in(dir: &std::path::Path) -> Vec<u32> {
-    if cfg!(test) {
-        return Vec::new();
-    }
-    let in_tree = crate::check_tree::running_in(dir);
-    left_by_a_seat(&in_tree, &crate::check_tree::exes(), &processes(), dir)
-}
-
-/// `TERM`, a moment, then `KILL` for what is left. Returns what it signalled,
-/// TERM first, then KILL.
-pub(crate) fn end_pids(pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
-    if cfg!(test) || pids.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    crate::check_tree::signal("TERM", pids);
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let still: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect();
-    crate::check_tree::signal("KILL", &still);
-    (pids.to_vec(), still)
-}
-
-const SEEN: &str = "reap-seen.json";
-
-/// What a test binary's CPU time was when it was last looked at, and since
-/// when it has not changed. `ps` has no history; this is the history. Written
-/// by every `wsp reap`, so `wsp reap --list` begins the fifteen minutes.
-fn observe(store: &Store, procs: &[Proc], now: i64) -> BTreeMap<u32, u64> {
-    let path = store.state_file(SEEN);
-    let old: Value = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}));
-    let mut next = serde_json::Map::new();
-    let mut idle = BTreeMap::new();
-    for p in procs.iter().filter(|p| is_test_binary(&p.command)) {
-        let key = p.pid.to_string();
-        let since = match old.get(&key) {
-            Some(rec) if rec.get("cputime").and_then(Value::as_u64) == Some(p.cputime) => {
-                rec.get("since").and_then(Value::as_i64).unwrap_or(now)
-            }
-            _ => now,
-        };
-        next.insert(key, json!({ "cputime": p.cputime, "since": since }));
-        idle.insert(p.pid, ((now - since).max(0) as u64).min(p.age));
-    }
-    let _ = crate::store::write_atomic(&path, &Value::Object(next).to_string());
-    idle
-}
-
-fn signal(sig: &str, pid: u32) {
-    crate::host::Host::signal(&crate::host::LOCAL, &[pid], sig);
-}
-
-/// Why `role` may not run `wsp reap` (`list` is the read-only form), if it may
-/// not. Only stopping a pid is gated on the seat; listing changes nothing and is
-/// open to every role.
-pub(crate) fn reap_gate(role: &Role, list: bool) -> Option<&'static str> {
-    (*role == Role::Seat && !list).then_some("a member, verifier or check seat does not reap")
-}
-
-/// The role whose scope `--list` shows. A seat has no scope of its own to reap
-/// in, so it sees every candidate, as the primary would; every other role sees
-/// what it could stop.
-pub(crate) fn scope_for(role: &Role, list: bool) -> Role {
-    if list && *role == Role::Seat { Role::Primary } else { role.clone() }
-}
-
-/// `wsp reap <pid>…` and `wsp reap --list`.
+/// `wsp reap --list`: what this host's manager runs, its seats and its jobs,
+/// read from the manager (wsp-057, the person's (b) on wsp-042). wsp finds no
+/// process and stops none: a seat's group ends with the seat, a job's with the
+/// job, both by the manager, and what escapes a group is reported and counted
+/// and stopped by no one ((c)). `wsp reap <pid>` is removed. Open to every
+/// role: it changes nothing.
 pub fn reap(store: &Store, args: &Args) -> i32 {
-    let role = role(store);
-    let list = args.has("list");
-    if let Some(why) = reap_gate(&role, list) {
-        return refuse(store, "reap", &role, why);
-    }
-    let mut asked: Vec<u32> = Vec::new();
-    for w in &args.rest {
-        match w.parse::<u32>() {
-            Ok(p) if p > 1 => asked.push(p),
-            _ => {
-                eprintln!("wsp: reap takes pids, never patterns — `{w}` is not one");
-                return 2;
-            }
-        }
-    }
-    if !list && asked.is_empty() {
-        eprintln!("usage: wsp reap <pid>… | wsp reap --list");
+    if !args.rest.is_empty() || !args.has("list") {
+        eprintln!("wsp: `wsp reap <pid>` is removed (wsp-057): wsp stops no process by pid. A seat's processes end with the seat (`wsp despawn`), a job's with the job; `wsp reap --list` shows what this host's manager runs");
         return 2;
     }
-    let Some(keep) = crate::check_tree::live_seat_pids() else {
-        return refuse(store, "reap", &role, "no backend answered, so whose processes are whose is not known — nothing stopped");
+    let tcp = match crate::host_tcp::Tcp::from_record(&store.state, wsp_host_api::Role::Cli, env!("CARGO_PKG_VERSION")) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("wsp: reap --list: no manager on this host to ask: {e}");
+            return 1;
+        }
     };
-    let procs = processes();
-    let cwds = crate::host::Host::cwds(&crate::host::LOCAL, None).map(|o| parse_cwds(&o)).unwrap_or_default();
-    let idle = observe(store, &procs, util::epoch_secs());
-
-    let claims = store.claims();
-    let status_of = |n: &str| store.task(n).map(|t| t.status());
-    let check_in_use = |n: &str| crate::check_tree::named(store, n).map(|(l, at)| crate::check_tree::in_use(store, &l, at));
-    let held = |n: &str| claims.contains_key(n) || !store.panes_for_task(n).is_empty();
-    let idle_for = |p: &Proc| idle.get(&p.pid).copied().unwrap_or(0);
-    let bindings = store.bindings();
-    let governors = store.governors();
-    let seat_live = |label: &str| {
-        bindings.contains_key(label) || crate::place::governs(&governors, &crate::place::Seat::new(label)).is_some()
-    };
-    let facts = Facts { status_of: &status_of, check_in_use: &check_in_use, held: &held, keep: &keep, idle_for: &idle_for, seat_live: &seat_live };
-    let list_of = |n: &str| list_of_row(store, n);
-    let check_list = |n: &str| crate::check_tree::named(store, n).map(|(l, _)| l);
-
-    let scope = scope_for(&role, list);
-    let judge = |p: &Proc| -> Result<Proof, String> {
-        let proof = prove(p, cwds.get(&p.pid).map(String::as_str), &facts)?;
-        in_scope(&scope, &proof, &list_of, &check_list)?;
-        Ok(proof)
-    };
-
-    if list {
-        let mut n = 0;
-        for p in &procs {
-            if let Ok(proof) = judge(p) {
-                n += 1;
-                println!("{}  {}  {}", p.pid, proof.text, util::truncate(&p.command, 80));
-            }
-        }
-        if n == 0 {
-            println!("nothing to reap");
-        }
-        return 0;
+    let seats = tcp.seats().map_err(|e| e.to_string());
+    let jobs = crate::host::Host::jobs(&tcp).map_err(|e| e.to_string());
+    for line in list_lines(&seats, &jobs, util::epoch_secs()) {
+        println!("{line}");
     }
+    i32::from(seats.is_err() || jobs.is_err())
+}
 
-    let mut refused = 0;
-    let mut stopped = Vec::new();
-    for pid in asked {
-        let Some(p) = procs.iter().find(|p| p.pid == pid) else {
-            eprintln!("wsp: reap: no process {pid}");
-            refused += 1;
-            continue;
-        };
-        match judge(p) {
-            Ok(proof) => {
-                crate::store::log_line(
-                    store,
-                    &format!("reap {pid} by {}: {} — {}", role.name(), proof.text, util::truncate(&p.command, 100)),
-                );
-                signal("TERM", pid);
-                stopped.push((pid, proof));
-            }
-            Err(why) => {
-                refused += 1;
-                eprintln!("wsp: reap {pid}: {why}");
-                crate::store::log_line(store, &format!("refused reap {pid} by {}: {why}", role.name()));
+/// What `wsp reap --list` prints of a manager's seats and jobs at `now`
+/// (epoch seconds): one line each, and why for a table it could not read.
+pub(crate) fn list_lines(
+    seats: &Result<Vec<wsp_host_api::SeatRow>, String>,
+    jobs: &Result<Vec<crate::host::JobRow>, String>,
+    now: i64,
+) -> Vec<String> {
+    let word = |d: &dyn std::fmt::Debug| format!("{d:?}").to_lowercase();
+    let mut out = Vec::new();
+    match seats {
+        Ok(rows) if rows.is_empty() => out.push("seats: none".to_string()),
+        Ok(rows) => {
+            out.push(format!("seats: {}", rows.len()));
+            for r in rows {
+                out.push(format!("  {}  {}  {} MB  {} shell(s)", r.seat.0, word(&r.state), r.rss_bytes >> 20, r.shells));
             }
         }
+        Err(why) => out.push(format!("seats: not read — {why}")),
     }
-    if !stopped.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let still = crate::host::Host::alive(&crate::host::LOCAL, &stopped.iter().map(|(p, _)| *p).collect::<Vec<_>>());
-        for (pid, proof) in &stopped {
-            if still.contains(pid) {
-                signal("KILL", *pid);
-                println!("{pid}  killed ({})", proof.text);
-            } else {
-                println!("{pid}  stopped ({})", proof.text);
+    match jobs {
+        Ok(rows) if rows.is_empty() => out.push("jobs: none".to_string()),
+        Ok(rows) => {
+            out.push(format!("jobs: {}", rows.len()));
+            for r in rows {
+                let secs = (now - r.started.0 as i64).max(0);
+                out.push(format!("  {}  {}  {}  group {}  {}s", crate::check::key_text(&r.key), word(&r.class), word(&r.state), r.pgid, secs));
             }
         }
+        Err(why) => out.push(format!("jobs: not read — {why}")),
     }
-    (refused > 0) as i32
+    out
 }
 
 // ---- the seat's settings ------------------------------------------------------
@@ -999,106 +620,16 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     help: &[crate::verbs::Help {
         section: crate::verbs::Section::Agents,
         order: 310,
-        text: r##"  wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
-                                    or test tool over an hour old in the tree of a
-                                    row no seat or claim holds, a zsh busy loop, a test
-                                    binary idle 15 min in a finished tree. Never
-                                    a live seat's. The primary any such pid; a
-                                    governor those in its list's trees"##,
+        text: r##"  wsp reap --list                   what this host's manager runs: its seats and its
+                                    jobs, read from the manager. wsp stops no
+                                    process by pid (`wsp reap <pid>` is removed):
+                                    a seat's end with it, a job's with the job"##,
     }],
 }];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn proc(pid: u32, age: u64, cpu: f32, command: &str) -> Proc {
-        Proc { pid, ppid: 400, age, cpu, cputime: 5, command: command.into() }
-    }
-
-    struct World {
-        rows: Vec<(&'static str, Status)>,
-        held: Vec<&'static str>,
-    }
-
-    fn judge(w: &World, p: &Proc, cwd: &str, idle: u64) -> Result<Proof, String> {
-        let status_of = |n: &str| w.rows.iter().find(|(r, _)| *r == n).map(|(_, s)| *s);
-        let check = |n: &str| (n == "L-check-1").then_some(false);
-        let held = |n: &str| w.held.contains(&n);
-        let idle_for = |_: &Proc| idle;
-        let facts = Facts { status_of: &status_of, check_in_use: &check, held: &held, keep: &[7], idle_for: &idle_for, seat_live: &|l| l == "cpd-9" };
-        prove(p, Some(cwd), &facts)
-    }
-
-    fn world() -> World {
-        World { rows: vec![("wsp-1", Status::Doing), ("wsp-2", Status::Review), ("wsp-3", Status::Done)], held: vec!["wsp-3"] }
-    }
-
-    const VITE: &str = "node /r/.worktrees/x/node_modules/.bin/vite --port 5173";
-
-    #[test]
-    fn reap_allows_a_pid_in_the_tree_of_a_doing_row_with_no_seat_and_refuses_one_a_seat_holds() {
-        let ok = judge(&world(), &proc(10, 9000, 0.0, VITE), "/r/.worktrees/wsp-1/web", 0).unwrap();
-        assert_eq!(ok.tree.as_deref(), Some("wsp-1"));
-        assert!(ok.text.contains("no seat"), "{}", ok.text);
-        let mut w = world();
-        w.held.push("wsp-1");
-        let why = judge(&w, &proc(10, 9000, 0.0, VITE), "/r/.worktrees/wsp-1/web", 0).unwrap_err();
-        assert!(why.contains("held"), "{why}");
-    }
-
-    #[test]
-    fn reap_refuses_a_pid_younger_than_an_hour() {
-        let why = judge(&world(), &proc(10, 3599, 0.0, VITE), "/r/.worktrees/wsp-2/web", 0).unwrap_err();
-        assert!(why.contains("younger") || why.contains("min old"), "{why}");
-        let ok = judge(&world(), &proc(10, 3600, 0.0, VITE), "/r/.worktrees/wsp-2/web", 0).unwrap();
-        assert_eq!(ok.tree.as_deref(), Some("wsp-2"));
-    }
-
-    #[test]
-    fn reap_refuses_a_row_a_seat_or_claim_holds_and_a_live_seats_own_process() {
-        let why = judge(&world(), &proc(10, 9000, 0.0, VITE), "/r/.worktrees/wsp-3", 0).unwrap_err();
-        assert!(why.contains("held"), "{why}");
-        let why = judge(&world(), &proc(7, 9000, 0.0, VITE), "/r/.worktrees/wsp-2", 0).unwrap_err();
-        assert!(why.contains("live seat"), "{why}");
-    }
-
-    #[test]
-    fn a_leaked_compound_sup_session_with_no_live_row_is_reaped() {
-        let sess = |l: &str| format!("/u/.local/bin/compound-sup spawn --label {l} --cwd /r/.worktrees/wsp-2 -- /bin/zsh");
-        let ok = judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-2", 0).unwrap();
-        assert!(ok.text.contains("cpd-5"), "{}", ok.text);
-        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-9")), "/r/.worktrees/wsp-2", 0).is_err(), "live seat");
-        assert!(judge(&world(), &proc(10, 100, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-2", 0).is_err(), "young");
-        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-1", 0).is_ok(), "doing, no seat");
-        assert!(judge(&world(), &proc(10, 4000, 0.0, &sess("cpd-5")), "/r/.worktrees/wsp-3", 0).is_err(), "held");
-        assert_eq!(session_label("compound-sup spawn --socket /x -- /bin/zsh"), None, "no label, no pattern");
-        assert_eq!(session_label("vim --label cpd-5"), None);
-    }
-
-    #[test]
-    fn a_despawn_ends_the_dev_tools_and_test_sessions_in_the_tree_and_no_host() {
-        let t = std::path::Path::new("/r/.worktrees/wsp-1");
-        let ex = |pid: u32, ppid: u32, exe: &str| (pid, ppid, exe.to_string());
-        let table = vec![
-            ex(100, 1, "/usr/local/bin/node"),
-            ex(101, 1, "/Users/u/.local/bin/compound-sup"),
-            ex(102, 101, "/bin/zsh"),
-            ex(103, 1, "/Users/u/.local/bin/compound-sup"),
-            ex(104, 1, "/opt/backend"),
-            ex(105, 1, "/Users/u/.local/bin/compound-sup"),
-        ];
-        let procs = vec![
-            proc(100, 9000, 0.0, "node /r/.worktrees/wsp-1/node_modules/.bin/vite"),
-            proc(101, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --label cpd-7 -- /bin/zsh"),
-            proc(102, 9000, 0.0, "/bin/zsh"),
-            proc(103, 9000, 0.0, "/Users/u/.local/bin/compound-sup serve"),
-            proc(104, 9000, 0.0, "/opt/backend"),
-            proc(105, 9000, 0.0, "/Users/u/.local/bin/compound-sup spawn --socket /x -- /bin/zsh"),
-        ];
-        let got = left_by_a_seat(&[100, 101, 102, 103, 104, 105], &table, &procs, t);
-        assert_eq!(got, vec![100, 101, 102], "vite, the labelled session and its zsh; not the server, the host or an unlabelled one");
-    }
 
     #[test]
     fn the_stale_done_deny_comes_out_and_nothing_else_does() {
@@ -1122,75 +653,6 @@ mod tests {
     fn a_member_is_a_seat_and_not_outside_for_despawn() {
         assert_eq!(role_of_caller(Some("cpd-3"), None, true), Role::Seat);
         assert_eq!(role_of_caller(Some("w1:p1"), None, false), Role::Outside);
-    }
-
-    #[test]
-    fn reap_refuses_what_is_no_tool_and_what_stands_in_no_tree() {
-        assert!(judge(&world(), &proc(10, 9000, 0.0, "vim notes"), "/r/.worktrees/wsp-2", 0).is_err());
-        assert!(judge(&world(), &proc(10, 9000, 0.0, VITE), "/Users/ed", 0).is_err());
-        assert!(judge(&world(), &proc(10, 9000, 0.0, VITE), "/r/.worktrees/nobody", 0).is_err());
-    }
-
-    #[test]
-    fn a_test_binary_needs_fifteen_idle_minutes_in_a_finished_tree() {
-        let bin = proc(11, 9000, 0.0, "/r/target/debug/deps/wsp-abc123 --test-threads 4");
-        assert!(judge(&world(), &bin, "/r/.worktrees/wsp-2", 14 * 60).is_err());
-        assert!(judge(&world(), &bin, "/r/.worktrees/wsp-2", 15 * 60).is_ok());
-        assert!(judge(&world(), &bin, "/r/.worktrees/wsp-1", 15 * 60).is_ok(), "a doing row with no seat");
-        assert!(judge(&world(), &bin, "/r/.worktrees/L-check-1", 15 * 60).is_ok(), "a barrier check's tree no longer in use");
-        let busy = proc(11, 9000, 3.0, "/r/target/debug/deps/wsp-abc123");
-        assert!(judge(&world(), &busy, "/r/.worktrees/wsp-2", 99_999).is_err());
-    }
-
-    #[test]
-    fn a_busy_loop_is_a_zsh_while_over_twenty_percent_with_parent_one() {
-        let mut l = proc(12, 100, 90.0, "/bin/zsh -c while :; do :; done");
-        l.ppid = 1;
-        assert!(judge(&world(), &l, "/", 0).is_ok());
-        l.ppid = 400;
-        assert!(judge(&world(), &l, "/", 0).is_err());
-        l.ppid = 1;
-        l.cpu = 10.0;
-        assert!(judge(&world(), &l, "/", 0).is_err());
-    }
-
-    #[test]
-    fn a_governor_reaps_only_in_trees_of_its_own_list() {
-        let list_of = |n: &str| (n == "wsp-2").then(|| "fleet".to_string());
-        let check_list = |n: &str| (n == "L-check-1").then(|| "L".to_string());
-        let p = |tree: Option<&str>| Proof { tree: tree.map(str::to_string), text: "x".into() };
-        let gov = |s: &str| Role::Governor(s.into());
-        assert!(in_scope(&gov("fleet"), &p(Some("wsp-2")), &list_of, &check_list).is_ok());
-        let why = in_scope(&gov("other"), &p(Some("wsp-2")), &list_of, &check_list).unwrap_err();
-        assert!(why.contains("other") && why.contains("fleet"), "names both scopes: {why}");
-        assert!(in_scope(&gov("L"), &p(Some("L-check-1")), &list_of, &check_list).is_ok(), "its barrier tree");
-        assert!(in_scope(&gov("fleet"), &p(None), &list_of, &check_list).is_err(), "a busy loop is the primary's");
-        assert!(in_scope(&Role::Primary, &p(None), &list_of, &check_list).is_ok());
-        assert!(in_scope(&Role::Seat, &p(Some("wsp-2")), &list_of, &check_list).is_err());
-    }
-
-    #[test]
-    fn reap_list_is_open_to_every_role_and_a_pid_stays_gated_for_a_seat() {
-        // a check seat, a member seat and a verifier seat are all `Role::Seat`
-        for role in [Role::Seat, Role::Outside, Role::Primary, Role::Governor("fleet".into())] {
-            assert_eq!(reap_gate(&role, true), None, "{role:?} may list");
-        }
-        assert_eq!(reap_gate(&Role::Seat, false), Some("a member, verifier or check seat does not reap"));
-        for role in [Role::Outside, Role::Primary, Role::Governor("fleet".into())] {
-            assert_eq!(reap_gate(&role, false), None, "{role:?} may reap");
-        }
-    }
-
-    #[test]
-    fn a_seat_lists_every_candidate_but_stopping_one_stays_refused() {
-        let list_of = |_: &str| None;
-        let check_list = |_: &str| None;
-        let p = Proof { tree: Some("wsp-2".into()), text: "x".into() };
-        assert!(in_scope(&scope_for(&Role::Seat, true), &p, &list_of, &check_list).is_ok());
-        let why = in_scope(&scope_for(&Role::Seat, false), &p, &list_of, &check_list).unwrap_err();
-        assert!(why.contains("does not reap"), "{why}");
-        let gov = Role::Governor("fleet".into());
-        assert_eq!(scope_for(&gov, true), gov, "a governor still sees its own scope");
     }
 
     #[test]
@@ -1245,13 +707,20 @@ mod tests {
     }
 
     #[test]
-    fn ps_lines_and_clocks_parse() {
-        assert_eq!(clock_secs("01:02:03"), Some(3723));
-        assert_eq!(clock_secs("2-00:00:10"), Some(172_810));
-        assert_eq!(clock_secs("0:01.50"), Some(1));
-        let p = parse_ps("  412     1  1-02:03:04  97.3   0:12.00 /bin/zsh -c while :; do :; done").unwrap();
-        assert_eq!((p.pid, p.ppid, p.age, p.cputime), (412, 1, 93_784, 12));
-        assert!(is_busy_loop(&p));
+    fn reap_list_reads_the_managers_seats_and_jobs_and_says_a_table_it_could_not_read() {
+        use wsp_host_api::{Epoch, SeatId, SeatRow, SeatState};
+        let seat = SeatRow { seat: SeatId("cpd-3".into()), epoch: Epoch(1), state: SeatState::Working, rss_bytes: 412 << 20, shells: 2, last_turn: None, last_word: None };
+        let job = crate::host::JobRow {
+            key: crate::host::job_key("wsp-1", 0, "check:s@1.0"),
+            class: crate::host::JobClass::Check,
+            pgid: 77,
+            started: crate::host::At(1000),
+            state: crate::host::JobState::Running,
+        };
+        let lines = list_lines(&Ok(vec![seat]), &Ok(vec![job]), 1090);
+        assert_eq!(lines, ["seats: 1", "  cpd-3  working  412 MB  2 shell(s)", "jobs: 1", "  wsp-1/0/check:s@1.0  check  running  group 77  90s"]);
+        let none = list_lines(&Ok(Vec::new()), &Err("host silent".into()), 0);
+        assert_eq!(none, ["seats: none", "jobs: not read — host silent"]);
     }
 
     #[test]

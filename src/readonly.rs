@@ -31,6 +31,7 @@ pub const READ_ONLY: &[&str] = &[
     "burn",     // token cost
     "spend",    // tokens and cost by day, model, project and list
     "calls",    // this log
+    "reap",     // `--list`: the manager's seats and jobs (wsp-057; `reap <pid>` is gone)
 ];
 
 /// Verbs that write, or that write for some of their forms.
@@ -40,7 +41,7 @@ pub const ACTIONS: &[&str] = &[
     "rename", "caption", "rm", "archive", "ask", "answer", "yours", "ack", "watch", "verified", "check", "spawn", "despawn",
     "attend", "claim", "release", "pin", "unpin", "agent", "doctor", "say", "tell", "flag", "reconcile",
     "attempts", "leg", "install", "daemon", "brief", "commit-help", "machine", "migrate", "code", "retro", "packet", "sandbox",
-    "mandate", "cold", "after", "scratch", "artefact", "done", "reap", "stuck", "verifications", "panel", "init",
+    "mandate", "cold", "after", "scratch", "artefact", "done", "stuck", "verifications", "panel", "init",
     "project", "resume", "govern", "view", "kanban", "checkout", "land", "verify", "report", "throttle", "submit",
 ];
 

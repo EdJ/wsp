@@ -377,9 +377,6 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And the scratch of rows that have closed (`wsp-373`).
     wsp_base::calls::phase("sweep:scratch");
     crate::scratch::tidy(store);
-    // And agents running for a store no daemon keeps (`wsp-333`).
-    wsp_base::calls::phase("sweep:leaked-agents");
-    crate::leaked_agents::tidy(store);
     wsp_base::calls::phase("sweep:disk");
     crate::disk::tidy(store);
     // And the build holds of processes that died, and the load warning's edges
