@@ -1782,6 +1782,19 @@ pub(crate) fn review_payload(args: &Args, usage: &str) -> Result<(String, String
 /// the row to `review` with `account` as its `review:` line. `args` names the
 /// row as its first word and may carry `--anyway` and `--hold-review`.
 pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
+    let code = accept_now(store, args, account, said);
+    // `wsp-691`: what the row left running in its tree goes with its submit,
+    // all but this seat's agent and the chain this command runs on.
+    if code == 0 {
+        if let Some(id) = args.rest.first().and_then(|n| store.find_task(n)).map(|t| t.id) {
+            crate::ending::stop_in_tree(store, &id, true, &format!("{id} submitted"));
+        }
+    }
+    code
+}
+
+/// [`accept`] before its sweep.
+fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
     // A row copied to an executor is reviewed only at the tree `verify` ran on.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
         if let Some(tree) = crate::cmd_checkout::member_tree(store, &t.id) {

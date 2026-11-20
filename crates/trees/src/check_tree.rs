@@ -452,6 +452,16 @@ fn wsp_above(mut at: u32, in_tree: &[u32], table: &[(u32, u32, String)]) -> Opti
 /// `in_tree` is every pid standing in the tree; `table` is [`exes`]. A seat's
 /// processes never get here: `keep` took them before.
 pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)]) -> Verdict {
+    judge(pid, tree, in_tree, table, false)
+}
+
+/// [`verdict`], and where `orphans` is set an orphan (`ppid` 1, its starter
+/// gone) that no rule above spares is the tree's to stop (`wsp-691`: eight
+/// `yes` burners stood in a member's tree at review, orphaned to launchd). Set
+/// for the trees a seat has just left or is waiting in at review, and at a
+/// submit: there the tree is the row's alone, so what nobody holds is its
+/// leftovers. Hosts, servers, apps and a wsp's check are spared as ever.
+pub fn judge(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)], orphans: bool) -> Verdict {
     let find = |p: u32| table.iter().find(|(q, _, _)| *q == p);
     let Some(&(_, ppid, ref exe)) = find(pid) else { return Verdict::Spare("it is not in the process table".into()) };
     if let Some(why) = host_named(exe) {
@@ -483,6 +493,9 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     if DEV_TOOLS.contains(&base_of(exe)) {
         return Verdict::Stop;
     }
+    if orphans && ppid <= 1 {
+        return Verdict::Stop;
+    }
     // Up through its parents, to the first that decides it: a host makes it
     // the host's; one that stood in the tree makes it the tree's. Further up is
     // not asked: every pane has a backend above it.
@@ -506,13 +519,20 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
 /// `lefts` with each tree's pids sorted by [`verdict`] into what is stopped and
 /// what is spared. A tree with neither is dropped.
 pub fn sorted(lsof: &str, lefts: Vec<Left>, table: &[(u32, u32, String)]) -> Vec<Left> {
+    sorted_with(lsof, lefts, table, &|_| false)
+}
+
+/// [`sorted`], judging the trees of the rows `orphans` names with
+/// [`judge`]'s `orphans` set.
+pub fn sorted_with(lsof: &str, lefts: Vec<Left>, table: &[(u32, u32, String)], orphans: &dyn Fn(&str) -> bool) -> Vec<Left> {
     lefts
         .into_iter()
         .filter_map(|mut l| {
             let in_tree = pids_in(lsof, Path::new(&l.tree));
             let (mut stop, mut spare) = (Vec::new(), Vec::new());
+            let orphans = orphans(&l.row);
             for p in std::mem::take(&mut l.pids) {
-                match verdict(p, Path::new(&l.tree), &in_tree, table) {
+                match judge(p, Path::new(&l.tree), &in_tree, table, orphans) {
                     Verdict::Stop => stop.push(p),
                     Verdict::Spare(why) => spare.push((p, why)),
                 }
@@ -593,6 +613,15 @@ pub fn finished_trees(lsof: &str, finished: &dyn Fn(&str) -> bool, keep: &[u32])
 /// process standing in its tree that is no live seat's and that the tree
 /// started ([`verdict`], `wsp-478`).
 ///
+/// **And two more (`wsp-691`)**, judged with [`judge`]'s `orphans` set: a row
+/// at `review` whose seat is still open (a member waits there for its
+/// verifier, and wsp-693's eight `yes` burners stood beside it for 19
+/// minutes), and a row in `ended`, whose seat ended on this tick, whatever its
+/// status. Of the seat `own` names for a row at review, only its agent and what
+/// the agent started directly ([`agent_of`]) are kept, and only in that row's
+/// tree; every other live seat's processes (a verifier working in the tree)
+/// are kept whole.
+///
 /// `None` when no backend answered: a census that failed says nothing about
 /// which rows have a seat, so the caller signals and names nothing.
 pub fn left_in_finished(
@@ -600,28 +629,183 @@ pub fn left_in_finished(
     census: Vec<(String, String)>,
     pids: &dyn Fn(&str) -> Option<Vec<u32>>,
     staged: &dyn Fn(&crate::model::Task) -> bool,
+    own: &dyn Fn(&str) -> Option<String>,
+    ended: &BTreeSet<String>,
 ) -> Option<Vec<Left>> {
     let mut live = BTreeSet::new();
     let mut keep = crate::base::procs::ancestors(&LOCAL.parents());
+    let mut seats: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for (seat, label) in census {
         live.insert(label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string());
-        keep.extend(pids(&seat).unwrap_or_default());
+        seats.insert(seat.clone(), pids(&seat).unwrap_or_default());
+    }
+    let at_review = |name: &str| {
+        store.task(name).is_some_and(|t| t.status() == crate::model::Status::Review && !staged(&t))
+    };
+    // The open seat of each row at review: seat to row.
+    let owners: BTreeMap<String, String> = live
+        .iter()
+        .filter(|row| at_review(row))
+        .filter_map(|row| own(row).filter(|seat| seats.contains_key(seat)).map(|seat| (seat, row.clone())))
+        .collect();
+    let mut table = None;
+    // Each such row's seat whole: kept in every tree but its own row's.
+    let mut theirs: Vec<(String, Vec<u32>)> = Vec::new();
+    for (seat, ps) in &seats {
+        match owners.get(seat) {
+            Some(row) => {
+                keep.extend(agent_of(ps, table.get_or_insert_with(exes)));
+                theirs.push((row.clone(), ps.clone()));
+            }
+            None => keep.extend(ps),
+        }
     }
     let claims = store.claims();
-    let finished = |name: &str| {
-        !live.contains(name)
-            && !claims.contains_key(name)
-            && store.task(name).is_some_and(|t| {
-                matches!(t.status(), crate::model::Status::Review | crate::model::Status::Done) && !staged(&t)
-            })
+    // `Some(orphans)` for a row whose tree is swept.
+    let class = |name: &str| -> Option<bool> {
+        let t = store.task(name)?;
+        if ended.contains(name) {
+            return Some(true);
+        }
+        if staged(&t) {
+            return None;
+        }
+        match t.status() {
+            crate::model::Status::Review if live.contains(name) => Some(true),
+            crate::model::Status::Review | crate::model::Status::Done
+                if !live.contains(name) && !claims.contains_key(name) =>
+            {
+                Some(false)
+            }
+            _ => None,
+        }
     };
     let lsof = LOCAL.cwds(None)?;
-    let found = finished_trees(&lsof, &finished, &keep);
+    let mut found = finished_trees(&lsof, &|n| class(n).is_some(), &keep);
+    for l in &mut found {
+        l.pids.retain(|p| !theirs.iter().any(|(row, ps)| row != &l.row && ps.contains(p)));
+    }
+    found.retain(|l| !l.pids.is_empty());
     // The executables are read only for processes there are to sort (`wsp-480`).
     if found.is_empty() {
         return Some(found);
     }
-    Some(sorted(&lsof, found, &exes()))
+    let table = table.unwrap_or_else(exes);
+    Some(sorted_with(&lsof, found, &table, &|n| class(n) == Some(true)))
+}
+
+/// A seat's agent, out of `seat` (every process of the seat) and `table`
+/// ([`exes`]): down from the seat's root through the hosts and servers that
+/// carry it (`compound-sup`, a login shell), the first process that is
+/// neither, and every process it is the direct parent of — its tool shells
+/// and its servers (`wsp-691`). What those started is not the agent's to keep.
+/// The whole seat when the table could not be read.
+pub fn agent_of(seat: &[u32], table: &[(u32, u32, String)]) -> Vec<u32> {
+    if table.is_empty() {
+        return seat.to_vec();
+    }
+    let row = |p: u32| table.iter().find(|(q, _, _)| *q == p);
+    let children = |of: &[u32]| table.iter().filter(|(_, pp, _)| of.contains(pp)).map(|r| r.0).collect::<Vec<u32>>();
+    let carrier = |p: u32| row(p).is_some_and(|(_, _, exe)| host_named(exe).is_some() || BUILT_SERVERS.contains(&base_of(exe)));
+    let mut layer: Vec<u32> =
+        seat.iter().copied().filter(|p| !row(*p).is_some_and(|(_, pp, _)| seat.contains(pp))).collect();
+    let mut keep = Vec::new();
+    for _ in 0..=seat.len() {
+        if layer.is_empty() {
+            break;
+        }
+        keep.extend(&layer);
+        let (carriers, agents): (Vec<u32>, Vec<u32>) = layer.iter().copied().partition(|p| carrier(*p));
+        keep.extend(children(&agents));
+        layer = children(&carriers).into_iter().filter(|p| !keep.contains(p)).collect();
+    }
+    keep
+}
+
+/// A plain shell, the kind an agent runs a command in the background under.
+fn shell_named(exe: &str) -> bool {
+    matches!(base_of(exe), "sh" | "bash" | "zsh" | "dash" | "fish")
+}
+
+/// What a submit keeps of one live seat (`wsp-691`), `chain` being this
+/// process and its parents: another seat's processes whole; of the caller's own
+/// seat (one of its processes is on `chain`), its agent and the agent's direct
+/// children ([`agent_of`]) less the shells off `chain` — the background shells
+/// it left go, and its foreground one is on `chain`.
+pub fn kept_at_submit(seat: &[u32], chain: &[u32], table: &[(u32, u32, String)]) -> Vec<u32> {
+    if !seat.iter().any(|p| *p > 1 && chain.contains(p)) {
+        return seat.to_vec();
+    }
+    let exe = |p: u32| table.iter().find(|(q, _, _)| *q == p).map(|r| r.2.as_str()).unwrap_or_default();
+    agent_of(seat, table).into_iter().filter(|p| chain.contains(p) || !shell_named(exe(*p))).collect()
+}
+
+/// What stands in `tree`, row `row`'s, that is the row's to stop: by working
+/// directory in the tree and by nothing else, less `keep`, judged with
+/// [`judge`]'s `orphans` set (`wsp-691`). Read in `lsof` and `table`.
+pub fn left_among(lsof: &str, row: &str, tree: &Path, keep: &[u32], table: &[(u32, u32, String)]) -> Left {
+    let tree = util::real(&tree.display().to_string());
+    let pids = strays(lsof, &tree, keep);
+    let l = Left { row: row.to_string(), tree: tree.display().to_string(), pids, spared: Vec::new() };
+    let empty = Left { row: l.row.clone(), tree: l.tree.clone(), pids: Vec::new(), spared: Vec::new() };
+    sorted_with(lsof, vec![l], table, &|_| true).pop().unwrap_or(empty)
+}
+
+/// [`left_among`] read now, less `keep` and this process's chain.
+pub fn left_kept(row: &str, tree: &Path, keep: &[u32]) -> Option<Left> {
+    let lsof = LOCAL.cwds(None)?;
+    let mut keep = keep.to_vec();
+    keep.extend(crate::base::procs::ancestors(&LOCAL.parents()));
+    Some(left_among(&lsof, row, tree, &keep, &exes()))
+}
+
+/// What row `row` has left standing in `tree` when it is submitted
+/// (`submit`, [`kept_at_submit`] for the caller's own seat) or its seat has
+/// ended (every live seat kept whole): `wsp-691`. `None` when no backend
+/// answered or `lsof` did not run.
+pub fn left_in_tree(row: &str, tree: &Path, submit: bool) -> Option<Left> {
+    let all = crate::place::local_backends();
+    let chain = crate::base::procs::ancestors(&LOCAL.parents());
+    let table = exes();
+    let mut keep = Vec::new();
+    let mut heard = false;
+    for backend in here_of(&all) {
+        let Ok(census) = backend.census() else { continue };
+        heard = true;
+        for seat in census.seats() {
+            let mut ps = backend.pids(&seat.seat).unwrap_or_default();
+            ps.extend(backend.root(&seat.seat));
+            keep.extend(if submit { kept_at_submit(&ps, &chain, &table) } else { ps });
+        }
+    }
+    if !heard {
+        return None;
+    }
+    let lsof = LOCAL.cwds(None)?;
+    keep.extend(chain);
+    Some(left_among(&lsof, row, tree, &keep, &table))
+}
+
+/// Each of `pids` with its command line, as `ps` says it now.
+pub fn commands(pids: &[u32]) -> Vec<(u32, String)> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let out = LOCAL.rows_of(pids, "pid=,command=").unwrap_or_default();
+    let mut found: Vec<(u32, String)> = out
+        .lines()
+        .filter_map(|l| {
+            let (pid, rest) = l.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, rest.trim().to_string()))
+        })
+        .collect();
+    for p in pids {
+        if !found.iter().any(|(q, _)| q == p) {
+            found.push((*p, "(gone)".into()));
+        }
+    }
+    found.sort_by_key(|(p, _)| pids.iter().position(|q| q == p));
+    found
 }
 
 /// The resident memory of `pids` in kilobytes.
@@ -1220,6 +1404,71 @@ mod tests {
         assert_eq!(judged(21, &[20, 21], &table), Verdict::Stop, "a child of a process in the tree");
         assert_eq!(judged(22, &[20, 22], &table), Verdict::Stop, "and its descendants");
         assert!(matches!(judged(21, &[21], &table), Verdict::Spare(_)), "its parent was not in the tree");
+    }
+
+    /// `wsp-691`: an orphan nothing spares is the tree's where the tree is a
+    /// seat's that has ended or waits at review; a host, a server or an app
+    /// standing there is spared as ever.
+    #[test]
+    fn an_orphan_is_stopped_where_orphans_are_judged_and_a_host_or_server_never() {
+        let table = [
+            proc(40, 1, "yes"),
+            proc(41, 1, "/usr/local/bin/some-server"),
+            proc(42, 1, "/opt/homebrew/bin/tmux"),
+            proc(43, 1, "/Users/e/.local/bin/compound-sup"),
+            proc(44, 1, "/Users/e/Applications/web-chrome.app/Contents/MacOS/web-chrome"),
+        ];
+        let in_tree = [40, 41, 42, 43, 44];
+        let tree = Path::new("/r/.worktrees/c-1");
+        assert!(matches!(judge(40, tree, &in_tree, &table, false), Verdict::Spare(_)), "today's rule, unchanged");
+        assert_eq!(judge(40, tree, &in_tree, &table, true), Verdict::Stop);
+        assert_eq!(judge(41, tree, &in_tree, &table, true), Verdict::Stop);
+        for pid in [42, 43, 44] {
+            assert!(matches!(judge(pid, tree, &in_tree, &table, true), Verdict::Spare(_)), "{pid}");
+        }
+    }
+
+    /// `wsp-691`: a compound seat's agent is the child of its `compound-sup`;
+    /// it and what it started directly are kept, and no further down.
+    #[test]
+    fn a_seats_agent_is_found_under_its_carrier_and_kept_with_its_direct_children() {
+        let table = [
+            proc(50, 1, "/Users/e/.local/bin/compound-sup"),
+            proc(51, 50, "claude"),
+            proc(52, 51, "/bin/zsh"),
+            proc(53, 52, "/usr/bin/yes"),
+            proc(54, 51, "node"),
+        ];
+        let mut kept = agent_of(&[50, 51, 52, 53, 54], &table);
+        kept.sort();
+        assert_eq!(kept, vec![50, 51, 52, 54]);
+        assert_eq!(agent_of(&[7, 8], &[]), vec![7, 8], "no table: the seat whole");
+    }
+
+    /// `wsp-691`: at submit the caller's own seat keeps its agent, its servers
+    /// and the chain the submit runs on; a background shell it left goes, and
+    /// another seat is kept whole.
+    #[test]
+    fn the_submit_keeps_the_callers_chain_and_agent_and_drops_its_background_shells() {
+        let table = [
+            proc(50, 1, "/Users/e/.local/bin/compound-sup"),
+            proc(51, 50, "claude"),
+            proc(52, 51, "/bin/zsh"),
+            proc(53, 52, "/Users/e/.local/bin/wsp"),
+            proc(55, 51, "/bin/bash"),
+            proc(56, 55, "yes"),
+            proc(57, 51, "node"),
+        ];
+        let chain = [53, 52, 51, 50, 1];
+        let mut kept = kept_at_submit(&[50, 51, 52, 53, 55, 56, 57], &chain, &table);
+        kept.sort();
+        assert_eq!(kept, vec![50, 51, 52, 57]);
+        assert_eq!(kept_at_submit(&[60, 61], &chain, &table), vec![60, 61], "another seat, whole");
+        let lsof = "p51\nn/r/.worktrees/c-1\np52\nn/r/.worktrees/c-1\np53\nn/r/.worktrees/c-1\np55\nn/r/.worktrees/c-1\np56\nn/r/.worktrees/c-1/web\np57\nn/r/.worktrees/c-1\np70\nn/r/.worktrees/c-2\n";
+        let mut keep = kept;
+        keep.extend(chain);
+        let left = left_among(lsof, "c-1", Path::new("/r/.worktrees/c-1"), &keep, &table);
+        assert_eq!(left.pids, vec![55, 56], "the background shell and its yes; nothing outside the tree");
     }
 
     /// `wsp-633`: a person's app's children were TERMed by cwd every cycle.

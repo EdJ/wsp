@@ -4960,6 +4960,11 @@ fn swept_up(
     workspace: Option<&str>,
     keep: bool,
 ) -> Leftovers {
+    // `wsp-691`: the seat has ended, and what it left running in its row's
+    // tree goes now, every live seat's processes kept.
+    if let Some(task) = task {
+        crate::ending::stop_in_tree(store, task, false, &format!("despawn of {}", seat.as_str()));
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     let here = util::real(&cwd.display().to_string());
     // The seat this despawn has just closed is not somebody standing in the

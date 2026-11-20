@@ -358,7 +358,9 @@ pub(crate) fn left(r: &Reading) -> Option<Left> {
 /// off the **open** lists alone — their groups that wsp runs — and the verdict
 /// off the member.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
-    exits(store, seats);
+    // The rows whose seat ended on this tick, or was found gone: their trees
+    // are swept below whatever their status (`wsp-691`).
+    let mut ended = exits(store, seats);
     // A seat its exit is still to end (a turn in flight, or left running by it)
     // is that ending's alone: the `--end-seat` helper may be ending it now.
     let owned = exit_owns(store);
@@ -368,6 +370,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     let mut seated = std::collections::BTreeSet::new();
     for id in seated_rows(store) {
         seated.insert(id.clone());
+        if seat_of(store, &id).is_some_and(|seat| seats.absent(&seat)) {
+            ended.insert(id.clone());
+        }
         let Some(m) = store.find_task(&id) else { continue };
         let Some(h) = due(store, &lists, &mut tasks, &m) else { continue };
         let Some(seat) = seat_of(store, &id) else {
@@ -382,16 +387,17 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
         let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
         if end_one(store, seats, w, &m.id, &seat, &h, asks) {
             record_ended(store, &m.id, &h);
+            ended.insert(m.id.clone());
         }
     }
-    released_seats(store, seats, &lists, &seated, &mut tasks, &mut asks);
+    ended.extend(released_seats(store, seats, &lists, &seated, &mut tasks, &mut asks));
     original_seats(store, seats);
     // `wsp-453`: what a finished row's tree still has running goes with its
     // seat, or by the next tick where the seat went some other way. Not in a
     // test, which would signal the machine's own processes, unless the test
     // asked for it ([`tests::SCANS`]) over a tree of its own.
     if scans_finished() {
-        stop_finished(store, seats);
+        stop_finished(store, seats, &ended);
     }
 }
 
@@ -404,11 +410,14 @@ fn scans_finished() -> bool {
     true
 }
 
-/// [`crate::check_tree::left_in_finished`], asked of a fleet's seats.
-fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::check_tree::Left>> {
+/// [`crate::check_tree::left_in_finished`], asked of a fleet's seats, with
+/// each row's own seat read off its binding or claim ([`seat_of`]).
+fn left_in_finished_by(store: &Store, seats: &dyn Seats, ended: &std::collections::BTreeSet<String>) -> Option<Vec<crate::check_tree::Left>> {
     // One `ps` for the whole scan, not one per seat (`wsp-480`); each scan takes
     // its own, so the look after a signal is a fresh one.
-    crate::place_super::one_ps(|| crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged))
+    crate::place_super::one_ps(|| {
+        crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged, &|row| seat_of(store, row), ended)
+    })
 }
 
 /// How long [`stop_finished`] gives a `TERM` before it looks again and sends
@@ -416,32 +425,92 @@ fn left_in_finished_by(store: &Store, seats: &dyn Seats) -> Option<Vec<crate::ch
 const TERM_GRACE_MS: u64 = if cfg!(test) { 100 } else { 1500 };
 
 /// Stop what the finished rows left running (`wsp-453`): `TERM`, a moment,
-/// then `KILL` for what is still there, and a `cycle.log` line for each tree.
+/// then `KILL` for what is still there, and a `cycle.log` line for each tree,
+/// naming each pid with its command, and the same as a note on the row.
 /// Run by the tick, so a row that reaches review has nothing of its own
-/// running by the next one. Returns the lines said.
-pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
-    let Some(found) = left_in_finished_by(store, seats) else { return Vec::new() };
+/// running by the next one; a row at review whose seat is open, and a row in
+/// `ended` (its seat ended on this tick), are swept too (`wsp-691`,
+/// [`crate::check_tree::left_in_finished`]). Returns the lines said.
+pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats, ended: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let Some(found) = left_in_finished_by(store, seats, ended) else { return Vec::new() };
     let mut said = say_spared(store, &found);
     let found: Vec<_> = found.into_iter().filter(|l| !l.pids.is_empty()).collect();
     if found.is_empty() {
         return said;
     }
     let all = |l: &[crate::check_tree::Left]| l.iter().flat_map(|t| t.pids.clone()).collect::<Vec<u32>>();
+    let named = crate::check_tree::commands(&all(&found));
     crate::check_tree::signal("TERM", &all(&found));
     std::thread::sleep(std::time::Duration::from_millis(TERM_GRACE_MS));
-    let still = left_in_finished_by(store, seats).unwrap_or_default();
-    crate::check_tree::signal("KILL", &all(&still));
+    let still = left_in_finished_by(store, seats, ended).unwrap_or_default();
+    // Only what was sent `TERM`: a pid that came since is the next tick's.
+    let still: Vec<u32> = all(&still).into_iter().filter(|p| all(&found).contains(p)).collect();
+    crate::check_tree::signal("KILL", &still);
     for t in &found {
-        let kill: Vec<u32> = still.iter().filter(|s| s.tree == t.tree).flat_map(|s| s.pids.clone()).collect();
-        let path = util::contract(std::path::Path::new(&t.tree));
-        let list = |p: &[u32]| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
-        let mut line = format!("stopped in finished row {} tree {path}: TERM {}", t.row, list(&t.pids));
-        if !kill.is_empty() {
-            line.push_str(&format!(", KILL {}", list(&kill)));
-        }
+        let kill: Vec<u32> = t.pids.iter().copied().filter(|p| still.contains(p)).collect();
+        let line = stopped_line(&format!("stopped in finished row {} tree", t.row), t, &kill, &named);
         crate::store::log_line(store, &line);
+        note_on(store, &t.row, &line);
         said.push(line);
     }
+    said
+}
+
+/// The line a stop says: `head` and the tree, then `TERM` and the pids, each
+/// with its command, then `KILL` and the pids that needed it.
+fn stopped_line(head: &str, t: &crate::check_tree::Left, kill: &[u32], named: &[(u32, String)]) -> String {
+    let path = util::contract(std::path::Path::new(&t.tree));
+    let list = |p: &[u32]| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+    let what = |p: &u32| {
+        let cmd = named.iter().find(|(q, _)| q == p).map(|(_, c)| c.as_str()).unwrap_or("(gone)");
+        format!("{p} `{}`", util::truncate(cmd, 120))
+    };
+    let mut line = format!("{head} {path}: TERM {}", list(&t.pids));
+    line.push_str(&format!(" ({})", t.pids.iter().map(what).collect::<Vec<_>>().join(", ")));
+    if !kill.is_empty() {
+        line.push_str(&format!(", KILL {}", list(kill)));
+    }
+    line
+}
+
+/// `line` as a note on row `id`, where there is such a row.
+fn note_on(store: &Store, id: &str, line: &str) {
+    if let Some(mut t) = store.find_task(id) {
+        let _ = crate::log::note(store, &mut t, &format!("wsp: {line}"));
+    }
+}
+
+/// Stop what row `row` has left standing in its tree (`wsp-691`): at its
+/// submit (`wsp review`, `wsp submit`, `wsp leg done`: `submit` set, which
+/// spares the caller's own seat's agent and its foreground chain and nothing
+/// else of it) or as its seat is despawned (every live seat kept whole). By
+/// working directory in the row's tree and by nothing else; `TERM`, a moment,
+/// `KILL`, each pid and its command said in `cycle.log` and on the row. `why`
+/// heads the line. Not in a test unless it asked ([`tests::SCANS`]).
+pub(crate) fn stop_in_tree(store: &Store, row: &str, submit: bool, why: &str) -> Vec<String> {
+    if !scans_finished() {
+        return Vec::new();
+    }
+    let Some(tree) = crate::cmd_checkout::member_tree(store, row) else { return Vec::new() };
+    stop_tree(store, why, &|| crate::check_tree::left_in_tree(row, &tree, submit))
+}
+
+/// [`stop_in_tree`] over what `look` finds, asked again after the `TERM`.
+fn stop_tree(store: &Store, why: &str, look: &dyn Fn() -> Option<crate::check_tree::Left>) -> Vec<String> {
+    let Some(found) = look() else { return Vec::new() };
+    let mut said = say_spared(store, std::slice::from_ref(&found));
+    if found.pids.is_empty() {
+        return said;
+    }
+    let named = crate::check_tree::commands(&found.pids);
+    crate::check_tree::signal("TERM", &found.pids);
+    std::thread::sleep(std::time::Duration::from_millis(TERM_GRACE_MS));
+    let still: Vec<u32> = look().map(|l| l.pids).unwrap_or_default().into_iter().filter(|p| found.pids.contains(p)).collect();
+    crate::check_tree::signal("KILL", &still);
+    let line = stopped_line(&format!("{why}: stopped what row {} left in its tree", found.row), &found, &still, &named);
+    crate::store::log_line(store, &line);
+    note_on(store, &found.row, &line);
+    said.push(line);
     said
 }
 
@@ -514,8 +583,9 @@ fn released_seats(
     seated: &std::collections::BTreeSet<String>,
     tasks: &mut Option<Vec<Task>>,
     asks: &mut Option<crate::waiting::Asks>,
-) {
-    let Some(census) = seats.census() else { return };
+) -> Vec<String> {
+    let mut ended = Vec::new();
+    let Some(census) = seats.census() else { return ended };
     let held = store.held_seats();
     for (seat, label) in census {
         let id = label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string();
@@ -531,8 +601,10 @@ fn released_seats(
         let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
         if end_one(store, seats, w, &m.id, &seat, &h, asks) {
             record_ended(store, &m.id, &h);
+            ended.push(m.id.clone());
         }
     }
+    ended
 }
 
 /// Whether the member's last claim was made from `seat` and has been let go.
@@ -968,11 +1040,20 @@ fn mark_left(store: &Store, seat: &str) {
     });
 }
 
-/// Every accepted exit's seat, tried once each tick.
-fn exits(store: &Store, seats: &dyn Seats) {
+/// Every accepted exit's seat, tried once each tick. Returns the rows whose
+/// seat was ended, or found gone.
+fn exits(store: &Store, seats: &dyn Seats) -> std::collections::BTreeSet<String> {
+    let mut ended = std::collections::BTreeSet::new();
     for seat in exit_owns(store) {
-        end_exit(store, seats, &seat);
+        let row = read_exits(store).get(&seat).and_then(|e| e["row"].as_str().map(str::to_string));
+        let line = end_exit(store, seats, &seat);
+        if let (Some(row), Some(line)) = (row, line) {
+            if line.starts_with(EXIT_ENDED) || line.starts_with(EXIT_GONE) {
+                ended.insert(row);
+            }
+        }
     }
+    ended
 }
 
 /// End the seat of an accepted exit — member, verifier or check — by ending.rs's
@@ -1939,8 +2020,8 @@ mod tests {
 
     /// `wsp-453` where it happened: a check left a server in a row's tree (here
     /// a `sleep`, in a group of its own the way `vite` leaves one), and the row
-    /// reached review. The tick's stop ends it; a row still `doing`, and a row
-    /// with a seat open, keep theirs. The server is a `sleep` under a shell
+    /// reached review. The tick's stop ends it; a row still `doing` keeps its
+    /// own, and since `wsp-691` a row at review with a seat open does not. The server is a `sleep` under a shell
     /// that stands in the tree; a plain `sleep` started from elsewhere with its
     /// cwd in the tree is not the tree's (`wsp-478`), and `f-4` is that.
     #[test]
@@ -1980,7 +2061,7 @@ mod tests {
             rows.push((id, child));
         }
         let seated = Quiet(vec![("cpd-9".into(), "f-3 · working".into())]);
-        let said = stop_finished(&store, &seated);
+        let said = stop_finished(&store, &seated, &Default::default());
         let mut ended = Vec::new();
         for (id, child) in rows.iter_mut() {
             // A signalled child of ours is reaped at once; one alive is not.
@@ -1992,10 +2073,11 @@ mod tests {
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(ended, vec![("f-1", true), ("f-2", false), ("f-3", false), ("f-4", false)], "said: {said:?}");
+        assert_eq!(ended, vec![("f-1", true), ("f-2", false), ("f-3", true), ("f-4", false)], "said: {said:?}");
         assert!(said.iter().any(|l| l.starts_with("stopped in finished row f-1")), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with("stopped in finished row f-3")), "{said:?}");
         assert!(said.iter().any(|l| l.starts_with("spared") && l.contains("row f-4")), "{said:?}");
-        assert!(!said.iter().any(|l| l.contains("f-2") || l.contains("f-3")), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains("f-2")), "{said:?}");
         assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2], spared: vec![] }, 2048).contains("2 processes (2 MB)"));
     }
 
@@ -2248,5 +2330,146 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ended despawn --pane cpd-10\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- `wsp-691`: what a member leaves running in its tree is stopped -------
+
+    /// A `yes` started in `tree` in the background by a shell that then exits:
+    /// orphaned, its parent pid 1, as wsp-693's eight burners were.
+    fn orphaned_yes(tree: &std::path::Path) -> u32 {
+        let out = wsp_base::calls::Command::new("sh")
+            .args(["-c", "yes >/dev/null 2>&1 </dev/null & echo $!"])
+            .current_dir(tree)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        for _ in 0..100 {
+            let ppid = crate::check_tree::exes().into_iter().find(|(p, _, _)| *p == pid).map(|r| r.1);
+            if ppid == Some(1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pid
+    }
+
+    /// The seat's agent: a shell standing in `tree` with a `sleep` under it,
+    /// its one direct child.
+    fn agent_in(tree: &std::path::Path) -> wsp_base::calls::Child {
+        wsp_base::calls::Command::new("sh")
+            .args(["-c", "sleep 60; true"])
+            .current_dir(tree)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// The pids under `parent`, read now.
+    fn children_of(parent: u32) -> Vec<u32> {
+        crate::check_tree::exes().into_iter().filter(|(_, pp, _)| *pp == parent).map(|r| r.0).collect()
+    }
+
+    fn alive(pids: &[u32]) -> Vec<u32> {
+        let mut a: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect();
+        a.sort();
+        a
+    }
+
+    /// A tree of the test's own, `.worktrees/<row>` under a fresh root.
+    fn own_tree(row: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("wsp-691-{}-{}", std::process::id(), util::epoch_nanos()));
+        let tree = root.join(crate::cmd_checkout::WORKTREES).join(row);
+        std::fs::create_dir_all(&tree).unwrap();
+        (root, tree)
+    }
+
+    /// `wsp-691` where it happened: a member at review with its seat still
+    /// open (waiting for its verifier) and an orphaned `yes` in its tree. The
+    /// tick stops the `yes`; the open seat's own running agent, and what it
+    /// started directly, are never stopped.
+    #[test]
+    fn a_member_at_review_with_an_open_seat_has_its_orphaned_yes_stopped_on_the_tick_and_its_agent_kept() {
+        let env = util::isolated("ending-691-tick");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = "y-691t";
+        let mut t = Task::new(row, row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(row);
+        let mut agent = agent_in(&tree);
+        let yes = orphaned_yes(&tree);
+        let mut kid = Vec::new();
+        for _ in 0..100 {
+            kid = children_of(agent.id());
+            if !kid.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), vec![agent.id()]);
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, agent_alive) = (alive(&[yes]), agent.try_wait().unwrap().is_none());
+        let kid_alive = alive(&kid);
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &kid, "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped");
+        assert!(agent_alive, "the open seat's agent is never stopped");
+        assert_eq!(kid_alive.len(), kid.len(), "nor what the agent started directly: {kid:?}");
+        let log = log_of(&store, row);
+        assert!(log.contains(&format!("{yes} `")) && log.contains("stopped in finished row y-691t"), "{log}");
+    }
+
+    /// `wsp-691` at submit: everything standing in the row's tree goes but the
+    /// caller's chain — the seat's agent and the command it runs, here the
+    /// shell and the `sleep` under it — and an orphan stood beside them goes.
+    #[test]
+    fn the_submit_sweep_stops_an_orphan_in_the_tree_and_spares_the_callers_chain() {
+        let env = util::isolated("ending-691-submit");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = "y-691s";
+        let mut t = Task::new(row, row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        let (root, tree) = own_tree(row);
+        let mut agent = agent_in(&tree);
+        let yes = orphaned_yes(&tree);
+        let mut chain = Vec::new();
+        for _ in 0..100 {
+            chain = children_of(agent.id());
+            if !chain.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        chain.push(agent.id());
+        let keep = crate::check_tree::kept_at_submit(&[agent.id()], &chain, &crate::check_tree::exes());
+        let said = stop_tree(&store, &format!("{row} submitted"), &|| crate::check_tree::left_kept(row, &tree, &keep));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, chain_alive) = (alive(&[yes]), alive(&chain));
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &chain, "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(yes_alive.is_empty(), "the orphan went: {said:?}");
+        let mut want = chain.clone();
+        want.sort();
+        assert_eq!(chain_alive, want, "the caller's chain stands: {said:?}");
+        assert!(said.iter().any(|l| l.starts_with("y-691s submitted: stopped what row y-691s left") && l.contains(&format!("TERM {yes}"))), "{said:?}");
+        assert!(log_of(&store, row).contains(&format!("{yes} `")), "the pid and its command, on the row");
     }
 }
