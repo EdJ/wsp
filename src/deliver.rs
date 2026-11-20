@@ -99,6 +99,11 @@ pub struct Worker {
     lease: Duration,
     again: Duration,
     asked: HashMap<OrderId, Instant>,
+    /// Seats whose place said busy (`NotReady`), and when: not asked again
+    /// until the mirror has read them other than idle since, or [`AGAIN`]
+    /// has passed. Without it a busy refusal, an event, wakes the worker to
+    /// ask the same busy seat again at once.
+    busy: HashMap<SeatId, Instant>,
     log: Box<dyn Fn(&str) + Send>,
 }
 
@@ -123,6 +128,7 @@ impl Worker {
             lease: LEASE,
             again: AGAIN,
             asked: HashMap::new(),
+            busy: HashMap::new(),
             log: Box::new(|_| {}),
         }
     }
@@ -158,6 +164,9 @@ impl Worker {
                 continue;
             }
             let Some(s) = state.seats.get(seat) else { continue };
+            if self.busy.get(seat).is_some_and(|at| at.elapsed() < self.again) {
+                continue;
+            }
             let ready = |o: &Order| s.state == SeatState::Idle || (o.first && s.state == SeatState::Started);
             if let Some(q) = orders.iter().find(|o| o.state == OrderState::Queued && ready(o)) {
                 due.push((*q).clone());
@@ -176,8 +185,11 @@ impl Worker {
                 return Vec::new();
             }
         };
-        // Forget what is no longer typed, against this pass's own read.
+        // Forget what is no longer typed, against this pass's own read, and a
+        // busy seat the mirror has since read as anything but idle: its next
+        // idle is a new one.
         self.asked.retain(|id, _| state.orders.get(id).is_some_and(|o| o.state == OrderState::Typed));
+        self.busy.retain(|seat, _| state.seats.get(seat).is_some_and(|s| s.state == SeatState::Idle));
         let mut asked = Vec::new();
         for o in self.due(&state) {
             if self.deliver(&o) {
@@ -234,6 +246,9 @@ impl Worker {
                 self.apply(Command::OrderDelivered { order: id.clone() }, format!("order:{}:delivered", id.0));
             }
             Answer::Refused { why, counts } => {
+                if !counts {
+                    self.busy.insert(o.to.clone(), Instant::now());
+                }
                 self.apply(Command::OrderRefused { order: id.clone(), why, counts }, format!("order:{}:refused:{}", id.0, token.0));
             }
             Answer::Pending(why) => {
@@ -247,7 +262,7 @@ impl Worker {
     /// How long the next wait on the head may be: [`WAIT`], or less when a
     /// typed order this worker asked comes due sooner.
     pub fn next_wait(&self) -> Duration {
-        let soonest = self.asked.values().map(|at| self.again.saturating_sub(at.elapsed())).min();
+        let soonest = self.asked.values().chain(self.busy.values()).map(|at| self.again.saturating_sub(at.elapsed())).min();
         soonest.map_or(WAIT, |d| d.min(WAIT)).max(Duration::from_millis(10))
     }
 
@@ -437,11 +452,15 @@ mod tests {
         w.pass();
         let o = order(&db, &id);
         assert_eq!((o.state, o.attempts), (OrderState::Queued, 0));
+        assert!(w.pass().is_empty(), "a busy seat is not asked again until it moves");
+        seat(&db, "cpd-1", SeatState::Working);
+        assert!(w.pass().is_empty(), "a seat the mirror reads working is not asked");
+        seat(&db, "cpd-1", SeatState::Idle);
         w.pass();
         let o = order(&db, &id);
         assert_eq!((o.state, o.attempts), (OrderState::Queued, 0), "a second busy refusal is applied too, and counts nothing");
         seat(&db, "cpd-1", SeatState::Working);
-        assert!(w.pass().is_empty(), "a seat the mirror reads working is not asked");
+        w.pass();
         seat(&db, "cpd-1", SeatState::Idle);
         w.pass();
         assert_eq!(order(&db, &id).state, OrderState::Acknowledged);
