@@ -642,6 +642,15 @@ pub fn left_line(l: &Left, kb: u64) -> String {
     )
 }
 
+/// Whether what a check started in its tree is the manager's to end: under
+/// `WSP_JOBS=manager` every step ran as a job, whose process group the manager
+/// ends with it, so ending the tree stops nothing. A `WSP_JOBS` that does not
+/// read is no choice of the manager's, and the tree's leftovers are stopped as
+/// before.
+fn groups_are_the_managers(jobs: Option<crate::host::JobsChoice>) -> bool {
+    jobs == Some(crate::host::JobsChoice::Manager)
+}
+
 /// The `cycle.log` line for what ending a tree signalled, so a run read
 /// afterwards says which processes a check's end took (`wsp-388`). `None` when
 /// nothing was signalled.
@@ -666,8 +675,10 @@ fn take(store: &Store, repo: &Path, dir: &Path, residue: &Residue, standing: &dy
         None => Tree::Kept { path, why: "git could not read it".into() },
         Some(found) if !found.is_empty() => Tree::Kept { path, why: holds_more(&found) },
         Some(_) => {
-            // Only a tree that is going: a kept one keeps its servers.
-            let (term, kill) = stop_running(dir);
+            // Only a tree that is going: a kept one keeps its servers. Under
+            // `WSP_JOBS=manager` what a check started is its job's group, and
+            // the manager ended it with the job: wsp signals nothing here.
+            let (term, kill) = if groups_are_the_managers(crate::host::JobsChoice::from_env().ok()) { (Vec::new(), Vec::new()) } else { stop_running(dir) };
             if let Some(line) = signalled_line(&path, &term, &kill) {
                 crate::store::log_line(store, &line);
             }
@@ -1114,6 +1125,17 @@ mod tests {
             signalled_line("~/r/.worktrees/x-check-1", &[10, 12], &[12]).as_deref(),
             Some("stopped in barrier check tree ~/r/.worktrees/x-check-1: TERM 10 12, KILL 12")
         );
+    }
+
+    /// Under `WSP_JOBS=manager` a going tree's processes are its jobs' groups,
+    /// the manager's to end: check_tree stops nothing there. `inproc`, and a
+    /// `WSP_JOBS` that does not read, stop what the check left as before.
+    #[test]
+    fn ending_a_tree_under_manager_stops_nothing_of_wsps_own() {
+        use crate::host::JobsChoice;
+        assert!(groups_are_the_managers(Some(JobsChoice::Manager)));
+        assert!(!groups_are_the_managers(Some(JobsChoice::Inproc)));
+        assert!(!groups_are_the_managers(None), "an unread choice is not the manager's");
     }
 
     /// `wsp-388` where it happened: a seat whose process stands in a check's

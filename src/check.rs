@@ -1376,7 +1376,7 @@ pub(crate) fn key_text(key: &JobKey) -> String {
 thread_local! {
     /// The probes of processes wsp made itself on this thread (`ps`, `kill`,
     /// `lstart`): what a check under `manager` must leave empty.
-    static PROBES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static PROBES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Notes a probe of processes wsp makes itself, for the call log a test reads.

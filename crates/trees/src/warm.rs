@@ -24,7 +24,9 @@
 //! **And the wait is bounded.** The clone is made under a hidden name outside
 //! the tree and renamed in only when it finishes inside [`LIMIT`]; past that the
 //! tree starts cold, the line says so, and the half-made copy is removed once
-//! this process has gone.
+//! this process has gone. Under `WSP_JOBS=manager` that removal is a detached
+//! job on the manager of the host that holds the copy ([`removal_job`]), not a
+//! shell of wsp's own.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -143,32 +145,183 @@ fn prune_objects(target: &Path, older: Duration, spend: Duration) -> usize {
 
 /// Run `clone` from `from` to the hidden name `tmp`, and move it into place at
 /// `to` only if it finishes inside `limit`. Past the limit the copy is left to the
-/// thread still making it and a shell removes it once this process is gone.
+/// thread still making it, and is removed once this process is gone
+/// ([`remove_when_gone`]); under `manager`, by this process too if the clone
+/// ends while it lives.
 fn bounded<F>(from: &Path, to: &Path, tmp: &Path, limit: Duration, clone: F) -> Result<(), String>
 where
     F: FnOnce(&Path, &Path) -> Result<(), String> + Send + 'static,
 {
     let (src, dst, tmp) = (from.to_path_buf(), tmp.to_path_buf(), tmp.to_path_buf());
     let (tx, rx) = std::sync::mpsc::channel();
+    // What a clone that ends after the limit leaves behind, once it is given
+    // up: taken under this lock, so a clone ends either before the give-up
+    // (and is moved in) or after it (and is tidied), never between.
+    let late: std::sync::Arc<std::sync::Mutex<Option<Tidy>>> = std::sync::Arc::default();
+    let given_up = late.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(clone(&src, &dst));
+        let done = clone(&src, &dst);
+        let mut late = given_up.lock().unwrap_or_else(|e| e.into_inner());
+        match late.take() {
+            Some(tidy) => tidy.now(&dst),
+            None => {
+                let _ = tx.send(done);
+            }
+        }
     });
-    match rx.recv_timeout(limit) {
-        Ok(Ok(())) => std::fs::rename(&tmp, to).map_err(|e| {
+    let finish = |done: Result<(), String>| match done {
+        Ok(()) => std::fs::rename(&tmp, to).map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp);
             e.to_string()
         }),
-        Ok(Err(e)) => Err(e),
+        Err(e) => Err(e),
+    };
+    match rx.recv_timeout(limit) {
+        Ok(done) => finish(done),
         Err(_) => {
-            remove_when_gone(&tmp);
+            let mut late = late.lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(done) = rx.try_recv() {
+                return finish(done);
+            }
+            *late = Some(remove_when_gone(&tmp));
             Err(format!("still cloning after {}s, so the tree starts without it", limit.as_secs()))
         }
     }
 }
 
+/// How a given-up clone is removed, and what is left for its thread to do if
+/// it ends while this process still lives.
+enum Tidy {
+    /// A shell of this process's removes it once the process is gone; the
+    /// thread does nothing (`WSP_JOBS=inproc`, as before M3).
+    Shell,
+    /// A detached job removes it once the process is gone ([`removal_job`]).
+    /// A clone that ends first is removed here and the job let go: `hold` is
+    /// what the job waits on, and closing it ends the wait.
+    Job { fifo: PathBuf, hold: std::fs::File },
+}
+
+impl Tidy {
+    /// The clone at `dst` has ended after it was given up.
+    fn now(self, dst: &Path) {
+        if let Tidy::Job { fifo, hold } = self {
+            let _ = std::fs::remove_dir_all(dst);
+            let _ = std::fs::remove_file(&fifo);
+            drop(hold);
+        }
+    }
+}
+
+/// The longest warm's removal job waits for this process to go. It holds one
+/// of its host's build slots while it waits, so it is bounded: a process that
+/// outlives it removes the copy itself when the clone ends ([`Tidy::now`]).
+const REMOVAL_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How long [`removal_job`] waits to hear its job start before it lets the
+/// caller go on.
+const REMOVAL_HEARD: Duration = Duration::from_secs(10);
+
 /// Remove `path` after this process has exited, which is when the clone still
-/// running in it has stopped. Best effort: a leftover is only disk.
-fn remove_when_gone(path: &Path) {
+/// running in it has stopped. Under `WSP_JOBS=manager`, a detached job on the
+/// manager of the host that holds the copy (this one, which made it); where
+/// that job cannot be placed or sent, and under `inproc`, a shell of this
+/// process's. Best effort: a leftover is only disk.
+fn remove_when_gone(path: &Path) -> Tidy {
+    let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(crate::store::Store::default_state);
+    if let Ok(Some(host)) = crate::throttle::manager_jobs(&state) {
+        if let Ok((fifo, hold)) = removal_job(host, path) {
+            return Tidy::Job { fifo, hold };
+        }
+    }
+    remove_here(path);
+    Tidy::Shell
+}
+
+/// The removal of the given-up clone at `path` as a **detached job** on
+/// `host`'s manager, which outlives this process: placed in the clone's
+/// staging directory relative to the host's tree root, it waits on a FIFO
+/// beside the clone that this process holds open (the returned file) and
+/// removes the clone and the FIFO once it reads the end of it, which comes
+/// when every holder has closed it: when this process has gone, or when
+/// [`Tidy::now`] lets it go. No pid is probed by wsp or by the job.
+///
+/// Answers the FIFO and its hold once the job is heard to start, or once
+/// [`REMOVAL_HEARD`] passes with no answer (a job slow to start is still the
+/// removal, and dropping the hold would let it remove a clone still in
+/// flight); an error where it could not be placed, was refused or ended.
+fn removal_job(host: &'static dyn crate::host::Host, path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else {
+        return Err(format!("{} has no directory to stand in", path.display()));
+    };
+    let at = crate::job_place::dir_on(&crate::util::hostname(), parent, "the warm clone's staging directory")?;
+    let held = format!("{name}.held");
+    let fifo = parent.join(&held);
+    let _ = std::fs::remove_file(&fifo);
+    make_fifo(&fifo)?;
+    // Read and write, so the open does not wait for the job's reader; closed
+    // on exec, so nothing this process starts holds it past its end.
+    let hold = std::fs::File::options().read(true).write(true).open(&fifo).map_err(|e| {
+        let _ = std::fs::remove_file(&fifo);
+        format!("{}: {e}", fifo.display())
+    })?;
+    let run = removal_run(at, &held, &name);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    std::thread::spawn(move || {
+        let heard = tx.clone();
+        let ended = host.run_job(&run, &mut |_| {
+            let _ = heard.send(Ok(()));
+        });
+        let _ = tx.send(Err(match ended {
+            Ok(end) => format!("the removal job ended before it held (exit {:?})", end.exit),
+            Err(e) => format!("the removal job was not run: {e}"),
+        }));
+    });
+    match rx.recv_timeout(REMOVAL_HEARD) {
+        Ok(Ok(())) | Err(_) => Ok((fifo, hold)),
+        Ok(Err(why)) => {
+            drop(hold);
+            let _ = std::fs::remove_file(&fifo);
+            Err(why)
+        }
+    }
+}
+
+/// The `job.run` of [`removal_job`]: detached, so it outlives the connection
+/// (and the process) that sent it; at the staging directory `at`; waiting on
+/// the FIFO `held` and then removing it and the clone `name`, both named
+/// relative to `at`, within [`REMOVAL_WAIT`].
+fn removal_run(at: crate::host::HostDir, held: &str, name: &str) -> crate::host::JobRun {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    crate::host::JobRun {
+        key: crate::host::job_key("warm", 0, &format!("remove:{name}@{nanos}")),
+        class: crate::host::JobClass::Build,
+        argv: ["sh", "-c", "echo held; cat \"$1\" > /dev/null; rm -rf -- \"$2\" \"$1\"", "sh", held, name].map(String::from).to_vec(),
+        at: crate::host::JobAt::Dir(at),
+        timeout_secs: REMOVAL_WAIT.as_secs(),
+        hung_after_secs: None,
+        detach: true,
+    }
+}
+
+/// Make a FIFO at `path`, readable and writable by its owner.
+fn make_fifo(path: &Path) -> Result<(), String> {
+    use std::os::raw::{c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(target_os = "macos")]
+    type Mode = u16;
+    #[cfg(not(target_os = "macos"))]
+    type Mode = u32;
+    extern "C" {
+        fn mkfifo(path: *const c_char, mode: Mode) -> c_int;
+    }
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated string that outlives the call.
+    let rc = unsafe { mkfifo(c.as_ptr(), 0o600) };
+    if rc == 0 { Ok(()) } else { Err(format!("{}: {}", path.display(), std::io::Error::last_os_error())) }
+}
+
+/// [`remove_when_gone`] by a shell of this process's (`WSP_JOBS=inproc`).
+fn remove_here(path: &Path) {
     let script = format!("while kill -0 {} 2>/dev/null; do sleep 1; done; rm -rf \"$1\"", std::process::id());
     let _ = wsp_base::calls::Command::new("sh")
         .args(["-c", &script, "sh"])
@@ -266,6 +419,54 @@ mod tests {
         bounded(&d.join("p"), &to, &d.join(".t.cloning"), Duration::from_secs(5), quick).unwrap();
         assert!(to.is_dir());
         assert_eq!(std::fs::read_dir(&d).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("cloning")).count(), 0, "no hidden name left");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Under `manager` a given-up clone's removal is a detached job at the
+    /// staging directory on the host that holds it: it outlives the
+    /// connection that sent it, waits while its caller lives, and removes the
+    /// clone once the caller has gone (its hold closed). A clone that ends
+    /// while its caller lives is removed by the caller and the job let go.
+    #[test]
+    fn a_given_up_clone_is_removed_by_a_detached_job_once_its_caller_has_gone() {
+        use crate::host::{Host, JobAt, JobClass, JobState};
+        let d = scratch("job").canonicalize().unwrap();
+        crate::job_place::set_tree_root(Some(d.clone()));
+        let host: &'static crate::host::InProcess = Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&d.join("jobs"), &d)));
+        let until = |what: &str, ok: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(15);
+            while !ok() {
+                assert!(Instant::now() < end, "{what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let tmp = d.join("stage/.c-target.cloning-1");
+        write(&tmp.join("debug/x"), "half");
+
+        let at = crate::job_place::dir_on(&crate::util::hostname(), tmp.parent().unwrap(), "x").unwrap();
+        let run = removal_run(at.clone(), ".c-target.cloning-1.held", ".c-target.cloning-1");
+        assert!(run.detach, "outlives the connection that sent it");
+        assert_eq!((run.at, run.class, at.path.as_str(), at.host.0.clone()), (JobAt::Dir(at.clone()), JobClass::Build, "stage", crate::util::hostname()));
+        assert!(!run.argv.join(" ").contains(&*d.to_string_lossy()), "no path on wsp's machine: {:?}", run.argv);
+
+        let (fifo, hold) = removal_job(host, &tmp).unwrap();
+        let rows = host.jobs().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].key.row.0.as_str(), rows[0].state), ("warm", JobState::Running));
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(tmp.exists() && fifo.exists(), "nothing is removed while its caller lives");
+        drop(hold);
+        until("the job removed the clone once its caller had gone", &|| !tmp.exists() && !fifo.exists());
+        until("the job ended", &|| host.jobs().unwrap().iter().all(|r| r.state == JobState::Ended));
+
+        let tmp = d.join("stage/.c-node_modules.cloning-1");
+        write(&tmp.join("a"), "half");
+        let (fifo, hold) = removal_job(host, &tmp).unwrap();
+        Tidy::Job { fifo: fifo.clone(), hold }.now(&tmp);
+        assert!(!tmp.exists() && !fifo.exists(), "ended while its caller lives: removed here");
+        until("the job was let go", &|| host.jobs().unwrap().iter().all(|r| r.state == JobState::Ended));
+        assert!(removal_job(host, Path::new("/x")).is_err(), "a clone outside the tree root is no job's");
+        crate::job_place::set_tree_root(None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

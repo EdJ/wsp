@@ -80,7 +80,20 @@ impl Place {
 /// The host a row's work happens on: the host its seat was spawned on, which
 /// holds its trees under T2 (`docs/agent-manager.md` 6.2, "M3 under T2").
 /// Until rows record their seat's host (M4) every seat is this machine's.
-pub fn host_of(_whose: Whose<'_>) -> String {
+///
+/// A barrier's is the list's barrier host: the trunk's host by default (the
+/// barrier stays where the trunk is), which is this machine until the trunk
+/// is a remote (M4). A list names no other yet.
+pub fn host_of(whose: Whose<'_>) -> String {
+    match whose {
+        Whose::Row(_) => util::hostname(),
+        Whose::Barrier(_) => trunk_host(),
+    }
+}
+
+/// The trunk's host, where a barrier runs unless its list names another: this
+/// machine, which holds the trunk until M4 makes it a remote.
+pub fn trunk_host() -> String {
     util::hostname()
 }
 
@@ -118,19 +131,27 @@ pub fn place_of(whose: Whose<'_>, kind: TreeKind, tree: &Path) -> Result<Place, 
     if !tree.is_dir() {
         std::fs::create_dir_all(tree).map_err(|e| format!("could not make the {} tree {}: {e}", kind.word(), util::contract(tree)))?;
     }
+    let at = dir_on(&host_of(whose), tree, &format!("the {} tree", kind.word()))?;
+    Ok(Place { at: JobAt::Dir(at), dir: tree.to_path_buf(), row: whose.id().to_string(), kind })
+}
+
+/// The directory `dir` (on this machine, there already) as a [`HostDir`] on
+/// `host`, relative to the tree root: how a job that belongs to no tree (warm's
+/// cleanup) is placed. `what` names it in an error.
+pub fn dir_on(host: &str, dir: &Path, what: &str) -> Result<HostDir, String> {
     let root = tree_root();
-    let (Ok(root_real), Ok(real)) = (root.canonicalize(), tree.canonicalize()) else {
-        return Err(format!("the {} tree {} or the tree root {} does not read", kind.word(), util::contract(tree), util::contract(&root)));
+    let (Ok(root_real), Ok(real)) = (root.canonicalize(), dir.canonicalize()) else {
+        return Err(format!("{what} {} or the tree root {} does not read", util::contract(dir), util::contract(&root)));
     };
     let Ok(rel) = real.strip_prefix(&root_real) else {
-        return Err(format!("the {} tree {} is not under the tree root {}", kind.word(), util::contract(tree), util::contract(&root)));
+        return Err(format!("{what} {} is not under the tree root {}", util::contract(dir), util::contract(&root)));
     };
     let path = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
-    let at = HostDir { host: HostId(host_of(whose)), path };
+    let at = HostDir { host: HostId(host.to_string()), path };
     if at.escapes() {
-        return Err(format!("the {} tree {} is the tree root itself or outside it", kind.word(), util::contract(tree)));
+        return Err(format!("{what} {} is the tree root itself or outside it", util::contract(dir)));
     }
-    Ok(Place { at: JobAt::Dir(at), dir: tree.to_path_buf(), row: whose.id().to_string(), kind })
+    Ok(at)
 }
 
 #[cfg(test)]

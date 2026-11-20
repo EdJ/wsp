@@ -438,7 +438,7 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     // How each unit's tree stood when its steps began (`wsp-566`).
     let mut starts: Vec<String> = Vec::new();
     for unit in &plan.units {
-        let (r, w, narrowed, start) = run_unit_scoped(store, unit, &format!("barrier {list} {at}"), Some((&scope, &changed)));
+        let (r, w, narrowed, start) = run_unit_scoped(store, unit, &barrier_key(list, at), &format!("barrier {list} {at}"), Some((&scope, &changed)));
         waited += w;
         starts.extend(start.map(|s| format!("{}: {}", unit.project, s.line())));
         ranged.push(r);
@@ -556,15 +556,23 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
     0
 }
 
-/// Whether a live process holds the tree lock of one of group `at`'s units: a
-/// run in its steps, or writing its result, whatever `ps` says of its pid.
+/// Whether a live run holds the tree lock of one of group `at`'s units: a run
+/// in its steps, or writing its result. Under `WSP_JOBS=manager` the lock names
+/// the job running in the tree and is read by key from the job table of the
+/// tree's host's manager ([`check::TreeLock::live`]); in-process, by its pid.
 pub(crate) fn lock_held(store: &Store, w: &Worklist, at: usize) -> bool {
     plan(store, w, at).units.iter().any(|u| check::TreeLock::live(&check::barrier_dir(store, &u.project, &u.repo).join("lock")))
 }
 
 #[cfg(test)]
 fn run_unit(store: &Store, unit: &Unit, who: &str) -> Ranged {
-    run_unit_scoped(store, unit, who, None).0
+    run_unit_scoped(store, unit, &barrier_key("run", 1), who, None).0
+}
+
+/// What a barrier's jobs are keyed under in `row`, since a barrier has no row
+/// (wsp-044): `<list>#<group>`.
+pub(crate) fn barrier_key(list: &str, at: usize) -> String {
+    format!("{list}#{at}")
 }
 
 /// What a scoped run is given: the scope decided for the group, and the paths
@@ -574,7 +582,7 @@ type Scoping<'a> = Option<(&'a scope::Scope, &'a [String])>;
 /// [`run_unit`], and how long it waited for the tree lock, and what scoping did
 /// to the unit's steps (so the caller reads results against the steps that ran).
 /// A wait is said in the log, with whose lock it was.
-fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (Ranged, std::time::Duration, Option<scope::Narrowed>, Option<check::Start>) {
+fn run_unit_scoped(store: &Store, unit: &Unit, key: &str, who: &str, scoping: Scoping) -> (Ranged, std::time::Duration, Option<scope::Narrowed>, Option<check::Start>) {
     if unit.items.is_empty() {
         return (Ranged::Ran(Vec::new()), std::time::Duration::ZERO, None, None);
     }
@@ -589,13 +597,14 @@ fn run_unit_scoped(store: &Store, unit: &Unit, who: &str, scoping: Scoping) -> (
     });
     // Everything up to the lock is waiting; the checkout and the steps are not.
     let waited = if lock.is_ok() { before.elapsed() } else { std::time::Duration::ZERO };
-    let (ranged, narrowed, start) = run_unit_locked(store, unit, who, &dir, lock, scoping);
+    let (ranged, narrowed, start) = run_unit_locked(store, unit, key, who, &dir, lock, scoping);
     (ranged, waited, narrowed, start)
 }
 
 fn run_unit_locked(
     store: &Store,
     unit: &Unit,
+    key: &str,
     who: &str,
     dir: &std::path::Path,
     lock: Result<check::TreeLock, String>,
@@ -620,9 +629,32 @@ fn run_unit_locked(
     let steps: Vec<Step> = items.iter().map(|i| i.step.clone()).collect();
     let greens = crate::greens::Greens::open(store, &unit.project, &unit.repo);
     let reuse = crate::greens::Reuse { greens: &greens, sha: &unit.sha, env: crate::greens::Env::Warm, who };
-    let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), &check::Runner::Inproc, |_| {}); // the barrier row chooses its runner
+    // Under `WSP_JOBS=manager` each step is one `job.run` keyed by the list and
+    // the group, at the place `place_of` gives the barrier tree on the list's
+    // barrier host, and the lock names the job running there.
+    let runner = match runner_for(store, key, &tree, &dir.join("lock")) {
+        Ok(r) => r,
+        Err(why) => {
+            drop(lock);
+            return (Ranged::Could(why), narrowed, Some(start));
+        }
+    };
+    let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), &runner, |_| {});
     drop(lock);
     (Ranged::Ran(ran), narrowed, Some(start))
+}
+
+/// What runs barrier `key`'s steps in its tree at `tree`, holding the lock at
+/// `lock`: [`check::Runner::chosen`] for the barrier's own tree. Under `inproc`
+/// this process, as before; under `manager` the manager of the list's barrier
+/// host, the trunk's host by default ([`check::Whose::Barrier`]).
+fn runner_for(store: &Store, key: &str, tree: &std::path::Path, lock: &std::path::Path) -> Result<check::Runner<'static>, String> {
+    #[cfg(test)]
+    if let Some(host) = tests::MANAGER.with(|m| m.get()) {
+        let place = check::place_of(check::Whose::Barrier(key), check::TreeKind::Barrier, tree)?;
+        return Ok(check::Runner::Jobs(check::Jobs::new(host, place, Some(lock.to_path_buf()))));
+    }
+    check::Runner::chosen(store, check::Whose::Barrier(key), check::TreeKind::Barrier, tree, Some(lock))
 }
 
 fn could_not_any(ranged: &[Ranged]) -> bool {
@@ -748,6 +780,116 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// A test's own manager for the barrier's steps (`WSP_JOBS=manager`),
+        /// kept to its thread: `wsp-host`'s runner in this process.
+        pub(super) static MANAGER: std::cell::Cell<Option<&'static dyn crate::host::Host>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Runs `f` with the barrier's steps sent as jobs to a manager whose tree
+    /// root is the store's state (where the barrier tree is), and answers the
+    /// manager, so a test reads its job table.
+    fn under_manager<T>(store: &Store, f: impl FnOnce(&'static crate::host::InProcess) -> T) -> T {
+        let root = store.state.clone();
+        wsp_trees::job_place::set_tree_root(Some(root.clone()));
+        let host: &'static crate::host::InProcess = Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&root.join("jobs"), &root)));
+        MANAGER.with(|m| m.set(Some(host)));
+        let out = f(host);
+        MANAGER.with(|m| m.set(None));
+        wsp_trees::job_place::set_tree_root(None);
+        out
+    }
+
+    fn dones(r: Ranged) -> Vec<(String, Done)> {
+        ran_of(r).into_iter().map(|r| (r.step.name, r.done)).collect()
+    }
+
+    /// The barrier tree's place is `place_of(barrier, barrier)` on the list's
+    /// barrier host (the trunk's host by default), relative to that host's
+    /// tree root and never a path on wsp's machine; each step is one `job.run`
+    /// keyed by the list and the group.
+    #[test]
+    fn a_barrier_under_manager_runs_each_step_as_a_job_keyed_by_list_and_group_at_its_place() {
+        let (_env, store) = world("jobs", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        let u = &plan.units[0];
+        let dir = check::barrier_dir(&store, &u.project, &u.repo);
+        under_manager(&store, |host| {
+            use crate::host::Host;
+            let runner = runner_for(&store, &barrier_key("run", 1), &dir.join("tree"), &dir.join("lock")).unwrap();
+            let check::Runner::Jobs(jobs) = &runner else { panic!("not run as jobs under manager") };
+            let crate::host::JobAt::Dir(at) = &jobs.place.at else { panic!("{:?}", jobs.place.at) };
+            let barrier = check::Whose::Barrier("run#1");
+            assert_eq!(at.host.0, wsp_trees::job_place::host_of(barrier), "the list's barrier host");
+            assert_eq!(jobs.place, check::place_of(barrier, check::TreeKind::Barrier, &dir.join("tree")).unwrap(), "from place_of");
+            assert!(!at.escapes() && !at.path.starts_with('/') && at.path.ends_with("/tree"), "{}", at.path);
+            let run = jobs.run_of(&u.items[0].step);
+            assert_eq!((run.key.row.0.as_str(), run.at.clone()), ("run#1", jobs.place.at.clone()));
+            drop(runner);
+
+            let ran = dones(run_unit(&store, u, "barrier run 1"));
+            assert!(ran.iter().all(|(_, d)| *d == Done::Passed), "{ran:?}");
+            let table = host.jobs().unwrap();
+            assert_eq!(table.len(), u.items.len(), "one job.run per step: {table:?}");
+            assert!(table.iter().all(|r| r.key.row.0 == "run#1" && r.class == crate::host::JobClass::Check && r.state == crate::host::JobState::Ended), "{table:?}");
+            assert!(!check::TreeLock::live(&dir.join("lock")), "the lock went with the run");
+        });
+    }
+
+    /// The same group reads the same under `manager` as under `inproc`: a red
+    /// suite, the member's own check and the stop's, step for step.
+    #[test]
+    fn a_barrier_under_manager_reads_the_same_verdict_as_inproc() {
+        let suite = "echo 'store::tests::x FAILED'; exit 1\n";
+        // One isolated world at a time: the second waits for the first's end.
+        let (a, here) = world("verdict-inproc", suite, "");
+        let inproc = dones(run_unit(&here, &plan(&here, &here.worklist("run").unwrap(), 1).units[0], "barrier run 1"));
+        drop((here, a));
+        let (_b, store) = world("verdict-manager", suite, "");
+        let plan = plan(&store, &store.worklist("run").unwrap(), 1);
+        let manager = under_manager(&store, |_| dones(run_unit(&store, &plan.units[0], "barrier run 1")));
+        assert_eq!(manager, inproc);
+        assert!(matches!(inproc[0].1, Done::Failed { exit: Some(1), .. }), "{inproc:?}");
+    }
+
+    /// A step past its limit is ended by the manager (its `job.ended` says
+    /// `timed_out`), with what it started, and reads as a timed-out step.
+    #[test]
+    fn a_barrier_step_past_its_limit_is_ended_by_the_manager() {
+        let (_env, store) = world("limit", "sleep 30 & sleep 30\n", "");
+        let mut plan = plan(&store, &store.worklist("run").unwrap(), 1);
+        plan.units[0].items[0].step.limit = std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let ran = under_manager(&store, |host| {
+            use crate::host::Host;
+            let ran = dones(run_unit(&store, &plan.units[0], "barrier run 1"));
+            assert!(host.jobs().unwrap().iter().all(|r| r.state == crate::host::JobState::Ended), "the manager ended it");
+            ran
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "waited on the sleep");
+        assert_eq!(ran[0].1, Done::Failed { exit: None, timed_out: true }, "{ran:?}");
+    }
+
+    /// The call log of a whole barrier run under `manager` holds no `ps`,
+    /// `kill` or `lstart` from wsp (nor any `lsof`: the run reads no process's
+    /// working directory): the steps, their bounds and the lock are the
+    /// manager's and its job table's. Under `inproc` wsp still probes.
+    #[test]
+    fn a_barrier_run_under_manager_probes_no_process_from_wsp() {
+        let (env, store) = world("probes", "exit 1\n", "");
+        let w = store.worklist("run").unwrap();
+        assert!(barrier::open_within(&store, &w, 1, Some("abc".into()), None, barrier::Mechanical::Yes, &|_: &str| false, &|| true).is_some());
+        check::PROBES.with(|p| p.borrow_mut().clear());
+        assert_eq!(under_manager(&store, |_| run(&store, "run", 1)), 0);
+        assert_eq!(barrier::suite_of(&store, "run", 1), Some(Suite::Red));
+        assert_eq!(check::PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "wsp probed a process under manager");
+        drop((store, env));
+        let (_b, here) = world("probes-inproc", "exit 1\n", "");
+        run_unit(&here, &plan(&here, &here.worklist("run").unwrap(), 1).units[0], "barrier run 1");
+        assert!(!check::PROBES.with(|p| p.borrow().is_empty()), "inproc takes its check slot and ends its own group");
+    }
 
     fn step(name: &str, command: &str) -> Step {
         Step { name: name.into(), command: command.into(), limit: std::time::Duration::from_secs(60), of: Of::Task, on: Vec::new(), barrier: false, end: false }
