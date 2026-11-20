@@ -356,6 +356,89 @@ pub fn answer_in(db: &SharedStore, id: &OrderId, wait: Duration) -> Result<Optio
     }
 }
 
+// ---- wip's delivery columns (wsp-127) -------------------------------------
+
+/// How many events one page of [`typed_since`] reads back from the head.
+const TYPED_PAGE: u64 = 256;
+
+/// Every order the store holds, in any state, without waiting: in the daemon
+/// a read of its open store, anywhere else the API's `orders` read, dialled
+/// within `wait`.
+pub fn all(store: &Store, wait: Duration) -> Result<Vec<Order>, Error> {
+    match in_process() {
+        Some(db) => all_in(db),
+        None => {
+            let mut client = wsp_client::Client::dial(&store.state, Principal::Wsp("wip".into()), wait)
+                .map_err(|s| Error::Silent(s.to_string()))?;
+            read_orders(&mut client, serde_json::json!({}))
+        }
+    }
+}
+
+/// [`all`] on an open store.
+pub fn all_in(db: &SharedStore) -> Result<Vec<Order>, Error> {
+    Ok(db.snapshot().map_err(from_store)?.0.orders.into_values().collect())
+}
+
+/// The orders an `order.typed` event at or after `since` names, read back
+/// from the head a page at a time until a page begins before `since`. An order
+/// in `typed` that is not among them was typed before `since`: `order.typed`
+/// is the last event of an order still in that state. In the daemon its open
+/// store, anywhere else the API's `events` read, dialled within `wait`.
+pub fn typed_since(store: &Store, since: wsp_store_contract::At, wait: Duration) -> Result<std::collections::BTreeSet<OrderId>, Error> {
+    match in_process() {
+        Some(db) => typed_since_in(db, since),
+        None => {
+            let mut client = wsp_client::Client::dial(&store.state, Principal::Wsp("wip".into()), wait)
+                .map_err(|s| Error::Silent(s.to_string()))?;
+            let mut read = |from: u64, limit: usize| -> Result<(Vec<wsp_store_contract::Event>, u64), Error> {
+                let reply = client
+                    .request("events", serde_json::json!({ "from": from, "limit": limit }))
+                    .map_err(from_client)?;
+                match reply.outcome {
+                    wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, head }) => Ok((events, head.0)),
+                    wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("events was answered {other:?}"))),
+                    wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
+                }
+            };
+            // An empty read past every id: nothing but the head.
+            let (_, head) = read(i64::MAX as u64, 1)?;
+            typed_back(&mut |from, limit| read(from, limit).map(|(e, _)| e), head, since)
+        }
+    }
+}
+
+/// [`typed_since`] on an open store.
+pub fn typed_since_in(db: &SharedStore, since: wsp_store_contract::At) -> Result<std::collections::BTreeSet<OrderId>, Error> {
+    let head = db.head().map_err(from_store)?;
+    typed_back(&mut |from, limit| db.events_after(EventId(from), limit).map_err(from_store), head.0, since)
+}
+
+/// [`typed_since`]'s walk: `read(after, limit)` gives the events after id
+/// `after`, at most `limit`; pages go back from `head`.
+fn typed_back(
+    read: &mut dyn FnMut(u64, usize) -> Result<Vec<wsp_store_contract::Event>, Error>,
+    head: u64,
+    since: wsp_store_contract::At,
+) -> Result<std::collections::BTreeSet<OrderId>, Error> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut top = head;
+    while top > 0 {
+        let after = top.saturating_sub(TYPED_PAGE);
+        let page = read(after, (top - after) as usize)?;
+        for e in page.iter().filter(|e| e.at >= since && e.kind == EventKind::OrderTyped) {
+            if let Subject::Order(id) = &e.subject {
+                out.insert(id.clone());
+            }
+        }
+        if page.first().is_none_or(|e| e.at < since) {
+            break;
+        }
+        top = after;
+    }
+    Ok(out)
+}
+
 // ---- tells and answers as orders (wsp-124) -------------------------------
 
 /// How long a tell waits for its order to settle: today's wait, the
@@ -536,6 +619,44 @@ pub(crate) mod tests {
         assert_eq!(failed5.iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![f5]);
         let queued = orders_of_in(&db, &SeatId("cpd-4".into()), &[OrderState::Queued]).unwrap();
         assert_eq!(queued.iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![q]);
+    }
+
+    /// wip's reads (wsp-127): every order, and the ones typed since a moment,
+    /// read back from the head through the API and on the open store alike,
+    /// past more than one page of events.
+    #[test]
+    fn every_order_and_the_ones_typed_lately_are_read_through_the_api_and_in_process() {
+        let env = crate::util::isolated("orders-typed-since");
+        let store = Store::open();
+        let db = db(&store.state, wsp_server::Mode::Owned);
+        seat(&db, "cpd-6", SeatState::Idle);
+        let to = SeatId("cpd-6".into());
+        let by = Principal::Wsp("wsp".into());
+        let typed = send_in(&db, Command::OrderSend { to: to.clone(), text: "go".into(), first: false }, &ed()).unwrap();
+        let lease = LeaseName::deliver(&to);
+        let token = Leases::take(&*db, &lease, &by, Duration::from_secs(60)).unwrap().expect("free");
+        db.apply(Command::OrderDeliver { order: typed.clone(), fence: Fence { lease: lease.clone(), token } }, IdempotencyKey("d".into()), by)
+            .unwrap();
+        Leases::release(&*db, &lease, token).unwrap();
+        // More than a page of events after the typing.
+        for n in 0..(TYPED_PAGE + 10) {
+            seat(&db, &format!("cpd-x{n}"), SeatState::Idle);
+        }
+        let mut cfg = wsp_server::Config::new(&store.state);
+        cfg.port = 0;
+        let server = wsp_server::Server::start(db.clone(), cfg).unwrap();
+
+        let wait = Duration::from_secs(5);
+        let start = wsp_store_contract::At(0);
+        let late = wsp_store_contract::At(u64::MAX / 2);
+        assert_eq!(typed_since(&store, start, wait).unwrap(), [typed.clone()].into(), "through the API");
+        assert_eq!(typed_since_in(&db, start).unwrap(), [typed.clone()].into(), "in process");
+        assert!(typed_since(&store, late, wait).unwrap().is_empty());
+        assert!(typed_since_in(&db, late).unwrap().is_empty());
+        assert_eq!(all(&store, wait).unwrap().iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![typed.clone()]);
+        assert_eq!(all_in(&db).unwrap().len(), 1);
+        server.stop();
+        drop(env);
     }
 
     /// Outside the daemon: the same send through the API with `wsp-client`,
