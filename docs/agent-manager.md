@@ -968,47 +968,55 @@ The last code row of M1: with `manager` the default, wsp no longer does what M1'
 
 #### M1's result (wsp-031, 2026-11-20)
 
-**What was live, and when.** The store moved to this machine (Linux, `omarchy`) on 2026-11-19. The daemon and
-the manager first started there at 07:29Z, with `manager` the default (wsp-029). The M1 trunk (`38e6aa8`, wsp-030)
-was installed at 2026-11-20T07:58:22Z, 41 minutes before these figures were taken. So "a day after" has not
-passed. Two windows are measured, with `measure.py` in the row's scratch directory. It reads `calls.jsonl` and
-`polls.jsonl` the way `wsp calls --since`, `--polls` and `--incidents` do:
-- **the day before the M1 trunk**: 2026-11-19T07:58:22Z to 2026-11-20T07:58:22Z, 24.0 h, 4,280 ticks. Every
-  group of M1 but the contract is live in it.
-- **the first 0.7 h on the M1 trunk**: 07:58:22Z to 08:39:52Z, 123 ticks. This is too short to judge. It is
-  given for its direction, which is the wrong one: more renders and dearer `wip` calls than the day before,
-  on a machine busy with builds. The stale manager below is one candidate cause, and the day owed will say.
+**The window.** These verdicts are taken from one window: **2026-11-20T07:58:22Z to 08:41:38Z, 43 min (0.72 h),
+128 ticks**. It starts when the M1 trunk (`38e6aa8`, wsp-030) was installed. The daemon's start on that binary is
+`daemon.json`'s `since`, 07:58:22Z, and the manager restarted at 07:58:24Z. The person passed barrier 8 at
+08:25Z on judgement, without waiting for the M1 day. So `wsp calls --since 24h` still holds mostly ticks from
+before M1 (ff9afa6), and is not M1's result. Every figure below comes from `measure.py` in the row's scratch
+directory, run over the window. It reads `calls.jsonl` and `polls.jsonl` the way `wsp calls --since` and
+`--polls` do. The 24 h before the install (2026-11-19T07:58:22Z to 2026-11-20T07:58:22Z, 4,280 ticks) is
+given beside it as the before figure only.
+
+A figure that is a rate per tick or per call is judged on the window when its miss or its hold is far wider
+than the window's noise. A figure that is per day, or that rests on a handful of calls, is **owed**: the
+day-long figure on the M1 trunk is filed as wsp-323, after wsp-324.
 
 **The installed manager is not the M1 trunk's.** `wsp install` at 07:58Z rebuilt `wsp`. It copied the
 `wsp-manager` it found beside it, and that was `target/release/wsp-manager` from 2026-11-19T07:29Z
 (`put_manager`, `src/cmd_install.rs`: a binary beside `wsp` is not rebuilt). `cmp` shows the binaries are the
 same. The live manager lacks every manager and host commit since then: 3488325, f44f2cb, and wsp-030's
-7498607, 9ffd75e and 981dca4. The day-after figure is owed on a manager built from the trunk.
+7498607, 9ffd75e and 981dca4. So the window measures the trunk's `wsp` against a manager a day older. The
+owed day is to be taken on a manager built from the trunk.
 
-| measure | 6.1 baseline | M1 asks | the day before the M1 trunk | first 0.7 h on it | verdict |
+| measure | 6.1 baseline | M1 asks | **M1 trunk, from 07:58:22Z, 0.72 h** | before: 24 h to the install (ff9afa6) | verdict |
 |---|---|---|---|---|---|
-| `ps` per tick | 37.5 | ≤ 1 | 6.85 | 8.89 | **missed** |
-| renders per tick (`compound-reader`) | 59.5 | 0 | 14.40 | 34.89 | **missed** |
-| `df` per tick | 24.6 | 0 | 1.36 | 2.67 | **missed** |
-| `lsof` in `wip` | (in the 2.9 s) | 0 | 0 | 0 | met |
-| `wip` CPU per call (polls, p50) | 2.9 CPU-s | < 0.2 | 0.428 (`--json` 0.483), n = 5,397 | 0.67 (`--json` 0.65), n = 48 | **missed** |
-| compound's host polling, CPU-s per day | 25,268 | < 2,500 | 660 (all no-seat polls: 2,448) | all no-seat polls ~1,299 scaled | met |
-| spawn p50 | 9.4 s | ≤ 9.4 s | 0.93 s, p95 2.71 s (147) | 1.50 s (1) | met |
-| tick p50 / p95 | 19.5 s / 116 s | — | 20 ms / 686 ms | 75 ms / 976 ms | — |
-| wsp-411-kind incidents | 0 of 30 (M0's week) | 0 over a week | 0 of 79 (25 h) | — | **owed** 2026-11-27 |
-| manager `kill -9` mid-turn | — | 10 scripted runs | 10 of 10 hold | — | met |
+| `ps` per tick | 37.5 | ≤ 1 | 9.00 (128 ticks) | 6.85 | **missed** |
+| renders per tick (`compound-reader`) | 59.5 | 0 | 35.32 | 14.40 | **missed** |
+| `df` per tick | 24.6 | 0 | 2.69 | 1.36 | **missed** |
+| `lsof` in `wip` | (in the 2.9 s) | 0 | 0 in 54 calls | 0 | met in the window |
+| `wip` CPU per call (polls, p50) | 2.9 CPU-s | < 0.2 | 0.671 (n = 23), `--json` 0.647 (n = 31) | 0.428, `--json` 0.483 | **missed** |
+| compound's host polling, CPU-s per day | 25,268 | < 2,500 | partial: 20.1 CPU-s in 0.72 h, ~668 a day scaled | 660 | **owed** (full day) |
+| spawn p50 | 9.4 s | ≤ 9.4 s | partial: 2 spawns, 1.50 s | 0.93 s (147) | **owed** (full day) |
+| tick p50 / p95 | 19.5 s / 116 s | — | 76 ms / 976 ms | 20 ms / 686 ms | — |
+| wsp-411-kind incidents | 0 of 30 (M0's week) | 0 over a week | 0 of 5 seats ended | 0 of 79 (25 h) | **owed**, 2026-11-27 |
+| manager `kill -9` mid-turn | — | 10 scripted runs | 10 of 10 hold (on the trunk's build) | — | met |
+
+In this window the trunk does worse than the day before it: more renders, more `ps`, and dearer `wip` calls,
+on a machine busy with builds. 43 minutes cannot say whether that is load, the stale manager, or the trunk. The
+owed day will.
 
 How each was taken, and the cause of each miss:
-- **Per tick** is the children counted on every `"k":"tick"` line, over all ticks. It includes the light ticks
-  that run only `standing` and `attention`. The causes come from the same lines' `phase_kids`:
-  - **`ps`.** It comes from `ending:verification` (2.83 per tick), `attention` (0.71), `repair:refusing` (0.52),
-    `cycle` (0.51), `ending:checks` (0.38) and `sweep:leaked-agents` (0.33). These are `Host::alive`,
+- **Per tick** is the children counted on every `"k":"tick"` line in the window, over all of them. It includes
+  the light ticks that run only `standing` and `attention`. The causes come from the same lines' `phase_kids`
+  in the window:
+  - **`ps`.** It comes from `ending:verification` (4.03 per tick), `attention` (1.16), `repair:refusing` (0.77),
+    `repair:frozen` (0.59), `tunnels` (0.55) and `sweep:build-output` (0.37). These are `Host::alive`,
     `tree_of`, `table` and `rows_of`. `host::Tcp` leaves all of them in-process under both choices, because
     group 4 kept the process table where it was until M3 (`crates/wire/src/host_tcp.rs`, "the process table
     stays in-process at M1"). M1's line asked for ≤ 1 without a row that moves them. This is a gap in the
     breakdown, not a regression.
-  - **Renders.** They come from `ending:verification` (5.04), `attention` (2.26), `ending:checks` (1.97),
-    `sweep:check-trees` (1.83), `sweep:build-output` (1.31) and `tunnels` (0.54). They are
+  - **Renders.** They come from `ending:verification` (9.61), `tunnels` (6.16), `attention` (6.10),
+    `sweep:build-output` (4.13), `ending:checks` (3.80) and `sweep:check-trees` (3.80). They are
     `Host::screen_state`, which `Tcp` hands to the in-process host (`host_tcp.rs`, `screen_state`).
     `Compound::detected_state` (`place_compound.rs`) reads the screen first for every seat whose state it is
     asked. The manager's `seats` reply has the hook-folded state (wsp-038), and nothing in the daemon reads it
@@ -1016,20 +1024,21 @@ How each was taken, and the cause of each miss:
   - **`df`.** All of it is `sweep:scratch` (`scratch::tidy`). It asks the disk itself and does not read the
     beat's `HostFacts.disk` (the throttle reads those, wsp-028).
 - **`wip`** is user+sys of the process and its waited children, from `polls.jsonl`. It has no children: no
-  `ps`, no `lsof`, no render. The 0.43 CPU-s is wsp's own work in the process. On the same store, `ls --json`
-  takes 0.04 s. M0's A/B measured 0.131 on the Mac, with 2 seats and a smaller store. Here there are 12 seats
-  and a 44 MB store of 4,770 files. This machine has no profiler (`perf`, `strace`), so the cost was not
-  isolated to a phase. The cause is named as not found.
+  `ps`, no `lsof`, no render. The 0.67 CPU-s in the window, and the 0.43 the day before, is wsp's own work in
+  the process. On the same store, `ls --json` takes 0.04 s. M0's A/B measured 0.131 on the Mac, with 2 seats
+  and a smaller store. Here there are 12 seats and a 44 MB store of 4,770 files. This machine has no profiler
+  (`perf`, `strace`), so the cost was not isolated to a phase. The cause is named as not found (wsp-327).
 - **compound's host polling.** In 6.1 this was `none via host`, the gpui app. Here compound polls over ssh:
-  `stamp`, `wip --json`, `ls --json`, `spend --json` and `worklist … --json` under `sshd-session`. That is
-  5,711 polls and 658 CPU-s in the day. compound's local web-chrome added 32 polls and 1.6 CPU-s. Every
-  no-seat poll together, the person's shell's `wip` loop (`zsh`, 8,273 polls, 1,788 CPU-s) included, comes to
-  2,448 CPU-s. That is still under 2,500.
-- **Spawn** is `"verb":"spawn"` with exit 0 in `calls.jsonl`, live, with the agent, as M0's live column.
-- **Incidents** are `wsp calls --incidents`. On this machine `cycle.log` starts at 2026-11-19T07:36Z, so the
-  week is owed on 2026-11-26 for the manager's default and on 2026-11-27 for the M1 trunk. Over the 25 h: I1 5
-  (wsp-478 kind 1, barrier check trees 4), I2 3, I3 3, I4 1. **wsp-411 kind: 0 of 79** seats ended on a
-  census.
+  `stamp`, `wip --json`, `ls --json`, `spend --json` and `worklist … --json` under `sshd-session`. In the window
+  that is 104 polls and 20.1 CPU-s, about 668 a day if the rate held. Every no-seat poll together, the person's
+  shell's `wip` loop (`zsh`) included, is 42.0 CPU-s, about 1,398 a day. The day before, compound's set was
+  5,711 polls and 658 CPU-s, and everything was 2,448. The figure is partial, so it is owed, not met.
+- **Spawn** is `"verb":"spawn"` with exit 0 in `calls.jsonl`, live, with the agent, as M0's live column. The
+  window holds 2 spawns, too few for a p50. The day before held 147 (0.93 s, p95 2.71 s).
+- **Incidents** are `wsp calls --incidents`. Since the install: none of any kind, and 0 of 5 seats ended on a
+  census were heard from after. On this machine `cycle.log` starts at 2026-11-19T07:36Z, so the week on the M1
+  trunk is owed on 2026-11-27. Over the 25 h before: I1 5 (wsp-478 kind 1, barrier check trees 4), I2 3, I3 3,
+  I4 1. wsp-411 kind: 0 of 79.
 
 **The `kill -9` proof.** The proof is `k9/proof.sh` in the row's scratch directory, run 10 times by
 `k9/ten.sh`. Each run's log, journal, manager log and agent log are in `k9/runs/<n>/`. Each run starts and
@@ -1068,22 +1077,26 @@ checked alive. The script now unsets the variable, points `--inproc-run` at an e
 anything is adopted. `wsp sandbox rm` also leaves a manager-forked seat running, because it reaps by
 `WSP_STATE` in a process's arguments. The script ends whatever names its sandbox.
 
-**Against the done-when line:**
-- **ps ≤ 1, renders 0, `df` 0: missed.** About 7, 14 and 1.4 per tick, down from 37.5, 59.5 and 24.6. The
-  cause is calls that M1's breakdown left in-process (the process table, `screen_state` and the scratch
-  sweep's disk), not new ones.
-- **`lsof` in `wip` 0: met.**
-- **`wip` < 0.2 CPU-s: missed.** 0.43, from 2.9. The cause is in-process work, not isolated.
-- **Host polling < 2,500 CPU-s per day: met.** 660 for compound, 2,448 for everything that polls.
-- **Spawn p50 ≤ 9.4 s: met.** 0.93 s.
-- **wsp-411 kind 0 over a week: owed.** 0 of 79 in the first 25 h.
+**Against the done-when line** (window 2026-11-20T07:58:22Z, 0.72 h, on the M1 trunk's `wsp` and a stale
+manager):
+- **ps ≤ 1, renders 0, `df` 0: missed.** 9.00, 35.32 and 2.69 per tick over 128 ticks, down from 37.5, 59.5 and
+  24.6. The cause is calls that M1's breakdown left in-process (the process table, `screen_state` and the
+  scratch sweep's disk), not new ones (wsp-326).
+- **`lsof` in `wip` 0: met in the window**, over 54 calls.
+- **`wip` < 0.2 CPU-s: missed.** 0.67 in the window and 0.43 the day before, from 2.9. The cause is in-process
+  work, not isolated (wsp-327).
+- **Host polling < 2,500 CPU-s per day: owed.** It is partial: about 668 a day for compound, and 1,398 for
+  everything that polls, scaled from 0.72 h.
+- **Spawn p50 ≤ 9.4 s: owed.** 2 spawns in the window.
+- **wsp-411 kind 0 over a week: owed** on 2026-11-27. 0 of 5 since the install.
 - **kill -9 mid-turn loses no seat and no order: met,** 10 of 10, with two orders in flight at the manager each
   time. The agent is a stand-in, so what this proves is wsp, the manager, compound-sup and the hooks, not
   Claude Code.
 
 Filed from here:
-- wsp-323: the figures owed, a day on the trunk's wsp *and* manager and the week of incidents. It comes after
-  wsp-324.
+- wsp-323: the figures owed. That is a full 24 h on the trunk's `wsp` *and* manager, no earlier than 24 h after
+  the reinstall wsp-324 makes possible (and no earlier than 2026-11-21T07:58Z), and the week of incidents on
+  2026-11-27. It comes after wsp-324.
 - wsp-324: `wsp install` keeps a stale `wsp-manager`.
 - wsp-325: `wsp sandbox` keeps `COMPOUND_RUN_DIR`, and `sandbox rm` leaves manager-forked seats.
 - wsp-326: the per-tick `ps`, renders and `df` M1's breakdown left in-process. Which go to M3 is to be decided.
