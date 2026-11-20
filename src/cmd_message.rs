@@ -1728,6 +1728,17 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
         receipt(false, false, &format!("{pane} holds no agent — the answer is written"));
         return 0;
     }
+    // **Under `WSP_ORDERS=store` the answer is an order at once** (wsp-124),
+    // whether the asker is busy or not: the machine's queue replaces the held
+    // hop, and the daemon types it when the asker reads idle. The `Sent` hop
+    // is written when the order is acknowledged, here or by
+    // [`settle_ordered_through`] on the tick. An order that cannot be sent
+    // goes the files way below.
+    if crate::orders::mode() == crate::orders::Mode::Store {
+        if let Some(code) = deliver_as_order(store, closed, args, &pane, found.state, &receipt) {
+            return code;
+        }
+    }
     // **Busy is later, not never — `wsp-204`.** The one state a message must
     // not be sent into is a permission dialog, where the text is typed *at the
     // dialog* and can select an answer nobody chose; and a seat mid-turn or
@@ -1775,6 +1786,151 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     }
 }
 
+/// The event an answer sent as an order leaves (wsp-124): the reply, the order
+/// and the asker's pane, which [`settle_ordered_through`] reads to write the
+/// reply's `Sent` hop once the order is acknowledged.
+const ANSWER_ORDERED: &str = "answer-ordered";
+
+/// The event that says an [`ANSWER_ORDERED`] order's hop is written.
+const ANSWER_SETTLED: &str = "answer-order-settled";
+
+/// The order key of an answer: one reply is one order, however often it is sent.
+fn answer_key(reply: &str) -> String {
+    format!("answer:{reply}")
+}
+
+/// [`deliver`] under `store`: the answer sent as an order. To an asker that
+/// takes a prompt, today's wait for its answer and the receipt it comes to;
+/// to a busy one, the order queued and the receipt of a hold. `None` when no
+/// order could be sent.
+fn deliver_as_order(
+    store: &Store,
+    closed: &message::Closed,
+    args: &Args,
+    pane: &str,
+    state: crate::place::State,
+    receipt: &dyn Fn(bool, bool, &str),
+) -> Option<i32> {
+    let p = Paint::new();
+    let text = wire(closed);
+    let sent = crate::cmd_agent::Sent::new(pane, &asker(closed), pane, pane, &text, args);
+    if let Some(ago) = sent.already_sent(store) {
+        if !args.has("again") {
+            return Some(crate::cmd_agent::twice(&sent, ago, &p));
+        }
+    }
+    let seat = wsp_store_contract::SeatId(pane.to_string());
+    let by = crate::orders::principal(&sender(store));
+    let id = match crate::orders::send_keyed(store, &seat, &text, &by, false, &answer_key(&closed.reply.id)) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::store::log_line(store, &format!("answer to {} for {pane}: not sent as an order ({e}); the files way", closed.question.id));
+            return None;
+        }
+    };
+    note_ordered(store, closed, &id, pane);
+    if !state.will_take_a_prompt() {
+        let why = match crate::waiting::on_screen(state) {
+            Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
+            None => crate::wake::held_because(state).unwrap_or("not taking a prompt").to_string(),
+        };
+        receipt(false, true, &format!("{pane}: {why} — sent as order {}, typed there by the daemon when it is next idle", id.0));
+        return Some(0);
+    }
+    let now = match crate::orders::answer(store, &id, crate::orders::TELL_WAIT) {
+        Ok(Some(o)) => Some(o),
+        _ => crate::orders::order(store, &id).ok().flatten(),
+    };
+    let Some(outcome) = now.as_ref().and_then(crate::orders::said) else {
+        receipt(false, true, &format!("{pane}: not answered yet — sent as order {}, typed there by the daemon", id.0));
+        return Some(0);
+    };
+    if let Some(o) = now.as_ref() {
+        settle_one(store, &closed.reply.id, pane, o);
+    }
+    Some(match crate::cmd_agent::delivered(store, outcome, &sent) {
+        0 => 0,
+        _ => {
+            eprintln!("     the answer is on the record whatever the composer does");
+            0
+        }
+    })
+}
+
+/// Write down that `closed`'s reply went to `pane` as order `id`: what
+/// [`settle_ordered_through`] reads. No hop: the reply holds nothing.
+fn note_ordered(store: &Store, closed: &message::Closed, id: &wsp_store_contract::OrderId, pane: &str) {
+    store.log_event(
+        ANSWER_ORDERED,
+        json!({ "reply": closed.reply.id, "question": closed.question.id, "order": id.0, "pane": pane, "at": util::epoch_secs() }),
+    );
+}
+
+/// The reply's hop for its order as it stands, and whether one was written:
+/// `Sent` once the order is acknowledged, `Noted` when it failed or was
+/// cancelled. Each written once, under [`ANSWER_SETTLED`].
+fn settle_one(store: &Store, reply: &str, pane: &str, o: &wsp_store_contract::Order) -> Option<String> {
+    use wsp_store_contract::OrderState as S;
+    let (act, note) = match o.state {
+        S::Acknowledged | S::Done => (message::Act::Sent, format!("typed at {pane} as order {} — delivered, acknowledged by the seat", o.id.0)),
+        S::Failed => (
+            message::Act::Noted,
+            format!("{pane} was not told: {} (order {})", o.why.as_deref().unwrap_or("the order failed"), o.id.0),
+        ),
+        S::Cancelled => (message::Act::Noted, format!("{pane} was not told: order {} was cancelled", o.id.0)),
+        S::Queued | S::Typed | S::Delivered => return None,
+    };
+    settle(store, reply, pane, &o.id.0, act, &note)
+}
+
+/// Write the hop and the event that says it is written.
+fn settle(store: &Store, reply: &str, pane: &str, order: &str, act: message::Act, note: &str) -> Option<String> {
+    let _ = message::unheld(store, reply, pane, act, note);
+    store.log_event(ANSWER_SETTLED, json!({ "reply": reply, "order": order, "act": act.as_str(), "at": util::epoch_secs() }));
+    Some(note.to_string())
+}
+
+type ReadOrder<'a> =
+    dyn Fn(&wsp_store_contract::OrderId) -> Result<Option<wsp_store_contract::Order>, crate::orders::Error> + 'a;
+
+/// Every answer sent as an order and not yet settled, its hop written where
+/// the order now says (wsp-124): `Sent` once it is acknowledged, `Noted` when
+/// it failed, was cancelled, or its asker's pane is gone. The orders machine
+/// and the daemon's worker deliver it; this only writes down what they did.
+/// `read` reads an order, so a test can be the store. Returns a line per hop.
+fn settle_ordered_through(store: &Store, seats: &dyn crate::cycle::Seats, read: &ReadOrder) -> Vec<String> {
+    let done: std::collections::BTreeSet<String> = store
+        .events_of(ANSWER_SETTLED)
+        .iter()
+        .filter_map(|e| e.get("order").and_then(serde_json::Value::as_str).map(str::to_string))
+        .collect();
+    let mut said = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for e in store.events_of(ANSWER_ORDERED) {
+        let field = |k: &str| e.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+        let (reply, order, pane) = (field("reply"), field("order"), field("pane"));
+        if order.is_empty() || done.contains(&order) || !seen.insert(order.clone()) {
+            continue;
+        }
+        let id = wsp_store_contract::OrderId(order.clone());
+        let line = match read(&id) {
+            Ok(Some(o)) => match settle_one(store, &reply, &pane, &o) {
+                Some(note) => Some(note),
+                None if seats.absent(&pane) => {
+                    settle(store, &reply, &pane, &order, message::Act::Noted, &format!("{pane} is gone — the answer is on the record and in the log (order {order})"))
+                }
+                None => None,
+            },
+            Ok(None) => settle(store, &reply, &pane, &order, message::Act::Noted, &format!("no store holds order {order} — the answer is on the record and in the log")),
+            Err(_) => None,
+        };
+        if let Some(note) = line {
+            said.push(format!("answer {reply} sent as order {order}: {note}"));
+        }
+    }
+    said
+}
+
 /// Whether a hook is waiting on this question to print the agent's decision
 /// (`choices.via` is `hook`), as against one raised from the CLI.
 fn held_by_a_hook(q: &Message) -> bool {
@@ -1804,7 +1960,13 @@ fn hold(
 /// waiting says nothing**: this runs every minute, and a line per minute per
 /// busy asker would bury the log it is written to.
 pub(crate) fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Vec<String> {
-    deliver_held_through(store, seats, &type_at)
+    let mut said = deliver_held_through(store, seats, &type_at);
+    // Answers sent as orders (wsp-124) hold nothing here: the machine queues
+    // them, and this writes their hops once the orders settle.
+    if crate::orders::mode() == crate::orders::Mode::Store {
+        said.extend(settle_ordered_through(store, seats, &|id| crate::orders::order(store, id)));
+    }
+    said
 }
 
 /// The typing, over every backend here: `None` where nothing answers for the
@@ -2501,6 +2663,86 @@ mod tests {
         let said = deliver_held_through(&store, &gone, &type_at);
         assert!(said[0].contains("the pane is gone"), "{said:?}");
         assert!(message::held_replies(&store).is_empty(), "and the hold is over");
+    }
+
+    /// **wsp-124, an answer to a busy asker under `store`.** The answer is one
+    /// order, queued while the asker works; nothing is held, so the files
+    /// tick types nothing; the worker types it once the asker reads idle, and
+    /// the reply's `Sent` hop is written then and not before, once.
+    #[test]
+    fn under_store_an_answer_to_a_busy_asker_is_one_order_and_sent_once_it_is_acknowledged() {
+        use wsp_store_contract::{Command, OrderState, SeatId, SeatState};
+        let store = scratch("ordered");
+        task(&store, "wsp-149");
+        let q = Message::question(Party::pane("cpd-380", ""), Kind::Note, "does the barrier hold?", Waiting::new("cpd-380", ""))
+            .about(About::Task("wsp-149".into()));
+        message::raise(&store, &q).unwrap();
+        let closed = message::answer(&store, &q.id, &Party::seat("wsp-process"), "it holds").unwrap();
+
+        let db = crate::orders::tests::db(&store.state.join("orders-db"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&db, "cpd-380", SeatState::Working);
+        let send = Command::OrderSend { to: SeatId("cpd-380".into()), text: wire(&closed), first: false };
+        let id = crate::orders::send_in(&db, send, &crate::orders::tests::ed()).unwrap();
+        note_ordered(&store, &closed, &id, "cpd-380");
+        let read = |id: &wsp_store_contract::OrderId| crate::orders::order_in(&db, id);
+        let sent_hops = || {
+            store.message(&closed.reply.id).unwrap().via.iter().filter(|h| h.act == message::Act::Sent).count()
+        };
+
+        let typed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = typed.clone();
+        let ask: Box<crate::deliver::Ask> = Box::new(move |_, o, _| {
+            log.lock().unwrap().push(o.0.clone());
+            Ok(crate::place::Delivery::Acked)
+        });
+        let mut worker = crate::deliver::Worker::new(db.clone(), "wsp", ask);
+        let busy = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
+
+        worker.pass();
+        assert!(typed.lock().unwrap().is_empty(), "nothing is typed at a working asker");
+        assert!(message::held_replies(&store).is_empty(), "the machine's queue holds it, not a held hop");
+        let no_typing = |_: &str, _: &str| -> Option<crate::place::Result<crate::place::Delivery>> {
+            panic!("the files tick types nothing for an answer sent as an order")
+        };
+        assert!(deliver_held_through(&store, &busy, &no_typing).is_empty());
+        assert!(settle_ordered_through(&store, &busy, &read).is_empty(), "a queued order writes no hop");
+        assert_eq!(sent_hops(), 0, "not Sent before it is delivered");
+        assert_eq!(crate::orders::orders_of_in(&db, &SeatId("cpd-380".into()), &[]).unwrap().len(), 1, "one order");
+
+        crate::orders::tests::seat(&db, "cpd-380", SeatState::Idle);
+        worker.pass();
+        assert_eq!(*typed.lock().unwrap(), vec![id.0.clone()], "typed once the asker reads idle, under the order's id");
+        assert_eq!(crate::orders::order_in(&db, &id).unwrap().unwrap().state, OrderState::Acknowledged);
+        let idle = Pane { state: std::cell::Cell::new(Some(crate::place::State::Idle)), gone: false };
+        let said = settle_ordered_through(&store, &idle, &read);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("acknowledged"), "{said:?}");
+        assert_eq!(sent_hops(), 1, "the Sent hop, once acknowledged");
+
+        assert!(settle_ordered_through(&store, &idle, &read).is_empty(), "settled once");
+        assert_eq!(sent_hops(), 1);
+    }
+
+    /// An answer's order that fails, or whose asker goes, ends with a `Noted`.
+    #[test]
+    fn under_store_an_answer_whose_asker_goes_is_noted_and_not_sent() {
+        use wsp_store_contract::{Command, SeatId, SeatState};
+        let store = scratch("ordered-gone");
+        let closed = answered_mid_turn(&store);
+        // The files hold the fixture made: ended, as the store path never makes one.
+        message::unheld(&store, &closed.reply.id, "cpd-380", message::Act::Noted, "fixture").unwrap();
+        let db = crate::orders::tests::db(&store.state.join("orders-db"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&db, "cpd-380", SeatState::Working);
+        let send = Command::OrderSend { to: SeatId("cpd-380".into()), text: wire(&closed), first: false };
+        let id = crate::orders::send_in(&db, send, &crate::orders::tests::ed()).unwrap();
+        note_ordered(&store, &closed, &id, "cpd-380");
+        let read = |id: &wsp_store_contract::OrderId| crate::orders::order_in(&db, id);
+        let gone = Pane { state: std::cell::Cell::new(None), gone: true };
+        let said = settle_ordered_through(&store, &gone, &read);
+        assert!(said.len() == 1 && said[0].contains("is gone"), "{said:?}");
+        let last = store.message(&closed.reply.id).unwrap().via.last().cloned().unwrap();
+        assert_eq!(last.act, message::Act::Noted);
+        assert!(settle_ordered_through(&store, &gone, &read).is_empty(), "noted once");
     }
 
     /// **`wsp-469`, the replay.** A seat asks the person with `--wait`; the tool

@@ -1474,6 +1474,18 @@ fn tell_seat(
     // order; a seat that ends first has it said back to the sender. And a tell
     // to a seat that already has tells queued queues behind them, whatever the
     // seat reads now, so the order they were sent in is the order they land.
+    // **Under `WSP_ORDERS=store` a tell is an order** (wsp-124): `order.send`,
+    // and the daemon's delivery worker types it under `deliver:<seat>` when
+    // the seat reads idle. The machine's queue is the queue, so a busy seat's
+    // tell is an order at once and not a line in the held-tell spool.
+    // `--anyway` (a person who has looked at the seat) keeps the files path;
+    // wsp-130, the deletion row of s2-state-core-2, decides what it becomes.
+    let by_order = !args.has("anyway") && crate::orders::mode() == crate::orders::Mode::Store;
+    if by_order && queues_for_idle(row.state) {
+        if let Some(code) = queue_as_order(store, args, p, from, re, text, needle, &said, &seat, &what, row.state) {
+            return code;
+        }
+    }
     let queue = crate::wake::held_tells(store, &seat);
     let queued = queue.len();
     if !args.has("anyway") && (queues_for_idle(row.state) || (queued > 0 && row.state != State::Unknown)) {
@@ -1543,12 +1555,130 @@ fn tell_seat(
             return twice(&sent, ago, p);
         }
     }
+    if by_order {
+        match tell_as_order(store, &seat, &said, from, crate::orders::TELL_WAIT) {
+            Ok((_, Some(outcome))) => return delivered(store, outcome, &sent),
+            Ok((id, None)) => return left_for_the_daemon(store, args, p, &sent, &id),
+            // No API, or a store that holds no such seat yet: the files path
+            // takes it, and cycle.log says so.
+            Err(e) => crate::store::log_line(store, &format!("told {what}: not sent as an order ({e}); typed the files way")),
+        }
+    }
     match how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &said) {
         // The host went silent between the census and the order: held, as a
         // seat found unreachable is, and asked again under the same order id.
         Err(Refusal::Unreachable(_)) => held("unreachable"),
         outcome => delivered(store, outcome, &sent),
     }
+}
+
+// ---- tells as orders (wsp-124) ---------------------------------------------
+
+/// `said` to `seat` as an order: sent, its answer waited for up to `wait`, and
+/// what it came to by then ([`crate::orders::said`]; `None` is left for the daemon).
+/// An `Err` is an order that was not sent, which the caller types the files way.
+pub(crate) fn tell_as_order(
+    store: &Store,
+    seat: &str,
+    said: &str,
+    from: &str,
+    wait: std::time::Duration,
+) -> Result<(wsp_store_contract::OrderId, Option<crate::place::Result<Delivery>>), crate::orders::Error> {
+    let id = crate::orders::send(store, &wsp_store_contract::SeatId(seat.into()), said, &crate::orders::principal(from), false)?;
+    let now = match crate::orders::answer(store, &id, wait)? {
+        Some(o) => Some(o),
+        None => crate::orders::order(store, &id)?,
+    };
+    Ok((id, now.as_ref().and_then(crate::orders::said)))
+}
+
+/// `seat`'s orders the daemon has still to type: `queued` and `typed`.
+fn orders_waiting(store: &Store, seat: &str) -> Vec<wsp_store_contract::Order> {
+    use wsp_store_contract::OrderState as S;
+    crate::orders::orders_of(store, &wsp_store_contract::SeatId(seat.into()), &[S::Queued, S::Typed]).unwrap_or_default()
+}
+
+/// A tell whose order had not settled when the wait ran out: the daemon types
+/// it, and the receipt is the files path's for a tell it holds.
+fn left_for_the_daemon(store: &Store, args: &Args, p: &Paint, sent: &Sent, id: &wsp_store_contract::OrderId) -> i32 {
+    let n = orders_waiting(store, &sent.pane).len().max(1);
+    store.log_event(
+        "agent-told",
+        json!({
+            "target": sent.target, "pane": sent.pane, "chars": sent.chars, "id": sent.id, "from": sent.from,
+            "re": sent.re, "text": sent.text, "held": true, "order": id.0, "at": util::epoch_secs(), "turn": false,
+        }),
+    );
+    crate::store::log_line(store, &format!("told {}: order {} left for the daemon ({n} waiting), from {}", sent.what, id.0, sent.from));
+    match args.json() {
+        true => println!("{}", json!({ "held": true, "pane": sent.pane, "waiting": n })),
+        false => println!(
+            "{} {} has not answered yet — left for the daemon as order {} ({n} waiting), typed under deliver:{}",
+            p.yellow("…"),
+            sent.what,
+            id.0,
+            sent.pane
+        ),
+    }
+    0
+}
+
+/// A tell to a busy seat under `store`: an order at once, which the daemon
+/// types at the seat's next idle, with the files path's queued receipt.
+/// `None` when the order could not be sent, and the held-tell spool takes it.
+#[allow(clippy::too_many_arguments)]
+fn queue_as_order(
+    store: &Store,
+    args: &Args,
+    p: &Paint,
+    from: &str,
+    re: Option<&str>,
+    text: &str,
+    needle: &str,
+    said: &str,
+    seat: &str,
+    what: &str,
+    state: State,
+) -> Option<i32> {
+    let waiting = orders_waiting(store, seat);
+    if !args.has("again") && waiting.iter().any(|o| o.text == said) {
+        let n = waiting.len();
+        match args.json() {
+            true => println!("{}", json!({ "held": true, "queued": true, "pane": seat, "waiting": n, "already": true })),
+            false => println!(
+                "{} {what} has that sentence queued already ({n} waiting) — not queued twice; `--again` queues it anyway",
+                p.dim("·")
+            ),
+        }
+        return Some(0);
+    }
+    let id = match crate::orders::send(store, &wsp_store_contract::SeatId(seat.into()), said, &crate::orders::principal(from), false) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::store::log_line(store, &format!("told {what}: not sent as an order ({e}); held the files way"));
+            return None;
+        }
+    };
+    let n = orders_waiting(store, seat).len().max(1);
+    store.log_event(
+        "agent-told",
+        json!({
+            "target": addressee_id(store, needle, what), "pane": seat, "chars": text.len(),
+            "id": message_id(seat, text), "from": from, "re": re, "text": text, "held": true,
+            "queued": true, "order": id.0, "at": util::epoch_secs(), "turn": false,
+        }),
+    );
+    crate::store::log_line(store, &format!("told {what}: order {} queued for its next idle ({n} waiting), from {from}", id.0));
+    let word = format!(
+        "{what} is {} — queued as order {} ({n} waiting), typed by the daemon at its next idle",
+        state.as_str(),
+        id.0
+    );
+    match args.json() {
+        true => println!("{}", json!({ "held": true, "queued": true, "pane": seat, "waiting": n })),
+        false => println!("{} {word}", p.yellow("…")),
+    }
+    Some(0)
 }
 
 /// The sentence as the seat reads it (`wsp-521`): it opens by saying who

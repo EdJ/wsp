@@ -356,6 +356,36 @@ pub fn answer_in(db: &SharedStore, id: &OrderId, wait: Duration) -> Result<Optio
     }
 }
 
+// ---- tells and answers as orders (wsp-124) -------------------------------
+
+/// How long a tell waits for its order to settle: today's wait, the
+/// supervisor's 30 s for one delivery.
+pub const TELL_WAIT: Duration = Duration::from_secs(30);
+
+/// What an order has come to, as the place's own answer to a tell says it, so
+/// a tell under `store` prints what the files path prints for the same
+/// outcome. `None` while it is `queued` or `typed`: the daemon's still.
+pub fn said(o: &Order) -> Option<crate::place::Result<crate::place::Delivery>> {
+    use crate::place::{Delivery, Refusal as Said};
+    use OrderState as S;
+    match o.state {
+        S::Acknowledged | S::Done => Some(Ok(Delivery::Acked)),
+        S::Delivered => Some(Ok(Delivery::Unconfirmed)),
+        S::Failed => Some(Err(Said::Failed(o.why.clone().unwrap_or_else(|| "the order failed".into())))),
+        S::Cancelled => Some(Err(Said::Failed("the order was cancelled".into()))),
+        S::Queued | S::Typed => None,
+    }
+}
+
+/// Who the orders machine is told sent an order: the seat this process runs
+/// in, else the person, under the address the sentence opens with.
+pub fn principal(from: &str) -> Principal {
+    match crate::place::seat_from_env() {
+        Some(s) => Principal::Seat(SeatId(s.to_string())),
+        None => Principal::Person(from.to_string()),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
