@@ -1417,6 +1417,10 @@ How each was taken, and the cause of each miss:
     manager's tree root left at `~`). The rest are filed as wsp-361: a cargo run from outside the tree root is
     refused, with nothing run. The tree root is `/mnt/data/src`, and outside it are a seat's
     `$WSP_SCRATCH` and the home directory. `cargo --version` in this row's scratch directory reproduces it.
+    The same root refuses `wsp check <id>` in wsp's shared check tree, which is under the state directory
+    (`~/.local/state/wsp/checks/wsp-wsp/tree`). That happened to wsp-057 and wsp-128, whose checks wsp ran
+    itself on a ready row, and to this row's own `wsp check --at`. Every check job that did run was in a row's
+    own worktree.
 - **Spawn** is `"verb":"spawn"` with exit 0, live, with the agent, as in M0's live column. The window holds 1
   spawn (0.89 s).
 - **The rollback** is `rollback.sh`, run at 2026-11-20T12:15:23Z. It starts and ends its own instance:
@@ -1448,7 +1452,8 @@ manager):
 - **wsp-478-kind incidents → 0 over a week: owed** on 2026-11-27T12:08Z (wsp-360). It is 0 since the install,
   but the sign's writer is gone, so the count cannot rise. The week's `pgids.py` is the real figure.
 - **`throttle run`'s wall per build no worse: owed.** The window holds one build (28.1 s, against a 24.2 s
-  p50). Builds from outside the tree root are not run at all (wsp-361).
+  p50). Builds from outside the tree root, and `wsp check` in the shared check tree, are not run at all
+  (wsp-361).
 - **Spawn p50 ≤ 9.4 s: owed.** There was 1 spawn (0.89 s), against 1.02 s the day before.
 - **The rollback works: met.** `WSP_JOBS=inproc` ran a `wsp check` in-process on a sandbox row, with a
   manager present and unused, and the script ended the sandbox itself.
@@ -1457,7 +1462,8 @@ Filed from here:
 - wsp-360: the figures owed. That is a full 24 h on the trunk's `wsp` *and* manager, no earlier than 24 h
   after the reinstall wsp-324 makes possible (and no earlier than 2026-11-21T12:08Z), and the week of
   incidents with `pgids.py` beside it, on 2026-11-27T12:08Z. It comes after wsp-324.
-- wsp-361: `throttle run` refuses a cargo run from outside the manager's tree root.
+- wsp-361 (high): under `WSP_JOBS=manager`, work outside the manager's tree root is refused and not run. That
+  covers `wsp check` in the shared check tree, and `throttle run` in a seat's scratch or the home directory.
 - On wsp-324, a note that it bit again at M3.
 
 M4 is broken down by the governor once this row is done (d1 Q14).
