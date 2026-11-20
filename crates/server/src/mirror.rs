@@ -196,7 +196,12 @@ fn about(cmd: &Command) -> Subject {
         Command::SeatSpawn { row: Some(row), .. } => Subject::Row(row.clone()),
         Command::SeatEnd { seat, .. } | Command::SeatDespawn { seat, .. } => Subject::Seat(seat.clone()),
         Command::OrderSend { to, .. } => Subject::Seat(to.clone()),
-        Command::OrderCancel { order } => Subject::Order(order.clone()),
+        Command::OrderCancel { order }
+        | Command::OrderDeliver { order, .. }
+        | Command::OrderDelivered { order }
+        | Command::OrderAcked { order, .. }
+        | Command::OrderRefused { order, .. }
+        | Command::OrderDone { order } => Subject::Order(order.clone()),
         Command::AskAnswer { ask, .. } | Command::AskAck { ask } => Subject::Ask(ask.clone()),
         Command::AskRaise { about: Some(s), .. } => s.clone(),
         Command::MachineSet { name, .. } => Subject::Machine(name.clone()),
@@ -329,6 +334,27 @@ mod tests {
 
     fn mirror(put: Vec<Entity>, gone: Vec<Subject>) -> Command {
         Command::Mirror { put, gone }
+    }
+
+    /// The orders machine's verbs (wsp-117) are refused as every verb but
+    /// `mirror` is: `illegal`, state `mirrored`, naming the order.
+    #[test]
+    fn the_orders_machine_verbs_are_refused_mirrored() {
+        use wsp_store_contract::{Fence, OrderId};
+        let o = OrderId("ord-1".into());
+        let fence = Fence { lease: LeaseName::deliver(&SeatId("cpd-1".into())), token: Token(1) };
+        for cmd in [
+            Command::OrderDeliver { order: o.clone(), fence },
+            Command::OrderDelivered { order: o.clone() },
+            Command::OrderAcked { order: o.clone(), turn_began: At(1) },
+            Command::OrderRefused { order: o.clone(), why: "busy".into(), counts: true },
+            Command::OrderDone { order: o.clone() },
+        ] {
+            assert_eq!(
+                Mirror.decide(&State::default(), &cmd, &ed()),
+                Err(Refusal::Illegal { subject: Subject::Order(o.clone()), state: MIRRORED.into(), verb: verb(&cmd) })
+            );
+        }
     }
 
     #[test]

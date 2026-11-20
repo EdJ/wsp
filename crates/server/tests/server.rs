@@ -210,6 +210,8 @@ fn everything() -> Vec<Entity> {
             text: "go".into(),
             state: OrderState::Queued,
             attempts: 0,
+            first: false,
+            why: None,
         }),
         Entity::Ask(Ask {
             id: AskId("a-1".into()),

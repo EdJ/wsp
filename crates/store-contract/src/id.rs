@@ -1,5 +1,6 @@
 //! Ids and who (docs/state-core.md section 2.1, 2.2). Newtypes only: what a
-//! value means is in its type, and nothing here parses or formats one.
+//! value means is in its type, and nothing here parses one. One name is
+//! formed here, [`LeaseName::deliver`], so its spelling has one home.
 //!
 //! There is no tenant field on any id or record: a tenant is an instance, with
 //! its own store, socket and executors (section 8.6).
@@ -90,6 +91,14 @@ pub struct MachineName(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LeaseName(pub String);
+
+impl LeaseName {
+    /// `deliver:<seat>`: the lease whose holder delivers the seat's orders
+    /// (`order.deliver`, 3.1). A name, as 2.1 writes it; nothing parses it back.
+    pub fn deliver(seat: &SeatId) -> LeaseName {
+        LeaseName(format!("deliver:{}", seat.0))
+    }
+}
 
 /// A run's key: one row, one attempt, one kind (2.1).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

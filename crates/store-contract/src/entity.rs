@@ -218,6 +218,13 @@ pub struct Order {
     pub state: OrderState,
     #[serde(default)]
     pub attempts: u32,
+    /// The spawn's first work order, which went out inside `seat.spawn` rather
+    /// than through delivery (3.1, wsp-117).
+    #[serde(default)]
+    pub first: bool,
+    /// The last refusal's words, which wip draws (wsp-117).
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 /// An ask, a note or a flag (2.1).

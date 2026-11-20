@@ -442,7 +442,9 @@ fn order_entity(db: &SharedStore, host: &str, order: &str, seat: &str, state: Or
         to: SeatId(seat.to_string()),
         text: held.as_ref().map(|h| h.text.clone()).unwrap_or_default(),
         state,
-        attempts: held.map(|h| h.attempts).unwrap_or(0),
+        attempts: held.as_ref().map(|h| h.attempts).unwrap_or(0),
+        first: held.as_ref().is_some_and(|h| h.first),
+        why: held.and_then(|h| h.why),
     })
 }
 

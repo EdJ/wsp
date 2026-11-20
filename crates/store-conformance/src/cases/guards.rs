@@ -54,7 +54,7 @@ pub fn case_machine_guards<H: Harness>(h: &H) -> CaseResult {
     let parked = c.add_row(&s, "guard-row-parked")?;
     c.apply(&s, Command::RowPark { row: parked.clone() }, "guard-park")?;
 
-    let sent = c.apply(&s, Command::OrderSend { to: worker.clone(), text: "hello".into() }, "guard-order")?;
+    let sent = c.apply(&s, Command::OrderSend { to: worker.clone(), text: "hello".into(), first: false }, "guard-order")?;
     let order = match sent.events.first().map(|id| c.subject_of(&s, *id)).transpose()? {
         Some(Subject::Order(id)) => id,
         other => return Err(c.fail(format!("order.send's event names {other:?}, not an order"))),
@@ -89,7 +89,7 @@ pub fn case_machine_guards<H: Harness>(h: &H) -> CaseResult {
         (Command::SeatEnd { seat: ending.clone(), fence: None }, seat(&ending), "ending"),
         (Command::SeatEnd { seat: gone.clone(), fence: None }, seat(&gone), "gone"),
         (Command::SeatDespawn { seat: worker.clone(), lost: false }, seat(&worker), "working"),
-        (Command::OrderSend { to: ending.clone(), text: "late".into() }, seat(&ending), "ending"),
+        (Command::OrderSend { to: ending.clone(), text: "late".into(), first: false }, seat(&ending), "ending"),
         (Command::OrderCancel { order: order.clone() }, Subject::Order(order), "cancelled"),
     ];
 

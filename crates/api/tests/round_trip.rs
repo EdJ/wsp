@@ -94,6 +94,8 @@ fn an_order() -> Order {
         text: "begin\nwith two lines".into(),
         state: OrderState::Delivered,
         attempts: 1,
+        first: false,
+        why: Some("busy".into()),
     }
 }
 fn an_ask() -> Ask {
@@ -273,7 +275,7 @@ fn every_frame_type_round_trips() {
 
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 12;
-const COMMANDS: usize = 20;
+const COMMANDS: usize = 25;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
@@ -315,6 +317,11 @@ fn command_ordinal(c: &Command) -> (usize, &'static str) {
         Command::AskAck { .. } => (17, "ask.ack"),
         Command::MachineSet { .. } => (18, "machine.set"),
         Command::Mirror { .. } => (19, "mirror"),
+        Command::OrderDeliver { .. } => (20, "order.deliver"),
+        Command::OrderDelivered { .. } => (21, "order.delivered"),
+        Command::OrderAcked { .. } => (22, "order.acked"),
+        Command::OrderRefused { .. } => (23, "order.refused"),
+        Command::OrderDone { .. } => (24, "order.done"),
     }
 }
 
@@ -435,6 +442,7 @@ fn requests() -> Vec<Frame> {
         Command::OrderSend {
             to: seat_id(),
             text: "go".into(),
+            first: false,
         },
         Command::OrderCancel {
             order: an_order().id,
@@ -458,6 +466,28 @@ fn requests() -> Vec<Frame> {
         Command::Mirror {
             put: vec![Entity::Seat(a_seat()), Entity::Row(a_row())],
             gone: vec![Subject::Order(an_order().id)],
+        },
+        Command::OrderDeliver {
+            order: an_order().id,
+            fence: Fence {
+                lease: LeaseName::deliver(&seat_id()),
+                token: Token(3),
+            },
+        },
+        Command::OrderDelivered {
+            order: an_order().id,
+        },
+        Command::OrderAcked {
+            order: an_order().id,
+            turn_began: At(2_000),
+        },
+        Command::OrderRefused {
+            order: an_order().id,
+            why: "busy".into(),
+            counts: true,
+        },
+        Command::OrderDone {
+            order: an_order().id,
         },
     ];
     let mut out: Vec<Call> = vec![];
