@@ -344,6 +344,8 @@ pub(crate) struct Api {
     pub(crate) db: wsp_server::SharedStore,
     _server: Option<wsp_server::Server>,
     _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// The delivery worker, under `WSP_ORDERS=store` alone (wsp-122).
+    _deliver: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 /// Open `state.db`, serve it, and start the mirror thread. Each failure is one
@@ -353,9 +355,11 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         return None;
     }
     let say = |line: String| wsp_store::store::log_line(store, &line);
-    // The composed domain, the mirror still putting orders (wsp-121): the
-    // live daemon is unchanged until group 4's flag turns on `Owned`.
-    let domain = std::sync::Arc::new(wsp_server::Composed::new(wsp_server::Mode::Mirrored));
+    // The composed domain (wsp-121): the mirror still puts orders under
+    // `WSP_ORDERS=files`, today's path; under `store` the orders machine
+    // decides them and the delivery worker runs beside the server (wsp-122).
+    let orders = crate::orders::mode();
+    let domain = std::sync::Arc::new(wsp_server::Composed::new(crate::orders::server_mode(orders)));
     let db: wsp_server::SharedStore =
         match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), domain) {
             Ok(db) => std::sync::Arc::new(db),
@@ -375,7 +379,18 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         }
     };
     let mirror = Some(crate::mirror::start(store, db.clone()));
-    Some(Api { db, _server: server, _mirror: mirror })
+    let deliver = match orders {
+        crate::orders::Mode::Store => {
+            crate::orders::serve_in_process(db.clone());
+            let started = crate::deliver::start(store, db.clone());
+            if started.is_none() {
+                say("orders: the delivery worker did not start; queued orders wait".into());
+            }
+            started
+        }
+        crate::orders::Mode::Files => None,
+    };
+    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -396,6 +411,11 @@ pub(crate) fn health(
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
+    // Which path owns orders (wsp-122), said whether or not a daemon answers,
+    // wherever `WSP_ORDERS` is set at all: unset is today's path, said nothing.
+    if let Some(orders) = std::env::var(crate::orders::ENV).ok().filter(|v| !v.trim().is_empty()) {
+        notes.push(crate::orders::describe(crate::orders::mode(), Some(&orders)));
+    }
     let Some(running) = running else { return };
     let list = |pids: &[u32]| {
         pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
