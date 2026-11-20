@@ -573,7 +573,7 @@ taken with `wsp calls` over a day before and a day after, and its incident count
 | **M0. herdr out, seam named** | wsp-120 (4.4). `host-api` holds the types of 3.2. Every OS-touching call outside tree work goes through one `Host` trait (`crates/wire/src/host.rs`, its methods grouped by the messages of 3.2). Its only implementation is **in-process** (`host::InProcess`): today's code, behind the trait. The seat operations of place_compound.rs and place_super.rs are behind it first (wsp-005), then the transcript and hook-log reads, grouped as `seat.did` and `turn` (wsp-007), and the host facts (wsp-006): `df`/`du`, per-seat memory and running shells (`ps`), the throttle's `sysctl`, `pmset`, `vm_stat`, `memory_pressure` and `ioreg`, pid liveness and a check run's `lstart`. Layers below wire (base, store) ask nothing themselves: their callers pass the host's answer in. `wsp calls --incidents`. | `grep` finds no `ps`, `lsof`, `kill`, render, transcript or fact probe outside the in-process host (tree work excepted). Spawn p50 ≤ 9.4 s, `wip` CPU no worse, tick no slower. Herdr references → 0. | Revert. It is a pure move plus deletions, behind the same tests. |
 | **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. `WSP_HOST` is `manager` when unset (wsp-029); a manager's start adopts the seats the in-process host started, from compound's run directory. |
 | **M2. The i5 under its own manager** | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
-| **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag. The sweep is restored with them. |
+| **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag (`WSP_JOBS=inproc`; the default is `manager` since wsp-056). The sweep is restored with them. |
 | **M4. Trees placed (T2, Ed 2026-11-18; see "M3 under T2")** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
 
 Spawn p50 is the guard rail at every step: a step that makes it worse than 9.4 s, measured the same way, does not
@@ -1105,7 +1105,7 @@ Filed from here:
 #### M3's breakdown (wsp-042, 2026-11-17)
 
 The list is `m3-agent-manager`, at status init. It is planned on top of M1 alone, because no far machine is registered and M2 is not available. It follows wsp-018's three rules:
-- expand, then contract. A job runner is added beside today's in-process runs, behind `WSP_JOBS=inproc|manager`, which defaults to `inproc`. Callers move one area at a time. The old spawns and the sweeps are deleted last;
+- expand, then contract. A job runner is added beside today's in-process runs, behind `WSP_JOBS=inproc|manager`, which defaulted to `inproc` until group 6 made it `manager` (wsp-056). Callers move one area at a time. The old spawns and the sweeps are deleted last;
 - a removal that cannot be staged is one row run as legs;
 - every row's checks build the workspace and test every crate it touches, with at least 120 s per cargo test step.
 
@@ -1118,7 +1118,7 @@ Each row's overview names the files it changes.
 | 3 | components | wsp-050 | The manager serves `job.*`: keyed runs, a hard cap per class, events journalled, `job.stop` on its own pgid only, and re-adoption on restart. |
 | 4 | wiring | wsp-051 | `Host::run_job`, `stop_job` and `jobs` on `host::Tcp` (waiting by subscription, never by a poll) and on `InProcess`. `WSP_JOBS` is independent of `WSP_HOST`. |
 | 5 | wiring | wsp-052, wsp-053, wsp-054, wsp-055 | Callers move under `manager`, one row per area: `throttle run` (its output streamed, ^C as `job.stop`, slots from `jobs`, admission from the beat); `check`'s `run_step` and its locks; `verify`'s cargo, listing and `--alone`; barrier runs and warm.rs's cleanup. The barrier row rests on check's. |
-| 6 | contract | wsp-056 | `WSP_JOBS` defaults to `manager`, and `wsp install` writes the job capacities. Stop: a live day on the installed trunk. |
+| 6 | contract | wsp-056 | `WSP_JOBS` defaults to `manager`, and `wsp install` writes the job capacities. Stop: a live day on the installed trunk. Done: see "M3 group 6". |
 | 7 | contract | wsp-057 | Contract, as legs: delete check_tree's sweep, leaked_agents, the slot probes, the direct spawns of tree work, Host methods left with no caller, and warm.rs's allowed line. host_seam loses "tree work excepted". Stop: install, then a day. |
 | 8 | insitu | wsp-058 | The M3 line's measure, written here as "M3's result": `lsof` and `ps` at 0 on the wsp side, every kill matched to a pgid the manager started, wsp-478-kind incidents at 0 over a week, `throttle run`'s wall no worse, and spawn p50 no worse than 9.4 s. |
 
@@ -1224,7 +1224,7 @@ The `Host` trait (crates/wire/src/host.rs) gains `run_job`, `stop_job` and `jobs
   `~/.local/state/wsp/inproc` and the home directory). It places a `dir` by the manager's rule, uses the same 5 s
   grace between `TERM` and `KILL`, and keeps a job table per process. A key the runner's files show already ran
   gets back that run's end and is not run again.
-- **`WSP_JOBS=inproc|manager`** is read once per process (`host::jobs_chosen`). The default is `inproc`. `manager`
+- **`WSP_JOBS=inproc|manager`** is read once per process (`host::jobs_chosen`). The default was `inproc` until wsp-056 made it `manager`. `manager`
   is the same `Tcp` that `WSP_HOST` uses, but the two variables are independent. A silent manager is "host silent",
   and the job is not run in-process instead.
 - **Keys** come from `host::job_key(row, attempt, job)`, built once per run by the caller. `job` must be unique per
@@ -1269,6 +1269,38 @@ environment. A slot left in this process's own name, whose job has ended, is tak
 beat that says the person left, the person is here, or the clock is limited drives the decision. `run_raw` run as
 its own process ships the build as its job, and its call log has none of `sysctl`, `pmset`, `ioreg`, `vm_stat`, `ps`
 or `kill`. SIGINT to that process stops the job (exit 130, the tool gone, the job ended in the table).
+
+#### M3 group 6: `WSP_JOBS` defaults to `manager` (wsp-056, 2026-11-20)
+
+- **The default.** An unset or empty `WSP_JOBS` is `manager` (`host::JobsChoice`, in `crates/wire/src/host_tcp.rs`,
+  re-exported by `host.rs`). `WSP_JOBS=inproc` still runs jobs in this process through wsp-host's runner, and is the
+  rollback. A silent manager is still "host silent", and an unset `WSP_JOBS` never falls back to in-process.
+- **The capacities.** `wsp install` writes `--build`, `--check` and `--tree-root` into the manager's launcher (the
+  plist on macOS, the systemd unit's `ExecStart` on Linux), after `--port`. It takes them from `manager::Jobs`.
+  `--build` is the throttle's slot count on this machine's cores (`throttle::cores`, a pinned count first), and
+  `--check` is its check slots. Both use the cool counts, the larger, so the manager's hard cap never refuses what
+  the throttle admits. A hand's `slots` and `checks` in `throttle.json` carry through. A change to either is a
+  rewrite of the launcher and a restart.
+- **The tree root.** Each host's install writes its own manager's tree root, as T2 asks. If every registered
+  project root is under the home directory, the root is the home directory (the manager's default). Otherwise it
+  is the deepest directory all the project roots share, for example `/Volumes/Work/src`. A project root is also
+  where its trees are made at M4 (`.worktrees` under it), so the root covers them too. If the roots share nothing
+  below `/`, the install says so in red, since then no job is confined. `--tree-root` stays single: a `HostDir` is
+  a path relative to one root, so a repeatable root would change the contract. Today's project roots on each host
+  share one volume.
+- **One root on both sides.** The install keeps what it told the manager in `<state>/manager/jobs.json`, beside the
+  machine record, and `--uninstall-manager` removes it with the record. wsp places a job under the same root:
+  `job_place::tree_root` and `throttle run`'s `Jobs` read it there (`job_place::installed_tree_root`). Without the
+  file, wsp uses the home directory, as before.
+- **Doctor** names the capacities in the manager's `hello` ("runs N build and M check jobs at once"). It reports a
+  problem when they differ from what `jobs.json` says the install wrote.
+
+Tests: `crates/wire/tests/host.rs` runs a job with `WSP_JOBS` unset on a loopback manager. The manager's host and
+its exec dir keep the log. The same job under `inproc` runs in this process, with its log under `<state>/inproc`.
+`launchd.rs` and `systemd.rs` check that the launcher carries the capacities in order. `manager.rs` checks that
+doctor names `hello`'s capacities and holds them to `jobs.json`. `cmd_install.rs` checks that the launcher `wsp
+install -n` compares against carries the throttle's settings and a root covering the projects.
+`job_place.rs` checks that wsp reads back the root the install wrote.
 
 #### M3 under T2 (wsp-093, 2026-11-18)
 

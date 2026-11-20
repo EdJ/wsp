@@ -47,8 +47,8 @@
 //! Tree work's jobs (M3, wsp-051) are [`Host::run_job`], [`Host::stop_job`]
 //! and [`Host::jobs`]: `job.run`, `job.stop` and `jobs` on [`Tcp`], and
 //! `wsp-host`'s runner in this process on [`InProcess`]. `WSP_JOBS=inproc|manager`
-//! chooses between them ([`choose_jobs`], [`jobs_chosen`]; `inproc` by
-//! default), apart from `WSP_HOST`. The callers move at M3's group 5, the
+//! chooses between them ([`choose_jobs`], [`jobs_chosen`]; `manager` by
+//! default since wsp-056, `inproc` the rollback), apart from `WSP_HOST`. The callers move at M3's group 5, the
 //! first `throttle run` (wsp-052), which also asks [`Host::job_host`] for the
 //! name a job's place carries and [`Host::facts`] for the beat it decides on.
 //!
@@ -400,8 +400,8 @@ pub trait Host: Sync {
 /// still names the trait to ask it anything, as it did before the move, and a
 /// second implementation (M1's `host::Tcp`) can stand where this one does.
 ///
-/// It also runs tree jobs here (`WSP_JOBS=inproc`, the default and M3's
-/// rollback): `wsp-host`'s runner ([`wsp_host::jobs`]), the code the manager
+/// It also runs tree jobs here (`WSP_JOBS=inproc`, M3's rollback; the
+/// default is `manager` since wsp-056): `wsp-host`'s runner ([`wsp_host::jobs`]), the code the manager
 /// runs them with, so a job's files, bounds and end are the same under both.
 /// Its job table is this process's; a key that ran before in another process
 /// is found by the runner's files under the exec dir and never run again.

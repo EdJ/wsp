@@ -899,7 +899,9 @@ pub fn readiness_scale_now() -> u32 {
     load_average().map_or(1, |(one, _, _)| readiness_scale(one, cores()))
 }
 
-fn cores() -> usize {
+/// The cores the throttle decides by (a pinned count first): what `wsp
+/// install` sizes the manager's job capacities from too (wsp-056).
+pub fn cores() -> usize {
     if let Some(n) = pinned().and_then(|m| m["cores"].as_u64()) {
         return n as usize;
     }
@@ -1894,7 +1896,8 @@ fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, a
         },
         body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
     };
-    let jobs = Jobs { host, on, tree_root: util::home(), env: std::env::vars().collect(), out: &out };
+    let tree_root = crate::job_place::installed_tree_root(&store.state);
+    let jobs = Jobs { host, on, tree_root, env: std::env::vars().collect(), out: &out };
     run_on(&ctx, Some(&jobs), tool, args)
 }
 

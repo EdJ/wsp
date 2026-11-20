@@ -1723,9 +1723,14 @@ fn manager_agent(
     let port = m::DEFAULT_PORT;
     let var = l::path_for(std::env::var_os("PATH").as_deref());
     let path = b::manager_definition_path();
+    let jobs = manager_jobs(store);
+    let jobs_json = json!({"build": jobs.build, "check": jobs.check, "tree_root": util::contract(&jobs.tree_root)});
+    if !json_out {
+        println!("{}", manager_jobs_line(p, &jobs));
+    }
 
     if dry {
-        let change = match b::plan(&b::manager_definition(&mgr, &exec_dir, port, &var), &path) {
+        let change = match b::plan(&manager_text(&mgr, &exec_dir, port, &jobs, &var), &path) {
             l::Plan::Unchanged => "unchanged",
             l::Plan::Write => "would write",
         };
@@ -1738,7 +1743,7 @@ fn manager_agent(
             );
         }
         return json!({"installed": false, "label": b::MANAGER_LABEL,
-                      "path": util::contract(&path), "plist": change});
+                      "path": util::contract(&path), "plist": change, "jobs": jobs_json});
     }
 
     let done = (|| -> Result<(b::Done, bool), String> {
@@ -1747,8 +1752,9 @@ fn manager_agent(
             None if mgr.is_file() => false,
             None => return Err(format!("{} is not there — `wsp install` puts it beside wsp", util::contract(&mgr))),
         };
-        let done = b::ensure_manager(&mgr, &exec_dir, port, &var, restarted)?;
+        let done = b::ensure_manager(&mgr, &exec_dir, port, &jobs, &var, restarted)?;
         m::install_record(&store.state, &m::Local::new(&exec_dir, port), Duration::from_secs(15))?;
+        m::write_jobs(&store.state, &jobs)?;
         Ok((done, restarted))
     })();
 
@@ -1762,10 +1768,56 @@ fn manager_agent(
         Ok((d, restarted)) => json!({"installed": true, "label": b::MANAGER_LABEL,
                                     "path": util::contract(&d.path),
                                     "plist": if d.wrote { "written" } else { "unchanged" },
-                                    "loaded": d.loaded, "binary_replaced": restarted}),
+                                    "loaded": d.loaded, "binary_replaced": restarted, "jobs": jobs_json}),
         Err(why) => json!({"installed": false, "label": b::MANAGER_LABEL,
-                           "path": util::contract(&path), "error": why}),
+                           "path": util::contract(&path), "error": why, "jobs": jobs_json}),
     }
+}
+
+/// The manager's launcher as `wsp install` writes it, and as `-n` compares it:
+/// the job capacities and tree root ([`manager_jobs`]) are in its arguments.
+fn manager_text(mgr: &Path, exec_dir: &Path, port: u16, jobs: &crate::manager::Jobs, var: &str) -> String {
+    backend::manager_definition(mgr, exec_dir, port, jobs, var)
+}
+
+/// What the manager is told about tree jobs (wsp-056): `--build` and
+/// `--check` from the throttle's own settings on this machine's cores (the
+/// cool counts, the larger, so the manager's hard cap never refuses what the
+/// throttle admits), and a `--tree-root` covering every registered project's
+/// roots, where this host's jobs run now and its trees are made at M4.
+fn manager_jobs(store: &Store) -> crate::manager::Jobs {
+    let s = crate::throttle::Settings::load(&store.state);
+    let cores = crate::throttle::cores();
+    let build = s.slot_count(cores).max(s.slots_at(cores, true));
+    let check = s.check_slots_at(cores, false).max(s.check_slots_at(cores, true));
+    let roots: Vec<PathBuf> =
+        store.projects().iter().flat_map(|p| p.roots.iter()).map(|r| wsp_base::util::expand(r)).collect();
+    manager_jobs_of(build, check, &util::home(), &roots)
+}
+
+fn manager_jobs_of(build: usize, check: usize, home: &Path, roots: &[PathBuf]) -> crate::manager::Jobs {
+    crate::manager::Jobs {
+        build: u32::try_from(build.max(1)).unwrap_or(u32::MAX),
+        check: u32::try_from(check.max(1)).unwrap_or(u32::MAX),
+        tree_root: crate::manager::tree_root_for(home, roots),
+    }
+}
+
+/// The line `wsp install` prints for [`manager_jobs`]; a tree root of `/`
+/// (roots that share nothing below it) is said as the warning it is.
+fn manager_jobs_line(p: &crate::util::Paint, jobs: &crate::manager::Jobs) -> String {
+    let root = util::contract(&jobs.tree_root);
+    let warn = if jobs.tree_root.parent().is_none() {
+        format!(" — {} the project roots share nothing below /, so no job is confined to a tree", p.red("!"))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {} build and {} check jobs at once, trees under {root}{warn}",
+        p.dim("manager jobs"),
+        jobs.build,
+        jobs.check
+    )
 }
 
 /// The line `wsp install` prints once the manager's launcher is in place; `kind`
@@ -1982,6 +2034,55 @@ mod tests {
 
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
+
+    /// wsp-056: the launcher `wsp install -n` compares against (and `wsp
+    /// install` writes) carries `--build` and `--check` from the throttle's
+    /// settings and a `--tree-root` covering the registered project roots.
+    #[test]
+    fn the_managers_launcher_carries_the_throttles_job_capacities_and_the_tree_root() {
+        let d = scratch("manager-jobs");
+        let store = Store::at(d.join("home"), d.join("state"));
+        let settings = crate::throttle::Settings { slots: Some(3), checks: Some(5), ..Default::default() };
+        settings.save(&store.state).unwrap();
+        let mut a = crate::model::Project::new("a");
+        a.roots = vec![d.join("vol/src/a").display().to_string()];
+        let mut b = crate::model::Project::new("b");
+        b.roots = vec![d.join("vol/src/b").display().to_string(), "relative/is/skipped".into()];
+        store.save_project(&a).unwrap();
+        store.save_project(&b).unwrap();
+
+        let jobs = manager_jobs(&store);
+        assert_eq!((jobs.build, jobs.check), (3, 5), "{jobs:?}");
+        assert_eq!(jobs.tree_root, d.join("vol/src"), "the roots' deepest shared directory");
+        let text = manager_text(Path::new("/b/wsp-manager"), Path::new("/e"), 7487, &jobs, "/usr/bin");
+        for want in ["--build", "--check", "--tree-root", &d.join("vol/src").display().to_string()] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        let at = |flag: &str| text.find(flag).unwrap();
+        assert!(at("--port") < at("--build") && at("--build") < at("--check") && at("--check") < at("--tree-root"), "{text}");
+        let line = manager_jobs_line(&crate::util::Paint::new(), &jobs);
+        assert!(line.contains("3 build and 5 check jobs at once"), "{line}");
+        assert!(!line.contains("share nothing"), "{line}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Roots all under home keep the home directory, the manager's default and
+    /// where wsp's side places jobs; roots on other volumes are covered by what
+    /// they share; roots sharing only `/` are warned of.
+    #[test]
+    fn the_tree_root_covers_every_project_root() {
+        let home = Path::new("/Users/e");
+        let j = |roots: &[&str]| manager_jobs_of(2, 4, home, &roots.iter().map(PathBuf::from).collect::<Vec<_>>());
+        assert_eq!(j(&[]).tree_root, home);
+        assert_eq!(j(&["/Users/e/src/a", "/Users/e/b"]).tree_root, home);
+        assert_eq!(j(&["/Volumes/Work/src/a", "/Volumes/Work/src/b"]).tree_root, Path::new("/Volumes/Work/src"));
+        assert_eq!(j(&["/Volumes/Work/src/a", "/Volumes/Data/b"]).tree_root, Path::new("/Volumes"));
+        assert_eq!(j(&["/Volumes/Work/a"]).tree_root, Path::new("/Volumes/Work/a"));
+        let wide = j(&["/Volumes/Work/a", "/Users/e/b"]);
+        assert_eq!(wide.tree_root, Path::new("/"));
+        assert!(manager_jobs_line(&crate::util::Paint::new(), &wide).contains("share nothing below /"));
+        assert_eq!((j(&[]).build, manager_jobs_of(0, 0, home, &[]).check), (2, 1), "never a cap of 0");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-install-{}-{}", name, std::process::id()));

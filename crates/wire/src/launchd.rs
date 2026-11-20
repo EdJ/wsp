@@ -79,6 +79,7 @@ use std::path::{Path, PathBuf};
 use wsp_base::calls::Command;
 use std::time::Duration;
 
+use crate::manager::Jobs;
 use crate::util;
 
 /// The job's name in launchd and in `~/Library/LaunchAgents`.
@@ -466,8 +467,8 @@ pub fn manager_definition_path() -> PathBuf {
 
 /// [`manager_plist`] under the name both launchers share
 /// ([`crate::systemd::manager_definition`]).
-pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
-    manager_plist(bin, exec_dir, port, path_var)
+pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, jobs: &Jobs, path_var: &str) -> String {
+    manager_plist(bin, exec_dir, port, jobs, path_var)
 }
 
 /// The manager's launchd log: `<exec_dir>/log/launchd.log`, beside the
@@ -484,9 +485,12 @@ pub fn manager_log(exec_dir: &Path) -> PathBuf {
 /// asks for.
 ///
 /// `--port` is written out, so the machine record and the process cannot
-/// disagree about it.
-pub fn manager_plist(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+/// disagree about it. So are the job capacities and the tree root (`jobs`,
+/// wsp-056): `--build` and `--check` from the throttle's slot settings, so the
+/// manager's hard cap and wsp's own decision agree, and `--tree-root`.
+pub fn manager_plist(bin: &Path, exec_dir: &Path, port: u16, jobs: &Jobs, path_var: &str) -> String {
     let arg = |s: &str| format!("    <string>{}</string>", escape(s));
+    let jobs_args = jobs.args().iter().map(|a| arg(a)).collect::<Vec<_>>().join("\n");
     let log = manager_log(exec_dir);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -503,6 +507,7 @@ pub fn manager_plist(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> 
 {exec_dir}
     <string>--port</string>
     <string>{port}</string>
+{jobs_args}
   </array>
 
   <key>RunAtLoad</key>
@@ -543,8 +548,8 @@ pub fn manager_plist(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> 
 /// Write the manager's plist at `path` and make its log directory, without
 /// loading anything. What a test calls, and the first half of
 /// [`ensure_manager`].
-pub fn write_manager_plist(path: &Path, bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> Result<bool, String> {
-    let want = manager_plist(bin, exec_dir, port, path_var);
+pub fn write_manager_plist(path: &Path, bin: &Path, exec_dir: &Path, port: u16, jobs: &Jobs, path_var: &str) -> Result<bool, String> {
+    let want = manager_plist(bin, exec_dir, port, jobs, path_var);
     let _ = std::fs::create_dir_all(exec_dir.join("log"));
     if plan(&want, path) == Plan::Unchanged {
         return Ok(false);
@@ -556,12 +561,12 @@ pub fn write_manager_plist(path: &Path, bin: &Path, exec_dir: &Path, port: u16, 
 /// Write the manager's plist if it differs and load the job. `restarted` says
 /// the binary beside it was just replaced, so a job that is already right is
 /// kicked to run it.
-pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, restarted: bool) -> Result<Done, String> {
+pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, jobs: &Jobs, path_var: &str, restarted: bool) -> Result<Done, String> {
     let _ = std::fs::create_dir_all(exec_dir.join("log"));
     ensure_text(
         MANAGER_LABEL,
         &manager_plist_path(),
-        &manager_plist(bin, exec_dir, port, path_var),
+        &manager_plist(bin, exec_dir, port, jobs, path_var),
         restarted,
     )
 }
@@ -780,7 +785,8 @@ mod tests {
         assert!(path.starts_with(&home));
         assert!(path.ends_with("Library/LaunchAgents/com.wsp.manager.plist"));
 
-        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, "/usr/bin:/bin"), Ok(true));
+        let jobs = Jobs { build: 3, check: 6, tree_root: "/Volumes/Work/src".into() };
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, &jobs, "/usr/bin:/bin"), Ok(true));
         let got = std::fs::read_to_string(&path).unwrap();
         assert!(got.contains("<key>Label</key>\n  <string>com.wsp.manager</string>"), "{got}");
         assert!(got.contains("<key>KeepAlive</key>\n  <true/>"), "{got}");
@@ -791,8 +797,18 @@ mod tests {
         assert_eq!(got.matches(&format!("<string>{}</string>", log.display())).count(), 2, "{got}");
         assert!(exec.join("log").is_dir(), "the log's directory is made, or launchd cannot open the log");
         assert!(got.contains("<string>7487</string>"), "{got}");
+        // The job capacities and the tree root the install chose (wsp-056).
+        assert!(
+            got.contains(
+                "<string>--port</string>\n    <string>7487</string>\n    <string>--build</string>\n    <string>3</string>\n    \
+                 <string>--check</string>\n    <string>6</string>\n    <string>--tree-root</string>\n    <string>/Volumes/Work/src</string>\n  </array>"
+            ),
+            "{got}"
+        );
 
-        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, "/usr/bin:/bin"), Ok(false), "a second write is no write");
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, &jobs, "/usr/bin:/bin"), Ok(false), "a second write is no write");
+        let other = Jobs { build: 4, ..jobs };
+        assert_eq!(write_manager_plist(&path, &bin, &exec, 7487, &other, "/usr/bin:/bin"), Ok(true), "other capacities are a write");
         let _ = std::fs::remove_dir_all(&home);
     }
 

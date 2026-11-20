@@ -98,13 +98,21 @@ pub fn trunk_host() -> String {
 }
 
 /// The directory a host's manager keeps the trees it runs jobs in under (its
-/// `--tree-root`): the home directory, the manager's default.
+/// `--tree-root`): what `wsp install` told it (`<state>/manager/jobs.json`,
+/// wsp-056), else the home directory, the manager's default.
 pub fn tree_root() -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(root) = TREE_ROOT.with(|r| r.borrow().clone()) {
         return root;
     }
-    util::home()
+    let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(crate::store::Store::default_state);
+    installed_tree_root(&state)
+}
+
+/// The tree root the install under `state` wrote into the manager's launcher,
+/// else the home directory (an install before wsp-056, or none).
+pub fn installed_tree_root(state: &Path) -> PathBuf {
+    wsp_wire::manager::read_jobs(state).map(|j| j.tree_root).unwrap_or_else(util::home)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -157,6 +165,19 @@ pub fn dir_on(host: &str, dir: &Path, what: &str) -> Result<HostDir, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wsp-056: the tree root wsp places a job under is the one the install
+    /// wrote into the manager's launcher, and the home directory without one.
+    #[test]
+    fn the_installed_tree_root_is_the_one_the_install_wrote() {
+        let state = std::env::temp_dir().join(format!("wsp-job-place-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        assert_eq!(installed_tree_root(&state), util::home(), "no install: the manager's default");
+        let jobs = wsp_wire::manager::Jobs { build: 2, check: 4, tree_root: "/Volumes/Work/src".into() };
+        wsp_wire::manager::write_jobs(&state, &jobs).unwrap();
+        assert_eq!(installed_tree_root(&state), Path::new("/Volumes/Work/src"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
 
     /// Every kind is placed by the same function: the row's (or barrier's)
     /// host and a path relative to the tree root, never a path on wsp's

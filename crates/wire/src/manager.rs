@@ -79,6 +79,90 @@ impl Local {
     }
 }
 
+/// What `wsp install` tells the manager about tree jobs (wsp-056): its
+/// capacity per class (`--build`, `--check`), a hard cap taken from the
+/// throttle's slot settings so the cap and wsp's own decision agree, and the
+/// tree root a job's `dir` is under (`--tree-root`). Written into the
+/// launcher's arguments and kept beside the record as `manager/jobs.json`, so
+/// doctor can hold `hello`'s capacity against what was installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jobs {
+    pub build: u32,
+    pub check: u32,
+    pub tree_root: PathBuf,
+}
+
+impl Jobs {
+    /// The manager's own defaults (2 and 4 under the home directory): what a
+    /// launcher written before wsp-056 left it to.
+    pub fn defaults() -> Jobs {
+        Jobs { build: 2, check: 4, tree_root: util::home() }
+    }
+
+    /// The arguments that tell `wsp-manager` these.
+    pub fn args(&self) -> Vec<String> {
+        vec![
+            "--build".into(),
+            self.build.to_string(),
+            "--check".into(),
+            self.check.to_string(),
+            "--tree-root".into(),
+            self.tree_root.display().to_string(),
+        ]
+    }
+
+    fn to_json(&self) -> Value {
+        json!({"build": self.build, "check": self.check, "tree_root": self.tree_root.display().to_string()})
+    }
+
+    fn from_json(v: &Value) -> Option<Jobs> {
+        Some(Jobs {
+            build: u32::try_from(v.get("build")?.as_u64()?).ok()?,
+            check: u32::try_from(v.get("check")?.as_u64()?).ok()?,
+            tree_root: PathBuf::from(v.get("tree_root")?.as_str()?),
+        })
+    }
+}
+
+/// The tree root that covers every root in `roots` (the registered projects'
+/// roots, where this host's manager runs jobs now and makes trees at M4):
+/// `home` while each is under it, the manager's default and the root wsp's
+/// side places a job under; else the deepest directory all of them share.
+/// Two roots that share nothing but `/` are said by the caller, since `/`
+/// confines no job.
+pub fn tree_root_for(home: &Path, roots: &[PathBuf]) -> PathBuf {
+    let roots: Vec<&PathBuf> = roots.iter().filter(|r| r.is_absolute()).collect();
+    if roots.iter().all(|r| r.starts_with(home)) {
+        return home.to_path_buf();
+    }
+    let mut common: PathBuf = roots[0].to_path_buf();
+    for r in &roots[1..] {
+        while !r.starts_with(&common) {
+            if !common.pop() {
+                break;
+            }
+        }
+    }
+    common
+}
+
+pub fn jobs_path(state: &Path) -> PathBuf {
+    dir(state).join("jobs.json")
+}
+
+/// Keep what the launcher was told, beside the record.
+pub fn write_jobs(state: &Path, jobs: &Jobs) -> Result<(), String> {
+    let d = dir(state);
+    fs::create_dir_all(&d).map_err(|e| format!("cannot make {}: {e}", util::contract(&d)))?;
+    crate::store::write_atomic(&jobs_path(state), &format!("{}\n", jobs.to_json()))
+        .map_err(|e| format!("cannot write {}: {e}", util::contract(&jobs_path(state))))
+}
+
+/// What the last install told the manager, if it said.
+pub fn read_jobs(state: &Path) -> Option<Jobs> {
+    Jobs::from_json(&serde_json::from_str(&fs::read_to_string(jobs_path(state)).ok()?).ok()?)
+}
+
 fn dir(state: &Path) -> PathBuf {
     state.join("manager")
 }
@@ -110,6 +194,7 @@ pub fn write_record(state: &Path, local: &Local, token: &str) -> Result<(), Stri
 
 /// Remove the record and the secret file.
 pub fn remove_record(state: &Path) {
+    let _ = fs::remove_file(jobs_path(state));
     let _ = fs::remove_file(secret_path(state));
     let _ = fs::remove_file(record_path(state));
 }
@@ -216,13 +301,29 @@ pub fn health(
     let Some((local, token)) = read_record(state) else {
         return false;
     };
-    health_of(&local, &token, sup, wsp_version, problems, notes);
+    health_with(&local, &token, read_jobs(state).as_ref(), sup, wsp_version, problems, notes);
     true
 }
 
 pub fn health_of(
     local: &Local,
     token: &Token,
+    sup: Option<&Path>,
+    wsp_version: &str,
+    problems: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    health_with(local, token, None, sup, wsp_version, problems, notes)
+}
+
+/// [`health_of`], with what the install told the manager (`jobs`, wsp-056):
+/// the capacities `hello` reports are named, and a manager running other ones
+/// than the install wrote is a problem, since then the throttle's decision and
+/// the manager's hard cap disagree.
+pub fn health_with(
+    local: &Local,
+    token: &Token,
+    jobs: Option<&Jobs>,
     sup: Option<&Path>,
     wsp_version: &str,
     problems: &mut Vec<String>,
@@ -252,6 +353,19 @@ pub fn health_of(
                     "the manager is version {}, this wsp is {wsp_version} — `wsp install` puts them at one commit",
                     m.version
                 ));
+            }
+            let c = m.capacity;
+            notes.push(format!(
+                "manager {} runs {} build and {} check jobs at once (hello's capacity), and {} seats",
+                m.host.0, c.build, c.check, c.seats
+            ));
+            if let Some(j) = jobs {
+                if (j.build, j.check) != (c.build, c.check) {
+                    problems.push(format!(
+                        "the manager runs {} build and {} check jobs at once, the install wrote {} and {} — `wsp install --daemon` writes and restarts it",
+                        c.build, c.check, j.build, j.check
+                    ));
+                }
             }
             sup_in_range(sup, m.compound_sup, problems, notes);
         }
@@ -374,6 +488,57 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("refused wsp's token")), "{problems:?}");
         m.stop();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// wsp-056: doctor names the job capacities the manager's `hello`
+    /// reports, and says when they are not what the install wrote.
+    #[test]
+    fn doctor_names_the_job_capacities_hello_reports_and_holds_them_to_the_install() {
+        let root = scratch("caps");
+        let exec = root.join("exec");
+        let state = root.join("state");
+        let mut cfg = Config::new(&exec, "testhost");
+        cfg.port = 0;
+        cfg.build = 3;
+        cfg.check = 6;
+        let m = Manager::start(cfg).expect("a manager starts on loopback");
+        let mut local = Local::new(&exec, m.addrs()[0].port());
+        local.host = "testhost".into();
+        install_record(&state, &local, Duration::from_secs(2)).unwrap();
+
+        // No jobs.json (an install before wsp-056): named, nothing to hold it to.
+        let (mut problems, mut notes) = (vec![], vec![]);
+        assert!(health(&state, None, wsp_manager::VERSION, &mut problems, &mut notes));
+        assert!(notes.iter().any(|n| n.contains("runs 3 build and 6 check jobs at once")), "{notes:?}");
+        assert!(!problems.iter().any(|p| p.contains("the install wrote")), "{problems:?}");
+
+        // What the install wrote, kept and read back.
+        let jobs = Jobs { build: 3, check: 6, tree_root: root.clone() };
+        write_jobs(&state, &jobs).unwrap();
+        assert_eq!(read_jobs(&state), Some(jobs.clone()));
+        let (mut problems, mut notes) = (vec![], vec![]);
+        assert!(health(&state, None, wsp_manager::VERSION, &mut problems, &mut notes));
+        assert!(!problems.iter().any(|p| p.contains("the install wrote")), "{problems:?}");
+
+        // Another capacity than the install wrote is a problem.
+        write_jobs(&state, &Jobs { build: 2, ..jobs }).unwrap();
+        let (mut problems, mut notes) = (vec![], vec![]);
+        assert!(health(&state, None, wsp_manager::VERSION, &mut problems, &mut notes));
+        assert!(problems.iter().any(|p| p.contains("runs 3 build and 6 check") && p.contains("the install wrote 2 and 6")), "{problems:?}");
+
+        remove_record(&state);
+        assert_eq!(read_jobs(&state), None, "removed with the record");
+        m.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tree_root_for_is_home_while_every_root_is_under_it() {
+        let home = Path::new("/home/e");
+        assert_eq!(tree_root_for(home, &[]), home);
+        assert_eq!(tree_root_for(home, &["/home/e/a".into()]), home);
+        assert_eq!(tree_root_for(home, &["/mnt/data/src/a".into(), "/mnt/data/src/b/c".into()]), Path::new("/mnt/data/src"));
+        assert_eq!(Jobs::defaults().args()[..4], ["--build", "2", "--check", "4"]);
     }
 
     #[test]

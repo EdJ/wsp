@@ -38,8 +38,8 @@
 //! manager code inside this process ([`crate::host_inproc`], wsp-030): the
 //! same `Tcp`, the same events, a different place it runs.
 //! Tree jobs are chosen apart, by `WSP_JOBS=inproc|manager` ([`JobsChoice`],
-//! [`jobs_chosen`]; `inproc` until M3's callers have moved), so they roll back
-//! on their own.
+//! [`jobs_chosen`]; `manager` since wsp-056, `inproc` the rollback), so they
+//! roll back on their own.
 //!
 //! **A job** (M3, wsp-051) runs on a connection of its own: it subscribes
 //! from the journal's head, then sends `job.run`, so the connection owns the
@@ -249,20 +249,22 @@ pub fn chosen(state: &Path, version: &str) -> std::result::Result<&'static dyn H
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobsChoice {
     /// `wsp-host`'s runner in this process: the default until M3's callers
-    /// have moved, and the rollback after.
-    #[default]
+    /// had moved, and the rollback since (wsp-056).
     Inproc,
-    /// `job.run` to the manager the local machine record names. A manager that
-    /// does not answer is "host silent", and the job is not run here instead.
+    /// `job.run` to the manager the local machine record names, the default
+    /// since wsp-056. A manager that does not answer is "host silent", and
+    /// the job is not run here instead.
+    #[default]
     Manager,
 }
 
 impl JobsChoice {
-    /// `None` and the empty string are the default, [`JobsChoice::Inproc`].
+    /// `None` and the empty string are the default, [`JobsChoice::Manager`]
+    /// (wsp-056); `inproc` is the rollback.
     pub fn parse(value: Option<&str>) -> std::result::Result<JobsChoice, HostError> {
         match value.map(str::trim) {
-            None | Some("") | Some("inproc") => Ok(JobsChoice::Inproc),
-            Some("manager") => Ok(JobsChoice::Manager),
+            None | Some("") | Some("manager") => Ok(JobsChoice::Manager),
+            Some("inproc") => Ok(JobsChoice::Inproc),
             Some(other) => Err(HostError::JobsChoice(other.to_string())),
         }
     }
