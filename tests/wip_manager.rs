@@ -138,8 +138,21 @@ fn wip_under_the_manager_runs_no_probe_and_a_stopped_manager_reads_silent() {
     // One seat the manager runs.
     let tcp = Tcp::new(local.socket(), token, wsp_host_api::Role::Cli, "test");
     let args: Vec<String> = vec![];
-    let spawn = Spawn { key: wsp_host_api::Key { row: wsp_host_api::RowId("wsp-027".into()), attempt: 0 }, seat: "cpd-wm1", kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "true", args: &args };
-    let session = tcp.spawn_session(&spawn).expect("the manager spawns the seat");
+    // The manager gives the fake sup `HANDSHAKE` (5 s) to announce its socket
+    // and refuses the seat past that, which a machine oversubscribed several
+    // times over overruns: spawned again, as a next attempt, bounded generously.
+    let spawn_deadline = Instant::now() + Duration::from_secs(120);
+    let mut attempt = 0;
+    let session = loop {
+        let spawn = Spawn { key: wsp_host_api::Key { row: wsp_host_api::RowId("wsp-027".into()), attempt }, seat: "cpd-wm1", kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "true", args: &args };
+        match tcp.spawn_session(&spawn) {
+            Ok(session) => break session,
+            Err(e) => {
+                assert!(Instant::now() < spawn_deadline && attempt < 30, "the manager spawns the seat: {e:?}");
+                attempt += 1;
+            }
+        }
+    };
 
     // Under the manager: the seat, and no probe.
     // `wip` gives the manager `SILENT` (1 s) to answer and reads it silent
