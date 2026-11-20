@@ -1356,7 +1356,7 @@ built from this tree.
 | `throttle run` wall per build (exit 0, ≥ 10 s), p50 | — | no worse | 1 run, 28.1 s | 24.2 s (338 runs), p95 88.4 s | **owed** (full day) |
 | spawn p50 | 9.4 s | ≤ 9.4 s | 1 spawn, 0.89 s | 1.02 s (213), p95 3.12 s | **owed** (full day) |
 | tick p50 / p95 | 19.5 s / 116 s | — | 80 ms / 807 ms | 23 ms / 954 ms | — |
-| `WSP_JOBS=inproc` runs a `wsp check` in-process | — | shown once | holds (`rollback.sh`) | — | met |
+| `WSP_JOBS=inproc` runs a `wsp check` in-process | — | shown once | the step: holds (`rollback.sh`); the step's cargo: goes to the manager | — | **partly met** |
 
 How each was taken, and the cause of each miss:
 - **`lsof`, `ps` and `kill`** are the children recorded on each record's `children`. These are counted for
@@ -1437,7 +1437,15 @@ How each was taken, and the cause of each miss:
   its ancestors to be either `wsp-manager` or `wsp check`. With `WSP_JOBS=inproc`, the manager's journal gained
   no job, and the step's log is under the sandbox's `<state>/inproc/jobs`. Its first such ancestor is `wsp
   check <row> --at …` itself. Both runs exited 0. The manager was then ended, along with anything naming the
-  sandbox, and the sandbox was removed. **It holds**, 6 checks of 6 (`rollback/run.log`).
+  sandbox, and the sandbox was removed. **It holds**, 6 checks of 6 (`rollback/run.log`, the run at
+  12:21:33Z).
+
+  **But the rollback does not reach the cargo a step runs.** check.rs removes every `WSP_*` variable from
+  a step's environment, so the cargo shim inside the step reads `WSP_JOBS` as unset, which means `manager`.
+  `rollback.sh` prints this as the step's `WSP_JOBS=unset`. Live, `WSP_JOBS=inproc wsp check wsp-058 --at
+  58f7f6f` ran its steps in-process, and its `build` step's cargo went to the manager. The manager refused it
+  with exit 126, since the shared check tree is outside the root (wsp-361; `check-inproc-wsp-058.txt`). A
+  rollback taken because the manager is down would still send every check's build to it. Filed as wsp-362.
 
 **Against the done-when line** (window 2026-11-20T12:08:12Z, 0.14 h, on the M3 trunk's `wsp` and a stale
 manager):
@@ -1455,8 +1463,9 @@ manager):
   p50). Builds from outside the tree root, and `wsp check` in the shared check tree, are not run at all
   (wsp-361).
 - **Spawn p50 ≤ 9.4 s: owed.** There was 1 spawn (0.89 s), against 1.02 s the day before.
-- **The rollback works: met.** `WSP_JOBS=inproc` ran a `wsp check` in-process on a sandbox row, with a
-  manager present and unused, and the script ended the sandbox itself.
+- **The rollback works: partly met.** `WSP_JOBS=inproc` ran a `wsp check` in-process on a sandbox row, with a
+  manager present and unused, and the script ended the sandbox itself. But a step's own cargo still goes to
+  the manager, because the step's environment drops `WSP_JOBS` (wsp-362).
 
 Filed from here:
 - wsp-360: the figures owed. That is a full 24 h on the trunk's `wsp` *and* manager, no earlier than 24 h
@@ -1464,6 +1473,7 @@ Filed from here:
   incidents with `pgids.py` beside it, on 2026-11-27T12:08Z. It comes after wsp-324.
 - wsp-361 (high): under `WSP_JOBS=manager`, work outside the manager's tree root is refused and not run. That
   covers `wsp check` in the shared check tree, and `throttle run` in a seat's scratch or the home directory.
+- wsp-362 (high): `WSP_JOBS=inproc` does not reach a check step's cargo.
 - On wsp-324, a note that it bit again at M3.
 
 M4 is broken down by the governor once this row is done (d1 Q14).
