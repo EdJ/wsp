@@ -242,7 +242,7 @@ fn masked(out: &Output) -> String {
     let json: Value = serde_json::from_str(&text).unwrap();
     let load = &json["load"];
     assert!(json.get("load").is_some(), "no load key: {json}");
-    assert!(load.is_null() || load.as_str().is_some_and(|l| l.starts_with("load is ")), "load is not a load line: {load}");
+    assert!(load.is_null() || load.as_str().is_some_and(is_warning_line), "load is not a warning line: {load}");
     let mem = &json["idle_memory"];
     assert!(
         mem["over"].is_boolean() && mem["panes"].is_array() && mem["total_kb"].is_u64() && mem["unread"].is_u64() && mem["warn_kb"].is_u64(),
@@ -269,6 +269,30 @@ fn masked(out: &Output) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// The `load` key is `Throttle::warning()`: the load sentence, the thermal
+/// sentence, or both joined by "; " with the load first. So a well-formed line
+/// opens with one of the two sentences and carries more than the opening.
+fn is_warning_line(line: &str) -> bool {
+    const LOAD: &str = "load is ";
+    const THERMAL: &str = "the CPU is thermally limited to ";
+    match line.strip_prefix(LOAD) {
+        Some(rest) => !rest.is_empty(),
+        None => line.strip_prefix(THERMAL).is_some_and(|rest| !rest.is_empty()),
+    }
+}
+
+#[test]
+fn the_load_key_accepts_every_sentence_warning_can_produce() {
+    let load = "load is 12.3 (1m) and 11.0 (5m) on 8 cores, over 1.5x for a while — hold off heavy runs; no wsp-run build is among it";
+    let thermal = "the CPU is thermally limited to 70% of its clock (under 80%), so builds are held to 1 at once and 2 jobs each in every mode — more parallel builds add heat and finish fewer; fewer agents at once would help: `wsp machine set seat agents=2`";
+    assert!(is_warning_line(load), "the load sentence");
+    assert!(is_warning_line(thermal), "the thermal sentence");
+    assert!(is_warning_line(&format!("{load}; {thermal}")), "the two joined");
+    for bad in ["", "load is ", "the CPU is thermally limited to ", "cpu clock 70%", "3.2"] {
+        assert!(!is_warning_line(bad), "accepted {bad:?}");
+    }
 }
 
 /// An agent's `held` and its wait's `line` count whole seconds since a moment
