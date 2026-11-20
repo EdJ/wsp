@@ -7,8 +7,8 @@
 //!
 //! - under `WSP_HOST=manager` there is no `ps`, `lsof`, `compound-render` or
 //!   `df` among them, and the seat the manager runs is in the answer;
-//! - under `WSP_HOST=inproc` the same call does run `ps`, so the log is seen
-//!   to count what it should;
+//! - under `WSP_HOST=inproc` the manager is the `wsp` process's own, so the
+//!   log is seen to count the children its readings run;
 //! - with the manager stopped, `wip` under `manager` says the manager is
 //!   unreachable rather than answering with nothing, still within the second
 //!   and still with none of those children;
@@ -160,9 +160,14 @@ fn wip_under_the_manager_runs_no_probe_and_a_stopped_manager_reads_silent() {
     assert!(json["unreachable"].is_null(), "the manager answered: {json}");
     assert!(took < Duration::from_secs(10), "{took:?}");
 
-    // In process: the same call does run `ps`, so the log counts children.
+    // In process: the manager runs in the `wsp` process itself (wsp-030) and
+    // `wip` reads it as it reads any manager, so the call asks for no probe of
+    // its own; what the log is seen to count is the children that manager's
+    // own readings run (host facts: `df`, `sysctl`, `vm_stat`), which the call
+    // under the installed manager does not run. It runs no `ps` here for want
+    // of a seat of its own to read.
     let (inproc, kids, _) = wip(&state, "inproc");
-    assert!(ran(&kids, &["ps"]) == ["ps"], "wip in process runs ps: {kids}");
+    assert!(ran(&kids, &["df", "sysctl", "vm_stat"]).len() > 0, "wip in process counts the children it runs: {kids}");
     // The shape is the same: the keys the UI polls are there under both.
     let (k_mgr, k_in) = (keys(&json), keys(&inproc));
     assert_eq!(k_mgr, k_in, "the json's keys under manager and inproc");
