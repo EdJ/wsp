@@ -1,5 +1,6 @@
 {
   "_comment": "Written per row under wsp's state and passed to a member seat's Claude Code with --settings (wsp-681), <row> replaced by its own row. Auto mode's classifier denied members `wsp check <row> --set` (an agent rewriting the checks that judge its own work), so every row whose check line needed a budget, a cd or a narrower path blocked on Ed. The rule allows the call on the seat's own row only; wsp itself decides what of the change a member may make and logs each change for the verifier.",
+  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command finds the script in the checkout or, on an executor, in ~/.claude/hooks; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
   "permissions": {
     "allow": [
       "Bash(wsp check <row> --set:*)"
@@ -9,6 +10,20 @@
     "allow": [
       "$defaults",
       "`wsp check <row> --set --why \"…\"` on the seat's own row <row> is authorised by Ed: wsp itself lets a member only raise a step's budget, add or correct a leading `cd <dir> &&`, narrow a step to the files its commits touched, or add a step, refuses deleting a step, lowering a budget or replacing a command, and logs every change with its reason where the row's verifier reads it."
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/claude/wsp/claude-code/wsp-session.sh\"; [ -f \"$f\" ] || f=\"$HOME/.claude/hooks/wsp-session.sh\"; exec sh \"$f\" PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

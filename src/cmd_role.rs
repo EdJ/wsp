@@ -47,6 +47,7 @@ pub(crate) const RETRO_SETTINGS: &str = include_str!("../claude-code/retro.setti
 /// The settings a member seat is started with, `<row>` its own row (wsp-681).
 pub(crate) const MEMBER_SETTINGS: &str = include_str!("../claude-code/member.settings.json");
 const RETRO_FILE: &str = "wsp-retro.settings.json";
+const GUARD_FILE: &str = "wsp-seat.settings.json";
 const PRIMARY_FILE: &str = "wsp-primary.settings.json";
 const GOVERNOR_FILE: &str = "wsp-governor.settings.json";
 
@@ -968,13 +969,48 @@ pub(crate) fn seat_spawn_args(kind: &str, member_row: Option<&str>, verifying: b
     vec!["--settings".into(), path.display().to_string()]
 }
 
-/// What a spawn adds for a retro seat: the settings pair when the row is
-/// tagged `retro` and the seat is not its verifier, nothing otherwise.
+/// What a spawn adds for a seat that is no member: a retro seat's settings
+/// when the row is tagged `retro` and the seat is not its verifier, and for any
+/// other Claude seat (a verifier, a check's or a leg's seat) the guard settings,
+/// so that every seat runs the Bash kill guard (wsp-691).
 pub(crate) fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
     match retro_wanted(verifying, row_tags) {
         true => retro_settings_args(kind, state),
-        false => Vec::new(),
+        false => guard_settings_args(kind, state),
     }
+}
+
+/// The settings of a seat with no role file of its own (wsp-691): the hooks
+/// every role file holds, which is the PreToolUse kill guard, and nothing else.
+/// On 2026-11-19 a verifier, which was started with no `--settings` at all, ran
+/// the `pkill -f "scripts/check.mjs" -P 0` that ended every session.
+pub(crate) fn guard_settings() -> String {
+    let member: Value = serde_json::from_str(MEMBER_SETTINGS).unwrap_or_else(|_| json!({}));
+    let v = json!({
+        "_comment": "Written by wsp under its state and passed with --settings to a Claude seat that has no role file of its own: a verifier, a check's seat, a leg's (wsp-691). It holds only the hooks every role file holds, the Bash kill guard.",
+        "hooks": member.get("hooks").cloned().unwrap_or_else(|| json!({})),
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+}
+
+/// The argument pair for the guard settings, written under `state` when it is
+/// missing or differs; nothing for an agent that is not Claude, or when the
+/// file cannot be written.
+pub(crate) fn guard_settings_args(kind: &str, state: &std::path::Path) -> Vec<String> {
+    if kind != "claude" {
+        return Vec::new();
+    }
+    let path = state.join("claude-code").join(GUARD_FILE);
+    let body = guard_settings();
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, &body).is_err() {
+            return Vec::new();
+        }
+    }
+    vec!["--settings".into(), path.display().to_string()]
 }
 
 pub const VERBS: &[crate::verbs::Verb] = &[
@@ -1286,8 +1322,9 @@ mod tests {
         assert!(!retro_wanted(false, &[]));
         let state = std::env::temp_dir().join(format!("wsp-retro-args-{}", std::process::id()));
         assert!(retro_spawn_args("opencode", false, &retro, &state).is_empty());
-        assert!(retro_spawn_args("claude", true, &retro, &state).is_empty());
-        assert!(retro_spawn_args("claude", false, &["wsp".to_string()], &state).is_empty());
+        assert_eq!(retro_spawn_args("claude", true, &retro, &state), guard_settings_args("claude", &state), "its verifier gets the guard");
+        assert_eq!(retro_spawn_args("claude", false, &["wsp".to_string()], &state), guard_settings_args("claude", &state));
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -1329,11 +1366,48 @@ mod tests {
         let args = seat_spawn_args("claude", Some("wsp-9"), false, &[], &state);
         assert_eq!(args, ["--settings".to_string(), member_settings_path(&state, "wsp-9").display().to_string()]);
         assert_eq!(std::fs::read_to_string(member_settings_path(&state, "wsp-9")).unwrap(), member_settings("wsp-9", false));
-        assert!(seat_spawn_args("claude", Some("wsp-9"), true, &[], &state).is_empty(), "a verifier is no member");
-        assert!(seat_spawn_args("claude", None, false, &[], &state).is_empty(), "no member row, no file");
+        let guard = guard_settings_args("claude", &state);
+        assert_eq!(seat_spawn_args("claude", Some("wsp-9"), true, &[], &state), guard, "a verifier is no member: the guard alone");
+        assert_eq!(seat_spawn_args("claude", None, false, &[], &state), guard, "no member row: the guard alone");
         assert!(seat_spawn_args("opencode", Some("wsp-9"), false, &[], &state).is_empty());
         let retro = vec!["retro".to_string()];
         assert_eq!(seat_spawn_args("claude", None, false, &retro, &state), retro_settings_args("claude", &state), "a retro seat as before");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// wsp-691: every seat's settings run the Bash kill guard, and the guard
+    /// itself refuses the 11-19 command (claude-code/test-kill-guard.sh).
+    #[test]
+    fn every_seats_settings_run_the_kill_guard_on_bash() {
+        let guard_of = |s: &str| -> String {
+            let v: Value = serde_json::from_str(s).unwrap();
+            let e = &v["hooks"]["PreToolUse"][0];
+            assert_eq!(e["matcher"], "Bash", "{s}");
+            e["hooks"][0]["command"].as_str().unwrap().to_string()
+        };
+        let snippet = include_str!("../claude-code/settings.snippet.json");
+        let want = guard_of(snippet);
+        assert!(want.contains("wsp-session.sh") && want.ends_with("PreToolUse"), "{want}");
+        for body in [PRIMARY_SETTINGS, GOVERNOR_SETTINGS, RETRO_SETTINGS, MEMBER_SETTINGS] {
+            assert_eq!(guard_of(body), want);
+        }
+        assert_eq!(guard_of(&member_settings("wsp-9", true)), want);
+        assert_eq!(guard_of(&guard_settings()), want);
+        let state = std::env::temp_dir().join(format!("wsp-guard-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = guard_settings_args("claude", &state);
+        assert_eq!(args[0], "--settings");
+        assert_eq!(std::fs::read_to_string(&args[1]).unwrap(), guard_settings());
+        assert!(guard_settings_args("opencode", &state).is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_kill_guard_shell_tests_pass() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let out = std::process::Command::new("sh").arg(format!("{dir}/claude-code/test-kill-guard.sh")).output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("cases pass"), "{said}");
     }
 }

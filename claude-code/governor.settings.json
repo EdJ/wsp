@@ -1,5 +1,6 @@
 {
   "_comment": "Passed to each governor seat's Claude Code with --settings (wsp-473). wsp refuses a despawn or reap outside the governor's own list and names the scope it would have needed. `wsp check --set` (wsp-681): wsp refuses it on a row outside the governor's list and logs every change for the verifier; autoMode.allow is the classifier's own rule, which a permission alone does not reach.",
+  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command finds the script in the checkout or, on an executor, in ~/.claude/hooks; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
   "permissions": {
     "allow": [
       "Bash(wsp despawn:*)",
@@ -11,6 +12,20 @@
     "allow": [
       "$defaults",
       "`wsp check <row> --set --why \"…\"` by a governor on a row of the list it governs is authorised by Ed: wsp refuses it on any other row and logs every change with its reason where the row's verifier and the barrier read it."
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/claude/wsp/claude-code/wsp-session.sh\"; [ -f \"$f\" ] || f=\"$HOME/.claude/hooks/wsp-session.sh\"; exec sh \"$f\" PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

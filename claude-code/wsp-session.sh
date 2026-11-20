@@ -12,11 +12,268 @@
 # already wired into somebody's settings.json.
 #
 # Everything here is best-effort: a hook that fails a session, or delays one, is
-# a hook that gets deleted within a week. Every path exits 0.
+# a hook that gets deleted within a week. Every path exits 0, but one: the kill
+# guard below (PreToolUse) exits 2 to refuse a command that would signal half
+# the machine.
 
 set -eu
 
 action="${1:-}"
+
+# PreToolUse on Bash: the kill guard (wsp-691), and the one path here that can
+# say no. On macOS `pkill`, `pgrep` and `killall` use BSD getopt, which stops at
+# the first non-option, so every word after the first pattern is one more
+# pattern: on 2026-11-19 a verifier's `pkill -f "scripts/check.mjs" -P 0` meant
+# "check.mjs, or -P, or 0", matched nearly every process on the machine and
+# ended every Claude session on it within ten seconds.
+#
+# Refused, with exit 2 and the reason on stderr (which Claude Code shows the
+# agent instead of running the command):
+#   - `pkill`/`killall`, or a `pgrep` in a command that also runs `kill` (`pgrep
+#     … | xargs kill`, `kill $(pgrep …)`), with any option after the first
+#     pattern;
+#   - one of them naming a bare common name: claude, node, wsp, compound-sup,
+#     compound-render, cargo;
+#   - a `pkill` (or killing `pgrep`) pattern shorter than 4 characters, unless
+#     `-x` makes it exact;
+#   - a `pkill` or `killall` with no pattern and nothing that narrows it to a
+#     pidfile, a parent other than 0 or 1, a process group or a tty (`pkill -u
+#     me` is every process you own).
+# Looked through: `VAR=x`, sudo, env, nice, nohup, timeout, xargs, command,
+# exec, `sh -c '…'` and `eval`. Everything else, `kill $(cat pidfile)` and
+# `pkill -f "vite --port 5199"` included, runs.
+#
+# Every session is guarded, seated or not: the machine is everybody's. A
+# command with no `kill` in it costs one `cat` and a `case`. Anything that
+# fails to read is allowed: the guard is for the slip, not for an adversary.
+# Tested by claude-code/test-kill-guard.sh.
+if [ "$action" = PreToolUse ]; then
+  payload="$(cat 2>/dev/null || true)"
+  case "$payload" in *kill*) ;; *) exit 0 ;; esac
+  why="$(printf '%s' "$payload" | awk '
+function base(p) { sub(/.*\//, "", p); return p }
+
+function hexval(h,   i, v, c) {
+  v = 0
+  for (i = 1; i <= length(h); i++) {
+    c = index("0123456789abcdef", tolower(substr(h, i, 1)))
+    if (c == 0) return 63
+    v = v * 16 + c - 1
+  }
+  return v
+}
+
+# The Bash tool input'"'"'s `command`, as the JSON string unescaped.
+function json_command(s,   i, rest, out, c, n, v) {
+  i = index(s, "\"tool_input\"")
+  if (i == 0) return ""
+  rest = substr(s, i)
+  if (!match(rest, /"command"[ \t\r\n]*:[ \t\r\n]*"/)) return ""
+  rest = substr(rest, RSTART + RLENGTH)
+  out = ""; n = length(rest)
+  for (i = 1; i <= n; i++) {
+    c = substr(rest, i, 1)
+    if (c == "\"") break
+    if (c == "\\") {
+      i++; c = substr(rest, i, 1)
+      if (c == "n") c = "\n"
+      else if (c == "t") c = "\t"
+      else if (c == "r") c = "\r"
+      else if (c == "b" || c == "f") c = " "
+      else if (c == "u") { v = hexval(substr(rest, i + 1, 4)); i += 4; c = (v > 0 && v < 128) ? sprintf("%c", v) : "?" }
+    }
+    out = out c
+  }
+  return out
+}
+
+# Shell words and separators: typ "w" a word, "s" a separator (; & | ( ) `
+# newline, and $( ), "r" a redirection, whose target word is not an argument.
+function tokenize(s, tok, typ,   n, i, c, q, w, have, nx, L) {
+  n = 0; w = ""; have = 0; q = ""; L = length(s)
+  for (i = 1; i <= L; i++) {
+    c = substr(s, i, 1)
+    if (q == "\047") { if (c == "\047") q = ""; else w = w c; continue }
+    if (q == "\"") {
+      if (c == "\"") { q = ""; continue }
+      if (c == "\\") {
+        nx = substr(s, i + 1, 1)
+        if (nx == "\\" || nx == "\"" || nx == "$" || nx == "`") { w = w nx; i++; continue }
+        if (nx == "\n") { i++; continue }
+      }
+      w = w c; continue
+    }
+    if (c == "\\") { nx = substr(s, i + 1, 1); i++; if (nx != "\n") { w = w nx; have = 1 }; continue }
+    if (c == "\047" || c == "\"") { q = c; have = 1; continue }
+    if (c == " " || c == "\t" || c == "\r") { if (have) { tok[++n] = w; typ[n] = "w"; w = ""; have = 0 }; continue }
+    if (c == "#" && !have) { while (i <= L && substr(s, i, 1) != "\n") i++; i--; continue }
+    if (c == "<" || c == ">") {
+      if (have && w ~ /^[0-9]+$/) { w = ""; have = 0 }
+      if (have) { tok[++n] = w; typ[n] = "w"; w = ""; have = 0 }
+      tok[++n] = c; typ[n] = "r"; continue
+    }
+    if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")" || c == "`" || c == "\n" || (c == "$" && substr(s, i + 1, 1) == "(")) {
+      if (have) { tok[++n] = w; typ[n] = "w"; w = ""; have = 0 }
+      if (c == "$") i++
+      tok[++n] = c; typ[n] = "s"; continue
+    }
+    w = w c; have = 1
+  }
+  if (have) { tok[++n] = w; typ[n] = "w" }
+  return n
+}
+
+function common(a) {
+  return a == "claude" || a == "node" || a == "wsp" || a == "compound-sup" || a == "compound-render" || a == "cargo"
+}
+
+function pidwise() {
+  return "Kill by pid instead: `kill $(cat <pidfile>)` for what you started (`echo $! > <pidfile>`), or the pids `lsof -t -i :<port>` or `lsof -t +D <dir>` gives."
+}
+
+function after(name, pat, opt) {
+  return "wsp refused this command: `" name "` stops reading options at its first pattern on macOS (BSD getopt), so `" opt "` after `" pat "` is read as one more pattern, which matches nearly every process on the machine. On 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on it. Put every option before the pattern (`" name " -P <ppid> -f \"<pattern>\"`). " pidwise()
+}
+
+function bare(name, a) {
+  return "wsp refused this command: `" name " " a "` stops every " a " on the machine, every other seat'"'"'s included. " pidwise()
+}
+
+function short(name, a) {
+  return "wsp refused this command: the `" name "` pattern `" a "` is under 4 characters and matches far more than your process. Name it by something only it has (`pkill -f \"vite --port 5199\"`), or: " pidwise()
+}
+
+function unnarrowed(name) {
+  return "wsp refused this command: `" name "` with no pattern, a pidfile, a parent, a process group or a tty matches every process it is allowed to signal. " pidwise()
+}
+
+# Whether option `o` of wrapper `b` takes the next word as its value.
+function valued(b, o) {
+  if (b == "sudo" || b == "doas") return o ~ /^-[ugCchpU]$/
+  if (b == "env") return o ~ /^-[uPS]$/
+  if (b == "nice") return o == "-n"
+  if (b == "timeout" || b == "gtimeout") return o ~ /^-[sk]$/
+  if (b == "xargs") return o ~ /^-[IJLnPsEdRS]$/
+  return 0
+}
+
+# pkill or pgrep from word i on: "" or why it is refused.
+function pk(w, nw, i, name,   j, a, dd, seen, k, ch, letters, exact, narrow, nxt) {
+  dd = 0; seen = ""; exact = 0; narrow = 0
+  for (j = i + 1; j <= nw; j++) {
+    a = w[j]
+    if (!dd && a == "--") { dd = 1; continue }
+    if (!dd && a ~ /^-./) {
+      if (seen != "") return after(name, seen, a)
+      if (a ~ /^--/) {
+        if (a ~ /^--(parent|pidfile|pgroup|terminal)/) narrow = 1
+        if (a !~ /=/ && a ~ /^--(signal|parent|pgroup|session|terminal|euid|uid|group|pidfile|ns|nslist|older|newer|runstates|cgroup)$/) j++
+        if (a == "--exact") exact = 1
+        continue
+      }
+      if (a ~ /^-[0-9]+$/ || (length(a) > 2 && a ~ /^-[A-Z][A-Z0-9]+$/)) continue
+      letters = substr(a, 2)
+      for (k = 1; k <= length(letters); k++) {
+        ch = substr(letters, k, 1)
+        if (ch == "x") exact = 1
+        if (index("FGMNPUgtucsJ", ch)) {
+          nxt = (k == length(letters)) ? w[j + 1] : substr(letters, k + 1)
+          if (ch == "F" || ch == "g" || ch == "t" || (ch == "P" && nxt != "0" && nxt != "1")) narrow = 1
+          if (k == length(letters)) j++
+          break
+        }
+      }
+      continue
+    }
+    if (seen == "") seen = a
+    if (common(a)) return bare(name, a)
+    if (length(a) < 4 && !exact) return short(name, a)
+  }
+  if (seen == "" && !narrow && name == "pkill") return unnarrowed(name)
+  return ""
+}
+
+function ka(w, nw, i,   j, a, dd, seen, k, ch, letters) {
+  dd = 0; seen = ""
+  for (j = i + 1; j <= nw; j++) {
+    a = w[j]
+    if (!dd && a == "--") { dd = 1; continue }
+    if (!dd && a ~ /^-./) {
+      if (seen != "") return after("killall", seen, a)
+      if (a ~ /^--/) { if (a !~ /=/ && a ~ /^--(signal|user|older-than|younger-than|ns|context)$/) j++; continue }
+      if (a == "-help" || a ~ /^-[0-9]+$/ || (length(a) > 2 && a ~ /^-(SIG)?[A-Z][A-Z0-9]+$/)) continue
+      letters = substr(a, 2)
+      for (k = 1; k <= length(letters); k++) {
+        ch = substr(letters, k, 1)
+        if (index("utcoynZ", ch)) { if (k == length(letters)) j++; break }
+      }
+      continue
+    }
+    if (seen == "") seen = a
+    if (common(a)) return bare("killall", a)
+  }
+  if (seen == "") return unnarrowed("killall")
+  return ""
+}
+
+# One simple command, words 1..nw: "" or why it is refused.
+function simple(w, nw, haskill, depth,   i, h, b, j, sc) {
+  i = 1
+  while (i <= nw) {
+    h = w[i]; b = base(h)
+    if (h ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { i++; continue }
+    if (h == "!" || h == "{" || h == "}" || h == "if" || h == "then" || h == "do" || h == "else" || h == "elif" || h == "while" || h == "until" || h == "time" || h == "command" || h == "builtin" || h == "exec" || h == "nohup") { i++; continue }
+    if (b == "sudo" || b == "doas" || b == "env" || b == "nice" || b == "timeout" || b == "gtimeout" || b == "xargs" || b == "caffeinate") {
+      i++
+      while (i <= nw && w[i] ~ /^-/) { if (valued(b, w[i])) i++; i++ }
+      if ((b == "timeout" || b == "gtimeout") && i <= nw) i++
+      continue
+    }
+    break
+  }
+  if (i > nw) return ""
+  b = base(w[i])
+  if (b == "pkill") return pk(w, nw, i, "pkill")
+  if (b == "pgrep") return haskill ? pk(w, nw, i, "pgrep") : ""
+  if (b == "killall") return ka(w, nw, i)
+  if ((b == "sh" || b == "bash" || b == "zsh" || b == "dash" || b == "ksh") && depth < 4) {
+    for (j = i + 1; j < nw; j++) {
+      if (w[j] !~ /^-/) break
+      if (w[j] ~ /^-[a-zA-Z]*c[a-zA-Z]*$/) return check(w[j + 1], depth + 1)
+    }
+  }
+  if (b == "eval" && depth < 4) {
+    sc = ""
+    for (j = i + 1; j <= nw; j++) sc = sc " " w[j]
+    return check(sc, depth + 1)
+  }
+  return ""
+}
+
+function check(s, depth,   tok, typ, n, i, haskill, words, nw, r, skip) {
+  n = tokenize(s, tok, typ)
+  haskill = 0
+  for (i = 1; i <= n; i++) if (typ[i] == "w" && base(tok[i]) == "kill") haskill = 1
+  nw = 0; skip = 0
+  for (i = 1; i <= n + 1; i++) {
+    if (i <= n && typ[i] == "w") { if (skip) { skip = 0; continue }; words[++nw] = tok[i]; continue }
+    if (i <= n && typ[i] == "r") { skip = 1; continue }
+    if (nw > 0) { r = simple(words, nw, haskill, depth); if (r != "") return r }
+    nw = 0; skip = 0
+  }
+  return ""
+}
+
+{ doc = doc $0 "\n" }
+END {
+  cmd = json_command(doc)
+  if (cmd != "") { r = check(cmd, 0); if (r != "") print r }
+}
+' 2>/dev/null || true)"
+  [ -n "$why" ] || exit 0
+  printf '%s\n' "$why" >&2
+  exit 2
+fi
 
 # The reporting hooks fire several times a turn, in every Claude Code on this
 # machine, most of which are in a herdr pane and are none of wsp's business. So
