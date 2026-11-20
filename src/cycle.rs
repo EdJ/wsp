@@ -310,6 +310,15 @@ pub(crate) trait Seats {
     fn end_exit_when_idle(&self, _store: &Store, _seat: &str) -> Result<(), String> {
         Ok(())
     }
+
+    /// Fold what was typed at `scope`'s seat and never confirmed, so a successor
+    /// is not handed the payload its predecessor refused —
+    /// `wake::fold_what_was_typed` (`wsp-694`). How many were folded. **Does
+    /// nothing by default**, for [`Seats::rotate`]'s reason: the spool is the
+    /// seats layer's, and a fake has none to fold.
+    fn fold_typed(&self, _store: &Store, _scope: &str) -> usize {
+        0
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own

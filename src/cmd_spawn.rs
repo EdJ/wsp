@@ -5745,6 +5745,10 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         rotate_on_behalf(store, scope)
     }
 
+    fn fold_typed(&self, store: &Store, scope: &str) -> usize {
+        crate::wake::fold_what_was_typed(store, scope)
+    }
+
     fn end_when_idle(&self, store: &Store, seat: &str) -> Result<(), String> {
         end_seat_when_idle(store, seat)
     }
