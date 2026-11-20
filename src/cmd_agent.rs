@@ -3895,8 +3895,8 @@ fn silent_lines(store: &Store) -> Vec<String> {
 }
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
-    // Through the API unless `WSP_READ=files`; a silent or failed dial reads
-    // the files and says why, once (wsp-076).
+    // The files unless `WSP_READ=api`; a silent or failed dial reads the files
+    // and says why, once (wsp-076).
     let api = match wip_reads_api() {
         false => None,
         true => match api_state(store) {
@@ -4508,10 +4508,12 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
 /// 4.6 (c)).
 const API_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Whether `wip` reads through the API: `WSP_READ=files` is the files path
-/// and never dials (step 1's rollback); unset, `api` or anything else dials.
+/// Whether `wip` reads through the API: only under `WSP_READ=api`. Unset or
+/// anything else is the files path and never dials, because on a full store the
+/// API path costs about five times the files' CPU until it meets state-core's
+/// step 1 bar.
 fn wip_reads_api() -> bool {
-    std::env::var("WSP_READ").map(|v| v.trim() != "files").unwrap_or(true)
+    std::env::var("WSP_READ").is_ok_and(|v| v.trim() == "api")
 }
 
 /// One `state` through the API, dialled within [`API_BUDGET`], or why not:

@@ -287,13 +287,13 @@ fn elapsed_masked(line: &str) -> Option<String> {
     None
 }
 
-/// The throttle line with the person's idle seconds masked (`idle 3s`, `away
-/// 2h`): the files path reads them from `ioreg` at its call and the api path
-/// from the manager's last beat, so the number may move between the two; the
-/// in-force/away word around it is kept.
+/// The throttle line with the person's idle seconds (`idle 3s`, `away 2h`) and
+/// the CPU clock (`cpu clock 75%`) masked: the files path reads them at its call
+/// and the api path from the manager's last beat, so either may move between
+/// the two; the in-force/away word around them is kept.
 fn idle_masked(line: &str) -> String {
     let mut out = line.to_string();
-    for (open, close) in [("(idle ", ")"), ("away ", " (back")] {
+    for (open, close) in [("(idle ", ")"), ("away ", " (back"), ("cpu clock ", "%")] {
         if let Some(i) = out.find(open) {
             let from = i + open.len();
             if let Some(n) = out[from..].find(close) {
