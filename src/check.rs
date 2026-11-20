@@ -99,6 +99,7 @@ use crate::util::{self, Paint};
 use crate::verification::{self as v, Run, RunState};
 use crate::Args;
 use crate::host::Host;
+use crate::host::{HostDir, HostId, JobAt, JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobState};
 
 /// The heading a project or a task lists its checks under.
 pub(crate) const SECTION: &str = "Checks";
@@ -1053,8 +1054,13 @@ pub(crate) fn checkout_started(repo: &Path, tree: &Path, sha: &str) -> Result<St
     Ok(Start::of(tree, seed))
 }
 
-/// One check at a time in a tree: a file beside it holding the pid that has it.
+/// One check at a time in a tree: a file beside it holding the pid that has it,
+/// and under `WSP_JOBS=manager` the job running in the tree.
 pub(crate) struct TreeLock(PathBuf);
+
+/// How long a lock whose job is not running stands before it is stale: the
+/// moment between two steps of a run, with room to spare.
+const HOLD_GRACE: Duration = Duration::from_secs(60);
 
 impl TreeLock {
     pub(crate) fn take(path: PathBuf, wait: Duration) -> Result<TreeLock, String> {
@@ -1110,9 +1116,56 @@ impl TreeLock {
         Self::holder(path).is_some() && !Self::dead(path)
     }
 
-    /// Whether the pid in the lock is gone, which is the only reason to break one.
+    /// Whether the lock's holder is gone, which is the only reason to break
+    /// one. A lock that names a job (`WSP_JOBS=manager`) is read by key from
+    /// the job table of its tree's host's manager, and no process is probed;
+    /// one that names none is its pid's, asked with `kill -0`.
     fn dead(path: &Path) -> bool {
-        Self::dead_by(path, |pid| crate::host::LOCAL.signal(&[pid], "0"))
+        Self::dead_with(
+            path,
+            HOLD_GRACE,
+            |pid| {
+                note_probe("kill");
+                crate::host::LOCAL.signal(&[pid], "0")
+            },
+            jobs_of,
+        )
+    }
+
+    /// [`TreeLock::dead`] with the pid probe, the job table and the grace
+    /// given. A lock naming a job is stale when that job is not running in its
+    /// host's table (ended, or forgotten by a manager that restarted) and the
+    /// lock has not been touched for `grace`: a run touches it as each job is
+    /// sent and as it ends, so the moment between two steps is not stale. A
+    /// table that could not be read keeps the lock, as a probe that could not
+    /// ask does.
+    fn dead_with(path: &Path, grace: Duration, probe: impl Fn(u32) -> Option<bool>, table: impl Fn(&str) -> Option<Vec<JobRow>>) -> bool {
+        let Some((host, key)) = Self::job_of(path) else { return Self::dead_by(path, probe) };
+        let Some(rows) = table(&host) else { return false };
+        if rows.iter().any(|r| key_text(&r.key) == key && r.state == JobState::Running) {
+            return false;
+        }
+        std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().unwrap_or_default() >= grace)
+    }
+
+    /// The job a lock names, as `(host, row/attempt/job)`: the third word of
+    /// its line, `job:<host>:<key>`.
+    fn job_of(path: &Path) -> Option<(String, String)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let named = text.split_whitespace().nth(2)?.strip_prefix("job:")?;
+        let (host, key) = named.split_once(':')?;
+        Some((host.to_string(), key.to_string()))
+    }
+
+    /// Names job `key` on `host` as the holder of the lock at `path`, keeping
+    /// its pid and its since, and touches it. Written beside and renamed over,
+    /// so a reader never sees half a line.
+    pub(crate) fn name_job(path: &Path, host: &str, key: &JobKey) {
+        let (pid, since) = Self::holder(path).unwrap_or_else(|| (std::process::id(), util::now_iso()));
+        let next = path.with_extension("next");
+        if std::fs::write(&next, format!("{pid} {since} job:{host}:{}\n", key_text(key))).is_ok() {
+            let _ = std::fs::rename(&next, path);
+        }
     }
 
     /// [`TreeLock::dead`] with the probe given. Only a definite "not there"
@@ -1135,6 +1188,259 @@ impl Drop for TreeLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+// ---- where a step runs (M3 under T2, wsp-053) -------------------------------
+
+/// Whose tree a job runs in: a row's, or a barrier's (`<list>#<group>`, as a
+/// barrier's job key names it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Whose<'a> {
+    Row(&'a str),
+    Barrier(&'a str),
+}
+
+impl Whose<'_> {
+    fn id(&self) -> &str {
+        match self {
+            Whose::Row(r) | Whose::Barrier(r) => r,
+        }
+    }
+}
+
+/// Which of its trees: the row's own (`work`), the tree its check runs in, the
+/// verifier's, or the barrier's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeKind {
+    Work,
+    Check,
+    /// The verifier's tree: placed here by the verify row (wsp-053 leaves it named).
+    #[allow(dead_code)]
+    Verify,
+    Barrier,
+}
+
+impl TreeKind {
+    fn word(self) -> &'static str {
+        match self {
+            TreeKind::Work => "work",
+            TreeKind::Check => "check",
+            TreeKind::Verify => "verify",
+            TreeKind::Barrier => "barrier",
+        }
+    }
+}
+
+/// Where a job runs, as [`place_of`] answers it: the host-api's [`JobAt`],
+/// which is all a job is given, and the tree as this process reaches it for
+/// what is still done here (the checkout, the lock, "tree missing").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Place {
+    pub at: JobAt,
+    /// The tree on this machine. At M4, when the tree is made on its host by
+    /// `tree.checkout`, this goes, and nothing a job is sent reads it.
+    pub dir: PathBuf,
+    /// The row (or barrier) a job here is keyed under.
+    pub row: String,
+    pub kind: TreeKind,
+}
+
+impl Place {
+    /// The host the place is on.
+    pub(crate) fn host(&self) -> &str {
+        match &self.at {
+            JobAt::Tree(t) => &t.host.0,
+            JobAt::Dir(d) => &d.host.0,
+        }
+    }
+}
+
+/// The host a row's work happens on: the host its seat was spawned on, which
+/// holds its trees under T2 (`docs/agent-manager.md` 6.2, "M3 under T2").
+/// Until rows record their seat's host (M4) every seat is this machine's.
+pub(crate) fn host_of(_whose: Whose<'_>) -> String {
+    util::hostname()
+}
+
+/// The directory a host's manager keeps the trees it runs jobs in under (its
+/// `--tree-root`): the home directory, the manager's default.
+pub(crate) fn tree_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TREE_ROOT.with(|r| r.borrow().clone()) {
+        return root;
+    }
+    util::home()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own tree root, kept to its thread.
+    static TREE_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Where `whose`'s `kind` tree is, as every job sent to it is placed: the one
+/// function the check, the verifier and the barrier take a job's place from,
+/// so none of them joins a path on wsp's machine into a job.
+///
+/// It makes the tree if it is not there. In this row the tree is made here,
+/// on this machine, at `tree` as today (its checkout follows under the lock),
+/// and answered as a [`HostDir`] on the row's host relative to the tree root.
+/// At M4 the body becomes `tree.checkout` on the place's host, `tree` goes,
+/// and no caller moves again.
+pub(crate) fn place_of(whose: Whose<'_>, kind: TreeKind, tree: &Path) -> Result<Place, String> {
+    if !tree.is_dir() {
+        std::fs::create_dir_all(tree).map_err(|e| format!("could not make the {} tree {}: {e}", kind.word(), util::contract(tree)))?;
+    }
+    let root = tree_root();
+    let (Ok(root_real), Ok(real)) = (root.canonicalize(), tree.canonicalize()) else {
+        return Err(format!("the {} tree {} or the tree root {} does not read", kind.word(), util::contract(tree), util::contract(&root)));
+    };
+    let Ok(rel) = real.strip_prefix(&root_real) else {
+        return Err(format!("the {} tree {} is not under the tree root {}", kind.word(), util::contract(tree), util::contract(&root)));
+    };
+    let path = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+    let at = HostDir { host: HostId(host_of(whose)), path };
+    if at.escapes() {
+        return Err(format!("the {} tree {} is the tree root itself or outside it", kind.word(), util::contract(tree)));
+    }
+    Ok(Place { at: JobAt::Dir(at), dir: tree.to_path_buf(), row: whose.id().to_string(), kind })
+}
+
+/// What runs a step: this process, as before M3 (`WSP_JOBS=inproc`, the
+/// default and the rollback), or a host's manager, as one `job.run` per step
+/// (`WSP_JOBS=manager`). The barrier chooses its own in its row.
+pub(crate) enum Runner<'a> {
+    Inproc,
+    Jobs(Jobs<'a>),
+}
+
+/// A run's steps as jobs: the host whose manager runs them, the place they
+/// run in, and the tree lock the run holds, which names the job running.
+pub(crate) struct Jobs<'a> {
+    pub host: &'a dyn crate::host::Host,
+    pub place: Place,
+    pub lock: Option<PathBuf>,
+    /// What makes this run's keys its own (wsp-040): a job key is unique per run.
+    run: String,
+    seq: std::sync::atomic::AtomicU32,
+}
+
+impl<'a> Jobs<'a> {
+    pub(crate) fn new(host: &'a dyn crate::host::Host, place: Place, lock: Option<PathBuf>) -> Jobs<'a> {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        Jobs { host, place, lock, run: format!("{}.{nanos}", std::process::id()), seq: std::sync::atomic::AtomicU32::new(0) }
+    }
+
+    /// `job.run` for `step`: class `check`, at the place, `sh -c` its command
+    /// with wsp's own environment taken off on the argv (the rule of
+    /// `seat.spawn`), bounded by its limit and [`hung_after`].
+    pub(crate) fn run_of(&self, step: &Step) -> JobRun {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let name: String = step.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(40).collect();
+        let job = format!("{}:{name}@{}.{n}", self.place.kind.word(), self.run);
+        let mut argv = vec!["env".to_string()];
+        for (k, _) in std::env::vars() {
+            if k.starts_with("WSP_") || k == "GIT_INDEX_FILE" {
+                argv.extend(["-u".to_string(), k]);
+            }
+        }
+        argv.extend(["--", "sh", "-c"].map(String::from));
+        argv.push(step.command.clone());
+        JobRun {
+            key: crate::host::job_key(&self.place.row, 0, &job),
+            class: JobClass::Check,
+            argv,
+            at: self.place.at.clone(),
+            timeout_secs: step.limit.as_secs().max(1),
+            hung_after_secs: Some(hung_after().as_secs().max(1)),
+            detach: false,
+        }
+    }
+
+    /// The lock names `key` as the job holding the tree, and is touched: once
+    /// as the job is sent and once as it ends, so a lock whose job ended long
+    /// ago is stale and one between two steps is not.
+    fn hold(&self, key: &JobKey) {
+        if let Some(lock) = &self.lock {
+            TreeLock::name_job(lock, self.place.host(), key);
+        }
+    }
+}
+
+impl Runner<'static> {
+    /// What `WSP_JOBS` chooses for a run in `whose`'s `kind` tree at `tree`,
+    /// holding `lock`: `inproc` runs here, as before, and places nothing;
+    /// `manager` takes the place from [`place_of`] and runs on the manager of
+    /// the place's host. A place on a host with no manager (only this
+    /// machine has one until M4) keeps the in-process path. A manager that
+    /// cannot be reached is an error, and nothing is run here in its place.
+    pub(crate) fn chosen(store: &Store, whose: Whose<'_>, kind: TreeKind, tree: &Path, lock: Option<&Path>) -> Result<Runner<'static>, String> {
+        use crate::host::JobsChoice;
+        if JobsChoice::from_env().map_err(|e| e.to_string())? == JobsChoice::Inproc {
+            return Ok(Runner::Inproc);
+        }
+        let place = place_of(whose, kind, tree)?;
+        let managed = crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host);
+        if managed.as_deref() != Some(place.host()) {
+            return Ok(Runner::Inproc);
+        }
+        let host = crate::host::choose_jobs(JobsChoice::Manager, &store.state, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+        Ok(Runner::Jobs(Jobs::new(host, place, lock.map(Path::to_path_buf))))
+    }
+}
+
+/// The job table of `host`'s manager, for a lock or a run named by a job:
+/// `None` where it could not be asked (no manager there, or one that did not
+/// answer), which keeps what it would have freed.
+pub(crate) fn jobs_of(host: &str) -> Option<Vec<JobRow>> {
+    #[cfg(test)]
+    if let Some(table) = JOB_TABLE.with(|t| t.borrow().clone()) {
+        return table;
+    }
+    let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(Store::default_state);
+    let (local, _) = crate::host_tcp::record(&state).ok()?;
+    if local.host != host {
+        return None;
+    }
+    let manager = crate::host::choose_jobs(crate::host::JobsChoice::Manager, &state, env!("CARGO_PKG_VERSION")).ok()?;
+    manager.jobs().ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own job table, kept to its thread: `Some(None)` is a manager
+    /// that could not be asked.
+    static JOB_TABLE: std::cell::RefCell<Option<Option<Vec<JobRow>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether job `key` on `host` is running (`Some(true)`), ended or not in its
+/// manager's table (`Some(false)`), or could not be asked (`None`). The
+/// store's `suite:running` start reads this for a run named by its job
+/// (`checks::Run::gone_by`); the barrier's run is named by its job in the
+/// barrier row, which this one leaves its runner to.
+#[allow(dead_code)]
+pub(crate) fn job_runs(host: &str, key: &str) -> Option<bool> {
+    let table = jobs_of(host)?;
+    Some(table.iter().any(|r| key_text(&r.key) == key && r.state == JobState::Running))
+}
+
+/// A job key as a lock or a store entry writes it: `row/attempt/job`, with no
+/// spaces (a row id and a check's job name have none).
+pub(crate) fn key_text(key: &JobKey) -> String {
+    format!("{}/{}/{}", key.row.0, key.attempt, key.job)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The probes of processes wsp made itself on this thread (`ps`, `kill`,
+    /// `lstart`): what a check under `manager` must leave empty.
+    static PROBES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes a probe of processes wsp makes itself, for the call log a test reads.
+fn note_probe(_what: &'static str) {
+    #[cfg(test)]
+    PROBES.with(|p| p.borrow_mut().push(_what));
 }
 
 // ---- running ----------------------------------------------------------------
@@ -1219,6 +1525,7 @@ thread_local! {
 /// The processes of group `pgid`: (`pid command` lines, their CPU time summed in
 /// hundredths of a second). `None` where `ps` does not answer.
 fn group_of(pgid: u32) -> Option<(Vec<String>, u64)> {
+    note_probe("ps");
     let text = crate::host::LOCAL.table("pid=,pgid=,time=,command=", false)?;
     let (mut lines, mut cpu) = (Vec::new(), 0u64);
     for l in text.lines() {
@@ -1258,14 +1565,98 @@ pub(crate) struct Ran {
     pub reused: Option<Green>,
 }
 
-/// Run one step in `dir`, its output to `log`, killed with its process group
-/// at the limit.
-pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
+/// Run one step in `dir`, its output to `log`, by `runner`: here, killed with
+/// its process group at the limit, or as one `job.run` on a host's manager.
+pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path, runner: &Runner<'_>) -> Ran {
+    match runner {
+        Runner::Inproc => run_here(dir, step, log),
+        Runner::Jobs(jobs) => run_as_job(dir, step, log, jobs),
+    }
+}
+
+/// [`run_step`] as one job (`WSP_JOBS=manager`): `job.run` of class `check`
+/// at the place [`place_of`] gave, its limit the step's and its hung bound
+/// [`hung_after`]. What it writes comes back as `job.output` into `log`, which
+/// the tail and the first error are read from; its timeout and its hang come
+/// from `job.ended`. The manager admits it (no check slot is taken here) and
+/// ends its group; wsp probes no process for it.
+fn run_as_job(dir: &Path, step: &Step, log: &Path, jobs: &Jobs<'_>) -> Ran {
+    use std::io::Write;
+    let start = Instant::now();
+    let failed = |why: String| Ran {
+        step: step.clone(),
+        done: Done::Failed { exit: None, timed_out: false },
+        took: start.elapsed(),
+        tail: why,
+        first: None,
+        reused: None,
+    };
+    if let Some(why) = unparsable(&step.command) {
+        return Ran { done: Done::Malformed(why.clone()), tail: why, ..failed(String::new()) };
+    }
+    if let Some(missing) = tree_missing(dir, step, start) {
+        return missing;
+    }
+    let Ok(mut out) = std::fs::File::create(log) else { return failed(format!("could not write {}", util::contract(log))) };
+    let run = jobs.run_of(step);
+    jobs.hold(&run.key);
+    let ended = jobs.host.run_job(&run, &mut |o: &JobOutput| {
+        let _ = out.write_all(o.text.as_bytes());
+    });
+    jobs.hold(&run.key);
+    drop(out);
+    match ended {
+        Ok(end) => ran_of_job(dir, step, log, &end, start),
+        Err(e) => {
+            if let Some(missing) = tree_missing(dir, step, start) {
+                return missing;
+            }
+            failed(format!("the step was not run as a job on {}: {e}", jobs.place.host()))
+        }
+    }
+}
+
+/// What a step's `job.ended` reads as: the same pass, fail, timeout and hang
+/// a step run here reads as.
+fn ran_of_job(dir: &Path, step: &Step, log: &Path, end: &JobEnded, start: Instant) -> Ran {
+    let ran = |done: Done, tail: String| Ran { step: step.clone(), done, took: start.elapsed(), tail, first: None, reused: None };
+    if end.exit != Some(0) {
+        if let Some(missing) = tree_missing(dir, step, start) {
+            return missing;
+        }
+    }
+    if end.hung {
+        let what = format!("job {} (its group ended by the host's manager)", key_text(&end.key));
+        let tail = format!("hung — no output and no CPU for {}s; {what}", secs(hung_after()));
+        return ran(Done::Hung(what), tail);
+    }
+    let mut tail = tail_of(log);
+    if end.timed_out {
+        return ran(Done::Failed { exit: None, timed_out: true }, tail);
+    }
+    match end.exit {
+        Some(0) => ran(Done::Passed, tail),
+        Some(code) => match failed_to_start(Some(code), &tail) {
+            Some(why) => ran(Done::Malformed(why), tail),
+            None => ran(Done::Failed { exit: Some(code), timed_out: false }, tail),
+        },
+        None => {
+            tail = format!("{tail}\nended by a signal (not by its limit)");
+            ran(Done::Failed { exit: None, timed_out: false }, tail)
+        }
+    }
+}
+
+/// [`run_step`] in this process (`WSP_JOBS=inproc`).
+fn run_here(dir: &Path, step: &Step, log: &Path) -> Ran {
     // `wsp-668`: a check, a verifier's build and a barrier run all come through
     // here, and take one of the machine's check slots before they start: the
     // seat cap holds agents, not what a wide group starts beside them. The wait
     // is not the step's time, and the slot is let go when the step ends.
-    let _slot = (!step.command.trim().is_empty()).then(|| crate::throttle::check_slot_now(dir, &step.command));
+    let _slot = (!step.command.trim().is_empty()).then(|| {
+        note_probe("ps");
+        crate::throttle::check_slot_now(dir, &step.command)
+    });
     let start = Instant::now();
     let failed = |why: String| Ran {
         step: step.clone(),
@@ -1316,6 +1707,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
             Ok(Some(s)) => break Some(s),
             Ok(None) if start.elapsed() > step.limit => {
                 timed_out = true;
+                note_probe("kill");
                 crate::host::LOCAL.signal_group(child.id(), "KILL");
                 break child.wait().ok();
             }
@@ -1328,6 +1720,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
                         quiet_since = Instant::now();
                     } else if quiet_since.elapsed() >= quiet_for {
                         hung = Some(pids.join("\n"));
+                        note_probe("kill");
                         crate::host::LOCAL.signal_group(child.id(), "KILL");
                         break child.wait().ok();
                     }
@@ -1339,6 +1732,7 @@ pub(crate) fn run_step(dir: &Path, step: &Step, log: &Path) -> Ran {
     };
     // `wsp-453`: whatever the step started and left in its group (a Vite
     // server, a Vitest watcher) goes with it, however it ended.
+    note_probe("kill");
     crate::host::LOCAL.signal_group(child.id(), "KILL");
     // The tree went while the step ran: what it said is the missing tree's,
     // not a verdict on the work.
@@ -1400,14 +1794,14 @@ fn tail_of(log: &Path) -> String {
 }
 
 /// Run `steps` in order, stopping at the first that fails.
-pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
+pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, runner: &Runner<'_>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
     let mut out: Vec<Ran> = Vec::new();
     for s in steps {
         let stop = out.last().is_some_and(|r| r.done.stops());
         let ran = if stop {
             Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None }
         } else {
-            run_again(dir, s, log, reuse)
+            run_again(dir, s, log, reuse, runner)
         };
         each(&ran);
         out.push(ran);
@@ -1417,12 +1811,13 @@ pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reu
 
 /// Run every step whatever the one before did. A barrier wants all of its
 /// answers — a red suite does not excuse a member's own check from being read —
-/// where a row's run stops at the first.
-pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
+/// where a row's run stops at the first. Its `runner` is the caller's: the
+/// barrier chooses its own in its row.
+pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, runner: &Runner<'_>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
     steps
         .iter()
         .map(|s| {
-            let ran = run_again(dir, s, log, reuse);
+            let ran = run_again(dir, s, log, reuse, runner);
             each(&ran);
             ran
         })
@@ -1442,7 +1837,7 @@ pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&R
 /// With a `reuse`, a step already green at that commit is not run (it costs 0s
 /// and is not written again), and a pass is recorded when the tree was clean at
 /// that commit before the step ran.
-pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>) -> Ran {
+pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, runner: &Runner<'_>) -> Ran {
     let inputs = reuse.and_then(|r| crate::affected::key(dir, r.sha, &step.command));
     if let Some(r) = reuse {
         if let Some(green) = r.greens.lookup_by(r.sha, inputs.as_deref(), &step.command, r.env) {
@@ -1450,7 +1845,7 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
         }
     }
     let clean = reuse.is_some_and(|r| greens::clean_at(dir, r.sha));
-    let mut first = run_step(dir, step, log);
+    let mut first = run_step(dir, step, log, runner);
     // `wsp-067`: a missing tree is waited for, and the step run once more when
     // it is back; still gone, the step stays "tree missing".
     if matches!(first.done, Done::TreeMissing(_)) {
@@ -1461,14 +1856,14 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
         if !dir.is_dir() {
             return Ran { took: first.took + waited.elapsed(), ..first };
         }
-        first = run_step(dir, step, log);
+        first = run_step(dir, step, log, runner);
     }
     let ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
-        let second = run_step(dir, step, log);
+        let second = run_step(dir, step, log, runner);
         Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
     } else if matches!(first.done, Done::Failed { timed_out: true, .. }) {
         let wide = Step { limit: step.limit * 2, ..step.clone() };
-        let second = run_step(dir, &wide, log);
+        let second = run_step(dir, &wide, log, runner);
         Ran { step: step.clone(), took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
     } else {
         first
@@ -1909,7 +2304,14 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     let greens = greens::Greens::open(store, &tg.project, &tg.repo);
     let ledger = (at.is_none() && !args.has("again") && !args.has("force"))
         .then(|| Reuse { greens: &greens, sha: &tg.sha, env: greens::Env::Warm, who: &t.id });
-    let ran = run_all(&tree, &steps, &dir.join("last.log"), ledger.as_ref(), |r| {
+    let runner = match Runner::chosen(store, Whose::Row(&t.id), TreeKind::Check, &tree, Some(&dir.join("lock"))) {
+        Ok(r) => r,
+        Err(why) => {
+            drop(lock);
+            return gave_up(store, &t.id, entry.as_deref(), &why);
+        }
+    };
+    let ran = run_all(&tree, &steps, &dir.join("last.log"), ledger.as_ref(), &runner, |r| {
         if !auto && !args.json() {
             let (mark, tail) = match &r.done {
                 Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
@@ -2218,7 +2620,14 @@ fn inner(store: &Store, args: &Args) -> i32 {
         })
         .flatten();
     let reuse = ledger.as_ref().map(|g| Reuse { greens: g, sha: &head, env: greens::Env::Warm, who: &t.id });
-    let ran = run_all(&tree, &steps, &log, reuse.as_ref(), |r| match &r.done {
+    let runner = match Runner::chosen(store, Whose::Row(&t.id), TreeKind::Work, &tree, None) {
+        Ok(r) => r,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    };
+    let ran = run_all(&tree, &steps, &log, reuse.as_ref(), &runner, |r| match &r.done {
         Done::Passed if r.reused.is_some() => println!("  {} {} · reused", p.green("✓"), r.step.name),
         Done::Passed => println!("  {} {} · {}s", p.green("✓"), r.step.name, secs(r.took)),
         Done::Skipped => println!("  {} {} · skipped", p.dim("–"), r.step.name),
@@ -2337,7 +2746,14 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         }
     };
     println!("{} {} barrier at {} · {}", p.dim("checking"), p.bold(&found.id), &tg.sha[..12], start.line());
-    let ran = run_all(&tree, &steps, &dir.join("last.log"), None, |r| {
+    let runner = match Runner::chosen(store, Whose::Barrier(&found.id), TreeKind::Barrier, &tree, Some(&dir.join("lock"))) {
+        Ok(r) => r,
+        Err(why) => {
+            drop(lock);
+            return gave_up(store, &found.id, None, &why);
+        }
+    };
+    let ran = run_all(&tree, &steps, &dir.join("last.log"), None, &runner, |r| {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
             Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
@@ -2923,7 +3339,11 @@ pub(crate) fn rerun(
         .and_then(|t| target(store, &t, Some(new_head)).ok())
         .map(|tg| crate::greens::Greens::open(store, &tg.project, &tg.repo));
     let reuse = greens.as_ref().map(|g| crate::greens::Reuse { greens: g, sha: new_head, env: crate::greens::Env::Warm, who: task });
-    let ran = run_all(dir, &steps, &lockdir.join("land.log"), reuse.as_ref(), |_| {});
+    let runner = match Runner::chosen(store, Whose::Row(task), TreeKind::Work, dir, Some(&lockdir.join("lock"))) {
+        Ok(r) => r,
+        Err(why) => return Rerun::NoLock(why),
+    };
+    let ran = run_all(dir, &steps, &lockdir.join("land.log"), reuse.as_ref(), &runner, |_| {});
     drop(lock);
     if !passed(&ran) {
         return Rerun::Failed(owed(&ran, new_head));
@@ -3032,11 +3452,11 @@ mod tests {
         let s = step("- intents and more (2s): echo only-the-command; sleep 10");
         assert_eq!(s.limit, Duration::from_secs(2));
         let (dir, log) = scratch_log("labelled");
-        let r = run_step(&dir, &s, &log);
+        let r = run_step(&dir, &s, &log, &Runner::Inproc);
         assert!(matches!(r.done, Done::Failed { timed_out: true, .. }), "the label's limit is the step's: {:?}", r.done);
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "only-the-command");
         let s = step("- say it: echo said");
-        let r = run_step(&dir, &s, &log);
+        let r = run_step(&dir, &s, &log, &Runner::Inproc);
         assert_eq!(r.done, Done::Passed);
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "said", "the label is not run");
     }
@@ -3071,7 +3491,7 @@ mod tests {
         let s = step("- echo at nowhere: touch marker");
         assert_eq!(s.command, "echo at nowhere: touch marker");
         let (dir, log) = scratch_log("unread-label");
-        let r = run_step(&dir, &s, &log);
+        let r = run_step(&dir, &s, &log, &Runner::Inproc);
         assert!(matches!(&r.done, Done::Malformed(w) if w.contains("label")), "{:?}", r.done);
         assert!(!dir.join("marker").exists() && std::fs::read_to_string(&log).unwrap_or_default().is_empty(), "nothing ran");
         assert!(r.done.is_red());
@@ -3096,7 +3516,7 @@ mod tests {
         HUNG_AFTER.with(|h| h.set(Some(Duration::from_secs(1))));
         let (dir, log) = scratch_log("hung");
         let start = Instant::now();
-        let r = run_step(&dir, &sh("sleep 30", 60), &log);
+        let r = run_step(&dir, &sh("sleep 30", 60), &log, &Runner::Inproc);
         HUNG_AFTER.with(|h| h.set(None));
         assert!(start.elapsed() < Duration::from_secs(20), "ended when hung, not at its limit");
         let Done::Hung(pids) = &r.done else { panic!("{:?}", r.done) };
@@ -3131,7 +3551,7 @@ mod tests {
         let threads: Vec<_> = (0..6)
             .map(|i| {
                 let (dir, step) = (dir.clone(), step.clone());
-                std::thread::spawn(move || run_step(&dir, &step, &dir.join(format!("log{i}"))))
+                std::thread::spawn(move || run_step(&dir, &step, &dir.join(format!("log{i}")), &Runner::Inproc))
             })
             .collect();
         for t in threads {
@@ -3146,34 +3566,153 @@ mod tests {
         assert!(most <= 2 && most >= 1, "{most} checks at once under 2 slots");
     }
 
+    /// The two choices a step is run by (wsp-053): here (`WSP_JOBS=inproc`),
+    /// and as jobs (`manager`) on a host whose job runner is the manager's
+    /// own (`wsp-host`'s, in this process), its tree root the parent of `dir`
+    /// and its jobs' files beside it.
+    fn both(dir: &Path) -> Vec<(&'static str, Runner<'static>)> {
+        let root = dir.parent().unwrap().to_path_buf();
+        TREE_ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
+        let exec = root.join(format!("{}-jobs", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&exec);
+        let host: &'static crate::host::InProcess = Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&exec, &root)));
+        let place = place_of(Whose::Row("pj-001"), TreeKind::Check, dir).unwrap();
+        vec![("inproc", Runner::Inproc), ("manager", Runner::Jobs(Jobs::new(host, place, None)))]
+    }
+
     #[test]
     fn exit_zero_passes_and_a_failure_keeps_the_end_of_its_output() {
         let (dir, log) = scratch_log("exit");
-        let ok = run_step(&dir, &sh("echo fine", 10), &log);
-        assert_eq!(ok.done, Done::Passed);
-        let bad = run_step(&dir, &sh("echo one; echo two >&2; exit 3", 10), &log);
-        assert_eq!(bad.done, Done::Failed { exit: Some(3), timed_out: false });
-        assert!(bad.tail.contains("one") && bad.tail.contains("two"), "both streams: {}", bad.tail);
+        for (how, runner) in both(&dir) {
+            let ok = run_step(&dir, &sh("echo fine", 10), &log, &runner);
+            assert_eq!(ok.done, Done::Passed, "{how}");
+            let bad = run_step(&dir, &sh("echo one; echo two >&2; exit 3", 10), &log, &runner);
+            assert_eq!(bad.done, Done::Failed { exit: Some(3), timed_out: false }, "{how}");
+            assert!(bad.tail.contains("one") && bad.tail.contains("two"), "{how}: both streams: {}", bad.tail);
+        }
     }
 
     #[test]
     fn a_step_past_its_limit_is_killed_with_everything_it_started() {
         let (dir, log) = scratch_log("limit");
-        let started = Instant::now();
-        let r = run_step(&dir, &sh("sleep 30 & sleep 30", 1), &log);
-        assert!(started.elapsed() < Duration::from_secs(10), "waited on the sleep");
-        assert_eq!(r.done, Done::Failed { exit: None, timed_out: true });
-        assert!(why_failed(&r).contains("timed out after 1s"));
+        for (how, runner) in both(&dir) {
+            let started = Instant::now();
+            let r = run_step(&dir, &sh("sleep 30 & sleep 30", 1), &log, &runner);
+            assert!(started.elapsed() < Duration::from_secs(10), "{how}: waited on the sleep");
+            assert_eq!(r.done, Done::Failed { exit: None, timed_out: true }, "{how}");
+            assert!(why_failed(&r).contains("timed out after 1s"), "{how}");
+        }
     }
 
     #[test]
     fn a_step_at_its_limit_is_retried_at_twice_it_and_a_hang_still_fails() {
         let (dir, log) = scratch_log("tight");
-        let tight = run_again(&dir, &sh("sleep 1.5", 1), &log, None);
-        assert_eq!(tight.done, Done::Passed);
-        assert!(account(&[tight]).contains("limit too tight"));
-        let hung = run_again(&dir, &sh("sleep 30", 1), &log, None);
-        assert_eq!(hung.done, Done::Failed { exit: None, timed_out: true });
+        for (how, runner) in both(&dir) {
+            let tight = run_again(&dir, &sh("sleep 1.5", 1), &log, None, &runner);
+            assert_eq!(tight.done, Done::Passed, "{how}");
+            assert!(account(&[tight]).contains("limit too tight"), "{how}");
+            let hung = run_again(&dir, &sh("sleep 30", 1), &log, None, &runner);
+            assert_eq!(hung.done, Done::Failed { exit: None, timed_out: true }, "{how}");
+        }
+    }
+
+    /// Under `manager` the hang is the manager's to see and end (its
+    /// `job.ended` says `hung`); it reads as the same red.
+    #[test]
+    fn a_hung_job_reads_hung_as_a_hung_step_does() {
+        HUNG_AFTER.with(|h| h.set(Some(Duration::from_secs(1))));
+        let (dir, log) = scratch_log("hung-job");
+        let (_, runner) = both(&dir).pop().unwrap();
+        let start = Instant::now();
+        let r = run_step(&dir, &sh("sleep 30", 60), &log, &runner);
+        HUNG_AFTER.with(|h| h.set(None));
+        assert!(start.elapsed() < Duration::from_secs(20), "ended when hung, not at its limit");
+        assert!(matches!(r.done, Done::Hung(_)), "{:?}", r.done);
+        assert!(why_failed(&r).starts_with("hung") && r.done.is_red(), "{}", r.tail);
+    }
+
+    /// Every job a check sends takes its place from `place_of`: the row's
+    /// host and a path relative to that host's tree root, never a path on
+    /// wsp's machine. A step is one `job.run`.
+    #[test]
+    fn a_step_is_one_job_placed_on_the_rows_host_relative_to_its_tree_root() {
+        let (dir, log) = scratch_log("placed");
+        let (_, runner) = both(&dir).pop().unwrap();
+        let Runner::Jobs(jobs) = &runner else { unreachable!() };
+        let JobAt::Dir(at) = &jobs.place.at else { panic!("{:?}", jobs.place.at) };
+        assert_eq!(at.host.0, host_of(Whose::Row("pj-001")));
+        assert_eq!(at.path, dir.file_name().unwrap().to_string_lossy(), "relative to the tree root");
+        assert!(!at.escapes() && !at.path.contains(&*dir.to_string_lossy()));
+        let run = jobs.run_of(&sh("true", 10));
+        assert_eq!((run.at.clone(), run.class, run.key.row.0.as_str()), (jobs.place.at.clone(), JobClass::Check, "pj-001"));
+        assert_eq!(run.argv.last().map(String::as_str), Some("true"));
+        assert_ne!(run.key, jobs.run_of(&sh("true", 10)).key, "a key is unique per run");
+        let before = jobs.host.jobs().unwrap().len();
+        assert_eq!(run_step(&dir, &sh("echo one", 10), &log, &runner).done, Done::Passed);
+        let table = jobs.host.jobs().unwrap();
+        assert_eq!(table.len(), before + 1, "one job.run for one step");
+        assert!(table.iter().all(|r| r.class == JobClass::Check && r.state == JobState::Ended));
+        assert!(place_of(Whose::Row("pj-001"), TreeKind::Check, Path::new("/")).is_err(), "a tree outside the root is no place");
+    }
+
+    /// A stale lock whose job ended reads free, read by key from the job
+    /// table, and no `kill -0` is asked; a running job, a job just ended (the
+    /// moment between two steps) and a table that cannot be read keep it.
+    #[test]
+    fn a_lock_whose_job_ended_reads_free_with_no_kill() {
+        let env = util::isolated("check-lock-job");
+        let path = env.state().join("lock");
+        let held = TreeLock::take(path.clone(), Duration::from_secs(1)).unwrap();
+        let key = crate::host::job_key("pj-001", 0, "check:s@1.0");
+        TreeLock::name_job(&path, "mac", &key);
+        assert_eq!(TreeLock::holder(&path).map(|(p, _)| p), Some(std::process::id()), "the holder is kept");
+        let row = |state| JobRow { key: key.clone(), class: JobClass::Check, pgid: 1, started: crate::host::At(0), state };
+        let no_kill = |_: u32| -> Option<bool> { panic!("kill -0 was asked of a lock that names a job") };
+        let table = |rows: Option<Vec<JobRow>>| move |host: &str| -> Option<Vec<JobRow>> {
+            assert_eq!(host, "mac", "asked of the tree's host");
+            rows.clone()
+        };
+        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(vec![row(JobState::Ended)]))), "just ended: between two steps");
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        assert!(TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(vec![row(JobState::Ended)]))), "its job ended: free");
+        assert!(TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(Vec::new()))), "its job is gone from the table: free");
+        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(vec![row(JobState::Running)]))), "running: held");
+        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(None)), "a table not read keeps it");
+        JOB_TABLE.with(|t| *t.borrow_mut() = Some(Some(vec![row(JobState::Ended)])));
+        assert!(!TreeLock::live(&path), "TreeLock::live reads the same table");
+        JOB_TABLE.with(|t| *t.borrow_mut() = None);
+        assert_eq!(job_runs("mac", &key_text(&key)), None, "no manager here: not asked");
+        drop(held);
+    }
+
+    /// The call log of a check under `manager` holds no `ps`, `kill` or
+    /// `lstart` probe from wsp: the steps, their bounds and the lock are the
+    /// manager's and its job table's. Under `inproc` wsp still probes.
+    #[test]
+    fn a_check_under_manager_probes_no_process_from_wsp() {
+        let env = util::isolated("check-no-probes");
+        let (dir, log) = scratch_log("no-probes");
+        let lock = env.state().join("lock");
+        let mut runners = both(&dir);
+        let (_, mut manager) = runners.pop().unwrap();
+        let (_, inproc) = runners.pop().unwrap();
+        if let Runner::Jobs(jobs) = &mut manager {
+            jobs.lock = Some(lock.clone());
+        }
+        PROBES.with(|p| p.borrow_mut().clear());
+        let held = TreeLock::take(lock.clone(), Duration::from_secs(1)).unwrap();
+        let steps = [sh("echo a", 10), sh("exit 1", 10), sh("sleep 3", 1)];
+        let ran = run_every(&dir, &steps, &log, None, &manager, |_| {});
+        assert_eq!(ran.iter().map(|r| r.done.is_red()).collect::<Vec<_>>(), [false, true, true], "{:?}", ran.iter().map(|r| &r.done).collect::<Vec<_>>());
+        assert!(TreeLock::job_of(&lock).is_some(), "the lock names the job in the tree");
+        JOB_TABLE.with(|t| *t.borrow_mut() = Some(Some(Vec::new())));
+        assert!(TreeLock::live(&lock), "touched as the last job ended");
+        JOB_TABLE.with(|t| *t.borrow_mut() = None);
+        drop(held);
+        assert_eq!(PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "wsp probed a process under manager");
+        run_step(&dir, &sh("true", 10), &log, &inproc);
+        assert!(PROBES.with(|p| p.borrow().contains(&"kill")), "inproc ends its own group");
     }
 
     /// `wsp-453`: a step that passes still has its group killed — the Vite and
@@ -3182,54 +3721,61 @@ mod tests {
     fn a_step_that_passes_leaves_nothing_it_started_running() {
         let (dir, log) = scratch_log("leaves");
         let pidfile = dir.join("server.pid");
-        let r = run_step(&dir, &sh(&format!("sleep 60 > /dev/null 2>&1 & echo $! > {}", pidfile.display()), 20), &log);
-        assert_eq!(r.done, Done::Passed);
-        let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
-        let alive = || {
-            pid.parse().is_ok_and(|pid| crate::host::LOCAL.probe(pid) == Some(true))
-        };
-        let until = Instant::now() + Duration::from_secs(5);
-        while alive() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(50));
+        for (how, runner) in both(&dir) {
+            let r = run_step(&dir, &sh(&format!("sleep 60 > /dev/null 2>&1 & echo $! > {}", pidfile.display()), 20), &log, &runner);
+            assert_eq!(r.done, Done::Passed, "{how}");
+            let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+            let alive = || pid.parse().is_ok_and(|pid| crate::host::LOCAL.probe(pid) == Some(true));
+            let until = Instant::now() + Duration::from_secs(5);
+            while alive() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(!alive(), "{how}: the step's background process {pid} is still running");
         }
-        assert!(!alive(), "the step's background process {pid} is still running");
     }
 
     #[test]
     fn a_step_that_fails_once_and_passes_is_passed_and_the_flake_is_kept_on_the_entry() {
         let (dir, log) = scratch_log("flake");
-        let flaky = sh("test -f seen || { touch seen; echo first-time >&2; exit 1; }", 10);
-        let ran = run_all(&dir, &[flaky], &log, None, |_| {});
-        assert!(passed(&ran), "the second run counts");
-        let text = account(&ran);
-        assert!(text.contains("passed on a second run, the first was exit 1") && text.contains("~ first-time"), "{text}");
-        let broken = sh("echo no; exit 2", 10);
-        let ran = run_all(&dir, &[broken], &log, None, |_| {});
-        assert!(!passed(&ran));
-        assert!(account(&ran).contains("exit 2 both times"), "{}", account(&ran));
+        for (how, runner) in both(&dir) {
+            let _ = std::fs::remove_file(dir.join("seen"));
+            let flaky = sh("test -f seen || { touch seen; echo first-time >&2; exit 1; }", 10);
+            let ran = run_all(&dir, &[flaky], &log, None, &runner, |_| {});
+            assert!(passed(&ran), "{how}: the second run counts");
+            let text = account(&ran);
+            assert!(text.contains("passed on a second run, the first was exit 1") && text.contains("~ first-time"), "{how}: {text}");
+            let broken = sh("echo no; exit 2", 10);
+            let ran = run_all(&dir, &[broken], &log, None, &runner, |_| {});
+            assert!(!passed(&ran), "{how}");
+            assert!(account(&ran).contains("exit 2 both times"), "{how}: {}", account(&ran));
+        }
     }
 
     #[test]
     fn steps_stop_at_the_first_failure_and_say_which_were_not_run() {
         let (dir, log) = scratch_log("stop");
         let steps = vec![sh("true", 10), sh("exit 1", 10), sh("true", 10)];
-        let ran = run_all(&dir, &steps, &log, None, |_| {});
-        let done: Vec<_> = ran.iter().map(|r| r.done.clone()).collect();
-        assert_eq!(done[0], Done::Passed);
-        assert!(matches!(done[1], Done::Failed { .. }));
-        assert_eq!(done[2], Done::Skipped);
-        assert!(!passed(&ran));
-        let text = account(&ran);
-        assert!(text.contains("✓ s") && text.contains("✗ s") && text.contains("– s · true · skipped"), "{text}");
+        for (how, runner) in both(&dir) {
+            let ran = run_all(&dir, &steps, &log, None, &runner, |_| {});
+            let done: Vec<_> = ran.iter().map(|r| r.done.clone()).collect();
+            assert_eq!(done[0], Done::Passed, "{how}");
+            assert!(matches!(done[1], Done::Failed { .. }), "{how}");
+            assert_eq!(done[2], Done::Skipped, "{how}");
+            assert!(!passed(&ran), "{how}");
+            let text = account(&ran);
+            assert!(text.contains("✓ s") && text.contains("✗ s") && text.contains("– s · true · skipped"), "{how}: {text}");
+        }
     }
 
     #[test]
     fn a_check_runs_without_wsps_own_environment() {
         let (dir, log) = scratch_log("env");
         std::env::set_var("WSP_CHECK_PROBE", "set");
-        let r = run_step(&dir, &sh(r#"test -z "$WSP_CHECK_PROBE""#, 10), &log);
+        for (how, runner) in both(&dir) {
+            let r = run_step(&dir, &sh(r#"test -z "$WSP_CHECK_PROBE""#, 10), &log, &runner);
+            assert_eq!(r.done, Done::Passed, "{how}: WSP_* reached the command");
+        }
         std::env::remove_var("WSP_CHECK_PROBE");
-        assert_eq!(r.done, Done::Passed, "WSP_* reached the command");
     }
 
     // ---- the row ----
@@ -3543,14 +4089,15 @@ mod tests {
 
     #[test]
     fn a_step_that_cannot_start_is_malformed_and_never_run() {
-        let dir = std::env::temp_dir();
-        let log = dir.join(format!("wsp-malformed-{}.log", std::process::id()));
-        let broken = Ran { ..run_step(&dir, &sh("cd x &&", 30), &log) };
-        assert!(matches!(broken.done, Done::Malformed(_)), "{:?}", broken.done);
-        let missing = run_step(&dir, &sh("wsp-no-such-command-anywhere", 30), &log);
-        assert!(matches!(missing.done, Done::Malformed(_)), "a command that is not found is not a red test: {:?}", missing.done);
-        let red = run_step(&dir, &sh("exit 3", 30), &log);
-        assert!(matches!(red.done, Done::Failed { exit: Some(3), .. }), "and a real failure still is one");
+        let (dir, log) = scratch_log("malformed");
+        for (how, runner) in both(&dir) {
+            let broken = Ran { ..run_step(&dir, &sh("cd x &&", 30), &log, &runner) };
+            assert!(matches!(broken.done, Done::Malformed(_)), "{how}: {:?}", broken.done);
+            let missing = run_step(&dir, &sh("wsp-no-such-command-anywhere", 30), &log, &runner);
+            assert!(matches!(missing.done, Done::Malformed(_)), "{how}: a command that is not found is not a red test: {:?}", missing.done);
+            let red = run_step(&dir, &sh("exit 3", 30), &log, &runner);
+            assert!(matches!(red.done, Done::Failed { exit: Some(3), .. }), "{how}: and a real failure still is one");
+        }
     }
 
     #[test]
@@ -3583,7 +4130,7 @@ mod tests {
         let tree = scratch.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::remove_dir_all(&tree).unwrap();
-        let ran = run_all(&tree, &[sh("true", 10), sh("true", 10)], &log, None, |_| {});
+        let ran = run_all(&tree, &[sh("true", 10), sh("true", 10)], &log, None, &Runner::Inproc, |_| {});
         assert!(matches!(&ran[0].done, Done::TreeMissing(p) if p.ends_with("tree")), "{:?}", ran[0].done);
         assert_eq!(ran[1].done, Done::Skipped, "the next step has no tree either");
         assert!(!ran[0].done.is_red(), "not a failed step");
@@ -3613,11 +4160,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             std::fs::create_dir_all(&back).unwrap();
         });
-        let r = run_again(&tree, &sh("touch ran", 10), &log, None);
+        let r = run_again(&tree, &sh("touch ran", 10), &log, None, &Runner::Inproc);
         maker.join().unwrap();
         assert_eq!(r.done, Done::Passed, "{}", r.tail);
         assert!(tree.join("ran").exists(), "run once the tree was back");
-        let bad = run_again(&tree, &sh("exit 4", 10), &log, None);
+        let bad = run_again(&tree, &sh("exit 4", 10), &log, None, &Runner::Inproc);
         assert_eq!(bad.done, Done::Failed { exit: Some(4), timed_out: false });
         assert!(why_failed(&bad).contains("exit 4"));
     }
@@ -3940,10 +4487,10 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "pj-001" };
         let step = counting(&dir, "count");
-        let first = run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {});
+        let first = run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(passed(&first) && first[0].reused.is_none());
         assert!(g.lookup(&sha, &step.command, greens::Env::Warm).is_some());
-        let second = run_all(&dir, &[step], &log, Some(&reuse), |_| {});
+        let second = run_all(&dir, &[step], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(passed(&second));
         assert_eq!(runs_of(&dir, "count"), 1, "the second run did not run the command");
         assert_eq!(second[0].took, Duration::ZERO);
@@ -3956,11 +4503,11 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let step = counting(&dir, "count");
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
-        assert_eq!(tally_line(&run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {})), "0 reused, 1 ran");
+        assert_eq!(tally_line(&run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {})), "0 reused, 1 ran");
         git_run(&dir, &["commit", "--quiet", "--allow-empty", "-m", "a rebase that changed nothing"]);
         let sha2 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let reuse = Reuse { greens: &g, sha: &sha2, env: greens::Env::Warm, who: "a" };
-        let again = run_all(&dir, &[step], &log, Some(&reuse), |_| {});
+        let again = run_all(&dir, &[step], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "count"), 1, "the same inputs at another commit are not run again");
         assert_eq!(tally_line(&again), "1 reused, 0 ran");
         assert!(account(&again).contains("with the same inputs"));
@@ -3972,14 +4519,14 @@ mod tests {
         let (dir, log, sha) = repo_at_head("reuse-other");
         let g = greens::Greens::open(&store, "pj", &dir);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
-        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), |_| {});
-        run_all(&dir, &[counting(&dir, "two")], &log, Some(&reuse), |_| {});
+        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), &Runner::Inproc, |_| {});
+        run_all(&dir, &[counting(&dir, "two")], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert_eq!((runs_of(&dir, "one"), runs_of(&dir, "two")), (1, 1));
         std::fs::write(dir.join("f"), "2").unwrap();
         git_run(&dir, &["commit", "--quiet", "-am", "two"]);
         let sha2 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let reuse = Reuse { greens: &g, sha: &sha2, env: greens::Env::Warm, who: "a" };
-        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), |_| {});
+        run_all(&dir, &[counting(&dir, "one")], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "one"), 2, "a green at the old commit says nothing of the new one");
     }
 
@@ -3990,11 +4537,11 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "a" };
         let bad = sh("exit 3", 10);
-        assert!(!passed(&run_all(&dir, &[bad.clone()], &log, Some(&reuse), |_| {})));
+        assert!(!passed(&run_all(&dir, &[bad.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {})));
         assert!(g.lookup(&sha, &bad.command, greens::Env::Warm).is_none());
         std::fs::write(dir.join("untracked"), "x").unwrap();
         let step = counting(&dir, "count");
-        run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {});
+        run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(g.lookup(&sha, &step.command, greens::Env::Warm).is_none(), "a dirty tree proved the diff, not the commit");
         std::fs::remove_file(dir.join("untracked")).unwrap();
         std::fs::remove_file(dir.join("count")).unwrap();
@@ -4003,7 +4550,7 @@ mod tests {
         git_run(&dir, &["commit", "--quiet", "-m", "ignore"]);
         let sha3 = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let reuse = Reuse { greens: &g, sha: &sha3, env: greens::Env::Warm, who: "a" };
-        run_all(&dir, &[step.clone()], &log, Some(&reuse), |_| {});
+        run_all(&dir, &[step.clone()], &log, Some(&reuse), &Runner::Inproc, |_| {});
         assert!(g.lookup(&sha3, &step.command, greens::Env::Warm).is_some(), "ignored files do not make a tree dirty");
     }
 
@@ -4014,11 +4561,11 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         let cold = Reuse { greens: &g, sha: &sha, env: greens::Env::Cold, who: "cold" };
         let warm = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "warm" };
-        run_all(&dir, &[counting(&dir, "a")], &log, Some(&cold), |_| {});
-        run_all(&dir, &[counting(&dir, "a")], &log, Some(&warm), |_| {});
+        run_all(&dir, &[counting(&dir, "a")], &log, Some(&cold), &Runner::Inproc, |_| {});
+        run_all(&dir, &[counting(&dir, "a")], &log, Some(&warm), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "a"), 1, "the cold green answered the warm ask");
-        run_all(&dir, &[counting(&dir, "b")], &log, Some(&warm), |_| {});
-        run_all(&dir, &[counting(&dir, "b")], &log, Some(&cold), |_| {});
+        run_all(&dir, &[counting(&dir, "b")], &log, Some(&warm), &Runner::Inproc, |_| {});
+        run_all(&dir, &[counting(&dir, "b")], &log, Some(&cold), &Runner::Inproc, |_| {});
         assert_eq!(runs_of(&dir, "b"), 2, "the warm green did not answer the cold ask");
     }
 
@@ -4092,7 +4639,7 @@ mod tests {
         let g = greens::Greens::open(&store, "pj", &dir);
         g.record(&sha, "true", greens::Env::Warm, 101, "wsp-9", false);
         let reuse = Reuse { greens: &g, sha: &sha, env: greens::Env::Warm, who: "x" };
-        let ran = run_all(&dir, &[sh("true", 10)], &log, Some(&reuse), |_| {});
+        let ran = run_all(&dir, &[sh("true", 10)], &log, Some(&reuse), &Runner::Inproc, |_| {});
         let text = account(&ran);
         assert!(text.contains("reused (green at this commit, 101s, by wsp-9,"), "{text}");
         assert!(passed(&ran));

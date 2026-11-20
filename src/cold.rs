@@ -178,7 +178,11 @@ fn build(store: &Store, label: &str, n: usize, j: &Job, keep: bool, log: &Path) 
     let greens = Greens::open(store, &j.project, &j.repo);
     let who = format!("cold {label} {n}");
     let reuse = Reuse { greens: &greens, sha: &j.sha, env: Env::Cold, who: &who };
-    built.ran = check::run_every(&tree, &j.steps, log, Some(&reuse), |_| {});
+    built.ran = {
+        // The cold build stays in this process: its jobs move with the
+        // barrier's (the barrier row chooses its runner).
+        check::run_every(&tree, &j.steps, log, Some(&reuse), &check::Runner::Inproc, |_| {})
+    };
     if !keep {
         remove_tree(&j.repo, &tree);
     }

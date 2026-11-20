@@ -620,7 +620,7 @@ fn run_unit_locked(
     let steps: Vec<Step> = items.iter().map(|i| i.step.clone()).collect();
     let greens = crate::greens::Greens::open(store, &unit.project, &unit.repo);
     let reuse = crate::greens::Reuse { greens: &greens, sha: &unit.sha, env: crate::greens::Env::Warm, who };
-    let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), |_| {});
+    let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), &check::Runner::Inproc, |_| {}); // the barrier row chooses its runner
     drop(lock);
     (Ranged::Ran(ran), narrowed, Some(start))
 }

@@ -132,13 +132,47 @@ impl Run {
 
     /// Whether the process is gone: no such pid, or one that started at another
     /// time. A `ps` that cannot be run says nothing, and the run is believed.
+    /// A run named by its job ([`Run::of_job`]) is not a pid's to read: it is
+    /// [`Run::gone_by`]'s.
     pub fn gone(&self, start_of: StartOf) -> bool {
+        if self.job().is_some() {
+            return false;
+        }
         match start_of(self.pid) {
             Ok(now) => now.as_deref() != Some(self.started.as_str()),
             Err(()) => false,
         }
     }
+
+    /// The run as the job that makes it under `WSP_JOBS=manager` (wsp-053):
+    /// its start is that job's key on the tree's host, written
+    /// `pid:<pid>@job=<host>/<row>/<attempt>/<job>`, and read back from that
+    /// host's job table rather than from `ps -o lstart=`.
+    pub fn of_job(host: &str, key: &str) -> Run {
+        Run { pid: std::process::id(), started: format!("job={host}/{key}") }
+    }
+
+    /// The job a run is named by, as `(host, key)`.
+    pub fn job(&self) -> Option<(&str, &str)> {
+        self.started.strip_prefix("job=")?.split_once('/')
+    }
+
+    /// Whether the run is gone: a run named by its job, when `job_runs` (the
+    /// host's job table, read by key) says that job is not running; any other
+    /// run, as [`Run::gone`] reads it. A table that could not be read says
+    /// nothing, and the run is believed.
+    pub fn gone_by(&self, start_of: StartOf, job_runs: JobRuns) -> bool {
+        match self.job() {
+            Some((host, key)) => job_runs(host, key) == Some(false),
+            None => self.gone(start_of),
+        }
+    }
 }
+
+/// Whether job `key` on `host` is running (`Some(true)`), ended or not in that
+/// host's job table (`Some(false)`), or could not be asked (`None`): the
+/// manager's answer, passed in by a caller that can name the host.
+pub type JobRuns<'a> = &'a dyn Fn(&str, &str) -> Option<bool>;
 
 /// When process `pid` started, as the host's `ps` says it, or `None` where
 /// there is none; `Err` where the host could not tell.
@@ -355,3 +389,28 @@ pub fn wait_after(tries: u32) -> Option<i64> {
 /// the steps' own limits being what end it sooner.
 pub const SUITE_WEDGED_AFTER: i64 = 3 * 60 * 60;
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wsp-053: a run named by its job is read by key from the host's job
+    /// table, and no `lstart` is asked of it; it reads back as written.
+    #[test]
+    fn a_run_named_by_its_job_reads_its_liveness_from_the_job_table() {
+        let run = Run::of_job("mac", "m3#5/0/barrier:suite@1.0");
+        assert_eq!(Run::parse(&run.text()), Some(run.clone()), "it reads back as written");
+        assert_eq!(run.job(), Some(("mac", "m3#5/0/barrier:suite@1.0")));
+        let no_lstart: StartOf = &|_| panic!("lstart was asked of a run named by its job");
+        let asked = |want: Option<bool>| move |host: &str, key: &str| {
+            assert_eq!((host, key), ("mac", "m3#5/0/barrier:suite@1.0"));
+            want
+        };
+        assert!(run.gone_by(no_lstart, &asked(Some(false))), "its job ended: gone");
+        assert!(!run.gone_by(no_lstart, &asked(Some(true))), "running");
+        assert!(!run.gone_by(no_lstart, &asked(None)), "a table not read believes the run");
+        assert!(!run.gone(no_lstart), "not a pid's to read");
+        let pid = Run { pid: 7, started: "Tue_Nov_4_11:19:05_2026".into() };
+        assert!(pid.gone_by(&|_| Ok(None), &|_, _| panic!("a pid's run asked the job table")));
+    }
+}
