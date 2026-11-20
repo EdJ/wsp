@@ -4219,7 +4219,7 @@ impl Wip {
     /// projections' verbatim records rebuilt by `crate::mirror`'s `*_of`. What
     /// is no part of the domain yet stays a file read, as on the files path:
     /// projects, governors, mandates, refusals, pins, agents, said, worked,
-    /// seat-since and finished-wip.json.
+    /// and the per-seat files the manager's events replaced (wsp-030) are no part of it.
     ///
     /// **It runs no child**: no `ps`, `lsof`, `df`, render, `git` or `wsp`.
     /// The moment readings are no part of the snapshot: the seats' rss and

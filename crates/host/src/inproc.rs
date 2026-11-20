@@ -1184,8 +1184,8 @@ mod comm_tests {
 /// Ends the pane of a seat whose agent has left: the supervisor, its shell and
 /// the renderer, a few seconds on so the agent finishes its own exit. Detached
 /// and in its own group, because the hook that calls it runs under the very
-/// group it ends. The daemon's sweep (`ended_panes`) is the backstop for an ending
-/// that never said `SessionEnd`.
+/// group it ends. The manager's `seat.stopped` is the backstop for an ending
+/// that never said `SessionEnd` (wsp-030 deleted the daemon's `ended_panes` sweep).
 pub fn close_pane_soon(sup: u32) {
     if sup == std::process::id() {
         return;
