@@ -7,6 +7,9 @@
 //! - [`Client::dial_at`] does the same against addresses and a token the
 //!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
+//! - [`Client::apply`] sends a command under one idempotency key, again under
+//!   the same key after a lost reply; [`Client::await_order`] follows an order
+//!   to a state.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
 //!
@@ -17,13 +20,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use wsp_api::{ApiToken, Call, ConnError, Connection, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
-use wsp_store_contract::Principal;
+use wsp_api::{ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
+use wsp_store_contract::{Principal, Refusal};
 
 mod dial;
+mod orders;
 mod subscribe;
 
 pub use dial::Silent;
+pub use orders::APPLY_ATTEMPTS;
 pub use subscribe::{Feed, Item};
 
 /// How long [`Client::request`] waits for a reply unless [`Client::set_timeout`]
@@ -42,6 +47,14 @@ pub enum Error {
     Silent(Silent),
     /// `args` do not fit the verb, so the request could not be made.
     Args(String),
+    /// The server refused a command, and said why; the same command under the
+    /// same key would be refused the same, so it is not sent again.
+    Refused(Refusal),
+    /// The server answered `err` with a code and no refusal (a verb it does not
+    /// run, a malformed request, a failed store).
+    Failed(Failure),
+    /// The server answered with something other than what the verb answers.
+    Unexpected(String),
 }
 
 impl std::fmt::Display for Error {
@@ -51,6 +64,9 @@ impl std::fmt::Display for Error {
             Error::Lost(e) => write!(f, "{e}"),
             Error::Silent(s) => write!(f, "{s}"),
             Error::Args(why) => write!(f, "the arguments do not fit the verb: {why}"),
+            Error::Refused(r) => write!(f, "the server refused it: {r:?}"),
+            Error::Failed(x) => write!(f, "the server failed it: {:?}: {}", x.code, x.text),
+            Error::Unexpected(what) => write!(f, "the server's answer was not the verb's: {what}"),
         }
     }
 }
