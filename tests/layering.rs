@@ -797,6 +797,38 @@ fn the_api_links_the_contract_alone_and_does_no_io() {
     assert!(found.is_empty(), "wsp-api does no IO (R2):\n{}", found.join("\n"));
 }
 
+/// `wsp-view`, the CLI's `--json` projections (wsp-305), is pure: it links `wsp-store-contract`
+/// and nothing else of the workspace, directly or through it, its own tests included, so
+/// web-chrome can link it and draw what the CLI prints from its own fold. Its only other
+/// dependency is `serde_json`, and its source names no IO of the standard library: what it
+/// projects (the records, the live readings, the clock) is handed in by the caller.
+#[test]
+fn the_view_links_the_contract_alone_and_does_no_io() {
+    const MAY: &[&str] = &["wsp-store-contract"];
+    let dir = root().join("crates/view");
+    let bad = beyond(&reached_from(&dir, "wsp-view"), MAY);
+    assert!(bad.is_empty(), "wsp-view must link only {MAY:?} of the workspace (wsp-305):\n{bad}");
+
+    let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
+    let extra: Vec<&String> =
+        named.iter().filter(|d| !["serde_json", "wsp-store-contract", "wsp-view"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-view depends on serde_json and the contract alone, not {extra:?}");
+
+    const IO: &[&str] = &[
+        "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "std::time",
+        "SystemTime", "Instant", "File::", "TcpStream", "TcpListener", "UnixStream",
+    ];
+    let mut found = vec![];
+    for e in fs::read_dir(dir.join("src")).unwrap() {
+        let p = e.unwrap().path();
+        let code = strip(&fs::read_to_string(&p).unwrap());
+        for io in IO.iter().filter(|io| code.contains(*io)) {
+            found.push(format!("{}: {io}", p.strip_prefix(root()).unwrap().display()));
+        }
+    }
+    assert!(found.is_empty(), "wsp-view does no IO and reads no clock: its inputs are handed in (wsp-305):\n{}", found.join("\n"));
+}
+
 /// `wsp-server`, the state core's server, goes through `Store` only (`docs/state-core.md`
 /// section 6; wsp-073): its normal dependencies are `wsp-api` and `wsp-store-contract`, and with
 /// its tests it reaches only those and `wsp-store-conformance` (for `MemStore`) of the workspace,
