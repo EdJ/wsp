@@ -293,7 +293,8 @@ pub enum Verb {
     Subscribe(#[serde(default)] Subscribe),
     /// What `wip` draws of `state` (wsp-695), as the store's
     /// `Reads::wip_snapshot` says: open rows whole, the rest as heads, lists
-    /// without their text, only raised asks, the seats and claims; small enough
+    /// whole but finished ones without their text, only raised asks, the
+    /// seats and claims; small enough
     /// for one line under [`MAX_LINE`] where `state`'s whole domain is not.
     Wip(#[serde(default)] NoArgs),
 }

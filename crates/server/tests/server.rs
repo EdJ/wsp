@@ -395,7 +395,7 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
 }
 
 /// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
-/// on rows not done, lists without theirs, raised asks only, and `state` beside
+/// on rows not done and lists not finished, raised asks only, and `state` beside
 /// it unchanged.
 #[test]
 fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
@@ -416,7 +416,8 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     let mut list_fields = std::collections::BTreeMap::new();
     list_fields.insert("body".to_string(), "list prose".to_string());
     list_fields.insert("name".to_string(), "the list".to_string());
-    put.push(Entity::List(List { id: ListId("s2".into()), state: ListState::Running, groups: vec![], fields: list_fields }));
+    put.push(Entity::List(List { id: ListId("s2".into()), state: ListState::Running, groups: vec![], fields: list_fields.clone() }));
+    put.push(Entity::List(List { id: ListId("s3".into()), state: ListState::Finished, groups: vec![], fields: list_fields }));
     put.push(Entity::Ask(Ask {
         id: AskId("a-2".into()),
         kind: AskKind::Ask,
@@ -442,10 +443,11 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     assert_eq!(fields("wsp-3").get("prose").map(String::as_str), Some("more of it"));
     for body in WIP_BODIES {
         assert_eq!(fields("wsp-4").get(body), None, "a done row loses {body}");
-        assert_eq!(state.lists[&ListId("s2".into())].fields.get(body), None, "a list loses {body}");
+        assert_eq!(state.lists[&ListId("s3".into())].fields.get(body), None, "a finished list loses {body}");
     }
+    assert_eq!(state.lists[&ListId("s2".into())], full.lists[&ListId("s2".into())], "a running list is whole");
     assert_eq!(fields("wsp-4").get("head").map(String::as_str), Some("a head"), "a done row keeps its head");
-    assert_eq!(state.lists[&ListId("s2".into())].fields.get("name").map(String::as_str), Some("the list"));
+    assert_eq!(state.lists[&ListId("s3".into())].fields.get("name").map(String::as_str), Some("the list"));
     assert_eq!(state.asks.keys().cloned().collect::<Vec<_>>(), vec![AskId("a-1".into())], "raised asks only");
     assert_eq!((state.seats.clone(), state.claims.clone()), (full.seats.clone(), full.claims.clone()));
     assert!(state.orders.is_empty() && state.machines.is_empty());

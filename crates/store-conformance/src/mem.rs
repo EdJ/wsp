@@ -379,7 +379,14 @@ impl Reads for MemStore {
                 _ => (id, r),
             })
             .collect();
-        let lists = s.lists.into_iter().map(|(id, l)| (id, List { fields: bodiless(l.fields), ..l })).collect();
+        let lists = s
+            .lists
+            .into_iter()
+            .map(|(id, l)| match l.state {
+                ListState::Finished => (id, List { fields: bodiless(l.fields), ..l }),
+                _ => (id, l),
+            })
+            .collect();
         let asks = s.asks.into_iter().filter(|(_, a)| a.state == AskState::Raised).collect();
         Ok((State { rows, lists, seats: s.seats, claims: s.claims, asks, ..State::default() }, at))
     }

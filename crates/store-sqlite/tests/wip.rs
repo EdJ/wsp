@@ -1,5 +1,6 @@
-//! `wip_snapshot` (wsp-695): what `wip` draws of the state, cut in SQL. Open rows keep their
-//! bodies, every other row and every list loses its `WIP_BODIES` fields and keeps the rest, only
+//! `wip_snapshot` (wsp-695): what `wip` draws of the state, cut in SQL. Open rows and lists
+//! not finished keep their bodies, every other row and list loses its `WIP_BODIES` fields and
+//! keeps the rest, only
 //! raised asks come back, seats and claims are whole, and the rest is empty. `snapshot()` is
 //! unchanged beside it, and the in-memory store cuts the same state to the same reply.
 
@@ -86,7 +87,7 @@ fn ask(id: &str, state: AskState) -> Entity {
 }
 
 /// One of everything the cut treats apart: a row in each state, a done row with a body and one
-/// with a head and prose, a list with a body, an ask in each state, a seat, a claim, an order and
+/// with a head and prose, a running list and a finished one with bodies, an ask in each state, a seat, a claim, an order and
 /// a machine.
 fn world() -> Vec<Entity> {
     let mut es: Vec<Entity> = [
@@ -114,6 +115,18 @@ fn world() -> Vec<Entity> {
             fields: fields(&[("caption", "group two"), ("stop", "barrier")]),
         }],
         fields: fields(&[("body", "# the list's file"), ("title", "read api"), ("status", "running")]),
+    }));
+    es.push(Entity::List(List {
+        id: ListId("old-list".into()),
+        state: ListState::Finished,
+        groups: vec![Group {
+            id: GroupId { list: ListId("old-list".into()), n: 1 },
+            state: ListState::Passed,
+            members: vec![RowId("done-body".into())],
+            attempt: 1,
+            fields: BTreeMap::new(),
+        }],
+        fields: fields(&[("body", "# a finished list's file"), ("title", "old"), ("status", "done")]),
     }));
     for (id, st) in [("q-raised", AskState::Raised), ("q-acked", AskState::Acked), ("q-answered", AskState::Answered)] {
         es.push(ask(id, st));
@@ -187,11 +200,18 @@ fn wip_snapshot_keeps_bodies_on_open_rows_alone_and_raised_asks_alone() {
     assert_eq!(wip.rows[&RowId("done-head".into())].fields["head"], "{\"id\":\"done-head\"}");
     assert_eq!(wip.rows[&RowId("done-body".into())].fields["tags"], "verify");
 
-    // Lists without their text, groups whole.
-    let list = &wip.lists[&ListId("wsp-read-api".into())];
-    let whole_list = &whole.lists[&ListId("wsp-read-api".into())];
-    assert!(!list.fields.contains_key("body"));
-    assert_eq!(list.fields, fields(&[("title", "read api"), ("status", "running")]));
+    // A list not finished is whole: its body is the only way back to its worklist.
+    assert_eq!(wip.lists.keys().collect::<Vec<_>>(), whole.lists.keys().collect::<Vec<_>>());
+    let running = ListId("wsp-read-api".into());
+    assert_eq!(wip.lists[&running], whole.lists[&running], "a running list is whole");
+    assert_eq!(wip.lists[&running].fields["body"], "# the list's file");
+    // A finished list without its text, groups whole.
+    let list = &wip.lists[&ListId("old-list".into())];
+    let whole_list = &whole.lists[&ListId("old-list".into())];
+    for k in WIP_BODIES {
+        assert!(!list.fields.contains_key(k), "a finished list keeps no `{k}`");
+    }
+    assert_eq!(list.fields, fields(&[("title", "old"), ("status", "done")]));
     assert_eq!((&list.groups, list.state), (&whole_list.groups, whole_list.state));
 
     // Only the raised ask.
@@ -221,6 +241,8 @@ fn the_sql_cut_and_the_memory_cut_agree() {
     let line = serde_json::to_string(&s.wip_snapshot().unwrap().0).unwrap();
     let back: Value = serde_json::from_str(&line).unwrap();
     assert!(back["rows"]["done-body"]["fields"].get("body").is_none());
+    assert!(back["lists"]["old-list"]["fields"].get("body").is_none());
+    assert!(back["lists"]["wsp-read-api"]["fields"].get("body").is_some());
 }
 
 #[test]

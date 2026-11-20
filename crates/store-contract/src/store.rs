@@ -57,8 +57,9 @@ pub const STORE_INSTANCE: &str = "store";
 
 /// The `fields` keys that hold a row's or a list's text, which
 /// [`Reads::wip_snapshot`] leaves out of every row that is not open and every
-/// list: `body` is the file's text, `prose` a head-only row's body (as
-/// `src/mirror.rs` writes them).
+/// list that is `finished`: `body` is the file's text, `prose` a head-only
+/// row's body (as `src/mirror.rs` writes them). A list's `body` is the only
+/// way back to its worklist, so one that is not finished keeps it.
 pub const WIP_BODIES: [&str; 2] = ["body", "prose"];
 
 /// Which rows `rows` returns; an empty field does not filter.
@@ -102,8 +103,9 @@ pub trait Reads {
     /// What `wip` draws of [`snapshot`](Reads::snapshot), at the id it is
     /// consistent at (wsp-695): every row, an open one (any state but `done`)
     /// whole and any other as its head, which is the row without the
-    /// [`WIP_BODIES`] fields; every list without them too, its groups whole;
-    /// only the asks that are `raised`; and the seats and claims whole. Orders, runs, machines and leases
+    /// [`WIP_BODIES`] fields; every list, one not `finished` whole and a
+    /// finished one without those fields, its groups whole; only the asks
+    /// that are `raised`; and the seats and claims whole. Orders, runs, machines and leases
     /// are left empty. It is `snapshot()` with exactly that taken out, nothing
     /// else changed.
     fn wip_snapshot(&self) -> Result<(State, EventId)>;

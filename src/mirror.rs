@@ -1317,6 +1317,42 @@ mod tests {
         assert!(head.has_section(crate::verification::SECTION), "the head still says the row has a Verification");
     }
 
+    /// wsp-695: `wip_snapshot` over lists as the mirror writes them. A list
+    /// that is not finished comes back with its `body`, so [`list_of`] reads
+    /// back the very `Worklist` the files hold (wip's running list, homes and
+    /// governor come from it); a finished one comes back without its text,
+    /// which `list_of` reads as no list, as wip draws nothing from it.
+    #[test]
+    fn wip_snapshot_keeps_a_running_lists_body_so_list_of_reads_it_back_and_cuts_a_finished_ones() {
+        use c::{Commands, Reads};
+        let s = seed("mirror-wip-lists");
+        let mut old = Worklist::new("list-old", "A finished list");
+        let mut g = model::Group::default();
+        g.members = vec!["wsp-5".into()];
+        g.verdict = "holds".into();
+        old.set_groups(&[g]);
+        old.set_status(WorklistStatus::Done);
+        s.save_worklist(&old).unwrap();
+        let es: Vec<Entity> = read_rows_etc(&s, "here").into_iter().filter(|e| matches!(e, Entity::List(_))).collect();
+        assert_eq!(es.len(), 2, "a running list and a finished one");
+        assert!(es.iter().all(|e| matches!(e, Entity::List(l) if l.fields.contains_key(BODY))), "the mirror writes each with its body");
+
+        let db = wsp_store_sqlite::SqliteStore::open(s.state.join("state.db"), Arc::new(wsp_server::Mirror)).unwrap();
+        db.apply(Command::Mirror { put: es, gone: Vec::new() }, IdempotencyKey("t".into()), Principal::Wsp("test".into())).unwrap();
+        let (cut, _) = db.wip_snapshot().unwrap();
+        let files = s.worklists();
+        let running = &cut.lists[&ListId("list-a".into())];
+        assert_eq!(running.state, ListState::Running);
+        let back = list_of(running).expect("a running list keeps the body list_of reads");
+        let want = files.iter().find(|w| w.id == "list-a").unwrap();
+        assert_eq!(format!("{back:?}"), format!("{want:?}"), "list_of reads back the running list the files hold");
+
+        let finished = &cut.lists[&ListId("list-old".into())];
+        assert_eq!((finished.state, finished.groups.len()), (ListState::Finished, 1), "a finished list keeps its state and groups");
+        assert!(c::WIP_BODIES.iter().all(|k| !finished.fields.contains_key(*k)), "a finished list loses its text");
+        assert!(list_of(finished).is_none(), "so list_of reads no list from it");
+    }
+
     /// An ask carries its message's record, and the store's reader rebuilds the
     /// same message from it; a flag carries its `flags.json` record.
     #[test]

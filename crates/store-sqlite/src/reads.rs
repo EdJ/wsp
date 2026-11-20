@@ -93,6 +93,7 @@ impl Reads for SqliteStore {
         let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
         let done = word(serde_json::json!(RowState::Done));
         let raised = word(serde_json::json!(AskState::Raised));
+        let finished = word(serde_json::json!(ListState::Finished));
         let [body, prose] = WIP_BODIES.map(|k| format!("$.fields.{k}"));
         self.with_conn(|c| {
             let (json, head): (String, i64) = c
@@ -102,7 +103,9 @@ impl Reads for SqliteStore {
                                     CASE WHEN json_extract(value, '$.state') = ?1
                                          THEN json_remove(value, ?3, ?4) ELSE json(value) END)
                                  FROM json_each(s.json, '$.rows')),
-                        'lists', (SELECT json_group_object(key, json_remove(value, ?3, ?4))
+                        'lists', (SELECT json_group_object(key,
+                                     CASE WHEN json_extract(value, '$.state') = ?5
+                                          THEN json_remove(value, ?3, ?4) ELSE json(value) END)
                                   FROM json_each(s.json, '$.lists')),
                         'seats', json(COALESCE(json_extract(s.json, '$.seats'), '{}')),
                         'claims', json(COALESCE(json_extract(s.json, '$.claims'), '{}')),
@@ -111,7 +114,7 @@ impl Reads for SqliteStore {
                                  WHERE json_extract(value, '$.state') = ?2)),
                      (SELECT COALESCE(MAX(id), 0) FROM event)
                      FROM (SELECT (SELECT json FROM state WHERE id = 1) AS json) AS s",
-                    params![done, raised, body, prose],
+                    params![done, raised, body, prose, finished],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(be)?;
