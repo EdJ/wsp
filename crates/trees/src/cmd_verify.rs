@@ -270,16 +270,12 @@ enum Runs<'a> {
     Jobs(Jobs<'a>),
 }
 
-/// One verify's jobs: the host they go to, the run they belong to, and the
-/// host's tree root that a place is relative to.
+/// One verify's jobs: the host they go to and the run they belong to.
 struct Jobs<'a> {
     host: &'a dyn wsp_wire::host::Host,
     /// The key's row and attempt and the mark every job name ends with
     /// (`verify:<what>:<n>@<mark>`); also what a warm lock names.
     run: sharing::Run,
-    /// The host's tree root, as its manager's `--tree-root` (the home
-    /// directory by default).
-    root: PathBuf,
     /// Jobs sent so far, so each key is unique per run (wsp-040).
     sent: std::sync::atomic::AtomicU32,
 }
@@ -290,8 +286,8 @@ struct Jobs<'a> {
 const BUILD_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 impl<'a> Jobs<'a> {
-    fn new(host: &'a dyn wsp_wire::host::Host, run: sharing::Run, root: PathBuf) -> Jobs<'a> {
-        Jobs { host, run, root, sent: std::sync::atomic::AtomicU32::new(0) }
+    fn new(host: &'a dyn wsp_wire::host::Host, run: sharing::Run) -> Jobs<'a> {
+        Jobs { host, run, sent: std::sync::atomic::AtomicU32::new(0) }
     }
 
     /// The next job's key, `verify:<what>:<n>@<mark>`.
@@ -335,7 +331,8 @@ impl<'a> Jobs<'a> {
         timeout: Duration,
         seen: &mut dyn FnMut(&str),
     ) -> Result<(wsp_wire::host::JobEnded, String), String> {
-        let at = place_of_verify(self, dir)?;
+        // The place comes from `place_of`, never from a path joined here.
+        let at = place_of(Whose::Row(&self.run.row), TreeKind::Verify, dir)?.at;
         // `env -u K -- K=V … cmd`: the values wsp mints cross on the argv
         // (host-api `JobRun`), and the caller's private index does not.
         let mut full: Vec<String> = vec!["env".into(), "-u".into(), "GIT_INDEX_FILE".into(), "--".into()];
@@ -363,29 +360,95 @@ impl<'a> Jobs<'a> {
     }
 }
 
-/// Where a verify job runs: the **one** place verify names a job's place, so
-/// that wsp-053's `place_of(row, verify)` replaces this body and no caller
-/// moves. Until then it answers what `place_of` answers on the Mac at M3: a
-/// `HostDir` on the jobs' host, relative to that host's tree root, for the
-/// tree verify made in-process. Never a path on wsp's machine.
-fn place_of_verify(jobs: &Jobs, dir: &Path) -> Result<wsp_wire::host::JobAt, String> {
-    let rel = under(&jobs.root, dir)?;
-    Ok(wsp_wire::host::JobAt::Dir(wsp_wire::host::HostDir { host: wsp_wire::host::HostId(jobs.run.host.clone()), path: rel }))
-}
+// Where a verify job runs: `place_of(row, verify)`, the one function a check,
+// a verifier and a barrier take a job's place from (wsp-053). Until wsp-053
+// lands it is `place_stub` below, written against the same signature; the
+// swap is this one line, to `crate::job_place::{…}`.
+use place_stub::{host_of, place_of, TreeKind, Whose};
 
-/// `dir` relative to `root`, with `/` between its parts: refused when it is
-/// not under it, as the manager would refuse it (`no_tree`).
-fn under(root: &Path, dir: &Path) -> Result<String, String> {
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let (root, dir) = (canon(root), canon(dir));
-    let rel = dir
-        .strip_prefix(&root)
-        .map_err(|_| format!("{} is not under the jobs' tree root {}", dir.display(), root.display()))?;
-    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-    if parts.is_empty() {
-        return Err(format!("{} is the tree root itself, not a tree under it", dir.display()));
+/// A stand-in for wsp-053's `job_place` (its signature, `place_of(whose:
+/// Whose, kind: TreeKind, tree: &Path) -> Result<Place, String>`), holding
+/// only what verify uses, until that row lands and this module goes. It
+/// answers what `place_of` answers at M3: a `HostDir` on the row's host (this
+/// machine until rows record their seat's host) relative to the tree root
+/// (the home directory, the manager's default), for the tree verify made
+/// here; never a path on wsp's machine.
+#[allow(dead_code)]
+mod place_stub {
+    use std::path::{Path, PathBuf};
+    use wsp_wire::host::{HostDir, HostId, JobAt};
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Whose<'a> {
+        Row(&'a str),
     }
-    Ok(parts.join("/"))
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TreeKind {
+        Verify,
+    }
+
+    pub struct Place {
+        pub at: JobAt,
+        pub dir: PathBuf,
+        pub row: String,
+        pub kind: TreeKind,
+    }
+
+    impl Place {
+        pub fn host(&self) -> &str {
+            match &self.at {
+                JobAt::Tree(t) => &t.host.0,
+                JobAt::Dir(d) => &d.host.0,
+            }
+        }
+    }
+
+    /// The host a row's work happens on: this machine, until rows record
+    /// their seat's host.
+    pub fn host_of(_whose: Whose<'_>) -> String {
+        crate::util::hostname()
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static TREE_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// A test's own tree root, kept to its thread.
+    #[cfg(test)]
+    pub fn set_tree_root(root: Option<PathBuf>) {
+        TREE_ROOT.with(|r| *r.borrow_mut() = root);
+    }
+
+    /// The host's tree root, as its manager's `--tree-root`.
+    pub fn tree_root() -> PathBuf {
+        #[cfg(test)]
+        if let Some(root) = TREE_ROOT.with(|r| r.borrow().clone()) {
+            return root;
+        }
+        crate::util::home()
+    }
+
+    pub fn place_of(whose: Whose<'_>, kind: TreeKind, tree: &Path) -> Result<Place, String> {
+        let Whose::Row(row) = whose;
+        if !tree.is_dir() {
+            std::fs::create_dir_all(tree).map_err(|e| format!("could not make the verify tree {}: {e}", tree.display()))?;
+        }
+        let root = tree_root();
+        let (Ok(root_real), Ok(real)) = (root.canonicalize(), tree.canonicalize()) else {
+            return Err(format!("the verify tree {} or the tree root {} does not read", tree.display(), root.display()));
+        };
+        let Ok(rel) = real.strip_prefix(&root_real) else {
+            return Err(format!("the verify tree {} is not under the tree root {}", tree.display(), root.display()));
+        };
+        let path = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+        let at = HostDir { host: HostId(host_of(whose)), path };
+        if at.escapes() {
+            return Err(format!("the verify tree {} is the tree root itself or outside it", tree.display()));
+        }
+        Ok(Place { at: JobAt::Dir(at), dir: tree.to_path_buf(), row: row.to_string(), kind })
+    }
 }
 
 /// `to` as seen from `from`, both on the jobs' host: how a job names its
@@ -414,27 +477,35 @@ fn relative(from: &Path, to: &Path) -> PathBuf {
 /// barrier's list and group do (the governor's answer, 2026-11-20); the mark
 /// is the start in milliseconds and this pid, so each run's keys are its own
 /// (wsp-051).
-fn this_run(host: &str, checkout: Option<&Path>, key: &str) -> sharing::Run {
+///
+/// Its host is the row's, as `place_of` names it ([`host_of`]), so a warm
+/// lock is read from the job table of the host its jobs run on.
+fn this_run(checkout: Option<&Path>, key: &str) -> sharing::Run {
     let row = checkout
         .and_then(|c| c.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| key.to_string());
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    sharing::Run { host: host.to_string(), row, attempt: 0, mark: format!("{ms}-{}", std::process::id()) }
+    let host = host_of(Whose::Row(&row));
+    sharing::Run { host, row, attempt: 0, mark: format!("{ms}-{}", std::process::id()) }
 }
 
-/// The jobs' host under `WSP_JOBS=manager`, and its id as the machine record
-/// names it; `None` under `inproc`. An error is the choice or the manager
-/// failing, said once, and nothing is run in this process in its place.
-fn jobs_host(state: &Path) -> Result<Option<(&'static dyn wsp_wire::host::Host, String)>, String> {
+/// The manager `run`'s jobs go to under `WSP_JOBS=manager`; `None` under
+/// `inproc`, and `None` too when the run's host is not the host this
+/// machine's manager is (6.2: while the Mac's manager is the only one, a row
+/// on a host with no manager keeps the in-process path). An error is the
+/// choice or the manager failing, said once, and nothing is run in this
+/// process in its place.
+fn jobs_host(state: &Path, run: &sharing::Run) -> Result<Option<&'static dyn wsp_wire::host::Host>, String> {
     use wsp_wire::host::JobsChoice;
     match JobsChoice::from_env().map_err(|e| e.to_string())? {
         JobsChoice::Inproc => Ok(None),
         JobsChoice::Manager => {
-            let host = wsp_wire::host::jobs_chosen(state, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
-            let (local, _) = wsp_wire::manager::read_record(state)
-                .ok_or_else(|| format!("no machine record under {}", state.display()))?;
-            Ok(Some((host, local.host)))
+            let ours = wsp_wire::manager::read_record(state).map(|(local, _)| local.host);
+            if ours.as_deref() != Some(run.host.as_str()) {
+                return Ok(None);
+            }
+            wsp_wire::host::jobs_chosen(state, env!("CARGO_PKG_VERSION")).map(Some).map_err(|e| e.to_string())
         }
     }
 }
@@ -1569,9 +1640,10 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     let Scratch { dir, tree, target, checkout } = scratch(store, &repo, &key);
     // `WSP_JOBS` decides how the runs below are run ([`Runs`]), once, before
     // anything is claimed: a warm lock says which kind of holder it is.
-    let runs = match jobs_host(&store.state) {
+    let run = this_run(checkout.as_deref(), &key);
+    let runs = match jobs_host(&store.state, &run) {
         Ok(None) => Runs::Direct,
-        Ok(Some((host, id))) => Runs::Jobs(Jobs::new(host, this_run(&id, checkout.as_deref(), &key), util::home())),
+        Ok(Some(host)) => Runs::Jobs(Jobs::new(host, run)),
         Err(e) => {
             eprintln!("wsp: verify's jobs: {e}");
             return 2;
@@ -2814,7 +2886,17 @@ mod jobs_tests {
     use wsp_manager::{Config, Manager, TOKEN_FILE};
     use wsp_wire::host::{Host, JobClass, JobState, Tcp};
 
-    const HOST: &str = "verify-host";
+    /// The host `place_of` names a row's tree on: this machine, until rows
+    /// record their seat's host. The manager must be it, or it refuses the
+    /// place as another host's.
+    fn host() -> String {
+        host_of(Whose::Row("any"))
+    }
+
+    /// Jobs placed under this test's tree root, on this thread.
+    fn rooted(place: &Place) {
+        place_stub::set_tree_root(Some(place.root.clone()));
+    }
 
     /// A tree root with a `tree` and a `target` in it, an exec dir and a
     /// state dir beside it.
@@ -2870,7 +2952,7 @@ mod jobs_tests {
     /// The manager alone, and the port and token a client dials it with.
     fn manager_at(place: &Place) -> (Manager, u16, String) {
         let exec = place.top.join("exec");
-        let mut cfg = Config::new(&exec, HOST);
+        let mut cfg = Config::new(&exec, &host());
         cfg.port = free_port();
         cfg.tree_root = place.root.clone();
         cfg.job_grace = Duration::from_millis(500);
@@ -2889,7 +2971,7 @@ mod jobs_tests {
     }
 
     fn run(row: &str, mark: &str) -> sharing::Run {
-        sharing::Run { host: HOST.into(), row: row.into(), attempt: 0, mark: mark.into() }
+        sharing::Run { host: host(), row: row.into(), attempt: 0, mark: mark.into() }
     }
 
     fn within(wait: Duration, mut f: impl FnMut() -> bool) -> bool {
@@ -2916,26 +2998,37 @@ mod jobs_tests {
         rows
     }
 
-    /// The place stub names the jobs' host and a path relative to its tree
-    /// root, never a path on wsp's machine; a tree outside the root is
-    /// refused, as the manager would refuse it. (wsp-053's `place_of(row,
-    /// verify)` replaces the stub's body; the `HostDir` it answers is this.)
+    /// A verify job takes its place from `place_of(row, verify)`: a
+    /// `HostDir` naming the row's host and a path relative to that host's
+    /// tree root, never a path on wsp's machine; and the job runs there. A
+    /// tree outside the root is no place.
     #[test]
-    fn a_verify_job_is_placed_on_the_jobs_host_relative_to_its_tree_root() {
+    fn a_verify_job_takes_its_place_from_place_of_and_names_the_rows_host() {
         let place = Place::new("place");
+        rooted(&place);
         let (m, tcp) = manager(&place);
-        let jobs = Jobs::new(&tcp, run("wsp-054", "p1"), place.root.clone());
-        match place_of_verify(&jobs, &place.tree()) {
-            Ok(wsp_wire::host::JobAt::Dir(d)) => {
-                assert_eq!(d.host.0, HOST, "the job names the host its tree is on");
+        let p = place_of(Whose::Row("wsp-054"), TreeKind::Verify, &place.tree()).unwrap();
+        assert_eq!(p.host(), host(), "the row's host");
+        match &p.at {
+            wsp_wire::host::JobAt::Dir(d) => {
                 assert_eq!(d.path, "w/tree", "relative to the host's tree root");
                 assert!(!d.escapes());
             }
             other => panic!("expected a HostDir, got {other:?}"),
         }
+        let me = run("wsp-054", "p1");
+        assert_eq!(me.host, p.host(), "the run's locks are read from the host its jobs run on");
+        let jobs = Jobs::new(&tcp, me);
+        let (ended, out) = jobs
+            .run("pwd", JobClass::Check, &place.tree(), &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {})
+            .unwrap();
+        assert_eq!(ended.exit, Some(0), "{out}");
+        assert_eq!(PathBuf::from(out.trim()).canonicalize().unwrap(), place.tree().canonicalize().unwrap(), "it ran in the place");
+
         let outside = place.top.join("elsewhere");
         std::fs::create_dir_all(&outside).unwrap();
-        assert!(place_of_verify(&jobs, &outside).is_err(), "a tree outside the root is no place");
+        assert!(place_of(Whose::Row("wsp-054"), TreeKind::Verify, &outside).is_err(), "a tree outside the root is no place");
+        assert!(jobs.run("pwd", JobClass::Check, &outside, &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {}).is_err());
         assert_eq!(relative(&place.tree(), &place.root.join("w").join("target")), PathBuf::from("../target"));
         m.stop();
     }
@@ -2946,13 +3039,14 @@ mod jobs_tests {
     #[test]
     fn verifys_cargo_is_a_build_job_with_its_target_and_share_in_the_env_prefix() {
         let place = Place::new("cargo");
+        rooted(&place);
         let tree = place.tree();
         std::fs::write(tree.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
         std::fs::create_dir_all(tree.join("src")).unwrap();
         std::fs::write(tree.join("src/lib.rs"), "").unwrap();
         let (m, tcp) = manager(&place);
         let me = run("wsp-054", "c1");
-        let runs = Runs::Jobs(Jobs::new(&tcp, me.clone(), place.root.clone()));
+        let runs = Runs::Jobs(Jobs::new(&tcp, me.clone()));
         let share = sharing::unregistered();
         let target = place.root.join("w").join("target");
         let (ok, text) =
@@ -2992,8 +3086,9 @@ mod jobs_tests {
     }
 
     fn echo_flow(place: &Place, tcp: &Tcp) {
+        rooted(place);
         let me = run("wsp-054", "e1");
-        let jobs = Jobs::new(tcp, me.clone(), place.root.clone());
+        let jobs = Jobs::new(tcp, me.clone());
         let go = place.tree().join("go");
         let script = "echo first; i=0; while [ ! -e go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; [ -e go ] && echo second";
         let mut heard = Vec::new();
@@ -3023,23 +3118,25 @@ mod jobs_tests {
     }
 
     fn lock_flow(place: &Place, tcp: &Tcp) {
+        rooted(place);
         let repo = place.top.join("repo");
         let a = run("wsp-054", "a1");
         let b = run("wsp-099", "b1");
-        let jobs_a = Jobs::new(tcp, a.clone(), place.root.clone());
-        let jobs_b = Jobs::new(tcp, b.clone(), place.root.clone());
+        let jobs_a = Jobs::new(tcp, a.clone());
+        let jobs_b = Jobs::new(tcp, b.clone());
         let table_a = |h: &str| jobs_a.table(h);
         let table_b = |h: &str| jobs_b.table(h);
         let live_a = sharing::Live::Jobs { me: &a, table: &table_a };
         let live_b = sharing::Live::Jobs { me: &b, table: &table_b };
 
         let warm = sharing::warm(&place.state(), &repo, 1, live_a).expect("a free tree");
-        assert!(warm.dir.starts_with(place.state().join("warm").join(HOST)), "warm trees are per host: {:?}", warm.dir);
+        assert!(warm.dir.starts_with(place.state().join("warm").join(crate::util::slugify(&host()))), "warm trees are per host: {:?}", warm.dir);
         assert!(sharing::warm(&place.state(), &repo, 1, live_b).is_none(), "held through setup, with no job yet");
         assert!(warm.touch());
 
         std::thread::scope(|s| {
             let build = s.spawn(|| {
+                rooted(place);
                 jobs_a.run("cargo-test", JobClass::Build, &place.tree(), &[], vec!["sh".into(), "-c".into(), "sleep 30".into()], Duration::from_secs(60), &mut |_| {})
             });
             assert!(
@@ -3074,8 +3171,9 @@ mod jobs_tests {
     }
 
     fn alone_flow(place: &Place, tcp: &Tcp) {
+        rooted(place);
         let me = run("wsp-054", "al1");
-        let runs = Runs::Jobs(Jobs::new(tcp, me.clone(), place.root.clone()));
+        let runs = Runs::Jobs(Jobs::new(tcp, me.clone()));
         let tree = place.tree();
         let bin = place.root.join("w").join("target");
         let lists = bin.join("lists");
@@ -3156,11 +3254,12 @@ mod jobs_tests {
     /// agent's workspace, and two runs never share a mark.
     #[test]
     fn a_verify_with_no_row_is_keyed_by_its_workspace_and_each_run_by_its_mark() {
-        let in_row = this_run(HOST, Some(Path::new("/x/.worktrees/wsp-054")), "cpd-185");
+        let in_row = this_run(Some(Path::new("/x/.worktrees/wsp-054")), "cpd-185");
         assert_eq!(in_row.row, "wsp-054");
-        let bare = this_run(HOST, None, "cpd-185");
+        assert_eq!(in_row.host, host(), "the row's host, as place_of names it");
+        let bare = this_run(None, "cpd-185");
         assert_eq!(bare.row, "cpd-185", "the workspace stands in for the row");
         std::thread::sleep(Duration::from_millis(2));
-        assert_ne!(this_run(HOST, None, "cpd-185").mark, bare.mark, "unique per run");
+        assert_ne!(this_run(None, "cpd-185").mark, bare.mark, "unique per run");
     }
 }
