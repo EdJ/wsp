@@ -16,6 +16,9 @@
 //!   `cancelled` (and `done`, which only follows `acknowledged`, so an order
 //!   that went past it while nobody was looking is settled too). In process
 //!   it follows the head with `wait_for`; outside it, `await_order`.
+//! - [`send_keyed`] is [`send`] under the caller's key, so a repeat (the
+//!   daemon's next tick) is the same order; [`order`] reads an order in any
+//!   state and [`orders_of`] a seat's orders in some states, neither waiting.
 //!
 //! Nothing here delivers: that is the worker's, under `deliver:<seat>`.
 
@@ -171,25 +174,137 @@ pub fn send(store: &Store, seat: &SeatId, text: &str, from: &Principal, first: b
         None => {
             let mut client = dial(store, from)?;
             let applied = client.apply(&cmd).map_err(from_client)?;
-            let first = applied.events.iter().min().copied().ok_or_else(no_queued)?;
-            let reply = client
-                .request("events", serde_json::json!({ "from": first.0.saturating_sub(1), "limit": applied.events.len() }))
-                .map_err(from_client)?;
-            match reply.outcome {
-                wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, .. }) => queued(&events).ok_or_else(no_queued),
-                wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("events was answered {other:?}"))),
-                wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
-            }
+            queued_through(&mut client, &applied.events)
         }
+    }
+}
+
+/// The order an applied `order.send` queued, read back through the API from
+/// the events the apply wrote.
+fn queued_through(client: &mut wsp_client::Client, written: &[EventId]) -> Result<OrderId, Error> {
+    let first = written.iter().min().copied().ok_or_else(no_queued)?;
+    let reply = client
+        .request("events", serde_json::json!({ "from": first.0.saturating_sub(1), "limit": written.len() }))
+        .map_err(from_client)?;
+    match reply.outcome {
+        wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, .. }) => queued(&events).ok_or_else(no_queued),
+        wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("events was answered {other:?}"))),
+        wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
     }
 }
 
 /// [`send`] through an open store.
 pub fn send_in(db: &SharedStore, cmd: Command, from: &Principal) -> Result<OrderId, Error> {
-    let applied = db.apply(cmd, mint_key(), from.clone()).map_err(from_store)?;
+    send_in_keyed(db, cmd, mint_key(), from)
+}
+
+/// `cmd` applied under `key` through an open store, and the order it queued.
+/// A key the store has seen gives the first apply's events, so the same order.
+fn send_in_keyed(db: &SharedStore, cmd: Command, key: IdempotencyKey, from: &Principal) -> Result<OrderId, Error> {
+    let applied = db.apply(cmd, key, from.clone()).map_err(from_store)?;
     let first = applied.events.iter().min().copied().ok_or_else(no_queued)?;
     let events = db.events_after(EventId(first.0.saturating_sub(1)), applied.events.len()).map_err(from_store)?;
     queued(&events).ok_or_else(no_queued)
+}
+
+/// How many times [`send_keyed`] sends outside the daemon, at most, after a
+/// lost reply or connection. The key makes each one after the first safe.
+const KEYED_ATTEMPTS: u32 = 3;
+
+/// The idempotency key [`send_keyed`] applies under for the caller's `key`:
+/// namespaced, so it meets no key [`mint_key`] or anyone else makes.
+fn caller_key(key: &str) -> IdempotencyKey {
+    IdempotencyKey(format!("send:key:{key}"))
+}
+
+/// [`send`] under the caller's `key` rather than a fresh one: the same key
+/// sent again (the daemon's next tick, say) is the same order, and the same
+/// [`OrderId`] comes back, because the store gives a repeated key the first
+/// apply's result (store-contract's `Store::apply`, wsp-065). Two keys are two
+/// orders. In the daemon through its open store; anywhere else through the API
+/// under the same key on each retry.
+pub fn send_keyed(
+    store: &Store,
+    seat: &SeatId,
+    text: &str,
+    from: &Principal,
+    first: bool,
+    key: &str,
+) -> Result<OrderId, Error> {
+    let cmd = Command::OrderSend { to: seat.clone(), text: text.to_string(), first };
+    match in_process() {
+        Some(db) => send_in_keyed(db, cmd, caller_key(key), from),
+        None => {
+            let mut client = dial(store, from)?;
+            let args = match serde_json::to_value(&cmd) {
+                Ok(mut v) => v.get_mut("args").map(serde_json::Value::take).unwrap_or_default(),
+                Err(e) => return Err(Error::Failed(format!("order.send as json: {e}"))),
+            };
+            let mut attempt = 0;
+            let reply = loop {
+                attempt += 1;
+                match client.request_keyed("order.send", args.clone(), caller_key(key)) {
+                    Err(wsp_client::Error::Timeout | wsp_client::Error::Lost(_)) if attempt < KEYED_ATTEMPTS => {}
+                    other => break other.map_err(from_client)?,
+                }
+            };
+            match reply.outcome {
+                wsp_api::Outcome::Ok(wsp_api::Answer::Applied) => queued_through(&mut client, &reply.events),
+                wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("order.send was answered {other:?}"))),
+                wsp_api::Outcome::Err(f) => match f.refusal {
+                    Some(r) => Err(Error::Refused(r)),
+                    None => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
+                },
+            }
+        }
+    }
+}
+
+/// Order `id` in whatever state it is in now, without waiting; `None` when no
+/// store holds it. In the daemon a read of its open store; anywhere else the
+/// API's `orders` read.
+pub fn order(store: &Store, id: &OrderId) -> Result<Option<Order>, Error> {
+    match in_process() {
+        Some(db) => order_in(db, id),
+        None => {
+            let mut client = dial(store, &Principal::Wsp("orders".into()))?;
+            Ok(read_orders(&mut client, serde_json::json!({}))?.into_iter().find(|o| &o.id == id))
+        }
+    }
+}
+
+/// [`order`] on an open store.
+pub fn order_in(db: &SharedStore, id: &OrderId) -> Result<Option<Order>, Error> {
+    let (state, _) = db.snapshot().map_err(from_store)?;
+    Ok(state.orders.get(id).cloned())
+}
+
+/// `seat`'s orders in any of `states` (every state when `states` is empty, as
+/// the store and the API read it), without waiting. In the daemon a read of
+/// its open store; anywhere else the API's `orders` read.
+pub fn orders_of(store: &Store, seat: &SeatId, states: &[OrderState]) -> Result<Vec<Order>, Error> {
+    match in_process() {
+        Some(db) => orders_of_in(db, seat, states),
+        None => {
+            let mut client = dial(store, &Principal::Wsp("orders".into()))?;
+            read_orders(&mut client, serde_json::json!({ "seat": seat, "states": states }))
+        }
+    }
+}
+
+/// [`orders_of`] on an open store.
+pub fn orders_of_in(db: &SharedStore, seat: &SeatId, states: &[OrderState]) -> Result<Vec<Order>, Error> {
+    db.orders_for(seat, states).map_err(from_store)
+}
+
+/// The API's `orders` read under `args`.
+fn read_orders(client: &mut wsp_client::Client, args: serde_json::Value) -> Result<Vec<Order>, Error> {
+    let reply = client.request("orders", args).map_err(from_client)?;
+    match reply.outcome {
+        wsp_api::Outcome::Ok(wsp_api::Answer::Orders(orders)) => Ok(orders),
+        wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("orders was answered {other:?}"))),
+        wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
+    }
 }
 
 fn dial(store: &Store, by: &Principal) -> Result<wsp_client::Client, Error> {
@@ -231,7 +346,7 @@ pub fn answer_in(db: &SharedStore, id: &OrderId, wait: Duration) -> Result<Optio
 pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
-    use wsp_store_contract::{Entity, MachineName, Seat, SeatState};
+    use wsp_store_contract::{Entity, Fence, LeaseName, Leases, MachineName, Seat, SeatState};
 
     /// A fresh `state.db` under `dir`, its domain the composed one under `mode`.
     pub(crate) fn db(dir: &std::path::Path, mode: wsp_server::Mode) -> SharedStore {
@@ -315,6 +430,70 @@ pub(crate) mod tests {
         assert!(matches!(send_in(&db, gone, &ed()), Err(Error::Refused(Refusal::NotFound { .. }))));
     }
 
+    /// In process: one caller's key is one order however often it is sent, and
+    /// two keys are two.
+    #[test]
+    fn a_keyed_send_repeated_is_the_same_order_and_two_keys_are_two() {
+        let env = crate::util::isolated("orders-keyed");
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        seat(&db, "cpd-3", SeatState::Idle);
+        let cmd = || Command::OrderSend { to: SeatId("cpd-3".into()), text: "go".into(), first: false };
+        let a = send_in_keyed(&db, cmd(), caller_key("tick:1"), &ed()).unwrap();
+        let again = send_in_keyed(&db, cmd(), caller_key("tick:1"), &ed()).unwrap();
+        assert_eq!(a, again, "the same key gives the same order");
+        assert_eq!(orders_of_in(&db, &SeatId("cpd-3".into()), &[]).unwrap().len(), 1, "one order for one key");
+        let b = send_in_keyed(&db, cmd(), caller_key("tick:2"), &ed()).unwrap();
+        assert_ne!(a, b, "another key is another order");
+        assert_eq!(orders_of_in(&db, &SeatId("cpd-3".into()), &[]).unwrap().len(), 2);
+    }
+
+    /// `order` reads a queued order that `answer` with no wait does not report,
+    /// and `orders_of` lists only the named seat's orders in the named states.
+    #[test]
+    fn an_order_is_read_in_any_state_and_a_seats_failed_orders_are_listed() {
+        let env = crate::util::isolated("orders-read");
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        seat(&db, "cpd-4", SeatState::Idle);
+        seat(&db, "cpd-5", SeatState::Idle);
+        let to = |s: &str| Command::OrderSend { to: SeatId(s.into()), text: "go".into(), first: false };
+        let q = send_in(&db, to("cpd-4"), &ed()).unwrap();
+        assert_eq!(answer_in(&db, &q, Duration::ZERO).unwrap(), None, "a queued order is not settled");
+        let read = order_in(&db, &q).unwrap().expect("read without waiting");
+        assert_eq!(read.state, OrderState::Queued);
+        assert_eq!(order_in(&db, &OrderId("cpd-4-o99".into())).unwrap(), None);
+
+        // Failed: one of cpd-4's and one of cpd-5's, typed under the seat's
+        // lease and refused as the delivery worker would, until the machine's
+        // attempts run out.
+        let by = Principal::Wsp("wsp".into());
+        let fail = |seat: &str| {
+            let id = send_in(&db, to(seat), &ed()).unwrap();
+            let lease = LeaseName::deliver(&SeatId(seat.into()));
+            for n in 0.. {
+                if order_in(&db, &id).unwrap().unwrap().state == OrderState::Failed {
+                    break;
+                }
+                assert!(n < 50, "{id:?} never failed");
+                let token = Leases::take(&*db, &lease, &by, Duration::from_secs(60)).unwrap().expect("free");
+                let fence = Fence { lease: lease.clone(), token };
+                let key = |k: &str| IdempotencyKey(format!("test:{k}:{}:{n}", id.0));
+                db.apply(Command::OrderDeliver { order: id.clone(), fence }, key("deliver"), by.clone()).unwrap();
+                let refused = Command::OrderRefused { order: id.clone(), why: format!("no {n}"), counts: true };
+                db.apply(refused, key("refused"), by.clone()).unwrap();
+                Leases::release(&*db, &lease, token).unwrap();
+            }
+            id
+        };
+        let f4 = fail("cpd-4");
+        let f5 = fail("cpd-5");
+        let failed = orders_of_in(&db, &SeatId("cpd-4".into()), &[OrderState::Failed]).unwrap();
+        assert_eq!(failed.iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![f4]);
+        let failed5 = orders_of_in(&db, &SeatId("cpd-5".into()), &[OrderState::Failed]).unwrap();
+        assert_eq!(failed5.iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![f5]);
+        let queued = orders_of_in(&db, &SeatId("cpd-4".into()), &[OrderState::Queued]).unwrap();
+        assert_eq!(queued.iter().map(|o| o.id.clone()).collect::<Vec<_>>(), vec![q]);
+    }
+
     /// Outside the daemon: the same send through the API with `wsp-client`,
     /// and the answer through `await_order`.
     #[test]
@@ -333,6 +512,17 @@ pub(crate) mod tests {
         db.apply(Command::OrderCancel { order: id.clone() }, IdempotencyKey("c".into()), ed()).unwrap();
         let o = answer(&store, &id, Duration::from_secs(10)).unwrap().expect("settled");
         assert_eq!(o.state, OrderState::Cancelled);
+
+        // The keyed send and the reads, through the API as well.
+        let seat2 = SeatId("cpd-2".into());
+        let k = send_keyed(&store, &seat2, "again", &ed(), false, "tick:1").unwrap();
+        assert_eq!(send_keyed(&store, &seat2, "again", &ed(), false, "tick:1").unwrap(), k);
+        assert_ne!(send_keyed(&store, &seat2, "again", &ed(), false, "tick:2").unwrap(), k);
+        assert_eq!(order(&store, &k).unwrap().map(|o| o.state), Some(OrderState::Queued));
+        assert_eq!(order(&store, &OrderId("cpd-2-o99".into())).unwrap(), None);
+        assert_eq!(orders_of(&store, &seat2, &[OrderState::Queued]).unwrap().len(), 2);
+        assert_eq!(orders_of(&store, &seat2, &[OrderState::Cancelled]).unwrap().len(), 1);
+        assert_eq!(orders_of(&store, &seat2, &[]).unwrap().len(), 3);
         server.stop();
         drop(env);
     }
