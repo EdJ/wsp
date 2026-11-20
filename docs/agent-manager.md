@@ -1352,6 +1352,7 @@ built from this tree.
 | `kill` per tick | 1.3 | 0 | 0 | 0.41 | met in the window |
 | `kill` in CLI calls / `throttle run` / polls | — | 0 | 0 / 0 / 0 | 3,057 / 725 / 686 | met in the window |
 | signals in manager.log on a pgid the manager started | — | every one | 6 of 6 | 354 of 354 (from 2026-11-19T07:29Z) | met in the window |
+| processes that escape a seat's group, counted (wsp-042 (c)) | — | reported and counted | no reporter | — | **missed**, no reporter until wsp-359 |
 | wsp-478-kind incidents | 0 (M0's week) | 0 over a week | 0 | 2 (in 29 h of cycle.log) | **owed**, 2026-11-27; 0 by construction |
 | `throttle run` wall per build (exit 0, ≥ 10 s), p50 | — | no worse | 1 run, 28.1 s | 24.2 s (338 runs), p95 88.4 s | **owed** (full day) |
 | spawn p50 | 9.4 s | ≤ 9.4 s | 1 spawn, 0.89 s | 1.02 s (213), p95 3.12 s | **owed** (full day) |
@@ -1398,6 +1399,13 @@ How each was taken, and the cause of each miss:
   manager's whole log before the install, 354 of 354 match (102 job ends and 252 seat stops). One path signals
   without a line: seats.rs sends KILL to a compound-sup that never gave its handshake, which is a failed
   spawn. The log holds no such failure.
+- **The escape count is missed, for want of a reporter.** wsp-042's decision (c) says that once the sweep
+  goes, processes that escape a seat's group are reported and counted, and stopped by no one. wsp-057
+  deleted the sweep, and with it the only reporter of such processes on wsp's side: `LiveTree::left_in`
+  (src/cmd_spawn.rs) now answers nothing. The manager does not count them either: its seat and job
+  bookkeeping knows a group, not what left it, and manager.log has no line for an escape. So M3 has no
+  number for decision (c) in the window. This is not a 0: an escape in the window would have gone unseen. wsp-359 adds the
+  count, and the owed day (wsp-360) reads it once wsp-359 lands.
 - **Incidents** are counted by `wsp calls --incidents`. Since the install, I1, I2 and I4 are 0, and I3 is 1
   (a prompt read off the screen). The wsp-478 kind is 0, **by construction**: wsp-057 deleted its writer,
   `ending.rs`'s `stop_finished` (32df421), and with it the sign that the count reads. So the week's count will
@@ -1457,6 +1465,9 @@ manager):
   journal, and the call log holds no `kill` from wsp. The day before it held 4,468 in calls and polls, and
   1,759 in ticks. Over the manager's log
   before the install, 354 of 354 match.
+- **Escapes from a seat's group reported and counted (wsp-042 (c)): missed.** Nothing reports them since
+  wsp-057 deleted the sweep (`LiveTree::left_in` answers nothing), and the manager keeps no count. The figure
+  has no reporter until wsp-359, and wsp-360 reads it after that.
 - **wsp-478-kind incidents → 0 over a week: owed** on 2026-11-27T12:08Z (wsp-360). It is 0 since the install,
   but the sign's writer is gone, so the count cannot rise. The week's `pgids.py` is the real figure.
 - **`throttle run`'s wall per build no worse: owed.** The window holds one build (28.1 s, against a 24.2 s
@@ -1474,6 +1485,7 @@ Filed from here:
 - wsp-361 (high): under `WSP_JOBS=manager`, work outside the manager's tree root is refused and not run. That
   covers `wsp check` in the shared check tree, and `throttle run` in a seat's scratch or the home directory.
 - wsp-362 (high): `WSP_JOBS=inproc` does not reach a check step's cargo.
+- Owed elsewhere: the escape count waits on wsp-359 (filed by wsp-057), and wsp-360 carries it.
 - On wsp-324, a note that it bit again at M3.
 
 M4 is broken down by the governor once this row is done (d1 Q14).
