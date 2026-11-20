@@ -1059,8 +1059,25 @@ pub(crate) fn checkout_started(repo: &Path, tree: &Path, sha: &str) -> Result<St
 pub(crate) struct TreeLock(PathBuf);
 
 /// How long a lock whose job is not running stands before it is stale: the
-/// moment between two steps of a run, with room to spare.
+/// moment between two steps of a run, with room to spare. A run that sends no
+/// job for longer (the wsp-067 wait for a missing tree) touches its lock as it
+/// waits ([`Runner::keep_held`]), so a live run's lock never ages past it.
 const HOLD_GRACE: Duration = Duration::from_secs(60);
+
+/// [`HOLD_GRACE`], or a test's own.
+fn hold_grace() -> Duration {
+    #[cfg(test)]
+    if let Some(d) = GRACE.with(|g| g.get()) {
+        return d;
+    }
+    HOLD_GRACE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own grace for a lock whose job is not running, kept to its thread.
+    static GRACE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
 
 impl TreeLock {
     pub(crate) fn take(path: PathBuf, wait: Duration) -> Result<TreeLock, String> {
@@ -1123,7 +1140,7 @@ impl TreeLock {
     fn dead(path: &Path) -> bool {
         Self::dead_with(
             path,
-            HOLD_GRACE,
+            hold_grace(),
             |pid| {
                 note_probe("kill");
                 crate::host::LOCAL.signal(&[pid], "0")
@@ -1160,12 +1177,30 @@ impl TreeLock {
     /// Names job `key` on `host` as the holder of the lock at `path`, keeping
     /// its pid and its since, and touches it. Written beside and renamed over,
     /// so a reader never sees half a line.
+    /// A lock that is not this process's (broken and taken by another run, or
+    /// gone) is left as it is: a holder that lost its lock never writes over
+    /// the next holder's.
     pub(crate) fn name_job(path: &Path, host: &str, key: &JobKey) {
-        let (pid, since) = Self::holder(path).unwrap_or_else(|| (std::process::id(), util::now_iso()));
-        let next = path.with_extension("next");
+        let Some((pid, since)) = Self::holder(path).filter(|(pid, _)| *pid == std::process::id()) else { return };
+        let next = path.with_extension(format!("next-{pid}"));
         if std::fs::write(&next, format!("{pid} {since} job:{host}:{}\n", key_text(key))).is_ok() {
             let _ = std::fs::rename(&next, path);
         }
+    }
+
+    /// Touches the lock at `path`, while it is still this process's: a run
+    /// that holds a tree and sends no job keeps its lock from aging out.
+    pub(crate) fn touch(path: &Path) {
+        if Self::ours(path) {
+            if let Ok(f) = std::fs::File::options().write(true).open(path) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
+        }
+    }
+
+    /// Whether the lock at `path` names this process as its holder.
+    fn ours(path: &Path) -> bool {
+        Self::holder(path).is_some_and(|(pid, _)| pid == std::process::id())
     }
 
     /// [`TreeLock::dead`] with the probe given. Only a definite "not there"
@@ -1185,8 +1220,12 @@ impl TreeLock {
 }
 
 impl Drop for TreeLock {
+    /// Removes the lock only while it is still this process's: one that was
+    /// broken and taken by another run is that run's to remove.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if Self::ours(&self.0) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }
 
@@ -1254,6 +1293,18 @@ impl<'a> Jobs<'a> {
     fn hold(&self, key: &JobKey) {
         if let Some(lock) = &self.lock {
             TreeLock::name_job(lock, self.place.host(), key);
+        }
+    }
+}
+
+impl Runner<'_> {
+    /// Keeps the run's tree lock held through a stretch in which it sends no
+    /// job (the wsp-067 wait for a missing tree): touched, so it does not age
+    /// past the grace and read free while the run is alive. In-process, a
+    /// live holder's pid keeps it, and there is nothing to do.
+    pub(crate) fn keep_held(&self) {
+        if let Runner::Jobs(Jobs { lock: Some(lock), .. }) = self {
+            TreeLock::touch(lock);
         }
     }
 }
@@ -1742,6 +1793,7 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
     if matches!(first.done, Done::TreeMissing(_)) {
         let waited = Instant::now();
         while !dir.is_dir() && waited.elapsed() < tree_back_after() {
+            runner.keep_held();
             std::thread::sleep(Duration::from_millis(200).min(tree_back_after()));
         }
         if !dir.is_dir() {
@@ -3577,6 +3629,43 @@ mod tests {
         JOB_TABLE.with(|t| *t.borrow_mut() = None);
         assert_eq!(job_runs("mac", &key_text(&key)), None, "no manager here: not asked");
         drop(held);
+    }
+
+    /// cpd-197's block: a run under `manager` that waits for its missing tree
+    /// longer than the grace sends no job, and still holds its lock — a
+    /// second take does not get it. A holder that lost its lock neither
+    /// writes over the next holder's nor removes it.
+    #[test]
+    fn a_run_waiting_for_its_tree_past_the_grace_keeps_its_lock() {
+        let env = util::isolated("check-lock-wait");
+        let (dir, log) = scratch_log("lock-wait");
+        let lock = env.state().join("lock");
+        let (_, mut manager) = both(&dir).pop().unwrap();
+        if let Runner::Jobs(jobs) = &mut manager {
+            jobs.lock = Some(lock.clone());
+        }
+        let held = TreeLock::take(lock.clone(), Duration::from_secs(1)).unwrap();
+        assert_eq!(run_step(&dir, &sh("true", 10), &log, &manager).done, Done::Passed, "step 1 names its job in the lock");
+        let named = TreeLock::job_of(&lock).expect("the lock names the job");
+        GRACE.with(|g| g.set(Some(Duration::from_millis(500))));
+        TREE_BACK.with(|t| t.set(Some(Duration::from_secs(2))));
+        JOB_TABLE.with(|t| *t.borrow_mut() = Some(Some(Vec::new())));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let r = run_again(&dir, &sh("true", 10), &log, None, &manager);
+        assert!(matches!(r.done, Done::TreeMissing(_)), "{:?}", r.done);
+        assert!(r.took >= Duration::from_secs(2), "waited past the grace");
+        assert!(TreeLock::take(lock.clone(), Duration::ZERO).is_err(), "a live run's lock read free after its wait");
+        assert_eq!(TreeLock::job_of(&lock), Some(named.clone()));
+
+        // Lost to another holder: neither renamed, touched nor removed by this one.
+        std::fs::write(&lock, format!("4000000000 {} job:mac:other/0/check:x@1.0\n", util::now_iso())).unwrap();
+        TreeLock::name_job(&lock, "mac", &crate::host::job_key("pj-001", 0, "check:s@9.9"));
+        assert!(std::fs::read_to_string(&lock).unwrap().contains("other/0/"), "wrote over the next holder's lock");
+        drop(held);
+        assert!(lock.exists(), "removed the next holder's lock");
+        GRACE.with(|g| g.set(None));
+        TREE_BACK.with(|t| t.set(None));
+        JOB_TABLE.with(|t| *t.borrow_mut() = None);
     }
 
     /// The call log of a check under `manager` holds no `ps`, `kill` or
