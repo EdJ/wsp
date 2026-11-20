@@ -7,6 +7,7 @@ pub use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, lo
 pub mod fake;
 pub mod far;
 pub mod host;
+pub mod host_inproc;
 pub mod host_tcp;
 pub mod launchd;
 pub mod manager;

@@ -440,9 +440,9 @@ Until state-core step 1 moves state into the store, this lives in today's files 
 | inference (state-core 1.6) | deleted from wsp | replaced by |
 |---|---|---|
 | I1: who owns a process (cwd, descent) | `lsof -d cwd` (check_tree.rs:221, :579; ended_panes.rs:81; cmd_role.rs:671), the `procs.rs` callers, leaked_agents.rs, `leaked-agents.json`, `reap-seen.json` | the manager's seat and job tables |
-| I2: is a seat alive, and in what state | `util::alive` per seat, `seat-since.json`, memory.rs's `ps`, waiting.rs's `ps`, herdr's `agent.list` | `turn`, `seat.stopped`, `seats` |
-| I3: was an order delivered and taken | screen renders (59.5 per tick), `typed-unsent.json`, `first-orders.json`, the `hooks.jsonl` scans, `stuck-commands.json` | `order.*`, `seat.stuck` |
-| I4: has a seat ended | census-by-absence, `finished-wip.json` | `seat.stopped` |
+| I2: is a seat alive, and in what state | `util::alive` per seat, `seat-since.json`, memory.rs's `ps`, waiting.rs's `ps`, herdr's `agent.list` | `turn`, `seat.stopped`, `seats` (`seat-since.json` done: group 7) |
+| I3: was an order delivered and taken | screen renders (59.5 per tick), `typed-unsent.json`, `first-orders.json`, the `hooks.jsonl` scans, `stuck-commands.json` | `order.*`, `seat.stuck` (`typed-unsent.json`, `first-orders.json` done: group 7) |
+| I4: has a seat ended | census-by-absence, `finished-wip.json` | `seat.stopped` (done: group 7) |
 | transcript reads in wsp | agent_commands.rs:2723's callers, did.rs:463, the opencode reads | `seat.said`, `seat.spent`, `seat.did` |
 
 I5 (row state) is state-core's rows machine and is not this plan's.
@@ -951,6 +951,20 @@ Tests:
   `a_tell_under_manager_is_delivered_and_a_silent_manager_is_unreachable_then_delivered_on_return`.
 - `cmd_spawn::tests::despawn_under_a_manager_asks_the_manager_and_a_silent_one_keeps_the_claim`.
 - `cmd_agent::tests::a_tell_to_a_silent_manager_is_held_and_the_flush_keeps_it`.
+
+#### Group 7: the contract (wsp-030, 2026-11-20)
+
+The last code row of M1: with `manager` the default, wsp no longer does what M1's events replaced.
+- **Deleted:** `seat-since.json` sampling, `typed-unsent.json`, `first-orders.json`, `repair:unsent`,
+  `sweep:ended-panes` and census-by-absence for the Mac's seats (`finished-wip.json`), `Place::turn_began_since`,
+  `Host::turn_began` and wsp's own scan of `hooks.jsonl` for a turn. `wake` reads the folded turn
+  (`fold::turn_began_since`); `under_manager()` is gone because it is always true.
+- **`WSP_HOST=inproc`** now runs the manager's own code in the daemon's process over the same `Tcp`, not the M0
+  path. It is the manager without a second process, not a rollback to the old inferences.
+- **Left, by plan:** `tunnels` and far.rs's two ssh lines (M2); `leaked_agents`, check_tree's sweep and warm.rs (M3).
+  `wait_ready`'s 150 ms `state` loop and `submit`'s poll stay as the fallback for far seats, which have no events
+  until M2; `hooks.jsonl` is still written by `log_hook`, and `did.rs` and the `ran` clause still read the
+  transcript, since no `seat.*` event replaces them. `docs/host-seam-allowed.txt` holds its four lines.
 
 #### M3's breakdown (wsp-042, 2026-11-17)
 

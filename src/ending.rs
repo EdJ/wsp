@@ -32,8 +32,9 @@
 //!   passes on its own.
 //! - **A seat a person has typed to since the verdict.** A turn that began
 //!   after the verdict is somebody using the agent, and the agent is theirs to
-//!   end now. Read through [`Seats::turn_began_since`], and **a backend that
-//!   cannot say holds too** — the cost of holding is a pane left open, the cost
+//!   end now. Read through [`Seats::turn_began_since`], which is the manager's folded
+//!   `turn` and `order.acked` facts, and **a seat nothing was heard of
+//!   holds too** — the cost of holding is a pane left open, the cost
 //!   of guessing is a conversation a person was in.
 //! - **A governor seat.** Whatever row it is bound to, a seat in
 //!   `governors.json` is a post, and ending it is a reseat nobody asked for.
@@ -418,17 +419,8 @@ const TERM_GRACE_MS: u64 = if cfg!(test) { 100 } else { 1500 };
 /// then `KILL` for what is still there, and a `cycle.log` line for each tree.
 /// Run by the tick, so a row that reaches review has nothing of its own
 /// running by the next one. Returns the lines said.
-///
-/// **Under `WSP_HOST=manager` the scan is wip's too** (`wsp-034`): `wip` there
-/// runs no scan of its own and draws [`finished_wip_lines_held`], so what this
-/// scan found is left in `finished-wip.json` before anything is signalled, an
-/// empty list where nothing was. Under `inproc` `wip` scans for itself and the
-/// file is its alone, as it was.
 pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
     let Some(found) = left_in_finished_by(store, seats) else { return Vec::new() };
-    if crate::fold::under_manager() {
-        hold_wip_lines(store, &wip_lines_of(&found));
-    }
     let mut said = say_spared(store, &found);
     let found: Vec<_> = found.into_iter().filter(|l| !l.pids.is_empty()).collect();
     if found.is_empty() {
@@ -469,67 +461,6 @@ fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
         }
     }
     said
-}
-
-/// How long the lines `wsp wip` draws for finished trees are good for.
-const WIP_LINES_FOR_SECS: i64 = 30;
-
-/// The lines a finished-tree scan left in `finished-wip.json`, as the last
-/// scan left them, and nothing when they are stale: no scan here. `wip` under
-/// `WSP_HOST=manager` runs no `ps` (`docs/agent-manager.md` 4.3) and draws
-/// these; the daemon's tick scans and writes them ([`stop_finished`]).
-pub(crate) fn finished_wip_lines_held(store: &Store) -> Vec<String> {
-    let now = util::epoch_secs();
-    std::fs::read_to_string(store.state_file("finished-wip.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(|v| now - v["at"].as_i64().unwrap_or(0) < WIP_LINES_FOR_SECS)
-        .and_then(|v| v["lines"].as_array().map(|l| l.iter().filter_map(|l| l.as_str().map(str::to_string)).collect()))
-        .unwrap_or_default()
-}
-
-/// The lines `wsp wip` draws for the trees in `found` that still have
-/// processes the tree started.
-fn wip_lines_of(found: &[crate::check_tree::Left]) -> Vec<String> {
-    found.iter().filter(|l| !l.pids.is_empty()).map(|l| crate::check_tree::left_line(l, crate::check_tree::rss_kb(&l.pids))).collect()
-}
-
-/// Leave `lines` in `finished-wip.json` for the next [`WIP_LINES_FOR_SECS`],
-/// written whole and renamed into place.
-fn hold_wip_lines(store: &Store, lines: &[String]) {
-    let file = store.state_file("finished-wip.json");
-    let tmp = file.with_extension(format!("json.{}", std::process::id()));
-    if std::fs::write(&tmp, serde_json::json!({ "at": util::epoch_secs(), "lines": lines }).to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &file);
-    }
-}
-
-/// The lines `wsp wip` draws for finished trees that still have processes.
-///
-/// **One scan for every caller in the half minute** (`wsp-480`): it is an
-/// `lsof` over the whole machine and four `ps` runs, 0.35 s of CPU on a
-/// thermally limited one, and compound's host asks `wsp wip` every three
-/// seconds. The scan leaves its lines in `finished-wip.json`; a `wip` within
-/// [`WIP_LINES_FOR_SECS`] of it draws those. The tick, which stops what the
-/// lines name, scans for itself and never reads this; under
-/// `WSP_HOST=manager` it writes it ([`stop_finished`]).
-pub(crate) fn finished_wip_lines(store: &Store) -> Vec<String> {
-    let file = store.state_file("finished-wip.json");
-    let now = util::epoch_secs();
-    if !cfg!(test) {
-        let held = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-        if let Some(v) = held.filter(|v| now - v["at"].as_i64().unwrap_or(0) < WIP_LINES_FOR_SECS) {
-            if let Some(lines) = v["lines"].as_array() {
-                return lines.iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
-            }
-        }
-    }
-    let Some(found) = left_in_finished_by(store, &crate::cycle::Fleet) else { return Vec::new() };
-    let lines = wip_lines_of(&found);
-    if !cfg!(test) {
-        hold_wip_lines(store, &lines);
-    }
-    lines
 }
 
 fn open_lists(store: &Store) -> Vec<Worklist> {
@@ -669,7 +600,7 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
         state,
         wait: crate::waiting::reading(state, asks, &shells, seat, member),
         governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
-        typed: seats.turn_began_since(seat, h.at),
+        typed: seats.turn_began_since(store, seat, h.at),
         pids: seats.pids(seat),
     };
     let by = w.map_or(member, |w| w.id.as_str());
@@ -733,7 +664,7 @@ fn original_seats(store: &Store, seats: &dyn Seats) {
                 state,
                 wait: crate::waiting::reading(state, asks, &shells, &seat, &row.id),
                 governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat.as_str())),
-                typed: seats.turn_began_since(&seat, at),
+                typed: seats.turn_began_since(store, &seat, at),
                 pids: seats.pids(&seat),
             };
             if let Some(why) = left(&reading) {
@@ -1091,7 +1022,7 @@ pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<S
         state,
         wait: None,
         governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
-        typed: seats.turn_began_since(seat, at),
+        typed: seats.turn_began_since(store, seat, at),
         pids: seats.pids(seat),
     };
     let line = match left(&reading) {
@@ -1248,7 +1179,7 @@ mod tests {
         fn state(&self, seat: &str) -> Option<State> {
             self.state.get(seat).copied()
         }
-        fn turn_began_since(&self, seat: &str, _since: i64) -> Option<bool> {
+        fn turn_began_since(&self, _store: &Store, seat: &str, _since: i64) -> Option<bool> {
             self.typed.get(seat).copied()
         }
         fn pids(&self, seat: &str) -> Option<Vec<u32>> {
@@ -1269,85 +1200,6 @@ mod tests {
         /// Set by a test that wants the tick's finished-tree scan
         /// ([`super::scans_finished`]) over a tree of its own.
         pub(super) static SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// `WSP_HOST` for one test, put back however it ends. Taken after
-    /// [`util::isolated`], whose lock it is held under.
-    struct HostVar;
-    impl HostVar {
-        fn set(v: &str) -> HostVar {
-            std::env::set_var(wsp_wire::host_tcp::ENV, v);
-            HostVar
-        }
-    }
-    impl Drop for HostVar {
-        fn drop(&mut self) {
-            std::env::remove_var(wsp_wire::host_tcp::ENV);
-            SCANS.with(|s| s.set(false));
-        }
-    }
-
-    /// `wsp-034`: under `WSP_HOST=manager` `wip` runs no scan and draws
-    /// `finished-wip.json`, so the daemon's tick, which scans, writes it. A row
-    /// at review with no seat and no claim has its tree's own binary standing
-    /// in it: a tick under `inproc` stops it and leaves no file (wip scans for
-    /// itself there, as before); a tick under the manager stops it and leaves
-    /// the line `wip` draws.
-    #[test]
-    fn a_tick_under_the_manager_leaves_wip_its_finished_tree_heading() {
-        let env = util::isolated("ending-finished-wip");
-        let store = Store::at(env.home(), env.state());
-        store.ensure_dirs().unwrap();
-        let row = format!("fin-{}", std::process::id());
-        let mut t = Task::new(&row, &row);
-        t.set_status(Status::Review);
-        store.save_task(&t).unwrap();
-        // `lsof` names the real path, and the tree's own binary is read off
-        // `ps -o comm=`, which is the name it was run under: a `sleep` named
-        // as the tree's build (a copied system binary is refused a start).
-        let base = std::fs::canonicalize(env.home()).unwrap();
-        let tree = base.join(".worktrees").join(&row);
-        std::fs::create_dir_all(&tree).unwrap();
-        let stand = || {
-            use std::os::unix::process::CommandExt;
-            std::process::Command::new("/bin/sleep").arg0(tree.join("target/debug/stand")).arg("60").current_dir(&tree).spawn().unwrap()
-        };
-        let gone = |c: &mut std::process::Child| {
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < until {
-                if c.try_wait().unwrap().is_some() {
-                    return true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            let _ = c.kill();
-            false
-        };
-        // The manager's seats: none, so nobody holds the row.
-        let seats = Fake { census: Some(vec![]), ..Fake::default() };
-        let held = store.state_file("finished-wip.json");
-
-        let mut child = stand();
-        let host = HostVar::set("inproc");
-        SCANS.with(|s| s.set(true));
-        tick(&store, &seats);
-        drop(host);
-        assert!(gone(&mut child), "the tick stops what the finished tree started");
-        assert!(!held.exists(), "under inproc the file is wip's own scan's, as before");
-        assert!(crate::ending::finished_wip_lines_held(&store).is_empty());
-
-        let mut child = stand();
-        let host = HostVar::set("manager");
-        SCANS.with(|s| s.set(true));
-        tick(&store, &seats);
-        drop(host);
-        assert!(gone(&mut child), "the tick under the manager stops it too");
-        let lines = finished_wip_lines_held(&store);
-        assert_eq!(lines.len(), 1, "wip draws the tick's one line: {lines:?}");
-        assert!(lines[0].starts_with(&format!("{row} is finished and has no seat, and 1 process ")), "{}", lines[0]);
-        assert!(lines[0].ends_with("the tick stops them"), "{}", lines[0]);
-        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
-        assert_eq!(log.matches(&format!("stopped in finished row {row} ")).count(), 2, "{log}");
     }
 
     fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
@@ -1497,8 +1349,8 @@ mod tests {
             fn state(&self, seat: &str) -> Option<State> {
                 self.0.state(seat)
             }
-            fn turn_began_since(&self, seat: &str, since: i64) -> Option<bool> {
-                self.0.turn_began_since(seat, since)
+            fn turn_began_since(&self, store: &Store, seat: &str, since: i64) -> Option<bool> {
+                self.0.turn_began_since(store, seat, since)
             }
             fn pids(&self, seat: &str) -> Option<Vec<u32>> {
                 self.0.pids(seat)

@@ -104,7 +104,7 @@ pub(crate) fn look(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, g:
         // A seat that is not up has no prompt to press at or resend to, and
         // took no turn by being there: ended and replaced on sight, once. The
         // turn read below is for a seat that can have taken one.
-        if not_up && seats.turn_began_since(&o.seat, o.since) != Some(true) {
+        if not_up && seats.turn_began_since(store, &o.seat, o.since) != Some(true) {
             let log = log.get_or_insert_with(|| std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default());
             if newest(log, &replaced(&o.seat)).is_some() {
                 continue;
@@ -113,7 +113,7 @@ pub(crate) fn look(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, g:
             replace(store, seats, w, at, &o, &head, &format!("its agent never came up: the seat reads {}", state.map_or("", |s| s.as_str())));
             continue;
         }
-        if now - o.since < AFTER || seats.turn_began_since(&o.seat, o.since) != Some(false) {
+        if now - o.since < AFTER || seats.turn_began_since(store, &o.seat, o.since) != Some(false) {
             continue;
         }
         if state != Some(State::Idle) {

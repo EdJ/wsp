@@ -444,26 +444,23 @@ fn record(state: &Path, volume: &str, found: &[Removable]) {
 
 /// The volumes the project roots are on, deduplicated, with free space.
 ///
-/// Under `WSP_HOST=manager`, the volumes of the newest beat folded (the
-/// manager reads the ones it was configured with, the project roots'), and no
-/// `df` here; none before a beat is folded (wsp-028).
+/// The volumes of the newest beat folded (the manager reads the ones it was
+/// configured with, the project roots'), and no `df` here; none before a beat
+/// is folded (wsp-028).
 fn volumes(store: &Store) -> Vec<(String, u64)> {
-    if crate::fold::under_manager() {
-        return crate::fold::facts(store).map(|f| f.disks.into_iter().map(|d| (d.volume, d.free_bytes)).collect()).unwrap_or_default();
-    }
-    let mut seen = BTreeSet::new();
-    crate::check_tree::repos(store)
-        .iter()
-        .filter_map(|r| free_of(r))
-        .filter(|(v, _)| seen.insert(v.clone()))
-        .collect()
+    crate::fold::facts(store).map(|f| f.disks.into_iter().map(|d| (d.volume, d.free_bytes)).collect()).unwrap_or_default()
 }
 
 /// One reading of every volume against `limit`. On a low one, the biggest
 /// reclaimable items from the record, or, with `measure`, measured now when
 /// there are none.
 pub(crate) fn read(store: &Store, limit: u64, measure: bool) -> Vec<Disk> {
-    volumes(store)
+    read_over(store, volumes(store), limit, measure)
+}
+
+/// [`read`] over the volumes given.
+fn read_over(store: &Store, volumes: Vec<(String, u64)>, limit: u64, measure: bool) -> Vec<Disk> {
+    volumes
         .into_iter()
         .map(|(volume, free)| {
             let mut disk = Disk { volume, free, limit, items: Vec::new() };
@@ -725,17 +722,20 @@ mod tests {
         let mut p = crate::model::Project::new("p");
         p.roots = vec![repo.display().to_string()];
         store.save_project(&p).unwrap();
+        // The volume the beat would name: the repository's own, with room.
+        let volume = free_of(&repo).unwrap().0;
+        let vols = || vec![(volume.clone(), 1u64 << 40)];
 
-        let roomy = read(&store, 0, true);
+        let roomy = read_over(&store, vols(), 0, true);
         assert!(roomy.iter().all(|d| !d.low() && d.items.is_empty()));
         assert!(!roomy[0].line().contains("low"), "{}", roomy[0].line());
 
-        assert!(read(&store, u64::MAX, false).iter().all(|d| d.low() && d.items.is_empty()), "measured when told not to");
-        let tight = read(&store, u64::MAX, true);
+        assert!(read_over(&store, vols(), u64::MAX, false).iter().all(|d| d.low() && d.items.is_empty()), "measured when told not to");
+        let tight = read_over(&store, vols(), u64::MAX, true);
         let largest = tight[0].items.first().expect("nothing named");
         assert!(largest.path.ends_with(".worktrees/wsp-2/target"), "{}", largest.path);
         assert!(tight[0].line().contains("disk is low") && tight[0].line().contains("wsp-2/target"), "{}", tight[0].line());
-        assert!(!read(&store, u64::MAX, false)[0].items.is_empty(), "the measurement was not recorded for the next reader");
+        assert!(!read_over(&store, vols(), u64::MAX, false)[0].items.is_empty(), "the measurement was not recorded for the next reader");
 
     }
 }

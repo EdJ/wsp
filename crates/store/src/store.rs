@@ -540,7 +540,7 @@ impl Store {
     /// and an exclusion is not.
     ///
     /// Files that hold no id are deliberately absent rather than harmless
-    /// passengers — `daemon.json`, `said.json`, `seat-since.json`, `.lock`.
+    /// passengers — `daemon.json`, `said.json`, `.lock`.
     /// Adding one costs a read and a token scan of a file that can never match.
     ///
     /// `watches.json` is here for what is *nested* in it rather than for its
@@ -617,7 +617,6 @@ impl Store {
             "resumable.json",
             "resume-held.json",
             "said.json",
-            "seat-since.json",
             "spawned.json",
             "watches.json",
             "worked.json",
@@ -3213,7 +3212,7 @@ impl Store {
     }
 
     /// Forget every trace of `seats` that keeps them in a reading
-    /// (wsp-094): their `spawned.json` and `seat-since.json` entries. For
+    /// (wsp-094): their `spawned.json` entries. For
     /// seats that are gone with nothing to say; `seat-memory.json` is a
     /// report's record over thirty days and is not touched.
     pub fn forget_seats(&self, seats: &[String]) -> usize {
@@ -3221,7 +3220,7 @@ impl Store {
             return 0;
         }
         let mut dropped = 0;
-        for file in ["spawned.json", "seat-since.json"] {
+        for file in ["spawned.json"] {
             self.update_json(file, |m| {
                 let before = m.len();
                 m.retain(|k, _| !seats.contains(k));
@@ -3229,72 +3228,6 @@ impl Store {
             });
         }
         dropped
-    }
-
-    // ---- since when a seat has been in its state -----------------------
-    //
-    // `wsp-250`. backend numbers a state change (`state_change_seq`) and does
-    // not date it, and compound's seat directory dates only its last write, so
-    // nothing on the port says when a seat began its turn or stopped. wsp
-    // dates it itself, the first time a census it reads sees the change: every
-    // `wsp wip` and every tick of the watch. So `since` is "first seen", at
-    // most one tick late — and on a seat wsp has not read before it is the
-    // first reading, not the start of the state.
-
-    /// seat -> `{ state, session, since, from }`, the time the seat was first
-    /// seen in its current state. A different `session` is a different agent
-    /// in a seat whose id was reused, and starts its clock again even in the
-    /// same state.
-    ///
-    /// `from` is the source a seat was read from — a backend, and the machine
-    /// when it is not this one (`backend`, `backend@mb2`, `compound`) — and is
-    /// what decides whether a seat missing from `seen` is gone: its entry is
-    /// dropped only when `answered` says its own source answered this reading
-    /// without it. A far machine that was silent, or not asked at all because
-    /// it had dropped off, answered nothing, so its seats keep their clocks.
-    /// A seat in `seen` with no `from` keeps the one it had; one never given a
-    /// source is never dropped.
-    pub fn note_seat_states(
-        &self,
-        seen: &[(String, String, String, Option<String>)],
-        at: i64,
-        answered: &dyn Fn(&str) -> bool,
-    ) -> BTreeMap<String, String> {
-        let stamp = crate::util::iso_at(at);
-        self.locked(|| {
-            let mut m = match self.read_json("seat-since.json") {
-                Value::Object(m) => m,
-                _ => serde_json::Map::new(),
-            };
-            let before = m.len();
-            m.retain(|seat, e| {
-                seen.iter().any(|(s, ..)| s == seat) || !e.get("from").and_then(Value::as_str).is_some_and(answered)
-            });
-            let mut moved = m.len() != before;
-            for (seat, state, session, from) in seen {
-                let was = m.get(seat);
-                let same = was.is_some_and(|e| {
-                    e.get("state").and_then(Value::as_str) == Some(state.as_str())
-                        && e.get("session").and_then(Value::as_str).unwrap_or("") == session
-                });
-                let from = from.clone().or_else(|| was.and_then(|e| e.get("from")?.as_str().map(str::to_string)));
-                let since = match same {
-                    true => was.and_then(|e| e.get("since")).cloned().unwrap_or_else(|| json!(stamp)),
-                    false => json!(stamp),
-                };
-                let entry = json!({ "state": state, "session": session, "since": since, "from": from });
-                if was != Some(&entry) {
-                    m.insert(seat.clone(), entry);
-                    moved = true;
-                }
-            }
-            if moved {
-                self.write_json("seat-since.json", &Value::Object(m.clone()));
-            }
-            m.into_iter()
-                .filter_map(|(seat, e)| Some((seat, e.get("since")?.as_str()?.to_string())))
-                .collect()
-        })
     }
 
     // ---- pins ---------------------------------------------------------

@@ -368,7 +368,8 @@ struct Forked {
 /// its hooks post it, and the `turn` they journal is this start's. Without it
 /// every hook posted epoch 0, and a spawn waiting on its seat's first turn at
 /// the epoch `seat.started` named heard none and stopped a working seat as
-/// never ready (wsp-079).
+/// never ready (wsp-079). It carries this manager's address and `<exec_dir>`
+/// too, and `WSP_HOST=manager`, so its hooks reach the manager that runs it.
 fn fork(shared: &Shared, s: &SeatSpawn, epoch: Epoch) -> Result<Forked, String> {
     let sup = sup_path(shared).ok_or("compound-sup not found: set $COMPOUND_SUP or put it on PATH")?;
     let Workdir::Cwd(cwd) = &s.workdir else { unreachable!("refused before forking") };
@@ -377,6 +378,13 @@ fn fork(shared: &Shared, s: &SeatSpawn, epoch: Epoch) -> Result<Forked, String> 
         s.agent.env.iter().filter_map(|name| std::env::var(name).ok().map(|v| (name.clone(), v))).collect();
     env.insert(wsp_base::base::seat::SEAT_ENV.into(), s.seat.0.clone());
     env.insert(wsp_host::hooks::EPOCH_ENV.into(), epoch.0.to_string());
+    // Its hooks post to this manager, wherever it listens and whatever
+    // `WSP_HOST` the process that started it had (wsp-030).
+    env.insert(wsp_host::hooks::HOST_ENV.into(), "manager".into());
+    env.insert(wsp_host::hooks::DIR_ENV.into(), shared.cfg.exec_dir.display().to_string());
+    if let Some(addr) = shared.hook_addr {
+        env.insert(wsp_host::hooks::ADDR_ENV.into(), addr.to_string());
+    }
     let spawn = Spawn { key: s.key.clone(), seat: &s.seat.0, kind: Some(s.agent.kind.clone()), cwd: cwd.clone(), env, program, args };
     let mut cmd = inproc::sup_command(&sup, &spawn);
     // After `sup_command`, so this run directory is the one it uses.

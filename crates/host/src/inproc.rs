@@ -634,10 +634,6 @@ impl InProcess {
         opencode_rows(session)
     }
 
-    pub fn turn_began(&self, dir: &Path, since: i64) -> Option<bool> {
-        fs::read_to_string(dir.join(HOOKS_FILE)).ok().map(|log| turn_in_log(&log, since))
-    }
-
     pub fn wire_health(&self, problems: &mut Vec<String>, notes: &mut Vec<String>) {
         let Some(sup) = self.sup() else {
             notes.push(
@@ -1188,8 +1184,8 @@ mod comm_tests {
 /// Ends the pane of a seat whose agent has left: the supervisor, its shell and
 /// the renderer, a few seconds on so the agent finishes its own exit. Detached
 /// and in its own group, because the hook that calls it runs under the very
-/// group it ends. The daemon's sweep (`ended_panes`) is the backstop for an ending
-/// that never said `SessionEnd`.
+/// group it ends. The manager's `seat.stopped` is the backstop for an ending
+/// that never said `SessionEnd` (wsp-030 deleted the daemon's `ended_panes` sweep).
 pub fn close_pane_soon(sup: u32) {
     if sup == std::process::id() {
         return;
@@ -1646,22 +1642,6 @@ fn tail_of(file: &Path, bytes: u64) -> Option<String> {
         text.drain(..=i);
     }
     Some(text)
-}
-
-/// Whether a hook log shows the seat's own prompt submitted at or after
-/// `since`, read newest first and stopping at the first line before it.
-pub fn turn_in_log(log: &str, since: i64) -> bool {
-    for line in log.lines().rev() {
-        let Ok(h) = serde_json::from_str::<Value>(line) else { continue };
-        if util::epoch_of(&str_of(&h, "at")) < since {
-            return false;
-        }
-        // A nested session's prompt is not the seat's turn (`wsp-364`).
-        if str_of(&h, "hook") == "UserPromptSubmit" && h.get("child").is_none() {
-            return true;
-        }
-    }
-    false
 }
 
 /// opencode, wherever it is — the same reasoning as `claude_bin` (`agent_commands`), and one
