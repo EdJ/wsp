@@ -966,6 +966,129 @@ The last code row of M1: with `manager` the default, wsp no longer does what M1'
   until M2; `hooks.jsonl` is still written by `log_hook`, and `did.rs` and the `ran` clause still read the
   transcript, since no `seat.*` event replaces them. `docs/host-seam-allowed.txt` holds its four lines.
 
+#### M1's result (wsp-031, 2026-11-20)
+
+**What was live, and when.** The store moved to this machine (Linux, `omarchy`) on 2026-11-19. The daemon and
+the manager first started there at 07:29Z, with `manager` the default (wsp-029). The M1 trunk (`38e6aa8`, wsp-030)
+was installed at 2026-11-20T07:58:22Z, 41 minutes before these figures were taken. So "a day after" has not
+passed. Two windows are measured, with `measure.py` in the row's scratch directory. It reads `calls.jsonl` and
+`polls.jsonl` the way `wsp calls --since`, `--polls` and `--incidents` do:
+- **the day before the M1 trunk**: 2026-11-19T07:58:22Z to 2026-11-20T07:58:22Z, 24.0 h, 4,280 ticks. Every
+  group of M1 but the contract is live in it.
+- **the first 0.7 h on the M1 trunk**: 07:58:22Z to 08:39:52Z, 123 ticks. This is too short to judge. It is
+  given for its direction, which is the wrong one: more renders and dearer `wip` calls than the day before,
+  on a machine busy with builds. The stale manager below is one candidate cause, and the day owed will say.
+
+**The installed manager is not the M1 trunk's.** `wsp install` at 07:58Z rebuilt `wsp`. It copied the
+`wsp-manager` it found beside it, and that was `target/release/wsp-manager` from 2026-11-19T07:29Z
+(`put_manager`, `src/cmd_install.rs`: a binary beside `wsp` is not rebuilt). `cmp` shows the binaries are the
+same. The live manager lacks every manager and host commit since then: 3488325, f44f2cb, and wsp-030's
+7498607, 9ffd75e and 981dca4. The day-after figure is owed on a manager built from the trunk.
+
+| measure | 6.1 baseline | M1 asks | the day before the M1 trunk | first 0.7 h on it | verdict |
+|---|---|---|---|---|---|
+| `ps` per tick | 37.5 | ≤ 1 | 6.85 | 8.89 | **missed** |
+| renders per tick (`compound-reader`) | 59.5 | 0 | 14.40 | 34.89 | **missed** |
+| `df` per tick | 24.6 | 0 | 1.36 | 2.67 | **missed** |
+| `lsof` in `wip` | (in the 2.9 s) | 0 | 0 | 0 | met |
+| `wip` CPU per call (polls, p50) | 2.9 CPU-s | < 0.2 | 0.428 (`--json` 0.483), n = 5,397 | 0.67 (`--json` 0.65), n = 48 | **missed** |
+| compound's host polling, CPU-s per day | 25,268 | < 2,500 | 660 (all no-seat polls: 2,448) | all no-seat polls ~1,299 scaled | met |
+| spawn p50 | 9.4 s | ≤ 9.4 s | 0.93 s, p95 2.71 s (147) | 1.50 s (1) | met |
+| tick p50 / p95 | 19.5 s / 116 s | — | 20 ms / 686 ms | 75 ms / 976 ms | — |
+| wsp-411-kind incidents | 0 of 30 (M0's week) | 0 over a week | 0 of 79 (25 h) | — | **owed** 2026-11-27 |
+| manager `kill -9` mid-turn | — | 10 scripted runs | 10 of 10 hold | — | met |
+
+How each was taken, and the cause of each miss:
+- **Per tick** is the children counted on every `"k":"tick"` line, over all ticks. It includes the light ticks
+  that run only `standing` and `attention`. The causes come from the same lines' `phase_kids`:
+  - **`ps`.** It comes from `ending:verification` (2.83 per tick), `attention` (0.71), `repair:refusing` (0.52),
+    `cycle` (0.51), `ending:checks` (0.38) and `sweep:leaked-agents` (0.33). These are `Host::alive`,
+    `tree_of`, `table` and `rows_of`. `host::Tcp` leaves all of them in-process under both choices, because
+    group 4 kept the process table where it was until M3 (`crates/wire/src/host_tcp.rs`, "the process table
+    stays in-process at M1"). M1's line asked for ≤ 1 without a row that moves them. This is a gap in the
+    breakdown, not a regression.
+  - **Renders.** They come from `ending:verification` (5.04), `attention` (2.26), `ending:checks` (1.97),
+    `sweep:check-trees` (1.83), `sweep:build-output` (1.31) and `tunnels` (0.54). They are
+    `Host::screen_state`, which `Tcp` hands to the in-process host (`host_tcp.rs`, `screen_state`).
+    `Compound::detected_state` (`place_compound.rs`) reads the screen first for every seat whose state it is
+    asked. The manager's `seats` reply has the hook-folded state (wsp-038), and nothing in the daemon reads it
+    in place of the screen. The breakdown never planned a row to make that switch.
+  - **`df`.** All of it is `sweep:scratch` (`scratch::tidy`). It asks the disk itself and does not read the
+    beat's `HostFacts.disk` (the throttle reads those, wsp-028).
+- **`wip`** is user+sys of the process and its waited children, from `polls.jsonl`. It has no children: no
+  `ps`, no `lsof`, no render. The 0.43 CPU-s is wsp's own work in the process. On the same store, `ls --json`
+  takes 0.04 s. M0's A/B measured 0.131 on the Mac, with 2 seats and a smaller store. Here there are 12 seats
+  and a 44 MB store of 4,770 files. This machine has no profiler (`perf`, `strace`), so the cost was not
+  isolated to a phase. The cause is named as not found.
+- **compound's host polling.** In 6.1 this was `none via host`, the gpui app. Here compound polls over ssh:
+  `stamp`, `wip --json`, `ls --json`, `spend --json` and `worklist … --json` under `sshd-session`. That is
+  5,711 polls and 658 CPU-s in the day. compound's local web-chrome added 32 polls and 1.6 CPU-s. Every
+  no-seat poll together, the person's shell's `wip` loop (`zsh`, 8,273 polls, 1,788 CPU-s) included, comes to
+  2,448 CPU-s. That is still under 2,500.
+- **Spawn** is `"verb":"spawn"` with exit 0 in `calls.jsonl`, live, with the agent, as M0's live column.
+- **Incidents** are `wsp calls --incidents`. On this machine `cycle.log` starts at 2026-11-19T07:36Z, so the
+  week is owed on 2026-11-26 for the manager's default and on 2026-11-27 for the M1 trunk. Over the 25 h: I1 5
+  (wsp-478 kind 1, barrier check trees 4), I2 3, I3 3, I4 1. **wsp-411 kind: 0 of 79** seats ended on a
+  census.
+
+**The `kill -9` proof.** The proof is `k9/proof.sh` in the row's scratch directory, run 10 times by
+`k9/ten.sh`. Each run's log, journal, manager log and agent log are in `k9/runs/<n>/`. Each run starts and
+ends its own instance:
+- a `wsp sandbox --fake` store and state, with a one-commit repo, a project and a row;
+- a private `wsp-manager` from this tree's build, on a free loopback port, with its own exec dir. The
+  sandbox's manager record names it;
+- the sandbox's own `wsp daemon`;
+- `wsp spawn <row> --agent`. This gives a real compound-sup session with compound-reader reading its screen.
+  The agent is `k9/claude`, a stand-in with no model: it draws Claude Code's composer (`❯` between two
+  rules) and the title spinner while a turn runs, and it fires the real hooks (`claude-code/wsp-session.sh`,
+  so `wsp report` to the manager and `compound-sup submitted`). Every prompt it is typed is logged.
+
+Order A is told. It is typed, and the seat is mid-turn: the screen is working, and A's `UserPromptSubmit` is
+held 2 s. Order B is told behind it. The manager is killed with SIGKILL 0.5 s later, with **both orders in
+flight in its `orders/`**. Both `wsp tell`s answer "unreachable — held". The manager is started again 2 s
+later, on the same port and exec dir. A run holds when every one of these is true:
+- the agent's process and its compound-sup are the same throughout;
+- the restarted manager adopts the seat under its epoch, and the journal holds one `seat.started` and no
+  `seat.stopped`;
+- `wip` lists the seat;
+- the brief, A and B were each typed exactly once, and each turn ended;
+- the journal acks each order once, and the manager's `orders/` is empty;
+- the row is still claimed by the seat, and `cycle.log` ends nothing.
+
+The restarted manager asks both orders again under their ids. compound-sup answers A from its kept answer
+without typing it again, and types B once the composer is idle. Runs 1–10, 2026-11-20T08:36Z to 08:39Z: **10 of 10 hold**. Every run passed all 15 checks, had 2
+orders in flight at the kill, and re-asked 2 orders on restart (`k9/ten.log`). A run takes 14 s from the kill
+to the checks, and most of that is A's 8 s turn.
+
+The first attempt found a hazard, not a failure. A seat's environment carries `COMPOUND_RUN_DIR`, which names
+the live manager's run directory, and `wsp sandbox` keeps it. So a manager started in a sandbox from a seat
+adopts the live fleet's seats as "started in-process". The private manager adopted all 12, and its first seat
+id, `cpd-1`, collided with the live m3 custodian's. It was killed before it acted, and every live seat was
+checked alive. The script now unsets the variable, points `--inproc-run` at an empty directory, and stops if
+anything is adopted. `wsp sandbox rm` also leaves a manager-forked seat running, because it reaps by
+`WSP_STATE` in a process's arguments. The script ends whatever names its sandbox.
+
+**Against the done-when line:**
+- **ps ≤ 1, renders 0, `df` 0: missed.** About 7, 14 and 1.4 per tick, down from 37.5, 59.5 and 24.6. The
+  cause is calls that M1's breakdown left in-process (the process table, `screen_state` and the scratch
+  sweep's disk), not new ones.
+- **`lsof` in `wip` 0: met.**
+- **`wip` < 0.2 CPU-s: missed.** 0.43, from 2.9. The cause is in-process work, not isolated.
+- **Host polling < 2,500 CPU-s per day: met.** 660 for compound, 2,448 for everything that polls.
+- **Spawn p50 ≤ 9.4 s: met.** 0.93 s.
+- **wsp-411 kind 0 over a week: owed.** 0 of 79 in the first 25 h.
+- **kill -9 mid-turn loses no seat and no order: met,** 10 of 10, with two orders in flight at the manager each
+  time. The agent is a stand-in, so what this proves is wsp, the manager, compound-sup and the hooks, not
+  Claude Code.
+
+Filed from here:
+- wsp-323: the figures owed, a day on the trunk's wsp *and* manager and the week of incidents. It comes after
+  wsp-324.
+- wsp-324: `wsp install` keeps a stale `wsp-manager`.
+- wsp-325: `wsp sandbox` keeps `COMPOUND_RUN_DIR`, and `sandbox rm` leaves manager-forked seats.
+- wsp-326: the per-tick `ps`, renders and `df` M1's breakdown left in-process. Which go to M3 is to be decided.
+- wsp-327: where `wip`'s 0.43 CPU-s goes.
+
 #### M3's breakdown (wsp-042, 2026-11-17)
 
 The list is `m3-agent-manager`, at status init. It is planned on top of M1 alone, because no far machine is registered and M2 is not available. It follows wsp-018's three rules:
