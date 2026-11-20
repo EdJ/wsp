@@ -452,6 +452,7 @@ mod tests {
         let mut cfg = Config::new(&d);
         let unheld: IpAddr = "100.127.255.254".parse().unwrap();
         cfg.addrs = vec![unheld];
+        cfg.port = 0; // the live server on DEFAULT_PORT is no part of this test
         let store: SharedStore = Arc::new(NoStore);
         let server = Server::start(store, cfg).expect("loopback serves when a tailnet address cannot be bound");
         assert!(server.addrs().iter().all(|a| a.ip().is_loopback()), "only loopback is bound: {:?}", server.addrs());
