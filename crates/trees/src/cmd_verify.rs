@@ -247,29 +247,15 @@ use serde_json::json;
 
 use crate::sharing::{self, Share};
 
-/// Which build-slot holders are running, asked of the in-process host.
-fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
-    use wsp_wire::host::Host;
-    wsp_wire::host::LOCAL.alive(pids)
-}
-
 // ---------------------------------------------------------------- jobs (wsp-054)
 
-/// How verify's runs are run (docs/agent-manager.md 6.2, M3 group 5).
-///
-/// `WSP_JOBS=inproc`, the default and the rollback, is [`Runs::Direct`]: cargo,
-/// the test listing and `--alone`'s per-test runs are this process's children,
-/// exactly as before, and a warm tree's lock holds this pid.
-///
-/// `WSP_JOBS=manager` is [`Runs::Jobs`]: each of them is a `job.run` on the
-/// tree's host, its output echoed from `job.output` and its end read from
-/// `job.ended`; nothing is spawned or killed here, and a warm tree's lock names
-/// the run, whose liveness is that host's job table.
-enum Runs<'a> {
-    Direct,
-    Jobs(Jobs<'a>),
-}
-
+/// How verify's runs are run (docs/agent-manager.md 6.2, M3): every one of
+/// them (cargo, the test listing and `--alone`'s per-test runs) is a `job.run`
+/// on the tree's host, its output echoed from `job.output` and its end read
+/// from `job.ended`; nothing is spawned or killed here, and a warm tree's lock
+/// names the run, whose liveness is that host's job table. The host is the
+/// manager's, or `wsp-host`'s runner in this process under `WSP_JOBS=inproc`
+/// and on a host with no manager ([`jobs_host`]).
 /// One verify's jobs: the host they go to and the run they belong to.
 struct Jobs<'a> {
     host: &'a dyn wsp_wire::host::Host,
@@ -405,41 +391,32 @@ fn this_run(checkout: Option<&Path>, key: &str) -> sharing::Run {
     sharing::Run { host, row, attempt: 0, mark: format!("{ms}-{}", std::process::id()) }
 }
 
-/// The manager `run`'s jobs go to under `WSP_JOBS=manager`; `None` under
-/// `inproc`, and `None` too when the run's host is not the host this
-/// machine's manager is (6.2: while the Mac's manager is the only one, a row
-/// on a host with no manager keeps the in-process path). An error is the
-/// choice or the manager failing, said once, and nothing is run in this
-/// process in its place.
-fn jobs_host(state: &Path, run: &sharing::Run) -> Result<Option<&'static dyn wsp_wire::host::Host>, String> {
-    use wsp_wire::host::JobsChoice;
+/// The host `run`'s jobs go to: the manager's under `WSP_JOBS=manager` when
+/// the run's host is the host this machine's manager is (6.2: while the Mac's
+/// manager is the only one, a row on a host with no manager runs in this
+/// process), else `wsp-host`'s runner in this process. An error is the choice
+/// or the manager failing, said once, and nothing is run in this process in
+/// its place.
+fn jobs_host(state: &Path, run: &sharing::Run) -> Result<&'static dyn wsp_wire::host::Host, String> {
+    use wsp_wire::host::{choose_jobs, JobsChoice};
+    let version = env!("CARGO_PKG_VERSION");
     match JobsChoice::from_env().map_err(|e| e.to_string())? {
-        JobsChoice::Inproc => Ok(None),
+        JobsChoice::Inproc => choose_jobs(JobsChoice::Inproc, state, version).map_err(|e| e.to_string()),
         JobsChoice::Manager => {
             let ours = wsp_wire::manager::read_record(state).map(|(local, _)| local.host);
             if ours.as_deref() != Some(run.host.as_str()) {
-                return Ok(None);
+                return choose_jobs(JobsChoice::Inproc, state, version).map_err(|e| e.to_string());
             }
-            wsp_wire::host::jobs_chosen(state, env!("CARGO_PKG_VERSION")).map(Some).map_err(|e| e.to_string())
+            wsp_wire::host::jobs_chosen(state, version).map_err(|e| e.to_string())
         }
     }
 }
 
-impl Runs<'_> {
-    /// How a warm lock's holder is asked whether it is still there.
+impl Jobs<'_> {
+    /// How a warm lock's holder is asked whether it is still there: by the
+    /// job table of the host the run's jobs go to.
     fn live<'s>(&'s self, table: &'s dyn Fn(&str) -> Option<Vec<sharing::Seen>>) -> sharing::Live<'s> {
-        match self {
-            Runs::Direct => sharing::Live::Pids(&alive),
-            Runs::Jobs(j) => sharing::Live::Jobs { me: &j.run, table },
-        }
-    }
-
-    /// The job table read for [`Runs::live`]; nothing under `inproc`.
-    fn table(&self, host: &str) -> Option<Vec<sharing::Seen>> {
-        match self {
-            Runs::Direct => None,
-            Runs::Jobs(j) => j.table(host),
-        }
+        sharing::Live::Jobs { me: &self.run, table }
     }
 }
 use crate::store::Store;
@@ -942,49 +919,8 @@ fn ensure_tree(repo: &Path, tree: &Path, head: &str) -> Result<bool, String> {
 /// usually green. Nothing here decides that a run is interesting; by the time
 /// anything could, the output would be gone.
 ///
-/// Two threads rather than one [`Command::output`] call, which would be
-/// simpler and would print nothing until cargo exited — for a 25s test run
-/// that is the difference between watching a build and watching a cursor.
-fn cargo(runs: &Runs, tree: &Path, target: &Path, argv: &[&str], echo: bool, share: &Share) -> (bool, String) {
-    if let Runs::Jobs(jobs) = runs {
-        return cargo_job(jobs, tree, target, argv, echo, share);
-    }
-    let mut cmd = Command::new("cargo");
-    cmd.args(argv)
-        .current_dir(tree)
-        .env("CARGO_TARGET_DIR", target)
-        .env_remove("GIT_INDEX_FILE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // The one thing this build does not decide for itself: how much of the
-    // machine it may have, and where the compiler cache is. See
-    // [`crate::sharing`] — the target directory above is still its own, and the
-    // cache is keyed on inputs rather than on paths, so neither can make this
-    // build tell the truth about somebody else's tree.
-    share.apply(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            if echo {
-                eprintln!("wsp: cargo: {e}");
-            }
-            return (false, format!("cargo: {e}"));
-        }
-    };
-    // Both streams are drained concurrently because a pipe nobody reads fills
-    // and stops the writer: reading stdout to the end first would deadlock the
-    // moment cargo wrote more warnings than a pipe buffer holds.
-    let out = child.stdout.take().map(|s| std::thread::spawn(move || pump(s, echo, false)));
-    let err = child.stderr.take().map(|s| std::thread::spawn(move || pump(s, echo, true)));
-    let ok = child.wait().map(|st| st.success()).unwrap_or(false);
-    let mut text = out.and_then(|t| t.join().ok()).unwrap_or_default();
-    text.push_str(&err.and_then(|t| t.join().ok()).unwrap_or_default());
-    (ok, text)
-}
-
-/// [`cargo`] under `WSP_JOBS=manager`: one `job.run` of class `build` in the
-/// tree's place. `CARGO_TARGET_DIR` (relative to the tree, so no path on
-/// wsp's machine crosses) and the share's `CARGO_BUILD_JOBS` cross as the env
+/// One `job.run` of class `build` in the tree's place. `CARGO_TARGET_DIR`
+/// (relative to the tree, so no path on wsp's machine crosses) and the share's `CARGO_BUILD_JOBS` cross as the env
 /// prefix, and the output is echoed from `job.output` as it arrives.
 fn cargo_job(jobs: &Jobs, tree: &Path, target: &Path, argv: &[&str], echo: bool, share: &Share) -> (bool, String) {
     let (k, v) = share.env();
@@ -1014,35 +950,6 @@ fn cargo_job(jobs: &Jobs, tree: &Path, target: &Path, argv: &[&str], echo: bool,
             (false, format!("cargo: {e}"))
         }
     }
-}
-
-/// Read one of cargo's streams to the end, passing it on as it arrives.
-fn pump(mut r: impl std::io::Read, echo: bool, is_err: bool) -> String {
-    use std::io::Write;
-    let mut kept: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                kept.extend_from_slice(&buf[..n]);
-                if echo {
-                    // Flushed per chunk: cargo's progress is only progress if
-                    // it arrives while the build is still running.
-                    if is_err {
-                        let mut h = std::io::stderr();
-                        let _ = h.write_all(&buf[..n]);
-                        let _ = h.flush();
-                    } else {
-                        let mut h = std::io::stdout();
-                        let _ = h.write_all(&buf[..n]);
-                        let _ = h.flush();
-                    }
-                }
-            }
-        }
-    }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// One test the run reported as failed: where it panicked, and what it said.
@@ -1156,14 +1063,14 @@ fn assertion(block: &[&str]) -> Option<String> {
 ///
 /// `None` is "not measured", which is not the same as passing and is printed as
 /// nothing at all rather than as a green word.
-fn rerun_alone(runs: &Runs, tree: &Path, target: &Path, name: &str, share: &Share) -> Option<bool> {
+fn rerun_alone(runs: &Jobs, tree: &Path, target: &Path, name: &str, share: &Share) -> Option<bool> {
     // A doc test is named `src/store.rs - Store::at (line 12)`, which is not
     // something libtest can be handed as an exact filter. Anything with a space
     // in it is left alone rather than guessed at.
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return None;
     }
-    let (ok, text) = cargo(runs, tree, target, &["test", "--workspace", "--quiet", "--", "--exact", name], false, share);
+    let (ok, text) = cargo_job(runs, tree, target, &["test", "--workspace", "--quiet", "--", "--exact", name], false, share);
     if !ok {
         return Some(false);
     }
@@ -1213,9 +1120,9 @@ const ALONE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The JSON is on stdout and everything a human reads is on stderr, so the two
 /// halves separate on the leading brace — which is also how a compile failure
 /// gets reported here without printing a build log made of objects.
-fn test_binaries(runs: &Runs, tree: &Path, target: &Path, share: &Share) -> Result<Vec<PathBuf>, String> {
+fn test_binaries(runs: &Jobs, tree: &Path, target: &Path, share: &Share) -> Result<Vec<PathBuf>, String> {
     let argv = &["test", "--workspace", "--no-run", "--message-format=json"];
-    let (ok, text) = cargo(runs, tree, target, argv, false, share);
+    let (ok, text) = cargo_job(runs, tree, target, argv, false, share);
     if !ok {
         let msg: Vec<&str> = text.lines().filter(|l| !l.starts_with('{')).collect();
         return Err(msg.join("\n"));
@@ -1255,18 +1162,12 @@ fn executables(text: &str) -> Vec<PathBuf> {
 /// Under `WSP_JOBS=manager` the listing is a job in the tree's place, bounded
 /// by [`ALONE_TIMEOUT`] as a per-test run is: a binary that never answers its
 /// `--list` is ended by the manager and lists nothing.
-fn test_names(runs: &Runs, tree: &Path, exe: &Path) -> Vec<String> {
-    if let Runs::Jobs(jobs) = runs {
-        let argv = vec![relative(tree, exe).display().to_string(), "--list".into(), "--format".into(), "terse".into()];
-        return match jobs.run("list", wsp_wire::host::JobClass::Check, tree, &[], argv, ALONE_TIMEOUT, &mut |_| {}) {
-            Ok((ended, text)) if ended.exit == Some(0) => listed(&text),
-            _ => Vec::new(),
-        };
+fn test_names(runs: &Jobs, tree: &Path, exe: &Path) -> Vec<String> {
+    let argv = vec![relative(tree, exe).display().to_string(), "--list".into(), "--format".into(), "terse".into()];
+    match runs.run("list", wsp_wire::host::JobClass::Check, tree, &[], argv, ALONE_TIMEOUT, &mut |_| {}) {
+        Ok((ended, text)) if ended.exit == Some(0) => listed(&text),
+        _ => Vec::new(),
     }
-    let Ok(out) = Command::new(exe).args(["--list", "--format", "terse"]).output() else {
-        return Vec::new();
-    };
-    listed(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// `name: test` per line, and a trailing count line that is not one.
@@ -1295,85 +1196,11 @@ fn listed(out: &str) -> Vec<String> {
 /// done, however long the machine takes to get round to it. A budget is for
 /// the one caller that cannot afford a hang, and it is a backstop rather than
 /// an expectation: see `ALONE_TIMEOUT`.
-fn run_alone(runs: &Runs, tree: &Path, exe: &Path, name: &str, log: &Path, timeout: Option<Duration>) -> Option<Failure> {
-    if let Runs::Jobs(jobs) = runs {
-        return run_alone_job(jobs, tree, exe, name, timeout);
-    }
-    let Ok(file) = std::fs::File::create(log) else {
-        return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
-    };
-    let Ok(err) = file.try_clone() else {
-        return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
-    };
-    let child = Command::new(exe)
-        .args(["--exact", name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
-        .stderr(Stdio::from(err))
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return Some(Failure { name: name.into(), at: None, message: Some(format!("{e}")) })
-        }
-    };
-    // Both arms wait on the child's own state and nothing standing in for it.
-    // With no budget that is one blocking wait, which is the only wait that
-    // cannot be wrong about a slow machine. With one it is `try_wait` in a
-    // loop; the median test alone is 10ms, so a 5ms poll overshoots by 2.5ms
-    // on average and costs about two seconds across the whole 776. The one
-    // caller that polls is spending that to bound a hang. The child is asked
-    // about before the clock is, so a parent descheduled past its own deadline
-    // still reports the child that finished while it was away — the deadline
-    // can only be reached by a child that is genuinely still running.
-    let waited: Result<bool, String> = match timeout {
-        None => child.wait().map(|st| st.success()).map_err(|e| format!("the wait failed: {e}")),
-        Some(limit) => {
-            let started = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(st)) => break Ok(st.success()),
-                    // Not a timeout, and it must not be reported as one: this
-                    // is the wait itself failing, and "no answer" would send
-                    // the next reader after a hang that never happened.
-                    Err(e) => break Err(format!("the wait failed: {e}")),
-                    Ok(None) => {}
-                }
-                if started.elapsed() > limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(format!("no answer in {limit:?} — killed"));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-    };
-    let ok = match waited {
-        Ok(ok) => ok,
-        Err(message) => {
-            return Some(Failure { name: name.into(), at: None, message: Some(message) })
-        }
-    };
-    if ok {
-        return None;
-    }
-    let text = std::fs::read_to_string(log).unwrap_or_default();
-    // The same parser the suite's own red runs use, so a failure reads the same
-    // whichever run found it. A name it cannot find a block for is still the
-    // failure — the exit status already said so.
-    Some(
-        failures(&text)
-            .into_iter()
-            .find(|f| f.name == name)
-            .unwrap_or(Failure { name: name.into(), at: None, message: None }),
-    )
-}
-
-/// [`run_alone`] under `WSP_JOBS=manager`: the test is one job of class
+/// Run one test in a process of its own and say what happened to it: one job of class
 /// `check` in the tree's place, its budget the job's timeout. The manager ends
 /// a job past it and says `timed_out`, which reads as the direct path's "no
 /// answer … — killed"; the failure is parsed out of the job's log.
-fn run_alone_job(jobs: &Jobs, tree: &Path, exe: &Path, name: &str, timeout: Option<Duration>) -> Option<Failure> {
+fn run_alone(jobs: &Jobs, tree: &Path, exe: &Path, name: &str, timeout: Option<Duration>) -> Option<Failure> {
     let argv = vec![relative(tree, exe).display().to_string(), "--exact".into(), name.to_string()];
     let limit = timeout.unwrap_or(BUILD_TIMEOUT);
     let (ended, text) = match jobs.run("alone", wsp_wire::host::JobClass::Check, tree, &[], argv, limit, &mut |_| {}) {
@@ -1405,8 +1232,7 @@ fn run_alone_job(jobs: &Jobs, tree: &Path, exe: &Path, name: &str, timeout: Opti
 /// the panic site and the assertion are what the suite's own red runs give and
 /// what both investigations here worked from, and a named test is one command
 /// to run again.
-fn alone_pass(runs: &Runs, p: &util::Paint, dir: &Path, tree: &Path, exes: &[PathBuf], json_out: bool) -> (usize, Vec<Failure>) {
-    let log = dir.join("alone.out");
+fn alone_pass(runs: &Jobs, p: &util::Paint, tree: &Path, exes: &[PathBuf], json_out: bool) -> (usize, Vec<Failure>) {
     let names: Vec<(PathBuf, String)> = exes
         .iter()
         .flat_map(|e| test_names(runs, tree, e).into_iter().map(move |n| (e.clone(), n)))
@@ -1429,7 +1255,7 @@ fn alone_pass(runs: &Runs, p: &util::Paint, dir: &Path, tree: &Path, exes: &[Pat
             print!("\r{} {}/{}  ", p.dim("alone"), i + 1, names.len());
             let _ = std::io::stdout().flush();
         }
-        if let Some(f) = run_alone(runs, tree, exe, name, &log, Some(ALONE_TIMEOUT)) {
+        if let Some(f) = run_alone(runs, tree, exe, name, Some(ALONE_TIMEOUT)) {
             if tick {
                 print!("\r\x1b[K");
             }
@@ -1453,7 +1279,6 @@ fn alone_pass(runs: &Runs, p: &util::Paint, dir: &Path, tree: &Path, exes: &[Pat
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
-    let _ = std::fs::remove_file(&log);
     (names.len(), bad)
 }
 
@@ -1465,10 +1290,9 @@ fn alone_pass(runs: &Runs, p: &util::Paint, dir: &Path, tree: &Path, exes: &[Pat
 /// this agent's change and not whatever is in the checkout.
 #[allow(clippy::too_many_arguments)]
 fn alone(
-    runs: &Runs,
+    runs: &Jobs,
     p: &util::Paint,
     state: &Path,
-    dir: &Path,
     tree: &Path,
     target: &Path,
     json_out: bool,
@@ -1497,7 +1321,7 @@ fn alone(
         }
     };
 
-    let (n, bad) = alone_pass(runs, p, dir, tree, &exes, json_out);
+    let (n, bad) = alone_pass(runs, p, tree, &exes, json_out);
     let secs = started.elapsed().as_secs_f64();
 
     if json_out {
@@ -1553,12 +1377,11 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // comes from and where the worktree is added; `scratch` decides where the
     // build goes from what kind of tree that is.
     let Scratch { dir, tree, target, checkout } = scratch(store, &repo, &key);
-    // `WSP_JOBS` decides how the runs below are run ([`Runs`]), once, before
+    // `WSP_JOBS` decides how the runs below are run (the run's [`Jobs`]), once, before
     // anything is claimed: a warm lock says which kind of holder it is.
     let run = this_run(checkout.as_deref(), &key);
     let runs = match jobs_host(&store.state, &run) {
-        Ok(None) => Runs::Direct,
-        Ok(Some(host)) => Runs::Jobs(Jobs::new(host, run)),
+        Ok(host) => Jobs::new(host, run),
         Err(e) => {
             eprintln!("wsp: verify's jobs: {e}");
             return 2;
@@ -1792,7 +1615,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     }
 
     if alone_pass_asked {
-        return alone(&runs, &p, &store.state, &dir, &tree, &target, json_out, started);
+        return alone(&runs, &p, &store.state, &tree, &target, json_out, started);
     }
 
     let mut steps: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -1824,14 +1647,14 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         // Under `manager` the warm tree's lock is touched before each job, so
         // its holder reads as there from the table; a lock that is no longer
         // this run's means the tree was taken, and nothing runs in it.
-        if let (Runs::Jobs(_), Some(w)) = (&runs, &warm) {
+        if let Some(w) = &warm {
             if !w.touch() {
                 output.push_str("wsp: the warm tree was taken by another build before this one ran in it\n");
                 failed = Some(name);
                 break;
             }
         }
-        let (ok, text) = cargo(&runs, &tree, &target, argv, !json_out, &share);
+        let (ok, text) = cargo_job(&runs, &tree, &target, argv, !json_out, &share);
         output.push_str(&text);
         if !ok {
             failed = Some(name);
@@ -1855,10 +1678,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         }
         failed_tests = failures(&output);
         if let Some(first) = failed_tests.first() {
-            let held = match (&runs, &warm) {
-                (Runs::Jobs(_), Some(w)) => w.touch(),
-                _ => true,
-            };
+            let held = warm.as_ref().is_none_or(|w| w.touch());
             if held {
                 alone = rerun_alone(&runs, &tree, &target, &first.name, &share);
             }
@@ -2033,14 +1853,7 @@ mod tests {
         let exe = dir.join("hangs");
         wsp_testkit::script(&exe, "#!/bin/sh\nexec sleep 300\n");
 
-        let out = run_alone(
-            &Runs::Direct,
-            Path::new("."),
-            &exe,
-            "whatever::hangs",
-            &dir.join("log"),
-            Some(Duration::from_millis(150)),
-        );
+        let out = run_alone(&inproc_runs(&dir), &dir.join("tree"), &exe, "whatever::hangs", Some(Duration::from_millis(150)));
 
         let f = out.expect("a test that never returned was reported as passing");
         assert_eq!(f.name, "whatever::hangs");
@@ -2061,17 +1874,18 @@ mod tests {
     /// test that was going to answer, it prints the accusation this instrument
     /// exists to make — *this test does not survive alone* — about a test that
     /// does. The child below is the same shape as the `exit 0` script that was
-    /// reported as never answering, only slowed to a fifth of a second so it
+    /// reported as never answering, only slowed to three seconds (a job's bound is whole seconds) so it
     /// can say so without a loaded machine.
     #[test]
     fn a_slow_test_is_not_a_hung_one_unless_a_budget_was_asked_for() {
         let dir = scratch_dir("alone-slow");
         let exe = dir.join("slow");
-        wsp_testkit::script(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n");
-        let log = dir.join("log");
+        wsp_testkit::script(&exe, "#!/bin/sh\nsleep 3\nexit 0\n");
+        let runs = inproc_runs(&dir);
+        let tree = dir.join("tree");
 
         // A budget it cannot meet accuses a test that passes.
-        let accused = run_alone(&Runs::Direct, Path::new("."), &exe, "a::b", &log, Some(Duration::from_millis(20)))
+        let accused = run_alone(&runs, &tree, &exe, "a::b", Some(Duration::from_secs(1)))
             .expect("the budget did not fire on a child that outlives it");
         assert!(
             accused.message.as_deref().unwrap_or_default().contains("no answer"),
@@ -2081,7 +1895,7 @@ mod tests {
 
         // The same child, no budget, and there is no clock left to be wrong.
         assert!(
-            run_alone(&Runs::Direct, Path::new("."), &exe, "a::b", &log, None).is_none(),
+            run_alone(&runs, &tree, &exe, "a::b", None).is_none(),
             "a test that passed was reported as a failure"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2105,7 +1919,8 @@ mod tests {
         // five seconds it did — 11 of 150 runs on a loaded machine reported a
         // script that is `exit 0` as a test that never answered, which is the
         // instrument accusing the suite of the fault it was built to find.
-        let f = run_alone(&Runs::Direct, Path::new("."), &exe, "a::b", &dir.join("log"), None)
+        let runs = inproc_runs(&dir);
+        let f = run_alone(&runs, &dir.join("tree"), &exe, "a::b", None)
             .expect("a failing test was reported as passing");
         assert_eq!(f.at.as_deref(), Some("src/a.rs:12:9"), "the panic site was lost");
         assert_eq!(f.message.as_deref(), Some("the seat was empty"), "the assertion was lost");
@@ -2113,7 +1928,7 @@ mod tests {
         let ok = dir.join("passes");
         wsp_testkit::script(&ok, "#!/bin/sh\nexit 0\n");
         assert!(
-            run_alone(&Runs::Direct, Path::new("."), &ok, "a::b", &dir.join("log"), None).is_none(),
+            run_alone(&runs, &dir.join("tree"), &ok, "a::b", None).is_none(),
             "a passing test was reported as a failure"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2151,6 +1966,27 @@ bench::b: benchmark
             vec!["store::tests::a".to_string()],
             "the count line or the benchmark was taken for a test"
         );
+    }
+
+    /// A verify's jobs on `wsp-host`'s runner in this process, the tree root
+    /// the parent of `dir`: a tree is `dir/tree` and a script beside it is
+    /// `../script`.
+    fn inproc_runs(dir: &Path) -> Jobs<'static> {
+        let root = dir.parent().unwrap().to_path_buf();
+        crate::job_place::set_tree_root(Some(root.clone()));
+        let host: &'static crate::host::InProcess =
+            Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&dir.join("jobs-exec"), &root)));
+        let run = sharing::Run { host: util::hostname(), row: "t".into(), attempt: 0, mark: "m".into() };
+        Jobs::new(host, run)
+    }
+
+    /// Whether `pid` runs, for the warm-tree tests' locks.
+    fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: signal 0 only asks.
+        pids.iter().copied().filter(|p| unsafe { kill(*p as i32, 0) } == 0).collect()
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
@@ -2781,11 +2617,12 @@ bench::b: benchmark
     fn a_name_libtest_cannot_filter_on_is_not_rerun_at_all() {
         let nowhere = Path::new("/nowhere");
         let share = sharing::unregistered();
+        let runs = inproc_runs(&scratch_dir("rerun-name"));
         assert_eq!(
-            rerun_alone(&Runs::Direct, nowhere, nowhere, "src/store.rs - Store::at (line 12)", &share),
+            rerun_alone(&runs, nowhere, nowhere, "src/store.rs - Store::at (line 12)", &share),
             None
         );
-        assert_eq!(rerun_alone(&Runs::Direct, nowhere, nowhere, "", &share), None);
+        assert_eq!(rerun_alone(&runs, nowhere, nowhere, "", &share), None);
     }
 }
 
@@ -2961,11 +2798,11 @@ mod jobs_tests {
         std::fs::write(tree.join("src/lib.rs"), "").unwrap();
         let (m, tcp) = manager(&place);
         let me = run("wsp-054", "c1");
-        let runs = Runs::Jobs(Jobs::new(&tcp, me.clone()));
+        let runs = Jobs::new(&tcp, me.clone());
         let share = sharing::unregistered();
         let target = place.root.join("w").join("target");
         let (ok, text) =
-            cargo(&runs, &tree, &target, &["metadata", "--no-deps", "--format-version", "1", "--offline"], false, &share);
+            cargo_job(&runs, &tree, &target, &["metadata", "--no-deps", "--format-version", "1", "--offline"], false, &share);
         assert!(ok, "{text}");
         let meta: serde_json::Value = serde_json::from_str(text.lines().find(|l| l.starts_with('{')).unwrap()).unwrap();
         let said = PathBuf::from(meta["target_directory"].as_str().unwrap());
@@ -2976,10 +2813,7 @@ mod jobs_tests {
         assert_eq!(rows[0].1, JobClass::Build);
 
         // The share's job count is in the env, as `apply` puts it on a child.
-        let jobs = match &runs {
-            Runs::Jobs(j) => j,
-            Runs::Direct => unreachable!(),
-        };
+        let jobs = &runs;
         let (k, v) = share.env();
         let (ended, out) = jobs
             .run("env", JobClass::Build, &tree, &[(k.into(), v)], vec!["sh".into(), "-c".into(), "echo jobs=$CARGO_BUILD_JOBS idx=${GIT_INDEX_FILE-unset}".into()], Duration::from_secs(30), &mut |_| {})
@@ -3088,7 +2922,7 @@ mod jobs_tests {
     fn alone_flow(place: &Place, tcp: &Tcp) {
         rooted(place);
         let me = run("wsp-054", "al1");
-        let runs = Runs::Jobs(Jobs::new(tcp, me.clone()));
+        let runs = Jobs::new(tcp, me.clone());
         let tree = place.tree();
         let bin = place.root.join("w").join("target");
         let lists = bin.join("lists");
@@ -3097,21 +2931,20 @@ mod jobs_tests {
 
         let ok = bin.join("passes");
         wsp_testkit::script(&ok, "#!/bin/sh\nexit 0\n");
-        let log = place.top.join("alone.out");
-        assert!(run_alone(&runs, &tree, &ok, "a::b", &log, Some(Duration::from_secs(30))).is_none());
+        assert!(run_alone(&runs, &tree, &ok, "a::b", Some(Duration::from_secs(30))).is_none());
 
         let red = bin.join("fails");
         wsp_testkit::script(
             &red,
             "#!/bin/sh\ncat <<'OUT'\nrunning 1 test\ntest a::b ... FAILED\n\nfailures:\n\n---- a::b stdout ----\nthread 'a::b' panicked at src/a.rs:12:9:\nthe seat was empty\n\nfailures:\n    a::b\n\ntest result: FAILED. 0 passed; 1 failed\nOUT\nexit 101\n",
         );
-        let f = run_alone(&runs, &tree, &red, "a::b", &log, Some(Duration::from_secs(30))).expect("red");
+        let f = run_alone(&runs, &tree, &red, "a::b", Some(Duration::from_secs(30))).expect("red");
         assert_eq!(f.at.as_deref(), Some("src/a.rs:12:9"));
         assert_eq!(f.message.as_deref(), Some("the seat was empty"));
 
         let hangs = bin.join("hangs");
         wsp_testkit::script(&hangs, "#!/bin/sh\nexec sleep 300\n");
-        let f = run_alone(&runs, &tree, &hangs, "a::b", &log, Some(Duration::from_secs(1))).expect("a hang is a failure");
+        let f = run_alone(&runs, &tree, &hangs, "a::b", Some(Duration::from_secs(1))).expect("a hang is a failure");
         assert!(f.message.as_deref().unwrap_or_default().contains("no answer"), "{f:?}");
 
         let rows = rows_of(tcp, &me);

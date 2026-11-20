@@ -4695,7 +4695,7 @@ fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> Strin
         speed_limit: f.and_then(|f| f.speed_limit_pct).filter(|&p| p < 100),
     };
     let idle = f.and_then(|f| f.hid_idle_secs);
-    crate::throttle::View::of_beat(&store.state, given, idle, &|pid| crate::host::LOCAL.pid_runs(pid)).status_line()
+    crate::throttle::View::of_beat(&store.state, given, idle).status_line()
 }
 
 /// [`crate::throttle::loud`] from a manager's host facts rather than `sysctl`
@@ -4707,7 +4707,7 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
     let five = f.load5_centi.map(centi).unwrap_or(one);
     let fifteen = f.load15_centi.map(centi).unwrap_or(five);
     let given = crate::throttle::Given { load1: one, cores: f.cpus as usize, speed_limit: f.speed_limit_pct };
-    let mut view = crate::throttle::View::of_beat(&store.state, given, None, &|pid| crate::host::LOCAL.pid_runs(pid));
+    let mut view = crate::throttle::View::of_beat(&store.state, given, None);
     view.load = Some((one, five, fifteen));
     view.warning(store.seat_cap())
 }

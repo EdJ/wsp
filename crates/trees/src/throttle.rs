@@ -65,8 +65,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use crate::host::Host;
-use std::process::Stdio;
-use wsp_base::calls::Command;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -935,11 +933,6 @@ pub fn weight(tool: &str, args: &[String]) -> Weight {
     }
 }
 
-fn alive(pid: u32) -> bool {
-    // Could not ask reads as not alive, as it did before the Host.
-    crate::host::LOCAL.probe(pid).unwrap_or(false)
-}
-
 fn fnv(s: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -973,10 +966,6 @@ fn record(task: &str, tool: &str, args: &[String], tree: &Path) -> Value {
     })
 }
 
-fn holder_pid(v: &Value) -> u32 {
-    v.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32
-}
-
 /// The job a hold's build runs as, under `WSP_JOBS=manager` (wsp-052): its
 /// key, written into the hold before the job is asked for.
 fn job_of(v: &Value) -> Option<JobKey> {
@@ -1000,32 +989,48 @@ fn touch(path: &Path) {
     }
 }
 
-/// Whether a hold's holder still holds it. A hold whose build is a job
-/// (`WSP_JOBS=manager`) is judged by the manager's job table, `table`: its job
-/// running holds, its job ended does not, and a job not in the table yet holds
-/// for [`JOB_START_GRACE`] after the file was last marked. No `kill -0` is sent
-/// for it. Any other hold (today's in-process run, a check's slot), and a
-/// job's hold where the table could not be read, is its holder's pid asked of
-/// `alive`, as before.
-pub(crate) fn live_by<'a>(table: Option<Vec<JobRow>>, alive: &'a dyn Fn(u32) -> bool) -> impl Fn(&Path, &Value) -> bool + 'a {
+/// Whether a hold's holder still holds it: a hold is a job's, judged by the
+/// manager's job table, `table`. Its job running holds, its job ended does not,
+/// and a job not in the table yet holds for [`JOB_START_GRACE`] after the file
+/// was last marked. A table that could not be read says nothing, so every hold
+/// with a job holds; a record with no job is nobody's.
+pub(crate) fn live_by(table: Option<Vec<JobRow>>) -> impl Fn(&Path, &Value) -> bool {
     move |path: &Path, v: &Value| match (job_of(v), &table) {
         (Some(key), Some(t)) => match t.iter().find(|r| r.key == key) {
             Some(r) => r.state == JobState::Running,
             None => age_of(path) < JOB_START_GRACE,
         },
-        _ => alive(holder_pid(v)),
+        (Some(_), None) => true,
+        (None, _) => false,
     }
 }
 
-/// The holds' liveness now: under `WSP_JOBS=manager`, the manager's job table
-/// read once; otherwise each holder's pid.
-fn live_now<'a>(state: &Path, alive: &'a dyn Fn(u32) -> bool) -> impl Fn(&Path, &Value) -> bool + 'a {
-    live_by(manager_jobs(state).ok().flatten().and_then(|h| h.jobs().ok()), alive)
+/// The job table of the host this machine's builds run on: the manager's,
+/// or `wsp-host`'s in-process runner where there is no manager.
+fn jobs_now(state: &Path) -> Option<Vec<JobRow>> {
+    jobs_host(state).ok().and_then(|h| h.jobs().ok())
+}
+
+/// The holds' liveness now: the job table read once.
+fn live_now(state: &Path) -> impl Fn(&Path, &Value) -> bool {
+    live_by(jobs_now(state))
 }
 
 /// A hold taken. Dropping it releases the file, if it is still ours.
 pub struct Hold {
     path: PathBuf,
+    /// The job the hold was taken for, which is how it knows it is still ours.
+    job: Value,
+}
+
+impl Hold {
+    fn none() -> Hold {
+        Hold { path: PathBuf::new(), job: Value::Null }
+    }
+
+    fn of(path: &Path, rec: &Value) -> Hold {
+        Hold { path: path.to_path_buf(), job: rec.get("job").cloned().unwrap_or(Value::Null) }
+    }
 }
 
 impl Drop for Hold {
@@ -1033,7 +1038,7 @@ impl Drop for Hold {
         let mine = fs::read_to_string(&self.path)
             .ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .is_some_and(|v| holder_pid(&v) == std::process::id());
+            .is_some_and(|v| !self.job.is_null() && v.get("job") == Some(&self.job));
         if mine {
             let _ = fs::remove_file(&self.path);
         }
@@ -1045,14 +1050,9 @@ enum Taken {
     HeldBy(Value),
 }
 
-/// Try for the hold at `path`. A file whose owner is gone ([`live_by`] says how
-/// that is judged), or that never got its contents and is old, is taken over
-/// under a mutex.
-fn take(path: &Path, rec: &Value, alive: &dyn Fn(u32) -> bool) -> Taken {
-    take_by(path, rec, &live_by(None, alive))
-}
-
-/// [`take`], the current holder judged by `live` ([`live_by`]).
+/// Try for the hold at `path`, the current holder judged by `live`
+/// ([`live_by`]): a file whose job has ended, or that never got its contents
+/// and is old, is taken over under a mutex.
 fn take_by(path: &Path, rec: &Value, live: &dyn Fn(&Path, &Value) -> bool) -> Taken {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
@@ -1061,11 +1061,11 @@ fn take_by(path: &Path, rec: &Value, live: &dyn Fn(&Path, &Value) -> bool) -> Ta
     match fs::OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut f) => {
             let _ = f.write_all(text.as_bytes());
-            return Taken::Yours(Hold { path: path.to_path_buf() });
+            return Taken::Yours(Hold::of(path, rec));
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         // An unwritable state directory is not a reason to stop a build.
-        Err(_) => return Taken::Yours(Hold { path: PathBuf::new() }),
+        Err(_) => return Taken::Yours(Hold::none()),
     }
     let current = || fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
     let age = || {
@@ -1091,7 +1091,7 @@ fn take_by(path: &Path, rec: &Value, live: &dyn Fn(&Path, &Value) -> bool) -> Ta
     let again = current();
     let out = match stale(&again) {
         true => match fs::write(path, &text) {
-            Ok(()) => Taken::Yours(Hold { path: path.to_path_buf() }),
+            Ok(()) => Taken::Yours(Hold::of(path, rec)),
             Err(_) => Taken::HeldBy(Value::Null),
         },
         false => Taken::HeldBy(again.unwrap_or(Value::Null)),
@@ -1130,7 +1130,6 @@ pub struct Ctx<'a> {
     pub idle: &'a dyn Fn() -> Option<u64>,
     /// `CPU_Speed_Limit` now, read at each decision: it moves with the build.
     pub thermal: &'a dyn Fn() -> Option<u32>,
-    pub alive: &'a dyn Fn(u32) -> bool,
     pub say: &'a dyn Fn(&str),
     pub poll: Duration,
     /// Set for a build already inside a hold.
@@ -1350,11 +1349,6 @@ pub fn full_suite_seats(state: &Path) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Today's run: the build runs in this process, niced and capped as decided.
-pub fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
-    run_on(ctx, None, tool, args)
-}
-
 /// Where `throttle run` sends an admitted build under `WSP_JOBS=manager`
 /// (wsp-052): the manager on the host this shim runs on.
 pub struct Jobs<'a> {
@@ -1426,13 +1420,12 @@ fn job_key_now(task: &str, tool: &str, args: &[String]) -> JobKey {
     crate::host::job_key(row, 0, &format!("throttle:{what}@{at}.{}", std::process::id()))
 }
 
-/// [`run_in`], and under `WSP_JOBS=manager` (`jobs`) an admitted run, heavy
-/// or `cargo run`, is the manager's job: the decision (the tree, the slot,
-/// the nice and the job cap) is taken here as before, and the holds carry the
-/// job's key so their liveness is read from the job table. A light run and a
-/// run inside a hold exec here as they do today, with no slot and nothing to
-/// kill.
-pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i32 {
+/// Every run is a job on `jobs`' host, the manager's or `wsp-host`'s runner
+/// in this process: the decision (the tree, the slot, the nice and the job
+/// cap) is taken here, and the holds carry the job's key so their liveness is
+/// read from the job table. A light run and a run inside a hold are jobs too,
+/// with no slot.
+pub fn run_on(ctx: &Ctx, jobs: &Jobs, tool: &str, args: &[String]) -> i32 {
     let settings = Settings::load(ctx.state);
     let shims = shim_dir(ctx.state);
     let Some(real) = real_tool(tool, &ctx.path_var, &shims) else {
@@ -1455,11 +1448,11 @@ pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i3
             note_full_suite(ctx);
         }
     }
-    let mut cmd = Command::new(&real);
-    cmd.args(args);
     let weight = weight(tool, args);
+    let key = job_key_now(&ctx.task, tool, args);
     if ctx.held || weight == Weight::Light {
-        return finish(cmd, None);
+        let argv = job_argv(&real, args, &job_env(&jobs.env, &[]), None);
+        return as_job(ctx, jobs, key, job_class(tool, args), argv, &[]);
     }
     let force = || {
         let idle = match settings.mode {
@@ -1473,20 +1466,17 @@ pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i3
     // nice stays the person's.
     let hot = || settings.is_hot((ctx.thermal)());
     let mut _holds = Vec::new();
-    let key = jobs.map(|_| job_key_now(&ctx.task, tool, args));
-    // The job table, read at each try, where the holds are jobs.
-    let table = || jobs.and_then(|j| j.host.jobs().ok());
+    // The job table, read at each try: the holds are jobs.
+    let table = || jobs.host.jobs().ok();
     let mut set: Vec<(String, String)> = Vec::new();
     if weight == Weight::Heavy {
         let tree = tree_of(&ctx.cwd);
         let mut rec = record(&ctx.task, tool, args, &tree);
-        if let Some(k) = &key {
-            rec["job"] = serde_json::to_value(k).unwrap_or(Value::Null);
-        }
+        rec["job"] = serde_json::to_value(&key).unwrap_or(Value::Null);
         // The tree first and the slot second: a build waiting on its own tree
         // must not be sitting on a slot somebody else could use.
         if tool == "cargo" {
-            let mut grab = || take_by(&tree_path(ctx.state, &tree), &rec, &live_by(table(), ctx.alive));
+            let mut grab = || take_by(&tree_path(ctx.state, &tree), &rec, &live_by(table()));
             _holds.push(wait_for(ctx, "its tree", &mut grab, None));
         }
         if force() || hot() {
@@ -1494,7 +1484,7 @@ pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i3
             let mut grab = || {
                 // A job's tree hold stays its own while it waits here.
                 fresh.iter().for_each(|p| touch(p));
-                let live = live_by(table(), ctx.alive);
+                let live = live_by(table());
                 // Read at each try: a wait that began cool ends hot.
                 let n = settings.slots_at(ctx.cores, hot());
                 let mut seen = Value::Null;
@@ -1508,7 +1498,6 @@ pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i3
             };
             _holds.push(wait_for(ctx, "a build slot", &mut grab, Some(&|| !force() && !hot())));
         }
-        cmd.env(HELD, tree.display().to_string());
         set.push((HELD.to_string(), tree.display().to_string()));
     }
     let mut niced = None;
@@ -1522,17 +1511,11 @@ pub fn run_on(ctx: &Ctx, jobs: Option<&Jobs>, tool: &str, args: &[String]) -> i3
             let wanted = if force() && limited { wanted.min(settings.job_cap(ctx.cores)) } else { wanted };
             let theirs = (ctx.env)(var).and_then(|v| v.parse::<usize>().ok());
             let cap = theirs.map_or(wanted, |t| t.min(wanted)).to_string();
-            cmd.env(var, &cap);
             set.push((var.clone(), cap));
         }
     }
-    match (jobs, key) {
-        (Some(j), Some(key)) => {
-            let argv = job_argv(&real, args, &job_env(&j.env, &set), niced);
-            as_job(ctx, j, key, job_class(tool, args), argv, &_holds)
-        }
-        _ => finish(cmd, niced),
-    }
+    let argv = job_argv(&real, args, &job_env(&jobs.env, &set), niced);
+    as_job(ctx, jobs, key, job_class(tool, args), argv, &_holds)
 }
 
 /// Set by ^C while a job runs: the shim's own process is not in the job's
@@ -1660,122 +1643,8 @@ fn wait_loop(
         waited += poll;
         polls += 1;
         if polls % 10 == 0 && lifted.is_some_and(|l| l()) {
-            return Hold { path: PathBuf::new() };
+            return Hold::none();
         }
-    }
-}
-
-/// What a check, a verifier's build or a barrier run reads to take a slot
-/// (`wsp-668`), so it can be made against a fake.
-pub struct CheckGate<'a> {
-    pub state: &'a Path,
-    pub cores: usize,
-    pub task: String,
-    pub cmd: String,
-    pub dir: PathBuf,
-    /// `CPU_Speed_Limit` now, read at each try: it moves with the work.
-    pub thermal: &'a dyn Fn() -> Option<u32>,
-    pub alive: &'a dyn Fn(u32) -> bool,
-    pub say: &'a dyn Fn(&str),
-    pub poll: Duration,
-}
-
-fn check_path(state: &Path, n: usize) -> PathBuf {
-    builds_dir(state).join(format!("check-{n}"))
-}
-
-fn waiting_path(state: &Path) -> PathBuf {
-    builds_dir(state).join(format!("waiting-{}-{}", std::process::id(), WAITS.fetch_add(1, Ordering::SeqCst)))
-}
-
-static WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// The slot for a check step now: in the process's own state directory, read
-/// from the machine. Not under test without a `WSP_STATE` of its own, where
-/// the live directory is not the test's to hold.
-pub fn check_slot_now(dir: &Path, command: &str) -> Hold {
-    let state = match std::env::var_os("WSP_STATE") {
-        Some(v) => PathBuf::from(v),
-        None if cfg!(test) => return Hold { path: PathBuf::new() },
-        None => Store::default_state(),
-    };
-    let say = |m: &str| eprintln!("{m}");
-    take_check_slot(&CheckGate {
-        state: &state,
-        cores: cores(),
-        task: std::env::var("WSP_TASK").unwrap_or_default(),
-        cmd: command.chars().take(80).collect(),
-        dir: dir.to_path_buf(),
-        thermal: &speed_limit,
-        alive: &alive,
-        say: &say,
-        poll: Duration::from_secs(1),
-    })
-}
-
-/// A check slot, waited for when none is free, released when the hold drops.
-/// The slots are the machine's, not a tree's: a check in any tree takes one,
-/// and they are not the build slots a `cargo` takes inside it, so a check that
-/// runs `cargo test` does not wait on itself. `off` lifts the cap on a cool
-/// machine; a limited clock holds it in every mode.
-pub fn take_check_slot(g: &CheckGate) -> Hold {
-    let settings = Settings::load(g.state);
-    let hot = || settings.is_hot((g.thermal)());
-    if settings.mode == Mode::Off && !hot() {
-        return Hold { path: PathBuf::new() };
-    }
-    let rec = record(&g.task, &g.cmd, &[], &tree_of(&g.dir));
-    let mut grab = || {
-        // Read at each try: a wait that began cool ends hot.
-        let n = settings.check_slots_at(g.cores, hot());
-        let mut seen = Value::Null;
-        for i in 0..n {
-            match take(&check_path(g.state, i), &rec, g.alive) {
-                Taken::Yours(h) => return Taken::Yours(h),
-                Taken::HeldBy(v) => seen = v,
-            }
-        }
-        Taken::HeldBy(seen)
-    };
-    if let Taken::Yours(h) = grab() {
-        return h;
-    }
-    // Waiting is on the record too, so `wsp wip` names what queues.
-    let _waiting = take(&waiting_path(g.state), &rec, g.alive);
-    wait_loop(g.say, g.poll, "a check slot", &mut grab, Some(&|| settings.mode == Mode::Off && !hot()))
-}
-
-fn finish(mut cmd: Command, nice: Option<i32>) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    extern "C" {
-        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
-        fn signal(sig: i32, handler: usize) -> usize;
-    }
-    if let Some(n) = nice {
-        // SAFETY: setpriority is async-signal-safe and touches nothing of ours.
-        unsafe {
-            cmd.pre_exec(move || {
-                setpriority(0, 0, n);
-                Ok(())
-            });
-        }
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("wsp: could not start {}: {e}", cmd.get_program().to_string_lossy());
-            return 126;
-        }
-    };
-    // After the spawn, so the build does not inherit the ignore: ^C reaches the
-    // build through the terminal, and this process must outlive it to release
-    // its holds.
-    unsafe {
-        signal(2, 1);
-    }
-    match child.wait() {
-        Ok(s) => s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)),
-        Err(_) => 1,
     }
 }
 
@@ -1795,6 +1664,8 @@ pub fn run_raw(argv: &[String]) -> i32 {
             return 126;
         }
     }
+    // No manager (`WSP_JOBS=inproc`, or a host with none): the build is a job
+    // on `wsp-host`'s runner in this process, the tree where it is.
     let idle = hid_idle_secs;
     let thermal = speed_limit;
     let say = |m: &str| eprintln!("{m}");
@@ -1807,7 +1678,6 @@ pub fn run_raw(argv: &[String]) -> i32 {
         cores: cores(),
         idle: &idle,
         thermal: &thermal,
-        alive: &alive,
         say: &say,
         poll: Duration::from_secs(1),
         held: std::env::var_os(HELD).is_some_and(|v| !v.is_empty()),
@@ -1821,7 +1691,14 @@ pub fn run_raw(argv: &[String]) -> i32 {
         },
         body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
     };
-    run_in(&ctx, tool, args)
+    let host = inproc_anywhere(&store.state);
+    let out = |text: &str| {
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(text.as_bytes());
+        let _ = o.flush();
+    };
+    let jobs = Jobs { host, on: HostId(crate::job_place::trunk_host()), tree_root: PathBuf::from("/"), env: std::env::vars().collect(), out: &out };
+    run_on(&ctx, &jobs, tool, args)
 }
 
 /// The host `throttle run`'s admitted builds go to: under `WSP_JOBS=manager`,
@@ -1840,6 +1717,24 @@ pub fn manager_jobs(state: &Path) -> Result<Option<&'static dyn crate::host::Hos
             Err(e) => Err(format!("WSP_JOBS=manager: {e}")),
         },
     }
+}
+
+/// `wsp-host`'s runner in this process for `state`: its files under
+/// `<state>/inproc` as `choose_jobs(Inproc)`'s are, and the tree root `/`, so a
+/// build runs in the tree where it is (wsp-057's d1, as `check`'s steps do).
+/// One per state, leaked once.
+fn inproc_anywhere(state: &Path) -> &'static dyn crate::host::Host {
+    use std::sync::{Mutex, OnceLock};
+    static HOSTS: OnceLock<Mutex<BTreeMap<PathBuf, &'static crate::host::InProcess>>> = OnceLock::new();
+    let mut map = HOSTS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    *map.entry(state.to_path_buf())
+        .or_insert_with(|| Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&state.join("inproc"), Path::new("/")))))
+}
+
+/// The host a build's holds are read from: the manager's, or the in-process
+/// runner's where there is none.
+pub(crate) fn jobs_host(state: &Path) -> Result<&'static dyn crate::host::Host, String> {
+    Ok(manager_jobs(state)?.unwrap_or_else(|| inproc_anywhere(state)))
 }
 
 /// The decision's readings out of a beat, asked of `facts` at each read: the
@@ -1880,9 +1775,6 @@ fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, a
         cores,
         idle: &idle,
         thermal: &thermal,
-        // Asked only of a hold that is no job's (a check's slot, an
-        // in-process run's): a job's hold is read from the table.
-        alive: &alive,
         say: &say,
         poll: Duration::from_secs(1),
         held: std::env::var_os(HELD).is_some_and(|v| !v.is_empty()),
@@ -1898,7 +1790,7 @@ fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, a
     };
     let tree_root = crate::job_place::installed_tree_root(&store.state);
     let jobs = Jobs { host, on, tree_root, env: std::env::vars().collect(), out: &out };
-    run_on(&ctx, Some(&jobs), tool, args)
+    run_on(&ctx, &jobs, tool, args)
 }
 
 // ---- the shims, and the seat's PATH -----------------------------------------
@@ -2009,8 +1901,8 @@ impl View {
             cores: cores(),
             load: load_average(),
             thermal: speed_limit(),
-            builds: builds(state, &alive),
-            checks: checks(state, &alive),
+            builds: builds_by(state, &live_by(jobs_now(state))),
+            checks: checks_by(state, &live_by(jobs_now(state))),
             shims: shim_dir(state),
         }
     }
@@ -2025,7 +1917,7 @@ impl View {
             Some(f) => Given { speed_limit: limit_of(f), ..Given::of_facts(f) },
             None => Given { load1: 0.0, cores: cores_unprobed(), speed_limit: None },
         };
-        let mut v = View::of_live(state, given, f.as_ref().and_then(|f| f.hid_idle_secs), &live_by(host.jobs().ok(), &alive));
+        let mut v = View::of_live(state, given, f.as_ref().and_then(|f| f.hid_idle_secs), &live_by(host.jobs().ok()));
         v.load = f.as_ref().map(loads_of);
         v
     }
@@ -2033,18 +1925,18 @@ impl View {
     /// [`View::read`] with the machine's facts handed in ([`Given`]): the
     /// person's idle time is not read, so `auto` reads as in force.
     pub fn given(state: &Path, g: Given) -> View {
-        View::of_beat(state, g, None, &alive)
+        View::of_beat(state, g, None)
     }
 
     /// [`View::given`] with the person's idle time handed in as well (a beat's
     /// `hid_idle_secs`, read under `auto` only, as [`View::read`] reads it),
-    /// and each build holder's liveness asked of `alive`: for `wip` through
+    /// and each build holder's liveness read from the job table: for `wip` through
     /// the API, which reads the machine from the manager's beat and runs no
     /// child (wsp-076).
-    /// Under `WSP_JOBS=manager` a hold whose build is a job is judged by the
-    /// manager's job table rather than `alive` ([`live_by`], wsp-052).
-    pub fn of_beat(state: &Path, g: Given, idle_secs: Option<u64>, alive: &dyn Fn(u32) -> bool) -> View {
-        View::of_live(state, g, idle_secs, &live_now(state, alive))
+    /// A hold is judged by the job table of the host its build ran on
+    /// ([`live_by`], wsp-052).
+    pub fn of_beat(state: &Path, g: Given, idle_secs: Option<u64>) -> View {
+        View::of_live(state, g, idle_secs, &live_now(state))
     }
 
     fn of_live(state: &Path, g: Given, idle_secs: Option<u64>, live: &dyn Fn(&Path, &Value) -> bool) -> View {
@@ -2223,10 +2115,6 @@ impl View {
     }
 }
 
-fn builds(state: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<Build> {
-    builds_by(state, &live_by(None, alive))
-}
-
 fn builds_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> Vec<Build> {
     let read = |name: &str| -> Vec<(String, Value)> {
         let mut v: Vec<(String, Value)> = fs::read_dir(builds_dir(state))
@@ -2246,16 +2134,12 @@ fn builds_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> Vec<Build> {
     let mut out: Vec<Build> = read("tree-").into_iter().map(|(_, h)| Build { holder: h, slot: None }).collect();
     for (name, h) in slots {
         let n: usize = name.trim_start_matches("slot-").parse().unwrap_or(0);
-        match out.iter_mut().find(|b| holder_pid(&b.holder) == holder_pid(&h)) {
+        match out.iter_mut().find(|b| job_of(&b.holder) == job_of(&h)) {
             Some(b) => b.slot = Some(n),
             None => out.push(Build { holder: h, slot: Some(n) }),
         }
     }
     out
-}
-
-fn checks(state: &Path, alive: &dyn Fn(u32) -> bool) -> Checks {
-    checks_by(state, &live_by(None, alive))
 }
 
 fn checks_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> Checks {
@@ -2331,14 +2215,14 @@ pub fn health(store: &Store, notes: &mut Vec<String>) {
 /// do not see each other's edge (wsp-116).
 static WARNED: std::sync::Mutex<BTreeMap<PathBuf, bool>> = std::sync::Mutex::new(BTreeMap::new());
 
-/// The daemon's half: drop holds whose process is gone, and log the load
-/// warning when it starts and when it clears. Not under test; [`reap`] and
+/// The daemon's half: drop holds whose job has ended, and log the load
+/// warning when it starts and when it clears. Not under test; [`reap_by`] and
 /// [`View`] are.
 pub fn tidy(store: &Store) {
     if cfg!(test) {
         return;
     }
-    reap_by(&store.state, &live_now(&store.state, &alive));
+    reap_by(&store.state, &live_now(&store.state));
     warn(store, &View::read(&store.state));
 }
 
@@ -2397,7 +2281,7 @@ fn cores_unprobed() -> usize {
 /// `pmset`, no `ioreg`. Under test as well, because nothing here probes.
 pub fn tidy_given(store: &Store, given: Option<Given>) {
     if !cfg!(test) {
-        reap_by(&store.state, &live_now(&store.state, &alive));
+        reap_by(&store.state, &live_now(&store.state));
     }
     // Nothing folded yet is no reading, and no warning edge either way.
     let Some(g) = given else { return };
@@ -2418,11 +2302,7 @@ fn warn(store: &Store, v: &View) {
     }
 }
 
-pub fn reap(state: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
-    reap_by(state, &live_by(None, alive))
-}
-
-/// [`reap`], each hold judged by `live` ([`live_by`]).
+/// Drop the holds `live` ([`live_by`]) says are nobody's.
 fn reap_by(state: &Path, live: &dyn Fn(&Path, &Value) -> bool) -> usize {
     let mut n = 0;
     for e in fs::read_dir(builds_dir(state)).into_iter().flatten().flatten() {
@@ -2812,37 +2692,35 @@ mod tests {
 
     // ---- holds ----
 
-    fn dead_pid() -> u32 {
-        let mut c = Command::new("true").spawn().unwrap();
-        let pid = c.id();
-        c.wait().unwrap();
-        pid
+    fn rec_for(job: &str) -> Value {
+        let mut rec = json!({"task": "wsp-9", "cmd": "cargo test", "tree": "/t", "since": util::epoch_secs()});
+        rec["job"] = serde_json::to_value(crate::host::job_key("wsp-9", 0, job)).unwrap();
+        rec
     }
 
-    fn rec_for(pid: u32) -> Value {
-        json!({"pid": pid, "task": "wsp-9", "cmd": "cargo test", "tree": "/t", "since": util::epoch_secs()})
+    /// The jobs named `up` are running: the job table, as a closure.
+    fn running(up: &'static [&'static str]) -> impl Fn(&Path, &Value) -> bool {
+        move |_: &Path, v: &Value| job_of(v).is_some_and(|k| up.iter().any(|j| k == crate::host::job_key("wsp-9", 0, j)))
     }
 
     #[test]
-    fn a_live_hold_is_waited_on_and_a_dead_one_is_taken_over() {
+    fn a_hold_of_a_running_job_is_waited_on_and_one_of_an_ended_job_is_taken_over() {
         let t = crate::util::isolated("throttle-hold");
         let p = slot_path(&t.state(), 0);
-        let me = std::process::id();
-        let live = |pid: u32| pid == me;
-        let first = take(&p, &rec_for(me), &live);
+        let live = running(&["mine"]);
+        let first = take_by(&p, &rec_for("mine"), &live);
         assert!(matches!(first, Taken::Yours(_)));
-        // A second taker sees it held by us.
-        let other = take(&p, &rec_for(1), &live);
-        assert!(matches!(other, Taken::HeldBy(ref v) if holder_pid(v) == me));
+        // A second taker sees it held by the job.
+        let other = take_by(&p, &rec_for("other"), &live);
+        assert!(matches!(other, Taken::HeldBy(ref v) if job_of(v) == job_of(&rec_for("mine"))));
         drop(first);
         assert!(!p.exists(), "dropping a hold removes it");
 
-        let ghost = dead_pid();
         fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(&p, rec_for(ghost).to_string()).unwrap();
-        let took = take(&p, &rec_for(me), &live);
-        assert!(matches!(took, Taken::Yours(_)), "a hold whose process is gone is not a hold");
-        assert!(fs::read_to_string(&p).unwrap().contains(&format!("\"pid\":{me}")));
+        fs::write(&p, rec_for("ended").to_string()).unwrap();
+        let took = take_by(&p, &rec_for("mine"), &live);
+        assert!(matches!(took, Taken::Yours(_)), "a hold whose job has ended is not a hold");
+        assert_eq!(job_of(&serde_json::from_str::<Value>(&fs::read_to_string(&p).unwrap()).unwrap()), job_of(&rec_for("mine")));
     }
 
     #[test]
@@ -2851,33 +2729,40 @@ mod tests {
         let p = slot_path(&t.state(), 0);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, "").unwrap();
-        let me = std::process::id();
-        assert!(matches!(take(&p, &rec_for(me), &|_| true), Taken::HeldBy(_)), "a creator is mid-write");
+        assert!(matches!(take_by(&p, &rec_for("mine"), &|_, _| true), Taken::HeldBy(_)), "a creator is mid-write");
     }
 
     #[test]
     fn dropping_a_hold_never_removes_someone_elses() {
         let t = crate::util::isolated("throttle-not-mine");
         let p = slot_path(&t.state(), 0);
-        let hold = match take(&p, &rec_for(std::process::id()), &|_| true) {
+        let hold = match take_by(&p, &rec_for("mine"), &|_, _| true) {
             Taken::Yours(h) => h,
             _ => panic!("free"),
         };
-        fs::write(&p, rec_for(dead_pid()).to_string()).unwrap();
+        fs::write(&p, rec_for("theirs").to_string()).unwrap();
         drop(hold);
         assert!(p.exists(), "the file was taken over by another holder");
     }
 
     #[test]
-    fn the_daemon_reaps_holds_whose_process_is_gone_and_only_those() {
+    fn the_daemon_reaps_holds_whose_job_has_ended_and_only_those() {
         let t = crate::util::isolated("throttle-reap");
         let dir = builds_dir(&t.state());
         fs::create_dir_all(&dir).unwrap();
-        let me = std::process::id();
-        fs::write(dir.join("slot-0"), rec_for(me).to_string()).unwrap();
-        fs::write(dir.join("slot-1"), rec_for(dead_pid()).to_string()).unwrap();
-        assert_eq!(reap(&t.state(), &|p| p == me), 1);
+        fs::write(dir.join("slot-0"), rec_for("up").to_string()).unwrap();
+        fs::write(dir.join("slot-1"), rec_for("ended").to_string()).unwrap();
+        assert_eq!(reap_by(&t.state(), &running(&["up"])), 1);
         assert!(dir.join("slot-0").exists() && !dir.join("slot-1").exists());
+    }
+
+    #[test]
+    fn a_table_that_could_not_be_read_keeps_every_hold_and_a_record_with_no_job_is_nobodys() {
+        let live = live_by(None);
+        assert!(live(Path::new("/x"), &rec_for("any")));
+        let mut old = rec_for("any");
+        old.as_object_mut().unwrap().remove("job");
+        assert!(!live(Path::new("/x"), &old));
     }
 
     #[test]
@@ -2942,7 +2827,6 @@ mod tests {
             cores: 8,
             idle,
             thermal: &|| None,
-            alive: &alive,
             say,
             poll: Duration::from_millis(20),
             held: false,
@@ -2950,6 +2834,20 @@ mod tests {
             log: &|_, _| {},
             body: &|_| String::new(),
         }
+    }
+
+    /// A build run as a job on `wsp-host`'s runner in this process, its tree
+    /// root `/`, with `ctx`'s PATH the caller's.
+    fn run_in(ctx: &Ctx, tool: &str, args: &[String]) -> i32 {
+        let host = inproc_anywhere(ctx.state);
+        let jobs = Jobs {
+            host,
+            on: HostId(crate::job_place::trunk_host()),
+            tree_root: PathBuf::from("/"),
+            env: vec![("PATH".into(), ctx.path_var.clone())],
+            out: &|_: &str| {},
+        };
+        run_on(ctx, &jobs, tool, args)
     }
 
     /// The niceness the test process itself runs at: `nice -n 12 cargo test`
@@ -2963,10 +2861,10 @@ mod tests {
         rest.split_whitespace().next().unwrap().parse().unwrap()
     }
 
-    /// Niced by the throttle: setpriority sets NICE, and never lowers a runner
-    /// already above it.
+    /// Niced by the throttle: the job's argv starts `nice -n NICE`, which adds
+    /// to the runner's own, to the most there is.
     fn niced(line: &str) -> bool {
-        nice_of(line) == base_nice().max(NICE)
+        nice_of(line) == (base_nice() + NICE).min(19)
     }
 
     /// Left at the niceness it was born with, whatever that is.
@@ -3084,7 +2982,7 @@ mod tests {
         let st = Settings { mode: Mode::Off, slots: Some(4), jobs: Some(4), hot_slots: Some(1), ..Settings::default() };
         st.save(&rig.state).unwrap();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
-        fs::write(slot_path(&rig.state, 0), rec_for(std::process::id()).to_string()).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for("held").to_string()).unwrap();
         let cooled = std::cell::Cell::new(false);
         let said = RefCell::new(Vec::new());
         let say = |m: &str| {
@@ -3106,7 +3004,7 @@ mod tests {
         let st = Settings { mode: Mode::Off, slots: Some(1), hot_slots: Some(1), ..Settings::default() };
         st.save(&rig.state).unwrap();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
-        fs::write(slot_path(&rig.state, 0), rec_for(std::process::id()).to_string()).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for("held").to_string()).unwrap();
         let (idle, say, env, cool) = (|| Some(0), |_: &str| panic!("it waited"), |_: &str| None, || Some(100));
         let mut c = ctx(&rig, &idle, &say, &env);
         c.thermal = &cool;
@@ -3135,12 +3033,11 @@ mod tests {
     fn a_nested_build_passes_through_without_a_hold() {
         let rig = rig("throttle-run-nested");
         mode(&rig, Mode::On, 1);
-        let me = std::process::id();
         // Both the only slot and the tree held by someone alive: a nested build
         // that waited would wait forever.
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
-        fs::write(slot_path(&rig.state, 0), rec_for(me).to_string()).unwrap();
-        fs::write(tree_path(&rig.state, &tree_of(&rig.tree)), rec_for(me).to_string()).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for("held").to_string()).unwrap();
+        fs::write(tree_path(&rig.state, &tree_of(&rig.tree)), rec_for("held").to_string()).unwrap();
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         let mut c = ctx(&rig, &idle, &say, &env);
         c.held = true;
@@ -3154,10 +3051,9 @@ mod tests {
             let rig = rig(name);
             mode(&rig, m, 4);
             let tree = tree_of(&rig.tree);
-            let me = std::process::id();
             fs::create_dir_all(builds_dir(&rig.state)).unwrap();
             let held = tree_path(&rig.state, &tree);
-            fs::write(&held, rec_for(me).to_string()).unwrap();
+            fs::write(&held, rec_for("held").to_string()).unwrap();
             let said = RefCell::new(Vec::<String>::new());
             let (idle, say, env) = (|| Some(0), |m: &str| said.borrow_mut().push(m.to_string()), |_: &str| None);
             let freer = {
@@ -3181,10 +3077,9 @@ mod tests {
     fn a_second_heavy_build_waits_for_a_slot_and_says_who_has_it() {
         let rig = rig("throttle-slot");
         mode(&rig, Mode::On, 1);
-        let me = std::process::id();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
         let held = slot_path(&rig.state, 0);
-        fs::write(&held, rec_for(me).to_string()).unwrap();
+        fs::write(&held, rec_for("held").to_string()).unwrap();
         let said = RefCell::new(Vec::<String>::new());
         let (idle, say, env) = (|| Some(0), |m: &str| said.borrow_mut().push(m.to_string()), |_: &str| None);
         let freer = {
@@ -3205,9 +3100,8 @@ mod tests {
     fn a_wait_for_a_slot_ends_when_auto_lifts_because_the_person_left() {
         let rig = rig("throttle-lift");
         mode(&rig, Mode::Auto, 1);
-        let me = std::process::id();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
-        fs::write(slot_path(&rig.state, 0), rec_for(me).to_string()).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for("held").to_string()).unwrap();
         let polls = std::cell::Cell::new(0);
         let idle = || {
             polls.set(polls.get() + 1);
@@ -3224,9 +3118,8 @@ mod tests {
     fn a_build_that_is_not_heavy_is_neither_held_nor_niced() {
         let rig = rig("throttle-light");
         mode(&rig, Mode::On, 1);
-        let me = std::process::id();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
-        fs::write(slot_path(&rig.state, 0), rec_for(me).to_string()).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for("held").to_string()).unwrap();
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         assert_eq!(run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["metadata"])), 0);
         assert!(seen(&rig)[0].contains("jobs=none"));
@@ -3236,9 +3129,8 @@ mod tests {
     fn cargo_run_is_niced_and_capped_but_holds_nothing() {
         let rig = rig("throttle-run-runs");
         mode(&rig, Mode::On, 1);
-        let me = std::process::id();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
-        fs::write(slot_path(&rig.state, 0), rec_for(me).to_string()).unwrap();
+        fs::write(slot_path(&rig.state, 0), rec_for("held").to_string()).unwrap();
         let (idle, say, env) = (|| Some(0), |_: &str| {}, |_: &str| None);
         run_in(&ctx(&rig, &idle, &say, &env), "cargo", &s(&["run", "-p", "host"]));
         let line = &seen(&rig)[0];
@@ -3414,10 +3306,9 @@ mod tests {
     #[test]
     fn the_view_names_the_builds_running_and_who_they_are_for() {
         let t = crate::util::isolated("throttle-view");
-        let me = std::process::id();
         fs::create_dir_all(builds_dir(&t.state())).unwrap();
-        fs::write(slot_path(&t.state(), 0), rec_for(me).to_string()).unwrap();
-        fs::write(tree_path(&t.state(), Path::new("/t")), rec_for(me).to_string()).unwrap();
+        fs::write(slot_path(&t.state(), 0), rec_for("held").to_string()).unwrap();
+        fs::write(tree_path(&t.state(), Path::new("/t")), rec_for("held").to_string()).unwrap();
         let v = View {
             settings: Settings::default(),
             idle: Some(12),
@@ -3425,7 +3316,7 @@ mod tests {
             cores: 8,
             load: Some((20.0, 18.0, 10.0)),
             thermal: None,
-            builds: builds(&t.state(), &|p| p == me),
+            builds: builds_by(&t.state(), &running(&["held"])),
             checks: Checks::default(),
             shims: PathBuf::from("/s"),
         };
@@ -3469,7 +3360,7 @@ mod tests {
             cores: 8,
             load: None,
             thermal: None,
-            builds: vec![Build { holder: rec_for(1), slot: Some(0) }],
+            builds: vec![Build { holder: rec_for("a"), slot: Some(0) }],
             checks: Checks::default(),
             shims: PathBuf::from("/s"),
         };
@@ -3494,70 +3385,13 @@ mod tests {
         }
     }
 
-    fn gate<'a>(
-        state: &'a Path,
-        thermal: &'a dyn Fn() -> Option<u32>,
-        alive: &'a dyn Fn(u32) -> bool,
-        say: &'a dyn Fn(&str),
-    ) -> CheckGate<'a> {
-        CheckGate {
-            state,
-            cores: 8,
-            task: "wsp-9".into(),
-            cmd: "sleep 1".into(),
-            dir: state.to_path_buf(),
-            thermal,
-            alive,
-            say,
-            poll: Duration::from_millis(10),
-        }
-    }
-
     #[test]
-    fn a_fifth_check_waits_for_one_of_four_slots_on_a_limited_clock_and_starts_when_one_ends() {
-        let t = crate::util::isolated("throttle-check-slots");
-        let state = t.state();
-        Settings { checks: Some(4), ..Settings::default() }.save(&state).unwrap();
-        let (thermal, say) = (|| Some(40u32), |_: &str| {});
-        let here = |_: u32| true;
-        let mut holds: Vec<Hold> = (0..4).map(|_| take_check_slot(&gate(&state, &thermal, &here, &say))).collect();
-        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let waiter = {
-            let (state, started) = (state.clone(), started.clone());
-            std::thread::spawn(move || {
-                let (thermal, say, here) = (|| Some(40u32), |_: &str| {}, |_: u32| true);
-                let h = take_check_slot(&gate(&state, &thermal, &here, &say));
-                started.store(true, Ordering::SeqCst);
-                drop(h);
-            })
-        };
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!started.load(Ordering::SeqCst), "the fifth check started with four running");
-        let seen = checks(&state, &here);
-        assert_eq!(seen.running.len(), 4, "{seen:?}");
-        assert_eq!(seen.waiting.len(), 1, "the fifth is named as waiting: {seen:?}");
-        holds.pop();
-        waiter.join().unwrap();
-        assert!(started.load(Ordering::SeqCst), "it started when a slot was freed");
-        assert!(checks(&state, &here).waiting.is_empty(), "and is no longer waiting");
-    }
-
-    #[test]
-    fn the_check_slots_shrink_with_the_clock_and_off_lifts_them_on_a_cool_machine() {
+    fn the_check_slots_shrink_with_the_clock_and_a_limited_clock_holds_them_down() {
         let s = Settings::default();
         assert_eq!(s.check_slots_at(8, false), 4);
         assert_eq!(s.check_slots_at(16, false), 8);
         assert_eq!(s.check_slots_at(16, true), HOT_SLOTS, "a limited clock holds the count down");
         assert_eq!(s.check_slots_at(2, true), 2.min(HOT_SLOTS));
-        let t = crate::util::isolated("throttle-check-off");
-        let state = t.state();
-        Settings { mode: Mode::Off, checks: Some(1), ..Settings::default() }.save(&state).unwrap();
-        let (cool, hot, say, here) = (|| Some(100u32), || Some(30u32), |_: &str| {}, |_: u32| true);
-        let _a = take_check_slot(&gate(&state, &cool, &here, &say));
-        let _b = take_check_slot(&gate(&state, &cool, &here, &say));
-        assert!(checks(&state, &here).running.is_empty(), "off on a cool machine takes no slot");
-        let _c = take_check_slot(&gate(&state, &hot, &here, &say));
-        assert_eq!(checks(&state, &here).running.len(), 1, "a limited clock holds it in every mode");
     }
 
     #[test]
@@ -3570,7 +3404,7 @@ mod tests {
             load: None,
             thermal: Some(40),
             builds: vec![],
-            checks: Checks { running: vec![(0, rec_for(1)), (1, rec_for(1))], waiting: vec![rec_for(1)] },
+            checks: Checks { running: vec![(0, rec_for("a")), (1, rec_for("a"))], waiting: vec![rec_for("a")] },
             shims: PathBuf::from("/s"),
         };
         let line = v.status_line();
@@ -3589,7 +3423,8 @@ mod tests {
 #[cfg(test)]
 mod manager_tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::process::Stdio;
+    use std::cell::RefCell;
     use std::sync::Mutex;
     use std::time::Instant;
     use wsp_host_api::{Role, Token};
@@ -3659,7 +3494,7 @@ mod manager_tests {
         Settings { mode: m, slots: Some(slots), jobs: Some(2), ..Settings::default() }.save(&rig.state).unwrap();
     }
 
-    fn ctx<'a>(rig: &'a Rig, alive: &'a dyn Fn(u32) -> bool, say: &'a dyn Fn(&str)) -> Ctx<'a> {
+    fn ctx<'a>(rig: &'a Rig, say: &'a dyn Fn(&str)) -> Ctx<'a> {
         Ctx {
             state: &rig.state,
             cwd: rig.tree.clone(),
@@ -3668,7 +3503,6 @@ mod manager_tests {
             cores: 8,
             idle: &|| Some(0),
             thermal: &|| None,
-            alive,
             say,
             poll: Duration::from_millis(20),
             held: false,
@@ -3721,11 +3555,6 @@ mod manager_tests {
         mode(&rig, Mode::On, 2);
         let m = manager(&rig);
         let host = tcp(&rig, &m);
-        let asked = Cell::new(0u32);
-        let alive = |_: u32| {
-            asked.set(asked.get() + 1);
-            true
-        };
         let said = RefCell::new(Vec::<String>::new());
         let say = |l: &str| said.borrow_mut().push(l.to_string());
         let got = Mutex::new(String::new());
@@ -3733,7 +3562,7 @@ mod manager_tests {
         let mut env = caller_env();
         env.push(("WSP_FAKE_EXIT".into(), "3".into()));
         let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env, out: &out };
-        assert_eq!(run_on(&ctx(&rig, &alive, &say), Some(&jobs), "cargo", &s(&["build", "-p", "x"])), 3, "the job's exit is the shim's");
+        assert_eq!(run_on(&ctx(&rig, &say), &jobs, "cargo", &s(&["build", "-p", "x"])), 3, "the job's exit is the shim's");
         let text = got.lock().unwrap().clone();
         assert!(text.contains("built by job:") && text.contains("args=build -p x"), "its output reached the caller: {text:?}");
         assert!(text.contains("jobs=2") && text.contains("held=yes"), "the decision's cap and hold went with it: {text}");
@@ -3744,7 +3573,6 @@ mod manager_tests {
         assert_eq!(rows.len(), 1, "one job.run: {rows:?}");
         assert_eq!(rows[0].0.row.0, "wsp-9");
         assert!(rows[0].0.job.starts_with("throttle:build@") && !rows[0].2, "{rows:?}");
-        assert_eq!(asked.get(), 0, "no holder was asked by pid");
         assert!(!builds_dir(&rig.state).join("slot-0").exists(), "the slot is let go: {:?}", said.borrow());
         m.stop();
     }
@@ -3755,36 +3583,29 @@ mod manager_tests {
         mode(&rig, Mode::On, 1);
         let m = manager(&rig);
         let host = tcp(&rig, &m);
-        let asked = Cell::new(0u32);
-        let alive = |_: u32| {
-            asked.set(asked.get() + 1);
-            true
-        };
         let said = RefCell::new(Vec::<String>::new());
         let say = |l: &str| said.borrow_mut().push(l.to_string());
         let out = |_: &str| {};
         let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env: caller_env(), out: &out };
         // A run whose job has ended; then its hold left behind, in this
         // process's own name: `kill -0` would call it held for ever.
-        assert_eq!(run_on(&ctx(&rig, &alive, &say), Some(&jobs), "cargo", &s(&["test"])), 0);
+        assert_eq!(run_on(&ctx(&rig, &say), &jobs, "cargo", &s(&["test"])), 0);
         let ended = m.jobs()[0].0.clone();
         let mut rec = json!({"pid": std::process::id(), "task": "wsp-8", "cmd": "cargo test", "tree": "/t", "since": util::epoch_secs()});
         rec["job"] = serde_json::to_value(&ended).unwrap();
         fs::create_dir_all(builds_dir(&rig.state)).unwrap();
         fs::write(slot_path(&rig.state, 0), rec.to_string()).unwrap();
         let start = Instant::now();
-        assert_eq!(run_on(&ctx(&rig, &alive, &say), Some(&jobs), "cargo", &s(&["build"])), 0);
+        assert_eq!(run_on(&ctx(&rig, &say), &jobs, "cargo", &s(&["build"])), 0);
         assert!(start.elapsed() < Duration::from_secs(10));
         assert!(!said.borrow().iter().any(|l| l.contains("waiting")), "the ended job's slot was free: {:?}", said.borrow());
-        assert_eq!(asked.get(), 0, "and no pid was asked");
         assert_eq!(m.jobs().len(), 2);
         // The views read it the same way: the ended job holds nothing.
         let left = json!({"pid": std::process::id(), "task": "wsp-8", "cmd": "cargo test", "tree": "/t", "since": util::epoch_secs(), "job": serde_json::to_value(&ended).unwrap()});
         fs::write(slot_path(&rig.state, 0), left.to_string()).unwrap();
-        let live = live_by(host.jobs().ok(), &alive);
+        let live = live_by(host.jobs().ok());
         assert!(builds_by(&rig.state, &live).is_empty());
         assert_eq!(reap_by(&rig.state, &live), 1);
-        assert_eq!(asked.get(), 0);
         m.stop();
     }
 
@@ -3796,18 +3617,15 @@ mod manager_tests {
         let key = crate::host::job_key("wsp-1", 0, "throttle:build@1");
         let rec = json!({"pid": 1, "job": serde_json::to_value(&key).unwrap()});
         fs::write(&p, rec.to_string()).unwrap();
-        let never = |_: u32| -> bool { panic!("no pid is asked of a job's hold") };
-        assert!(live_by(Some(vec![]), &never)(&p, &rec), "not yet started: within its grace");
+        assert!(live_by(Some(vec![]))(&p, &rec), "not yet started: within its grace");
         let row = |state| JobRow { key: key.clone(), class: JobClass::Build, pgid: 9, started: wsp_host_api::At(0), state };
-        assert!(live_by(Some(vec![row(JobState::Running)]), &never)(&p, &rec));
-        assert!(!live_by(Some(vec![row(JobState::Ended)]), &never)(&p, &rec));
+        assert!(live_by(Some(vec![row(JobState::Running)]))(&p, &rec));
+        assert!(!live_by(Some(vec![row(JobState::Ended)]))(&p, &rec));
         let old = std::time::SystemTime::now() - JOB_START_GRACE - Duration::from_secs(1);
         fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(old).unwrap();
-        assert!(!live_by(Some(vec![]), &never)(&p, &rec), "past its grace with no job: gone");
+        assert!(!live_by(Some(vec![]))(&p, &rec), "past its grace with no job: gone");
         touch(&p);
-        assert!(live_by(Some(vec![]), &never)(&p, &rec), "a waiting holder keeps it fresh");
-        // A hold that is no job's is its pid's, as before.
-        assert!(live_by(None, &|pid| pid == 7)(&p, &json!({"pid": 7})));
+        assert!(live_by(Some(vec![]))(&p, &rec), "a waiting holder keeps it fresh");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3833,7 +3651,6 @@ mod manager_tests {
         let rig = rig("throttle-job-facts");
         let m = manager(&rig);
         let host = tcp(&rig, &m);
-        let alive = |_: u32| true;
         let say = |_: &str| {};
         let got = Mutex::new(String::new());
         let out = |t: &str| got.lock().unwrap().push_str(t);
@@ -3842,11 +3659,11 @@ mod manager_tests {
             Settings { mode: m, slots: Some(2), jobs: Some(4), hot_jobs: Some(1), ..Settings::default() }.save(&rig.state).unwrap();
             let read = move || Some(beat.clone());
             let (idle, thermal) = (beat_idle(&read), beat_thermal(&read));
-            let mut c = ctx(&rig, &alive, &say);
+            let mut c = ctx(&rig, &say);
             c.idle = &idle;
             c.thermal = &thermal;
             got.lock().unwrap().clear();
-            assert_eq!(run_on(&c, Some(&jobs), "cargo", &s(&["build"])), 0);
+            assert_eq!(run_on(&c, &jobs, "cargo", &s(&["build"])), 0);
             got.lock().unwrap().clone()
         };
         let away = run(facts(Some(3600), Some(100)), Mode::Auto);

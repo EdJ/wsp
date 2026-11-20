@@ -192,9 +192,9 @@ where
 /// How a given-up clone is removed, and what is left for its thread to do if
 /// it ends while this process still lives.
 enum Tidy {
-    /// A shell of this process's removes it once the process is gone; the
-    /// thread does nothing (`WSP_JOBS=inproc`, as before M3).
-    Shell,
+    /// Nothing removes it once the process is gone: the removal job could not
+    /// be placed or sent, and a leftover is only disk. The thread does nothing.
+    Left,
     /// A detached job removes it once the process is gone ([`removal_job`]).
     /// A clone that ends first is removed here and the job let go: `hold` is
     /// what the job waits on, and closing it ends the wait.
@@ -222,19 +222,19 @@ const REMOVAL_WAIT: Duration = Duration::from_secs(15 * 60);
 const REMOVAL_HEARD: Duration = Duration::from_secs(10);
 
 /// Remove `path` after this process has exited, which is when the clone still
-/// running in it has stopped. Under `WSP_JOBS=manager`, a detached job on the
-/// manager of the host that holds the copy (this one, which made it); where
-/// that job cannot be placed or sent, and under `inproc`, a shell of this
-/// process's. Best effort: a leftover is only disk.
+/// running in it has stopped: a detached job on the host the jobs go to (the
+/// manager's, or `wsp-host`'s runner in this process under `WSP_JOBS=inproc`
+/// and where there is no manager), placed where the clone is. Where that job
+/// cannot be placed or sent nothing removes it. Best effort: a leftover is
+/// only disk.
 fn remove_when_gone(path: &Path) -> Tidy {
     let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(crate::store::Store::default_state);
-    if let Ok(Some(host)) = crate::throttle::manager_jobs(&state) {
+    if let Ok(host) = crate::throttle::jobs_host(&state) {
         if let Ok((fifo, hold)) = removal_job(host, path) {
             return Tidy::Job { fifo, hold };
         }
     }
-    remove_here(path);
-    Tidy::Shell
+    Tidy::Left
 }
 
 /// The removal of the given-up clone at `path` as a **detached job** on
@@ -318,18 +318,6 @@ fn make_fifo(path: &Path) -> Result<(), String> {
     // SAFETY: a NUL-terminated string that outlives the call.
     let rc = unsafe { mkfifo(c.as_ptr(), 0o600) };
     if rc == 0 { Ok(()) } else { Err(format!("{}: {}", path.display(), std::io::Error::last_os_error())) }
-}
-
-/// [`remove_when_gone`] by a shell of this process's (`WSP_JOBS=inproc`).
-fn remove_here(path: &Path) {
-    let script = format!("while kill -0 {} 2>/dev/null; do sleep 1; done; rm -rf \"$1\"", std::process::id());
-    let _ = wsp_base::calls::Command::new("sh")
-        .args(["-c", &script, "sh"])
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 #[cfg(target_os = "macos")]
