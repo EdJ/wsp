@@ -40,9 +40,11 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   tests. It copies `wsp-host`'s carrier, because that one is typed to the manager's `Frame`.
 - `src/mirror.rs`: `Mirror`, the `Domain` step 1 runs, plus `subject_of`. `decide` takes `Command::Mirror` alone.
   A `put` entity that differs from the state becomes `mirror.put`, and a `gone` subject the state holds becomes
-  `mirror.gone`. Puts are decided first, then gones, each against the drafts before it. Every other verb is
-  refused `illegal`, with the state `mirrored`. `evolve` folds both mirror kinds and the store's own `lease.*` and
-  `claim.*` events. `text.set` changes nothing. It is pure.
+  `mirror.gone`. A machine that differs only in its beat and its `LIVENESS` facts (`last_seen`, a beat's gauges)
+  becomes `machine.beat` instead, payload the bare `Machine` (`beat_only`, wsp-304), so a heartbeat is no entity
+  event. Puts are decided first, then gones, each against the drafts before it. Every other verb is
+  refused `illegal`, with the state `mirrored`. `evolve` folds both mirror kinds, `machine.beat` as a put, and the
+  store's own `lease.*` and `claim.*` events. `text.set` changes nothing. It is pure.
 - `tests/server.rs`: the done list, on loopback over `MemStore` (domain `Mirror`). It covers hello and tokens,
   each read verb against the store, commands `unsupported`, malformed lines, `subscribe {}` (the snapshot, then
   every event, no gap, two subscribers in one order), `subscribe {from}` across a restart, `too_old` (a

@@ -251,6 +251,7 @@ dependencies = [
  "wsp-store-sqlite",
  "wsp-testkit",
  "wsp-trees",
+ "wsp-view",
  "wsp-wire",
 ]
 
@@ -367,7 +368,16 @@ dependencies = [
  "wsp-base",
  "wsp-store",
  "wsp-testkit",
+ "wsp-view",
  "wsp-wire",
+]
+
+[[package]]
+name = "wsp-view"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-store-contract",
 ]
 
 [[package]]

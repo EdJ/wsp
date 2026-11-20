@@ -55,7 +55,7 @@ fn changed(started_as: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<(u
 /// owed to the passes either: this is called at the top of the loop, where the
 /// last one has finished and the next has not begun.
 fn reload(verbose: bool) -> std::io::Error {
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return e,
     };

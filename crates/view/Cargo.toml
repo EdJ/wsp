@@ -1,0 +1,13 @@
+[package]
+name = "wsp-view"
+version = "0.1.0"
+edition = "2021"
+description = "The CLI's --json projections (ls, show, wip, worklist ls, machine ls, throttle, spend) as pure functions over the state core's contract entities; no IO, no store"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The shapes are JSON values, as the CLI prints them.
+serde_json = "1"
+wsp-store-contract = { path = "../store-contract" }

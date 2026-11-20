@@ -446,16 +446,33 @@ pub(crate) fn reopened(store: &Store, id: &str, reason: &str) -> Option<(String,
 }
 
 fn launch(store: &Store, argv: &[&str]) {
+    if let Err(why) = start_detached(store, argv) {
+        log_line(store, &format!("could not start `wsp {}`: {why}", argv.join(" ")));
+    }
+}
+
+/// [`launch`]'s process, with why it did not start rather than nothing.
+///
+/// **Each way out used to be a bare `return`** (`wsp-151`), and on Linux one of
+/// them was every launch: `current_exe` read `wsp (deleted)` after an install,
+/// the spawn failed with `ENOENT`, and `cycle.log` said "seating a successor"
+/// with nothing after it, a minute at a time, for a day. [`util::self_exe`] (`wsp-152`) fixes
+/// that cause; this is so the next one is said.
+fn start_detached(store: &Store, argv: &[&str]) -> Result<(), String> {
     // A test's `current_exe` is the test harness, and handing it `worklist
     // advance` would run the suite again from inside itself.
     if cfg!(test) || std::env::var_os(OFF).is_some() {
-        return;
+        return Ok(());
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = store.state_file("cycle.log");
-    let Ok(out) = std::fs::OpenOptions::new().create(true).append(true).open(&log) else { return };
-    let Ok(err) = out.try_clone() else { return };
-    let mut cmd = Command::new(exe);
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
+    let err = out.try_clone().map_err(|e| format!("cannot share {}: {e}", log.display()))?;
+    let mut cmd = Command::new(&exe);
     cmd.args(argv)
         // Nobody's pane: a spawn started from here must not read itself as
         // the agent whose verb triggered it.
@@ -466,16 +483,23 @@ fn launch(store: &Store, argv: &[&str]) {
         .stdout(out)
         .stderr(err)
         .process_group(0);
-    let _ = cmd.spawn();
+    cmd.spawn().map(|_| ()).map_err(|e| format!("{} did not start: {e}", exe.display()))
 }
 
-/// [`launch`], for a verb that is not a run step — [`crate::repair`]'s reseat is
-/// the only caller, and it is here rather than duplicated because the four
+/// [`launch`], for a verb that is not a run step — [`crate::repair`]'s reseat was
+/// the first caller, and it is here rather than duplicated because the four
 /// things `launch` does are four things that have to be true of any process the
 /// run starts: its stdout is `cycle.log`, it inherits nobody's seat, it holds
 /// no terminal, and it outlives the tick that asked for it.
 pub(crate) fn launch_out(store: &Store, argv: &[&str]) {
     launch(store, argv)
+}
+
+/// [`launch_out`], returning why it did not start, for a caller that holds a
+/// claim and records the failure against it (`wsp-151`) rather than leaving a
+/// claim that times out with nothing said.
+pub(crate) fn try_launch(store: &Store, argv: &[&str]) -> Result<(), String> {
+    start_detached(store, argv)
 }
 
 /// `wsp worklist advance [<slug>] [--task ID --verb V] [--event go|hold --passed N]`
@@ -1410,7 +1434,7 @@ fn tell_seat(store: &Store, check: &str, text: &str, what: &str) {
         crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text.to_string())));
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = wsp_base::util::self_exe() else { return };
     let mut child = match wsp_base::calls::Command::new(exe)
         .args(["tell", check, "-"])
         .stdin(std::process::Stdio::piped())
@@ -2492,7 +2516,7 @@ fn start_leg(store: &Store, row: &str, leg: &str, owned: Option<(&str, &str)>) -
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -2844,7 +2868,7 @@ fn start_piece(store: &Store, row: &str, n: usize, owned: Option<(&str, &str)>) 
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -3983,7 +4007,7 @@ fn start(store: &Store, id: &str, policy: &Policy, owned: (&str, &str), verify: 
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -4020,7 +4044,7 @@ pub(crate) fn start_check(store: &Store, list: &str, at: usize, policy: &Policy)
             tests::FAIL.with(|f| f.borrow().clone())
         });
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return Some(e.to_string()),
     };
@@ -5126,7 +5150,7 @@ pub(crate) fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String>
             tests::END_FAIL.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
         });
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
     let out = Command::new(exe)
         .args(despawn_argv(&["--pane", seat], keep))
         .current_dir("/")
@@ -5169,7 +5193,7 @@ pub(crate) fn despawned_keeping(store: &Store, id: &str, keep: bool) -> Result<(
         }
         return Ok(());
     }
-    let Ok(exe) = std::env::current_exe() else { return Err("could not find wsp itself".into()) };
+    let Ok(exe) = wsp_base::util::self_exe() else { return Err("could not find wsp itself".into()) };
     let out = Command::new(exe).args(despawn_argv(&[id], keep)).stdin(Stdio::null()).output();
     let (said, result) = match out {
         Ok(o) if o.status.success() => ("ended".to_string(), Ok(())),
@@ -5340,12 +5364,8 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     if hand_it_to_the_governor(store, w, text) {
         return true;
     }
-    // On a member of the group the run stands at, where a person looking at
-    // the run is looking — not group 1's, long since finished.
     let w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
-    let groups = w.groups();
-    let here = groups.iter().find(|g| g.verdict.trim().is_empty()).or_else(|| groups.last());
-    let Some(first) = here.and_then(|g| g.members.first()).cloned() else { return false };
+    let Some(first) = noticed_on(&w) else { return false };
     let text = match w.runs_itself().then(|| nobody_coming(store, &w.id)).flatten() {
         Some(why) => format!("Meant for the {} list's own seat, and nobody is coming to it: {why}.\n\n{text}", w.id),
         None => text.to_string(),
@@ -5354,6 +5374,37 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
     crate::cmd_agent::notice(store, &first, &text).is_some()
+}
+
+/// The member [`tell_now`] puts a run's notice on: the first of the group the
+/// run stands at, where a person looking at the run is looking — not group 1's,
+/// long since finished.
+fn noticed_on(w: &Worklist) -> Option<String> {
+    let groups = w.groups();
+    let here = groups.iter().find(|g| g.verdict.trim().is_empty()).or_else(|| groups.last());
+    here.and_then(|g| g.members.first()).cloned()
+}
+
+/// Whether a notice [`tell_now`] puts on this list's member reaches a seat, as
+/// against the person's panel.
+///
+/// **The walk `cmd_govern::answering_seat` makes, from the layer below it**
+/// ([`crate::governors::seat_for`]: the member's running list, then its
+/// project). Its third step, the governor whose work order started the row,
+/// never applies here: a run member's log names the run as its starter, which
+/// ends that walk.
+fn notice_reaches_a_seat(store: &Store, w: &Worklist) -> bool {
+    let Some(task) = noticed_on(w).and_then(|m| store.task(&m)) else { return false };
+    let index = crate::resolve::Index::new(store.projects());
+    let lists = worklist::Running::read(store);
+    let governors = store.governors();
+    crate::governors::seat_for(&governors, &index, lists.list_for(&task), task.project.as_deref()).is_some()
+}
+
+/// Whether a sentence asks anybody for anything, by the rule a turn's last
+/// words are read by ([`crate::waiting::last_words`]), asked of each paragraph.
+fn asks_anything(text: &str) -> bool {
+    text.split("\n\n").any(|p| crate::waiting::last_words(p).is_some_and(|w| w.asks))
 }
 
 /// Why nobody is coming to a list's own post, or `None` while somebody is in
@@ -5407,8 +5458,21 @@ pub(crate) fn hand_on_what_done_lists_held(store: &Store) {
         if !w.runs_itself() || w.status() != WorklistStatus::Done {
             continue;
         }
+        // **Needs-you means act** (`wsp-151`, the `wsp-095` family). With no
+        // seat above, the notice lands on the person's panel, and cr-linux
+        // closed with 26 of 26 held sentences put there — started, parked,
+        // resumed, verified, none of them asking anything. The news of a run
+        // that has finished is nobody's to act on: a sentence that asks nothing
+        // is let go rather than raised. A seat above still hears all of it,
+        // because a governor is kept current where a person is asked.
+        let to_a_seat = notice_reaches_a_seat(store, &w);
         let mut handed = Vec::new();
+        let mut let_go = Vec::new();
         for (seq, at, text) in &held {
+            if !to_a_seat && !asks_anything(text) {
+                let_go.push(*seq);
+                continue;
+            }
             // The date as well as the clock: what a done list was left holding
             // is days old as often as not, and `15:42` alone reads as today.
             let since = format!("{} {}", util::local_ymd(&util::iso_at(*at)), util::local_hm(*at));
@@ -5416,15 +5480,19 @@ pub(crate) fn hand_on_what_done_lists_held(store: &Store) {
                 handed.push(*seq);
             }
         }
-        crate::wake::settle_held(store, scope, &handed);
+        crate::wake::settle_held(store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
         // Said when something moved, not every tick something could not: a
         // done list with no member to put a notice on would otherwise write
         // this line a minute for ever. What stays is still on `--status`.
-        if handed.is_empty() {
+        if handed.is_empty() && let_go.is_empty() {
             continue;
         }
+        let dropped = match let_go.len() {
+            0 => String::new(),
+            n => format!(", and let go {n} that asked nothing, with no seat above to keep current"),
+        };
         log_line(store, &format!(
-            "{scope} is done and its own seat with it — handed on {} of the {} sentence(s) held for it",
+            "{scope} is done and its own seat with it — handed on {} of the {} sentence(s) held for it{dropped}",
             handed.len(),
             held.len()
         ));
@@ -7127,6 +7195,42 @@ fn only_a_working_screen_is_ever_overruled() {
 
         hand_on_what_done_lists_held(&store);
         assert_eq!(crate::wake::messages_held(&store, "p").len(), 2, "once");
+    }
+
+    /// `wsp-151`. cr-linux closed on a machine whose project had no seat, and
+    /// all 26 sentences held on its post went to the person as flags —
+    /// started, parked, resumed, verified, none asking anything. With nobody
+    /// above to keep current, a sentence that asks nothing is let go; one that
+    /// asks still reaches the person.
+    #[test]
+    fn a_done_list_with_no_seat_above_lets_go_what_asks_nothing() {
+        let (_env, store, _w) = passed_with_seats("letgo");
+        a_failed_reseat(&store, "run");
+        assert!(store.clear_governor("p"), "nobody above the list");
+        crate::wake::say(&store, "run", "The run list was parked: nothing starts until it is resumed · wsp worklist show run", None);
+        crate::wake::say(&store, "run", "The run list was resumed where it was parked · wsp worklist show run", None);
+        crate::wake::say(&store, "run", "m-1 has been blocked for 40 min and waits on: does the schema keep its old column?", None);
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        let before: Vec<String> = crate::message::all(&store).into_iter().map(|m| m.id).collect();
+        let _ = drained(&SAID);
+
+        hand_on_what_done_lists_held(&store);
+
+        assert!(crate::wake::messages_held(&store, "run").is_empty(), "nothing is left on the done list's post");
+        let raised: Vec<String> =
+            crate::message::all(&store).into_iter().filter(|m| !before.contains(&m.id)).map(|m| m.text).collect();
+        assert_eq!(raised.len(), 1, "only the one that asks: {raised:?}");
+        assert!(raised[0].contains("does the schema keep its old column?"), "{raised:?}");
+        let said = drained(&SAID);
+        assert!(
+            said.iter().any(|l| l.contains("handed on 1 of the 3") && l.contains("let go 2 that asked nothing")),
+            "{said:?}"
+        );
+
+        hand_on_what_done_lists_held(&store);
+        assert_eq!(crate::message::all(&store).len(), before.len() + 1, "once");
     }
 
     /// `wsp-216`: `go` on the last barrier of a group wsp ran is the close, and

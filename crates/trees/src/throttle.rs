@@ -308,7 +308,27 @@ pub fn parse_hid_idle(ioreg: &str) -> Option<u64> {
     Some(ns / 1_000_000_000)
 }
 
+/// The machine a test build reads, pinned (wsp-305): `WSP_TEST_MACHINE` holds
+/// `{"cores": 8, "load": [1.5, 1.0, 0.5], "mem_free": 60, "swap": [512, 4096],
+/// "pageouts": 7, "thermal": 100, "idle": 30}`, and each reading below answers
+/// from it instead of the machine; a key absent or null is a reading this
+/// machine could not take. The golden test of the `--json` projections
+/// (tests/view_golden.rs) reads the same bytes on any machine through it. A
+/// release build has no such variable.
+#[cfg(any(test, feature = "test-support"))]
+fn pinned() -> Option<Value> {
+    std::env::var("WSP_TEST_MACHINE").ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn pinned() -> Option<Value> {
+    None
+}
+
 fn hid_idle_secs() -> Option<u64> {
+    if let Some(m) = pinned() {
+        return m["idle"].as_u64();
+    }
     parse_hid_idle(&LOCAL.idle()?)
 }
 
@@ -320,6 +340,9 @@ pub fn parse_speed_limit(pmset: &str) -> Option<u32> {
 }
 
 fn speed_limit() -> Option<u32> {
+    if let Some(m) = pinned() {
+        return m["thermal"].as_u64().map(|n| n as u32);
+    }
     if cfg!(test) {
         return None;
     }
@@ -334,6 +357,10 @@ pub fn parse_loadavg(s: &str) -> Option<(f64, f64, f64)> {
 }
 
 fn load_average() -> Option<(f64, f64, f64)> {
+    if let Some(m) = pinned() {
+        let n = |i: usize| m["load"].get(i).and_then(Value::as_f64);
+        return Some((n(0)?, n(1)?, n(2)?));
+    }
     parse_loadavg(&LOCAL.load()?)
 }
 
@@ -660,6 +687,9 @@ pub fn parse_mem_free(out: &str) -> Option<u32> {
 }
 
 fn mem_free() -> Option<u32> {
+    if let Some(m) = pinned() {
+        return m["mem_free"].as_u64().map(|n| n as u32);
+    }
     if cfg!(test) {
         return None;
     }
@@ -733,6 +763,10 @@ pub fn parse_pageouts(out: &str) -> Option<u64> {
 }
 
 fn swap_now() -> Option<(u32, u32)> {
+    if let Some(m) = pinned() {
+        let n = |i: usize| m["swap"].get(i).and_then(Value::as_u64).map(|n| n as u32);
+        return Some((n(0)?, n(1)?));
+    }
     if cfg!(test) {
         return None;
     }
@@ -747,6 +781,9 @@ fn swap_now() -> Option<(u32, u32)> {
 }
 
 fn pageouts_now() -> Option<u64> {
+    if let Some(m) = pinned() {
+        return m["pageouts"].as_u64();
+    }
     if cfg!(test) {
         return None;
     }
@@ -861,6 +898,9 @@ pub fn readiness_scale_now() -> u32 {
 }
 
 fn cores() -> usize {
+    if let Some(n) = pinned().and_then(|m| m["cores"].as_u64()) {
+        return n as usize;
+    }
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
@@ -1898,18 +1938,12 @@ pub fn memory_json(store: &Store) -> Value {
     let s = Settings::load(&store.state);
     let r = reading_now(&store.state);
     let held = hold_step(&store.state, &r, &s).into_iter().find(|h| h.kind == PauseKind::Memory);
-    memory_json_of(&r, held)
-}
-
-fn memory_json_of(r: &Reading, held: Option<Pause>) -> Value {
-    json!({
-        "free_percent": r.mem_free,
-        "swap_used_mb": r.swap.map(|s| s.0),
-        "swap_total_mb": r.swap.map(|s| s.1),
-        "swap_growth_mb_per_min": r.swap_growth_mb_min,
-        "pageouts_per_min": r.pageouts_min,
-        "held": held.is_some(),
-        "held_text": held.map(|h| h.text()),
+    wsp_view::throttle::memory_json(&wsp_view::throttle::Memory {
+        free_percent: r.mem_free,
+        swap: r.swap,
+        swap_growth_mb_min: r.swap_growth_mb_min,
+        pageouts_min: r.pageouts_min,
+        held_text: held.map(|h| h.text()),
     })
 }
 
@@ -2074,24 +2108,24 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
     match args.json() {
         true => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "mode": v.settings.mode.word(),
-                "in_force": v.in_force,
-                "idle_secs": v.idle,
-                "cores": v.cores,
-                "slots": v.settings.slot_count(v.cores),
-                "jobs": v.settings.job_cap(v.cores),
-                "load": v.load.map(|(a, b, c)| json!([a, b, c])),
-                "load_warning": v.load_warning(),
-                "memory": memory_json(store),
-                "cpu_speed_limit": v.thermal,
-                "thermal_below": v.settings.thermal_below,
-                "thermally_limited": v.hot(),
-                "hot_slots": v.settings.slots_at(v.cores, true),
-                "hot_jobs": v.settings.jobs_at(v.cores, true),
-                "suggested_agents": v.hot().then(|| v.settings.hot_agents(v.cores)),
-                "agents": store.seat_cap(),
-                "builds": v.builds.iter().map(|b| json!({"holder": b.holder, "slot": b.slot})).collect::<Vec<_>>(),
+            serde_json::to_string_pretty(&wsp_view::throttle::json(&wsp_view::throttle::Throttle {
+                mode: v.settings.mode.word().to_string(),
+                in_force: v.in_force,
+                idle_secs: v.idle,
+                cores: v.cores,
+                slots: v.settings.slot_count(v.cores),
+                jobs: v.settings.job_cap(v.cores),
+                load: v.load,
+                load_warning: v.load_warning(),
+                memory: memory_json(store),
+                cpu_speed_limit: v.thermal,
+                thermal_below: v.settings.thermal_below,
+                thermally_limited: v.hot(),
+                hot_slots: v.settings.slots_at(v.cores, true),
+                hot_jobs: v.settings.jobs_at(v.cores, true),
+                suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
+                agents: store.seat_cap(),
+                builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
             }))
             .unwrap_or_default()
         ),
@@ -2228,13 +2262,6 @@ mod tests {
         let st = Settings::default();
         // Free percentage at 2% with nothing paging and swap flat: not held.
         assert!(hold_step(&t.state(), &Reading { mem_free: Some(2), ..calm() }, &st).is_empty());
-        let j = memory_json_of(&Reading { mem_free: Some(32), swap_growth_mb_min: Some(120), ..calm() }, None);
-        assert_eq!(j["free_percent"], 32);
-        assert_eq!(j["swap_used_mb"], 4096);
-        assert_eq!(j["swap_total_mb"], 5120);
-        assert_eq!(j["swap_growth_mb_per_min"], 120);
-        assert_eq!(j["pageouts_per_min"], 1_500);
-        assert_eq!(j["held"], false);
     }
 
     #[test]

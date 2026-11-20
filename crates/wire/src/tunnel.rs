@@ -280,7 +280,7 @@ impl Tunnel {
         if !wants_check(&self.live, m, crate::place_compound::wire_version(), util::now_iso().as_str()) {
             return;
         }
-        let Ok(exe) = std::env::current_exe() else { return };
+        let Ok(exe) = wsp_base::util::self_exe() else { return };
         let mut c = Command::new(exe);
         c.args(["machine", "check", &m.name]).stdin(Stdio::null());
         c.stdout(Stdio::null()).stderr(Stdio::null());

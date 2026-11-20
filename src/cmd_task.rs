@@ -402,19 +402,17 @@ pub fn find(store: &Store, args: &Args) -> i32 {
         // row at once, rather than a walk of the store per row.
         let asked: Vec<&Task> = hits.iter().chain(archived.iter()).collect();
         let stages = crate::stage::with_history(store, &asked);
+        let claims = store.claims();
         let out: Vec<_> = hits
             .iter()
             .map(|t| (t, false))
             .chain(archived.iter().map(|t| (t, true)))
             .map(|(t, filed)| {
-                let mut v = t.json();
-                v["archived"] = json!(filed);
-                // `wsp-274`: and since when, off the same timeline `show` gives.
-                v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
-                v
+                let stage = stages.get(&t.id).map(|(s, h)| crate::stage::view(s, h));
+                wsp_view::task::ls_row(&row_of(t, &claims), filed, stage.as_ref())
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        println!("{}", wsp_view::task::ls(&out));
         return 0;
     }
 
@@ -768,43 +766,24 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         }
     };
     if args.json() {
-        let mut v = t.json();
-        v["body"] = json!(t.body);
-        // Present only when it is, on the same rule as `list` below: a reader
-        // of this payload sees what it always saw until there is something to
-        // say. An agent reading a cited id back gets the record *and* the fact
-        // that it is no longer live, which is the difference between quoting a
-        // decision and reopening it.
-        if let Some(path) = &archived {
-            v["archived"] = json!(util::contract(path));
-        }
-        // Who has it and who had it. An agent reading this back is usually
-        // asking exactly that, and the alternative is reading two state files
-        // it has no business knowing the names of.
-        v["claim"] = store.claims().get(&t.id).cloned().unwrap_or(json!(null));
-        v["worked"] = store.worked().get(&t.id).cloned().unwrap_or(json!(null));
-        // Present only while a list is running, so a reader of this payload
-        // sees what it always saw until there is one — the text half follows
-        // the same rule and for the same reason.
-        if let Some(l) = crate::worklist::Running::read(store).of(&t.id) {
-            v["list"] = json!({ "list": l.list, "group": l.group, "of": l.of });
-        }
-        // The same rule as `claim` above: an agent reading this back is often
-        // asking exactly this, and the alternative is the one it actually
-        // reached for — reading a state file by hand.
-        v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
-        // `wsp-241`: the passes, which were only ever inside `body`.
-        v["verification"] = crate::verification::json(&t);
-        v["legs"] = crate::legs::json(&t);
-        v["pieces"] = crate::pieces::json(&t);
-        // `wsp-242`: where it is, as a word wsp derives and the tail the step
-        // that put it there was given.
-        // `wsp-255`: and when it entered each stage it has been in.
+        // Each key's rule is `wsp_view::task::show`'s: this reads what it
+        // prints and hands it over.
+        let claims = store.claims();
         let staged = crate::stage::with_history(store, &[&t]);
-        let staged = staged.get(&t.id);
-        v["stage"] = json!(staged.map(|(s, h)| crate::stage::json(s, h)));
-        v["stages"] = json!(staged.map(|(_, h)| h.iter().map(|s| s.json()).collect::<Vec<_>>()));
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        let running = crate::worklist::Running::read(store);
+        let shown = wsp_view::task::Show {
+            body: &t.body,
+            archived: archived.as_ref().map(|path| util::contract(path)),
+            claim: claims.get(&t.id).cloned(),
+            worked: store.worked().get(&t.id).cloned(),
+            list: running.of(&t.id).map(|l| wsp_view::task::Running { list: l.list.clone(), group: l.group, of: l.of }),
+            raised: raised_about(store, &t.id).iter().map(|m| m.to_json()).collect(),
+            verification: crate::verification::view(&t),
+            legs: crate::legs::view(&t),
+            pieces: crate::pieces::view(&t),
+            stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
+        };
+        println!("{}", wsp_view::task::show(&row_of(&t, &claims), &shown));
         return 0;
     }
 
@@ -1455,7 +1434,7 @@ fn respawn(argv: &[String], json: bool) -> (String, i32) {
         tests::RESEATED.with(|r| r.borrow_mut().push(argv.to_vec()));
         return (String::new(), 0);
     }
-    let Ok(exe) = std::env::current_exe() else { return ("no wsp binary to run".to_string(), 1) };
+    let Ok(exe) = wsp_base::util::self_exe() else { return ("no wsp binary to run".to_string(), 1) };
     let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(argv).stdin(std::process::Stdio::null());
     if json {
@@ -1581,7 +1560,7 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
         }
         return Told::Yes;
     }
-    let Ok(exe) = std::env::current_exe() else { return Told::No };
+    let Ok(exe) = wsp_base::util::self_exe() else { return Told::No };
     let mut argv = vec!["tell", id, "-"];
     if anyway {
         argv.push("--anyway");
@@ -3523,6 +3502,17 @@ fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
             v
         })
         .collect()
+}
+
+/// The contract row a task is, as the mirror projects it, for `wsp-view`.
+fn row_of(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> wsp_store_contract::Row {
+    crate::mirror::rows(std::slice::from_ref(t), claims, &[], &Default::default())
+        .into_iter()
+        .find_map(|e| match e {
+            wsp_store_contract::Entity::Row(r) => Some(r),
+            _ => None,
+        })
+        .expect("a task projects to one row")
 }
 
 /// The verbs this module answers to, each with the help it carries. `main` and

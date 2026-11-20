@@ -1404,7 +1404,16 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
             reseat_failed(store, &scope, "the seat has somebody in it");
             return 1;
         }
-        return crate::cmd_spawn::reseat(store, &scope);
+        let code = crate::cmd_spawn::reseat(store, &scope);
+        // **Every way out without a seat is an outcome in `cycle.log`**
+        // (`wsp-151`). Some of the ways out of the spawn record why and some
+        // only print it to a stderr nobody reads, which left Linux lists at
+        // "seating a successor" with nothing after it. One record here, only
+        // where nothing more particular was written after the claim.
+        if code != 0 && !crate::governors::vacancy(&store.governors(), &scope).backed_off() {
+            reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` exited {code} with no seat opened"));
+        }
+        return code;
     }
     // After `--rotate` and `--reseat`, which take the same two flags as the
     // tier to start their successor on.

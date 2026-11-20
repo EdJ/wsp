@@ -34,6 +34,7 @@ use wsp_store::message::{About, Message, Party, Shape, State};
 use wsp_store::model::{self, Machine as MachineFile, Status, Task, TaskHead, Worklist, WorklistStatus};
 use wsp_store::store::{MachineLive, Store};
 use wsp_store_contract as c;
+use wsp_view::common::key;
 use wsp_store_contract::{
     AskId, AskKind, AskState, At, Command, Entity, GroupId, ListId, ListState, MachineName, Principal, ProjectId,
     RowId, RowState, SeatId, Subject, Token, Transport,
@@ -159,14 +160,20 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 
 /// Tasks → `Entity::Row`s. `fields` carry what `wip --json` shows of a task:
 /// `status` (the file's word), `prio`, `tags`, `caption`, `parent`, `after`,
-/// `refs`, `created`, `updated`. The seat is the claim's; the group is the
-/// list's placement. `before_block` and `commit` are not in the files (None).
+/// `refs`, `created`, `updated`; and what `ls` and `show` print beside it
+/// (wsp-305): `project`, the file's own (absent for an inbox row, whose
+/// `Row::project` is named after its id), and `caption_from`. The seat is the
+/// claim's; the group is the list's placement. `before_block` and `commit` are
+/// not in the files (None). `wsp_view::common` reads every key back, and its
+/// table is the contract.
 ///
 /// **And the record itself, verbatim** (wsp-076), so [`task_of`] rebuilds the
 /// `Task` `wip` reads with the store's own parser: `body` is the task file's
 /// text for every task `texts` holds (those [`wip_reads_in_full`]
 /// says `wip` opens), and `head` is the [`TaskHead`] as the store's index keeps
-/// it (`TaskHead::to_json`) for the rest, which `wip` reads bodiless.
+/// it (`TaskHead::to_json`) for the rest, which `wip` reads bodiless; beside
+/// `head`, `prose` is the task's body after its front matter (wsp-305), so `ls
+/// --all` and `show` read every row's legs, log and passes.
 ///
 /// A row at review that is finished (`wsp-105`: verified, not reverted, no
 /// held barrier still judging it) carries `attention` = `needs-you`,
@@ -191,7 +198,10 @@ pub fn rows(
             put(&mut f, "status", status.as_str());
             put(&mut f, "prio", model::Priority::parse(&t.priority_raw).unwrap_or(model::Priority::Normal).as_str());
             put(&mut f, "tags", &t.tags.join(","));
-            put(&mut f, "caption", &caption::of_task(t).text);
+            let cap = caption::of_task(t);
+            put(&mut f, "caption", &cap.text);
+            put(&mut f, key::CAPTION_FROM, cap.from);
+            put(&mut f, key::PROJECT, t.project.as_deref().unwrap_or(""));
             put(&mut f, "parent", t.parent.as_deref().unwrap_or(""));
             put(&mut f, "after", &t.after.join(","));
             put(&mut f, "refs", &t.refs.join(","));
@@ -220,6 +230,7 @@ pub fn rows(
                 }
                 None => {
                     f.insert(HEAD.into(), TaskHead::of(t).to_json().to_string());
+                    f.insert(key::PROSE.into(), t.body.clone());
                 }
             }
             Entity::Row(c::Row {
@@ -238,13 +249,13 @@ pub fn rows(
 }
 
 /// A row's `fields` key holding the task file's text.
-pub const BODY: &str = "body";
+pub const BODY: &str = key::BODY;
 /// A row's `fields` key holding the task's head, for a task `wip` reads bodiless.
-pub const HEAD: &str = "head";
+pub const HEAD: &str = key::HEAD;
 /// A row's `fields` key holding its `claims.json` record (JSON text), verbatim:
 /// an `Entity::Claim` keeps the seat alone, and `wip` joins the record's
 /// `agent_id` and `agent_kind` (wsp-076).
-pub const CLAIM: &str = "claim";
+pub const CLAIM: &str = key::CLAIM;
 
 /// The `claims.json` record a row carries, as `Store::claims` returns it.
 pub fn claim_of(row: &c::Row) -> Option<serde_json::Value> {
@@ -1217,6 +1228,33 @@ mod tests {
         let act: serde_json::Value = serde_json::from_str(&p["action"]).unwrap();
         assert_eq!((act["verb"].as_str(), &act["args"], act["sentence"].as_str()), (Some("answer"), &serde_json::json!(["m-p"]), Some("needed")));
         assert!(!fields("m-g").contains_key("action"), "not needs-you, so no action");
+    }
+
+    /// wsp-305: `wsp_view::common` reads off every row the record `Task::json`
+    /// prints and the body `show` prints, whichever way the row carries the
+    /// task (its file in `body`, or `head` and `prose`): an inbox row with no
+    /// project, a derived and an authored caption, tags, refs, `after` and a
+    /// parent, open and done.
+    #[test]
+    fn the_view_reads_back_each_tasks_record_and_body_off_its_row() {
+        let s = seed("mirror-view");
+        let mut t = Task::new("Inbox thing: with a clause", "inbox-001");
+        t.refs = vec!["docs/a.md".into(), "src/b.rs".into()];
+        t.after = vec!["wsp-1".into()];
+        t.parent = Some("wsp-2".into());
+        t.body = "\n## Overview\n\nprose\n".into();
+        s.save_task(&t).unwrap();
+        let mut done = s.task("wsp-5").unwrap();
+        done.body = "## Log\n\n- 2026-11-18T10:00:00Z → done\n".into();
+        s.save_task(&done).unwrap();
+        let es = read_rows_etc(&s, "here");
+        for files in s.tasks() {
+            let row = row_of(&es, &files.id);
+            assert_eq!(wsp_view::common::task_json(&row), files.json(), "{}", files.id);
+            assert_eq!(wsp_view::common::prose(&row), files.body, "{}", files.id);
+        }
+        assert!(row_of(&es, "wsp-5").fields.contains_key(key::PROSE), "a done row carries its prose beside its head");
+        assert_eq!(row_of(&es, "inbox-001").project.0, "inbox", "Row::project stays project_of");
     }
 
     #[test]

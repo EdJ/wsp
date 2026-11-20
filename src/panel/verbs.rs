@@ -1111,7 +1111,7 @@ pub(crate) struct Made {
 }
 
 pub(crate) fn run_wsp(argv: &[String]) -> Result<Made, String> {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "wsp".into());
+    let exe = wsp_base::util::self_exe().unwrap_or_else(|_| "wsp".into());
     let out = Command::new(exe)
         .args(argv)
         .arg("--json")

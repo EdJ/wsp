@@ -715,7 +715,7 @@ pub(crate) fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
 }
 
 pub fn compound_sup_binary() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
+    let exe_dir = wsp_base::util::self_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
     find_sup(
         std::env::var_os("COMPOUND_SUP"),
         std::env::var_os("PATH"),

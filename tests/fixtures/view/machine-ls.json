@@ -1,0 +1,1 @@
+{"machines":[{"added":"2026-11-18T11:06:40Z","agents":[],"arch":"","backend_at":"","exec_dir":"","lease":180,"link":"required","live":null,"name":"mb2","os":"","ssh":"mb2.local","status":"active","sup_at":""}],"seat":"golden-host","seat_agents":[],"seat_cap":null,"seat_working":[]}

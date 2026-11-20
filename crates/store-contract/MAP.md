@@ -72,7 +72,9 @@ none can say "this entity is now X"; `Command::Mirror { put: Vec<Entity>, gone: 
 
 - **`decide` for `mirror` is the server's mirror domain** (`mirror::Mirror`, wsp-073): each `put` drafts `mirror.put`
   (subject the entity's, a `Claim`'s `Claim(row)`; payload the `Entity`), each `gone` drafts `mirror.gone` (payload
-  `null`), and its `evolve` replaces or removes what they name. `src/store.rs`'s table lists both.
+  `null`), and its `evolve` replaces or removes what they name. A machine put that moves only its liveness (its
+  beat, `last_seen`, a beat's gauges) drafts `machine.beat` instead, payload the `Machine` (wsp-304), so a
+  subscriber that wakes on entity events is not woken by heartbeats. `src/store.rs`'s table lists both.
 - **A real domain refuses `mirror` as `illegal`.** `TestDomain` does (wsp-store-conformance), and so will
   `wsp-machines`: a domain that owns its entities is mirrored by nothing.
 - **The `fields` maps** on `Seat`, `List`, `Group` and `Ask` (as `Row` has) carry what today's files say and the typed

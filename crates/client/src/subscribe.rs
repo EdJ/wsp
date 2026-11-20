@@ -235,7 +235,7 @@ impl Feed {
     /// Dial and subscribe: `from` the last id, or `{}` at the first connection
     /// of a `subscribe(None)`, or again `{}` after `too_old`.
     fn connect(&mut self) {
-        let mut open = match dial::open(&self.target.state_dir, &self.target.by, self.target.wait) {
+        let mut open = match dial::open(&self.target) {
             Ok(o) => o,
             Err(s) => return self.failed(s.to_string()),
         };

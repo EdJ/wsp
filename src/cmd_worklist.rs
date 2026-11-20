@@ -2605,20 +2605,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
         // No collapse and no `--all` here: an abridgement is a thing done for
         // a reader, and a parser is not one.
         let waits = crate::waits::read(store, &listed);
-        let out: Vec<_> = listed
-            .iter()
-            .map(|l| {
-                let mut o = listed_json(store, l);
-                // A planned list says where it queues and what it waits on;
-                // the rest carry neither key (`wsp-383`).
-                if let Some(n) = waits.iter().position(|(id, _)| *id == l.list.id) {
-                    o["queue"] = json!(n + 1);
-                    o["may_start"] = json!(waits[n].1.is_none());
-                    o["waits"] = json!(waits[n].1.as_ref().map(|w| w.text()));
-                }
-                o
-            })
-            .collect();
+        let out = wsp_view::worklist::list_json(&listing_of(store, &listed, &waits));
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -2750,25 +2737,26 @@ fn count(n: usize) -> String {
     }
 }
 
-/// One row for a parser: the worklist object every other verb emits, and the
-/// five facts this reading adds to it.
-///
-/// `gone` and the position's `unwritten` have no column in the table — the
-/// `AT` mark says only that one of them is not empty — so this is where a
-/// caller that wants to know *which* group, or *which* member, reads it
-/// without running `show`.
-fn listed_json(store: &Store, l: &worklist::Listed) -> serde_json::Value {
-    let mut out = worklist_json_at(&l.list, &l.at, l.phase(store));
-    if let Some(o) = out.as_object_mut() {
-        o.insert("segment".into(), json!(l.segment.word()));
-        o.insert("open".into(), json!(l.open));
-        o.insert("gone".into(), json!(l.gone));
-        o.insert("unwritten".into(), json!(l.at.unwritten));
-        o.insert("activity".into(), json!(util::iso_at(l.activity)));
-        o.insert("prio".into(), json!(crate::waits::Prio::of(&l.list).word()));
-        o.insert("after".into(), json!(l.list.after));
-    }
-    out
+/// The rows of `worklist ls --json`, read: each list's head, the facts the
+/// listing adds, and the queue place of a planned one. `wsp-view` draws them.
+fn listing_of(store: &Store, listed: &[worklist::Listed], waits: &[(String, Option<crate::waits::Wait>)]) -> Vec<wsp_view::worklist::Listing> {
+    listed
+        .iter()
+        .map(|l| wsp_view::worklist::Listing {
+            head: head_of(&l.list, &l.at, l.phase(store)),
+            segment: l.segment.word().to_string(),
+            open: l.open,
+            gone: l.gone.clone(),
+            unwritten: l.at.unwritten.clone(),
+            activity: l.activity,
+            prio: crate::waits::Prio::of(&l.list).word().to_string(),
+            after: l.list.after.clone(),
+            queue: waits.iter().position(|(id, _)| *id == l.list.id).map(|n| wsp_view::worklist::Queue {
+                n: n + 1,
+                waits: waits[n].1.as_ref().map(|w| w.text()),
+            }),
+        })
+        .collect()
 }
 
 // ---- what a passed group left behind ----------------------------------
@@ -7623,22 +7611,38 @@ fn home_line(p: &Paint, id: &str, home: Option<&worklist::Home>) -> String {
 /// same groups is how a `--json` row comes to disagree with the table printed
 /// beside it, and it is the position that both of them are about.
 fn worklist_json_at(w: &Worklist, at: &Position, phase: worklist::Phase) -> serde_json::Value {
-    json!({
-        "id": w.id,
-        "title": w.title,
-        "caption": crate::caption::of_worklist(w).json(),
-        // wsp-382: the six words, with the stand-still reasons beside them.
-        // `stored` is the word on the record, for a reader who wants it.
-        "status": phase.status.word(),
-        "flags": phase.flags.json(),
-        "stored": w.status_raw.trim(),
-        "planned": w.planned,
-        "created": w.created,
-        "groups": at.of,
-        "at": at.at,
-        "outputs": crate::cmd_report::declared(w).iter().map(|o| json!({ "name": o.name, "kind": o.kind, "file": o.file(), "present": crate::cmd_report::dir(&w.id).join(o.file()).is_file() })).collect::<Vec<_>>(),
-        "outputs_dir": crate::cmd_report::dir(&w.id),
-    })
+    wsp_view::worklist::head_json(&head_of(w, at, phase))
+}
+
+/// What `wsp-view` draws a worklist's object from: the list, its position and
+/// phase, and which of its declared outputs are on disk.
+fn head_of(w: &Worklist, at: &Position, phase: worklist::Phase) -> wsp_view::worklist::Head {
+    let caption = crate::caption::of_worklist(w);
+    wsp_view::worklist::Head {
+        id: w.id.clone(),
+        title: w.title.clone(),
+        caption_text: caption.text.clone(),
+        caption_from: caption.from.to_string(),
+        status: phase.status.word().to_string(),
+        held: phase.flags.held,
+        waiting_on_ed: phase.flags.waiting_on_ed,
+        parked: phase.flags.parked,
+        stored: w.status_raw.trim().to_string(),
+        planned: w.planned.clone(),
+        created: w.created.clone(),
+        groups: at.of,
+        at: at.at,
+        outputs: crate::cmd_report::declared(w)
+            .iter()
+            .map(|o| wsp_view::worklist::Output {
+                name: o.name.clone(),
+                kind: o.kind.clone(),
+                file: o.file(),
+                present: crate::cmd_report::dir(&w.id).join(o.file()).is_file(),
+            })
+            .collect(),
+        outputs_dir: crate::cmd_report::dir(&w.id).display().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -11623,7 +11627,7 @@ mod tests {
         assert_eq!(v["worklist"]["flags"], json!({ "held": false, "waiting_on_ed": false, "parked": false }));
         assert_eq!(v["worklist"]["stored"], "running");
         let listed = worklist::listing(&store, store.worklists());
-        let l = listed_json(&store, &listed[0]);
+        let l = wsp_view::worklist::listed_json(&listing_of(&store, &listed, &[]).remove(0));
         assert_eq!(l["status"], "executing");
         assert!(l["flags"].is_object());
     }
