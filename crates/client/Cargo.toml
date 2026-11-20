@@ -1,0 +1,20 @@
+[package]
+name = "wsp-client"
+version = "0.1.0"
+edition = "2021"
+description = "The state core's client (docs/state-core.md section 6), step 1's part: dial and hello, request, and subscribe with reconnect, for the CLI and web-chrome"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Frames are lines of JSON, and `api.json` is read as one.
+serde_json = "1"
+wsp-api = { path = "../api" }
+wsp-store-contract = { path = "../store-contract" }
+
+[dev-dependencies]
+# The tests' loopback server and its in-memory store; never a normal dependency, so that
+# web-chrome links no more of wsp than the protocol (tests/layering.rs).
+wsp-server = { path = "../server" }
+wsp-store-conformance = { path = "../store-conformance" }

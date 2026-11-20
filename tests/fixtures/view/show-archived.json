@@ -1,0 +1,40 @@
+{
+  "after": [],
+  "archived": "<dir>/state/sandbox/wsp-golden/wsp/archive/tasks/2026-11/alpha-003.md",
+  "body": "",
+  "caption": {
+    "from": "title",
+    "text": "Gone row"
+  },
+  "claim": null,
+  "created": "2026-11-18T11:06:40Z",
+  "id": "alpha-003",
+  "legs": [],
+  "parent": null,
+  "pieces": [],
+  "priority": "normal",
+  "project": "alpha",
+  "raised": [],
+  "refs": [],
+  "stage": {
+    "at": "2026-11-18T11:06:40Z",
+    "from": "status",
+    "since": "2026-11-18T11:06:40Z",
+    "text": "Done",
+    "word": "done"
+  },
+  "stages": [
+    {
+      "at": "2026-11-18T11:06:40Z",
+      "word": "not started"
+    }
+  ],
+  "status": "done",
+  "tags": [
+    "old"
+  ],
+  "title": "Gone row",
+  "updated": "2026-11-18T11:06:40Z",
+  "verification": [],
+  "worked": null
+}

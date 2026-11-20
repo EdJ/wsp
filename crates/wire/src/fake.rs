@@ -2,23 +2,23 @@
 //!
 //! Not a multiplexer, and the name is the scope risk this file is written
 //! against: **no PTYs, no processes, no terminal**. It answers the protocol and
-//! holds a state. The moment it needs to host a shell it is herdr and we have
+//! holds a state. The moment it needs to host a shell it is backend and we have
 //! lost.
 //!
 //! # The argument is states, not speed
 //!
-//! A sandbox herdr comes up in 0.1s and `wsp verify` is seven seconds warm, so
-//! herdr is not what is slow. What a real herdr cannot do is *be in a state we
+//! A sandbox backend comes up in 0.1s and `wsp verify` is seven seconds warm, so
+//! backend is not what is slow. What a real backend cannot do is *be in a state we
 //! choose*, and every expensive bug in this store was a state: an empty pane
 //! list reaping every binding (robustness-015), one `pane.exited` cascade
 //! clearing every binding on the machine, a machine that stops answering
 //! mid-tick, a workspace id handed out again after a restart so a live pane
-//! answers to a dead pane's name, twenty-two workspaces and four agents. None of those can be manufactured on a live herdr, and all of them
+//! answers to a dead pane's name, twenty-two workspaces and four agents. None of those can be manufactured on a live backend, and all of them
 //! are two lines here.
 //!
 //! # The division of labour, and the trap it exists to avoid
 //!
-//! A fake encodes our *belief* about herdr, and a fake that is wrong about a
+//! A fake encodes our *belief* about backend, and a fake that is wrong about a
 //! behaviour makes tests green on a lie, silently and for ever. robustness-013's
 //! log carries a correction where two probes "verified" that a headless session
 //! loads no plugins and it was false — the redirect that made the probe safe
@@ -27,31 +27,31 @@
 //! - **the fake is for wsp's reaction to a state**;
 //! - **`wsp sandbox` stays the contract check against real behaviour**.
 //!
-//! And everything here asserting what herdr *does* was recorded from a live one
-//! rather than hand-written. herdr 0.7.5, in a sandbox session, 2026-08-17: the
+//! And everything here asserting what backend *does* was recorded from a live one
+//! rather than hand-written. backend 0.7.5, in a sandbox session, 2026-08-17: the
 //! id shapes, the reply envelopes, the four error codes, the split arithmetic,
 //! the subscription refusal and the fact that a pane with no agent reports
 //! `agent_status: "unknown"` and no `agent` field at all are all transcripts of
 //! that session, and each is marked *recorded* where it appears. Anything not
 //! marked that way is a decision of the fake's own, and is marked as one.
 //!
-//! # It speaks the ports' vocabulary and generates herdr's
+//! # It speaks the ports' vocabulary and generates backend's
 //!
 //! The state is [`Seat`], [`State`], [`Agent`] and [`Event`] — `place.rs`'s
-//! words — plus [`Rect`], which is `arrange.rs`'s. herdr's JSON is a *dialect*
+//! words — plus [`Rect`], which is `arrange.rs`'s. backend's JSON is a *dialect*
 //! computed from that state on the way out ([`of_state`]), never a canned reply
 //! hand-written into a test. Two things follow, and they are the reason the
 //! task asked for it this way round:
 //!
-//! - a wrong belief about herdr shows up as **one mapping function** that
-//!   `place_herdr::state_of_agent` documents the inverse of, rather than as a
+//! - a wrong belief about backend shows up as **one mapping function** that
+//!   `place_backend::state_of_agent` documents the inverse of, rather than as a
 //!   string in a fixture nobody re-reads;
-//! - a second backend that is not herdr is a second dialect over the same
+//! - a second backend that is not backend is a second dialect over the same
 //!   state, which is what the seam is for.
 //!
-//! `of_state` and `place_herdr::state_of_agent` are a round trip, and
+//! `of_state` and `place_backend::state_of_agent` are a round trip, and
 //! [`tests::the_dialect_is_the_inverse_of_the_readings_wsp_makes`] holds them
-//! to it — including the one place the trip is lossy, which is herdr's blind
+//! to it — including the one place the trip is lossy, which is backend's blind
 //! spot and not ours.
 //!
 //! # What it found on the first run, which is the argument for it
@@ -60,29 +60,29 @@
 //! the round trip failed immediately, and the failure was in the port rather
 //! than in the fake. Both were reported on robustness-024 rather than fixed here,
 //! and both were **repaired on 2026-08-17 by robustness-018**, which moved the
-//! reading into `place_herdr` as it migrated the first call site onto the port.
+//! reading into `place_backend` as it migrated the first call site onto the port.
 //! They are kept here because the fake is what caught them and what holds them
 //! shut:
 //!
-//! 1. **The port read a value herdr never sends.** It decided an agent was
+//! 1. **The port read a value backend never sends.** It decided an agent was
 //!    starting from `ready == Some(false)`. Recorded against a live Claude Code
 //!    on 2026-08-17: for 3.3 seconds after `agent.start`, `agent.get` answers
 //!    `agent_status: "idle"`, `launch_pending: true` and **no
 //!    `interactive_ready` field at all**; then the two swap. Absence is the
 //!    signal and `false` never appears. So the port mapped the launch window to
 //!    `Idle`, whose `will_take_a_prompt` says yes — the `agent_not_ready` bug
-//!    the port's own documentation exists to prevent. `place_herdr` now reads
+//!    the port's own documentation exists to prevent. `place_backend` now reads
 //!    `launch_pending`.
 //! 2. **The listing asymmetry is between panes and agents, not one and many.**
 //!    `pane.list` rows have no `interactive_ready` in the schema. `agent.list`
 //!    carries the same `AgentInfo` as `agent.get` and was recorded carrying
-//!    `interactive_ready: true`. wsp failed to see it because `herdr::Pane` did
+//!    `interactive_ready: true`. wsp failed to see it because `backend::Pane` did
 //!    not parse the field; it does now, and a census reads its seats from one
 //!    call and its states from the other.
 //!
 //! A third: `agent.start` returns *before* the agent exists — its reply names
 //! no agent and carries `launch_pending: true` — so `Place::start`'s "returns
-//! when the agent exists" is a promise its herdr adapter has to keep for it, and
+//! when the agent exists" is a promise its backend adapter has to keep for it, and
 //! does, by waiting.
 //!
 //! And a fourth, which is robustness-041 and which this fake **missed** until
@@ -98,8 +98,8 @@
 //! # Behind a socket, and what that costs
 //!
 //! It binds a unix socket and speaks newline-delimited JSON, so it exercises
-//! `herdr.rs`'s real wire code and works against an unmodified binary: point
-//! `HERDR_SOCKET_PATH` at it and the daemon, the panel and the storyboard all
+//! `backend.rs`'s real wire code and works against an unmodified binary: point
+//! `WSP_BACKEND_SOCKET_PATH` at it and the daemon, the panel and the storyboard all
 //! run against it unchanged. It therefore needs no trait and can land before
 //! robustness-018 rather than after.
 //!
@@ -114,14 +114,14 @@
 //!
 //! That question was answered for the *place-work* port while it had six verbs:
 //! all six reached the wire as six distinguishable methods, so migrating `spawn`
-//! onto it needed no double at all — `place_herdr`'s tests drive wsp's own client
+//! onto it needed no double at all — `place_backend`'s tests drive wsp's own client
 //! against this fake.
 //!
 //! `Place::stop` is the seventh and it ends that. It is `pane.close` on this
 //! backend and so is the arrange port's close, so **the two collide at the wire
 //! exactly as `run` and `send` do**: this file can record that a pane was taken
 //! away and cannot say whether the caller meant *end that agent's work* or *tidy
-//! that viewport*. Both collisions are the same shape — one herdr method, two
+//! that viewport*. Both collisions are the same shape — one backend method, two
 //! wsp verbs — and a test that has to tell them apart wants an in-process double
 //! rather than a socket.
 //!
@@ -131,7 +131,7 @@
 //!
 //! One row of the state is a [`Spot`]: the place-work half (seat, agent, state,
 //! session) and the arrange half (label, rect, and which screen it is on) in
-//! one record, because on herdr they are one pane. `arrange.rs` requires it —
+//! one record, because on backend they are one pane. `arrange.rs` requires it —
 //! *a `Seat` and a `Surface` naming the same physical pane must be the same
 //! string* — so the fake holds one id per spot and hands it out under both
 //! names.
@@ -147,7 +147,7 @@
 //!
 //! # Silence has two clocks
 //!
-//! [`Quiet`] is the state a real herdr cannot be put in on demand and the one
+//! [`Quiet`] is the state a real backend cannot be put in on demand and the one
 //! that has cost the most: **an absence is not a fact**. It has two forms
 //! deliberately, because they arrive at different times and the difference is
 //! where the bugs live — a hang-up arrives at once and looks like an answer to
@@ -172,7 +172,7 @@ use serde_json::{json, Value};
 use crate::place::Rect;
 use crate::place::{Agent, Event, Seat, Seated, State};
 
-/// What the fake was asked, in wsp's words rather than herdr's.
+/// What the fake was asked, in wsp's words rather than backend's.
 ///
 /// The recording is in port vocabulary on purpose. A test that asserts a JSON
 /// method name is a test that has to be rewritten when the backend changes,
@@ -181,7 +181,7 @@ use crate::place::{Agent, Event, Seat, Seated, State};
 /// and a test reads as a sentence about behaviour.
 ///
 /// The mapping is [`Verb::of_method`], and it is many-to-one in both
-/// directions: herdr answers a census with three different methods, and it
+/// directions: backend answers a census with three different methods, and it
 /// answers two different port verbs with one `pane.send_text`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verb {
@@ -226,7 +226,7 @@ pub enum Verb {
     /// Take a pane down. `pane.close`, `tab.close`, `workspace.close`.
     ///
     /// Both the arrange port's close and the place-work port's
-    /// [`crate::place::Place::stop`] arrive here, because on herdr they are the
+    /// [`crate::place::Place::stop`] arrive here, because on backend they are the
     /// same method; see the module docs on what a socket cannot see.
     Close,
     /// Read what is on a screen. `pane.read`.
@@ -261,11 +261,11 @@ impl Verb {
         }
     }
 
-    /// Which port verb a herdr method is, or `None` for one wsp has never
+    /// Which port verb a backend method is, or `None` for one wsp has never
     /// called.
     ///
     /// The table is the fake's whole surface, and it is short because wsp wraps
-    /// about a third of herdr's eighty-nine methods. A method absent from here
+    /// about a third of backend's eighty-nine methods. A method absent from here
     /// is answered with `unsupported_method` rather than something plausible —
     /// see [`Fake::answer`].
     pub fn of_method(method: &str) -> Option<Verb> {
@@ -334,13 +334,13 @@ pub enum Quiet {
 
 /// One seat, and where it is on a screen.
 ///
-/// Both ports' halves in one record, because on herdr they are one pane; see
+/// Both ports' halves in one record, because on backend they are one pane; see
 /// the module docs on the join neither port makes.
 #[derive(Debug, Clone, Default)]
 pub struct Spot {
     /// The durable handle, and also the surface. Opaque: nothing here parses
     /// it, and [`tests::a_seat_the_fake_did_not_invent_is_still_a_seat`] holds
-    /// that to ids no herdr would ever issue.
+    /// that to ids no backend would ever issue.
     pub seat: Seat,
     /// What a person reading a list of seats has to go on.
     pub label: String,
@@ -350,22 +350,22 @@ pub struct Spot {
     /// The agent's own session id, where the backend knows one — Claude Code's,
     /// which is what ties a seat to the transcript a TTY-less agent leaves.
     pub session: String,
-    /// Which screen this seat is on. herdr's workspace; `arrange::Live` has no
+    /// Which screen this seat is on. backend's workspace; `arrange::Live` has no
     /// word for it and `place::Seated` has no field for it.
     pub space: String,
     /// Which tab within that screen. `arrange::Live::tab`.
     pub tab: String,
     pub rect: Rect,
-    /// Metadata pushed at this seat. Kept because a real herdr echoes it back
+    /// Metadata pushed at this seat. Kept because a real backend echoes it back
     /// in `pane.list` (recorded), and because a test asserting wsp has *stopped*
     /// pushing tokens needs somewhere for them to fail to arrive.
     pub tokens: BTreeMap<String, String>,
     /// Whether a person started this agent by typing at the pane, rather than
-    /// herdr starting it.
+    /// backend starting it.
     ///
     /// **The distinction the fake did not have, and worklist-010 lived in the
-    /// gap.** `interactive_ready` is herdr's `managed_agent_interactive_ready`
-    /// (`app/agents.rs:390`) — true only for an agent herdr launched itself, and
+    /// gap.** `interactive_ready` is backend's `managed_agent_interactive_ready`
+    /// (`app/agents.rs:390`) — true only for an agent backend launched itself, and
     /// `skip_serializing_if = "is_false"` for everything else, so an agent
     /// somebody started by hand carries no readiness at any status. Every
     /// recording behind [`of_state`] was made against an agent `wsp spawn` had
@@ -413,7 +413,7 @@ impl Spot {
     pub fn agent(seat: &str, kind: &str, name: &str, state: State) -> Spot {
         Spot {
             seat: Seat::new(seat),
-            agent: Agent { kind: kind.into(), name: name.into(), args: Vec::new() },
+            agent: Agent { kind: kind.into(), name: name.into(), args: Vec::new(), key: None },
             state,
             ..Spot::default()
         }
@@ -440,7 +440,7 @@ impl Spot {
         self.session = id.into();
         self
     }
-    /// This agent was started by a person, not by herdr — see
+    /// This agent was started by a person, not by backend — see
     /// [`Spot::hand_started`].
     pub fn by_hand(mut self) -> Spot {
         self.hand_started = true;
@@ -472,15 +472,15 @@ pub struct Stage {
     /// Whether an agent that has just been started reaches [`State::Idle`] by
     /// itself.
     ///
-    /// `true` is herdr's happy path and the default, so `wsp spawn` against a
+    /// `true` is backend's happy path and the default, so `wsp spawn` against a
     /// fake completes. `false` leaves every started agent in
     /// [`State::Starting`] until something says otherwise, which is the window
-    /// `agent.prompt` refuses in and the one a real herdr passes through in
+    /// `agent.prompt` refuses in and the one a real backend passes through in
     /// half a second whether you wanted it to or not.
     pub settle: bool,
     /// Whether a prompt the agent accepts actually starts a turn.
     ///
-    /// `true` is herdr's happy path and the default. `false` is
+    /// `true` is backend's happy path and the default. `false` is
     /// robustness-035: `agent.prompt` answers `ok`, the sentence sits in the
     /// composer unsent and the agent stays [`State::Idle`] — which is what
     /// `wsp spawn` reported as a success for a night, and what nothing could
@@ -491,8 +491,8 @@ pub struct Stage {
     /// after `agent.start`, before detection catches up.
     ///
     /// The window this fake used to skip, and skipping it is what let
-    /// robustness-041 live in `place_herdr::start` for as long as it did. Recorded
-    /// against herdr 0.7.5 in a sandbox on 2026-08-17, polling `agent.get` every
+    /// robustness-041 live in `place_backend::start` for as long as it did. Recorded
+    /// against backend 0.7.5 in a sandbox on 2026-08-17, polling `agent.get` every
     /// 150ms from the moment `agent.start` was sent: at 70ms and at 210ms the
     /// reply is a record carrying `launch_pending: true`, `agent_status:
     /// "unknown"` and the name wsp asked for, with **no `agent` field at all**;
@@ -520,7 +520,7 @@ pub struct Stage {
     /// Keyed on the port verb rather than the method, so a test says "this
     /// backend will not take a prompt" rather than naming `agent.prompt`.
     pub refuse: BTreeMap<Verb, Snub>,
-    /// Where the next invented workspace id comes from. herdr numbers
+    /// Where the next invented workspace id comes from. backend numbers
     /// workspaces from one and panes within a workspace from one (recorded), and
     /// the fake does the same so that ids in a sandbox read the way ids read
     /// everywhere else.
@@ -528,13 +528,13 @@ pub struct Stage {
     /// The next pane number for each space, which is **not** derivable from the
     /// spots present and was for a while.
     ///
-    /// Recorded 2026-08-19 against herdr 0.8.0 in a sandbox (`robustness-084`):
+    /// Recorded 2026-08-19 against backend 0.8.0 in a sandbox (`robustness-084`):
     /// `next_public_pane_number` is persisted per workspace, only advances, and
     /// is asserted greater than every live pane on load. Split `w1` twice, close
     /// both, restart, split — the pane is `w1:p4`. The fake used to count the
     /// spots in the space and add one, which reissues `p2` the moment `p2`
     /// closes and, with `p3` still live, hands out an id that is already taken.
-    /// A fake that reissues what herdr will not is a test passing on a state
+    /// A fake that reissues what backend will not is a test passing on a state
     /// that cannot happen, which is the one thing this file must not do.
     next_pane: BTreeMap<String, u32>,
 }
@@ -551,7 +551,7 @@ pub enum Snub {
     /// The agent is not in a state to be told anything. `agent_not_ready`.
     NotReady,
     /// The seat is not ready to have an agent started in it. `agent_pane_busy`
-    /// — the shell race `place_herdr::launch` retries for five seconds.
+    /// — the shell race `place_backend::launch` retries for five seconds.
     Busy,
     /// The backend said no, in its own words.
     Backend(String),
@@ -578,7 +578,7 @@ impl Default for Stage {
 /// The pane number in a seat this fake minted, or `None` for a seat it did not.
 ///
 /// The one place the fake parses an id it made, and only to keep its own counter
-/// where herdr keeps its own — see [`Stage::next_pane`]. Everything else treats a
+/// where backend keeps its own — see [`Stage::next_pane`]. Everything else treats a
 /// seat as opaque, which is the rule `place::Seat` states and this does not bend.
 fn pane_number(space: &str, seat: &str) -> Option<u32> {
     seat.strip_prefix(space)?.strip_prefix(":p")?.parse().ok()
@@ -619,7 +619,7 @@ impl Stage {
                 *n += 1;
             }
             // A caller that named its own seat moves the counter past it, which
-            // is herdr's own `register_new_pane_with_number` (`workspace.rs:1259`
+            // is backend's own `register_new_pane_with_number` (`workspace.rs:1259`
             // takes `max(next, number + 1)`). Only its own shape is read: a seat
             // is opaque and a caller may name one anything, so anything else
             // leaves the counter alone rather than guessing at it.
@@ -698,15 +698,15 @@ impl Stage {
 }
 
 // ---------------------------------------------------------------------------
-// The dialect: herdr's words, computed from the state
+// The dialect: backend's words, computed from the state
 // ---------------------------------------------------------------------------
 
-/// The reading a herdr would give of a seat: what it calls the agent, its
+/// The reading a backend would give of a seat: what it calls the agent, its
 /// status, and whether it will take a prompt.
 ///
-/// The inverse of [`crate::place_herdr::state_of_agent`], and the one function in this file that
-/// is a *claim about herdr* rather than a translation. Every line of it was
-/// recorded from herdr 0.7.5 on 2026-08-17 except where marked:
+/// The inverse of `place_backend::state_of_agent` (deleted), and the one function in this file that
+/// is a *claim about backend* rather than a translation. Every line of it was
+/// recorded from backend 0.7.5 on 2026-08-17 except where marked:
 ///
 /// - a pane with no agent reports `agent_status: "unknown"` and carries **no
 ///   `agent` field at all** — not `"idle"`, which is what a reader of the
@@ -717,23 +717,23 @@ impl Stage {
 ///   `interactive_ready` **absent** — never `false`. Recorded across the whole
 ///   launch window of a real Claude Code, which took 3.3 seconds of looking
 ///   exactly like an idle agent;
-/// - `Gone` has no reading of its own. herdr cannot distinguish an exited
+/// - `Gone` has no reading of its own. backend cannot distinguish an exited
 ///   agent's pane from a shell, so this answers exactly what `Empty` answers,
 ///   and the loss is pinned in a test rather than smoothed over;
-/// - `Blocked` is `agent_status: "blocked"`, read off herdr 0.8.0's schema
+/// - `Blocked` is `agent_status: "blocked"`, read off backend 0.8.0's schema
 ///   (`api/schema/common.rs:151`) rather than off a running one, and marked as
 ///   such because that is a weaker claim than the lines above it.
 ///
-/// **`done` has no `Spot` and deliberately never will.** herdr sends it, and it
+/// **`done` has no `Spot` and deliberately never will.** backend sends it, and it
 /// is `idle` with a flag saying no human has looked at the pane since
 /// (`app/api_helpers.rs:104`) — a fact about a viewer's window, not about an
-/// agent. The adapter reads it as `Idle` (`place_herdr::of_status`), so a state
+/// agent. The adapter reads it as `Idle` (`place_backend::of_status`), so a state
 /// here that produced it would be a state wsp cannot round-trip, and this
 /// function's whole value is that it is an exact inverse.
 ///
 /// The `Starting` line is the one that cost something to get right, and it is
 /// why this function returns `Option<bool>` rather than `bool`: absence and
-/// `false` are different readings, herdr only ever sends the first, and the
+/// `false` are different readings, backend only ever sends the first, and the
 /// port was written against the second until this caught it. See
 /// [`tests::the_dialect_is_the_inverse_of_the_readings_wsp_makes`].
 fn of_state(spot: &Spot) -> (Option<&str>, &'static str, Option<bool>) {
@@ -741,9 +741,9 @@ fn of_state(spot: &Spot) -> (Option<&str>, &'static str, Option<bool>) {
         "" => None,
         kind => Some(kind),
     };
-    // An agent herdr did not start carries no readiness at all, whatever it is
+    // An agent backend did not start carries no readiness at all, whatever it is
     // doing — [`Spot::hand_started`] has the recording and the bug. The status
-    // word is unaffected: herdr scrapes that off the screen and reports it for
+    // word is unaffected: backend scrapes that off the screen and reports it for
     // every agent it can see.
     let ready = |r: Option<bool>| match spot.hand_started {
         true => None,
@@ -784,13 +784,13 @@ fn pane_json(spot: &Spot) -> Value {
     if !spot.label.is_empty() {
         v["label"] = json!(spot.label);
     }
-    // The shape a session arrives in, which is what `herdr::parse_pane` digs
+    // The shape a session arrives in, which is what `backend::parse_pane` digs
     // `session_id` out of — and **only while there is an agent to have one**.
     //
-    // Recorded 2026-08-17 in a sandbox session, herdr 0.7.5: a Claude Code was
-    // spawned into `w1:p1`, herdr reported `agent_session.value`, the process
+    // Recorded 2026-08-17 in a sandbox session, backend 0.7.5: a Claude Code was
+    // spawned into `w1:p1`, backend reported `agent_session.value`, the process
     // was killed, and the very next `pane.list` gave `agent_status: "unknown"`
-    // with no `agent` and no `agent_session` at all. herdr's own
+    // with no `agent` and no `agent_session` at all. backend's own
     // `session.json` had dropped the key too, so it does not come back after a
     // restart either — the persistence is of a *live* agent's session and not
     // of the fact that a session once ran there.
@@ -810,7 +810,7 @@ fn pane_json(spot: &Spot) -> Value {
 
 /// One agent, as `agent.get` and `agent.list` render it.
 ///
-/// The difference from a pane is `interactive_ready`, which lives on herdr's
+/// The difference from a pane is `interactive_ready`, which lives on backend's
 /// `AgentInfo` and on nothing else — a `pane.list` row has no such field in the
 /// schema and never carries one. So the reading that can tell starting from
 /// idle is available from *either* agent call and from neither pane call, which
@@ -821,19 +821,19 @@ fn pane_json(spot: &Spot) -> Value {
 /// while the agent comes up, then `interactive_ready: true` with no
 /// `launch_pending` once it will take a prompt. Neither is ever sent false, and
 /// that asymmetry is load-bearing, and reading it wrong is what
-/// `place_herdr::state_of_agent` was repaired to stop doing.
-/// The same agent, in the first reading after `agent.start` — before herdr can
+/// `place_backend::state_of_agent` was repaired to stop doing.
+/// The same agent, in the first reading after `agent.start` — before backend can
 /// say what is in the pane.
 ///
 /// A transcript, and the shape is the whole point: the record *exists*, so a
 /// caller waiting for one is satisfied by it, and it names nothing, so the same
 /// caller reading its state is told the seat is empty. See [`Stage::unnamed`]
-/// for the recording and `place_herdr::start` for what that cost.
+/// for the recording and `place_backend::start` for what that cost.
 fn launching_json(spot: &Spot) -> Value {
     let mut v = pane_json(spot);
     if let Some(o) = v.as_object_mut() {
-        // Absent rather than empty, because that is what herdr sends and
-        // because `herdr::parse_pane` reading a missing field as `""` is
+        // Absent rather than empty, because that is what backend sends and
+        // because `backend::parse_pane` reading a missing field as `""` is
         // precisely the step that turns this into an empty seat.
         o.remove("agent");
         o.remove("agent_session");
@@ -849,7 +849,7 @@ fn launching_json(spot: &Spot) -> Value {
 fn agent_json(spot: &Spot) -> Value {
     let (agent, status, ready) = of_state(spot);
     let mut v = pane_json(spot);
-    // **`agent.list` carries no label.** Measured against the live herdr 0.7.5
+    // **`agent.list` carries no label.** Measured against the live backend 0.7.5
     // on 2026-08-25: its two listings differ by exactly `label` and `scroll`,
     // both of which only `pane.list` has. Building this on `pane_json` handed
     // out a field the real backend does not send, and a census reading its rows
@@ -884,7 +884,7 @@ fn space_json(stage: &Stage, space: &str) -> Value {
         t
     };
     // A workspace's own label is whatever `workspace.rename` last said, and the
-    // fake keeps it on the seat that is its root pane — herdr keeps it on the
+    // fake keeps it on the seat that is its root pane — backend keeps it on the
     // workspace, and nothing in wsp reads one back except through
     // `workspace.list`, so this is the cheapest place it can live.
     let label = spots.first().map(|s| s.label.clone()).unwrap_or_default();
@@ -929,7 +929,7 @@ fn rect_json(r: &Rect) -> Value {
 /// `splits` is empty and that is a decision rather than an oversight: a real
 /// reply carries the split tree, wsp reads `panes[].rect` and nothing else
 /// (`panel/install.rs:103`, `detail/run.rs:433`, `detail/editors.rs:342`), and
-/// inventing a tree would be the fake asserting something about herdr that
+/// inventing a tree would be the fake asserting something about backend that
 /// nobody has checked. Empty is visibly empty; a plausible tree is not.
 fn layout_json(stage: &Stage, tab: &str) -> Value {
     let spots: Vec<&Spot> = stage.spots.iter().filter(|s| s.tab == tab).collect();
@@ -951,15 +951,15 @@ fn layout_json(stage: &Stage, tab: &str) -> Value {
     })
 }
 
-/// A port event, in the words herdr's stream uses.
+/// A port event, in the words backend's stream uses.
 ///
 /// The stream names events with underscores where a subscription uses dots, and
 /// the mapping is not one-to-one in either direction:
 ///
-/// - an agent *starting* is `pane_agent_detected`, which herdr also raises when
+/// - an agent *starting* is `pane_agent_detected`, which backend also raises when
 ///   the agent goes away (`released`), so [`Event::Stopped`] is the same event
 ///   with the agent taken out of it;
-/// - a state *change* is `pane_updated`, the noisiest thing herdr sends and the
+/// - a state *change* is `pane_updated`, the noisiest thing backend sends and the
 ///   only global carrier of a status change — the panel's `CHATTY` list exists
 ///   because of it;
 /// - `pane_exited` is the pane's process ending rather than the agent's, so
@@ -1029,7 +1029,7 @@ fn event_json(stage: &Stage, event: &Event) -> Vec<(String, Value)> {
     }
 }
 
-/// The subscription types herdr scopes to a single pane.
+/// The subscription types backend scopes to a single pane.
 ///
 /// Recorded, and it is the fact that cost the panel its whole event feed once:
 /// naming one of these without a `pane_id` refuses **the entire list** with
@@ -1038,7 +1038,7 @@ fn event_json(stage: &Stage, event: &Event) -> Vec<(String, Value)> {
 /// `daemon::EVENTS` look arbitrary to whoever reads it next.
 const PER_PANE: &[&str] = &["pane.agent_status_changed", "pane.output_matched", "pane.scroll_changed"];
 
-/// Every subscription type a real herdr accepts. Recorded from its own refusal
+/// Every subscription type a real backend accepts. Recorded from its own refusal
 /// message, which lists them.
 const EVENT_TYPES: &[&str] = &[
     "workspace.created", "workspace.updated", "workspace.metadata_updated", "workspace.renamed",
@@ -1083,7 +1083,7 @@ struct Watcher {
     tx: Sender<Value>,
 }
 
-/// A herdr that is not herdr, on a socket of its own.
+/// A backend that is not backend, on a socket of its own.
 ///
 /// Dropping it stops the server and removes the socket file, because a unix
 /// socket outlives the process that bound it and the second fake on a path
@@ -1159,7 +1159,7 @@ impl Fake {
     /// Says out loud what it is doing to a process-wide variable, because the
     /// caller has to hold whatever lock the rest of the suite uses for it.
     pub fn socket_env(&self) -> (&'static str, String) {
-        ("HERDR_SOCKET_PATH", self.path.display().to_string())
+        ("WSP_BACKEND_SOCKET_PATH", self.path.display().to_string())
     }
 
     fn with_stage<T>(&self, f: impl FnOnce(&mut Stage) -> T) -> T {
@@ -1381,7 +1381,7 @@ fn watch(inner: &Arc<Inner>, out: &mut UnixStream, id: &Value, params: &Value) {
     if let Some(message) = subscription_error(&subs) {
         // One error reply and then the server hangs up — recorded, and the
         // behaviour that made a refused subscription indistinguishable from a
-        // clean close until `herdr::subscribe_on` learned to read it.
+        // clean close until `backend::subscribe_on` learned to read it.
         let reply = json!({ "id": "", "error": { "code": "invalid_request", "message": message } });
         let _ = out.write_all(format!("{reply}\n").as_bytes());
         let _ = out.flush();
@@ -1415,11 +1415,11 @@ fn watch(inner: &Arc<Inner>, out: &mut UnixStream, id: &Value, params: &Value) {
     }
 }
 
-/// The error codes a real herdr answers with, recorded rather than invented.
+/// The error codes a real backend answers with, recorded rather than invented.
 ///
-/// Anything the fake refuses for a reason herdr has never had is
+/// Anything the fake refuses for a reason backend has never had is
 /// [`OUR_OWN`], and says so in the message — because a fake that invents a
-/// herdr error code teaches a caller to match on a string no server will ever
+/// backend error code teaches a caller to match on a string no server will ever
 /// send.
 const NO_PANE: &str = "pane_not_found";
 const NO_AGENT: &str = "agent_not_found";
@@ -1440,7 +1440,7 @@ fn no_pane(id: &str) -> (String, String) {
 /// whole design. The verb table in [`Verb::of_method`] is what decides whether
 /// a method is answered at all — an unknown one is refused rather than given
 /// something plausible, because a fake that quietly answers a method wsp has
-/// never called is a fake that will go on answering it after herdr stops.
+/// never called is a fake that will go on answering it after backend stops.
 fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
     let sget = |key: &str| params.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -1507,6 +1507,7 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             spot.agent = Agent {
                 kind,
                 name: sget("name"),
+                key: None,
                 args: params
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -1530,7 +1531,7 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             // named** — the name appears about three tenths of a second later.
             // So `Place::start`'s "returns when the agent exists" is not what
             // this backend does, and an adapter owes that wait to its caller.
-            // Nothing in wsp reads this reply (`place_herdr::launch` matches on
+            // Nothing in wsp reads this reply (`place_backend::launch` matches on
             // `Ok(_)`); the adapter waits for the agent instead.
             let mut agent = agent_json(&before);
             agent["launch_pending"] = json!(true);
@@ -1553,17 +1554,17 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             if spot.agent.kind.is_empty() {
                 return Err((NO_AGENT.into(), format!("agent target {seat} not found")));
             }
-            // The one guard that is the port's rather than herdr's wording:
+            // The one guard that is the port's rather than backend's wording:
             // `will_take_a_prompt` is `place::State`'s single answer to the
             // question every `state == "idle"` caller is actually asking.
             //
-            // `Working` is let through, and that is herdr's behaviour rather
+            // `Working` is let through, and that is backend's behaviour rather
             // than a convenience. A real `agent.prompt` has no idle guard at all
             // — it refuses a launch window and an unknown agent and nothing else
             // — so a sentence addressed to an agent in the middle of a turn is
             // accepted and queued behind it. That is not a corner: it is the
             // whole of `wsp govern --tell`, which the fake could not reach while
-            // it modelled a guard herdr does not have.
+            // it modelled a guard backend does not have.
             let busy = spot.state == State::Working;
             if !busy && !spot.state.will_take_a_prompt() {
                 return Err((
@@ -1583,7 +1584,7 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
                 }
                 events.push(Event::Moved(seat.clone(), State::Working));
             }
-            // `wait` is a caller asking herdr to hold the reply until the status
+            // `wait` is a caller asking backend to hold the reply until the status
             // moves, and modelling it is modelling its two failures rather than
             // its duration — the fake answers in outcomes, and a test that slept
             // for eight seconds to prove a point would be measuring the machine.
@@ -1592,7 +1593,7 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
             // robustness-035 arriving as an answer instead of as a silence.
             // Delivered to an agent that was *already* working is the trap: the
             // status cannot change because it is already what it would change
-            // to, so herdr waits out the whole timeout and calls it a timeout —
+            // to, so backend waits out the whole timeout and calls it a timeout —
             // a plain failure reported for a sentence that arrived perfectly.
             // A caller that sends the field to a busy agent gets this, and the
             // fake's job is to make that a test failure rather than a night.
@@ -1926,7 +1927,7 @@ fn answer(inner: &Arc<Inner>, method: &str, params: &Value) -> Answer {
 
 /// The seat a call is about, from whichever id it is addressed by.
 ///
-/// The same keys `herdr::route` reads, and for a related reason: the id is what
+/// The same keys `backend::route` reads, and for a related reason: the id is what
 /// a call is *about*, so a recording keyed on anything else would lose which
 /// seat a test was watching.
 fn pick_seat(params: &Value) -> Option<Seat> {
@@ -2016,7 +2017,7 @@ pub fn stage_from_json(v: &Value) -> Stage {
             seat: Seat::new(text("seat")),
             label: text("label"),
             cwd: text("cwd"),
-            agent: Agent { kind, name: text("name"), args: Vec::new() },
+            agent: Agent { kind, name: text("name"), args: Vec::new(), key: None },
             state,
             session: text("session"),
             space: text("space"),
@@ -2099,7 +2100,6 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr;
     use crate::util;
 
 
@@ -2108,7 +2108,7 @@ mod tests {
     /// it is only ever paid by a test that is already failing.
     const DELIVERY: Duration = Duration::from_secs(10);
 
-    /// Recorded against herdr 0.8.0, 2026-08-19: a pane number is never handed
+    /// Recorded against backend 0.8.0, 2026-08-19: a pane number is never handed
     /// out twice inside a workspace, whatever has closed since. The fake counted
     /// live spots instead, which reissues an id the moment the pane below it
     /// closes — and with a higher pane still open, hands out one already taken.
@@ -2121,7 +2121,7 @@ mod tests {
         assert_eq!(
             [one.as_str(), two.as_str(), three.as_str()],
             ["w1:p1", "w1:p2", "w1:p3"],
-            "the fake stopped numbering panes the way herdr does"
+            "the fake stopped numbering panes the way backend does"
         );
 
         stage.spots.retain(|s| s.seat != two);
@@ -2136,7 +2136,7 @@ mod tests {
     }
 
     /// A stage that names its own seats has to leave the counter somewhere the
-    /// next invented id cannot collide with, which is herdr's rule at restore.
+    /// next invented id cannot collide with, which is backend's rule at restore.
     #[test]
     fn a_named_seat_moves_the_counter_past_itself() {
         let mut stage = Stage::of(vec![Spot::empty("w1:p7").on("w1", "w1:t1")]);
@@ -2165,7 +2165,7 @@ mod tests {
     #[test]
     fn a_caller_that_takes_its_time_asking_is_still_answered() {
         let dir = scratch("slow");
-        let fake = Fake::bind(dir.join("herdr.sock"), Stage::new()).unwrap();
+        let fake = Fake::bind(dir.join("backend.sock"), Stage::new()).unwrap();
         let mut s = UnixStream::connect(fake.path()).unwrap();
         s.set_read_timeout(Some(DELIVERY)).unwrap();
         std::thread::sleep(Duration::from_millis(50));
@@ -2199,187 +2199,17 @@ mod tests {
         }
     }
 
-    /// The dialect and the readings wsp makes of herdr are one mapping seen
-    /// from two sides, so a wrong belief about herdr can only be wrong in one
-    /// place. This is that assertion — and it is where the fake earned its
-    /// keep, because it failed the first time it was run.
-    ///
-    /// **Two states do not survive the trip, and only one of them is herdr's
-    /// fault.**
-    ///
-    /// `Gone` is the known one. herdr cannot tell an exited agent's pane from a
-    /// shell somebody opened, so it comes back as `Empty`; `place.rs` says the
-    /// adapter answers `Empty` from a census and `Gone` from the event stream,
-    /// and this is what forces that to stay true.
-    ///
-    /// `Starting` is the finding, and it is worth reading twice. The port
-    /// decided an agent was starting from `ready == Some(false)` — and **herdr
-    /// never sends `false`**. Recorded against a live Claude Code on 2026-08-17:
-    /// for 3.3 seconds after `agent.start`, `agent.get` answers
-    /// `agent_status: "idle"` with `launch_pending: true` and *no*
-    /// `interactive_ready` field at all, and then the fields swap —
-    /// `interactive_ready: true`, no `launch_pending`. Absence is the signal, in
-    /// both directions.
-    ///
-    /// So the port's own translation mapped the launch window to
-    /// [`State::Idle`], whose `will_take_a_prompt` says yes, which is exactly
-    /// the bug `place.rs` names three paragraphs above the function that had it:
-    /// the work order goes into a pane still drawing its banner.
-    ///
-    /// The fake keeps herdr's answer rather than the convenient one. That is
-    /// the whole discipline: a fake that sent `Some(false)` would make this
-    /// test pass, the port look right, and the bug arrive in production.
-    ///
-    /// **Repaired 2026-08-17 by robustness-018**, which is what this assertion
-    /// asked for in as many words: the reading moved out of `place.rs` and into
-    /// the herdr adapter, where it takes a parsed reply instead of three loose
-    /// arguments — so `Starting` now survives the trip, and there is no longer a
-    /// way to hand it a shape herdr does not send.
-    #[test]
-    fn the_dialect_is_the_inverse_of_the_readings_wsp_makes() {
-        let read = |spot: &Spot| crate::place_herdr::state_of_agent(&herdr::parse_pane(&agent_json(spot)));
-
-        for state in
-            [State::Empty, State::Starting, State::Idle, State::Working, State::Blocked, State::Unknown]
-        {
-            let spot = Spot::agent("s1", "claude", "t-1", state);
-            assert_eq!(
-                read(&spot),
-                state,
-                "{state:?} does not survive the round trip through herdr's words"
-            );
-        }
-
-        let gone = Spot::agent("s1", "claude", "t-1", State::Gone);
-        assert_eq!(
-            read(&gone),
-            State::Empty,
-            "herdr's blind spot has been quietly fixed by the fake, which makes tests green on a lie"
-        );
-
-        // The launch window is the one that mattered, and the absence is still
-        // the only thing marking it: nothing here was made to send a readiness
-        // herdr does not send.
-        let starting = Spot::agent("s1", "claude", "t-1", State::Starting);
-        assert_eq!(of_state(&starting).2, None, "herdr was made to send a readiness it does not send");
-        assert!(!read(&starting).will_take_a_prompt(), "the port would tell a caller to prompt a banner");
-    }
-
-    /// The reading this fake could not produce until worklist-010, and the one
-    /// every seat in the store answers with.
-    ///
-    /// `interactive_ready` is `managed_agent_interactive_ready`
-    /// (`app/agents.rs:390`): true only for an agent herdr launched itself, and
-    /// `skip_serializing_if = "is_false"`, so for an agent a person started it
-    /// is absent at every status rather than `false`. Recorded 2026-08-19 from
-    /// one `agent.list` on this machine: `w1:p6`, the `wsp` seat, `agent_status:
-    /// "working"` with no `interactive_ready` and no `name`; `w3R:p1`, spawned
-    /// by wsp, working, with both.
-    ///
-    /// The dialect claimed the second reading for every agent because every
-    /// recording behind it was taken from one wsp had spawned — so a fake full
-    /// of managed agents was the whole population under test, and the verb that
-    /// only misbehaves against seats had a green suite over it.
-    #[test]
-    fn an_agent_a_person_started_carries_no_readiness_at_any_status() {
-        for state in [State::Idle, State::Working, State::Blocked] {
-            let by_hand = Spot::agent("w1:p6", "claude", "", state).by_hand();
-            let seen = agent_json(&by_hand);
-            assert_eq!(seen.get("interactive_ready"), None, "{state:?} was given a readiness flag");
-            assert_eq!(seen.get("launch_pending"), None, "{state:?} is not a launch window either");
-            assert_eq!(
-                of_state(&by_hand).1,
-                of_state(&Spot::agent("w1:p6", "claude", "", state)).1,
-                "the status word is scraped off the screen and does not depend on who started it",
-            );
-
-            // Which wsp reads two ways, and the difference is worklist-010:
-            // readiness-qualified it is not knowable, and as a plain status word
-            // it is exactly what herdr said.
-            let pane = herdr::parse_pane(&seen);
-            assert_eq!(crate::place_herdr::state_of_agent(&pane), State::Unknown);
-            assert_eq!(crate::place_herdr::state_of_pane(&pane), state);
-        }
-    }
-
-    /// `done` is the one status in herdr's vocabulary with no `Spot`, and the
-    /// asymmetry is deliberate rather than missing — so it is asserted here
-    /// instead of being left to be discovered as a hole.
-    ///
-    /// herdr sends it for an agent that went idle while nobody was looking
-    /// (`app/api_helpers.rs:104`), which makes it a fact about a viewer's
-    /// window rather than about an agent. The adapter reads it as `Idle`, so it
-    /// cannot round-trip, and a fake that gave it its own state would be
-    /// offering wsp a distinction wsp has decided not to have.
-    #[test]
-    fn done_is_a_word_herdr_uses_for_idle_and_the_fake_never_sends_it() {
-        let done = herdr::parse_pane(&json!({
-            "pane_id": "s1", "agent": "claude", "agent_status": "done", "interactive_ready": true,
-        }));
-        assert_eq!(crate::place_herdr::state_of_agent(&done), State::Idle);
-        assert!(
-            crate::place_herdr::state_of_agent(&done).will_take_a_prompt(),
-            "read as Unknown this agent was unreachable, and four of twelve on this machine were it"
-        );
-
-        for state in [State::Idle, State::Working, State::Blocked, State::Starting] {
-            let spot = Spot::agent("s1", "claude", "t-1", state);
-            assert_ne!(of_state(&spot).1, "done", "{state:?} was given herdr's viewer flag");
-        }
-    }
-
-    /// The launch window is something [`Stage::unnamed`] *does*, not something
-    /// it *is* — so a stage of agents that are already up is unaffected by it
-    /// being on by default.
-    ///
-    /// Worth pinning because the default is the risky half of that change: every
-    /// existing fixture builds its seats with agents already in them and never
-    /// calls `agent.start`, so if the window were a property of a seat rather
-    /// than of a start, turning it on would have made the fake disagree with a
-    /// herdr that finished launching an hour ago. The countdown is armed by
-    /// `agent.start` and by nothing else, which is what these two readings say.
-    #[test]
-    fn a_stage_of_agents_that_are_already_up_never_enters_the_launch_window() {
-        let env = util::isolated("fake-already-up");
-        let stage = Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]);
-        assert!(stage.unnamed > 0, "the window is off, and this asserts nothing");
-        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let read = || {
-            let v = herdr::call("agent.get", json!({ "target": "w1:p1" })).expect("the fake answered");
-            herdr::parse_pane(v.get("agent").expect("a record"))
-        };
-        assert_eq!(read().agent, "claude", "a seat nobody started went blind");
-        assert_eq!(read().agent, "claude", "…and again, so this is not a countdown running out");
-
-        // Armed by a start and by nothing else, so the same seat read *after*
-        // one is in the window. The pair is the field: same stage, same seat,
-        // and the only thing between the two readings is `agent.start`.
-        herdr::call("agent.start", json!({ "pane_id": "w1:p1", "kind": "claude", "name": "t-1" }))
-            .expect("started");
-        let coming_up = read();
-        assert_eq!(coming_up.agent, "", "the launch window named an agent");
-        assert_eq!(coming_up.launch_pending, Some(true));
-        assert_eq!(
-            crate::place_herdr::state_of_agent(&coming_up),
-            State::Empty,
-            "which wsp reads as an empty seat, and that is the whole of t-260817-010"
-        );
-    }
-
     /// Which readings can tell a starting agent from an idle one, recorded
     /// rather than reasoned about — because `place.rs` reasons about it and
     /// gets it half right.
     ///
     /// The port says a listing cannot carry `interactive_ready` and so answers
     /// with the state that can lie. True of `pane.list`, whose rows have no
-    /// such field in herdr's schema and never carry one. **False of
+    /// such field in backend's schema and never carry one. **False of
     /// `agent.list`**, which carries the same `AgentInfo` as `agent.get` and
     /// was recorded carrying `interactive_ready: true` on a ready agent. So the
     /// asymmetry is between *panes and agents*, not between one and many, and
-    /// wsp only fails to see it because `herdr::Pane` does not parse the field.
+    /// wsp only fails to see it because `backend::Pane` does not parse the field.
     #[test]
     fn a_pane_reading_cannot_tell_starting_from_idle_and_an_agent_reading_can() {
         let starting = Spot::agent("w1:p1", "claude", "t-1", State::Starting);
@@ -2387,7 +2217,7 @@ mod tests {
 
         for spot in [&starting, &idle] {
             let pane = pane_json(spot);
-            assert!(pane.get("interactive_ready").is_none(), "a pane row invented a field herdr has not got");
+            assert!(pane.get("interactive_ready").is_none(), "a pane row invented a field backend has not got");
             assert_eq!(pane["agent_status"], "idle", "both look idle to a pane listing, and must");
         }
 
@@ -2397,11 +2227,11 @@ mod tests {
 
         let ready = agent_json(&idle);
         assert_eq!(ready["interactive_ready"], true, "the reading that can say yes did not");
-        assert!(ready.get("launch_pending").is_none(), "the two fields were sent together, which herdr never does");
+        assert!(ready.get("launch_pending").is_none(), "the two fields were sent together, which backend never does");
     }
 
     /// A pane with nobody in it is `agent_status: "unknown"` with no `agent`
-    /// field — recorded from herdr 0.7.5, and not what a reader would guess.
+    /// field — recorded from backend 0.7.5, and not what a reader would guess.
     /// The panel draws `·` from exactly this, and `sync` decides what to reap
     /// from it.
     #[test]
@@ -2409,86 +2239,20 @@ mod tests {
         let v = pane_json(&Spot::empty("w1:p1").at("/tmp"));
         assert_eq!(v["agent_status"], "unknown");
         assert!(v.get("agent").is_none(), "an empty pane carried an agent field");
-        assert_eq!(crate::place_herdr::state_of_agent(&herdr::parse_pane(&v)), State::Empty);
-    }
-
-    /// The whole point of the thing: wsp's own client, over a real socket, and
-    /// a state nobody could put a herdr into — a seat that is starting, one
-    /// that is working, one that has gone and a shell with nobody in it.
-    #[test]
-    fn wsps_own_client_reads_a_state_no_herdr_could_be_put_in() {
-        let env = util::isolated("fake-client");
-        let stage = Stage::of(vec![
-            Spot::agent("w1:p1", "claude", "t-1", State::Starting).labelled("one").on("w1", "w1:t1"),
-            Spot::agent("w1:p2", "claude", "t-2", State::Working).labelled("two").on("w1", "w1:t1"),
-            Spot::agent("w2:p1", "claude", "t-3", State::Gone)
-                .session("s-3")
-                .labelled("three")
-                .on("w2", "w2:t1"),
-            Spot::empty("w2:p2").labelled("a shell").on("w2", "w2:t1"),
-        ]);
-        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let panes = herdr::panes().expect("the fake answered");
-        assert_eq!(panes.len(), 4, "every seat is a pane, whatever is in it");
-        assert_eq!(panes[0].agent, "claude");
-        assert_eq!(panes[0].agent_status, "idle", "starting reads as idle from a listing");
-        assert_eq!(panes[1].agent_status, "working");
-        assert_eq!(panes[2].agent, "", "an agent that has gone leaves a pane that looks like a shell");
-        // And it takes its session with it, recorded against a live herdr on
-        // 2026-08-17 by killing a spawned Claude Code and reading the next
-        // `pane.list`. This is the reading `cmd_agent::sessions_learned` must
-        // not act on: it is silence, not a correction, and treating it as one
-        // would erase the id `claude --resume` needs at the one moment it is
-        // wanted.
-        assert_eq!(panes[2].session_id, "", "a dead agent's pane offers no session id");
-        assert_eq!(panes[3].agent_status, "unknown");
-
-        // …and `agent.list` is the narrower question, which a gone agent is not
-        // an answer to.
-        let agents = herdr::agents().expect("the fake answered");
-        assert_eq!(agents.len(), 2, "a gone agent was listed as a live one");
-    }
-
-    /// Silence, in both its forms, is not an empty list. This is robustness-015's
-    /// class of bug, at the seam it came in through — and it is the state the
-    /// task exists for, since a live herdr cannot be asked to stop answering.
-    #[test]
-    fn a_backend_that_is_not_answering_is_an_error_and_never_an_empty_list() {
-        let env = util::isolated("fake-quiet");
-        let fake = Fake::bind(
-            env.path("herdr.sock"),
-            Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
-        )
-        .unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        assert_eq!(herdr::panes().expect("answering").len(), 1);
-
-        // Hangs up: arrives at once, and is what a server restarting under a
-        // caller looks like.
-        fake.goes(Quiet::HangsUp);
-        assert!(herdr::panes().is_err(), "a hang-up was read as a machine with no panes");
-
-        fake.goes(Quiet::No);
-        assert_eq!(herdr::panes().expect("answering again").len(), 1);
     }
 
     /// The order `spawn` depends on, driven end to end: open a seat, start an
     /// agent in it, find it will not take a prompt yet, and only then tell it
     /// something. The recording is the assertion, and it is in the port's
-    /// words rather than herdr's.
+    /// words rather than backend's.
     #[test]
     fn a_spawn_shaped_conversation_is_recorded_as_the_verbs_it_was() {
         let dir = scratch("spawn");
         let mut stage = Stage::new();
-        // The window a live herdr passes through in half a second whether you
+        // The window a live backend passes through in half a second whether you
         // want it to or not.
         stage.settle = false;
-        let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
+        let fake = Fake::bind(dir.join("backend.sock"), stage).unwrap();
 
         let made = call(&fake, "workspace.create", json!({ "label": "r/1", "cwd": "/tmp", "focus": true }))
             .expect("a seat");
@@ -2519,7 +2283,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **robustness-035, on a socket.** A prompt herdr accepts and Claude Code
+    /// **robustness-035, on a socket.** A prompt backend accepts and Claude Code
     /// never takes: `ok` on the wire, the sentence in the composer, the agent
     /// idle in front of it. Every reading `wsp spawn` had said the handover went
     /// well, and for one night it printed so.
@@ -2534,7 +2298,7 @@ mod tests {
         let env = util::isolated("fake-unsent");
         let mut stage = Stage::of(vec![Spot::agent("w3M:p1", "claude", "robustness-035", State::Idle)]);
         stage.takes = false;
-        let fake = Fake::bind(env.path("herdr.sock"), stage).unwrap();
+        let fake = Fake::bind(env.path("backend.sock"), stage).unwrap();
         let seat = "w3M:p1";
 
         call(&fake, "agent.prompt", json!({ "target": seat, "text": "you have been claimed" }))
@@ -2554,61 +2318,14 @@ mod tests {
         );
     }
 
-    /// The subscribe stream, which is the half neither port could test before:
-    /// hold a connection open, change the state, and the event arrives on it.
-    /// wsp's own subscriber reads it, so the qualification and the
-    /// dots-to-underscores rename are exercised rather than assumed.
-    #[test]
-    fn a_state_change_reaches_a_watcher_that_was_already_listening() {
-        let env = util::isolated("fake-watch");
-        let fake = Fake::bind(
-            env.path("herdr.sock"),
-            Stage::of(vec![Spot::agent("w1:p1", "claude", "t-1", State::Idle)]),
-        )
-        .unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let (tx, rx) = mpsc::channel::<(String, Value)>();
-        std::thread::spawn(move || {
-            let _ = herdr::subscribe(&["pane.updated", "pane.closed", "pane.agent_detected"], |name, data| {
-                tx.send((name.to_string(), data.clone())).is_ok()
-            });
-        });
-        // The stream has to be up before the change, or the test is asserting
-        // nothing: a watcher that subscribes afterwards learns nothing at all,
-        // which is the failure mode the daemon lives with. Asked of the register
-        // the event will be delivered to rather than slept for — see
-        // [`Fake::watched`].
-        assert!(fake.watched(), "the subscriber never reached the fake");
-
-        let seat = Seat::new("w1:p1");
-        fake.moves(&seat, State::Working);
-        let (name, data) = rx.recv_timeout(DELIVERY).expect("no event arrived");
-        assert_eq!(name, "pane_updated", "the stream renames dots to underscores");
-        assert_eq!(data["pane"]["agent_status"], "working");
-
-        fake.closes(&seat);
-        let (name, data) = rx.recv_timeout(DELIVERY).expect("no close arrived");
-        assert_eq!(name, "pane_closed");
-        assert_eq!(data["pane_id"], "w1:p1");
-    }
-
     /// One entry missing its `pane_id` refuses **every other entry with it**,
-    /// and the server then hangs up. Recorded from herdr 0.7.5, and reproduced
+    /// and the server then hangs up. Recorded from backend 0.7.5, and reproduced
     /// rather than smoothed over: `daemon::EVENTS` and `panel::SHAPE` are both
     /// shaped by this refusal, and a fake that accepted the list would make
     /// both of them look arbitrary.
     #[test]
     fn one_per_pane_subscription_refuses_the_whole_list() {
-        let env = util::isolated("fake-subs");
-        let fake = Fake::bind(env.path("herdr.sock"), Stage::new()).unwrap();
-        let (k, v) = fake.socket_env();
-        std::env::set_var(k, v);
-
-        let err = herdr::subscribe(&["pane.created", "pane.agent_status_changed"], |_, _| true)
-            .expect_err("a list herdr would have refused");
-        assert!(err.to_string().contains("pane_id"), "{err}");
+        assert!(subscription_error(&[json!({ "type": "pane.created" }), json!({ "type": "pane.agent_status_changed" })]).is_some());
 
         // Naming a pane is what makes it legal, which is why the panel
         // subscribes per pane for those three and globally for the rest.
@@ -2633,10 +2350,10 @@ mod tests {
         assert_eq!((bottom.y, bottom.h), (13, 11));
     }
 
-    /// Nothing here parses an id. herdr's are `w0:p3`, strata's D-55 is an
+    /// Nothing here parses an id. backend's are `w0:p3`, strata's D-55 is an
     /// index and a generation, and a seat the fake did not invent has to work
     /// exactly as well as one it did — otherwise the fake is quietly asserting
-    /// herdr's shape of id, which is the assumption the ports exist to remove.
+    /// backend's shape of id, which is the assumption the ports exist to remove.
     #[test]
     fn a_seat_the_fake_did_not_invent_is_still_a_seat() {
         let dir = scratch("ids");
@@ -2644,7 +2361,7 @@ mod tests {
             Spot::agent("sess_01HQ", "claude", "t-1", State::Idle).on("host-a", "host-a/main"),
             Spot::empty("7").on("host-a", "host-a/main"),
         ]);
-        let fake = Fake::bind(dir.join("herdr.sock"), stage).unwrap();
+        let fake = Fake::bind(dir.join("backend.sock"), stage).unwrap();
 
         let panes = call(&fake, "pane.list", json!({})).expect("a listing");
         assert_eq!(panes["panes"][0]["pane_id"], "sess_01HQ");
@@ -2695,7 +2412,7 @@ mod tests {
         assert_eq!(stage.spots[1].state, State::Empty, "a seat with nobody in it is a shell");
         assert_eq!(stage.spots[2].state, State::Working);
 
-        // Ids are invented herdr-style so that a sandbox reads like a machine,
+        // Ids are invented backend-style so that a sandbox reads like a machine,
         // and each seat gets a screen of its own — a workspace per task, which
         // is what wsp opens.
         assert_eq!(stage.spots[0].seat.as_str(), "w1:p1");
@@ -2709,16 +2426,16 @@ mod tests {
     }
 
     /// A method wsp has never called is refused rather than answered. A fake
-    /// that improvises is a fake that goes on answering after herdr has stopped
+    /// that improvises is a fake that goes on answering after backend has stopped
     /// — and the refusal carries the fake's own error code, because inventing a
-    /// herdr one teaches a caller to match on a string no server sends.
+    /// backend one teaches a caller to match on a string no server sends.
     #[test]
     fn a_method_nothing_calls_is_refused_in_the_fakes_own_words() {
         let dir = scratch("unknown");
-        let fake = Fake::bind(dir.join("herdr.sock"), Stage::new()).unwrap();
+        let fake = Fake::bind(dir.join("backend.sock"), Stage::new()).unwrap();
         let err = call(&fake, "layout.apply", json!({})).expect_err("answered a method nothing calls");
         assert!(err.contains(OUR_OWN), "{err}");
-        assert!(!err.contains("pane_not_found"), "the fake borrowed a herdr code for its own refusal");
+        assert!(!err.contains("pane_not_found"), "the fake borrowed a backend code for its own refusal");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

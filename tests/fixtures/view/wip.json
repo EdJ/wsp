@@ -1,0 +1,106 @@
+{
+  "agents": [
+    {
+      "answers_to": null,
+      "answers_to_empty": "list-a",
+      "closed_row": null,
+      "direction": null,
+      "dropped": false,
+      "effort": null,
+      "full_suite": false,
+      "held": null,
+      "kind": null,
+      "leg": null,
+      "members_waiting": null,
+      "model": null,
+      "needs_you": false,
+      "pane": "cpd-7",
+      "project": "beta",
+      "queued": 0,
+      "role": {
+        "group": 1,
+        "is": "member",
+        "list": "list-a",
+        "task": "beta-003"
+      },
+      "said": null,
+      "seat": null,
+      "since": "2026-11-18T11:06:40Z",
+      "spawned_by": null,
+      "state": "idle",
+      "stuck": null,
+      "task": "Doing row",
+      "task_id": "beta-003",
+      "turning": false,
+      "unsent": false,
+      "wait": {
+        "kind": "itself",
+        "line": "waiting on itself: a shell (0s, busy)",
+        "quiet_secs": 0,
+        "since": "2026-11-18T11:06:40Z",
+        "target": null
+      },
+      "waiting": {
+        "age": 0,
+        "on": "itself",
+        "question": null,
+        "quiet": 0,
+        "reason": "waiting on itself: a shell (0s, busy)",
+        "shells": 1,
+        "why": "shell",
+        "word": "waiting · itself",
+        "work": ""
+      },
+      "was_governor": null,
+      "workspace": "cpd-7"
+    }
+  ],
+  "attention": {
+    "follow_up": [],
+    "needs_you": []
+  },
+  "blocked": [
+    {
+      "after": [],
+      "caption": {
+        "from": "title",
+        "text": "Blocked row"
+      },
+      "created": "2026-11-18T11:06:40Z",
+      "id": "beta-001",
+      "parent": null,
+      "priority": "normal",
+      "project": "beta",
+      "refs": [],
+      "status": "blocked",
+      "tags": [
+        "ops"
+      ],
+      "title": "Blocked row",
+      "updated": "2026-11-18T11:06:40Z"
+    }
+  ],
+  "daemon": null,
+  "disk": null,
+  "idle_memory": {
+    "over": false,
+    "panes": [
+      {
+        "kb": 307200,
+        "name": "beta-003",
+        "seat": "cpd-7"
+      }
+    ],
+    "total_kb": 307200,
+    "unread": 0,
+    "warn_kb": 2097152
+  },
+  "inbox": 1,
+  "load": null,
+  "needs_you": 0,
+  "review": [],
+  "throttle": "throttle: auto — in force, idle time unreadable so assuming the person is here · cpu clock 100% · check slots 0/4",
+  "turning": 0,
+  "unreachable": null,
+  "waiting": 0
+}

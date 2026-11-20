@@ -78,7 +78,7 @@ enum State {
     /// Inside `ESC [` … final byte.
     Csi,
     /// Inside `ESC O` — the same arrows, from a terminal in application cursor
-    /// mode, which is a mode herdr's panes can be left in.
+    /// mode, which is a mode backend's panes can be left in.
     Ss3,
     /// The bytes after `ESC [ M`, which sit *outside* the grammar: an X10
     /// mouse report puts three raw bytes after its final, and they are the one

@@ -1,6 +1,6 @@
 //! The half of a panel's view that belongs to the person rather than the pane.
 //!
-//! herdr owns panes through workspaces, so a panel cannot be one pane that
+//! backend owns panes through workspaces, so a panel cannot be one pane that
 //! follows you — wsp-015 has the evidence. What it can be is twenty-two
 //! panes nobody can tell apart, and this is the difference between the two: the
 //! folds, the filters and the cursor live in the store, so the panel you switch
@@ -74,7 +74,7 @@ pub(super) struct Shared {
     /// `F`. It changes how much of a row you can read rather than which rows
     /// there are, which is why it is easy to leave out of a list of filters —
     /// but it is a dock you turn on and go on working under, not a glance. Left
-    /// behind, it came off every time herdr swapped which panel was on screen,
+    /// behind, it came off every time backend swapped which panel was on screen,
     /// and the titles went back to their first twenty-five characters with
     /// nothing having asked for that.
     focus: bool,

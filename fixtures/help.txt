@@ -64,6 +64,9 @@ TASKS
                                     sonnet medium; another tier needs --why
   wsp leg after <task> <name> <leg>…|-   replace a pending leg's waits
   wsp leg skip <task> <name> "why"       a pending leg, never run
+  wsp leg reset <task> <name> "why" [--force]   a running leg whose seat is gone,
+                                         back to pending: the person, the primary
+                                         or the row's governor
   wsp leg show <task> [<name>]           the legs, the tier and waits in full
   wsp leg done <task> [--from FILE|-] --caption "…"   a leg's seat ends it, at a clean
                                          commit: the baton, the caption, the run poked
@@ -250,6 +253,13 @@ AGENTS
                                     is not, its pid untouched if it is right. An
                                     install that cannot leave the daemon running
                                     exits 1 and `wsp wip` says so
+  wsp install → ~/Library/LaunchAgents/com.wsp.manager.plist
+                                    …and puts `wsp-manager` beside wsp (the one
+                                    built beside it), writes and loads its agent
+                                    (KeepAlive, 5 s throttle, log in its
+                                    <exec_dir>/log/) and copies its token into
+                                    <state>/manager/local.secret. `wsp install
+                                    --uninstall-manager` unloads and removes it
   wsp install --why - | --why --from FILE
                                     …with the reason read from a stream or a
                                     file, where a shell never sees it — it is
@@ -258,14 +268,14 @@ AGENTS
                                     has every backtick in it run. The binary
                                     stays the positional: `--from` is where the
                                     sentence comes from, not the build
-  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
+  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own backend session,
                                     store and state — and the exports to use it;
                                     inside it `wsp` is the binary you ran
   wsp sandbox --run "cmd" [--keep]  …or run one thing in it and take it down
-  wsp sandbox --fake [--stage F]    …or with no herdr at all: a backend that
+  wsp sandbox --fake [--stage F]    …or with no backend at all: a backend that
                                     answers the socket out of a state you write
                                     down, so wsp can be driven through the ones
-                                    a real herdr cannot be put in
+                                    a real backend cannot be put in
   wsp scratch [-n]                  the scratch of closed rows ($WSP_SCRATCH and
                                     ~/.cache/<row-id>): list with sizes, then
                                     remove what the row did not keep
@@ -274,10 +284,9 @@ AGENTS
                                     first
   wsp claim <id>                    bind this pane to a task, leaving the last
   wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
-                 [--model <m>] [--effort <e>] [--subagents] [--herdr]
+                 [--model <m>] [--effort <e>] [--subagents]
                                     open a workspace on it and claim it there;
-                                    in a compound session by default — --herdr
-                                    opens it in the fork instead, and
+                                    in a compound session by default, or
                                     --headless in a supervisor with no terminal
                                     at all. --agent starts an agent in it too. --focus
                                     to go there, --on to run it on another
@@ -322,12 +331,10 @@ AGENTS
                                     back: release the claim, the row to todo,
                                     keep the worktree on the seat. A far seat
                                     only; a local one is refused
-  wsp resume [<id>] [--print]       the agents that were running before herdr
-                                    restarted, offered back one row at a time:
-                                    ␣ to pick, ↵ to bring those back on the
-                                    session they were on. With an id, that one —
-                                    which may reach further back than the last
-                                    census. --print says how to do it by hand
+  wsp resume <id> [--print]         bring the agent on a task, or a project's
+                                    seat, back on the session it was on — which
+                                    may reach further back than the last census.
+                                    --print says how to do it by hand
   wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
                                     or test tool over an hour old in the tree of a
                                     row no seat or claim holds, a zsh busy loop, a test
@@ -390,7 +397,7 @@ AGENTS
   wsp agent kinds [--json]          the agent kinds wsp has behaviour for — name,
                                     default, resume, models, efforts — for a menu
                                     that should not keep its own list. Any other
-                                    kind herdr can start is passed by --kind
+                                    kind is passed by --kind, for the backend
   wsp agent pi-extension            the pi extension this binary carries, which
                                     `wsp install` writes into pi's extensions
   wsp wip                           everything in flight, with agents
@@ -636,7 +643,13 @@ WORKLISTS
                                     `go` passes the barrier; `wsp reopen` of a
                                     member the check held on is the other: the
                                     run goes back to that group, reseats the
-                                    member and checks the barrier afresh
+                                    member and checks the barrier afresh.
+                                    --until WHEN (a time, or 24h/2d from now),
+                                    --on <row>… and --for "the person's act"
+                                    say what the hold waits on, so it is not
+                                    shown as needing the person before that is
+                                    all that is left; on a held list they
+                                    re-describe the wait, with no reason
   wsp worklist followup <slug> <task>… --blocking|--next --from FILE
                                     the barrier check's verdict with up to four
                                     rows attached: --blocking holds, and they
@@ -723,19 +736,9 @@ PLUMBING
   wsp view [<id>]                   detail pane; follows the panel unless given an id
   wsp kanban|board [<proj>] [--done]  the work as todo/doing/review/done columns;
                                     K in the panel opens it in a tab
-  wsp panel install [--all]         split it into a workspace, or all of them —
-                                    the way it works without a herdr that draws
-                                    the sidebar itself; skipped automatically
-                                    while `wsp surface` is running
-  wsp panel uninstall [-w ws]       take it back out
-  wsp surface                       the panel for a host that owns the cells:
-                                    one JSON object per line each way, frames
-                                    out. Started by herdr, not by a person
-  wsp sync [--force]                push tokens to herdr once
   wsp daemon [-v]                   cycle, repair and attention loop (launchd)
   wsp daemon reload                 put the launchd job back when no daemon
                                     answers; the primary seat's, refused if one does
-  wsp hook <event>                  herdr event-hook entrypoint
   wsp report <hook>                 a headless agent's Claude Code hook, saying
                                     what it is doing; silent outside a seat
   wsp burn [--json]                 tokens by seat, dearest first — input,
@@ -748,6 +751,11 @@ PLUMBING
                                     polls (polls.jsonl), --all both; each view
                                     says the time its file covers
                                     (WSP_NO_CALLS=1 stops the recording)
+  wsp calls --incidents [--since 7d] [--json]
+                                    how often wsp acted on a guess, by kind
+                                    (who owns a process, is a seat alive, was an
+                                    order taken, has a seat ended), from
+                                    cycle.log and events.jsonl
   wsp spend [--json]                tokens and cost over 30 days off the stop
                                     ledger: by day and model, today/7d/30d,
                                     by project and list, and the cost per row
@@ -845,7 +853,6 @@ PLUMBING
                                     --closed lists those and counts as looking
   wsp reconcile [--reap]            rebuild bindings from claims, and rename;
                                     --reap ends claims whose workspace is gone
-  wsp adopt [--yes]                 turn live workspaces into tasks
   wsp code [<proj> [<code>]]        the prefix a project's ids take, so a long
                                     slug can still number short: strata-prototype
                                     with code sp gives sp-062. Defaults to the

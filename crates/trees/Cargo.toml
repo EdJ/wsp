@@ -12,6 +12,8 @@ serde_json = "1"
 wsp-base = { path = "../base" }
 wsp-store = { path = "../store" }
 wsp-wire = { path = "../wire" }
+# throttle --json's projection (wsp-305).
+wsp-view = { path = "../view" }
 
 [dev-dependencies]
 wsp-base = { path = "../base", features = ["test-support"] }

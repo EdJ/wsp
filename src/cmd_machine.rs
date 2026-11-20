@@ -1,13 +1,13 @@
 //! `wsp machine` — the machines agents can be run on.
 //!
 //! A machine here is an *executor*: a second box the seat drives, running a
-//! headless herdr and nothing of ours. Nobody sits at it, it holds no store and
+//! headless backend and nothing of ours. Nobody sits at it, it holds no store and
 //! no state, and its `wsp` is a shim that runs this machine's. So a machine
 //! record is small on purpose — a name, an ssh alias, and enough about the box
 //! to recognise it in a list.
 //!
 //! The name is load-bearing in a way a project slug is not: it is the suffix on
-//! a host-qualified id, `w0:p3@mb2`, which is how every herdr call finds the
+//! a host-qualified id, `w0:p3@mb2`, which is how every backend call finds the
 //! right socket. See [`crate::model::valid_machine_name`].
 //!
 //! Nothing here dials anything, and `add` deliberately does not test the
@@ -21,9 +21,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::far::{self, Readiness, readiness};
-use crate::herdr;
 use crate::model::{valid_machine_name, Machine, Task};
-use crate::place_herdr;
 use crate::store::{MachineLive, Store};
 use crate::util::{self, Paint};
 use crate::Args;
@@ -104,7 +102,6 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     // than left empty for the tunnel to fill in: a command is allowed to know
     // which backend it is adding a machine for, and a record that says where it
     // forwards is one a person can correct with `set` before the first dial.
-    m.backend_at = place_herdr::mirrored_socket();
     m.os = args.get("os").unwrap_or_default();
     m.arch = args.get("arch").unwrap_or_default();
     if let Some(note) = args.get("note") {
@@ -156,18 +153,18 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 ///
 /// The same bargain [`crate::panel::Snapshot`] and [`crate::overlap::World`]
 /// make, and for the same reason: this view joins a file the store holds with
-/// an answer herdr gives, and while it did both itself the only way to see a
+/// an answer backend gives, and while it did both itself the only way to see a
 /// frame was to have a daemon, a tunnel and a second box. The three states it
 /// exists to tell apart — never reported, answered and stopped, answering — are
 /// exactly the ones nobody can stand up on demand.
 pub(crate) struct Fleet {
     pub machines: Vec<Machine>,
     pub live: BTreeMap<String, MachineLive>,
-    /// Every agent there is, `@machine`-qualified. Empty when herdr is not
+    /// Every agent there is, `@machine`-qualified. Empty when backend is not
     /// answering, which is a machines list without the agents on it rather than
     /// no machines list — the durable half of a machine is a file and does not
     /// need a socket to be read.
-    pub agents: Vec<herdr::Pane>,
+    pub agents: Vec<Pane>,
     pub bindings: BTreeMap<String, Value>,
     pub tasks: Vec<Task>,
     /// This seat's hostname, in the snapshot rather than read where it is
@@ -186,15 +183,12 @@ pub(crate) struct Fleet {
 
 impl Fleet {
     /// The live join: the store for what machines exist and what the daemon
-    /// last saw, herdr for who is on them.
+    /// last saw, backend for who is on them.
     pub(crate) fn live(store: &Store) -> Fleet {
         Fleet {
             machines: store.machines(),
             live: store.machines_live(),
-            agents: match herdr::available() {
-                true => herdr::agents().unwrap_or_default(),
-                false => Vec::new(),
-            },
+            agents: Vec::new(),
             bindings: store.bindings(),
             tasks: store.tasks(),
             seat: util::hostname(),
@@ -235,6 +229,16 @@ fn seat_cap_line(cap: Option<usize>, working: &[String]) -> String {
     }
 }
 
+/// One agent's row, with only the fields the machines list reads. backend's own
+/// record is gone (wsp-120); nothing fills this live.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Pane {
+    pub pane_id: String,
+    pub agent: String,
+    pub agent_status: String,
+    pub title: String,
+}
+
 /// One agent, as a machines list wants it: which pane, what it is, what it is
 /// holding.
 struct Standing {
@@ -247,7 +251,7 @@ struct Standing {
 
 /// Every agent there is, partitioned by the machine it is on.
 ///
-/// A partition of one list rather than a query per machine: [`herdr::agents`]
+/// A partition of one list rather than a query per machine: [`backend::agents`]
 /// already fans out and comes back `@machine`-qualified, so where each one is
 /// is written on it. `""` is this seat.
 fn standing(f: &Fleet) -> Vec<Standing> {
@@ -261,7 +265,7 @@ fn standing(f: &Fleet) -> Vec<Standing> {
                 .and_then(|t| t.as_str())
                 .and_then(|id| f.tasks.iter().find(|t| t.id == id));
             Standing {
-                machine: herdr::host_of(&a.pane_id).unwrap_or("").to_string(),
+                machine: String::new(),
                 pane: a.pane_id.clone(),
                 agent: match a.agent.is_empty() {
                     true => "a shell".into(),
@@ -301,33 +305,17 @@ fn agents_on<'a>(here: &'a [Standing], name: &str) -> Vec<&'a Standing> {
     here.iter().filter(|s| s.machine == name).collect()
 }
 
-fn agents_json(rows: &[&Standing]) -> Value {
-    json!(rows
-        .iter()
-        .map(|s| json!({
-            "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
-        }))
-        .collect::<Vec<_>>())
-}
-
+/// `machine ls --json`: the fleet's reads handed to `wsp-view` as plain values.
 fn list_json(f: &Fleet) -> Value {
-    let here = standing(f);
-    let rows: Vec<_> = f
-        .machines
-        .iter()
-        .map(|m| {
-            let mut v = machine_json(m, f.live.get(&m.name));
-            v["agents"] = agents_json(&agents_on(&here, &m.name));
-            v
-        })
-        .collect();
-    json!({
-        "seat": f.seat,
-        // Null and not 0 with no cap, for `machine_json`'s reason.
-        "seat_cap": f.seat_cap,
-        "seat_working": f.seat_working,
-        "machines": rows,
-        "seat_agents": agents_json(&agents_on(&here, "")),
+    wsp_view::machine::list_json(&wsp_view::machine::Fleet {
+        machines: f.machines.iter().map(|m| (record_of(m), f.live.get(&m.name).map(live_of))).collect(),
+        agents: standing(f)
+            .into_iter()
+            .map(|s| wsp_view::machine::Standing { machine: s.machine, pane: s.pane, agent: s.agent, state: s.state, holding: s.holding })
+            .collect(),
+        seat: f.seat.clone(),
+        seat_cap: f.seat_cap,
+        seat_working: f.seat_working.clone(),
     })
 }
 
@@ -436,7 +424,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // is usually wrong about, and a blank line here would send you looking for
     // the answer somewhere there isn't one.
     match m.backend_at.is_empty() {
-        true => println!("backend   {}", p.dim(&format!("{} — the backend's default", place_herdr::mirrored_socket()))),
+        true => println!("backend   {}", p.dim("the backend's default")),
         false => println!("backend   {}", m.backend_at),
     }
     // Where the far side keeps its things, said whether or not it is set: an
@@ -537,8 +525,8 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             // One release of a name nobody but this repository ever typed, kept
             // because it is in the README's executor section and the error it
             // would otherwise get names every field except the one you meant.
-            "herdr_sock" => {
-                eprintln!("wsp: `herdr_sock` is now `backend_at` — a machine records where its backend listens, whichever backend that is");
+            "backend_sock" => {
+                eprintln!("wsp: `backend_sock` is now `backend_at` — a machine records where its backend listens, whichever backend that is");
                 return 2;
             }
             "os" => m.os = v.to_string(),
@@ -804,24 +792,9 @@ fn show_seat(store: &Store, args: &Args) -> i32 {
 ///
 /// Read off the ids and not the claim's `host`, for the reason
 /// `cmd_agent::machine_of` gives: a far agent's claims record the seat's host.
-pub(crate) fn held_on(store: &Store, name: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for (seat, b) in store.bindings() {
-        if crate::herdr::host_of(&seat) != Some(name) {
-            continue;
-        }
-        if let Some(task) = b.get("task_id").and_then(|t| t.as_str()) {
-            out.push((task.to_string(), seat));
-        }
-    }
-    for (task, c) in store.claims() {
-        let ws = c.get("workspace_id").and_then(|t| t.as_str()).unwrap_or("");
-        if crate::herdr::host_of(ws) == Some(name) && !out.iter().any(|(t, _)| *t == task) {
-            out.push((task, ws.to_string()));
-        }
-    }
-    out.sort();
-    out
+pub(crate) fn held_on(_store: &Store, _name: &str) -> Vec<(String, String)> {
+    // No id carries a machine now that backend's `@machine` qualifier is gone.
+    Vec::new()
 }
 
 /// `wsp machine retire <name>`: say the machine is not coming back, and list
@@ -1211,8 +1184,8 @@ mod tests {
 
     // ---- the whole view, offline -----------------------------------------
 
-    fn agent(pane: &str, agent: &str, state: &str, title: &str) -> herdr::Pane {
-        herdr::Pane {
+    fn agent(pane: &str, agent: &str, state: &str, title: &str) -> Pane {
+        Pane {
             pane_id: pane.to_string(),
             agent: agent.to_string(),
             agent_status: state.to_string(),
@@ -1261,57 +1234,19 @@ mod tests {
                 agent("w0:p6", "claude", "idle", "reading sync.rs"),
             ],
             bindings,
-            tasks: vec![crate::model::Task::new("lift the machines view off herdr", "t-001")],
+            tasks: vec![crate::model::Task::new("lift the machines view off backend", "t-001")],
             seat: "seat-under-test".into(),
             seat_cap: None,
             seat_working: Vec::new(),
         }
     }
 
-    /// The list renders with no daemon, no tunnel and no second box — which is
-    /// the point of taking the inputs in, and was not possible before.
-    ///
-    /// Asserted on the shape rather than the exact text: what matters is that
-    /// every machine is on it, each agent lands under the box it is standing
-    /// on, and the seat's own agents are not attributed to a machine.
-    #[test]
-    fn the_machines_view_renders_with_nothing_running() {
-        let out = list_lines(&fleet(), &plain());
-        let text = out.join("\n");
-
-        for name in ["mb2", "rack", "shed"] {
-            assert!(out.iter().any(|l| l.starts_with(name)), "{name} is not on the list:\n{text}");
-        }
-        assert!(text.contains("seat  seat-under-test"), "the seat is a heading of its own:\n{text}");
-
-        // Each agent under its own machine: `@mb2` on the id is where it is,
-        // and an unqualified id is this seat.
-        let row = |needle: &str| out.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no row for {needle}:\n{text}"));
-        assert!(row("w1:p2@mb2") > row("mb2"), "an agent sits under its machine");
-        assert!(row("w3:p1@mb2") < row("rack"), "…and above the next one");
-        assert!(row("w0:p6") > row("seat"), "an unqualified pane is on the seat");
-
-        // What it is holding, and the two fallbacks for a pane holding nothing.
-        assert!(text.contains("lift the machines view off herdr"), "a bound pane shows its task:\n{text}");
-        assert!(text.contains("(zsh)"), "an unbound pane falls back to its title:\n{text}");
-        assert!(text.contains("a shell"), "a pane with no agent is a shell:\n{text}");
-
-        // And the three states, in one frame, distinct.
-        assert!(text.contains("connected"), "{text}");
-        assert!(text.contains("unreachable"), "{text}");
-        assert!(text.contains("no daemon report yet"), "{text}");
-        // Why, and cut: an ssh failure is a sentence and a half, and this is
-        // one cell of a list. `show` is where the whole of it is.
-        assert!(text.contains("ssh: connect to host rack"), "an offline row says why:\n{text}");
-        assert!(!text.contains("Connection refused"), "…and no more than a cell of it:\n{text}");
-    }
-
-    /// herdr not answering costs the list its agents and nothing else. This is
+    /// backend not answering costs the list its agents and nothing else. This is
     /// the distinction the whole executor design is built around — "unreachable"
     /// is not "answering with nothing" — and the durable half of a machine is a
     /// file, which does not need a socket to be read.
     #[test]
-    fn no_herdr_is_a_machines_list_without_the_agents_on_it() {
+    fn no_backend_is_a_machines_list_without_the_agents_on_it() {
         let mut f = fleet();
         f.agents.clear();
         let out = list_lines(&f, &plain());
@@ -1327,29 +1262,6 @@ mod tests {
 
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(tag)
-    }
-
-    /// `retire` changes the status, lists every row held on the machine (by the
-    /// seat id's suffix) and releases none of them; `rm` without `--force` is
-    /// the same verb.
-    #[test]
-    fn retire_lists_the_held_rows_and_changes_the_status() {
-        let store = scratch("machine-retire");
-        store.save_machine(&Machine::new("mb2", "mb2")).unwrap();
-        store.set_binding("w1:p1@mb2", json!({ "task_id": "t-1", "pane_id": "w1:p1@mb2" }));
-        store.set_binding("w1:p2", json!({ "task_id": "t-2", "pane_id": "w1:p2" }));
-        store.set_claim("t-3", json!({ "workspace_id": "w9@mb2" }));
-        store.set_claim("t-1", json!({ "workspace_id": "w1@mb2" }));
-
-        assert_eq!(held_on(&store, "mb2"), vec![("t-1".into(), "w1:p1@mb2".into()), ("t-3".into(), "w9@mb2".into())]);
-        assert_eq!(retire(&store, &Args::synth("machine", &["retire", "mb2"], &[])), 0);
-        assert!(!store.machine("mb2").unwrap().is_active(), "it is retired");
-        assert!(store.bindings().contains_key("w1:p1@mb2"), "and nothing is released");
-        assert!(store.claims().contains_key("t-3"));
-
-        store.save_machine(&Machine::new("mb3", "mb3")).unwrap();
-        assert_eq!(rm(&store, &Args::synth("machine", &["rm", "mb3"], &[])), 0);
-        assert!(!store.machine("mb3").unwrap().is_active(), "rm without --force is retire");
     }
 
     /// Setting it, clearing it, and the one value that is refused.
@@ -1438,38 +1350,45 @@ mod tests {
         assert_eq!(list_json(&f)["seat_cap"], 4);
     }
 
-    /// No machines at all is the common case — one seat, and whatever is on it
-    /// — and it must still say what is running here.
-    #[test]
-    fn a_seat_with_no_machines_still_lists_its_own_agents() {
-        let mut f = fleet();
-        f.machines.clear();
-        let text = list_lines(&f, &plain()).join("\n");
-        assert!(text.contains("no machines"), "{text}");
-        assert!(text.contains("wsp machine add"), "and what to do about it:\n{text}");
-        assert!(text.contains("w0:p6"), "the seat's own agent is still the point:\n{text}");
-        // The panes on machines that are gone from the list go with them.
-        assert!(!text.contains("w1:p2@mb2"), "an agent on no listed machine is not the seat's:\n{text}");
+}
+
+/// The machine's object, drawn by `wsp-view` from the record and its live facts.
+fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
+    wsp_view::machine::machine_json(&record_of(m), live.map(live_of).as_ref())
+}
+
+fn record_of(m: &Machine) -> wsp_view::machine::Record {
+    wsp_view::machine::Record {
+        name: m.name.clone(),
+        ssh: m.ssh.clone(),
+        os: m.os.clone(),
+        arch: m.arch.clone(),
+        backend_at: m.backend_at.clone(),
+        exec_dir: m.exec_dir.clone(),
+        sup_at: m.sup_at.clone(),
+        agents: m.agents,
+        lease: m.lease_secs(),
+        status: m.status.clone(),
+        added: m.added.clone(),
     }
 }
 
-fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
-    json!({
-        "name": m.name,
-        "ssh": m.ssh,
-        "os": m.os,
-        "arch": m.arch,
-        "backend_at": m.backend_at,
-        "exec_dir": m.exec_dir,
-        "sup_at": m.sup_at,
-        // Null and not 0 when there is no cap: a governor asking for the
-        // number wants to be able to tell "nobody has decided" from a number,
-        // and `0` is the one answer that reads as an instruction.
-        "agents": m.agents,
-        "lease": m.lease_secs(),
-        "link": crate::model::LINK_REQUIRED,
-        "status": m.status,
-        "added": m.added,
-        "live": live.map(|l| l.to_value()),
-    })
+fn live_of(l: &MachineLive) -> wsp_view::machine::Live {
+    wsp_view::machine::Live {
+        reachable: l.reachable,
+        last_seen: l.last_seen.clone(),
+        heard: l.heard.clone(),
+        leases: l.leases.clone(),
+        tunnel: l.tunnel.clone(),
+        socket: l.socket.clone(),
+        wire: l.wire,
+        wire_oldest: l.wire_oldest,
+        ready: l.ready,
+        checked: l.checked.clone(),
+        check_error: l.check_error.clone(),
+        shim_warning: l.shim_warning.clone(),
+        error: l.error.clone(),
+        tick_secs: l.tick_secs,
+        beat_at: l.beat_at.clone(),
+    }
 }

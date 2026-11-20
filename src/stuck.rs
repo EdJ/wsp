@@ -38,7 +38,7 @@
 //! matching, which is the direction that flags less.
 
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::BufRead;
 
 use serde_json::Value;
 
@@ -224,24 +224,8 @@ fn named(kind: Option<Kind>, foreground: bool, limit: i64, secs: i64) -> Option<
 
 /// The stalls in the last [`TAIL`] bytes of a transcript file, open and closed.
 pub(crate) fn in_tail(path: &std::path::Path, now: i64) -> Vec<Stall> {
-    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let from = len.saturating_sub(TAIL);
-    if f.seek(SeekFrom::Start(from)).is_err() {
-        return Vec::new();
-    }
-    let mut bytes = Vec::new();
-    if f.take(TAIL).read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    // The first line is cut in the middle when the read started inside the file.
-    if from > 0 {
-        match text.find('\n') {
-            Some(i) => text.drain(..=i),
-            None => return Vec::new(),
-        };
-    }
+    use crate::host::Host;
+    let Some(text) = crate::host::LOCAL.transcript_tail(path, TAIL) else { return Vec::new() };
     scan(&mut text.as_bytes(), now)
 }
 
@@ -417,7 +401,12 @@ fn simple_commands(command: &str) -> Vec<Simple> {
         }
         i += 1;
     }
-    end_command!(false);
+    if has_word {
+        words.push(word);
+    }
+    if !words.is_empty() {
+        out.push(Simple { words, after_pipe, pipeline });
+    }
     out
 }
 
@@ -689,6 +678,7 @@ const USAGE: &str = "usage: wsp stuck <transcript.jsonl>…   the commands in th
 /// `wsp stuck FILE…`: the stalls in whole transcripts, one line each and a
 /// total, which is how the rate is counted (`wsp-397`).
 pub fn stuck(args: &crate::Args) -> i32 {
+    use crate::host::Host;
     if args.rest.is_empty() {
         eprintln!("{USAGE}");
         return 2;
@@ -696,12 +686,12 @@ pub fn stuck(args: &crate::Args) -> i32 {
     let (mut files, mut hit, mut secs) = (0, 0, 0);
     let mut lines = Vec::new();
     for path in &args.rest {
-        let Ok(f) = std::fs::File::open(path) else {
+        let Some(mut src) = crate::host::LOCAL.read_transcript(std::path::Path::new(path)) else {
             eprintln!("wsp: cannot read {path}");
             continue;
         };
         files += 1;
-        let stalls = scan(&mut std::io::BufReader::new(f), 0);
+        let stalls = scan(&mut src, 0);
         if !stalls.is_empty() {
             hit += 1;
         }

@@ -5,12 +5,8 @@
 //! the argument for how a second one is turned away is under *one daemon per
 //! store* below.
 //!
-//! **It speaks to compound and to nothing of herdr's** (`wsp-544`). It used to
-//! subscribe to herdr's events, sync herdr's sidebar tokens every tick and
-//! subscribe to every far machine's herdr; none of those had a socket at the
-//! far end since `compound-112`, and the sync's failure was a `daemon.log` line
-//! every tick — 11,020 of them. The inventory is on `wsp-544`. Nothing wakes it
-//! early now: every pass below runs on its own interval, off a [`TICK`].
+//! **It speaks to compound and nothing else** (`wsp-544`, `wsp-120`). Nothing
+//! wakes it early: every pass below runs on its own interval, off a [`TICK`].
 //!
 //! It carries one passenger, and being the only long-lived process is the whole
 //! qualification for it: [`crate::attention`] derives what is wrong on this
@@ -59,7 +55,7 @@ fn changed(started_as: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<(u
 /// owed to the passes either: this is called at the top of the loop, where the
 /// last one has finished and the next has not begun.
 fn reload(verbose: bool) -> std::io::Error {
-    let exe = match std::env::current_exe() {
+    let exe = match wsp_base::util::self_exe() {
         Ok(e) => e,
         Err(e) => return e,
     };
@@ -86,7 +82,7 @@ fn reload(verbose: bool) -> std::io::Error {
 /// child of whichever of those processes started it, and goes to pid 1 when
 /// that one exits. A daemon started fresh has none, and says nothing.
 fn adopt_carried_over(store: &Store) {
-    let kids = wsp_base::calls::children();
+    let kids = wsp_base::calls::children_of(crate::host::LOCAL.own_children());
     if kids.is_empty() {
         return;
     }
@@ -102,106 +98,26 @@ fn reaper_off() -> bool {
 
 /// Is there nothing at all for the daemon to run for?
 ///
-/// Read this before touching the herdr-only gate it replaces: the gate used
-/// to be `!herdr::available()`, which refused every start on the ordinary
-/// machine since `compound-112` made compound the default backend and took
-/// herdr off it. `cmd_spawn::local_backends()` is the fold every other
-/// reader — `wip`, `tell`, `census` — already uses instead of asking herdr
-/// alone, and a machine with compound and no herdr has a backend: `Compound`
-/// surveys a local directory and never fails to answer it, herdr or no. So
-/// this is `true` only when literally nothing does — every backend's
-/// [`crate::place::Place::census`] came back `Err` — which in practice means
-/// the process list or the compound state directory itself could not be
-/// read, not "no herdr socket".
-///
-///
-/// The daemon no longer asks herdr anything else either (`wsp-544`): the
-/// herdr sync, its event subscriptions and the start-up reconcile were all
-/// taken out, so a compound-only machine is the whole of what it runs on.
+/// `place::local_backends()` is the fold every other reader — `wip`, `tell`,
+/// `census` — uses, and `Compound` surveys a local directory and never fails
+/// to answer it. So this is `true` only when literally nothing does — every
+/// backend's [`crate::place::Place::census`] came back `Err` — which in
+/// practice means the process list or the compound state directory itself
+/// could not be read.
 fn nothing_answered(backend_ok: &[bool]) -> bool {
     backend_ok.iter().all(|ok| !ok)
-}
-
-/// Why this daemon must not run: it is pointed at a herdr that is not the
-/// machine's, and at a store nobody named.
-///
-/// The third defence in robustness-021, and the one that holds when the other two
-/// are got right and something starts a daemon anyway. A herdr session server
-/// starts every enabled plugin's `[[startup]]` command — `plugins.json` is
-/// global, not per session — with its own environment. So a sandbox whose
-/// server was started carelessly gets a daemon holding *its* socket and the
-/// *live* store, and the first thing a daemon does is sync: `herdr::panes()`
-/// answers with nothing, and `reap_bindings` takes every binding in the real
-/// store with it. One line of environment between a test instance and everyone
-/// else's claims.
-///
-/// The rule is narrow on purpose. A daemon on the default socket is the
-/// ordinary one and is never refused, whatever its store. Only a daemon that is
-/// somewhere else has to say which store it is for — and it has to say *both*
-/// halves, because `WSP_HOME` alone leaves state at `~/.local/state/wsp`, which
-/// is where bindings and claims actually live (robustness-011).
-///
-/// # The socket decides, and `HERDR_SESSION` deliberately does not
-///
-/// There are two signals for "this is not the machine's herdr" and only one of
-/// them is ours. The socket path is a fact wsp can observe: this is where I am
-/// pointed, that is where the default is, they differ. `HERDR_SESSION` is
-/// herdr's own vocabulary — herdr calls the main session `default`, and if a
-/// server ever exported `HERDR_SESSION=default` to its `[[startup]]` plugins,
-/// a predicate that read it would refuse the *real* daemon on every herdr
-/// restart, and nobody would notice until claims stopped syncing. It does not
-/// today: neither the live daemon nor any live pane carries the variable, while
-/// a `--session` pane does.
-///
-/// So it stays in the message, where `herdr session `wsp-w1`` beats a path for
-/// telling you what you are looking at, and out of the predicate. The general
-/// rule, which is the argument of robustness-017: given two signals for the same
-/// question, prefer the one that survives the backend changing. Anything that
-/// is herdr's naming convention rather than an observable fact is something
-/// herdr can change without telling us, and something a different backend would
-/// not have at all — so the next person reading this should not re-add the
-/// session check as an obvious improvement.
-fn misdirected(
-    session: Option<&str>,
-    socket: Option<&str>,
-    home: Option<&str>,
-    state: Option<&str>,
-) -> Option<String> {
-    let default_socket = crate::util::home().join(".config/herdr/herdr.sock");
-    let elsewhere = socket
-        .map(|s| !s.trim().is_empty() && std::path::Path::new(s) != default_socket)
-        .unwrap_or(false);
-    if !elsewhere {
-        return None;
-    }
-    let told = |v: Option<&str>| v.map(|s| !s.trim().is_empty()).unwrap_or(false);
-    if told(home) && told(state) {
-        return None;
-    }
-    let which = match session {
-        Some(s) if !s.trim().is_empty() => format!("herdr session `{}`", s.trim()),
-        _ => format!("the herdr at {}", socket.unwrap_or("")),
-    };
-    Some(format!(
-        "refusing to run against {}: it is not this machine's herdr, and no WSP_HOME/WSP_STATE says which store it is for.\n\
-         wsp: a daemon started by another herdr would run the cycle and the repairs on the live store.\n\
-         wsp: set both, or start the session with `wsp sandbox`, which does.",
-        which
-    ))
 }
 
 // ---- one daemon per store ---------------------------------------------------
 //
 // Two of these ran for forty-two hours and nothing noticed (t-260817-052). One
-// was started by hand on the 15th with `-v`, survived herdr's death still
-// retrying its socket, and was still there when herdr came back and its
-// `[[startup]]` hook started a second. So the trigger is not carelessness: it is
-// any crash or restart, and the hand-started daemon that outlives the terminal
-// it was typed in is the ordinary way to get one.
+// was started by hand on the 15th with `-v`, outlived the session that started
+// it, and was still there when a startup hook started a second. So the trigger
+// is not carelessness: it is any crash or restart, and the hand-started daemon
+// that outlives the terminal it was typed in is the ordinary way to get one.
 //
-// Both then do everything twice against one store and one herdr: push tokens,
-// refresh TTLs, and reap. `sync` reaps bindings against the pane list herdr
-// answers with, and render-040 is the record of what one wrong reap costs.
+// Both then do everything twice against one store: refresh TTLs, run the
+// cycle, and repair. render-040 is the record of what one wrong reap costs.
 // The loser of any race is silent, which is why forty-two hours passed.
 //
 // # Refuse, not take over
@@ -212,8 +128,6 @@ fn misdirected(
 // *verified live* daemon on this store, and for that one there is no scenario
 // where the newcomer is the more correct process:
 //
-// - A newcomer pointed at the wrong herdr or an unnamed store is already
-//   refused, earlier and for a sharper reason — see `misdirected`.
 // - An incumbent running old code already replaces itself; see `reload`.
 //
 // What taking over would add is killing a working process on the strength of a
@@ -292,8 +206,7 @@ fn is_daemon(rest: &str) -> bool {
 }
 
 /// Is this `ps -E` line `wsp <sub>`? The same reading, for a subcommand that
-/// is not the daemon — see [`surface_drawing`], which is the other long-lived
-/// wsp process on a machine.
+/// is not the daemon.
 fn is_wsp(rest: &str, sub: &str) -> bool {
     let mut words = argv(rest);
     // `-v` and anything after it are somebody's flags, not our business.
@@ -340,7 +253,7 @@ pub(crate) fn state_of(rest: &str) -> PathBuf {
 /// process list could not be read at all — which no caller may read as "none",
 /// because a machine with no processes on it is a machine that cannot answer.
 pub(crate) fn running(state: &Path) -> Option<Vec<u32>> {
-    let all = crate::base::procs::processes();
+    let all = crate::host::Host::processes(&crate::host::LOCAL);
     if all.is_empty() {
         return None;
     }
@@ -363,92 +276,14 @@ fn daemons(all: &[(u32, u32, String)], me: u32, state: &Path) -> Vec<u32> {
         .collect()
 }
 
-/// Is a `wsp surface` drawing this store's sidebar?
-///
-/// The question `panel install` and its auto-install have to ask, and the
-/// answer that keeps the two surfaces from running at once: a surface *is* the
-/// panel on that screen, so splitting a second one into a pane is the old way
-/// arriving beside the new one — and it arrives by stealing the screen, which
-/// is `fork-002`.
-///
-/// Asked of the process list rather than of a marker wsp writes, because the
-/// fact wanted is "is one running now", and a file saying so outlives the
-/// process that wrote it — through a herdr that was killed, a crash, or a fork
-/// somebody has stopped running. There is nothing to go stale here.
-///
-/// Ancestors are **not** excluded, and [`running`] no longer excludes them
-/// either: the caller is usually a `wsp` the surface itself started — the
-/// plugin hook under a workspace the sidebar's `O` created — and the surface being our own parent
-/// is the case this exists to catch rather than the case to filter out.
-///
-/// A `ps` that will not answer reads as "no surface", which is the same way
-/// round as before this existed: an unanswerable process list should not stop
-/// a panel being installed on a machine that has no fork on it at all.
-pub(crate) fn surface_drawing(state: &Path) -> bool {
-    crate::base::procs::processes()
-        .iter()
-        .any(|(_, _, rest)| is_wsp(rest, "surface") && for_store(rest, state))
-}
-
-/// The panes of this machine that still have a wsp of this store's running in
-/// them, or `None` when the process list could not be read at all.
-///
-/// The question behind it is "is this pane still a panel, or only the shape one
-/// left" — a husk, in `render-074`'s words. herdr restores a *layout* across a
-/// restart, so a pane labelled `wsp` outlives the panel that was in it, and
-/// there is nothing in herdr's answer to tell the two apart: the label is the
-/// same, the tab is the same, and the pane is the same size it always was.
-///
-/// A running process is the fact that does distinguish them, and the panel puts
-/// one in the pane it owns — `install_one` `exec`s over the shell, and a reload
-/// `exec`s again over itself, so from the pane's first frame to its last there
-/// is a `wsp` there with `HERDR_PANE_ID` in its environment. `ps -E` prints
-/// that environment beside the command, which is what makes this answerable
-/// without asking herdr anything it does not know.
-///
-/// **`None` is not "no panes".** The one caller closes panes on the strength of
-/// this, and a `ps` that would not answer must never read as "nothing is
-/// running anywhere" — that is a list of every panel on the machine to close.
-/// Same rule, same reason, as [`running`].
-pub(crate) fn wsp_panes(state: &Path) -> Option<std::collections::HashSet<String>> {
-    let all = crate::base::procs::processes();
-    if all.is_empty() {
-        return None;
-    }
-    Some(manned(&all, state))
-}
-
-/// That reading of a process list, without the list. Any subcommand, not just
-/// `panel`: the detail pane, the board and the fullscreen tree are ours too and
-/// are drawn by other words, and what is being asked is whether *anything* of
-/// ours is alive in there.
-fn manned(all: &[(u32, u32, String)], state: &Path) -> std::collections::HashSet<String> {
-    all.iter()
-        .filter(|(_, _, rest)| is_exe(argv(rest).next()) && for_store(rest, state))
-        .filter_map(|(_, _, rest)| pane_of(rest))
-        .collect()
-}
-
-/// The pane a process is running in, from the environment `ps -E` appends.
-fn pane_of(rest: &str) -> Option<String> {
-    rest.split_whitespace()
-        .find_map(|w| w.strip_prefix("HERDR_PANE_ID="))
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-}
-
 /// Has anything on this machine that wants a daemon answered?
 ///
 /// The gate on [`loud`], and one function rather than four ad-hoc readings of
 /// "is this machine doing anything".
 ///
-/// It used to be `herdr`'s own census, which was the right question on a
-/// machine where herdr was the only backend and the wrong one here: this
-/// machine runs compound, herdr is not on it, and `doctor` therefore said
-/// nothing about a daemon that had been gone for a week while `wip`, a brief's
-/// seat line and `wsp watch --status` all said it loudly. One predicate, four
-/// call sites — and four call sites that had drifted into three answers is the
-/// failure the doc on [`loud`] claims not to have.
+/// It is asked of every local backend: one predicate, four call sites — and
+/// four call sites that had drifted into three answers is the failure the doc
+/// on [`loud`] claims not to have.
 pub(crate) fn a_backend_answered() -> bool {
     crate::place::local_backends().iter().any(|b| b.census().is_ok())
 }
@@ -456,7 +291,7 @@ pub(crate) fn a_backend_answered() -> bool {
 /// The one sentence four surfaces show when this machine has no daemon.
 ///
 /// **`wsp-145`, and why it is a function and not a paragraph.** The daemon was
-/// started by herdr's `[[startup]]` and herdr stopped being on this machine, so
+/// started by a startup hook that stopped being on this machine, so
 /// nothing was starting it — and the one surface that *did* notice was
 /// `wsp doctor`, which nobody runs unless something is already wrong. For six
 /// days the symptom was silence from a watchdog, and `wsp watch --status` said
@@ -479,7 +314,7 @@ pub(crate) fn a_backend_answered() -> bool {
 /// `None` for `running` says nothing, for [`health`]'s reason: a `ps` that will
 /// not answer is not an empty machine, and "no daemon running" would send
 /// somebody to start a second one. `backend_up` is `health`'s own gate — a
-/// machine with no herdr and nothing to spawn onto wants no daemon, and is told
+/// machine with nothing to spawn onto wants no daemon, and is told
 /// nothing.
 pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> {
     match running {
@@ -489,6 +324,55 @@ pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> 
         ),
         _ => None,
     }
+}
+
+/// The tailnet addresses `tailscale ip` names. The manager's parse
+/// (`wsp_manager::tailnet_addrs`), copied: the root links neither the manager
+/// nor the host crate outside tests.
+fn tailnet_addrs() -> Vec<std::net::IpAddr> {
+    let out = std::process::Command::new("tailscale").arg("ip").output().ok().filter(|o| o.status.success());
+    let Some(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<std::net::IpAddr>().ok())
+        .filter(|ip| wsp_server::allowed(ip) && !ip.is_loopback())
+        .collect()
+}
+
+/// What `start_api` started; ended with the daemon.
+pub(crate) struct Api {
+    pub(crate) db: wsp_server::SharedStore,
+    _server: Option<wsp_server::Server>,
+    _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+}
+
+/// Open `state.db`, serve it, and start the mirror thread. Each failure is one
+/// `cycle.log` line and the rest goes on.
+pub(crate) fn start_api(store: &Store) -> Option<Api> {
+    if crate::mirror::api_off() {
+        return None;
+    }
+    let say = |line: String| wsp_store::store::log_line(store, &line);
+    let db: wsp_server::SharedStore =
+        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), std::sync::Arc::new(wsp_server::Mirror)) {
+            Ok(db) => std::sync::Arc::new(db),
+            Err(e) => {
+                say(format!("api: state.db did not open ({e:?}); the daemon runs without the API"));
+                return None;
+            }
+        };
+    let mut cfg = wsp_server::Config::new(&store.state);
+    cfg.port = crate::mirror::api_port();
+    cfg.addrs = tailnet_addrs();
+    let server = match wsp_server::Server::start(db.clone(), cfg) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            say(format!("api: the server did not start ({e}); the mirror runs on"));
+            None
+        }
+    };
+    let mirror = Some(crate::mirror::start(store, db.clone()));
+    Some(Api { db, _server: server, _mirror: mirror })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -505,7 +389,7 @@ pub(crate) fn loud(running: Option<&[u32]>, backend_up: bool) -> Option<String> 
 pub(crate) fn health(
     holder: Option<u32>,
     running: Option<&[u32]>,
-    herdr_up: bool,
+    backend_up: bool,
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
@@ -520,7 +404,7 @@ pub(crate) fn health(
             // a person who is told it in one place and finds it missing in the
             // next is not being given two truths, and `wsp-145` is not paid for
             // four times in wording.
-            notes.extend(loud(Some(running), herdr_up));
+            notes.extend(loud(Some(running), backend_up));
         }
         [one] => match holder == Some(*one) {
             true => notes.push(format!("daemon up, pid {one}")),
@@ -617,15 +501,6 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // Before anything is spawned: a child here already is one the image before
     // an `exec`-reload started, whose reaping thread the exec ended (wsp-667).
     adopt_carried_over(store);
-    if let Some(why) = misdirected(
-        std::env::var("HERDR_SESSION").ok().as_deref(),
-        std::env::var("HERDR_SOCKET_PATH").ok().as_deref(),
-        std::env::var("WSP_HOME").ok().as_deref(),
-        std::env::var("WSP_STATE").ok().as_deref(),
-    ) {
-        eprintln!("wsp: {why}");
-        return 2;
-    }
     let backend_ok: Vec<bool> =
         crate::place::local_backends().iter().map(|b| b.census().is_ok()).collect();
     if nothing_answered(&backend_ok) {
@@ -633,7 +508,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         return 1;
     }
 
-    // Third gate, and after the other two on purpose: a daemon that is going to
+    // Second gate, and after the first on purpose: a daemon that is going to
     // refuse for a sharper reason should never have written itself into the
     // marker, and one with nothing at all to run for is not the daemon this
     // store wants to be holding it.
@@ -678,6 +553,16 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // So the signal is caught, and the masters are asked to exit before we do.
     reap_on_term(store);
 
+    // Under `WSP_HOST=manager`, the manager's events on a thread of their own,
+    // not paced by the tick (`docs/agent-manager.md` 3.4; wsp-028): each is
+    // folded into the store's files as it comes. Under `inproc`, nothing.
+
+    // The state core's database, its API and the mirror of the files into it
+    // (wsp-075). Beside everything else the daemon does; `WSP_API=off` starts
+    // none of it, and nothing here ends the run.
+    let _api = start_api(store);
+    let _fold = crate::fold::start(store, _api.as_ref().map(|a| a.db.clone()));
+
     // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.
     let mut tunnels = Supervisor::new();
@@ -690,13 +575,14 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // conditions that raise no event, and sharing a gate with a pass that *does*
     // would tie "somebody woke us" to "a member's agent exited".
     let mut repair_pass = crate::repair::Pass::new();
+    // When seats' resident memory was last sampled (`wsp-066`).
+    let mut memory_at = 0i64;
     // What we are executing, so we can notice an `install` landing underneath
     // us. See `reload` at the top of the loop.
     let mut started_as = crate::util::exe_stamp();
 
-    // Claims and worked records for tasks that no longer exist. Store-only:
-    // the herdr reconcile that used to run beside this was dead on a machine
-    // with no herdr (`wsp-544`).
+    // Claims and worked records for tasks that no longer exist. Store-only
+    // (`wsp-544`).
     let live: Vec<String> = store.tasks().into_iter().map(|t| t.id).collect();
     let dropped = store.reap_claims(&live) + store.reap_worked(&live);
     if verbose && dropped > 0 {
@@ -738,6 +624,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // work, and is left out of it.
         wsp_base::calls::tick_begin();
         crate::place_compound::tick_deliver_budget(true);
+        // The liveness stamp, at the top of the pass so a slow pass still
+        // reads as ticking (wsp-035).
+        store.stamp_daemon_tick(crate::util::epoch_secs());
         wsp_base::calls::phase("standing");
         // Whatever this process spawned and nothing waited for is a `<defunct>`
         // entry until the daemon exits, which is days (wsp-664).
@@ -747,7 +636,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // to it: an hour with no reaper and no `<defunct>` child (wsp-667 d1).
         let reap = match reaper_off() {
             true => Default::default(),
-            false => wsp_base::calls::reap_defunct(),
+            false => wsp_base::calls::reap_defunct_with(|| crate::host::LOCAL.own_defunct()),
         };
         for (pid, line) in &reap.reaped {
             crate::store::log_line(store, &format!("daemon: reaped defunct child {pid}, nothing was waiting on it: {line}"));
@@ -861,6 +750,14 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             }
         }
 
+        // Seats gone with nothing to say leave the state core and the files
+        // that name them, every tick (wsp-094): what a machine restart left
+        // clears on the first tick after it.
+        if let Some(api) = &_api {
+            wsp_base::calls::phase("sweep:mute-seats");
+            store.steady(|| crate::fold::sweep_mute(store, &api.db, |seats| crate::cmd_agent::mute_seats(store, seats)));
+        }
+
         // **The run's own steps, and the repairs, on the same timer** — `wsp-147`.
         //
         // On a timer for the reason the attention pass is: a member whose
@@ -876,18 +773,53 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // daemon stderr line nobody has attached to would be a second place to
         // look for the same answer.
         if repair_pass.due(now) {
-            store.steady(|| crate::repair::tick(store, &crate::cycle::Fleet, &mut repair_pass));
-            // A pane whose seat has ended, its agent gone (`wsp-637`).
-            wsp_base::calls::phase("sweep:ended-panes");
-            store.steady(|| crate::ended_panes::tidy(store));
-            // Answered retro questions plan their list (`wsp-472`); idempotent.
-            wsp_base::calls::phase("retro");
-            store.steady(|| crate::retro_series::sweep(store));
+            repairs(store, &crate::cycle::Fleet, &mut repair_pass);
+        }
+
+        // Every seated agent's resident memory, on its own interval, so a
+        // retro can read what a seat held over its seated time after the seat
+        // is gone (`wsp-066`).
+        if now - memory_at >= crate::memory::SAMPLE_EVERY {
+            memory_at = now;
+            wsp_base::calls::phase("seat-memory");
+            sample_seat_memory(store, now);
         }
 
         crate::place_compound::tick_deliver_budget(false);
         wsp_base::calls::tick_end();
     }
+}
+
+/// One sample of every seated agent's resident memory into
+/// `seat-memory.json`: off the managers' `seats` replies under
+/// `WSP_HOST=manager`, else one `ps` over the local backends' census.
+fn sample_seat_memory(store: &Store, now: i64) {
+    if crate::host_tcp::Choice::from_env() == Ok(crate::host_tcp::Choice::Manager) {
+        let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        let rss: std::collections::BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
+        crate::memory::sample_rss(&store.state, &rss, now);
+        return;
+    }
+    let agents: Vec<crate::place::Seated> =
+        crate::place::local_backends().iter().filter_map(|b| b.census().ok()).flat_map(|c| c.seats().cloned().collect::<Vec<_>>()).collect();
+    crate::memory::sample(&store.state, &agents, || crate::host::Host::seat_memory(&crate::host::LOCAL), now);
+}
+
+/// The repair pass, and the sweeps after it, as one tick runs them.
+///
+/// **Under `WSP_HOST=manager`** (wsp-028, `docs/agent-manager.md` 4.3) the
+/// manager's `seat.stopped` is the cause `sweep:ended-panes` looked for, and it
+/// is folded ([`crate::fold`]): the phase does not run, and is not marked.
+fn repairs(store: &Store, seats: &dyn crate::cycle::Seats, pass: &mut crate::repair::Pass) {
+    store.steady(|| crate::repair::tick(store, seats, pass));
+    // A pane whose seat has ended, its agent gone (`wsp-637`).
+    if !crate::fold::under_manager() {
+        wsp_base::calls::phase("sweep:ended-panes");
+        store.steady(|| crate::ended_panes::tidy(store));
+    }
+    // Answered retro questions plan their list (`wsp-472`); idempotent.
+    wsp_base::calls::phase("retro");
+    store.steady(|| crate::retro_series::sweep(store));
 }
 
 /// The verbs this module answers to, each with the help it carries. `main` and
@@ -938,126 +870,21 @@ mod tests {
 
     use super::*;
 
-    /// The gate this replaces refused every start with no herdr socket, which
-    /// since `compound-112` is the ordinary machine. One backend answering —
+    /// One backend answering —
     /// compound's local directory, which never fails to survey — is enough to
     /// run for; only every backend failing is "nothing to run for".
     #[test]
     fn the_daemon_runs_if_any_local_backend_answers() {
-        assert!(!nothing_answered(&[true, false]), "herdr down, compound up, refused anyway");
+        assert!(!nothing_answered(&[true, false]), "one down, one up, refused anyway");
         assert!(!nothing_answered(&[false, true]), "order should not matter");
         assert!(!nothing_answered(&[true, true]));
         assert!(nothing_answered(&[false, false]), "nothing answering was let through");
         assert!(nothing_answered(&[]), "an empty backend list answered for nobody");
     }
 
-    /// The husk test's evidence, and the field it is read out of: `ps -E`
-    /// prints the command and the environment as one blob, so the pane a
-    /// process is in is there to be had without asking herdr — which could not
-    /// answer it anyway, since herdr's pane knows its label and not what is
-    /// running inside it.
-    #[test]
-    fn a_panel_is_found_by_the_pane_its_environment_names() {
-        let state = Store::default_state();
-        let line = |s: &str| vec![(1u32, 1u32, s.to_string())];
-
-        assert_eq!(
-            manned(&line("/usr/local/bin/wsp panel HERDR_PANE_ID=w1:p2 SHELL=/bin/zsh"), &state),
-            ["w1:p2".to_string()].into_iter().collect()
-        );
-        // The board, the detail pane and the fullscreen tree are ours too, and
-        // are not `wsp panel`. Anything of ours in the pane holds it.
-        assert_eq!(
-            manned(&line("wsp detail t-1 HERDR_PANE_ID=w1:p3"), &state).len(),
-            1
-        );
-        // Somebody else's binary in a pane of ours says nothing about ours.
-        assert!(manned(&line("/bin/zsh -l HERDR_PANE_ID=w1:p6G"), &state).is_empty());
-        // A sandbox's panel is not this store's, and its pane is not one this
-        // store may close — the same filter that keeps `doctor` from crying
-        // wolf about a second daemon.
-        assert!(manned(
-            &line("wsp panel WSP_STATE=/tmp/sandbox/state HERDR_PANE_ID=w1:p2"),
-            &state
-        )
-        .is_empty());
-        // A wsp with no pane in its environment is a wsp somebody typed at a
-        // shell outside herdr. It holds nothing.
-        assert!(manned(&line("wsp panel"), &state).is_empty());
-    }
-
-    /// The guard that would have stopped robustness-021 on its own.
-    ///
-    /// A `wsp daemon` was started by a sandbox's herdr from the global
-    /// `plugins.json`, holding that session's socket and — because nobody told
-    /// it otherwise — the live store. Its first sync asks an empty herdr for
-    /// panes and reaps every binding in the real store against the answer.
-    ///
-    /// Both halves of the store have to be named, not just `WSP_HOME`: state is
-    /// where bindings and claims live, and a scratch store with live state is
-    /// the same accident wearing a different hat (robustness-011).
-    #[test]
-    fn a_daemon_on_somebody_elses_herdr_must_be_told_which_store() {
-        // Built from this machine's home rather than a literal: the rule is
-        // "not the default socket", and a test that had to set `HOME` to say so
-        // would be a test no other test could run beside.
-        let home = crate::util::home();
-        let sock = home.join(".config/herdr/sessions/wsp-w1/herdr.sock").display().to_string();
-        let default = home.join(".config/herdr/herdr.sock").display().to_string();
-        let (sock, default) = (sock.as_str(), default.as_str());
-
-        // Exactly what was found running: a session socket and no store.
-        assert!(
-            misdirected(Some("wsp-w1"), Some(sock), None, None).is_some(),
-            "the daemon that reaps the live store would have started"
-        );
-        // Half-told is not told: state is where bindings and claims are.
-        assert!(misdirected(Some("wsp-w1"), Some(sock), Some("/tmp/s/wsp"), None).is_some());
-        assert!(misdirected(Some("wsp-w1"), Some(sock), None, Some("/tmp/s/state")).is_some());
-        // A sandbox that says which instance it is, is what this is for.
-        assert!(
-            misdirected(Some("wsp-w1"), Some(sock), Some("/tmp/s/wsp"), Some("/tmp/s/state"))
-                .is_none(),
-            "a properly made sandbox was refused its own daemon"
-        );
-
-        // The ordinary daemon is never refused, whatever its store — this
-        // machine's herdr is the one case where the default store is right.
-        assert!(misdirected(None, None, None, None).is_none());
-        assert!(misdirected(None, Some(default), None, None).is_none());
-        assert!(misdirected(Some(""), Some(""), None, None).is_none());
-        // …including a deliberate non-default store on the real socket, which
-        // is `WSP_HOME=… wsp daemon` and nobody's accident.
-        assert!(misdirected(None, Some(default), Some("/tmp/s/wsp"), None).is_none());
-
-        // A socket somewhere else with no session name is the same danger: the
-        // socket is what decides, and it is the half wsp can observe for itself.
-        assert!(misdirected(None, Some("/tmp/somewhere/herdr.sock"), None, None).is_some());
-
-        // …and a session name on the *default* socket is not, however it is
-        // spelled. herdr calls the main session `default`, so a server that one
-        // day exported `HERDR_SESSION` to its startup plugins would otherwise
-        // have this refuse the real daemon on every restart — a naming
-        // convention we do not own deciding whether the machine syncs.
-        for named in ["default", "wsp-w1", "anything at all"] {
-            assert!(
-                misdirected(Some(named), Some(default), None, None).is_none(),
-                "HERDR_SESSION={named} on this machine's own socket refused the ordinary daemon"
-            );
-            assert!(misdirected(Some(named), None, None, None).is_none());
-        }
-        // The name is still what the message leads with, because it is better
-        // diagnostics than a path.
-        assert!(
-            misdirected(Some("wsp-w1"), Some(sock), None, None)
-                .is_some_and(|m| m.contains("herdr session `wsp-w1`")),
-            "the refusal stopped saying which session it was about"
-        );
-    }
-
     /// The marker a crash leaves behind must never be the reason a machine has
-    /// no daemon. This is the case t-260817-052 says will happen most: herdr
-    /// died, its daemon did not, and the pid in the marker is not there any more
+    /// no daemon. This is the case t-260817-052 says will happen most: the
+    /// session died, its daemon did not, and the pid in the marker is not there any more
     /// — or, on the 15th's numbers coming round again, is something else
     /// entirely wearing that pid.
     #[test]
@@ -1084,7 +911,7 @@ mod tests {
     /// backend is up and which has no daemon, said out loud.
     ///
     /// Both exclusions are load-bearing rather than politeness. A machine with
-    /// no herdr and nothing to spawn onto does not need a daemon, and telling
+    /// nothing to spawn onto does not need a daemon, and telling
     /// it one is missing is a line in the most expensive output wsp has, on a
     /// machine where it is false. And a `ps` that would not answer is not an
     /// empty machine — `health` has always refused to read it that way, because
@@ -1099,8 +926,7 @@ mod tests {
 
     /// The one case that is a real contest, and the house answer to it. The
     /// incumbent is running and answering, so the newcomer is not more correct
-    /// than it: a newcomer on the wrong herdr was refused earlier by
-    /// `misdirected`, and an incumbent on an old binary replaces itself.
+    /// than it: an incumbent on an old binary replaces itself.
     #[test]
     fn a_second_daemon_on_a_store_a_live_one_holds_refuses_and_says_which_pid() {
         assert_eq!(claim(Some(22121), 88994, Some(&[22121])), Claim::Refuse(22121));
@@ -1139,7 +965,7 @@ mod tests {
         assert!(is_daemon("wsp daemon"));
         // Flags are somebody's business and not ours: `-v` is how the daemon
         // found on the 15th had been started.
-        assert!(is_daemon("/Users/e/.local/bin/wsp daemon -v HERDR_SESSION=default"));
+        assert!(is_daemon("/Users/e/.local/bin/wsp daemon -v WSP_HOME=/tmp/s"));
 
         assert!(!is_daemon("/Users/e/.local/bin/wsp panel PATH=/usr/bin"));
         assert!(!is_daemon("wsp"));
@@ -1196,9 +1022,9 @@ mod tests {
     /// daemon has a problem.
     #[test]
     fn doctor_calls_two_daemons_a_problem_and_one_a_note() {
-        let check = |holder: Option<u32>, running: Option<&[u32]>, herdr_up: bool| {
+        let check = |holder: Option<u32>, running: Option<&[u32]>, backend_up: bool| {
             let (mut p, mut n) = (Vec::new(), Vec::new());
-            health(holder, running, herdr_up, &mut p, &mut n);
+            health(holder, running, backend_up, &mut p, &mut n);
             (p, n)
         };
 
@@ -1226,10 +1052,10 @@ mod tests {
             assert_eq!(notes.len(), 1, "one daemon said more than one line about itself");
         }
 
-        // None, and whether that is worth saying. A machine with no herdr on it
-        // is a machine wsp works on and does not want a daemon for.
-        assert_eq!(check(None, Some(&[]), true).1.len(), 1, "a herdr with no daemon went unsaid");
-        assert!(check(None, Some(&[]), false).1.is_empty(), "a machine with no herdr was told to run a daemon");
+        // None, and whether that is worth saying. A machine with no backend on
+        // it is a machine wsp works on and does not want a daemon for.
+        assert_eq!(check(None, Some(&[]), true).1.len(), 1, "a backend with no daemon went unsaid");
+        assert!(check(None, Some(&[]), false).1.is_empty(), "a machine with no backend was told to run a daemon");
 
         // And the answer we do not have. `ps` refusing is not an empty machine.
         let (problems, notes) = check(Some(88994), None, true);
@@ -1264,5 +1090,245 @@ mod tests {
             Some((101, 1_800_000_000)),
             "a reinstall inside the same second was not noticed"
         );
+    }
+
+    /// The tick under `WSP_HOST=manager` and under `inproc` (wsp-028, leg 2).
+    mod tick_by_host {
+        use super::super::repairs;
+        use crate::fold;
+        use crate::place::State;
+        use crate::store::Store;
+        use crate::util;
+        use serde_json::Value;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        use wsp_host_api::{
+            At, Beat, DiskFree, Epoch, Frame, HostFacts, Key, MemoryPressure, Message, OrderFail, OrderId, OrderRefused, RowId,
+            SeatDid, SeatId, SeatStarted, SeatStopped, SeatStuck, Thermal, Turn, TurnEdge, FileRef, HostId,
+        };
+        use wsp_manager::{Config, Manager, TOKEN_FILE};
+
+        const HOST: &str = "tick-host";
+        /// The probes a tick under the manager runs none of.
+        const PROBES: &[&str] = &["ps", "df", "compound-render", "lsof", "sysctl", "vm_stat", "memory_pressure", "pmset", "ioreg"];
+        const WAIT: &str = "until ! pgrep -f 'cargo test'; do sleep 5; done";
+
+        /// `WSP_HOST` for one test, put back however it ends. Taken after
+        /// [`util::isolated`], whose lock it is held under.
+        struct HostVar;
+        impl HostVar {
+            fn set(v: &str) -> HostVar {
+                std::env::set_var(wsp_wire::host_tcp::ENV, v);
+                HostVar
+            }
+        }
+        impl Drop for HostVar {
+            fn drop(&mut self) {
+                std::env::remove_var(wsp_wire::host_tcp::ENV);
+            }
+        }
+
+        /// The stuck seat mid-turn; every other seat unreadable.
+        struct Seats;
+        impl crate::cycle::Seats for Seats {
+            fn state(&self, seat: &str) -> Option<State> {
+                (seat == "cpd-t1").then_some(State::Working)
+            }
+        }
+
+        fn ms(secs: i64) -> At {
+            At(secs as u64 * 1000)
+        }
+
+        fn started(seat: &str, row: &str) -> Message {
+            Message::SeatStarted(SeatStarted {
+                key: Key { row: RowId(row.into()), attempt: 1 },
+                seat: SeatId(seat.into()),
+                epoch: Epoch(1),
+                pid: 4242,
+                sockets: vec![],
+            })
+        }
+
+        /// A manager on loopback, the machine record naming it, and the
+        /// daemon's fold thread on it; its first beat (its own probes, in this
+        /// process) folded before anything is counted.
+        fn manager(store: &Store, exec: &std::path::Path) -> (Manager, std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+            let mut cfg = Config::new(exec, HOST);
+            cfg.port = 0;
+            cfg.beat = Duration::from_secs(3600);
+            let m = Manager::start(cfg).expect("the manager starts on loopback");
+            let token = std::fs::read_to_string(exec.join(TOKEN_FILE)).unwrap();
+            let local = crate::manager::Local {
+                host: HOST.into(),
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: m.addrs()[0].port(),
+                exec_dir: exec.to_path_buf(),
+            };
+            crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
+            let (thread, stop) = fold::start(store, None).expect("under WSP_HOST=manager with a record, the fold runs");
+            let start = Instant::now();
+            while !fold::beat_path(&store.state, HOST).exists() {
+                assert!(start.elapsed() < Duration::from_secs(10), "no beat folded within 10s");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            (m, thread, stop)
+        }
+
+        /// The scripted stream, folded by the daemon's thread: a seat started,
+        /// mid-turn, its digest, stuck on itself, an order refused; a second
+        /// seat started and stopped. Then the beat the sweeps read: one volume
+        /// low, the load over the line.
+        fn script(store: &Store, m: &Manager) {
+            let now = util::epoch_secs();
+            let t1 = SeatId("cpd-t1".into());
+            let msgs = vec![
+                started("cpd-t1", "wsp-t1"),
+                Message::Turn(Turn { seat: t1.clone(), epoch: Epoch(1), edge: TurnEdge::Began, at: ms(now - 100), order: None }),
+                Message::SeatDid(SeatDid {
+                    seat: t1.clone(),
+                    epoch: Epoch(1),
+                    at: ms(now - 90),
+                    digest: "- **ran:** cargo test fold:: · failed → passed\n- **read:** src/fold.rs".into(),
+                    transcript: FileRef { host: HostId(HOST.into()), path: "/t.jsonl".into() },
+                }),
+                Message::SeatStuck(SeatStuck { seat: t1.clone(), epoch: Epoch(1), command: WAIT.into(), waited_secs: 80 }),
+                Message::OrderRefused(OrderRefused { order: OrderId("o-1".into()), seat: t1.clone(), why: OrderFail::Refused }),
+                started("cpd-t2", "wsp-t2"),
+                Message::SeatStopped(SeatStopped { seat: SeatId("cpd-t2".into()), epoch: Epoch(1), exit: Some(0), ended: vec![4243], renderer_left: false }),
+            ];
+            let last = msgs.into_iter().map(|msg| m.emit(msg).unwrap()).last().unwrap();
+            let start = Instant::now();
+            while fold::read_folded(&store.state, HOST) != Some(last) {
+                assert!(start.elapsed() < Duration::from_secs(10), "the stream was not folded within 10s");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let facts = HostFacts {
+                load_centi: 4000,
+                cpus: 4,
+                memory: MemoryPressure::Normal,
+                swap_used_bytes: 0,
+                disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
+                thermal: Thermal::Nominal,
+                load5_centi: None,
+                load15_centi: None,
+                speed_limit_pct: None,
+                hid_idle_secs: None,
+                free_memory_bytes: None,
+                pageouts: None,
+            };
+            let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: ms(now), host: Some(facts), seats: vec![] }) };
+            assert!(fold::fold(store, HOST, &beat));
+        }
+
+        /// One tick of the repair pass and its sweeps, as the daemon runs it;
+        /// its line in the call log.
+        fn tick(store: &Store) -> Value {
+            wsp_base::calls::tick_begin();
+            wsp_base::calls::phase("standing");
+            repairs(store, &Seats, &mut crate::repair::Pass::new());
+            wsp_base::calls::tick_end();
+            let ticks: Vec<Value> = wsp_base::calls::read_all(&store.state)
+                .into_iter()
+                .filter(|l| l["k"] == "tick" && l["phases"].get("retro").is_some())
+                .collect();
+            assert_eq!(ticks.len(), 1, "{ticks:?}");
+            ticks.into_iter().next().unwrap()
+        }
+
+        fn cycle_log(store: &Store) -> String {
+            std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
+        }
+
+        /// wsp-028's second leg, its done-when: under `manager` the tick runs
+        /// against a loopback manager's scripted events; no `ps`, render or
+        /// `df` (nor the throttle's probes) is in the call log for it;
+        /// `repair:unsent` and `sweep:ended-panes` do not run; and disk,
+        /// throttle, ending and stuck read the folded facts.
+        #[test]
+        fn under_the_manager_the_tick_reads_the_folded_events_and_probes_nothing() {
+            let env = util::isolated("tick-manager");
+            let _host = HostVar::set("manager");
+            let store = Store::open();
+            let exec = env.state().join("exec");
+            let (m, thread, stop) = manager(&store, &exec);
+            script(&store, &m);
+
+            let line = tick(&store);
+            for probe in PROBES {
+                assert!(line["children"].get(probe).is_none(), "{probe} ran: {}", line["children"]);
+            }
+            for gone in ["repair:unsent", "sweep:ended-panes"] {
+                assert!(line["phases"].get(gone).is_none(), "{gone} ran: {}", line["phases"]);
+            }
+            for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
+                assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
+            }
+
+            // sweep:throttle: the beat's load, 40 on 4 cores, is over the line.
+            let log = cycle_log(&store);
+            assert!(log.contains("load is 40.0 (1m)") && log.contains("on 4 cores"), "{log}");
+            // sweep:disk: the beat's volume, and only it.
+            let disks = crate::disk::read(&store, crate::disk::LOW, false);
+            assert_eq!(disks.iter().map(|d| (d.volume.as_str(), d.low())).collect::<Vec<_>>(), [("/Volumes/Scripted", true)]);
+            // The stuck tick: the manager's `seat.stuck`, recorded and said.
+            let stuck = crate::repair::stuck_seats(&store);
+            assert_eq!(stuck.get("cpd-t1").map(|(k, _)| *k), Some(crate::stuck::Kind::SelfWait), "{stuck:?}");
+            assert!(log.contains("cpd-t1: a command has been") && log.contains(WAIT), "{log}");
+            // ending:verification: the seat's digest, not a transcript.
+            let did = crate::cmd_agent::did_of_seat(&store, "cpd-t1", &util::iso_at(util::epoch_secs() - 600)).expect("the digest is read");
+            assert_eq!((did.ran.len(), did.ran[0].last(), did.read.files.len()), (1, crate::did::Outcome::Passed, 1));
+            assert!(crate::cmd_agent::did_of_seat(&store, "cpd-t1", &util::now_iso()).is_none(), "a digest before `since` is not read");
+
+            // A second tick: the stall is the same one, said once.
+            tick_again(&store);
+            assert_eq!(cycle_log(&store).matches("cpd-t1: a command has been").count(), 1, "{}", cycle_log(&store));
+
+            stop.store(true, Ordering::SeqCst);
+            m.stop();
+            let _ = thread.join();
+        }
+
+        /// The second tick, its line left uncounted by [`tick`]'s filter.
+        fn tick_again(store: &Store) {
+            wsp_base::calls::tick_begin();
+            repairs(store, &Seats, &mut crate::repair::Pass::new());
+            wsp_base::calls::tick_end();
+        }
+
+        /// The same tick under `inproc` runs as before: `repair:unsent` and
+        /// `sweep:ended-panes` run, and what a manager folded is not read.
+        #[test]
+        fn under_inproc_the_tick_runs_as_before_and_reads_nothing_folded() {
+            let _env = util::isolated("tick-inproc");
+            let _host = HostVar::set("inproc");
+            let store = Store::open();
+            assert!(fold::start(&store, None).is_none(), "no fold under inproc");
+            // Files a manager would have left: none of them is read here.
+            let facts = HostFacts {
+                load_centi: 4000,
+                cpus: 4,
+                memory: MemoryPressure::Normal,
+                swap_used_bytes: 0,
+                disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
+                thermal: Thermal::Nominal,
+                load5_centi: None,
+                load15_centi: None,
+                speed_limit_pct: None,
+                hid_idle_secs: None,
+                free_memory_bytes: None,
+                pageouts: None,
+            };
+            let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: At(1), host: Some(facts), seats: vec![] }) };
+            assert!(fold::fold(&store, HOST, &beat));
+            assert!(fold::facts(&store).is_none());
+
+            let line = tick(&store);
+            for ran in ["repair:unsent", "sweep:ended-panes", "sweep:disk", "sweep:throttle", "ending:verification", "retro"] {
+                assert!(line["phases"].get(ran).is_some(), "{ran} did not run: {}", line["phases"]);
+            }
+            assert!(!cycle_log(&store).contains("load is 40.0"), "{}", cycle_log(&store));
+            assert!(crate::disk::read(&store, crate::disk::LOW, false).iter().all(|d| d.volume != "/Volumes/Scripted"));
+        }
     }
 }

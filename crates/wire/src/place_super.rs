@@ -1,7 +1,7 @@
 //! A supervisor behind the place-work port: agents with no terminal at all,
 //! observed through the hook they fire rather than the screen they draw.
 //!
-//! The third implementor of `place.rs` and the second real one — `place_herdr`
+//! The third implementor of `place.rs` and the second real one — `place_backend`
 //! is a multiplexer and `fake` is a socket with a state in it. This one has no
 //! terminal anywhere: it forks a process, hands it a pipe, and learns what it is
 //! doing because the agent says so.
@@ -12,7 +12,7 @@
 //!
 //! # The boundary, which is the thing to hold
 //!
-//! **Not a multiplexer.** The moment it needs to host a terminal it is herdr and
+//! **Not a multiplexer.** The moment it needs to host a terminal it is backend and
 //! the point is lost. A person who wants to sit down in front of an agent this
 //! backend is running is a case it refuses, and refusing is correct.
 //!
@@ -79,7 +79,7 @@
 //! | `Stop` | end of the turn |
 //! | `SessionEnd` | +100ms after `SIGTERM` — it announces its own killing |
 //!
-//! Compare what that replaces. herdr decides an agent is working by matching a
+//! Compare what that replaces. backend decides an agent is working by matching a
 //! regex against a **spinner glyph** in the terminal title: rule
 //! `osc_title_working`, priority 1100, region `osc_title`, regex
 //! `^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}]`, with a hand-written comment saying
@@ -87,23 +87,23 @@
 //! manifest is versioned against Claude Code releases by hand, it was four days
 //! old against a build three patch versions ahead of it, and on 2026-08-17 it
 //! reported this project's own governor seat as working while it sat waiting for
-//! a person. That is not a criticism of herdr's detection — matching spinners is
+//! a person. That is not a criticism of backend's detection — matching spinners is
 //! a reasonable way to observe a program that will not tell you anything. It is
 //! the argument for not being that program.
 //!
-//! # What this backend is exact about, and herdr cannot be
+//! # What this backend is exact about, and backend cannot be
 //!
-//! - **[`State::Gone`].** An agent that has exited leaves herdr a pane that
-//!   looks like a shell somebody opened, so `place_herdr` can only raise `Gone`
+//! - **[`State::Gone`].** An agent that has exited leaves backend a pane that
+//!   looks like a shell somebody opened, so `place_backend` can only raise `Gone`
 //!   from the event stream and answers `Empty` from a listing. A supervisor
 //!   holds the pid: an agent that has stopped is `Gone`, a seat nobody started
 //!   is `Empty`, and there is no reading that confuses them.
-//! - **[`State::Starting`].** herdr's launch window is three seconds of looking
+//! - **[`State::Starting`].** backend's launch window is three seconds of looking
 //!   exactly like an idle agent, marked only by the *absence* of a field. Here
 //!   it is the interval between the fork and `SessionStart`, and it ends when
 //!   the agent says so.
 //! - **[`Place::start`] returns when the agent exists**, with nothing to wait
-//!   for: the fork either produced a pid or failed. herdr's adapter types a name
+//!   for: the fork either produced a pid or failed. backend's adapter types a name
 //!   at a shell that may not be listening, and pays a retry window, a retype and
 //!   a thirty-second appearance wait for the privilege.
 //!
@@ -115,7 +115,7 @@
 //! property of how an agent can be *observed*. Local Claude Code reports itself,
 //! which is this file; remote Claude Code is observed however the far side
 //! manages; a kind that offers nothing falls back to reading a screen, which is
-//! herdr. [`Place::open`] therefore refuses `Order::on` rather than pretending,
+//! backend. [`Place::open`] therefore refuses `Order::on` rather than pretending,
 //! and [`Recipe`] is the one place a kind's hosting is written down.
 //!
 //! # What an agent with nobody in front of it cannot be asked
@@ -158,10 +158,10 @@
 //! Ids are `sup-1`, `sup-2`, allocated by `O_EXCL` on the directory and never
 //! reused, and the counter that guarantees it survives the seat being ended. The
 //! rule is not tidiness, and it is the one place in this tree where the old
-//! belief about herdr was right: herdr does hand workspace ids out again, and
+//! belief about backend was right: backend does hand workspace ids out again, and
 //! the README's oldest complaint is that a claim naming a closed one is *waiting
 //! to attach itself to whatever takes the id next*. Measured 2026-08-19
-//! (`robustness-084`) — herdr's counter is process-local, so a restart reserves
+//! (`robustness-084`) — backend's counter is process-local, so a restart reserves
 //! only one above the highest workspace that survived and every id above that
 //! mark is reissued. This counter is on disk instead, in the same directory as
 //! the claims that could point at it, so an id can only come round again once
@@ -177,18 +177,32 @@
 //! daemon and is named here so it is chosen rather than inherited.
 
 // [`Place::census`] and [`Place::watch`] have no caller outside the tests yet —
-// the daemon and `sync` are herdr's for now — for the same reason `place_herdr`
+// the daemon and `sync` are backend's for now — for the same reason `place_backend`
 // gives: a trait method a backend has never had to answer is a guess.
 #![allow(dead_code)]
 
-use crate::util::alive;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use wsp_base::calls::Command;
 use std::time::Duration;
+
+use crate::host::{self, Host};
+/// Moved to [`crate::host`] with the rest of the OS half; named here still for
+/// the callers that reach a seat's processes by this path.
+pub use crate::host::{one_ps, SPENT_FILE};
+/// The tests that read a process tree and end a group by hand. Product code
+/// asks [`Host`] (`tests/host_seam.rs`).
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::host::{signal_group, tree_of};
+#[cfg(test)]
+use {crate::host::{burn_under, u_at, BURN_FILE}, wsp_base::calls::Command};
+
+/// Which of these pids are running, asked of the in-process host.
+#[cfg(test)]
+fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+    use crate::host::Host;
+    crate::host::LOCAL.alive(pids)
+}
 
 use serde_json::{json, Value};
 
@@ -199,7 +213,7 @@ use crate::util::{self, Clock};
 /// A supervisor as a place to put work.
 ///
 /// The two durations are `stop`'s, and they are fields for the reason
-/// `place_herdr`'s four are: a test that sits through a real two seconds to
+/// `place_backend`'s four are: a test that sits through a real two seconds to
 /// check what happens after two seconds is a test nobody runs. Everything else
 /// here answers out of the filesystem and waits for nothing.
 pub struct Supervisor<'a> {
@@ -212,6 +226,9 @@ pub struct Supervisor<'a> {
     pub poll: Duration,
     /// What time it is, and how to wait for the next look.
     pub clock: &'a dyn Clock,
+    /// Every OS operation a seat needs: the fork, the signals, the pids, the
+    /// feed and the hook files (`docs/agent-manager.md` 6.2, M0).
+    pub host: &'a dyn Host,
 }
 
 impl Supervisor<'static> {
@@ -236,123 +253,17 @@ impl Supervisor<'static> {
             linger: Duration::from_millis(2_000),
             poll: Duration::from_millis(150),
             clock: &util::Wall,
+            host: &host::LOCAL,
         }
     }
 
     /// Every seat's burn record that has one, seat id attached. This backend's
     /// seats only — see [`burn_under`] for why that is not the whole answer.
     pub fn burn(&self) -> Vec<(String, Value)> {
-        burn_under(&self.root)
+        self.host.burn_under(&self.root)
     }
 }
 
-/// The newest modification time among a seat directory and the files in it,
-/// in epoch seconds — [`crate::place::Place::quiet_since`] for both backends
-/// that keep a directory per seat. The directory counts too: a file replaced
-/// by rename moves the directory's time and not always the new file's.
-pub fn last_written(dir: &Path) -> Option<i64> {
-    let secs = |p: &Path| {
-        let m = std::fs::metadata(p).ok()?.modified().ok()?;
-        Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
-    };
-    let files = std::fs::read_dir(dir).ok()?.flatten().filter_map(|e| secs(&e.path()));
-    files.chain(secs(dir)).max()
-}
-
-/// The ledger of what stopped seats spent, one JSON line each, beside the seat
-/// roots (`<state>/spent.jsonl`). `stop()` deletes the seat's directory and
-/// its `burn.json` with it; this is the one copy that outlives it (wsp-264).
-pub const SPENT_FILE: &str = "spent.jsonl";
-
-/// Append the seat's burn record to the ledger before its directory goes.
-/// Best effort and silent: a stop that cannot write a receipt still stops.
-/// Same field names as `wsp burn --json`, so one reader serves both.
-pub fn bank_burn(dir: &Path) {
-    let rec = read_json(&dir.join(BURN_FILE));
-    if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
-        return;
-    }
-    let (Some(seat), Some(state)) = (
-        dir.file_name().map(|n| n.to_string_lossy().to_string()),
-        dir.parent().and_then(|r| r.parent()),
-    ) else {
-        return;
-    };
-    let n = |k: &str| rec.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-    let line = serde_json::json!({
-        "seat": seat,
-        "ended": util::now_iso(),
-        "session_id": str_of(&rec, "session_id"),
-        "model": str_of(&rec, "model"),
-        "turns": n("turns"),
-        "input": n("input"),
-        "output": n("output"),
-        "cache_read": n("cache_read"),
-        "cache_write": n("cache_write"),
-        "cost": cost_of(&rec),
-    });
-    if let Ok(mut f) =
-        fs::OpenOptions::new().create(true).append(true).open(state.join(SPENT_FILE))
-    {
-        let _ = writeln!(f, "{line}");
-    }
-}
-
-/// Every seat's burn record under one root, seat id attached.
-///
-/// The reading half of [`tally_burn`] (`core-049`): the ranking is a question
-/// about *where the tokens went*, and the answer lives one file per seat.
-///
-/// **The root is a parameter because two backends write these files and only
-/// one of them grew a reader.** `tally_burn` is shared verbatim —
-/// `place_compound` calls it at its own `heard` — so a compound seat tallies
-/// exactly like a headless one, into a directory of its own
-/// (`place_compound::SEATS`). This function living here as a method on
-/// [`Supervisor`] therefore read `seats/`, and on a machine where every seat is
-/// a compound one — which is the common case since `compound-112` — that
-/// directory does not exist at all: `wsp burn` reported no burn for a fleet of
-/// eight seats holding real records, and said so in the present tense
-/// (`wsp-116`). Nothing about the *shape* was wrong; the reader was pointed at
-/// one backend's store in a codebase whose seats are spread over two.
-///
-/// So the reader is a free function over a root, each backend reaches it
-/// through its own `burn()`, and the report folds the two — the same
-/// herdr-then-compound fold `sync.rs`, `cmd_watch` and `cmd_checkout` already
-/// make, and for the same reason: a source nobody folds is a source nobody is
-/// looking at.
-///
-/// **A seat that tallied zero turns is skipped**, which is not the same thing
-/// as a seat with no [`BURN_FILE`] and used to be documented as if it were. The
-/// two come apart: a hook carrying a transcript whose lines carry no `usage` —
-/// a kind that keeps none, or a format this does not read — writes a record
-/// with `turns: 0` and real totals of zero, and it is dropped here. That is
-/// right, and deliberately so: a seat at $0.00 is not a rank, and the report is
-/// a ranking. A seat with *no* file is the case the doc used to name, and it is
-/// dropped by the same line for a better reason — there is nothing there to
-/// read.
-pub fn burn_under(root: &Path) -> Vec<(String, Value)> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let path = e.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let rec = read_json(&path.join(BURN_FILE));
-        if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
-            continue;
-        }
-        let id = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        out.push((id, rec));
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
 
 /// The directory under the store's state that holds the seats.
 const SEATS: &str = "seats";
@@ -362,11 +273,11 @@ const SEATS: &str = "seats";
 const SEAT_FILE: &str = "seat.json";
 
 /// What the agent knows about itself, written by [`report`] from inside a hook.
-const SAID_FILE: &str = "said.json";
+// In crate::host, which writes it.
 
 /// What the session has cost, tallied from the transcript's `usage` fields one
-/// hook at a time. See [`tally_burn`].
-const BURN_FILE: &str = "burn.json";
+/// hook at a time. See [`crate::host::tally_burn`].
+// In crate::host, which writes it.
 
 /// The work orders, in the order they were given. The agent's stdin is a
 /// `tail -f` on this.
@@ -381,7 +292,7 @@ const ERR_FILE: &str = "err.log";
 const NEXT_FILE: &str = "next";
 
 /// What a seat is called. `sup-7` is the example `place.rs` reaches for when it
-/// wants an id that is plainly not herdr's, and this is where that comes from.
+/// wants an id that is plainly not backend's, and this is where that comes from.
 const SEAT_PREFIX: &str = "sup-";
 
 /// How a kind of agent is hosted with no terminal.
@@ -472,7 +383,7 @@ impl Recipe {
 pub fn said_by(hook: &str) -> Option<State> {
     Some(match hook.trim() {
         // The launch window closes here, and this is the whole of the readiness
-        // question herdr answers by looking for a missing field.
+        // question backend answers by looking for a missing field.
         "SessionStart" => State::Idle,
         "UserPromptSubmit" => State::Working,
         // Fires when Claude stops, which includes clear, resume and compact.
@@ -486,36 +397,10 @@ pub fn said_by(hook: &str) -> Option<State> {
     })
 }
 
-/// Whether a hook came from a session other than the one standing in the seat
-/// (`wsp-364`): a `claude -p` that the agent, or a script it ran, started from
-/// inside the seat. The child inherits `WSP_SEAT_ID`, so its hooks arrive here
-/// naming the parent's seat, and its `SessionEnd` used to make the seat read
-/// gone two minutes into a ten-minute turn.
-///
-/// The seat's session is whichever one reported first — `said.json`'s
-/// `session_id`, written by the first hook on a fresh seat and kept by every
-/// one after. A hook naming another session is a child's and says nothing
-/// about the seat: not its state, not its end.
-///
-/// | `said.json` | the hook | a child's? |
-/// |---|---|---|
-/// | no session yet | any | no — the first to report takes the seat |
-/// | the seat's session said `SessionEnd` | any | no — `/clear` ends one session and starts the next in the same agent |
-/// | session A | `source: "clear"` | no — the same `/clear`, its start seen first |
-/// | session A | no `session_id` | no — nothing to judge it by, so it is believed, as before |
-/// | session A | session A | no |
-/// | session A | session B | **yes** |
-pub fn a_childs(was: &Value, payload: &Value) -> bool {
-    let theirs = str_of(payload, "session_id");
-    let seats = str_of(was, "session_id");
-    // `/clear` starts its new session with `source: "clear"`; a `claude -p`
-    // child starts with `startup`. Either order of `/clear`'s two hooks lands.
-    let cleared = str_of(payload, "source") == "clear";
-    if theirs.is_empty() || seats.is_empty() || cleared || str_of(was, "state") == "gone" {
-        return false;
-    }
-    theirs != seats
-}
+/// Whether a hook came from a nested session rather than the seat's own
+/// (`wsp-364`): moved down to `wsp-host`, whose hook fold judges it the same
+/// way (wsp-023).
+pub use wsp_host::hooks::a_childs;
 
 /// Whether a hook is only a sign of life: a tool began or ended. It changes no
 /// state ([`said_by`] is `None` for both), but a seat that is `working` and says
@@ -650,7 +535,7 @@ pub fn pi_agent_dir() -> PathBuf {
         .unwrap_or_else(|| util::expand("~/.pi/agent"))
 }
 
-/// Where [`PI_EXTENSION`] goes: beside herdr's `herdr-agent-state.ts`, under a
+/// Where [`PI_EXTENSION`] goes: beside backend's `backend-agent-state.ts`, under a
 /// name of its own, since pi loads every file in the directory.
 pub fn pi_extension_path() -> PathBuf {
     pi_extension_in(&pi_agent_dir())
@@ -701,7 +586,7 @@ fn pi_extension_health_in(agent_dir: &Path, problems: &mut Vec<String>, notes: &
 /// that gets deleted within a week.
 ///
 /// It answers only for the seat named in this process's environment, which is
-/// the seat's own [`place::SEAT_ENV`] — so an agent in a herdr pane, a person's
+/// the seat's own [`place::SEAT_ENV`] — so an agent in a backend pane, a person's
 /// shell and a cron job all fall through it in silence, and nothing has to ask
 /// which backend is running.
 ///
@@ -726,7 +611,11 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     let state = said_by(&hook);
     let closes = (place::above().closes)(&hook);
     let activity = is_activity(&hook);
-    if state.is_none() && !closes && !activity {
+    // Under `WSP_HOST=manager` every hook goes to the host's manager, which
+    // reads turns and spend out of hooks `said_by` has no state for
+    // (`PostToolUse`); wsp-023.
+    let dial = wsp_host::hooks::Dial::from_env();
+    if state.is_none() && !closes && !activity && dial == wsp_host::hooks::Dial::Inproc {
         return 0;
     }
     let payload: Value = match args.has("payload") {
@@ -746,16 +635,6 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
     if closes {
         (place::above().heard)(store, &hook, &payload);
     }
-    let Some(state) = state else {
-        // A tool ran: the seat is alive, and if it was working it still is.
-        if activity {
-            let compound = crate::place_compound::Compound::new();
-            if compound.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
-                compound.touched(&seat, &payload);
-            }
-        }
-        return 0;
-    };
     // `--hold SECS` is the other thing this verb does for a hook: not saying
     // what happened but waiting on the person (`wsp-301`), and the only time
     // it prints anything. It is its own hook entry with its own long timeout,
@@ -769,331 +648,49 @@ pub fn report(store: &crate::store::Store, args: &crate::base::args::Args) -> i3
             _ => 0,
         };
     }
-    let super_place = Supervisor::new();
-    if super_place.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
-        super_place.heard(&seat, &hook, state, &payload);
-        return 0;
-    }
-    let compound = crate::place_compound::Compound::new();
-    if compound.dir_of(&seat).map(|d| d.is_dir()).unwrap_or(false) {
-        compound.heard(&seat, &hook, state, &payload);
-    }
+    report_to(&dial, &Supervisor::new(), &crate::place_compound::Compound::new(), &seat, &hook, state, &payload);
     0
 }
 
-/// The seat's environment, as the child will get it.
-///
-/// **An empty value is a removal here, and that is the port's own rule being
-/// kept rather than a liberty.** `place::shed_env` empties rather than unsets
-/// because a seat's environment on herdr's wire is an override-only map and
-/// there is no way to spell "unset" on it — the emptying is herdr's compromise,
-/// not the port's intention, and `place::seat_from_env` already reads an empty
-/// value as an absence. A supervisor mints the seat and *then* forks, so it can
-/// do the thing the wire could not.
-///
-/// The caller's own identity is shed whether or not the order mentioned it, for
-/// the reason [`place::CHILD_MARKER`] carries: a session that inherits it writes
-/// no transcript at all, and the only evidence is one truncated line in a pane
-/// this backend does not have.
-fn child_env(cmd: &mut Command, seat: &Seat, env: &BTreeMap<String, String>) {
-    for (k, v) in env {
-        match v.is_empty() {
-            true => cmd.env_remove(k),
-            false => cmd.env(k, v),
-        };
+/// Where one hook goes: to the manager `dial` names, or, under `inproc` or
+/// when the manager does not take it, to the seat's directory as at M0 (the
+/// directory that holds the seat's name, headless or compound). What it came
+/// to.
+pub fn report_to(
+    dial: &wsp_host::hooks::Dial,
+    super_place: &Supervisor,
+    compound: &crate::place_compound::Compound,
+    seat: &Seat,
+    hook: &str,
+    state: Option<State>,
+    payload: &Value,
+) -> wsp_host::hooks::Sent {
+    let epoch = wsp_host::hooks::epoch_from_env();
+    let sent = wsp_host::hooks::report(dial, seat.as_str(), epoch, hook, payload);
+    if matches!(sent, wsp_host::hooks::Sent::Taken(_)) {
+        return sent;
     }
-    for k in place::shed_keys() {
-        cmd.env_remove(k);
-    }
-    // Last, and not from the order: the seat's own name is the one thing wsp
-    // could not have put in `Order::env`, because it did not exist yet. This is
-    // the direction `place.rs` reversed — the backend delivers the seat to
-    // whatever runs in it, and says under what name.
-    cmd.env(place::SEAT_ENV, seat.as_str());
-}
-
-/// `root`, everything descended from it, and everything in the process group
-/// it leads — read in one `ps`.
-///
-/// **Both relations, because each misses a case the other catches.** A child
-/// that called `setsid` has left the group and is still a descendant until its
-/// parent dies; a process whose parent died is reparented to launchd and is
-/// still in the group [`signal_group`] signals. An agent found at `ppid=1`
-/// after its seat was closed is the second case, and it is the reason a caller
-/// takes this *before* ending anything: afterwards the parent link is gone.
-///
-/// `ps` failing to run answers the root alone — not empty, so a caller asking
-/// "is any of it still running?" still has the one pid it can certainly name.
-pub fn tree_of(root: u32) -> Vec<u32> {
-    let Some(rows) = process_rows() else { return vec![root] };
-    let rows = &*rows;
-    let mut tree = vec![root];
-    let mut i = 0;
-    while i < tree.len() {
-        let parent = tree[i];
-        for &(pid, ppid, _) in rows {
-            if ppid == parent && !tree.contains(&pid) {
-                tree.push(pid);
-            }
+    let Some(state) = state else {
+        // A tool ran: the seat is alive, and if it was working it still is.
+        if is_activity(hook) && compound.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false) {
+            compound.touched(seat, payload);
         }
-        i += 1;
-    }
-    for &(pid, _, pgid) in rows {
-        if pgid == root && !tree.contains(&pid) {
-            tree.push(pid);
-        }
-    }
-    tree
-}
-
-thread_local! {
-    /// The process table a [`one_ps`] scope holds: `None` outside one, and inside
-    /// one `None` until the first [`tree_of`] has read it.
-    static TABLE: std::cell::RefCell<Option<Option<std::rc::Rc<Vec<(u32, u32, u32)>>>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Every process as (pid, ppid, pgid), from one `ps` — or, inside [`one_ps`],
-/// from the one that scope has already made. `None` when `ps` would not run.
-fn process_rows() -> Option<std::rc::Rc<Vec<(u32, u32, u32)>>> {
-    let held = TABLE.with(|t| t.borrow().clone());
-    if let Some(Some(rows)) = held {
-        return Some(rows);
-    }
-    let rows = Command::new("ps").args(["-A", "-o", "pid=,ppid=,pgid="]).output().ok().map(|out| {
-        std::rc::Rc::new(
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
-                    Some((it.next()??, it.next()??, it.next()??))
-                })
-                .collect::<Vec<(u32, u32, u32)>>(),
-        )
-    });
-    if let (Some(_), Some(_)) = (&held, &rows) {
-        TABLE.with(|t| *t.borrow_mut() = Some(rows.clone()));
-    }
-    rows
-}
-
-/// Run `f` with every [`tree_of`] in it answering from **one** `ps` taken at
-/// its first call, rather than one per call (`wsp-480`). A scan that asks for
-/// the tree of each seat of a fleet cost seventy `ps` runs, 12 s of a thermally
-/// limited machine, for what one table answers. Nothing is kept past `f`: a
-/// caller that signals and looks again takes a scope for each look.
-pub fn one_ps<T>(f: impl FnOnce() -> T) -> T {
-    let outer = TABLE.with(|t| t.borrow_mut().replace(None));
-    let out = f();
-    TABLE.with(|t| *t.borrow_mut() = outer);
-    out
-}
-
-/// Signal a whole process group, by the id of the group's leader.
-///
-/// The group rather than the pid, because an agent's children are its work: a
-/// `Bash` tool call is a shell under the agent, and a `stop` that left it running
-/// would be the sort of half-ending that leaves a build writing into a tree wsp
-/// has told somebody else is free.
-pub fn signal_group(group: u32, sig: &str) {
-    // Never this process's own group: a record naming our own pid (a test's
-    // stand-in for a live supervisor) would otherwise end us when we are a group
-    // leader, as every test is under `cargo nextest` (wsp-440).
-    if group == std::process::id() {
-        return;
-    }
-    let _ = Command::new("kill")
-        .arg(format!("-{sig}"))
-        .arg(format!("-{group}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-/// What watches a seat's `tail -f` feed: `$1` the agent's pid, `$2` the feed's
-/// (the group's leader), `$3` the seat's directory. It ends the feed when the
-/// agent is gone or the directory is, which is the only thing that can tell
-/// `tail` it has no reader — it learns of one only when it next writes.
-const FEED_WATCH: &str = r#"while kill -0 "$1" 2>/dev/null && [ -d "$3" ]; do sleep 1; done; kill "$2" 2>/dev/null; exit 0"#;
-
-/// A file read as JSON, or an empty object — a seat whose record is missing is
-/// the caller's question rather than this function's.
-pub fn read_json(path: &PathBuf) -> Value {
-    fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({}))
-}
-
-pub fn str_of(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
-}
-
-/// Add this hook's slice of the transcript to the seat's running total.
-///
-/// Every request an agent makes re-reads its whole context, so **where the
-/// tokens are is the question `core-049` was filed to answer** — and Claude
-/// Code already writes the answer: every assistant message in the transcript
-/// carries a `usage` object with the input, output and cache counts of the
-/// request that produced it. Nothing else in wsp sees a transcript — they are
-/// session-private — so the hook is where this is read, one append at a time.
-///
-/// The tally is incremental and survives being wrong about nothing: a byte
-/// offset into the file says how far the last look got, only new *whole* lines
-/// are parsed and only whole lines advance the offset (a Stop fires every turn,
-/// so re-reading a whole night's transcript each time would be quadratic in
-/// exactly the sessions this exists to measure), a shorter file than remembered
-/// means it was rotated or truncated and the count restarts rather than
-/// double-counts, and a different `session_id` means the seat was cleared —
-/// `/clear` ends an accounting as surely as it ends a context. A transcript
-/// with no `usage` lines (a kind that keeps none, or a format wsp does not
-/// read) tallies zero and costs one pass.
-///
-/// Two things it counts *once* that the first draft counted wrong, both of them
-/// silent: the fragment at the end of a read, and the repeated `usage` object
-/// Claude Code writes per content block. The argument for each is at the line
-/// that does it.
-///
-/// Written for [`heard`], which every hook reaches; best-effort like everything
-/// else on that path.
-pub fn tally_burn(dir: &PathBuf, payload: &Value) {
-    let path = str_of(payload, "transcript_path");
-    if path.is_empty() {
-        return;
-    }
-    let sid = str_of(payload, "session_id");
-    let was = read_json(&dir.join(BURN_FILE));
-    // Same session continues the running total; anything else starts one. An
-    // empty stored id is a seat that has not been tallied yet, which is also a
-    // start.
-    let same = !sid.is_empty() && str_of(&was, "session_id") == sid;
-    let mut offset = if same {
-        was.get("offset").and_then(|v| v.as_u64()).unwrap_or(0)
-    } else {
-        0
+        return sent;
     };
-    let mut input = if same { u_at(&was, "input") } else { 0 };
-    let mut output = if same { u_at(&was, "output") } else { 0 };
-    let mut cache_read = if same { u_at(&was, "cache_read") } else { 0 };
-    let mut cache_write = if same { u_at(&was, "cache_write") } else { 0 };
-    let mut turns = if same { u_at(&was, "turns") } else { 0 };
-    let mut model = if same { str_of(&was, "model") } else { String::new() };
-    // Not `u_at`: a record from before the tally priced anything has totals and
-    // no cost, and starting from zero would report a whole night as costing
-    // whatever the next few turns did.
-    let mut cost = if same { cost_of(&was) } else { 0 };
-    // The last request counted, carried between hooks so the dedupe below
-    // survives a slice boundary landing in the middle of one.
-    let mut last = if same { str_of(&was, "last_request") } else { String::new() };
-
-    let Ok(file) = fs::File::open(&path) else {
-        return;
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < offset {
-        // Rotated, swept or truncated: whatever happened, counting from a hole
-        // would count somebody twice.
-        offset = 0;
-        (input, output, cache_read, cache_write, turns, cost) = (0, 0, 0, 0, 0, 0);
-        last.clear();
+    if super_place.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false) {
+        super_place.heard(seat, hook, state, payload);
+    } else if compound.dir_of(seat).map(|d| d.is_dir()).unwrap_or(false) {
+        compound.heard(seat, hook, state, payload);
     }
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut reader = std::io::BufReader::new(file);
-    if reader.seek(SeekFrom::Start(offset)).is_err() {
-        return;
-    }
-    let mut fresh = Vec::new();
-    if reader.read_to_end(&mut fresh).is_err() {
-        return;
-    }
-    let text = match String::from_utf8(fresh) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    // Only whole lines are counted, and only whole lines are consumed. A hook
-    // fires on the writer's clock, not on the writer's line endings, so a read
-    // can land inside a record that is still being written — and an offset
-    // advanced past the fragment would leave the next read starting inside a
-    // record it can no longer parse, dropping it for good. Silent undercount in
-    // an instrument whose whole job is counting.
-    let whole = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    for line in text[..whole].lines() {
-        let Ok(line) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(message) = line.get("message") else {
-            continue;
-        };
-        let Some(usage) = message.get("usage") else {
-            continue;
-        };
-        // One request, one bill. Claude Code writes a transcript line per
-        // *content block* and repeats the request's whole `usage` object on
-        // each of them, so an assistant turn that spoke and then called a tool
-        // is three identical lines. Measured on this store on 2026-08-26: 49
-        // usage lines over 30 requests, which a naive sum reports as 1.6x the
-        // real bill. The blocks of one request are written together, so
-        // remembering the last id counted is enough to tell a repeat from a
-        // new request.
-        let id = match str_of(&line, "requestId") {
-            // `message.id` is the same key one level in, and the fallback for a
-            // transcript that carries no request id of its own.
-            s if s.is_empty() => str_of(message, "id"),
-            s => s,
-        };
-        if !id.is_empty() && id == last {
-            continue;
-        }
-        if !id.is_empty() {
-            last = id;
-        }
-        let n = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        let (i, o) = (n("input_tokens"), n("output_tokens"));
-        let (cr, cw) = (n("cache_read_input_tokens"), n("cache_creation_input_tokens"));
-        input += i;
-        output += o;
-        cache_read += cr;
-        cache_write += cw;
-        turns += 1;
-        // Priced against the model *this request* ran on, not against the one
-        // the session opened with: an agent that types `/model` mid-session is
-        // billed at both tiers and neither total is a lie about the other. The
-        // stored `model` is therefore what the seat is on now, and the cost is
-        // not derivable from it — see [`cost`].
-        //
-        // A request that carried no tokens did not run on anything, so it has
-        // no tier to report, whatever it called itself: Claude Code writes
-        // zero-usage `<synthetic>` records (a cancelled turn, a refusal it composed) and
-        // one at the tail of a transcript would otherwise rename a seat that
-        // spent every dollar on a real tier.
-        let ran_on = str_of(message, "model");
-        cost += self::cost(&ran_on, i, o, cr, cw);
-        if !ran_on.is_empty() && i + o + cr + cw > 0 {
-            model = ran_on;
-        }
-    }
-
-    let _ = write_atomic(
-        &dir.join(BURN_FILE),
-        &json!({
-            "session_id": sid,
-            "transcript": path,
-            "offset": offset + whole as u64,
-            "model": model,
-            "last_request": last,
-            "cost": cost,
-            "input": input,
-            "output": output,
-            "cache_read": cache_read,
-            "cache_write": cache_write,
-            "turns": turns,
-            "updated": util::now_iso(),
-        })
-        .to_string(),
-    );
+    sent
 }
 
-/// A counter out of a burn record, absent meaning zero — the shape a first
-/// tally reads back as.
-fn u_at(v: &Value, key: &str) -> u64 {
-    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
-}
+
+/// A record read as JSON, and a string field of one: moved down to `wsp-host`,
+/// whose hook files and burn tally read them (wsp-020).
+pub use wsp_host::inproc::{read_json, str_of};
+
+
 
 impl Supervisor<'_> {
     /// A seat's directory, refusing anything that is not a name this backend
@@ -1213,7 +810,7 @@ impl Supervisor<'_> {
     /// What the agent last said about itself, and the state it implies.
     fn said(&self, seat: &Seat) -> Value {
         match self.dir_of(seat) {
-            Ok(dir) => read_json(&dir.join(SAID_FILE)),
+            Ok(dir) => self.host.said(&dir),
             Err(_) => json!({}),
         }
     }
@@ -1226,7 +823,7 @@ impl Supervisor<'_> {
         if !dir.is_dir() {
             return;
         }
-        let was = read_json(&dir.join(SAID_FILE));
+        let was = self.host.said(&dir);
         // A nested session's hook, not the seat's (`wsp-364`).
         if a_childs(&was, payload) {
             return;
@@ -1237,8 +834,8 @@ impl Supervisor<'_> {
                 false => str_of(payload, key),
             }
         };
-        let _ = write_atomic(
-            &dir.join(SAID_FILE),
+        self.host.say(
+            &dir,
             &json!({
                 "state": state.as_str(),
                 // The hook's own name, kept beside the state it was read as.
@@ -1257,10 +854,9 @@ impl Supervisor<'_> {
                 // they do all carry them — keeps what the last one said.
                 "session_id": keep("session_id"),
                 "transcript_path": keep("transcript_path"),
-            })
-            .to_string(),
+            }),
         );
-         tally_burn(&dir, payload);
+        self.host.tally(&dir, payload);
     }
 
     /// The reading, from what is on disk and what is in the process table.
@@ -1273,7 +869,7 @@ impl Supervisor<'_> {
     /// | an agent | running, and has said nothing yet | [`State::Starting`] |
     /// | an agent | running | whatever it last said |
     ///
-    /// The third row is the one herdr cannot do, and the fourth is the launch
+    /// The third row is the one backend cannot do, and the fourth is the launch
     /// window closed by an announcement rather than by a timer.
     ///
     /// An agent that has said `SessionEnd` while its process is still up is
@@ -1306,6 +902,7 @@ impl Supervisor<'_> {
             agent: Agent {
                 kind: str_of(&agent, "kind"),
                 name: str_of(&agent, "name"),
+                key: None,
                 args: agent
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -1333,7 +930,7 @@ impl Supervisor<'_> {
             .iter()
             .filter_map(|(_, r)| r.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32))
             .collect();
-        let running = alive(&pids);
+        let running = self.host.alive(&pids);
         seats
             .iter()
             .map(|(seat, rec)| {
@@ -1364,7 +961,7 @@ impl Place for Supervisor<'_> {
         let mut env: BTreeMap<String, String> = order.env.clone();
         // The seat's own name, on disk, at the moment the seat exists — which is
         // the promise `Place::here` is downstream of and the reason a supervisor
-        // can keep it where herdr cannot: it mints the seat and *then* forks.
+        // can keep it where backend cannot: it mints the seat and *then* forks.
         env.insert(place::SEAT_ENV.to_string(), seat.to_string());
         let rec = json!({
             "label": order.label,
@@ -1383,8 +980,8 @@ impl Place for Supervisor<'_> {
     /// than asked, which is the port's rule and is free here: the supervisor put
     /// it in the child's environment itself.
     ///
-    /// herdr's own name is deliberately not consulted as a fallback, for the
-    /// reason `place_herdr` gives about the mirror image: two answers to *which
+    /// backend's own name is deliberately not consulted as a fallback, for the
+    /// reason `place_backend` gives about the mirror image: two answers to *which
     /// seat is this* is a way to be in two seats. Which backend a process is
     /// standing in is decided by which name its seat arrived under, one level
     /// up, in `cmd_agent::my_pane`.
@@ -1407,53 +1004,12 @@ impl Place for Supervisor<'_> {
         let rec = self.record(seat)?;
         let dir = self.dir_of(seat)?;
         if let Some(pid) = rec.get("pid").and_then(|p| p.as_u64()) {
-            if alive(&[pid as u32]).contains(&(pid as u32)) {
+            if self.host.alive(&[pid as u32]).contains(&(pid as u32)) {
                 return Err(Refusal::Backend(format!("{seat} already has an agent running")));
             }
         }
         let recipe = Recipe::of(&agent.kind);
-        let prompts = dir.join(PROMPTS);
-        let io = |name: &str| -> Result<fs::File> {
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(name))
-                .map_err(|e| Refusal::Backend(e.to_string()))
-        };
-        io(PROMPTS)?;
-        let out = io(OUT_FILE)?;
-        let err = io(ERR_FILE)?;
-
-        // The durable writer on the agent's stdin. `-n +1` so that anything
-        // already in the file is delivered rather than skipped, which matters
-        // only for a seat being restarted and costs nothing when it is not.
-        let mut feeder = Command::new("tail")
-            .args(["-n", "+1", "-f"])
-            .arg(&prompts)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| Refusal::Backend(format!("no way to feed the agent: {e}")))?;
-        let group = feeder.id();
-        let Some(feed) = feeder.stdout.take() else {
-            signal_group(group, "KILL");
-            return Err(Refusal::Backend("the feed had no pipe".into()));
-        };
-
         let (program, argv) = (place::above().command)(&agent.kind, &agent.args);
-        let mut cmd = Command::new(&program);
-        cmd.args(recipe.flags)
-            .args(&argv)
-            .stdin(Stdio::from(feed))
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .process_group(group as i32);
-        let cwd = str_of(&rec, "cwd");
-        if !cwd.is_empty() {
-            cmd.current_dir(&cwd);
-        }
         let env: BTreeMap<String, String> = rec
             .get("env")
             .and_then(|e| e.as_object())
@@ -1463,38 +1019,21 @@ impl Place for Supervisor<'_> {
                     .collect()
             })
             .unwrap_or_default();
-        child_env(&mut cmd, seat, &env);
-
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                // The feed is not left running against a seat with no agent in
-                // it: a `tail -f` nobody is reading is a leak that would outlive
-                // every failed spawn.
-                signal_group(group, "KILL");
-                return Err(Refusal::Backend(format!("{} did not start: {e}", agent.kind)));
-            }
-        };
-
-        // The feed ends with its owner. `stop` signals the group, but a seat
-        // whose agent exits on its own, or whose directory goes without a
-        // `stop` (a sandbox removed, a test killed), would otherwise leave this
-        // `tail -f` idle for good — 20 of them were 15 days old (wsp-664). In
-        // the agent's group, so a `stop` ends it too.
-        let _ = Command::new("sh")
-            .args(["-c", FEED_WATCH, "sh"])
-            .arg(child.id().to_string())
-            .arg(group.to_string())
-            .arg(&dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(group as i32)
-            .spawn();
+        let forked = self.host.spawn_headless(&host::Headless {
+            seat: seat.as_str(),
+            program,
+            args: recipe.flags.iter().map(|f| f.to_string()).chain(argv).collect(),
+            cwd: str_of(&rec, "cwd"),
+            env,
+            prompts: dir.join(PROMPTS),
+            out: dir.join(OUT_FILE),
+            err: dir.join(ERR_FILE),
+        })?;
+        let (child_pid, group) = (forked.pid, forked.group);
 
         let mut rec = rec;
         rec["agent"] = json!({ "kind": agent.kind, "name": agent.name, "args": agent.args });
-        rec["pid"] = json!(child.id());
+        rec["pid"] = json!(child_pid);
         rec["group"] = json!(group);
         rec["started_at"] = json!(util::now_iso());
         write_atomic(&dir.join(SEAT_FILE), &rec.to_string())
@@ -1517,16 +1056,8 @@ impl Place for Supervisor<'_> {
         let dir = self.dir_of(seat)?;
         let kind = str_of(&self.record(seat)?.get("agent").cloned().unwrap_or(json!({})), "kind");
         let line = Recipe::of(&kind).sentence(text);
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(PROMPTS))
-            .map_err(|e| Refusal::Backend(e.to_string()))?;
-        // One `write_all` of one line, which is what makes this safe against a
-        // second `tell` arriving at the same moment: `O_APPEND` is atomic for a
-        // write this size, so two sentences interleave as two lines rather than
-        // as one unparseable one.
-        writeln!(f, "{line}").map_err(|e| Refusal::Backend(e.to_string()))?;
+        // One line, appended whole by the host, so two tells at once are two lines.
+        self.host.append_line(&dir.join(PROMPTS), &line)?;
         // [`Delivery::Unconfirmed`] and never anything stronger, on the same
         // grounds as the refusal above: an append to a file is not evidence
         // that anything read it. A backend that cannot watch says so.
@@ -1549,25 +1080,14 @@ impl Place for Supervisor<'_> {
         let group = rec.get("group").and_then(|g| g.as_u64()).map(|g| g as u32);
         let pid = rec.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
         if let Some(group) = group {
-            signal_group(group, "TERM");
-            let deadline = self.clock.now() + self.linger;
-            while let Some(pid) = pid {
-                if !alive(&[pid]).contains(&pid) {
-                    break;
-                }
-                if self.clock.now() >= deadline {
-                    signal_group(group, "KILL");
-                    break;
-                }
-                self.clock.rest(self.poll);
-            }
+            self.host.stop(host::Stop { group, watch: pid, grace: self.linger, poll: self.poll, clock: self.clock });
         }
         // The record goes with the agent. What survives is Claude Code's own
         // transcript, which is where a headless agent's durable output was
         // always going to be — the seat's directory holds a copy of the stream
         // and the orders it was given, and neither is the thing to keep a
         // directory per dead agent for.
-        bank_burn(&dir);
+        self.host.bank(&dir);
         self.take_away(&dir)
     }
 
@@ -1575,11 +1095,11 @@ impl Place for Supervisor<'_> {
         let rec = self.record(seat)?;
         let pids: Vec<u32> =
             rec.get("pid").and_then(|p| p.as_u64()).map(|p| vec![p as u32]).unwrap_or_default();
-        Ok(self.state_of(seat, &rec, &alive(&pids)))
+        Ok(self.state_of(seat, &rec, &self.host.alive(&pids)))
     }
 
     fn quiet_since(&self, seat: &Seat) -> Option<i64> {
-        last_written(&self.dir_of(seat).ok()?)
+        self.host.quiet_since(&self.dir_of(seat).ok()?)
     }
 
     fn stopped(&self, seat: &Seat) -> Option<crate::place::Stopped> {
@@ -1593,10 +1113,10 @@ impl Place for Supervisor<'_> {
     fn pids(&self, seat: &Seat) -> Option<Vec<u32>> {
         let rec = self.record(seat).ok()?;
         let pid = rec.get("pid").and_then(|p| p.as_u64())? as u32;
-        let mut pids = tree_of(pid);
+        let mut pids = self.host.tree_of(pid);
         // The group this backend signals is recorded apart from the agent's pid.
         if let Some(group) = rec.get("group").and_then(|g| g.as_u64()).map(|g| g as u32) {
-            pids.extend(tree_of(group).into_iter().filter(|p| !pids.contains(p)).collect::<Vec<_>>());
+            pids.extend(self.host.tree_of(group).into_iter().filter(|p| !pids.contains(p)).collect::<Vec<_>>());
         }
         Some(pids)
     }
@@ -1672,7 +1192,7 @@ impl Place for Supervisor<'_> {
 /// the help text are assembled from these; nothing in `main.rs` names them.
 pub const VERBS: &[crate::verbs::Verb] = &[
     // Not `hook`, deliberately, and the two are not variants of one thing.
-    // That one is herdr's plugin channel — a multiplexer saying a pane
+    // That one is backend's plugin channel — a multiplexer saying a pane
     // exited — and it ends in a full `sync` over the socket. This is an
     // agent saying what *it* is doing, from inside its own hook, several
     // times a turn, and it must touch nothing but its own seat's file.
@@ -1690,151 +1210,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
-// What a seat costs: the prices live here, with the tally that prices against them
-// (`cmd_burn` reports them from below it).
-
-/// What a million tokens costs, in micro-dollars, on one tier.
-///
-/// Micro-dollars because the unit has to divide exactly: every rate below is a
-/// whole number of dollars per million tokens, and the two cache multipliers
-/// are a tenth and a quarter, so integer arithmetic in millionths loses
-/// nothing. Floating point in a ranking would be a rounding argument nobody
-/// asked for.
-pub struct Price {
-    input: u64,
-    output: u64,
-    /// What a cache read bills at, as a fraction of `input`. A tenth on most
-    /// tiers and not on all of them: the page lists Opus 5.5 and Sonnet 5.5 at
-    /// 0.05x and Fable 5.1 and Mythos 5.1 at 0.025x.
-    cache_read: (u64, u64),
-}
-
-/// When [`PRICES`] was last checked against the first-party price reference.
-/// Printed under the report, so the reader sees the age of the quote beside
-/// the money it produced. Move it only when the page has actually been
-/// re-read: the date is a claim about what the table was checked against.
-pub const PRICES_READ: &str = "2026-10-18";
-
-/// **List prices, first-party Anthropic API, read on [`PRICES_READ`].** This is
-/// the thing in wsp that goes stale without saying so, which is why it is a
-/// table with a date on it rather than a constant buried in an expression — the
-/// same bargain the cache multipliers below make, and the reason `core-049`'s
-/// `CACHE_DISCOUNT` was written down instead of inlined.
-///
-/// **A reading date does not protect a promotional price, and a known end date
-/// is not a known outcome.** A list price goes stale unpredictably; an
-/// introductory one is due to change on a date known the day the row is typed.
-/// `core-056`: Sonnet 5 was entered at its introductory $2/$10, due to end
-/// 2026-08-31 with a step to $3/$15, and that step was then cancelled — $2/$10
-/// is the standard price. The row was right all along, and a first fix made
-/// from the brief's account rather than the page over-billed sonnet by half.
-/// So a row priced on a promotion carries its end date beside it, and the date
-/// is a prompt to re-read the page, not a number to apply.
-///
-/// **The cache-read multiplier is a column of this table, because the page's
-/// is not one number.** Opus 5.5 ($4/$20) and Sonnet 5.5 ($2/$10) read at 0.05x,
-/// Fable 5.1 and Mythos 5.1 at 0.025x, every other model at a tenth. A seat reads
-/// nearly all of its volume from cache, so a row priced at the wrong multiplier
-/// is wrong by up to the whole cache line: wsp-290 found Opus 5.5 priced at
-/// 2.5x its real read price and Sonnet 5.5, the tier legs run on, at 2x. Haiku
-/// 5.5 is priced by prompt length ($0.10/$0.50 up to 100k, $0.50/$2.50 over) and
-/// this table does not model that; it still reads as Haiku 4.5's $1/$5.
-///
-/// Matched as a prefix, longest-specific first, because a model id carries a
-/// date or a variant wsp has no business parsing (`claude-opus-5`,
-/// `claude-haiku-4-5-20251001`). A model that matches nothing is priced at the
-/// **first row**, which is the dearest: a report answering *where did the money
-/// go* must never make an unrecognised spender look cheap, and the model column
-/// shows the name that was not recognised.
-pub const PRICES: &[(&str, Price)] = &[
-    ("claude-fable-5-1", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 40) }),
-    ("claude-mythos-5-1", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 40) }),
-    ("claude-fable", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) }),
-    ("claude-mythos", Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) }),
-    ("claude-opus-5-5", Price { input: 4_000_000, output: 20_000_000, cache_read: (1, 20) }),
-    ("claude-opus", Price { input: 5_000_000, output: 25_000_000, cache_read: (1, 10) }),
-    // Sonnet 4.x, Sonnet 5 and Sonnet 5.5 are not the same price, and the fleet
-    // runs all three: `d5f0956` starts work under a seat on sonnet while seats
-    // stay on the settings tier, and a leg runs on Sonnet 5.5 unless its entry
-    // names another. Sonnet 5's $2/$10 was introductory through 2026-08-31; the
-    // step to $3/$15 that was to follow was cancelled and $2/$10 is now the
-    // standard price. Sonnet 5.5 is the same $2/$10 with reads at 0.05x.
-    ("claude-sonnet-4", Price { input: 3_000_000, output: 15_000_000, cache_read: (1, 10) }),
-    ("claude-sonnet-5-5", Price { input: 2_000_000, output: 10_000_000, cache_read: (1, 20) }),
-    ("claude-sonnet", Price { input: 2_000_000, output: 10_000_000, cache_read: (1, 10) }),
-    ("claude-haiku", Price { input: 1_000_000, output: 5_000_000, cache_read: (1, 10) }),
-];
-
-/// What a model that matches nothing is priced at: the dearest row, at the
-/// ordinary multiplier. A report answering *where did the money go* must never
-/// make an unrecognised spender look cheap.
-const UNKNOWN: Price = Price { input: 10_000_000, output: 50_000_000, cache_read: (1, 10) };
-
-/// Whether [`PRICES`] has a row for this model. A model id that is not Claude's
-/// (`opencode/x-free`) is priced by [`cost`] at [`UNKNOWN`], which is right for a
-/// seat's burn and wrong for a row that should say nothing instead.
-pub fn known(model: &str) -> bool {
-    PRICES.iter().any(|(prefix, _)| model.starts_with(prefix))
-}
-
-/// Cache reads bill at a tenth of the input rate unless the row says otherwise,
-/// cache writes at a quarter above it. Stated rather than hidden, exactly as `core-049` stated its
-/// tenth — the difference is that these are quoted rates rather than an
-/// estimate, so the column can say dollars.
-///
-/// The write multiplier is the **five-minute** TTL. A one-hour entry writes at
-/// twice the input rate, and Claude Code uses the hour: the split is in the
-/// transcript (`usage.cache_creation.ephemeral_1h_input_tokens`) but not in the
-/// `cache_creation_input_tokens` total the tally reads, so a seat that writes
-/// its cache hourly is undercounted on that one line item. Named here rather
-/// than guessed at; splitting the tally by TTL is worth doing the day cache
-/// writes are the answer to *where did the money go*, and they are not.
-const CACHE_WRITE: (u64, u64) = (5, 4);
-
-/// What one request cost, in micro-dollars, on the model that served it.
-///
-/// Called from the tally rather than from the report ([`crate::place_super`]),
-/// because a session that changed tier partway through has no single model to
-/// price its totals against — the request does. The report reads the
-/// accumulated number and does not re-derive it.
-pub fn cost(model: &str, input: u64, output: u64, cache_read: u64, cache_write: u64) -> u64 {
-    let p = PRICES
-        .iter()
-        .find(|(prefix, _)| model.starts_with(prefix))
-        .map(|(_, price)| price)
-        .unwrap_or(&UNKNOWN);
-    let at = |tokens: u64, per_mtok: u64| tokens.saturating_mul(per_mtok) / 1_000_000;
-    at(input, p.input)
-        + at(output, p.output)
-        + at(cache_read, p.input * p.cache_read.0 / p.cache_read.1)
-        + at(cache_write, p.input * CACHE_WRITE.0 / CACHE_WRITE.1)
-}
-
-/// What a seat has cost: its own tally where it has one, and the totals priced
-/// at its current model where it does not.
-///
-/// The fallback is for a record written before the tally priced anything. Read
-/// by the report *and* by the tally, which is the half that matters: a seat
-/// that has been running all night when this lands carries totals and no cost,
-/// and a tally that started its cost at zero would report the night as costing
-/// whatever the next few turns did. Priced at the stored model, which for a
-/// pre-existing record is the only model it remembers.
-pub fn cost_of(r: &serde_json::Value) -> u64 {
-    match r.get("cost").and_then(|v| v.as_u64()) {
-        Some(c) => c,
-        None => cost(
-            r.get("model").and_then(|v| v.as_str()).unwrap_or(""),
-            n(r, "input"),
-            n(r, "output"),
-            n(r, "cache_read"),
-            n(r, "cache_write"),
-        ),
-    }
-}
-
-fn n(v: &serde_json::Value, key: &str) -> u64 {
-    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
-}
+// What a seat costs: the prices, moved down to `wsp-host` with the tally that
+// prices against them (wsp-020; `cmd_burn` reports them from below it).
+pub use wsp_host::price::{cost, cost_of, known, Price, PRICES, PRICES_READ};
 
 #[cfg(test)]
 mod tests {
@@ -1877,7 +1255,7 @@ mod tests {
     /// one thing a live Claude Code adds is the hooks, which arrive as
     /// [`Supervisor::heard`] either way.
     fn a_process() -> Agent {
-        Agent { kind: "sleep".into(), name: "t-1".into(), args: vec!["60".into()] }
+        Agent { kind: "sleep".into(), name: "t-1".into(), args: vec!["60".into()], key: None }
     }
 
     /// Wait for something a real process does in its own time.
@@ -1926,7 +1304,7 @@ mod tests {
 
     /// A name is not handed out twice, however many seats have come and gone.
     ///
-    /// The rule is not tidiness. herdr reissues workspace ids — measured, not
+    /// The rule is not tidiness. backend reissues workspace ids — measured, not
     /// assumed (`robustness-084`) — and the oldest complaint in this repository
     /// is that a claim naming a closed one is waiting to attach itself to
     /// whatever takes the id next. A supervisor is free of that only if it
@@ -1970,17 +1348,51 @@ mod tests {
             assert_eq!(place.state(&seat), Err(Refusal::NoSeat(seat.clone())), "{id}");
             assert_eq!(place.stop(&seat), Err(Refusal::NoSeat(seat)), "{id}");
         }
-        // A herdr id is refused for being unknown rather than for its shape:
+        // A backend id is refused for being unknown rather than for its shape:
         // nothing here parses one, and `w1:p1` is a perfectly good file name.
-        let herdrs = Seat::new("w1:p1");
-        assert_eq!(place.state(&herdrs), Err(Refusal::NoSeat(herdrs)));
+        let backends = Seat::new("w1:p1");
+        assert_eq!(place.state(&backends), Err(Refusal::NoSeat(backends)));
+    }
+
+    /// wsp-023: the hook command under `WSP_HOST=manager` with no manager
+    /// answering, and under `inproc`, still writes the seat's hook log as at
+    /// M0, and a hook with no state (`PostToolUse`) still writes nothing there.
+    #[test]
+    fn with_no_manager_the_hook_command_still_writes_the_hook_log() {
+        use wsp_host::hooks::{Dial, Sent};
+        let scratch = Scratch::new("hook-fallback");
+        let place = scratch.place();
+        let compound = crate::place_compound::Compound::at(scratch.root.join("compound"));
+        // A compound seat: the backend that keeps the hook log.
+        let seat = Seat::new("cpd-1");
+        let dir = compound.dir_of(&seat).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(wsp_host::inproc::HOOKS_FILE);
+        let token = scratch.root.join("manager.token");
+        fs::write(&token, "a-token\n").unwrap();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let gone = Dial::Manager { addr, token_file: token };
+
+        let sent = report_to(&gone, &place, &compound, &seat, "UserPromptSubmit", Some(State::Working), &json!({}));
+        assert!(matches!(sent, Sent::Unanswered(_)), "{sent:?}");
+        let sent = report_to(&gone, &place, &compound, &seat, "PostToolUse", None, &json!({}));
+        assert!(matches!(sent, Sent::Unanswered(_)), "{sent:?}");
+        let sent = report_to(&Dial::Inproc, &place, &compound, &seat, "Stop", Some(State::Idle), &json!({}));
+        assert_eq!(sent, Sent::Inproc);
+
+        let hooks: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| str_of(&serde_json::from_str(l).unwrap(), "hook"))
+            .collect();
+        assert_eq!(hooks, ["UserPromptSubmit", "Stop"]);
     }
 
     /// The launch window, closed by an announcement rather than by a timer — and
-    /// the three readings herdr cannot tell apart, told apart.
+    /// the three readings backend cannot tell apart, told apart.
     ///
     /// A seat with nothing in it, an agent still coming up, an agent that will
-    /// take a prompt: on herdr the first and third are the same `agent_status`
+    /// take a prompt: on backend the first and third are the same `agent_status`
     /// and the second is marked only by a *missing field*. Here each is a
     /// different fact, and only the last one is told anything.
     #[test]
@@ -2010,7 +1422,7 @@ mod tests {
         assert_eq!(place.state(&seat).unwrap(), State::Idle, "the turn ended");
     }
 
-    /// **The reading herdr has to raise from an event stream, because a listing
+    /// **The reading backend has to raise from an event stream, because a listing
     /// cannot carry it.** An agent that has stopped is not a seat nobody used.
     ///
     /// And the arm that is easy to leave out: `wsp spawn` starts the agent and
@@ -2025,7 +1437,7 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         place
-            .start(&seat, &Agent { kind: "true".into(), name: "t-1".into(), args: Vec::new() })
+            .start(&seat, &Agent { kind: "true".into(), name: "t-1".into(), args: Vec::new(), key: None })
             .expect("a process");
 
         assert!(
@@ -2042,7 +1454,7 @@ mod tests {
     /// What a seat's occupant must not inherit is *removed* here, not emptied —
     /// and the difference is measured through a real fork rather than argued.
     ///
-    /// `place::shed_env` empties because herdr's wire has no way to spell an
+    /// `place::shed_env` empties because backend's wire has no way to spell an
     /// unset. That is the multiplexer's compromise and this backend is not
     /// bound by it: it mints the seat and then forks, so the caller's session
     /// identity simply does not exist in the child. The variable that matters
@@ -2073,6 +1485,7 @@ mod tests {
                     kind: "sh".into(),
                     name: "t-1".into(),
                     args: vec!["-c".into(), format!("env > {}", out.display())],
+                    key: None,
                 },
             )
             .expect("a process");
@@ -2112,7 +1525,7 @@ mod tests {
         let place = scratch.place();
         let seat = place.open(&Order::default()).unwrap();
         place
-            .start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new() })
+            .start(&seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: Vec::new(), key: None })
             .expect("a process");
         place.heard(&seat, "SessionStart", State::Idle, &json!({}));
         place.tell(&seat, "pick up robustness-061").expect("it was idle");
@@ -2129,7 +1542,7 @@ mod tests {
     }
 
     /// A census carries what the backend started and what the agent said it was,
-    /// which is the pair `place_herdr` needs two calls and a merge to assemble.
+    /// which is the pair `place_backend` needs two calls and a merge to assemble.
     #[test]
     fn a_census_carries_the_agent_wsp_started_and_the_session_it_reported() {
         let scratch = Scratch::new("census");
@@ -2151,7 +1564,7 @@ mod tests {
         assert_eq!(of(&busy).state, State::Working);
         assert_eq!(of(&busy).agent.name, "t-1", "what it was started as");
         assert_eq!(of(&busy).agent.kind, "sleep");
-        // The session id herdr reports as `agent_session.value` and takes a
+        // The session id backend reports as `agent_session.value` and takes a
         // second call to find. Here the agent said it, in its own hook.
         assert_eq!(of(&busy).session, "7a188ba8");
     }
@@ -2219,7 +1632,7 @@ mod tests {
         let place = Supervisor { poll: Duration::from_millis(10), ..Supervisor::at(base.join("seats")) };
         fs::create_dir_all(base.join("seats")).unwrap();
         let seat = place.open(&Order::default()).unwrap();
-        let burn = json!({ "session_id": "s-1", "model": "claude-sonnet-5-5", "turns": 7,
+        let burn = json!({ "session_id": "s-1", "transcript": "/t/s-1.jsonl", "model": "claude-sonnet-5-5", "turns": 7,
             "input": 1_234_567, "output": 89_012, "cache_read": 345_678_901,
             "cache_write": 2_345_678, "cost": 4_321_987 });
         fs::write(base.join("seats").join(seat.as_str()).join(BURN_FILE), burn.to_string()).unwrap();
@@ -2227,7 +1640,7 @@ mod tests {
         assert!(!base.join("seats").join(seat.as_str()).exists());
         let text = fs::read_to_string(base.join(SPENT_FILE)).expect("a ledger");
         let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-        for k in ["session_id", "model", "turns", "input", "output", "cache_read", "cache_write", "cost"] {
+        for k in ["session_id", "transcript", "model", "turns", "input", "output", "cache_read", "cache_write", "cost"] {
             assert_eq!(line[k], burn[k], "{k}");
         }
         assert_eq!(line["seat"], seat.as_str());
@@ -2420,7 +1833,7 @@ mod tests {
         // The agent exits on its own, and nobody calls `stop`.
         let exits = place.open(&Order::default()).unwrap();
         place
-            .start(&exits, &Agent { kind: "sh".into(), name: "t-2".into(), args: vec!["-c".into(), "exit 0".into()] })
+            .start(&exits, &Agent { kind: "sh".into(), name: "t-2".into(), args: vec!["-c".into(), "exit 0".into()], key: None })
             .expect("a process");
         let feed = feed_of(&exits);
         assert!(until(|| !alive(&[feed]).contains(&feed)), "an agent that exited left its tail");
@@ -2857,7 +2270,7 @@ mod tests {
     }
 
     /// One entry naming `wsp-session.sh` under a hook is what "installed" means
-    /// — anything else under that key (herdr's own `SessionStart` entry,
+    /// — anything else under that key (backend's own `SessionStart` entry,
     /// beside it) is not this backend's business.
     fn hook_entry(command: &str) -> Value {
         json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])
@@ -3034,12 +2447,10 @@ mod tests {
         fs::create_dir_all(dir.join("bin")).unwrap();
         let log = dir.join("log");
         let wsp = dir.join("bin/wsp");
-        fs::write(&wsp, format!("#!/bin/sh\ncat >/dev/null\necho \"$2\" >> '{}'\n", log.display())).unwrap();
-        fs::set_permissions(&wsp, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&wsp, &format!("#!/bin/sh\ncat >/dev/null\necho \"$2\" >> '{}'\n", log.display()));
         // A `compound-sup` that records the prompt it is told was submitted.
         let sup = dir.join("bin/compound-sup");
-        fs::write(&sup, format!("#!/bin/sh\ncat > '{}'/$$\n", dir.join("sup").display())).unwrap();
-        fs::set_permissions(&sup, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&sup, &format!("#!/bin/sh\ncat > '{}'/$$\n", dir.join("sup").display()));
         fs::create_dir_all(dir.join("sup")).unwrap();
         fs::create_dir_all(dir.join("state/compound-seats/t:1")).unwrap();
         fs::write(dir.join("state/compound-seats/t:1/seat.json"), r#"{"socket":"/s"}"#).unwrap();

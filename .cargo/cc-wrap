@@ -1,0 +1,38 @@
+#!/bin/sh
+# The C compiler `.cargo/config.toml`'s `[env] CC` names: `sccache cc` when this machine has sccache,
+# the bare `cc` when it does not. The C twin of `rustc-wrap` (docs/state-core.md section 9, option 1).
+# Called as `cc-wrap <args...>` by cc-rs from a build script (libsqlite3-sys compiles sqlite3.c).
+#
+# Why a wrapper of our own: cc-rs wraps C compiles in sccache only when RUSTC_WRAPPER is literally
+# sccache, and ours is the script `rustc-wrap`, so every tree would recompile sqlite3.c (about 28 CPU-s
+# release). With C through sccache a second tree builds it from cache in about 3 s.
+# - The same three places `rustc-wrap` looks for sccache.
+# - sccache exits 2 when it cannot reach or start its server; a build must not depend on a cache
+#   server that died (wsp-343), so the compile runs again with the bare `cc`.
+# - A server that is alive but never answers would hold the call forever (591 s for one cold
+#   build, wsp-083), and sccache 0.19 has no client timeout. The call runs under `sccache-bound`,
+#   which asks the server for its stats while a compile is slow and, when that goes unanswered,
+#   ends the call and exits 2 as for a dead server; the compile itself is never bounded. Without
+#   perl the call runs unbounded, as before.
+# - COMPOUND_NO_SCCACHE=1 bypasses sccache. An explicit CC in the environment overrides this file.
+here=$(dirname "$0")
+if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
+    for candidate in \
+        "$(command -v sccache 2>/dev/null || true)" \
+        /usr/local/bin/sccache \
+        /opt/homebrew/bin/sccache
+    do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            # Not `exec`: the exit code decides whether to fall back.
+            if command -v perl >/dev/null 2>&1; then
+                perl "$here/sccache-bound" "$candidate" cc "$@"
+            else
+                "$candidate" cc "$@"
+            fi
+            rc=$?
+            [ "$rc" = 2 ] || exit "$rc"
+            break
+        fi
+    done
+fi
+exec cc "$@"

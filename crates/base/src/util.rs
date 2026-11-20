@@ -5,22 +5,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The instance we are talking to, as environment for anything we spawn.
 ///
-/// A pane, tab or workspace herdr creates starts a fresh shell, which inherits
+/// A pane, tab or workspace backend creates starts a fresh shell, which inherits
 /// nothing from us — so a panel pointed at a non-default store would open
 /// editors pointed at the default one. They would then fail to find the task
 /// and take the tab down with them, which looks exactly like the key not
 /// working. An agent spawned onto a task has the same problem and a longer
 /// fuse: it would sit in a tree reading the wrong backlog.
 ///
-/// `WSP_BIN` joins them on the same argument: it is what `herdr-plugin/run.sh`
+/// `WSP_BIN` joins them on the same argument: it is what the launcher
 /// checks before `~/.local/bin/wsp`, so a pane opened by a wsp under test
 /// should run the binary under test rather than whatever is installed. Nothing
 /// but `wsp sandbox` sets it.
 ///
 /// The socket is the exception, and carrying it unconditionally was a bug.
-/// `HERDR_SOCKET_PATH` is set in *every* live herdr pane — herdr puts it there
+/// `WSP_BACKEND_SOCKET_PATH` is set in *every* live backend pane — backend puts it there
 /// itself, which is also why propagating it is pointless for an ordinary spawn:
-/// whichever herdr creates the workspace tells its panes where it is. What it
+/// whichever backend creates the workspace tells its panes where it is. What it
 /// is not is portable. This map goes into a seat's environment on whichever
 /// machine that seat is being made on, so an ordinary `wsp spawn --on <machine>`
 /// would bake *this* machine's socket path into a workspace on the executor — working by accident for as long as the two home layouts
@@ -56,30 +56,30 @@ fn store_env_from(
         carry(key);
     }
     if carry("WSP_BIN") {
-        carry("HERDR_SOCKET_PATH");
+        carry("WSP_BACKEND_SOCKET_PATH");
     }
     env
 }
 
-/// The lock every test that points wsp at a herdr takes.
+/// The lock every test that points wsp at a backend takes.
 ///
-/// `HERDR_SOCKET_PATH`, `WSP_HOME` and `WSP_STATE` are process-wide and cargo
+/// `WSP_BACKEND_SOCKET_PATH`, `WSP_HOME` and `WSP_STATE` are process-wide and cargo
 /// runs tests in threads, so two tests halfway through pointing the process at
 /// two different sockets is a flake that appears once a fortnight and is read as
-/// a real failure. `herdr.rs` and `fake.rs` each kept a mutex of their own for
+/// a real failure. `backend.rs` and `fake.rs` each kept a mutex of their own for
 /// this, which protects a module from itself and not from the module next door —
 /// and there are three of them now. One process-wide resource, one lock.
 ///
 /// Taken bare only for the variables nothing else knows how to set up — a seat
 /// id, a session marker, a credential the shed is being asked about. A test that
-/// can reach a store or a herdr wants [`isolated`], which takes this lock and
+/// can reach a store or a backend wants [`isolated`], which takes this lock and
 /// points all three of the pointing-variables at something of its own.
 #[cfg(any(test, feature = "test-support"))]
 pub static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How long a test may hold [`ENV`] before the process is ended and the test is
 /// named: `WSP_TEST_LIMIT_SECS`, else five minutes. Every test that touches a
-/// store or a herdr holds the lock, the rest of the suite queues behind it, and
+/// store or a backend holds the lock, the rest of the suite queues behind it, and
 /// `cargo test` has no per-test timeout, so one test waiting on something that
 /// never comes (a child, a socket, stdin) was a whole run, and a member's seat,
 /// blocked at 0 % CPU until a person killed it (wsp-434: `packet::` for 78
@@ -176,12 +176,12 @@ pub fn env_lock() -> EnvGuard {
 /// A store nobody else is using, a backend that does not exist, and this
 /// process pointed at both for as long as the guard lives. What a test takes
 /// instead of [`env_lock`] when anything under it can reach a
-/// [`crate::store::Store`] or a herdr.
+/// [`crate::store::Store`] or a backend.
 ///
 /// **Written by two tests that failed because a machine was added to the real
 /// store**, and neither of them was about machines (robustness-068).
 /// `Store::open()` falls back to `~/wsp` when `WSP_HOME` is unset, so a test
-/// that reaches a store reaches the developer's own — and `herdr::panes()` fans
+/// that reaches a store reaches the developer's own — and `backend::panes()` fans
 /// out over `store.machines()`, so a test that stood up a fake backend and
 /// asserted the one pane in it began asserting that pane *plus whatever was
 /// running on eds-macbook-i5*, over a tunnel, from a test named after a fake.
@@ -192,7 +192,7 @@ pub fn env_lock() -> EnvGuard {
 /// The fix belongs here rather than in `fanout()`, which is correct as written:
 /// fanning out is what it is for, and a production path taught to notice tests
 /// is a production path that behaves differently in the one place nobody is
-/// watching. `Store::open` and [`crate::herdr::socket_path`] each carry a
+/// watching. `Store::open` and [`crate::backend::socket_path`] each carry a
 /// `#[cfg(test)]` assertion that this guard has been taken — a line that
 /// compiles out of the binary, so no shipped path can tell, and that turns
 /// "somebody remembered" into "it will not run".
@@ -201,7 +201,7 @@ pub fn env_lock() -> EnvGuard {
 /// at `~/.local/state/wsp`, which is where the machine liveness the fan-out
 /// filters on is read from, so half an isolation still reads the real machine
 /// list (robustness-011 is open on that asymmetry). And the socket is not a
-/// third nicety: `HERDR_SOCKET_PATH` unset means the **live herdr**, which is a
+/// third nicety: `WSP_BACKEND_SOCKET_PATH` unset means the **live backend**, which is a
 /// server that gets written to. The three `cmd_govern` tests were renaming this
 /// machine's `w1` on every `cargo test` — the failure that file's module doc
 /// records as measured the hard way, still running. So the default here is a
@@ -235,11 +235,14 @@ pub fn isolated(name: &str) -> Isolated {
     std::env::set_var("WSP_STATE", dir.join("state"));
     // wsp-375: a list's reports go under here and never into the real folder.
     std::env::set_var("WSP_ARTEFACTS", dir.join("artefacts"));
-    std::env::set_var("HERDR_SOCKET_PATH", dir.join("no-backend.sock"));
-    // `my_pane()` reads the seat variable ahead of herdr's, so a `cargo test`
+    std::env::set_var("WSP_BACKEND_SOCKET_PATH", dir.join("no-backend.sock"));
+    // `my_pane()` reads the seat variable ahead of backend's, so a `cargo test`
     // run from inside an agent's seat (as `wsp verify` is) would answer every
     // "who am I" with the outer seat. A test that wants a seat sets its own.
     std::env::remove_var(crate::base::seat::SEAT_ENV);
+    // wsp-029: `WSP_HOST` unset is the manager, which a test reaches only
+    // when it says so (and stands one up); otherwise the host runs here.
+    std::env::set_var("WSP_HOST", "inproc");
     Isolated { _lock: lock, dir }
 }
 
@@ -267,7 +270,7 @@ impl Isolated {
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for Isolated {
     fn drop(&mut self) {
-        for key in ["WSP_HOME", "WSP_STATE", "HERDR_SOCKET_PATH"] {
+        for key in ["WSP_HOME", "WSP_STATE", "WSP_BACKEND_SOCKET_PATH", "WSP_HOST"] {
             std::env::remove_var(key);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -412,7 +415,14 @@ pub fn no_such(what: &str, needle: &str) -> String {
     }
 }
 
+/// The wall clock in seconds. Under a test build, `WSP_TEST_NOW` (epoch
+/// seconds) pins it: the golden test of the `--json` projections
+/// (tests/view_golden.rs, wsp-305) seeds and reads a store at one instant.
 pub fn epoch_secs() -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(n) = std::env::var("WSP_TEST_NOW").ok().and_then(|s| s.parse().ok()) {
+        return n;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -745,18 +755,25 @@ pub fn hostname() -> String {
     // writes with this, and a `hostname` child per stamp was a fork and an exec
     // per seat per minute in the daemon, for an answer that does not change
     // under a running process — the daemon `exec`s itself on every install.
+    // And read with gethostname(3), what the `hostname` program prints, not
+    // by running it (wsp-076): `wip` through the API runs no child, and its
+    // render compares each claim's host with this one.
     static ASKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ASKED
-        .get_or_init(|| {
-            crate::calls::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "localhost".into())
-        })
-        .clone()
+    ASKED.get_or_init(|| gethostname().filter(|s| !s.is_empty()).unwrap_or_else(|| "localhost".into())).clone()
+}
+
+fn gethostname() -> Option<String> {
+    extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is ours and its length is passed; one byte is kept
+    // back so the name is NUL-terminated even when it was cut.
+    if unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).trim().to_string())
 }
 
 pub fn home() -> PathBuf {
@@ -1040,7 +1057,36 @@ impl Paint {
 /// not read our own path, which is a reason not to reload rather than a
 /// reason to.
 pub fn exe_stamp() -> Option<(u64, u64)> {
-    stamp(&std::env::current_exe().ok()?)
+    stamp(&self_exe().ok()?)
+}
+
+/// The path of the binary we are running **as it is on disk now**, for running
+/// wsp again or asking whether it was replaced. Use this, never
+/// `std::env::current_exe()`, wherever a long-lived process does either.
+///
+/// `wsp-152`: on Linux `current_exe` reads `/proc/self/exe`, and once an install
+/// has replaced the binary under a running process that link reads
+/// `<path> (deleted)`. The daemon's `wsp despawn` was spawned at that name, so
+/// on Omarchy 2026-11-19 every verifier seat it went to end failed with "No
+/// such file or directory (os error 2)", tried again each tick. Its
+/// [`exe_stamp`] read nothing at that name either, so it never reloaded onto
+/// the new binary, which would have cleared it. macOS reports the path, so it
+/// never had this.
+pub fn self_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe().map(|p| on_disk(&p))
+}
+
+/// [`self_exe`]'s reading of a path, the half that can be tested: a path that
+/// is gone and ends in Linux's ` (deleted)` names what stands at the path
+/// without it. Any other path is returned as it is.
+pub fn on_disk(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    match path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(was) => PathBuf::from(was),
+        None => path.to_path_buf(),
+    }
 }
 
 /// [`exe_stamp`] against a path you name, which is the half that can be tested.
@@ -1164,7 +1210,7 @@ pub fn captures(glob: &str, path: &str) -> Option<Vec<String>> {
 /// The environment a check's commands get: the caller's, less wsp's own.
 pub fn clean_env(cmd: &mut crate::calls::Command) {
     for (k, _) in std::env::vars() {
-        if k.starts_with("WSP_") || k.starts_with("HERDR_") || k == "GIT_INDEX_FILE" {
+        if k.starts_with("WSP_") || k.starts_with("WSP_BACKEND_") || k == "GIT_INDEX_FILE" {
             cmd.env_remove(k);
         }
     }
@@ -1211,8 +1257,8 @@ mod tests {
         }
     }
 
-    /// The premise this was first written on was false: `HERDR_SOCKET_PATH` is
-    /// not "unset outside a sandbox", it is set in *every* live herdr pane. So
+    /// The premise this was first written on was false: `WSP_BACKEND_SOCKET_PATH` is
+    /// not "unset outside a sandbox", it is set in *every* live backend pane. So
     /// carrying it unconditionally put this machine's socket path into the env
     /// of a workspace created on another machine by `wsp spawn --on <machine>`
     /// — which works by accident while two home layouts match and fails
@@ -1224,13 +1270,13 @@ mod tests {
         let live = |k: &str| match k {
             "WSP_HOME" => Some("/Users/edjames/wsp".to_string()),
             "WSP_STATE" => Some("/Users/edjames/.local/state/wsp".to_string()),
-            // Set in every pane herdr makes, which is the whole point.
-            "HERDR_SOCKET_PATH" => Some("/Users/edjames/.config/herdr/herdr.sock".to_string()),
+            // Set in every pane backend makes, which is the whole point.
+            "WSP_BACKEND_SOCKET_PATH" => Some("/Users/edjames/.config/backend/backend.sock".to_string()),
             _ => None,
         };
         let env = store_env_from(live);
         assert!(
-            !env.contains_key("HERDR_SOCKET_PATH"),
+            !env.contains_key("WSP_BACKEND_SOCKET_PATH"),
             "a spawn from a live pane would carry this machine's socket to another machine: {env:?}"
         );
         assert_eq!(env.get("WSP_HOME").and_then(|v| v.as_str()), Some("/Users/edjames/wsp"));
@@ -1243,9 +1289,9 @@ mod tests {
         };
         let env = store_env_from(sandboxed);
         assert_eq!(
-            env.get("HERDR_SOCKET_PATH").and_then(|v| v.as_str()),
-            Some("/Users/edjames/.config/herdr/herdr.sock"),
-            "a sandbox spawned a workspace that could not find its own herdr"
+            env.get("WSP_BACKEND_SOCKET_PATH").and_then(|v| v.as_str()),
+            Some("/Users/edjames/.config/backend/backend.sock"),
+            "a sandbox spawned a workspace that could not find its own backend"
         );
     }
 
@@ -1489,7 +1535,7 @@ pub fn base36(mut n: u64) -> String {
 /// the same agent."* So it cannot be a session id, a pane id or a seat id —
 /// all three end and come back, and the thing this names does not. `wsp resume`
 /// carries it across a restart and across a change of BACKEND, which is what
-/// makes `compound-065`'s cutover — close down in herdr, come back in compound,
+/// makes `compound-065`'s cutover — close down in backend, come back in compound,
 /// on the same claim — a move rather than a replacement. `wsp govern --rotate`
 /// does not carry it: a successor is a different agent and mints its own.
 ///
@@ -1520,43 +1566,6 @@ pub fn new_agent_id() -> String {
 /// directions by the test, exactly as `message::is_message_id` is.
 pub fn is_agent_id(s: &str) -> bool {
     s.starts_with("a-") && s.rsplit('-').next().is_some_and(|tail| tail.starts_with('p'))
-}
-
-/// Which of these pids are running, in one ask.
-///
-/// One `ps` rather than one `kill -0` each, because [`Place::census`] would
-/// otherwise fork once per seat. An empty list forks nothing.
-///
-/// **A zombie is not alive**, and that arm is not hypothetical. `wsp spawn`
-/// starts the agent and then polls its readiness from the same process, so an
-/// agent that dies in its first second is a child nobody has reaped and sits in
-/// the process table looking exactly like a running one. Reporting it as alive
-/// is the same class of defect as robustness-041 with the sign flipped: an agent
-/// declared healthy while its corpse cools.
-pub fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
-    if pids.is_empty() {
-        return std::collections::BTreeSet::new();
-    }
-    let list = pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-    let out = match crate::calls::Command::new("ps").args(["-o", "pid=,state=", "-p", &list]).output() {
-        Ok(o) => o,
-        // Not an empty set: `ps` failing to run is not evidence that every agent
-        // on this machine has stopped, and a caller that reaped on the strength
-        // of it would end every claim at once. The rule is `sync.rs:41`'s and is
-        // older than this file.
-        Err(_) => return pids.iter().copied().collect(),
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let pid: u32 = it.next()?.parse().ok()?;
-            match it.next().unwrap_or("").starts_with('Z') {
-                true => None,
-                false => Some(pid),
-            }
-        })
-        .collect()
 }
 
 /// One entry is one line, so text that arrives on several becomes one.

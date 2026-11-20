@@ -32,7 +32,7 @@
 //! values for equality instead of one. There is no arithmetic to get wrong,
 //! which is the failure a single token is usually chosen to prevent.
 //!
-//! ## The census is not in the store, and it is not herdr's either
+//! ## The census is not in the store, and it is not backend's either
 //!
 //! `fingerprint`'s doc leaves ephemeral state out on the grounds that a raised
 //! hand is not a change to the work and has a stamp of its own where it needs
@@ -49,12 +49,12 @@
 //! because the verbs that write them write a task as well — `claim` ends in
 //! `save_task`, so it has already moved the record stamp.
 //!
-//! **The other place is not herdr.** This file digested `herdr::panes()` and
+//! **The other place is not backend.** This file digested `backend::panes()` and
 //! read `agent_status`, `interactive_ready` and `launch_pending` for one day,
 //! and that is a tie the rest of wsp spent [`crate::place`] removing — a port
 //! written so that nothing in a signature names a pane, a window or a tab. Its
 //! second implementor hosts agents with no terminal at all, and a surface that
-//! polls this verb is a candidate third. A stamp wired to herdr's field names
+//! polls this verb is a candidate third. A stamp wired to backend's field names
 //! would have to be unpicked again by exactly the migration this verb exists to
 //! serve, so it asks [`Place::census`] and digests [`Seated`] — `seat`, `label`,
 //! `agent`, `state`, `session`, in wsp's vocabulary — and [`State`] is already
@@ -106,7 +106,7 @@
 //! what is running in it, what state that is in, and the sentence it is
 //! wearing, which is what `wsp say` publishes into the label.
 //!
-//! `cwd` is deliberately out, and it is the same exclusion that kept herdr's
+//! `cwd` is deliberately out, and it is the same exclusion that kept backend's
 //! `title` and `focused` out before it: a stamp that moves when nothing a
 //! census draws has moved costs a full refetch every time somebody types, which
 //! is the same bill as not having a stamp at all. `agent.args` is out because
@@ -120,15 +120,15 @@
 //!
 //! **Every one `wsp wip` already asks, folded the same way — `compound-064`
 //! item 2.** This used to be `cmd_spawn::backend(args)`, the one `--headless`
-//! selects — singular, herdr by default — on the reasoning directly below,
+//! selects — singular, backend by default — on the reasoning directly below,
 //! now stale: `Census` keys by machine, not backend, so two backends folded
-//! with [`Census::and`] file under `"herdr"` and `"compound"`
+//! with [`Census::and`] file under `"backend"` and `"compound"`
 //! ([`crate::place::LOCAL_BACKEND_NAMES`]) rather than colliding on one
 //! name, which is the fact that makes the fold safe. It had to change because
 //! `Wip::live` went plural first (`compound-078`): `wsp wip --json` already
 //! shows a `compound` session with no flag asked of its caller, while this
 //! verb's token — the one thing that tells a polling surface *whether* to
-//! reread `wip` at all — stayed singular and herdr-first. A change that lived
+//! reread `wip` at all — stayed singular and backend-first. A change that lived
 //! only in a `compound` session moved nothing here, so a host polling this
 //! token alone never noticed (`compound-062`).
 //!
@@ -142,8 +142,8 @@
 //! does, under a name that cannot be mistaken for one. In practice
 //! `Compound::census` almost never refuses at all — an empty run directory
 //! is `Ok`, not `Err` — so what this mostly protects is the other direction:
-//! a machine running `compound` sessions with no herdr installed must not
-//! read as "no signal" the moment herdr's own call fails.
+//! a machine running `compound` sessions with no backend installed must not
+//! read as "no signal" the moment backend's own call fails.
 //!
 //! ## Cost, measured rather than assumed
 //!
@@ -151,11 +151,11 @@
 //! live store on 2026-08-25, release build, the mean of 50 runs: **11.5ms** end
 //! to end, of which 4.9ms is process start-up — `wsp --version` on the same
 //! machine — and 4.09ms is [`Store::fingerprint`]'s own measured walk over 468
-//! tasks. The rest is two `stat`s and the census — herdr's alone, at the time
+//! tasks. The rest is two `stat`s and the census — backend's alone, at the time
 //! this was measured; `compound-064` item 2 adds a second directory pass, on
 //! `Compound::census`'s own reasoning that it costs no socket at all.
 //!
-//! **The port costs 1.2ms against the raw `herdr::panes()` this file digested
+//! **The port costs 1.2ms against the raw `backend::panes()` this file digested
 //! before it** — 11.5ms against 10.3ms, measured the same way — and the 1.2ms
 //! buys the reading rather than only the decoupling: [`Place::census`] asks
 //! `pane.list` *and* `agent.list`, which is the only way to tell a starting
@@ -333,8 +333,8 @@ fn agents_now(place: &dyn Place) -> Agents {
 /// standing rule for one machine going quiet — now also covers a whole
 /// backend nobody has installed folding in silent beside one that answered,
 /// rather than reading as the fleet gone quiet. Proven against a real
-/// compound seat with no herdr socket anywhere
-/// (`a_compound_only_machine_is_heard_even_though_herdr_never_answers`):
+/// compound seat with no backend socket anywhere
+/// (`a_compound_only_machine_is_heard_even_though_backend_never_answers`):
 /// `heard()` stays true, and the stamp still moves when that seat opens and
 /// again when it closes.
 fn combined_census(store: &Store) -> Census {
@@ -349,7 +349,7 @@ fn combined_census(store: &Store) -> Census {
     let c = c.expect("local_backends() is never empty");
     // And every far machine that said nothing, under its own name. They are
     // not in any local backend's census, and without them a machine that has
-    // gone quiet is not on record at all; filed under `""` (what the herdr
+    // gone quiet is not on record at all; filed under `""` (what the backend
     // fan-out did) it would read as this machine being silent.
     match crate::far::silent_machines(&store.machines(), &store.machines_live()) {
         Some(far) => c.and(far),
@@ -509,9 +509,9 @@ mod tests {
     #[test]
     fn two_seats_cannot_be_confused_for_one_by_running_their_fields_together() {
         let mut a = seated("p1");
-        a.agent = Agent { kind: "claude".into(), name: "wsp-100".into(), args: Vec::new() };
+        a.agent = Agent { kind: "claude".into(), name: "wsp-100".into(), args: Vec::new(), key: None };
         let mut b = seated("p1");
-        b.agent = Agent { kind: "claudewsp".into(), name: "-100".into(), args: Vec::new() };
+        b.agent = Agent { kind: "claudewsp".into(), name: "-100".into(), args: Vec::new(), key: None };
         assert_ne!(census(&here(vec![a])), census(&here(vec![b])));
     }
 
@@ -553,13 +553,13 @@ mod tests {
         let quiet = Stamps {
             record: 1,
             attention: 2,
-            agents: Agents { stamp: None, silent: vec![(String::new(), "no herdr socket".into())] },
+            agents: Agents { stamp: None, silent: vec![(String::new(), "no backend socket".into())] },
         };
         let doc = document(&quiet);
         assert_eq!(doc["agents"]["heard"], json!(false), "silence did not say so");
         assert!(doc["agents"]["stamp"].is_null(), "silence came back as a value");
         assert_eq!(doc["agents"]["silent"][0]["machine"], json!(""));
-        assert_eq!(doc["agents"]["silent"][0]["why"], json!("no herdr socket"));
+        assert_eq!(doc["agents"]["silent"][0]["why"], json!("no backend socket"));
 
         let drawn = lines(&quiet, &Paint::plain());
         assert!(
@@ -619,55 +619,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `compound-064` item 2's own decision, proven against real backends:
-    /// a machine with `compound` sessions and no herdr up at all is HEARD —
-    /// herdr's own total refusal folds in as a silent row under `"herdr"`
-    /// (`crate::place::LOCAL_BACKEND_NAMES`), never as the whole answer
-    /// going to `None`. `stamp` (the CLI verb) is what this file used to ask
-    /// a single, flag-selected backend for; asking `combined_census` proves
-    /// the fold `stamp` now runs on rather than a hand-built `Agents`.
-    #[test]
-    fn a_compound_only_machine_is_heard_even_though_herdr_never_answers() {
-        let _env = util::isolated("stamp-compound-only");
-        let store = Store::open();
-        // No herdr socket bound anywhere — `HERDR_SOCKET_PATH` names a file
-        // that does not exist, `util::isolated`'s own doing.
-        let compound = crate::place_compound::Compound::new();
-
-        let before = take(&store);
-        assert!(before.agents.heard(), "a real (if empty) compound census is still an answer");
-        assert!(
-            before.agents.silent.iter().any(|(m, _)| m == "herdr"),
-            "herdr's own refusal is on record, under its own name and not `\"\"`, \
-             which `named` would draw as this whole machine: {:?}",
-            before.agents.silent
-        );
-        assert!(
-            !before.agents.silent.iter().any(|(m, _)| m == "compound"),
-            "compound answered — it must not also read as silent: {:?}",
-            before.agents.silent
-        );
-
-        let seat = compound.open(&Order::default()).expect("a compound seat");
-        let _stops = crate::place_compound::StopsOnDrop::new(seat.clone());
-        let opened = take(&store);
-        assert_ne!(
-            opened.agents.stamp, before.agents.stamp,
-            "a seat that exists only in compound's own directory must move the token \
-             `wsp stamp` publishes, or a host polling it never re-reads `wip` (compound-062)"
-        );
-
-        compound.stop(&seat).expect("the seat was there");
-        let closed = take(&store);
-        assert_ne!(closed.agents.stamp, opened.agents.stamp, "the seat ending was invisible");
-    }
-
     /// **The 16:40 defect, stated as a test.** A far machine that is silent, or
     /// refusing, must leave the local census heard and say so under its own name
     /// — never `""`, which a host drawing this machine's workspace reads as the
     /// local census being silent and stops drawing it. The local half here is
-    /// what compound answers (`heard("")`), with herdr's own absence beside it
-    /// under `"herdr"`.
+    /// what compound answers (`heard("")`), with backend's own absence beside it
+    /// under `"backend"`.
     #[test]
     fn a_silent_or_refusing_far_machine_leaves_the_local_census_heard() {
         use crate::model::Machine;
@@ -685,7 +642,7 @@ mod tests {
         live.insert("fine".to_string(), MachineLive { reachable: true, wire: Some(9), ..Default::default() });
 
         let local = Census::heard("", vec![seated("cpd-1")])
-            .and(Census::silent("herdr", Refusal::Unreachable("no herdr socket".into())));
+            .and(Census::silent("backend", Refusal::Unreachable("no backend socket".into())));
         let far = crate::far::silent_machines(&machines, &live).expect("two machines are silent");
         // And one that answered, with a refusal of its own kind.
         let c = local.and(far).and(Census::silent("gpu", Refusal::Backend("refused".into())));
@@ -693,7 +650,7 @@ mod tests {
         let agents = agents_of(&c);
         assert!(agents.heard(), "a far machine's silence is not the local census's");
         let silent: Vec<&str> = agents.silent.iter().map(|(m, _)| m.as_str()).collect();
-        assert_eq!(silent, ["gpu", "herdr", "mb2", "rack"], "each under its own name; `fine` answered");
+        assert_eq!(silent, ["backend", "gpu", "mb2", "rack"], "each under its own name; `fine` answered");
         assert!(!silent.contains(&""), "filed under this machine, a host stops drawing its workspace");
         let mb2 = agents.silent.iter().find(|(m, _)| m == "mb2").unwrap();
         assert!(mb2.1.contains("Connection refused"), "and why: {mb2:?}");

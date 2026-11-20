@@ -2,7 +2,7 @@
 //!
 //! Three agents worked `~/claude/wsp` on 2026-08-15 and none of them knew about
 //! the others until one swept another's uncommitted work into its commit. Every
-//! fact needed to have warned all three was already in this binary: herdr knows
+//! fact needed to have warned all three was already in this binary: backend knows
 //! what panes exist and where each is standing, and the store knows who claimed
 //! what. Nothing joined them and said so.
 //!
@@ -25,7 +25,6 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use crate::herdr;
 use crate::model::Task;
 use crate::resolve::{self, Index};
 use crate::store::Store;
@@ -64,7 +63,7 @@ impl Relation {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            // "tree" rather than "directory": herdr reports where a pane's
+            // "tree" rather than "directory": backend reports where a pane's
             // *shell* started, which for an agent launched from `~/claude` is
             // the parent of the checkout it is actually working in. That
             // containment is the whole reason this fires at all, so the word
@@ -83,14 +82,14 @@ impl Relation {
 #[derive(Debug, Clone)]
 pub struct Standing {
     pub pane: String,
-    /// The workspace label rather than its id — the id is herdr's business and
+    /// The workspace label rather than its id — the id is backend's business and
     /// the label is what a person recognises.
     pub workspace: String,
     pub cwd: String,
     /// Whether anyone is driving it. A shell counts: a person at one can
     /// clobber a file as thoroughly as an agent can.
     pub agent: bool,
-    /// herdr's `idle`/`working`, empty for a shell.
+    /// backend's `idle`/`working`, empty for a shell.
     pub state: String,
     /// The terminal's own title, which is all a pane holding no task can say
     /// about itself.
@@ -130,7 +129,7 @@ impl Standing {
     /// one definition of it rather than each of them keeping its own.
     ///
     /// It said `state == "idle"` until robustness-083, which is one of the
-    /// three words herdr has for a pane with nothing running in it. The two it
+    /// three words backend has for a pane with nothing running in it. The two it
     /// missed are the two nobody is watching for: `done`, which is what an
     /// agent that finished a turn in an unfocused workspace reports, and
     /// `blocked`, which is a permission prompt. Both read as busy, and this is
@@ -138,7 +137,7 @@ impl Standing {
     /// dead and every session started beside it would be told all was well.
     pub fn needs_you(&self) -> bool {
         self.agent
-            && crate::place_herdr::of_word(&self.state).stopped()
+            && matches!(self.state.trim(), "idle" | "done" | "blocked")
             && self.task.as_ref().map(|t| t.status() == crate::model::Status::Doing).unwrap_or(false)
     }
 
@@ -160,12 +159,32 @@ impl Standing {
     }
 }
 
+/// A pane someone is standing in: the fields the reckoning reads. It was
+/// backend's pane record; it is now a compound seat, filled by [`panes_of`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Pane {
+    pub pane_id: String,
+    pub label: String,
+    pub workspace_id: String,
+    pub agent: String,
+    pub agent_status: String,
+    pub cwd: String,
+    pub title: String,
+}
+
+/// A workspace's id and the label it is drawn under.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Workspace {
+    pub id: String,
+    pub label: String,
+}
+
 /// Everything the reckoning reads, taken in rather than fetched — so a test can
-/// stand six panes in a fabricated tree with no herdr and no store, the same
+/// stand six panes in a fabricated tree with no backend and no store, the same
 /// bargain [`crate::panel`] makes with its `Snapshot`.
 pub struct World {
-    pub panes: Vec<herdr::Pane>,
-    pub workspaces: Vec<herdr::Workspace>,
+    pub panes: Vec<Pane>,
+    pub workspaces: Vec<Workspace>,
     pub tasks: Vec<Task>,
     pub index: Index,
     pub pins: BTreeMap<String, String>,
@@ -177,16 +196,16 @@ pub struct World {
 }
 
 impl World {
-    /// The live join: herdr for what exists, the store for who holds what.
+    /// The live join: the store for who holds what, and compound's seat list
+    /// for who is standing where. A census that cannot be taken leaves the
+    /// panes empty, which is what overlap said before it had a feed at all:
+    /// it reports nobody rather than guess.
     pub fn live(store: &Store) -> World {
-        let (panes, workspaces) = if herdr::available() {
-            (herdr::panes().unwrap_or_default(), herdr::workspaces().unwrap_or_default())
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        use crate::place::Place;
+        let panes = crate::place_compound::Compound::new().census().map(|c| panes_of(&c)).unwrap_or_default();
         World {
             panes,
-            workspaces,
+            workspaces: Vec::new(),
             tasks: store.tasks(),
             index: Index::new(store.projects()),
             pins: store.pins(),
@@ -195,6 +214,28 @@ impl World {
             agents_held: store.agents_held(),
         }
     }
+}
+
+/// The panes a census reports: one per seat that is still there.
+///
+/// A seat that has gone is not standing anywhere, so it is left out; a plain
+/// terminal (`Empty`) stays, with no agent, because a shell in a tree can
+/// overwrite files as well as an agent can. The seat id is the pane id, and
+/// compound has no workspaces, so `workspace_id` is empty.
+pub fn panes_of(census: &crate::place::Census) -> Vec<Pane> {
+    census
+        .seats()
+        .filter(|s| s.state != crate::place::State::Gone)
+        .map(|s| Pane {
+            pane_id: s.seat.as_str().to_string(),
+            label: s.label.clone(),
+            workspace_id: String::new(),
+            agent: if s.state == crate::place::State::Empty { String::new() } else { s.agent.kind.clone() },
+            agent_status: s.state.as_str().to_string(),
+            cwd: s.cwd.clone(),
+            title: String::new(),
+        })
+        .collect()
 }
 
 /// The deepest declared project root containing `cwd`, if any.
@@ -244,9 +285,9 @@ fn same_tree(a: &str, b: &str) -> bool {
 
 /// Everyone else standing anywhere, nearest first.
 ///
-/// `my_cwd` overrides what herdr believes about the asking pane, because a
+/// `my_cwd` overrides what backend believes about the asking pane, because a
 /// process knows its own directory better than the pane it is running in does —
-/// herdr reports the shell's cwd, which is stale the moment anyone `cd`s.
+/// backend reports the shell's cwd, which is stale the moment anyone `cd`s.
 pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standing> {
     let label_of = |ws: &str| {
         w.workspaces.iter().find(|x| x.id == ws).map(|x| x.label.clone()).unwrap_or_default()
@@ -255,7 +296,7 @@ pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standin
         let id = w.bindings.get(pane)?.get("task_id")?.as_str()?;
         w.tasks.iter().find(|t| t.id == id)
     };
-    let project_of = |p: &herdr::Pane| {
+    let project_of = |p: &Pane| {
         let agent = crate::store::Store::agent_in_seat_from_map(&w.agents_held, &p.pane_id);
         resolve::resolve(
             &w.index,
@@ -278,7 +319,7 @@ pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standin
         .project
     };
 
-    // Where the asking pane is standing. A pane herdr has never heard of still
+    // Where the asking pane is standing. A pane backend has never heard of still
     // gets an answer, since `wsp overlap` is worth running from a bare shell.
     let mine = w.panes.iter().find(|p| p.pane_id == me);
     let my_cwd = my_cwd
@@ -293,9 +334,9 @@ pub fn standing_beside(w: &World, me: &str, my_cwd: Option<&str>) -> Vec<Standin
         if p.pane_id == me {
             continue;
         }
-        // Our own furniture is not company. Every workspace has a panel and
-        // most have a view, and reporting them would bury the one pane that
-        // matters under the ones we installed ourselves.
+        // Our own furniture is not company. A panel or a view is ours, found
+        // by its label, and reporting them would bury the one pane that
+        // matters under our own.
         if p.label == crate::base::labels::PANEL_LABEL || p.label == crate::base::labels::VIEW_LABEL {
             continue;
         }
@@ -359,8 +400,8 @@ mod tests {
     use super::*;
     use crate::model::Project;
 
-    fn pane(id: &str, ws: &str, cwd: &str) -> herdr::Pane {
-        herdr::Pane {
+    fn pane(id: &str, ws: &str, cwd: &str) -> Pane {
+        Pane {
             pane_id: id.into(),
             workspace_id: ws.into(),
             cwd: cwd.into(),
@@ -370,7 +411,7 @@ mod tests {
         }
     }
 
-    fn world(panes: Vec<herdr::Pane>) -> World {
+    fn world(panes: Vec<Pane>) -> World {
         let mut wsp = Project::new("wsp");
         wsp.roots = vec!["/home/ed/claude/wsp".into()];
         let mut vst = Project::new("vst");
@@ -385,6 +426,39 @@ mod tests {
             claims: BTreeMap::new(),
             agents_held: BTreeMap::new(),
         }
+    }
+
+    /// The feed: a compound census with a seat in it becomes a pane overlap
+    /// sees, a seat that has gone does not, and a shell with no agent in it is
+    /// still company.
+    #[test]
+    fn a_live_seat_in_the_census_is_a_pane_standing_beside_us() {
+        use crate::place::{Agent, Census, Seat, Seated, State};
+        let seated = |id: &str, cwd: &str, state: State| Seated {
+            seat: Seat::new(id),
+            cwd: cwd.into(),
+            agent: Agent { kind: "claude".into(), ..Default::default() },
+            state,
+            ..Default::default()
+        };
+        let census = Census::heard(
+            "",
+            vec![
+                seated("cpd-1", "/home/ed/claude/wsp", State::Working),
+                seated("cpd-2", "/home/ed/claude/wsp/src", State::Idle),
+                seated("cpd-3", "/home/ed/claude/wsp", State::Gone),
+                seated("cpd-4", "/home/ed/claude/wsp", State::Empty),
+            ],
+        );
+        let panes = panes_of(&census);
+        assert_eq!(panes.len(), 3, "a gone seat is still standing");
+        let w = world(panes);
+        let out = standing_beside(&w, "cpd-1", None);
+        let ids: Vec<&str> = out.iter().map(|s| s.pane.as_str()).collect();
+        assert_eq!(ids, vec!["cpd-2", "cpd-4"]);
+        let idle = out.iter().find(|s| s.pane == "cpd-2").unwrap();
+        assert!(idle.agent && idle.state == "idle" && idle.relation.is_near());
+        assert!(!out.iter().find(|s| s.pane == "cpd-4").unwrap().agent, "a shell is not an agent");
     }
 
     /// The failure this exists for: two panes in one directory, neither
@@ -420,7 +494,7 @@ mod tests {
     fn siblings_under_one_root_share_a_checkout() {
         let w = world(vec![
             pane("a", "w1", "/home/ed/claude/wsp/src"),
-            pane("b", "w2", "/home/ed/claude/wsp/herdr-plugin"),
+            pane("b", "w2", "/home/ed/claude/wsp/plugin"),
         ]);
         let out = standing_beside(&w, "a", None);
         assert_eq!(out[0].relation, Relation::SameRoot);
@@ -506,8 +580,8 @@ mod tests {
         assert_eq!(out[0].relation, Relation::SameCwd);
     }
 
-    /// The panel and the view are in every workspace by construction. Counting
-    /// them would bury the one pane that matters.
+    /// The panel and the view are ours, not company. Counting them would bury
+    /// the one pane that matters.
     #[test]
     fn our_own_furniture_is_not_company() {
         let mut panel = pane("p", "w1", "/home/ed/claude/wsp");
@@ -518,10 +592,10 @@ mod tests {
         assert!(standing_beside(&w, "me", None).is_empty());
     }
 
-    /// A process knows its own directory; herdr only knows where the pane's
+    /// A process knows its own directory; backend only knows where the pane's
     /// shell started.
     #[test]
-    fn the_callers_cwd_wins_over_herdrs() {
+    fn the_callers_cwd_wins_over_backends() {
         let w = world(vec![
             pane("me", "w0", "/home/ed/somewhere/stale"),
             pane("b", "w2", "/home/ed/claude/wsp"),
@@ -532,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_herdr_has_never_heard_of_still_gets_an_answer() {
+    fn a_pane_backend_has_never_heard_of_still_gets_an_answer() {
         let w = world(vec![pane("b", "w2", "/home/ed/claude/wsp")]);
         let out = standing_beside(&w, "not-a-pane", Some("/home/ed/claude/wsp"));
         assert_eq!(out.len(), 1);

@@ -114,8 +114,9 @@ pub struct Run {
 }
 
 impl Run {
-    /// The running process's own.
-    pub fn this() -> Option<Run> {
+    /// The running process's own. `start_of` is the host's reading of when a
+    /// pid started (`wire::host::Host::started`): this layer asks it nothing.
+    pub fn this(start_of: StartOf) -> Option<Run> {
         let pid = std::process::id();
         Some(Run { pid, started: start_of(pid).ok()?? })
     }
@@ -131,7 +132,7 @@ impl Run {
 
     /// Whether the process is gone: no such pid, or one that started at another
     /// time. A `ps` that cannot be run says nothing, and the run is believed.
-    pub fn gone(&self) -> bool {
+    pub fn gone(&self, start_of: StartOf) -> bool {
         match start_of(self.pid) {
             Ok(now) => now.as_deref() != Some(self.started.as_str()),
             Err(()) => false,
@@ -139,35 +140,14 @@ impl Run {
     }
 }
 
-/// When process `pid` started, as `ps` says it, or `None` where there is none.
-fn start_of(pid: u32) -> Result<Option<String>, ()> {
-    let out = wsp_base::calls::Command::new("ps").args(["-o", "lstart=,stat=", "-p", &pid.to_string()]).output().map_err(|_| ())?;
-    ps_says(out.status.code(), &out.stdout)
-}
+/// When process `pid` started, as the host's `ps` says it, or `None` where
+/// there is none; `Err` where the host could not tell.
+pub type StartOf<'a> = &'a dyn Fn(u32) -> Result<Option<String>, ()>;
 
-/// What a finished `ps -o lstart=,stat= -p <pid>` says. A defunct (zombie)
-/// process, its `stat` starting with `Z`, still has a pid and a start time but
-/// is no run: it reads as no process at all, so a barrier whose run died
-/// unreaped is not waited on forever. It says there is no such
-/// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
-/// too large for the system gets a complaint there with the same exit). Any
-/// other end — killed by a signal, or another exit status — says nothing about
-/// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
-/// itself fails with exit 1 and prints nothing cannot be told from a missing
-/// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
-pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
-    if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
-        return Err(());
-    }
-    let s = String::from_utf8_lossy(stdout);
-    let mut words = s.split_whitespace().collect::<Vec<_>>();
-    let Some(stat) = words.pop() else { return Ok(None) };
-    if stat.starts_with('Z') {
-        return Ok(None);
-    }
-    let s = words.join("_");
-    Ok((!s.is_empty()).then_some(s))
-}
+/// What a finished `ps -o lstart= -p <pid>` says: moved down to `wsp-base`'s
+/// `procs` with the other readings of `ps` (wsp-020), because the in-process
+/// host (`wsp-host`) reads it and links no store.
+pub use wsp_base::base::procs::ps_says;
 
 /// Where the barrier's mechanical run is: the project's full suite, the
 /// members' recorded checks and the stop condition's `stop-checks`.
@@ -217,8 +197,8 @@ impl Check {
 
     /// Its mechanical run was started by a process that is no longer there, and
     /// left no result.
-    pub fn run_died(&self) -> bool {
-        self.suite == Some(Suite::Running) && self.pane.is_none() && self.run.as_ref().is_some_and(Run::gone)
+    pub fn run_died(&self, start_of: StartOf) -> bool {
+        self.suite == Some(Suite::Running) && self.pane.is_none() && self.run.as_ref().is_some_and(|r| r.gone(start_of))
     }
 
     /// How long this entry waits with no seat before its agent is started
@@ -226,8 +206,8 @@ impl Check {
     /// never. A run known to be dead waits for nothing (while it has tries
     /// left, each retake being one); one whose process is alive, or unknown, is
     /// believed for [`SUITE_WEDGED_AFTER`] at most.
-    pub fn wait_before_next_try(&self) -> Option<i64> {
-        if self.run_died() {
+    pub fn wait_before_next_try(&self, start_of: StartOf) -> Option<i64> {
+        if self.run_died(start_of) {
             return (self.tries < TRIES).then_some(-1);
         }
         if self.suite == Some(Suite::Running) {

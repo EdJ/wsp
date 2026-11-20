@@ -384,8 +384,12 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::disk::tidy(store);
     // And the build holds of processes that died, and the load warning's edges
     // (`wsp-331`).
+    // Under `WSP_HOST=manager`, over the beat's facts as folded (wsp-028).
     wsp_base::calls::phase("sweep:throttle");
-    crate::throttle::tidy(store);
+    match crate::fold::under_manager() {
+        true => crate::throttle::tidy_given(store, crate::fold::facts(store).map(|f| throttle_given(&f))),
+        false => crate::throttle::tidy(store),
+    }
     // And a cold build for a tip that has none, while the person is away (`wsp-342`).
     wsp_base::calls::phase("sweep:cold");
     crate::cold::when_away(store, &crate::cycle::launch_out);
@@ -397,9 +401,13 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     wsp_base::calls::phase("stand-down");
     crate::stand_down::tick(store, seats);
     // And text typed at a governor's or a member's prompt and never sent
-    // (`wsp-386`): counted here, drawn by `wsp wip`.
-    wsp_base::calls::phase("repair:unsent");
-    unsent_tick(store, seats);
+    // (`wsp-386`): counted here, drawn by `wsp wip`. Not under
+    // `WSP_HOST=manager`, whose `order.refused` is the cause and is folded
+    // (wsp-028): no screen is read for it, and the phase is not marked.
+    if !crate::fold::under_manager() {
+        wsp_base::calls::phase("repair:unsent");
+        unsent_tick(store, seats);
+    }
     // And a governor whose supervisor has refused every tell for [`crate::refusals::REFUSED_TICKS`]
     // ticks running (`wsp-634`): ended, so the pass below seats a successor.
     wsp_base::calls::phase("repair:refusing");
@@ -426,6 +434,22 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // list a pass (`wsp-384`).
     wsp_base::calls::phase("pickup");
     crate::pickup::tick(store);
+}
+
+/// A beat's facts as the throttle reads them. A thermal state is the top of
+/// its band of `CPU_Speed_Limit` (`wsp_host::facts::parse_thermal`'s bands).
+pub(crate) fn throttle_given(f: &wsp_host_api::HostFacts) -> crate::throttle::Given {
+    use wsp_host_api::Thermal;
+    crate::throttle::Given {
+        load1: f.load_centi as f64 / 100.0,
+        cores: f.cpus as usize,
+        speed_limit: Some(match f.thermal {
+            Thermal::Nominal => 100,
+            Thermal::Fair => 99,
+            Thermal::Serious => 79,
+            Thermal::Critical => 49,
+        }),
+    }
 }
 
 /// The step on every running list: what the tick does first, and again once an
@@ -785,11 +809,28 @@ pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (
 /// returns now and the telling, which names the pid ended, is the next thing
 /// the seat reads. A pid found before the loop is not that shape
 /// ([`crate::stuck::classify`]), so a loop on a real build is left alone.
+///
+/// **Under `WSP_HOST=manager`** (wsp-028) the stall is the manager's `seat.stuck`
+/// as folded ([`crate::fold::stall`]): no transcript is read and no `ps` run.
+/// The shell is the manager's to end; until the protocol carries that ask, the
+/// seat is told and the shell left.
 pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
+    if crate::fold::under_manager() {
+        let before = held_all(store);
+        return stuck_tick_with(
+            store,
+            seats,
+            &|seat| {
+                let recorded = before.get(seat).map(|h| (h.command.as_str(), h.at));
+                crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), recorded)
+            },
+            &|_| Vec::new(),
+        );
+    }
     stuck_tick_with(
         store,
         seats,
-        &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs()),
+        &|seat| crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), None),
         &|seat| crate::waiting::end_self_waits(seat, &crate::stuck::Kind::is_self_wait),
     );
 }
@@ -1085,7 +1126,13 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
         #[cfg(test)]
         crate::cycle::tests::RESEATED.with(|s| s.borrow_mut().push(scope.clone()));
     }
-    crate::cycle::launch_out(store, &["govern", &scope, "--reseat"]);
+    // A successor that never started is a failed reseat, said with its reason
+    // and backed off like one (`wsp-151`): without this the claim timed out in
+    // silence and was taken again, and a done list's held sentences read
+    // "nobody coming" only once the list closed.
+    if let Err(why) = crate::cycle::try_launch(store, &["govern", &scope, "--reseat"]) {
+        cmd_govern::reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` could not be started: {why}"));
+    }
 }
 
 /// What is in a scope's seat: somebody, nobody, or a reading nobody can give.
@@ -1735,7 +1782,7 @@ pub(crate) fn tell_member(store: &Store, id: &str, text: &str) {
         #[cfg(test)]
         return crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), text.to_string())));
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = wsp_base::util::self_exe() else { return };
     let child = wsp_base::calls::Command::new(exe)
         .args(["tell", id, "-"])
         .stdin(std::process::Stdio::piped())
@@ -2256,7 +2303,7 @@ fn land_for_the_run(id: &str) -> Result<(), String> {
             tests::LAND_FAILS.with(|f| f.borrow().clone()).map_or(Ok(()), Err)
         });
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
     let out = wsp_base::calls::Command::new(exe)
         .args(["land", id, "--for-run"])
         .current_dir("/")
@@ -2911,6 +2958,164 @@ impl Seats for Absent {
         assert_eq!(reseated(), vec!["run".to_string()], "governors are wsp's to allocate");
     }
 
+    // ---- wsp-036: under the manager, a reseat is the manager's seat ---------
+
+    /// compound-sup as far as a seat's spawn and its first order go, as
+    /// `crates/wire/tests/host.rs`'s fake is: `spawn` prints the handshake and
+    /// becomes a sleeping session of its own (ended with this test process at
+    /// the latest), and appends `<label> <pid>` to `<run>/spawns`; `deliver`
+    /// answers `delivered`. No agent is ever started.
+    pub(crate) const FAKE_SUP: &str = r#"#!/bin/sh
+OWNER=__OWNER__
+verb=$1; shift
+case "$verb" in
+wire-version) echo "9 9" ;;
+spawn)
+  label=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) label=$2; shift 2 ;;
+      --agent|--cwd|--ephemeral|--cols|--rows) shift 2 ;;
+      --) shift; break ;;
+      *) shift ;;
+    esac
+  done
+  run=${COMPOUND_RUN_DIR:?}
+  mkdir -p "$run"
+  name=s$$
+  echo "$$" > "$run/$name.sock"
+  printf '%s' "$label" > "$run/$name.label"
+  echo "$label $$" >> "$run/spawns"
+  printf 'sup %s\npid %s\nsocket %s\nrender %s\n' "$$" "$$" "$run/$name.sock" "$run/$name.rsock"
+  exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' sh -c "trap 'exit 0' TERM; while kill -0 $OWNER 2>/dev/null; do sleep 0.2; done" "$0" spawn --label "$label" </dev/null >/dev/null 2>&1
+  ;;
+vitals)
+  pid=$(cat "$1" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "renderer_attached false"; echo "output_at 0"
+  else
+    echo "no session at $1" >&2; exit 1
+  fi
+  ;;
+deliver)
+  sock=$1; id=$2; d=$sock.orders
+  mkdir -p "$d"
+  if [ -f "$d/$id" ]; then cat "$d/$id"; exit 0; fi
+  pid=$(cat "$sock" 2>/dev/null)
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then echo "no session at $sock" >&2; exit 1; fi
+  text=$(cat)
+  echo "$id" >> "$d/typed"
+  echo "delivered $id" > "$d/$id"
+  cat "$d/$id"
+  ;;
+*) echo "fake compound-sup: no verb $verb" >&2; exit 2 ;;
+esac
+"#;
+
+    /// `WSP_HOST` back to the isolated default however the test ends: unset
+    /// would be the manager, which nothing after this test stands up.
+    pub(crate) struct Inproc;
+    impl Drop for Inproc {
+        fn drop(&mut self) {
+            std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
+        }
+    }
+
+    /// **`wsp-036`: a governor reseat goes through the Host `wsp spawn` does.**
+    /// retro-2's governor was reseated in cpd-241 by the daemon under
+    /// `WSP_HOST=manager`, and the manager neither journalled it nor listed it
+    /// to `wip`: `cmd_spawn::reseat` started the successor on the in-process
+    /// host whatever `WSP_HOST` said. Here the reconciler's pass finds a
+    /// running list with nobody in its seat and claims it, then the verb it
+    /// launches (`wsp govern run --reseat`) runs under a loopback manager: the
+    /// manager forks the seat (its `seat.spawn`, under the row's key), runs it,
+    /// and `wip`'s census reads it from the manager.
+    #[test]
+    fn a_governor_reseat_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census() {
+        let (env, store) = in_flight("reseat-mgr");
+        let _inproc = Inproc;
+        // The member's project gives the list's governor a root to stand in.
+        repo(&env, &store);
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+
+        let exec = env.path("x");
+        std::fs::create_dir_all(&exec).unwrap();
+        let sup = env.path("sup");
+        wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
+        let mut cfg = wsp_manager::Config::new(&exec, "test-host");
+        cfg.port = 0;
+        cfg.sup = Some(sup);
+        let m = wsp_manager::Manager::start(cfg).expect("the manager starts on loopback");
+        let token = std::fs::read_to_string(exec.join(wsp_manager::TOKEN_FILE)).unwrap();
+        let local = crate::manager::Local {
+            host: "test-host".into(),
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: m.addrs()[0].port(),
+            exec_dir: exec.clone(),
+        };
+        crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+
+        // The daemon's pass: claimed, and the reseat launched.
+        a_pass(&store, &Fake::empty());
+        assert_eq!(reseated(), vec!["run".to_string()]);
+        // Claude Code's hook, played: claude takes its order in argv and is
+        // ready when a turn runs, which under the manager its hook posts as
+        // the seat's turn begun, at the epoch the manager started it under
+        // (wsp-038; `wait_ready` hears it as an event, wsp-037). Posted once
+        // the agent is on the seat's record: its epoch then is the agent's,
+        // not that of the shell `open` put there first.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let dial = wsp_host::hooks::Dial::Manager { addr: m.addrs()[0], token_file: exec.join(wsp_manager::TOKEN_FILE) };
+        let code = std::thread::scope(|s| {
+            s.spawn(|| {
+                let seats = store.state.join(crate::place_compound::SEATS);
+                let mut posted = std::collections::BTreeSet::new();
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    for dir in std::fs::read_dir(&seats).into_iter().flatten().flatten().map(|e| e.path()) {
+                        let rec: serde_json::Value = std::fs::read_to_string(dir.join("seat.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                        let seat = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let Some(epoch) = m.seats().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch) else { continue };
+                        if rec.get("agent").is_some() && !posted.contains(&(seat.clone(), epoch.0)) {
+                            let payload = serde_json::json!({ "session_id": format!("sess-{seat}") });
+                            // Posted again on the next round until the manager takes it.
+                            if let wsp_host::hooks::Sent::Taken(_) = wsp_host::hooks::report(&dial, &seat, epoch, "UserPromptSubmit", &payload) {
+                                posted.insert((seat, epoch.0));
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+            // What it launched, run here (a test's `launch` starts nothing).
+            let code = crate::cmd_govern::govern(&store, &crate::Args::synth("govern", &["run"], &[("reseat", "true")]));
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            code
+        });
+        let said = || {
+            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            format!("cycle.log:\n{}\nmanager.log:\n{}", read(store.state_file("cycle.log")), read(m.log_path()))
+        };
+        assert_eq!(code, 0, "the reseat seated a successor: {}", said());
+        let seat = store.governors()["run"]["pane"].as_str().unwrap_or_default().to_string();
+        assert!(!seat.is_empty(), "the seat is on the record: {:?}", store.governors()["run"]);
+
+        // The manager took the seat.spawn and forked it: it runs the seat.
+        let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
+        assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "the manager forked {seat}: {spawns:?}");
+        assert!(m.seats().iter().any(|s| s.seat.0 == seat), "the manager runs {seat}: {:?}", m.seats());
+        // And `wip`'s census, which asks the manager, reads it.
+        let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        assert!(reading.rows.contains_key(&seat), "wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
+
+        // The seat ended through the manager, as `wsp despawn` would.
+        let place = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION")).unwrap();
+        let _ = crate::place::Place::stop(&place, &crate::place::Seat::new(&seat));
+        m.stop();
+    }
+
     /// **A person's pause leaves the post empty, and nothing reaches it to
     /// count.** `wsp-173`: native-window read `running` on 2026-10-05 after Ed
     /// paused it, so this pass counted `tooling` unseated and was one tick from
@@ -3238,14 +3443,14 @@ impl Seats for Absent {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// **A seat on a herdr pane, read by the real fleet** (`wsp-148`, live on
-    /// 2026-10-06). herdr is out of the picture, and while the fleet still asked
+    /// **A seat on a backend pane, read by the real fleet** (`wsp-148`, live on
+    /// 2026-10-06). backend is out of the picture, and while the fleet still asked
     /// it, its `Unreachable` made every such seat `Unreadable` — so compound,
     /// jolt-app and wsp sat dead with nothing coming to fill them. Compound has
     /// no record of the pane, which is a fact, and the seat reads `gone`.
     #[test]
-    fn a_seat_on_a_herdr_pane_reads_gone_to_the_real_fleet() {
-        let (_env, store) = in_flight("seat-herdr-pane");
+    fn a_seat_on_a_backend_pane_reads_gone_to_the_real_fleet() {
+        let (_env, store) = in_flight("seat-backend-pane");
         store.set_governor(
             "run",
             serde_json::json!({
@@ -3478,7 +3683,7 @@ fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it(
 
 /// **A stand-down survives `reconcile`, which vacates the same record.** Without
 /// this the decision lasts until the next dead pane, which on this machine is
-/// not long: `vacate` is what the reaper calls on a slot whose workspace herdr
+/// not long: `vacate` is what the reaper calls on a slot whose workspace backend
 /// has closed, so any unrelated project losing its governor would have quietly
 /// unseated every stood-down scope in the store on the same pass.
 #[test]

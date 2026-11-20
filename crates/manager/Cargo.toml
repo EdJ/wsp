@@ -1,0 +1,20 @@
+[package]
+name = "wsp-manager"
+version = "0.1.0"
+edition = "2021"
+description = "The agent manager (docs/agent-manager.md, M1): one process per host that serves wsp over TCP, keeps the journal, and beats with the host's facts"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wsp-manager"
+path = "src/main.rs"
+
+# wsp-host-api, wsp-base and wsp-host, and nothing of wsp-store (2.3 R1, d1 Q3):
+# tests/layering.rs, `the_manager_links_no_store_and_no_wire`.
+[dependencies]
+serde_json = "1"
+wsp-base = { path = "../base" }
+wsp-host = { path = "../host" }
+wsp-host-api = { path = "../host-api" }

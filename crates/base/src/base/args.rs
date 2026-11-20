@@ -21,12 +21,12 @@ pub const BOOL_FLAGS: &[&str] = &[
     "no-focus",
     // `spawn --headless <task>`, whose positional is a task id.
     "headless",
-    // `spawn --herdr <task>` the same way, and it is the OPT-IN since
+    // `spawn --backend <task>` the same way, and it is the OPT-IN since
     // `compound-112` flipped the default: compound is what a spawn gets when
     // it says nothing, and this asks for the fork by name. `--compound` stays
     // beside it and means what it always did, so a script, a shell history or
     // a work order that still says it keeps working.
-    "herdr", "compound",
+    "backend", "compound",
     // `verify` takes paths as positionals, so every flag it owns has to be
     // known here or `wsp verify --check src/main.rs` eats the path as a value.
     "release", "check", "rm", "alone", "no-alone", "no-retro", "packet", "at-clear", "defect", "strategic",

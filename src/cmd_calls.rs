@@ -16,6 +16,14 @@
 //! default view is the actions, `--polls` the polls, `--all` both.
 //!
 //! The report is sorted by total CPU, so its top line is the next thing to cut.
+//!
+//! **`--incidents`** (`docs/agent-manager.md` 6.1) is the other half of a
+//! step's measure: not what wsp's calls cost but how often it acted on a
+//! guess. It counts the `cycle.log` lines the daemon writes when it acts on
+//! one of `docs/state-core.md` 1.6's inferences, by kind (see [`SIGNS`]), and
+//! the two incident classes 6.1 names: wsp-478's (a process stopped for
+//! standing in a finished tree) and wsp-411's (a seat ended on the strength of
+//! a census, which was heard from afterwards: [`answered_after`]).
 
 use serde_json::{json, Value};
 use wsp_base::calls::{self, By, Row};
@@ -66,6 +74,9 @@ fn kids_line(r: &Row) -> String {
 }
 
 pub fn calls(store: &Store, args: &Args) -> i32 {
+    if args.has("incidents") {
+        return incidents(store, args);
+    }
     let by = match args.get("by").as_deref() {
         None | Some("verb") => "verb",
         Some("caller") => "caller",
@@ -214,6 +225,202 @@ pub fn calls(store: &Store, args: &Args) -> i32 {
     0
 }
 
+// ------------------------------------------------------------- incidents
+
+/// One sign that wsp acted on an inference: the `cycle.log` sentence its
+/// writer prints, matched on the line after its timestamp.
+pub(crate) struct Sign {
+    /// `I1` .. `I4`, as `docs/state-core.md` 1.6 numbers them.
+    pub kind: &'static str,
+    pub name: &'static str,
+    /// Where the sentence is written, for whoever changes it.
+    pub site: &'static str,
+    pub test: fn(&str) -> bool,
+}
+
+/// What each inference is, in 1.6's words.
+pub(crate) const KINDS: &[(&str, &str)] = &[
+    ("I1", "who owns a process"),
+    ("I2", "is a seat alive, and in what state"),
+    ("I3", "was an order delivered and taken"),
+    ("I4", "has a seat ended"),
+    ("I5", "what a row's state is"),
+];
+
+/// Every sign, by kind. A sentence here that its writer rewords stops being
+/// counted, which the test beside this reads from each writer's own words.
+/// I5 has none: a row's state is joined per call and never logged as a guess
+/// (it is state-core's rows machine, not the manager's).
+pub(crate) const SIGNS: &[Sign] = &[
+    Sign { kind: "I1", name: "stopped in a finished row's tree (wsp-478)", site: "ending.rs stop_finished", test: |l| l.starts_with("stopped in finished row ") },
+    Sign { kind: "I1", name: "stopped in a barrier check tree", site: "check_tree.rs signalled_line", test: |l| l.starts_with("stopped in barrier check tree ") },
+    Sign { kind: "I1", name: "leaked agent ended", site: "leaked_agents.rs sentence", test: |l| l.starts_with("leaked agent: ") && (l.ends_with("ended it") || l.ends_with("killed it")) },
+    Sign { kind: "I1", name: "reaped by a person", site: "cmd_role.rs", test: |l| l.starts_with("reap ") && l.contains(" by ") },
+    Sign { kind: "I1", name: "ended pane closed (lsof)", site: "ended_panes.rs", test: |l| l.starts_with("closed ended seat ") },
+    Sign { kind: "I2", name: "never became ready (screen)", site: "cmd_spawn.rs", test: |l| l.contains("started but never became ready for input") },
+    Sign { kind: "I2", name: "screen overruled by opencode's record", site: "repair.rs", test: |l| l.contains("the screen says working and opencode finished") },
+    Sign { kind: "I3", name: "typed, no turn seen", site: "wake.rs", test: |l| l.starts_with("told ") && l.contains("typed at the seat — no turn seen yet") },
+    Sign { kind: "I3", name: "pane did not get its order", site: "cmd_task.rs", test: |l| l.contains("but its pane did not get it") },
+    Sign { kind: "I3", name: "first order retyped or resent", site: "repair.rs first orders", test: |l| {
+        l.contains("its first work order sat typed and unsent") || l.contains("no turn started on its first work order") || l.contains("its first work order was sent")
+    } },
+    Sign { kind: "I3", name: "shell waiting on itself ended", site: "repair.rs stuck", test: |l| l.contains("ended the shell waiting on itself") },
+    Sign { kind: "I3", name: "prompt read off the screen", site: "waiting.rs", test: |l| l.contains("is at a prompt on its screen") },
+    Sign { kind: "I4", name: "an accepted exit's seat already gone", site: "ending.rs EXIT_GONE", test: |l| l.contains("the seat of an accepted exit had already gone") },
+    Sign { kind: "I4", name: "already gone, nothing to end", site: "cycle.rs barrier ends", test: |l| l.contains("has already gone — nothing to end") },
+];
+
+/// The lines that end seats on what a census said (`ps`, the screen, the
+/// absence of a pane): wsp-411's class is one of these whose seat was heard
+/// from afterwards.
+fn ends_seats(line: &str) -> bool {
+    line.contains("with nothing left to do, ended: ")
+        || (line.contains(") ended — ") && line.ends_with("and no pid of it is running"))
+        || SIGNS.iter().any(|s| s.kind == "I4" && (s.test)(line))
+}
+
+/// The seat labels a line names (`cpd-12`, `w64:p1`'s `p1` aside: compound's).
+fn seats_in(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, _) in line.match_indices("cpd-") {
+        if i > 0 && line.as_bytes()[i - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let n: String = line[i + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !n.is_empty() {
+            out.push(format!("cpd-{n}"));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// One `cycle.log` line: its timestamp and its text, or `None` for a
+/// continuation line.
+fn dated(line: &str) -> Option<(&str, &str)> {
+    let (at, rest) = line.split_at_checked(20)?;
+    (at.len() == 20 && at.as_bytes()[4] == b'-' && at.ends_with('Z') && rest.starts_with(' ')).then(|| (at, &rest[1..]))
+}
+
+/// `cycle.log`'s entries: each dated line with the undated lines after it (a
+/// failed spawn's reasons, a told text's tail) joined on, so a sign said on a
+/// continuation line counts once, for its entry.
+fn entries(cycle: &str) -> Vec<(&str, String)> {
+    let mut out: Vec<(&str, String)> = Vec::new();
+    for line in cycle.lines() {
+        match (dated(line), out.last_mut()) {
+            (Some((at, text)), _) => out.push((at, text.to_string())),
+            (None, Some((_, text))) if !line.trim().is_empty() => {
+                text.push_str(" / ");
+                text.push_str(line.trim());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `seat` was heard from after `at`: an event it caused (its claim, a
+/// session learnt, a verdict, a message it sent or acknowledged — not one wsp
+/// sent it), or a `cycle.log` line read off its own hooks (`<seat>: …`).
+fn answered_after(seat: &str, at: &str, cycle: &[(&str, String)], events: &[Value]) -> bool {
+    let heard_event = events.iter().any(|e| {
+        let t = e["ts"].as_str().unwrap_or("");
+        let d = &e["data"];
+        t > at && e["kind"] != "agent-told" && (d["pane"].as_str() == Some(seat) || d["by"].as_str() == Some(seat))
+    });
+    heard_event || cycle.iter().any(|(t, l)| *t > at && l.strip_prefix(seat).is_some_and(|r| r.starts_with(": ")) && !ends_seats(l))
+}
+
+/// The counts, over `cycle.log` and `events.jsonl`, of lines at or after `from`
+/// (an ISO time).
+pub(crate) fn count_incidents(cycle: &str, events: &str, from: &str) -> Value {
+    let lines = entries(cycle);
+    let evs: Vec<Value> = events.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let inside: Vec<&(&str, String)> = lines.iter().filter(|(t, _)| *t >= from).collect();
+    let mut kinds = Vec::new();
+    for (k, what) in KINDS {
+        let signs: Vec<Value> = SIGNS
+            .iter()
+            .filter(|s| s.kind == *k)
+            .map(|s| json!({"sign": s.name, "site": s.site, "count": inside.iter().filter(|(_, l)| (s.test)(l)).count()}))
+            .collect();
+        let count: u64 = signs.iter().map(|s| s["count"].as_u64().unwrap_or(0)).sum();
+        kinds.push(json!({"kind": k, "what": what, "count": count, "signs": signs, "logged": !signs.is_empty()}));
+    }
+    let wsp_478 = inside.iter().filter(|(_, l)| (SIGNS[0].test)(l)).count();
+    let mut ended = Vec::new();
+    let mut answered = Vec::new();
+    for (t, l) in &inside {
+        if !ends_seats(l) {
+            continue;
+        }
+        for seat in seats_in(l) {
+            if answered_after(&seat, t, &lines, &evs) {
+                answered.push(json!({"seat": seat, "at": t, "line": l}));
+            }
+            ended.push(seat);
+        }
+    }
+    json!({
+        "from": from,
+        "cycle_from": lines.first().map(|(t, _)| *t),
+        "cycle_to": lines.last().map(|(t, _)| *t),
+        "kinds": kinds,
+        "wsp_478": wsp_478,
+        "wsp_411": {"seats_ended_on_a_census": ended.len(), "heard_from_after": answered.len(), "seats": answered},
+    })
+}
+
+/// `wsp calls --incidents [--since 7d] [--json]`.
+fn incidents(store: &Store, args: &Args) -> i32 {
+    let span = match args.get("since") {
+        None => 7 * 86_400,
+        Some(t) => match window(&t) {
+            Some(s) => s,
+            None => {
+                eprintln!("wsp: --since takes a span such as 90s, 15m, 1h or 2d, not `{t}`");
+                return 2;
+            }
+        },
+    };
+    let from = util::iso_at(util::epoch_secs() - span);
+    let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+    let events = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
+    let got = count_incidents(&cycle, &events, &from);
+    if args.json() {
+        println!("{}", json!({"since": span, "incidents": got}));
+        return 0;
+    }
+    let p = util::Paint::new();
+    println!("{}", p.bold(&format!("wsp incidents — last {}: wsp acting on a guess (docs/state-core.md 1.6)", util::duration_human(span))));
+    match (got["cycle_from"].as_str(), got["cycle_to"].as_str()) {
+        (Some(a), Some(z)) => println!("  cycle.log covers {a} to {z}"),
+        _ => println!("  cycle.log is empty"),
+    }
+    for k in got["kinds"].as_array().into_iter().flatten() {
+        println!("  {} {:<38} {:>6}", k["kind"].as_str().unwrap_or(""), k["what"].as_str().unwrap_or(""), k["count"]);
+        if k["logged"] == false {
+            println!("       (never logged as a guess: not counted here)");
+        }
+        for s in k["signs"].as_array().into_iter().flatten().filter(|s| s["count"].as_u64() > Some(0)) {
+            println!("       {:<40} {:>5}", s["sign"].as_str().unwrap_or(""), s["count"]);
+        }
+    }
+    let w = &got["wsp_411"];
+    println!();
+    println!("  wsp-478 kind (stopped in a finished tree): {}", got["wsp_478"]);
+    println!(
+        "  wsp-411 kind (ended on a census, heard from after): {} of {} seat(s) ended so",
+        w["heard_from_after"], w["seats_ended_on_a_census"]
+    );
+    for s in w["seats"].as_array().into_iter().flatten().take(10) {
+        println!("       {} at {}: {}", s["seat"].as_str().unwrap_or(""), s["at"].as_str().unwrap_or(""), util::truncate(s["line"].as_str().unwrap_or(""), 90));
+    }
+    0
+}
+
 fn coverage_text(cov: &calls::Coverage, span: i64, since: i64) -> String {
     cov.line(span, since)
 }
@@ -239,7 +446,12 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
                                     ticks (calls.jsonl) by default, --polls the
                                     polls (polls.jsonl), --all both; each view
                                     says the time its file covers
-                                    (WSP_NO_CALLS=1 stops the recording)"##,
+                                    (WSP_NO_CALLS=1 stops the recording)
+  wsp calls --incidents [--since 7d] [--json]
+                                    how often wsp acted on a guess, by kind
+                                    (who owns a process, is a seat alive, was an
+                                    order taken, has a seat ended), from
+                                    cycle.log and events.jsonl"##,
     }],
 }];
 
@@ -315,4 +527,102 @@ mod tests {
         assert_eq!(calls(&store, &args("calls", &[], &[("all", "1"), ("json", "1")])), 0);
         assert_eq!(calls(&store, &args("calls", &[], &[("all", "1"), ("polls", "1")])), 2);
     }
+
+    /// Each sign is the sentence its writer prints: the writer's own source
+    /// holds the words the sign looks for, so a rewording there fails here
+    /// rather than counting nothing in silence.
+    #[test]
+    fn each_sign_reads_the_words_its_writer_prints() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let words: &[(&str, &[&str])] = &[
+            ("src/ending.rs", &["stopped in finished row {}", "wsp: the seat of an accepted exit had already gone —"]),
+            ("crates/trees/src/check_tree.rs", &["stopped in barrier check tree {path}"]),
+            ("src/leaked_agents.rs", &["leaked agent: {}", "ended it", "killed it"]),
+            ("src/cmd_role.rs", &["reap {pid} by {}"]),
+            ("src/ended_panes.rs", &["closed {}", "ended seat {}"]),
+            ("src/cmd_spawn.rs", &["started but never became ready for input"]),
+            ("src/wake.rs", &["typed at the seat — no turn seen yet"]),
+            ("src/cmd_task.rs", &["but its pane did not get it"]),
+            ("src/repair.rs", &[
+                "the screen says working and opencode finished",
+                "its first work order sat typed and unsent",
+                "no turn started on its first work order",
+                "its first work order was sent",
+                "ended the shell waiting on itself",
+                "verifier seat(s) with nothing left to do, ended: {}",
+            ]),
+            ("src/waiting.rs", &["is at a prompt on its screen"]),
+            ("src/cycle.rs", &["has already gone — nothing to end"]),
+        ];
+        for (file, want) in words {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            for w in *want {
+                assert!(text.contains(w), "{file} no longer says {w:?}; change the sign in SIGNS with it");
+            }
+        }
+        // And each sign matches a line as its writer would print it.
+        let lines = [
+            "stopped in finished row wsp-1 tree ~/w/wsp-1: TERM 4 5",
+            "stopped in barrier check tree ~/c/x: TERM 9",
+            "leaked agent: claude pid 7 in seat cpd-1 of /tmp/s: no daemon kept that store for the grace; ended it",
+            "reap 77 by person: its row is done — cargo test",
+            "closed ended seat cpd-3: pane idle 12 min in ~/w (supervisor 4, 2 processes)",
+            "FAILED spawn wsp-2: wsp: claude did not start in cpd-9: claude started but never became ready for input",
+            "cpd-4: the screen says working and opencode finished this session at 10:00 — read as idle",
+            "told m0: typed at the seat — no turn seen yet, and still owed · 1 held",
+            "wsp-6 is at doing with the reason on its row, but its pane did not get it — wsp retries",
+            "cpd-5: its first work order sat typed and unsent - submitted it",
+            "cpd-5: ended the shell waiting on itself (pid 99)",
+            "wsp-1 (cpd-2) is at a prompt on its screen — raised to the m0 governor",
+            "wsp-1: the seat of an accepted exit had already gone — cpd-126 (member) was ended by something else",
+            "m0: wsp-3 settled its barrier and has already gone — nothing to end",
+        ];
+        for sign in SIGNS {
+            assert!(lines.iter().any(|l| (sign.test)(l)), "no line reads as {:?}", sign.name);
+        }
+        assert!(!SIGNS.iter().any(|s| (s.test)("leaked agent: claude pid 7 in seat cpd-1 of /tmp/s: no daemon keeps that store; ending it in 30 min unless one starts")), "a warning is not an act");
+    }
+
+    /// The counts are by kind and in the window; a seat ended on a census and
+    /// heard from afterwards is wsp-411's class, one never heard from again is not.
+    #[test]
+    fn incidents_are_counted_by_kind_in_the_window_and_a_census_end_heard_from_after_is_wsp_411() {
+        let cycle = "\
+2026-11-01T00:00:00Z stopped in finished row old-1 tree ~/w: TERM 1
+2026-11-10T00:00:00Z stopped in finished row wsp-1 tree ~/w/wsp-1: TERM 4
+2026-11-10T00:01:00Z told m0: typed at the seat — no turn seen yet, and still owed · 1 held
+2026-11-10T00:02:00Z verifier seat(s) with nothing left to do, ended: cpd-7 cpd-8
+  a continuation line, undated
+2026-11-10T00:03:00Z cpd-7: a command has been waiting for 300s: cargo test
+2026-11-10T00:04:00Z m0 wsp-2 (cpd-9) ended — verification holds at abc, and no pid of it is running
+2026-11-10T00:07:00Z FAILED spawn wsp-3: wsp: an agent did not start
+wsp: claude did not start in cpd-10: claude started but never became ready for input
+wsp: claude did not start in cpd-10: claude started but never became ready for input, and it is still holding what failed
+";
+        let events = format!(
+            "{}\n{}\n",
+            json!({"kind": "agent-told", "ts": "2026-11-10T00:05:00Z", "data": {"pane": "cpd-8"}}),
+            json!({"kind": "message-acknowledged", "ts": "2026-11-10T00:06:00Z", "data": {"by": "cpd-9"}}),
+        );
+        let got = count_incidents(cycle, &events, "2026-11-05T00:00:00Z");
+        let kind = |k: &str| got["kinds"].as_array().unwrap().iter().find(|x| x["kind"] == k).unwrap()["count"].as_u64().unwrap();
+        assert_eq!((kind("I1"), kind("I2"), kind("I3"), kind("I4"), kind("I5")), (1, 1, 1, 0, 0), "a sign on continuation lines counts once, for its entry");
+        assert_eq!(got["wsp_478"], 1, "the line before the window is not counted");
+        assert_eq!(got["wsp_411"]["seats_ended_on_a_census"], 3);
+        let heard: Vec<&str> = got["wsp_411"]["seats"].as_array().unwrap().iter().map(|s| s["seat"].as_str().unwrap()).collect();
+        assert_eq!(heard, ["cpd-7", "cpd-9"], "cpd-8 was only told something, which is wsp speaking, not the seat");
+        assert_eq!(got["cycle_from"], "2026-11-01T00:00:00Z");
+        assert_eq!(seats_in("ended: cpd-7 cpd-8, xcpd-9"), ["cpd-7", "cpd-8"]);
+    }
+
+    #[test]
+    fn the_incidents_view_reads_the_state_and_refuses_a_bad_span() {
+        let env = crate::util::isolated("calls-incidents");
+        let store = Store::open();
+        std::fs::write(env.state().join("cycle.log"), format!("{} stopped in finished row a-1 tree ~/w: TERM 3\n", util::now_iso())).unwrap();
+        assert_eq!(calls(&store, &args("calls", &[], &[("incidents", "1")])), 0);
+        assert_eq!(calls(&store, &args("calls", &[], &[("incidents", "1"), ("json", "1"), ("since", "1d")])), 0);
+        assert_eq!(calls(&store, &args("calls", &[], &[("incidents", "1"), ("since", "soon")])), 2);
+    }
+
 }

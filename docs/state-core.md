@@ -79,6 +79,7 @@ one goes in this plan:
 | `governors.json` | 32 KB | `set_governor` store.rs:2421, `clear_governor` :2430, `edit_governor` :2457 (14 modules) | `governors` store.rs:2414 (22 modules); also read raw at crates/base/src/calls.rs:545 to name a caller's role | S: governor seats |
 | `spawned.json` | 8 KB | `set_spawned` store.rs:2996, `reap_spawned` :3010 (cmd_agent, cmd_spawn) | `spawned` store.rs:2986 (cmd_agent, cmd_spawn, sync) | S: seat birth |
 | `seat-since.json` | 19 KB | `note_seat_states` store.rs:3041 (cmd_agent, on every `wip`) | same, cmd_agent | C: seat state's start, inferred by sampling |
+| `seat-memory.json` | new (`wsp-066`) | `memory::sample` / `sample_rss`, from the daemon's tick once a minute | `memory::seat_memory` (cmd_report: effort.json's `standing_seats`) | X → E: a seat's resident memory over its seated time, sampled; the executor's per-tick RSS replaces the `ps` |
 | `said.json` | 169 KB | `set_said` store.rs:2908, `set_sentence` :2933 (cmd_agent); place_super.rs:365, place_compound.rs:239 per seat | `said` store.rs:2897 (14 modules) | C → S: a seat's last word |
 | `worked.json` | 569 KB | `set_worked` store.rs:2833 (cmd_agent) | `worked` store.rs:2826 (cmd_agent, cmd_spawn, cmd_task, detail) | S: row ↔ seat history |
 | `watches.json` | 1.5 MB | `update_watch` store.rs:2749, `set_watch` :2773 (attention, cmd_watch, wake, repair, cmd_spawn) | `watch`/`watches` store.rs:2716–2729 (10 modules, place backends) | S + C: waits on seats |
@@ -258,6 +259,15 @@ against every backend. A backend is done when it passes, with no exceptions file
 9. **Machine guards.** Every illegal transition in section 3's tables is refused by `apply` with its named reason,
    and no event is written.
 10. **Text.** `set_text` with a stale `Rev` is refused (no lost edit of Ed's prose).
+
+How a backend runs them (wsp-047): it implements `wsp_store_conformance::Harness` (open a store with a domain, open
+more handles on it, arm the crash hook, reopen). Each case is a `pub fn case_x<H: Harness>(&H) -> CaseResult` in
+`wsp_store_conformance::cases`, and a backend's tests call them one by one, `case_crash(&harness).unwrap()`, one
+`#[test]` each; a broken guarantee is an `Err(CaseFailure)` naming the case and what it saw. The suite's `MemStore`
+passes them first, in the crate's `tests/mem.rs`, and each of its `Knobs` breaks one guarantee to show the matching
+case fails (ignored idempotency key: 2; skipped fence: 4; a gap in event ids: 5; half a command written: 8). Case 9
+runs on the suite's `TestDomain` and its illegal transitions, staged until `wsp-machines` exists; it then takes
+section 3's tables.
 
 ### 2.4 The SQLite schema behind it (sketch)
 
@@ -573,8 +583,8 @@ p50 9.4 s.
 | **M1. The manager on the Mac** | The in-process host becomes a launchd process. wsp dials it on TCP. Hooks, journal and events go to it, and the daemon folds the events. | ps per tick → ≤ 1; renders → 0; `wip` < 0.2 CPU-s; wsp-411-kind → 0 | `WSP_HOST=inproc` |
 | **M2. The i5 under its own manager** | The heartbeat replaces the tick-paced beat. Per-seat ssh forwards and the tunnel go. | ssh for install and tree bytes only; no wsp-639 flap; far manifest < 15 s | machine `transport: ssh` |
 | **M3. Tree jobs under the manager** | check, build, verify and barrier processes run as manager jobs. check_tree's sweep and leaked_agents go. | lsof → 0; wsp-478-kind → 0 | jobs in-process behind a flag |
-| **M4. Trees placed** (only if Ed chooses T2, agent-manager Q6) | checkout and land on the agents' hosts, with a fenced push to the trunk | a list on two hosts with no copies | T1 (rows on the Mac) |
-| **0** (prep, could ride fleet-fixes' tail) | `rusqlite` behind the C-cached wrapper (section 9); the contract crate's types; the conformance suite against an in-memory fake | a cold tree builds SQLite in < 5 s from cache | nothing to roll back |
+| **M4. Trees placed** (T2: Ed's answer to agent-manager Q6, confirmed by Jesper 2026-11-18, provisional pending Ed's confirmation; agent-manager 6.2, "M3 under T2") | checkout and land on the agents' hosts, with a fenced push to the trunk | a list on two hosts with no copies | T1 (rows on the Mac) |
+| **0** (prep, could ride fleet-fixes' tail) | `rusqlite` behind the C-cached wrapper (section 9); the contract crate's types; the conformance suite against an in-memory fake | a cold tree builds SQLite in < 5 s from cache. **Met for SQLite's own build** (wsp-048, 2026-11-18): the `libsqlite3-sys` build script takes 1.2 s debug and 1.1 s release from cache. **Not met as the whole command's wall**: `cargo build -p wsp-store-sqlite` took 7.7 s debug and 6.1 s release at load 8–15 (section 9, "Step 0's result") | nothing to roll back |
 | **1. Server and store, read path; compound subscribes** | The daemon opens SQLite and **mirrors** today's files into it each tick (a projection; files still the truth). `api.sock` serves `state`/reads/`subscribe`. compound's host subscribes; `wip --json` reads through the API | host polling calls → 0; `wip --json` < 100 ms wall, < 0.1 CPU-s; no `ps`/`lsof` in read verbs; daemon tick no slower | the host goes back to `poll` (one flag); the CLI reads files |
 | **2. Orders machine** | Orders become commands; delivery via compound-sup's deliver verb and ack (wsp-477) under a `deliver:<seat>` lease; `repair:unsent` deleted | screen renders per tick → 0; `typed-unsent`/`first-orders`/`stuck-commands` files gone; incidents of "typed but unsent" and wait-loop stalls → 0 over a fortnight | `repair:unsent` restored behind a flag |
 | **3. Seats via executors, local and remote alike** | compound-sup speaks 5.1 locally and far; spawn/stop through it; beats carry machine facts; ps/lsof/cwd inference deleted (check_tree's `lsof`, `procs::processes` callers, `memory.rs` per call, `seat-since.json`) | `ps` per tick 34 → 0 (wsp side); `lsof` → 0; leaked/second-idle seats (wsp-411 kind) and wrong-owner kills (wsp-478 kind) → 0; spawn p50 7.2 s no worse | herdr/legacy `Place` backends stay compiled until the fortnight passes |
@@ -594,6 +604,218 @@ fleet.
   the record*. Its ps, lsof and cwd deletions are done at M1 and M3. Its herdr rollback is gone with M0.
 - **Step 6** keeps auth and principals only. Network transport moved into step 1 (D19), and into M1 for managers,
   which carry one token each until D13 is settled.
+
+### Step 0's breakdown (wsp-043, 2026-11-17)
+
+The list is `s0-state-core`, at status init. Per d1 it runs after M3, so it is not started. It follows wsp-018's
+rules. Each row adds something beside the old code and is green on its own, and nothing in wsp uses what step 0
+adds, so there is nothing to contract. Each row's checks build the workspace and test every crate it touches, with
+budgets of at least 120 s per cargo step (wsp-015).
+
+| group | kind | row | tier | what | creates / changes |
+|---|---|---|---|---|---|
+| 1 | components | wsp-045 | sonnet high | C compiles through sccache (section 9, option 1), and SQLite enters the tree | creates `.cargo/cc-wrap`, `crates/store-sqlite` (`wsp-store-sqlite`: `rusqlite` bundled, pinned, no type exposed), `tests/cc_wrap.rs`; changes `.cargo/config.toml` (`[env] CC`), `Cargo.toml`, `Cargo.lock`, `tests/layering.rs` (rusqlite in `wsp-store-sqlite` only), docs/components.md (D2's amendment to the one-external-dependency gate) |
+| 2 | contract | wsp-046 | opus high | The contract's types (2.1, 2.2, the commands of 4.2, the event semantics of 4.3), types only (R2), by a row of its own (R5) | changes `crates/store-contract` (new modules, `MAP.md`, a serde round-trip test), `Cargo.lock`, docs/components.md |
+| 3 | components | wsp-047 | opus high | `wsp-store-conformance`: the ten cases of 2.3 as generic functions, `mem::MemStore` (the fake), a test domain, and bite tests that show each case fails against a fake broken in the matching way. Three legs: `fake`, `state`, `events` | creates `crates/store-conformance`; changes `Cargo.toml`, `Cargo.lock`, `tests/layering.rs`, docs/components.md, this section's 2.3 |
+| 4 | insitu | wsp-048 | sonnet high | The measure: a fresh worktree builds `wsp-store-sqlite` in debug and release with sccache warm from another tree, plus both fallbacks, written into section 9 as "Step 0's result" | changes this document (sections 7 and 9) |
+
+The groups run one at a time. Each row of groups 1–3 changes `Cargo.lock`, and groups 1 and 3 each add a workspace
+member on `Cargo.toml`'s one `members` line, so in parallel they would conflict at land. The stop after group 3 asks
+for sccache to be installed before the measure.
+
+**Found while planning.** sccache is not installed on this Mac: it is not on `PATH`, in `/usr/local/bin` or in
+`/opt/homebrew/bin`. So `.cargo/rustc-wrap` falls back to bare rustc today, and no Rust compile is cached across
+trees either. Section 9's figures come from Ed's machine. On this one (M4 Pro, 12 cores, load about 4, no cache), a
+scratch crate on `rusqlite 0.32.1` with `libsqlite3-sys 0.30.1` bundled built cold in 3.1 s (debug) and 12.7 s
+(release). The `libsqlite3-sys` rebuild alone took 2.0 s (debug) and 12.1 s (release). So debug already builds
+under 5 s here without a cache. The cache matters for release builds (`wsp install`, `verify --release`) and for the
+i5.
+
+**Left for the person** (the review note on wsp-043):
+- (a) Where `apply`'s validation runs. Recommended: the contract declares a `Domain` trait with two signatures,
+  `decide(&State, &Command)` and `evolve(State, &Event)`. A backend runs `decide` and appends its events in one
+  atomic write, which matches 2.2's `apply(cmd)`. The suite brings a test domain now, and `wsp-machines` brings the
+  real one.
+- (b) Installing sccache on this Mac, before group 4.
+- (c) Whether step 0 waits for M3, as d1 says (recommended), or rides beside it (Q14).
+- `wsp-api` (4.1's envelope) is not in step 0. It belongs to step 1's breakdown, where whether it reuses
+  `wsp-host-api`'s `Connection` is decided.
+
+### Step 1's breakdown (wsp-069, 2026-11-17)
+
+The list is `s1-state-core`, at status init, not started. Per d1 it runs after step 0's list is complete (and so after
+M3). It follows wsp-018's rules: expand, then contract; a cut that cannot be staged is one row run as legs; every row's
+checks build the workspace and test each crate it touches, with budgets of at least 120 s per cargo step. It also follows
+wsp-068's recommendation: rows on one seam never share a group, and each overview names its seam and files.
+
+**What step 1 is, as amended.** The daemon opens `state.db` through `wsp-store-sqlite` and keeps a **mirror** in it. The
+mirror is a projection, never the owner of any state, and it is built from two sources:
+- the managers' events, applied by src/fold.rs (wsp-028) beside the files it already writes;
+- the store's files (rows, claims, lists, asks, machines), re-read by the daemon when `Store::fingerprint` or
+  `attention_stamp` moves. The daemon checks these in process once a second, with no child.
+
+Files stay the truth. The API serves the mirror's reads and `subscribe` over TCP on loopback and the tailnet (D19).
+web-chrome's census wakes on its events, not on the `wsp stamp` poll, and `wip --json` reads through it. Nothing is deleted
+in step 1, because both rollbacks (the host's poll and the CLI's files) must stay one flag away. The contract half comes
+with steps 2–4, when the machines own what the mirror only copies.
+
+| group | kind | row | tier | what | creates / changes · seam |
+|---|---|---|---|---|---|
+| 1 | contract | wsp-070 | opus high | The contract carries the mirror: `Command::Mirror { put, gone }`, `mirror.put`/`mirror.gone`, and `fields` on `Seat`, `List`, `Group`, `Ask`. `TestDomain` refuses `mirror` | crates/store-contract, crates/store-conformance/src/domain.rs, docs/components.md · the contract's types |
+| 2 | contract | wsp-071 | opus high | `wsp-api`: 4.1's envelope, the read verbs and `subscribe`, `hello`/`welcome` with `api.token`, `api.json` for where it listens, `Principal`'s text form, its own `Connection` (types only) | creates crates/api; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the API's wire types |
+| 3 | components | wsp-072 | opus high | `SqliteStore` implements `Store` and passes all ten cases of 2.3, plus `open_read_only`. Three legs: `apply`, `leases`, `events` | crates/store-sqlite; Cargo.lock, tests/layering.rs, docs/components.md · the SQLite backend |
+| 4 | components | wsp-073 | opus high | `wsp-server`: TCP on loopback and the tailnet, `hello`, the read verbs, `subscribe` with beats, commands `refused unsupported`, and `mirror::Mirror`, the domain step 1 runs | creates crates/server; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the server's socket and subscribe loop |
+| 5 | components | wsp-074 | sonnet high | `wsp-client`: dial from `api.json`, `Silent` never a hang, request by id, and subscribe with reconnect, de-duplication and `Resumed` | creates crates/client; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the wire's client side |
+| 6 | wiring | wsp-075 | opus high | The daemon opens `state.db`, starts the server (`WSP_API=off` is the rollback), applies the mirror per manager event in fold.rs, and re-mirrors the files on a fingerprint move. Doctor reports the API. Three legs: `project`, `serve`, `fold` | creates src/mirror.rs, tests/mirror.rs; src/daemon.rs, src/fold.rs, src/main.rs, Cargo.toml, Cargo.lock, tests/layering.rs · the daemon's start-up and the manager fold |
+| 7 | wiring | wsp-076 | opus high | `Wip::from_api`: `wip --json` from one `state`, byte-identical to the files path (a test), no child, files as the fallback within 200 ms, `WSP_READ=files` | src/cmd_agent.rs, Cargo.toml, Cargo.lock, tests/wip_api.rs · wip's read path |
+| 7 | wiring | wsp-078 | opus high | **compound-react**: web-chrome's `feed.rs` subscribes through `wsp-client` and rings the census `Gate` per subject (row → tasks, ask → flags, seat/claim/order → agents, list → worklists, machine → machines). `WEB_CHROME_FEED=poll` is the rollback, and a silent API falls back to the poll | spikes/web-chrome/src-tauri/{src/feed.rs, src/main.rs, Cargo.toml, Cargo.lock} · web-chrome's census wake-up |
+| 8 | insitu | wsp-077 | sonnet high | The measure, after a day on the installed trunk and app, written here as "Step 1's result" | this section |
+
+**Why the groups are serial.** Groups 2–7 each change Cargo.lock, and groups 2, 4 and 5 each add a member on
+Cargo.toml's one `members` line, and groups 1–6 each edit docs/components.md. In parallel they would conflict at land. wsp-073's tests run over `MemStore`, so in
+principle it does not need wsp-072. Group 7 is the only shared group. Its two rows are in different repositories, with
+no file and no seam in common.
+
+**The stops.** After group 6: wsp-078 must sit in a project whose root is compound-react. After group 7: the person
+installs the trunk and web-chrome's app, and a day passes on both before the measure.
+
+**Found while planning.**
+- **web-chrome's polling is host-core's `wsp stamp` loop**, not the reads. `push_census` (src-tauri/src/main.rs) runs
+  `host_core::poll::spawn`, one `wsp stamp` every 2–5 s. Each stamp that moves rings census.rs's `Gate`, whose reads are
+  `wsp` children (`ls --json --all`, the flags read, `wip --json`, the worklists read, `machine ls --json`). So the
+  smallest change that takes polling to 0 is to ring the same gate from `subscribe`. The census's reads, parsers and host-core
+  stay as they are (d3: Ed expects no compound change; host-core is shared with the gpui window).
+- **wsp has no project `compound`** (`wsp project show compound`: no project matching). wsp-078 is filed under `wsp`
+  until the person makes one. Its tree is the machine's compound-react checkout.
+- **The contract cannot write a projection.** Its 19 commands are 4.2's verbs, each with section 3's guards, so step 1's
+  mirror needs one contract change (wsp-070, R5) rather than a backdoor in the SQLite crate. A write path outside the
+  contract would make the server depend on `wsp-store-sqlite`, which section 6 forbids.
+- **The daemon already folds the managers' events** (src/fold.rs, wsp-028) on a thread of its own. The mirror hangs off
+  that fold, so the amendment's "folding the managers' events, not files written by probes" costs no second subscription.
+
+**Left for the person** (the review note on wsp-069, each with a recommended answer):
+- (1) The API's transport. Recommended: TCP on loopback and the tailnet with one token per instance, as the manager does
+  (D19, agent-manager 3.4). `$WSP_STATE/api.json` names where it listens and stands for 4.1's `api.sock`, with no unix
+  socket path.
+- (2) Whether `wsp-api` reuses `wsp-host-api`'s `Connection`. Recommended: no. wsp-api declares its own trait over its own
+  `Frame`, with the same framing rule copied. host-api's trait is typed to the manager's `Frame`, and making it generic
+  changes the manager's contract (R5) for no caller's gain.
+- (3) How the mirror is written. Recommended: one contract command, `mirror`, decided by the server's `Mirror` domain and
+  removed entity by entity at steps 2–4, plus `fields` maps for what wip's json needs and the typed fields lack.
+- (4) Output compatibility (Q5) and the CLI's fallback (Q4). Recommended: `wip --json` byte-compatible through step 1,
+  proven by a test, with the files as the fallback while they are the truth. The read-only database fallback of 4.6 (c)
+  waits for step 4.
+- (5) A wsp project for compound-react (`wsp project add`, rooted at the compound-react checkout), and
+  `wsp mv wsp-078` into it. Needed by the stop after group 6.
+- (6) Whether web-chrome later folds `State` itself (4.4's `store` half) rather than re-reading on each event.
+  Recommended: not in step 1. Re-reading on events already takes polling to 0. Folding means new parsers in compound for
+  the contract's entities, which belongs with step 4, when `--json` may change shape.
+
+### Step 2's breakdown (wsp-115, 2026-11-18)
+
+There are two lists, both at status init and not started. `s2-state-core` runs after `s1-state-core` (d1). It ends at a
+step only the person can do, which is installing the trunk with the store as the default (wsp-091). `s2-state-core-2`
+waits on it. It follows wsp-018's rules: expand, then contract; a cut that cannot be staged is one row run as legs; each
+row's checks build the workspace and test every crate the row touches, with budgets of at least 120 s per cargo step. It
+also follows wsp-068's rule (one seam, one group) and wsp-086's (no row here loads the machine on purpose, so none needs
+a group of its own for that). Each overview names its seam and its files.
+
+**What step 2 is, as amended.** Orders become commands to the store, and section 3.1's machine owns the order record
+and the `deliver:<seat>` lease. The manager already delivers and acks (M1: `order.deliver` → compound-sup's `deliver`
+verb, and `order.delivered`/`order.acked`/`order.refused`), and the daemon already folds those answers (src/fold.rs into
+`manager/<host>.orders.json`, and mirrored as `Order`s since wsp-075). What is missing is the owner. Today an order has
+no record of its own before the manager answers. Its id is minted by the seat's directory (`deliver.pending` in
+place_compound.rs). Three files and a phase stand in for its state:
+- `typed-unsent.json`: `repair::unsent_tick`, the `repair:unsent` phase. It already skips itself under the manager.
+- `first-orders.json`: `owe_first_order` from five sites in cmd_spawn.rs, and `first_order_tick`'s press, resend and
+  flag.
+- `stuck-commands.json`: `stuck_tick`'s record of a stalled command and whether the seat was told.
+
+A fourth, `refused-deliveries.json` (refusals.rs, wsp-634), counts refusals toward ending a deaf governor.
+untaken.rs (wsp-252) presses and resends from cycle.log markers. These files and that pressing are what the machine
+replaces.
+
+**Found while reading the code.**
+- **Every send has one choke point**: `agent_commands::Kind::tell` → `Place::tell` → `Compound::tell` → `deliver_through`
+  → `Host::deliver` (crates/wire/src/host_tcp.rs: `order.deliver` to the manager under wsp's id). The senders above it
+  are `wsp tell` (cmd_agent.rs `tell_seat`), answers (cmd_message.rs `deliver`, `deliver_held`/`type_at`), wake.rs
+  (`deliver_to` and its read at :1116), cycle.rs `tell_seat`, the spawn (cmd_spawn.rs `start_ordered`/`confirm_turn`),
+  repair.rs `stuck_tick`, and untaken.rs. Each moves over in one row of group 5.
+- **The first order already carries a wsp-minted id** (`FirstOrder { order: place::new_order_id(seat) }`, cmd_spawn.rs),
+  so the store's order id can replace it with no wire change. A told order's id is minted in the wire crate
+  (`delivery_id`), so the wire needs `deliver_order` with a caller's id (wsp-120). That is the new row of that number,
+  not D20's herdr row.
+- **The manager answers an id at most once**, and it keeps an unanswered order in `<exec_dir>/orders/` across a restart
+  (crates/manager/src/seats.rs). So the delivery worker can lose its lease mid-delivery and the next holder asks again
+  under the same id without doubling. Fencing protects the store's record, and the manager's key protects the seat.
+- **stuck-commands.json is not delivery.** It records a stalled shell command (wsp-397). Under the manager the stall is
+  already the folded `seat.stuck` (`manager/<host>.stuck.json`), and the file adds only `told`. That becomes the state
+  of the order that told the seat (part 4 below).
+- **The contract has `order.send` and `order.cancel` and nothing that moves an order on**, and the server refuses every
+  command (`unsupported`, crates/server/src/conn.rs). There is no `wsp-machines` crate yet. So the expand half is
+  contract → machine → server → the daemon's worker, each beside the old path.
+- **The daemon and the server share one process** (wsp-075), and the daemon holds the manager connections until step 3.
+  So delivery runs in the daemon, through the in-process store, and not in the server (part 1 below).
+
+**List `s2-state-core`: expand, move over, default on.** Every root row is behind `WSP_ORDERS` (`files` is today's path
+and the default until group 7).
+
+| group | kind | row | tier | what | creates / changes · seam |
+|---|---|---|---|---|---|
+| 1 | contract | wsp-117 | opus high | The contract carries the machine (R5): `order.deliver` (fenced on `deliver:<seat>`), `order.delivered`, `order.acked`, `order.refused { why, counts }`, `order.done`; `first` on `order.send` and `Order`; `LeaseName::deliver` | crates/store-contract, crates/store-conformance/src/domain.rs, crates/server/src/mirror.rs, docs/components.md · the contract's types |
+| 2 | components | wsp-118 | opus high | `wsp-machines`: `orders::Orders`, a pure `Domain` with 3.1's table, named refusals, the attempts cap, and repeat answers as empty decisions; case 9 against it | creates crates/machines; Cargo.toml, Cargo.lock, tests/layering.rs, docs/components.md · the orders machine |
+| 2 | components | wsp-119 | sonnet high | `wsp-client`: `apply` under one key across retries, `await_order` over subscribe | crates/client · the wire's client side |
+| 2 | components | wsp-120 | sonnet high | `Place::deliver_order(seat, order, text)`: tell's supervisor path under the caller's id, with no `deliver.pending` | crates/wire/src/{place.rs, place_compound.rs, fake.rs} · place_compound's deliver |
+| 3 | components | wsp-121 | opus high | `wsp-server` composes `Orders` and `Mirror`. Under `Owned` it accepts `order.send`/`order.cancel` from clients and the answers only from the instance or a manager. The daemon opens it `Mirrored` (no change) | crates/server, Cargo.lock, tests/layering.rs, docs/components.md, the root's open call site · the server's command path |
+| 4 | wiring | wsp-122 | opus high | src/orders.rs, the door (`mode`, `send`, `answer`, in process or through the client), and src/deliver.rs, the worker: `deliver:<seat>` taken, `order.deliver` fenced, `deliver_order` under the order's id, the answer applied. Two legs: `door`, `worker` | creates src/orders.rs, src/deliver.rs, tests/orders.rs; src/daemon.rs, src/main.rs · the daemon's start-up and delivery |
+| 5 | wiring | wsp-123 | opus high | The fold applies the manager's order answers as machine commands under the worker's keys, and `order.done` when the acked turn ends | src/fold.rs · the manager fold |
+| 5 | wiring | wsp-124 | opus high | `wsp tell` and answers: `order.send`, then the ack, with the receipts and `--json` unchanged. A held answer is a queued order | src/cmd_agent.rs (`tell_seat`), src/cmd_message.rs, tests/tell_orders.rs · the CLI's tells |
+| 5 | wiring | wsp-125 | opus high | The daemon's tells: the governor's spool and its confirmation, barrier checks, the stall's telling, and the deaf governor read from `failed` orders | src/wake.rs, src/cycle.rs (`tell_seat`), src/repair.rs (`stuck_tick_with`, `refusal_tick`), src/refusals.rs · the daemon's tells |
+| 5 | wiring | wsp-126 | opus high | The spawn's first order is `order.send { first }`, carried in `seat.spawn` under its id. untaken waits on `failed` and does not press | src/cmd_spawn.rs, src/untaken.rs · the spawn's first order |
+| 6 | wiring | wsp-127 | opus high | wip's `unsent`, `dropped`, `refusing` and `stuck`, and waiting.rs's `unsent`, read from the orders and the folded stall, with `--json` byte-identical | src/cmd_agent.rs (`Wip`), src/waiting.rs · wip's seat columns |
+| 7 | wiring | wsp-128 | opus high | `WSP_ORDERS` defaults to `store` under the manager, and doctor names the mode. `files` is the rollback | src/orders.rs, src/daemon.rs · the orders flag |
+
+**List `s2-state-core-2`: measure, then delete.** It runs after `s2-state-core`, once the person has installed it.
+
+| group | kind | row | tier | what | creates / changes · seam |
+|---|---|---|---|---|---|
+| 1 | insitu | wsp-129 | sonnet high | The measure, held until 14 days after the install: typed-but-unsent incidents and wait-loop stalls over the fortnight, renders per tick, `wsp calls` a day before and after, written here as "Step 2's result" | this section |
+| 2 | removal | wsp-130 | opus high | Delete `typed-unsent.json`, `first-orders.json`, `stuck-commands.json`, `refused-deliveries.json`, `repair:unsent`, `deliver.pending`/`delivery_id`, the `files` branches, `WSP_ORDERS` and `Orders::Mirrored`. Three legs: `root`, `wire`, `server` | src/ (repair, refusals and every order path), crates/wire/src/place_compound.rs, crates/server · every order path |
+
+**Why the groups are what they are.** Groups 1–4 are serial because each builds on the one before (types, machine,
+server, worker), and groups 1–3 each edit docs/components.md. Group 2 is the only components group run side by side.
+Its three rows name disjoint files, and only wsp-118 touches Cargo.toml, Cargo.lock or tests/layering.rs. Group 5's four
+rows are on four seams with disjoint files: fold.rs; cmd_agent.rs's `tell_seat` region with cmd_message.rs;
+wake/cycle/repair/refusals; and cmd_spawn/untaken. All four read src/orders.rs and none changes it. Their tests live in
+their own files (wsp-124's in tests/tell_orders.rs, not wsp-122's tests/orders.rs). wsp-127 is a group after wsp-124
+because both edit src/cmd_agent.rs, in different regions. wsp-128 flips the default only after every reader has moved, so
+the trunk never reads a file the default stopped writing. wsp-130 is alone because it touches every order path.
+
+**The stops.** After `s2-state-core`'s group 7, the person installs the trunk (`wsp install`) and restarts the daemon.
+That ends the list. `s2-state-core-2` starts once it is done, and its group 1 is held `--until` 14 days after the
+install. After its group 1, the deletion goes ahead only if the measure reads met. Otherwise the list holds and the
+`files` path stays the rollback.
+
+**Left for the person** (one `wsp ask` on wsp-115, each part with a recommended answer):
+- (1) Where delivery runs, meaning who holds `deliver:<seat>`. Recommended: a thread in the daemon process beside the
+  fold, through the in-process store. It is woken by `wait_for`, not paced by the tick. Step 3 moves it into the server
+  together with the manager connections.
+- (2) The orders machine under `WSP_HOST=inproc`. Recommended: `store` only under the manager. The in-process host keeps
+  today's path until M1's contraction removes it, and wsp-130 waits for that.
+- (3) Attempts and a busy seat. Recommended: the worker delivers only to a seat the mirror reads `idle` (or `started`,
+  for a first order). A `busy` refusal is no attempt (`counts: false`). The cap is 3, then `failed`, which wip draws as
+  today's `order not received` or `refusing`, and which ends a deaf governor (wsp-634).
+- (4) stuck-commands.json, which records stalls, not deliveries. Recommended: the record is the folded `seat.stuck`
+  (the seat machine's at step 3), and the telling is an order keyed by (seat, stall start), whose state replaces `told`.
+- (5) refused-deliveries.json, which section 3.5 does not name. Recommended: retire it with the others in wsp-130. The
+  deaf-governor ending reads the seat's `failed` orders.
+- (6) When the `files` path is deleted. Recommended: after the fortnight's measure passes (list 2: measure, then
+  delete), so the rollback stays one flag away (`WSP_ORDERS=files`) through the measure. After the deletion the
+  rollback is a revert. This replaces section 7's "repair:unsent restored behind a flag".
+- (7) `wsp tell` from a person's shell. Recommended: unchanged as the person sees it. It sends `order.send`, waits on the
+  order's events for today's 30 s, and prints the same receipt and `--json`. The tick never waits. It queues and reads
+  the order's state on the next tick.
+- (8) Two lists, split at the install (wsp-091). Recommended: yes, as filed.
 
 ---
 
@@ -740,6 +962,77 @@ here. The debug profile compiles SQLite at `-O0` and will be cheaper, but it sho
 The alternative is no bundling: link macOS's system `libsqlite3`. That costs no C build at all, but the SQLite
 version is the OS's, which matters for `RETURNING` (3.35+) and JSON functions, and it differs on a far machine.
 Bundled plus cache is the safer default. This is Q12.
+
+### Step 0's result (wsp-048, 2026-11-18)
+
+**Method.** Both profiles were warmed in the row's own tree with `cargo build -p wsp-store-sqlite` (debug, then
+`--release`), so sccache held `sqlite3.c`'s object for each. The cold tree is a fresh `git worktree add` of the trunk
+(`2b2150c`) under `$WSP_SCRATCH` with an empty `target/` before every run. It is not `warm.rs`'s copy, so there is no
+`OUT_DIR`. Each run is `nice cargo build -p wsp-store-sqlite --timings` (plus `--release`), as section 9 did. Three
+runs per figure, p50 shown, the three in brackets. M4 Pro, 12 cores, macOS 27.2.1, rustc 1.100.0, sccache 0.19.0,
+`rusqlite` bundled with `libsqlite3-sys`. The build-script figure is the `libsqlite3-sys` `run-custom-build` unit as
+`--timings` reports it. The wall is the whole command, 49 units. Load is the 1-minute average at the start of the run.
+The fallback configs ran on an isolated sccache server (`SCCACHE_SERVER_PORT`, `SCCACHE_DIR`), so no other tree's
+server was stopped.
+
+| config | profile | `libsqlite3-sys` build script, p50 (runs) | whole command, wall p50 (runs) | load | C compile through sccache |
+|---|---|---|---|---|---|
+| **cached** (cc-wrap, sccache warm from another tree) | debug | **1.18 s** (1.04, 1.18, 1.75) | **7.7 s** (5.7, 7.7, 7.7) | 7.7–10.6 | hit in every run |
+| | release | **1.11 s** (0.38, 1.11, 1.11) | **6.1 s** (4.9, 6.1, 9.7) | 12.0–14.7 | hit in every run |
+| fallback: `COMPOUND_NO_SCCACHE=1` | debug | 2.47 s (2.22, 2.47, 3.51) | 9.7 s (9.2, 9.7, 9.9) | 16.9–20.8 | bypassed |
+| | release | 13.83 s (13.82, 13.83, 13.94) | 22.3 s (21.4, 22.3, 24.3) | 21.3–23.1 | bypassed |
+| fallback: sccache's server stopped (it starts a fresh, empty one) | debug | 3.49 s (2.47, 3.49, 3.53) | 12.9 s (11.4, 12.9, 14.0) | 21.6–23.1 | miss, 0 hits |
+| | release | 14.58 s (13.89, 14.58, 15.17) | 26.0 s (23.9, 26.0, 26.5) | 23.2–26.3 | miss, 0 hits |
+| fallback: server dead (port held by a listener that accepts and closes; sccache exits 2) | debug | 4.71 s (3.13, 4.71, 8.03) | 63.8 s (48.2, 63.8, 80.2) | 41.5–66.6 | exit 2, bare `cc` and `rustc` |
+| | release | 15.13 s (15.05, 15.13, 21.76) | 33.8 s (28.6, 33.8, 36.5) | 55.9–66.4 | exit 2, bare `cc` and `rustc` |
+| *before: wsp-043's scratch crate, no sccache* | debug | 2.0 s | 3.1 s | about 4 | none installed |
+| | release | 12.1 s | 12.7 s | about 4 | none installed |
+| *before: 2026-11-08, Ed's machine, `libsqlite3-sys` alone, release* | release | 27.6 CPU-s | 30.0–34.0 s (tree b with `cc`) vs 3.4 s (tree d, `sccache cc`) | not recorded | tree d: hit |
+
+Every config built (exit 0 in all 24 runs). All figures are in `$WSP_SCRATCH/logs` (`results*.jsonl`, one
+`--timings` html per run); they are not kept in the tree.
+
+**The < 5 s line, judged.**
+- *SQLite's own build, from cache: met, both profiles.* The build script takes 1.2 s in debug and 1.1 s in release,
+  against 2.5 s and 13.8 s with the cache bypassed in the same session. For release that is 12× less, and it is
+  inside the 3.4 s that section 9 measured on Ed's machine. The cached runs show a C hit and no C miss in every
+  release run and in 2 of 3 debug runs. The debug run that shows one C miss ran on sccache's shared server beside
+  other trees' builds, so the miss may be theirs; this run's build script took 1.18 s, which is a hit's time here (a
+  miss takes 2.5–3.5 s).
+- *The whole `cargo build -p wsp-store-sqlite` wall: not met.* It is 7.7 s in debug and 6.1 s in release at p50, with
+  one release run under 5 s (4.9 s). The build script is about 1 s of that. The rest is the other 48 units:
+  `serde_derive`, `zerocopy`, `hashbrown`, `wsp-store-contract` and `wsp-store-sqlite` itself, each a Rust compile
+  that sccache serves as a hit but that still passes through `rustc-wrap`, a client round trip and, for registry
+  crates with an `OUT_DIR`, a content hash of it. It is not SQLite, and a cache miss on the C compile does not
+  explain it. The first run of each cached profile also missed on Rust (7 debug, 14 release), the workspace crates
+  that this tree built at another path; later runs hit.
+- *Why the wall is not a clean comparison.* The runs were taken at load 8–15 (cached) and up to 67 (the dead-server
+  runs), where the before figures were taken at about 4. Other panes were building on this Mac, and the average
+  reached 99 afterwards, with `yes` loops among the busiest processes. The cache's effect shows in the build-script column, which does not
+  depend on how many other crates are queued. The wall does: debug's cached 7.7 s sits under the no-cache 9.7 s, but
+  the load was 8 against 17. The before figure of 3.1 s was also a scratch crate with only `rusqlite` and its
+  dependencies, not the 49 units `wsp-store-sqlite` brings in. So debug was never the case the cache helps (it
+  already built in under 5 s without one at load 4), and release is: 22.3 s without the cache and 6.1 s with it
+  (3.7×), at loads of 21 and 12.
+- Nothing was tuned to make a figure pass. A rerun at a quiet load would settle the wall; the machine did not
+  get quiet during this row.
+
+**The fallbacks.** Both build, and cc-wrap's rule (wsp-343) holds where it can be tested.
+- `COMPOUND_NO_SCCACHE=1` builds with the bare `cc` and `rustc`: 2.5 s and 13.8 s for the build script, in line with wsp-043's
+  12.1 s release figure for the same compile at a lower load.
+- A stopped server is not a failure for the client: `sccache cc` starts a new one. The row shows that case, a fresh
+  empty cache, so the C compile misses and costs what it costs without a cache (3.5 s, 14.6 s), plus a few seconds
+  of cold Rust misses.
+- A dead server, one that refuses or drops the connection, makes sccache exit 2, and both `cc-wrap` and `rustc-wrap`
+  fall back to the bare compiler. The build script is 4.7 s and 15.1 s. The walls (63.8 s and 33.8 s) were taken at
+  load 42–67 and say only that the build finishes; every rustc call pays a failed sccache call first.
+- **A hung server is not covered.** The first attempt at the dead-server case held the port with a listener that
+  accepted connections and never answered. The first debug run finished (exit 0) after 591 s, and the second sat for
+  over five minutes in `sccache … rustc-remap -vV` before it was stopped by hand. The fallback waits for sccache's
+  exit 2, and a server that is alive but not answering does not give one quickly. This was seen on one run at load
+  26, and the cause was not isolated. It is a risk for wsp-343's rule, not a change made by this row: an `RUSTC_WRAPPER`
+  that bounds the client's wait (a timeout around the sccache call) is the usual shape of a fix, and nothing here
+  adds it.
 
 ---
 

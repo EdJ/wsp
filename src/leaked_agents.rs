@@ -123,13 +123,9 @@ pub(crate) fn sentence(act: &Act) -> String {
 }
 
 fn signal(pid: u32, sig: &str) {
-    let _ = wsp_base::calls::Command::new("kill")
-        .arg(format!("-{sig}"))
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    crate::place_super::signal_group(pid, sig);
+    use crate::host::{Host, LOCAL};
+    LOCAL.signal(&[pid], sig);
+    LOCAL.signal_group(pid, sig);
 }
 
 fn read(store: &Store) -> BTreeMap<u32, Seen> {
@@ -157,7 +153,7 @@ pub(crate) fn tidy(store: &Store) {
     if cfg!(test) {
         return;
     }
-    let all = crate::base::procs::processes();
+    let all = crate::host::Host::processes(&crate::host::LOCAL);
     if all.is_empty() {
         return;
     }

@@ -2,14 +2,14 @@
 name = "wsp"
 version = "0.1.0"
 edition = "2021"
-description = "Workspace and task control plane for herdr"
+description = "Workspace and task control plane for agent teams"
 
 [[bin]]
 name = "wsp"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/wire", "crates/trees", "crates/base", "crates/store", "crates/store-contract", "crates/testkit"]
+members = ["crates/wire", "crates/trees", "crates/base", "crates/store", "crates/store-contract", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager", "crates/api", "crates/server", "crates/client", "crates/view"]
 
 [dependencies]
 serde_json = "1"
@@ -17,13 +17,24 @@ wsp-base = { path = "crates/base" }
 wsp-store = { path = "crates/store" }
 wsp-wire = { path = "crates/wire" }
 wsp-trees = { path = "crates/trees" }
+wsp-host-api = { path = "crates/host-api" }
+wsp-store-contract = { path = "crates/store-contract" }
+wsp-server = { path = "crates/server" }
+wsp-store-sqlite = { path = "crates/store-sqlite" }
+wsp-api = { path = "crates/api" }
+wsp-client = { path = "crates/client" }
+wsp-view = { path = "crates/view" }
 
 [dev-dependencies]
+wsp-manager = { path = "crates/manager" }
 wsp-testkit = { path = "crates/testkit" }
 wsp-base = { path = "crates/base", features = ["test-support"] }
 wsp-store = { path = "crates/store", features = ["test-support"] }
 wsp-wire = { path = "crates/wire", features = ["test-support"] }
 wsp-trees = { path = "crates/trees", features = ["test-support"] }
+wsp-host-api = { path = "crates/host-api" }
+# repair's reseat test posts its played hook's turn to the manager, as a real hook does.
+wsp-host = { path = "crates/host" }
 
 [profile.release]
 opt-level = 2

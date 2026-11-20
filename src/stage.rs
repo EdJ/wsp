@@ -288,14 +288,11 @@ pub(crate) struct Step {
 
 impl Step {
     pub fn json(&self) -> serde_json::Value {
-        let mut v = serde_json::json!({ "word": self.word });
-        if !self.at.is_empty() {
-            v["at"] = serde_json::json!(self.at);
-        }
-        if let Some(t) = self.tail {
-            v["tail"] = serde_json::json!(t);
-        }
-        v
+        self.view().json()
+    }
+
+    fn view(&self) -> wsp_view::task::Step {
+        wsp_view::task::Step { word: self.word.to_string(), at: self.at.clone(), tail: self.tail.map(str::to_string) }
     }
 }
 
@@ -482,7 +479,7 @@ pub(crate) fn sayings(store: &Store) -> BTreeMap<String, String> {
 /// nothing asked about is `doing`, so a `--json` read of finished work never
 /// opens a socket.
 ///
-/// Never in a test: herdr is found by socket, and a test asking it would read
+/// Never in a test: backend is found by socket, and a test asking it would read
 /// whatever this machine's agents are doing.
 pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> {
     let mut out = BTreeMap::new();
@@ -533,23 +530,31 @@ pub(crate) fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> 
 /// further back is an earlier attempt's. compound-128 walked back that way to
 /// a `→ doing` 3h45m before the release that put it where it is, behind a
 /// park and a second claim. So: the later of the last step and the record.
+#[cfg(test)]
 pub(crate) fn since(now: &Told, steps: &[Step]) -> String {
-    match steps.last() {
-        Some(last) if last.word == now.word && !last.at.is_empty() => last.at.clone(),
-        Some(last) => last.at.clone().max(now.at.clone()),
-        None => now.at.clone(),
-    }
+    wsp_view::task::since(&told_view(now), &steps.iter().map(Step::view).collect::<Vec<_>>())
 }
 
 /// The stage as `ls`, `find`, `show` and `worklist show` give it: the
 /// caption's own fields and [`since`], absent on the same rule as `at`.
 pub(crate) fn json(now: &Told, steps: &[Step]) -> serde_json::Value {
-    let mut v = now.json();
-    let since = since(now, steps);
-    if !since.is_empty() {
-        v["since"] = serde_json::json!(since);
+    wsp_view::task::stage_json(&view(now, steps))
+}
+
+/// The stage as `wsp-view` takes it.
+pub(crate) fn view(now: &Told, steps: &[Step]) -> wsp_view::task::Stage {
+    wsp_view::task::Stage { now: told_view(now), steps: steps.iter().map(Step::view).collect() }
+}
+
+/// A caption's [`Told`] as `wsp-view` takes it.
+pub(crate) fn told_view(t: &Told) -> wsp_view::task::Told {
+    wsp_view::task::Told {
+        word: t.word.to_string(),
+        tail: t.tail.clone(),
+        text: t.text.clone(),
+        from: t.from.to_string(),
+        at: t.at.clone(),
     }
-    v
 }
 
 /// Every stage `ls`, `find`, `show` and `worklist show --json` give, for the

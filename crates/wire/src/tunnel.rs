@@ -1,16 +1,16 @@
-//! The tunnel supervisor: one ssh per executor, holding that machine's herdr
+//! The tunnel supervisor: one ssh per executor, holding that machine's backend
 //! socket open on this one.
 //!
 //! This is the whole of the "servitor", and it lives on the *seat*. Nothing
-//! long-lived of ours runs on the executor at all — over there it is a herdr
+//! long-lived of ours runs on the executor at all — over there it is a backend
 //! server, sshd, and a `wsp` shim that runs this machine's wsp back over the
 //! same connection.
 //!
 //! The mechanism is one flag. `ssh -L <local.sock>:<remote.sock>` (OpenSSH
-//! ≥ 6.7; we are on 9.9p2) puts the far machine's herdr socket at a path here,
-//! and wsp's existing herdr client then speaks to it unmodified — no proxy, no
-//! second protocol, no re-implementation of herdr's 89 methods. What tells the
-//! two servers apart is the id: [`crate::herdr`] routes `w0:p3@mb2` to the
+//! ≥ 6.7; we are on 9.9p2) puts the far machine's backend socket at a path here,
+//! and wsp's existing backend client then speaks to it unmodified — no proxy, no
+//! second protocol, no re-implementation of backend's 89 methods. What tells the
+//! two servers apart is the id: [`crate::backend`] routes `w0:p3@mb2` to the
 //! socket this file created.
 //!
 //! It lives in the daemon because the daemon is already the one long-lived
@@ -280,7 +280,7 @@ impl Tunnel {
         if !wants_check(&self.live, m, crate::place_compound::wire_version(), util::now_iso().as_str()) {
             return;
         }
-        let Ok(exe) = std::env::current_exe() else { return };
+        let Ok(exe) = wsp_base::util::self_exe() else { return };
         let mut c = Command::new(exe);
         c.args(["machine", "check", &m.name]).stdin(Stdio::null());
         c.stdout(Stdio::null()).stderr(Stdio::null());
@@ -817,7 +817,7 @@ fn ssh_args(m: &Machine, control: &std::path::Path) -> Vec<String> {
         s("-o"), s("ConnectTimeout=10"),
         // Notice a NAT timeout rather than hanging on a connection that is
         // already gone. Fallbacks, not overrides: `~/.ssh/config` is the user's
-        // and anything set there for this host wins, which is how herdr's own
+        // and anything set there for this host wins, which is how backend's own
         // remote config behaves and for the same reason.
         s("-o"), s("ServerAliveInterval=15"),
         s("-o"), s("ServerAliveCountMax=3"),
@@ -843,7 +843,7 @@ fn ssh_args(m: &Machine, control: &std::path::Path) -> Vec<String> {
         // No `-L`: the master carries no forward of its own. Compound is two
         // sockets per seat, added with `ssh -O forward` on this master at spawn
         // and put back by [`readd_forwards`] (`docs/remote-agents.md` section 2),
-        // so a machine-wide forward to herdr's socket, which compound replaced,
+        // so a machine-wide forward to backend's socket, which compound replaced,
         // has nothing at its far end and nothing that reads it.
         m.ssh.clone(),
     ]
@@ -935,14 +935,14 @@ mod tests {
     #[test]
     fn the_master_is_the_command_and_the_two_flags_that_must_be_on_it() {
         let mut m = Machine::new("mb2", "mac-mini");
-        m.backend_at = "/Users/ed/.config/herdr/herdr.sock".into();
+        m.backend_at = "/Users/ed/.config/backend/backend.sock".into();
         let args = ssh_args(&m, std::path::Path::new("/s/sock/cm-mb2"));
 
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(
             !args.contains(&"-L".to_string()),
-            "the master forwards nothing of its own, and never herdr's socket: {args:?}",
+            "the master forwards nothing of its own, and never backend's socket: {args:?}",
         );
         assert_eq!(args.last().unwrap(), "mac-mini", "the Host alias, and it goes last");
         assert!(
@@ -957,14 +957,12 @@ mod tests {
     /// new tunnel attached to it as a mux client and exited 0.
     #[test]
     fn a_stale_master_is_asked_to_exit_and_its_path_swept_before_a_new_one_starts() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("wsp-tunnel-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let said = dir.join("said");
         let fake = dir.join("ssh");
-        std::fs::write(&fake, format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", said.display())).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&fake, &format!("#!/bin/sh\necho \"$@\" > {}\nexit 0\n", said.display()));
         let control = dir.join("cm-mb2");
         std::fs::write(&control, "").unwrap();
         let m = Machine::new("mb2", "mac-mini");
@@ -1440,7 +1438,7 @@ mod tests {
     /// silent: a reader judges by the beats the daemon sent, and a stalled daemon
     /// sent none. A seat that is sent beats and does not answer them still is.
     /// This drives the tunnel's own beat step against a scripted wire: a real
-    /// `wsp sandbox --fake` stands in for herdr and has no far machine to ask.
+    /// `wsp sandbox --fake` stands in for backend and has no far machine to ask.
     #[test]
     fn the_first_slow_tick_past_the_lease_does_not_read_a_working_seat_silent() {
         let (store, root) = store_with_seats("stall", &[("cpd-7", "mb2")]);
@@ -1534,7 +1532,6 @@ mod tests {
     /// answers, and the probe prints a wire range. Each master and link test is
     /// a line in `said`.
     fn fake_ssh(dir: &std::path::Path) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let d = dir.display();
         let script = format!(
             r#"#!/bin/sh
@@ -1553,8 +1550,7 @@ esac
 "#
         );
         let fake = dir.join("ssh");
-        std::fs::write(&fake, script).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wsp_testkit::script(&fake, &script);
         fake.display().to_string()
     }
 

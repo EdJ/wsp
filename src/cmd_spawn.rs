@@ -38,11 +38,34 @@ use crate::cmd_govern;
 pub(crate) use crate::place::local_backends;
 use crate::leg_seat;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
-use crate::place_herdr::Herdr;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Clock, Paint};
 use crate::Args;
+
+/// A barrier check's seat opened with no check to go on (`wsp-089`): nothing
+/// names it, so nothing would end it, and it stood in the check's tree for
+/// thirteen hours after the barrier passed, the sweep keeping the tree for it.
+/// It is ended here, its stretch goes on the log as `barrier-check-orphaned`
+/// for effort.json's standing seats, and the check's tree goes with it unless
+/// a check has been opened on the group since.
+fn orphan_check_seat(place: &dyn Place, store: &Store, list: &str, at: usize, seat: &Seat, opened_at: &str) {
+    let stopped = place.stop(seat).is_ok();
+    store.log_event(
+        "barrier-check-orphaned",
+        json!({ "id": list, "group": at, "seat": seat.as_str(), "opened": opened_at, "ended": util::now_iso(), "stopped": stopped }),
+    );
+    let name = crate::barrier::subject(list, at);
+    match crate::check_tree::discard(store, &name, &|_| None) {
+        Tree::Removed { path, .. } => {
+            crate::store::log_line(store, &format!("removed barrier check tree {path}: {seat} opened on it with no check to go on, and was ended"));
+        }
+        Tree::Kept { path, why } => {
+            crate::store::log_line(store, &format!("kept barrier check tree {path} after ending {seat}: {why}"));
+        }
+        Tree::Absent => {}
+    }
+}
 
 /// How an agent came by the work it is being told about — and it is the one
 /// thing that changes what the work order should say.
@@ -132,7 +155,7 @@ impl Handover {
 ///
 /// **It is not [`crate::agent_commands::Kind::order_in_args`], and the day
 /// those two were the same predicate cost a revert.** The brief went into a
-/// `--prompt` argv element; herdr refuses `agent.start` args holding any
+/// `--prompt` argv element; backend refuses `agent.start` args holding any
 /// control character, a brief is multi-line, and three spawns of three were
 /// refused with `invalid_agent_argument` and no agent started. Env is not argv.
 ///
@@ -753,7 +776,7 @@ fn handover(subject: &str, how: Handover, route: Route) -> String {
 ///
 /// `WSP_PROJECT` and `WSP_TASK` go into the environment, so every pane inside
 /// the seat knows what it is for without anyone having to read it off a path.
-/// herdr does not persist env across a restart, which is why the durable answer
+/// backend does not persist env across a restart, which is why the durable answer
 /// is a claim rather than this — but for the life of the session it is exact,
 /// and exactness is what the cwd heuristic lacks.
 ///
@@ -775,6 +798,8 @@ fn order(
     agent: Option<Occupant<'_>>,
     custodian: bool,
 ) -> Order {
+    // An agent goes in next: under the manager, no shell first (wsp-079).
+    let agent_next = agent.is_some();
     Order {
         label: work.label.clone(),
         cwd: cwd.map(|c| c.to_string()),
@@ -786,6 +811,7 @@ fn order(
         ),
         on: on.map(|m| m.to_string()),
         show,
+        agent_next,
     }
 }
 
@@ -830,7 +856,7 @@ pub(crate) struct Occupant<'a> {
 /// call site, and that is `core-038`.** It was composed at the call site for a
 /// month, in `spawn` and nowhere else, so `resume` opened seats with the
 /// `WSP_*` half and none of the runtime's — and for opencode the runtime's half
-/// is `core-020` d1's permission policy. Driven 2026-08-22 in a sandbox herdr: a
+/// is `core-020` d1's permission policy. Driven 2026-08-22 in a sandbox backend: a
 /// spawned opencode stopped on `git status` and asked; the same agent, resumed
 /// into the same session, ran it without asking. `core-040` has since put
 /// `git status` on the read list, so re-drive that with `cargo build` — the
@@ -1147,9 +1173,6 @@ fn attention_gate(store: &Store, args: &Args, kind: &str, task: Option<&str>) ->
     if how.program().is_none() {
         return Ok(());
     }
-    if args.has("herdr") && !args.has("compound") {
-        return Err(format!("--kind {kind} cannot run on herdr, whose agent catalogue is closed — drop `--herdr` (compound is the default) or use `--headless`"));
-    }
     if args.has("verify") || args.has("govern") || args.has("leg") || args.has("piece") {
         return Err(format!("--kind {kind} runs a plain member's row, not a verifier, a leg, a piece or a governor"));
     }
@@ -1183,7 +1206,7 @@ const GOVERNED_EFFORT: &str = "medium";
 /// looked up. `place_work` has a store and has read all of this by the time it
 /// calls [`tier`]; reaching for one *here* would cost the property that makes
 /// every refusal above checkable — a function you can put four literals into
-/// and read an answer out of, with no store, no seat and no herdr.
+/// and read an answer out of, with no store, no seat and no backend.
 struct Scope<'a> {
     /// `governors/`, as [`crate::store::Store::governors`] reads it.
     governors: &'a BTreeMap<String, Value>,
@@ -1266,9 +1289,9 @@ fn governed(args: &Args, kind: &str, agent: bool, scope: &Scope) -> (Option<Stri
     (Some(GOVERNED_MODEL.to_string()), Some(GOVERNED_EFFORT.to_string()))
 }
 
-/// herdr's default when nobody says which agent. Every other kind it knows is
+/// backend's default when nobody says which agent. Every other kind it knows is
 /// spelt the way its own CLI spells it and passed straight through — an
-/// unknown one is refused by herdr with the whole catalogue in the message,
+/// unknown one is refused by backend with the whole catalogue in the message,
 /// which is a better list than one kept here and left to go stale.
 pub(crate) const DEFAULT_KIND: &str = "claude";
 
@@ -1287,7 +1310,7 @@ pub(crate) const DEFAULT_KIND: &str = "claude";
 ///
 /// What makes the default safe rather than merely convenient is that an absence
 /// no longer lasts: [`crate::cmd_agent::learn_sessions`] and
-/// [`crate::cmd_govern::learn_seats`] take the kind off herdr's own reading on
+/// [`crate::cmd_govern::learn_seats`] take the kind off backend's own reading on
 /// every `sync` tick, so a live record is corrected within a tick of anything
 /// looking at it and only a record whose agent is already gone can still be
 /// reading its default. For those, the default is what they were.
@@ -1304,7 +1327,7 @@ pub(crate) fn kind_or_default(recorded: &str) -> String {
 
 /// How long the caller is prepared to wait, in three numbers and a clock.
 ///
-/// A struct rather than three constants for the reason `place_herdr::Herdr`
+/// A struct rather than three constants for the reason `place_backend::Backend`
 /// gives about its own: every one of these was set by a failure, and a test that
 /// has to sit through two real seconds to check what happens after two seconds
 /// is a test nobody runs. [`Patience::default`] is what the CLI uses.
@@ -1312,9 +1335,9 @@ struct Patience<'a> {
     /// How long to give the agent to become ready for input, having started.
     ///
     /// A cold Claude Code measured four seconds to readiness on this machine;
-    /// herdr's own default for the same wait is thirty. What "started" means,
+    /// backend's own default for the same wait is thirty. What "started" means,
     /// what has to be retried to get there and how long any of it takes are the
-    /// backend's, and live in `place_herdr` — this is only how long the caller
+    /// backend's, and live in `place_backend` — this is only how long the caller
     /// is prepared to wait.
     ///
     /// **Sixty since `wsp-252`.** A compound seat now reads ready at its own
@@ -1325,7 +1348,7 @@ struct Patience<'a> {
     ready: Duration,
     /// How long a turn has to start, once the work order has been sent.
     ///
-    /// **Measured against a live herdr 0.8.0 and a live Claude Code on
+    /// **Measured against a live backend 0.8.0 and a live Claude Code on
     /// 2026-08-18**, three runs of the loop below in a workspace of its own: the
     /// prompt was accepted and left sitting in the composer every time, and a
     /// return pressed at 5.1s started the turn in **0.15s**. So the number this
@@ -1342,7 +1365,7 @@ struct Patience<'a> {
     /// cost of the defect. It is now paid by a spawn that has already been told
     /// the turn did not start and is confirming a submit, because a backend that
     /// reports [`Refusal::NotTaken`] has done this wait already and
-    /// [`hand_over`] does not repeat it. A healthy handover through herdr pays
+    /// [`hand_over`] does not repeat it. A healthy handover through backend pays
     /// one `agent.get` and no sleep at all.
     taken: Duration,
     /// How many times to press submit again on a work order that arrived and
@@ -1370,7 +1393,7 @@ struct Patience<'a> {
     /// **What this retries is a start, and never a work order.** The three
     /// failures [`hand_over`] can end in all leave the same ambiguity — no turn
     /// running, and possibly a work order sitting in a composer — and the only
-    /// safe answer to that is a fresh agent, which herdr has no verb for: its
+    /// safe answer to that is a fresh agent, which backend has no verb for: its
     /// one way to end an agent is `pane.close`, which takes the seat with it.
     /// So a handover that failed is reported and not retried, and what is
     /// retried is the case where the seat is already empty because the agent
@@ -1401,12 +1424,12 @@ struct Patience<'a> {
     steeper: u32,
     /// How long to wait for a seat to be able to hold an agent again.
     ///
-    /// **This wait is the retry, and it is a wait rather than a call.** herdr
+    /// **This wait is the retry, and it is a wait rather than a call.** backend
     /// refuses `agent.start` into a pane while `is_agent_terminal()` holds, and
     /// the agent *name* outlives the process, so a seat whose agent has died is
     /// briefly one that will answer `TargetBusy`. There is no verb to clear it:
     /// `pane.release_agent` is a no-op for exactly this case
-    /// (`is_official_agent_source("herdr:claude", "claude")` is true and the
+    /// (`is_official_agent_source("backend:claude", "claude")` is true and the
     /// handler returns early), and `pane.clear_agent_authority` drops the hook
     /// authority without touching the name.
     ///
@@ -1419,7 +1442,7 @@ struct Patience<'a> {
     ///
     /// A seat that has not emptied inside this is one holding an agent that is
     /// alive and not working, which is the case this must not retry into: it
-    /// stops and reports. Five seconds against the 620ms herdr was measured
+    /// stops and reports. Five seconds against the 620ms backend was measured
     /// taking to notice an agent at all.
     rearm: Duration,
     /// What time it is, and how to wait for the next look.
@@ -1442,7 +1465,7 @@ struct Patience<'a> {
     /// correction: a test that drove the clock and left the sleep behind still
     /// had to set `poll` to zero to be fast, so the loop under test was not the
     /// loop that runs. [`util::Clock`] holds the whole argument, and
-    /// `place_herdr::Herdr` waits through the same one.
+    /// `place_backend::Backend` waits through the same one.
     clock: &'a dyn Clock,
 }
 
@@ -1462,6 +1485,13 @@ impl Default for Patience<'static> {
             clock: &util::Wall,
         }
     }
+}
+
+/// Whether this thread's test asked for a quick spawn ([`tests::quick`]): the
+/// press windows of `agent_commands::pressing` follow it too.
+#[cfg(test)]
+pub(crate) fn quick_test() -> bool {
+    tests::QUICK.with(|q| q.get())
 }
 
 /// What `place_work` waits with: [`Patience::default`], and in a test that asks
@@ -1494,7 +1524,7 @@ fn spawn_patience(far: bool) -> Patience<'static> {
 
 /// Wait until the agent in a seat will take a sentence.
 ///
-/// **Not until it is idle**, which is the first trap this walked into: herdr
+/// **Not until it is idle**, which is the first trap this walked into: backend
 /// reports `agent_status: idle` while an agent is still drawing its banner, and
 /// refuses a prompt in that window. `will_take_a_prompt` is the port's single
 /// answer to the question every `state == "idle"` caller is actually asking, so
@@ -1504,7 +1534,7 @@ fn spawn_patience(far: bool) -> Patience<'static> {
 /// This used to return on the first empty reading, arguing that the agent
 /// existed when `start` returned so nothing in it now meant it had stopped. Both
 /// halves of that were wrong at once: `start` was coming back inside the launch
-/// window (see `place_herdr::start`), and even with that fixed, one blind read
+/// window (see `place_backend::start`), and even with that fixed, one blind read
 /// from one backend is a thin thing to end somebody's spawn on. It failed open
 /// every time — a claimed task, a live agent, and no work order — and it was
 /// only ever caught by a person watching the pane.
@@ -1533,8 +1563,29 @@ fn wait_ready(
     // that turn running (`wsp-476`), watched to the same deadline. Idle here is
     // the window before it starts, and a folder-trust prompt reads blocked.
     let by_turn = spawn.order.is_some() && how.order_in_args() && how.turn_marks_ready();
+    // Under a host with events (`WSP_HOST=manager`) the start is judged by
+    // them, never by a state read (wsp-037): one just after `seat.started` is
+    // not yet true, and every seat the manager started was taken for dead,
+    // stopped and started again at epoch 2. Events that cannot be heard say
+    // nothing of the seat, which `seat.started` already said runs.
+    if let Some(up) = place.await_up(seat, by_turn, wait.ready) {
+        return match up {
+            Ok(crate::place::Up::Ready) => Ok(()),
+            Ok(crate::place::Up::Stopped) => Err(format!("{kind} started and then stopped in {seat}")),
+            Ok(crate::place::Up::Unready) => Err(never_ready(kind, wait.ready, "no seat.started heard")),
+            Err(e) => {
+                eprintln!("wsp: {kind} started in {seat}; its first turn was not heard: {e}");
+                Ok(())
+            }
+        };
+    }
     loop {
-        match place.state(seat) {
+        let read = place.state(seat);
+        let saw = match &read {
+            Ok(s) => format!("{s:?}"),
+            Err(e) => format!("no answer: {e}"),
+        };
+        match read {
             Ok(s) if by_turn && s.turn_in_flight() => return Ok(()),
             Ok(s) if !by_turn && s.will_take_a_prompt() => return Ok(()),
             Ok(State::Empty) | Ok(State::Gone) => {
@@ -1557,10 +1608,62 @@ fn wait_ready(
             Ok(_) | Err(_) => empty_since = None,
         }
         if now() >= deadline {
-            return Err(format!("{kind} started but never became ready for input"));
+            return Err(never_ready(kind, wait.ready, &format!("last read {saw}")));
         }
         wait.clock.rest(wait.poll);
     }
+}
+
+/// The line a start that ran out of [`Patience::ready`] fails with (wsp-087):
+/// the sentence every reader matches on, then the wait that ran out and what
+/// was last seen of the seat, so "never ready" after 67 s reads as a timeout
+/// of a known length and not as a death.
+fn never_ready(kind: &str, ready: Duration, saw: &str) -> String {
+    format!("{kind} started but never became ready for input within {} s ({saw})", ready.as_secs())
+}
+
+/// The key `seat.spawn` carries for a row: the row's id and the number of
+/// seats the row has already had, so every spawn of the same row is a new key.
+/// The count is the seat starts its log records: a member's `claimed by pane`
+/// lines and a leg's or piece's `started by pane` (what
+/// `cmd_attempts::attempts_of` reads its attempts from, which a lower component
+/// may not call). Read **before** this spawn writes its own start, so a row's
+/// first seat is attempt 0 and a row reopened after one ended seat is attempt 1
+/// (wsp-040: counting the leg lines alone keyed every member seat after a
+/// reopen at attempt 0, and the manager refused it as a key that already ran).
+/// `None` for a seat with no row (a bare shell, a rotation without a task): the
+/// host then keys it by its own freshly minted seat id at attempt 0, which no
+/// other spawn can share.
+fn spawn_key(store: &Store, row: Option<&str>) -> Option<crate::place::Key> {
+    let t = store.find_task(row?)?;
+    let attempt = t.section("Log").map_or(0, |log| log.lines().filter(|l| seat_start(l)).count()) as u32;
+    Some(crate::place::Key { row: crate::place::RowId(t.id.clone()), attempt })
+}
+
+/// Whether a log line records a seat starting on the row: `- <date> claimed by
+/// pane …`, `- <date> leg <name> started by pane …` or `- <date> piece <n>
+/// started by pane …`. The sentence only, so a note quoting one is not one.
+fn seat_start(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("- ") else { return false };
+    let Some((_, said)) = rest.split_once(' ') else { return false };
+    let head = said.split(" · ").next().unwrap_or("");
+    if head.starts_with("claimed by pane ") {
+        return true;
+    }
+    let seat_line = head.strip_prefix("leg ").or_else(|| head.strip_prefix("piece "));
+    seat_line.and_then(|h| h.split_once(' ')).is_some_and(|(_, said)| said.starts_with("started by pane "))
+}
+
+/// The key of an agent started into a seat with no row (a governor's: a
+/// reseat or a rotation): the seat's own freshly minted id at attempt 1.
+///
+/// **Not attempt 0, which is the bare shell `open` ran there** (`wsp-036`):
+/// under a manager that shell is the seat's `seat.spawn` keyed `<seat>/0`, and
+/// the agent that replaces it under the same key is refused `Duplicate`, which
+/// is every keyless start into an opened seat. Named after the seat, so the
+/// fold claims no row for it (`wsp-029`); a retry is attempt 2, and so on.
+fn seat_key(seat: &Seat) -> crate::place::Key {
+    crate::place::Key { row: crate::place::RowId(seat.to_string()), attempt: 1 }
 }
 
 /// Start an agent in a seat, and try again if it does not survive the attempt.
@@ -1568,14 +1671,14 @@ fn wait_ready(
 /// **The retry this task asked for, and the whole of the argument for why it is
 /// here and not one step later.** `spawn` reports success on its own records
 /// rather than on the far side's state — that is the house failure and this file
-/// is where it lives — and `fork-015` closed the detection half: herdr now waits
+/// is where it lives — and `fork-015` closed the detection half: backend now waits
 /// for the turn and wsp knows when a work order did not land. What was left was
 /// the recovery, and the recovery is only safe for one of the two failures.
 ///
 /// **A failed handover is not retried, deliberately.** All three ways
 /// [`hand_over`] can end leave the same ambiguity — no turn running, and a work
 /// order that may be sitting in a composer — so the only retry that could not
-/// duplicate it is a fresh agent. herdr has no verb for that: `pane.close` is
+/// duplicate it is a fresh agent. backend has no verb for that: `pane.close` is
 /// the one thing that ends an agent and it takes the seat with it, and re-opening
 /// a seat means rebinding a claim, which is `cmd_agent`'s and is not paid for by
 /// a transient fault. So that case reports, names the agent it could not reach,
@@ -1590,7 +1693,7 @@ fn wait_ready(
 /// The order of the two waits below is what makes it safe. [`re_arm`] runs
 /// *before* the next start and refuses to proceed while anything is still in the
 /// seat, so this can never start a second agent beside a first one that was
-/// merely slow — and that same wait is what clears herdr's stale agent name; see
+/// merely slow — and that same wait is what clears backend's stale agent name; see
 /// [`Patience::rearm`].
 ///
 /// The name is reused across attempts rather than freshened, which is a decision
@@ -1609,15 +1712,23 @@ fn start_agent(
 ) -> Result<(), String> {
     let seat = spawn.seat;
     let mut backoff = wait.backoff;
+    // A re-start after a start that did not survive is a new agent, so it is a
+    // new key: the manager refuses a stopped key as `duplicate` (6.2 group 3).
+    // Built once per pass, never per send, so the host's one reopen resends it.
+    let mut agent = agent.clone();
+    let mut ran = None;
     for left in (0..=wait.attempts).rev() {
         let why = match place
-            .start(seat, agent)
+            .start(seat, &agent)
             .map_err(|e| e.to_string())
             .and_then(|()| wait_ready(place, how, spawn, kind, wait))
         {
             Ok(()) => return Ok(()),
             Err(why) => why,
         };
+        if let Some(said) = refused_again(&mut ran, &why) {
+            return Err(said);
+        }
         if left == 0 {
             return Err(why);
         }
@@ -1630,11 +1741,41 @@ fn start_agent(
             return Err(format!("{why}, and {stuck}"));
         }
         eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
+        if let Some(key) = agent.key.as_mut() {
+            key.attempt += 1;
+        }
         wait.clock.rest(backoff);
         backoff *= wait.steeper;
     }
     // Unreachable: the loop runs at least once and every path out of it returns.
     Err(format!("{kind} was never started in {seat}"))
+}
+
+/// The key a manager refused a start under as one that already ran: `cpd-9/0`
+/// out of `… Duplicate key cpd-9/0 already ran seat cpd-9 (epoch 1), which has
+/// stopped` (`seat.refused`'s detail as [`crate::place::Refusal::Backend`]
+/// carries it). `None` for any other failure.
+fn ran_key(why: &str) -> Option<&str> {
+    let (_, rest) = why.split_once("Duplicate key ")?;
+    let (key, rest) = rest.split_once(' ')?;
+    rest.starts_with("already ran").then_some(key)
+}
+
+/// wsp-063: a start refused as a key that already ran, refused so again under
+/// the **same** key, is not tried a third time. Every retry goes out under a
+/// fresh key (a row's `attempt + 1` here; a keyless seat's next attempt minted
+/// by the place, `Compound::seat_key`), so the same key refused twice is a
+/// retry that cannot change anything. Before this a key-less seat kept
+/// `<seat>/0` on every retry and the run retried the same refused start. The
+/// answer is said once, with the key, and the loop stops. `ran` is the key the
+/// last start was refused under.
+fn refused_again(ran: &mut Option<String>, why: &str) -> Option<String> {
+    let key = ran_key(why)?;
+    if ran.as_deref() == Some(key) {
+        return Some(format!("{why}; refused again under key {key}, so it was not tried again"));
+    }
+    *ran = Some(key.to_string());
+    None
 }
 
 /// Wait until a seat will take an agent again, or say why it will not.
@@ -1677,7 +1818,7 @@ fn re_arm(place: &dyn Place, seat: &Seat, wait: &Patience) -> Result<(), String>
 /// order it has never been shown, holding a claim, and reported as a healthy
 /// spawn. Ed found it by watching a pane; nothing else could have. Four of six
 /// agents in one burst on 2026-08-17, three of three in a quiet moment that
-/// night with the machine idle and nobody at the keyboard, after herdr 0.8.0
+/// night with the machine idle and nobody at the keyboard, after backend 0.8.0
 /// had already put a wait between its own text and its own Enter.
 ///
 /// **It is not wsp's, and that is why nothing wsp could do to its own call
@@ -1688,7 +1829,7 @@ fn re_arm(place: &dyn Place, seat: &Seat, wait: &Patience) -> Result<(), String>
 /// so.
 ///
 /// So the readiness wait is not the fix and was never missing: [`wait_ready`]
-/// runs first and asks `will_take_a_prompt`, which is herdr's optimistic
+/// runs first and asks `will_take_a_prompt`, which is backend's optimistic
 /// signal and goes true before the composer can take a submission. Waiting
 /// longer only widens the window it is wrong in. **The only thing that settles
 /// it is the agent leaving idle**, which is a fact about the agent rather than
@@ -1697,9 +1838,9 @@ fn re_arm(place: &dyn Place, seat: &Seat, wait: &Patience) -> Result<(), String>
 /// **Half of that reading has since moved to the server, and the half that
 /// stayed is the interesting one.** `agent.prompt` will now hold its reply until
 /// the agent's status moves and refuse when it does not
-/// (`place_herdr::Herdr::tell`), so on that backend the looking below is no
+/// (`place_backend::Backend::tell`), so on that backend the looking below is no
 /// longer how the defect is caught — the answer arrives already knowing. What it
-/// cannot answer is *why* nothing moved. herdr sees a prompt delivered to an
+/// cannot answer is *why* nothing moved. backend sees a prompt delivered to an
 /// agent that is genuinely idle, and that is the same picture whether the
 /// composer was a moment from ready or a folder-trust modal had the keyboard
 /// when the text arrived. Only the second is a thing a keystroke fixes and only
@@ -1740,8 +1881,8 @@ fn hand_over(
     // What was removed here, and it is a reading rather than a line: a backend
     // that answers [`Refusal::NotTaken`] has just spent its own timeout watching
     // for the turn this used to go and look for, so the first look is skipped and
-    // the submit is pressed at once. herdr does that watching now
-    // (`place_herdr::tell`), which is why the five seconds below are no longer
+    // the submit is pressed at once. backend does that watching now
+    // (`place_backend::tell`), which is why the five seconds below are no longer
     // the thing that catches the failure — they are what confirms the rescue.
     //
     // The refusal is not an error. A caller that propagated it would report the
@@ -1864,6 +2005,133 @@ fn confirm_turn(
                 .map_err(|second| format!("{first}; resent once and {second}"))
         }
     }
+}
+
+/// Why a start that carried its first order did not end in a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unordered {
+    /// No `seat.started`, and the host silent: the seat may start yet.
+    Start(String),
+    /// No `seat.started`, and the host answered: it refused the seat on the
+    /// last attempt's key, so nothing will start in it (wsp-040).
+    Denied(String),
+    /// Started, and the host answered the order `order.refused`: it is not
+    /// held anywhere, so it is owed to the repair tick as a tell is.
+    Refused(String),
+    /// Started, and no `order.acked` within the patience: the manager still
+    /// holds the order and asks again under its id, so nothing is owed.
+    Unanswered(String),
+}
+
+/// A seat the host refused to start in, taken down: the terminal `open` put
+/// up is stopped, and when the spawn claimed the row for it (`member`) the
+/// claim is released, so no seat is left standing with nothing in it and the
+/// row is free to be seated again. A seat already gone is the same outcome.
+fn denied(place: &dyn Place, store: &Store, seat: &Seat, member: bool) {
+    match place.stop(seat) {
+        Ok(()) | Err(Refusal::NoSeat(_)) => eprintln!("wsp: closed {seat}, which nothing will start in"),
+        Err(e) => eprintln!("wsp: {seat} could not be closed: {e} — `wsp despawn --pane {seat}`"),
+    }
+    if member {
+        let _ = cmd_agent::release_pane(store, seat.as_str());
+        crate::lapse::seat_ended(store, seat.as_str());
+        store.end_agents_in(seat.as_str());
+    }
+}
+
+/// `start_agent` and `confirm_turn` in one message, under a host that has
+/// events to wait by (`WSP_HOST=manager`, `docs/agent-manager.md` 4.3):
+/// `seat.spawn` carries the work order as its first order, and the answer is
+/// heard as `seat.started`, then `order.acked` (or `order.refused`,
+/// `seat.refused`) — never read off [`Place::state`] or a screen. `None`: the
+/// backend has no such host, nothing was started, and the caller goes the old
+/// way (start, [`wait_ready`], [`hand_over`]).
+///
+/// [`Patience`] keeps its meaning. `ready` and `taken` together are how long
+/// the seat and its order's ack may take, since an ack is a turn begun and so
+/// readiness as well: running out of them is what "never became ready for
+/// input" was, said as the event that did not come. `nudges` are presses of
+/// submit on an order still unanswered, each followed by `taken` more of
+/// listening. `attempts` and `backoff` retry a start the manager refused,
+/// under the next attempt's key; a silent host is not retried, it is said.
+fn start_ordered(
+    place: &dyn Place,
+    spawn: &crate::agent_commands::Spawn,
+    agent: &Agent,
+    kind: &str,
+    text: &str,
+    wait: &Patience,
+) -> Option<Result<(), Unordered>> {
+    let seat = spawn.seat;
+    let mut agent = agent.clone();
+    let mut backoff = wait.backoff;
+    let within = wait.ready + wait.taken;
+    let mut ran = None;
+    for left in (0..=wait.attempts).rev() {
+        let order = crate::place::FirstOrder { order: crate::place::new_order_id(seat), text: text.to_string() };
+        let heard = match place.start_ordered(seat, &agent, &order, within)? {
+            Ok(heard) => heard,
+            Err(Refusal::Unreachable(why)) => return Some(Err(Unordered::Start(why))),
+            Err(e) if left == 0 => return Some(Err(Unordered::Denied(e.to_string()))),
+            Err(e) => {
+                if let Some(said) = refused_again(&mut ran, &e.to_string()) {
+                    return Some(Err(Unordered::Denied(said)));
+                }
+                eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                eprintln!("wsp: trying {seat} again in {}s", backoff.as_secs());
+                if let Some(key) = agent.key.as_mut() {
+                    key.attempt += 1;
+                }
+                wait.clock.rest(backoff);
+                backoff *= wait.steeper;
+                continue;
+            }
+        };
+        return Some(heard_over(place, seat, kind, &order.order, heard, within, wait));
+    }
+    Some(Err(Unordered::Start(format!("{kind} was never started in {seat}"))))
+}
+
+/// [`hand_over`]'s loop on what the host said rather than on what a poll
+/// reads: acked is taken, refused is said, and unanswered is pressed and
+/// listened for again, `nudges` times.
+fn heard_over(
+    place: &dyn Place,
+    seat: &Seat,
+    kind: &str,
+    order: &crate::place::OrderId,
+    mut heard: crate::place::Heard,
+    within: Duration,
+    wait: &Patience,
+) -> Result<(), Unordered> {
+    use crate::place::Heard;
+    let mut waited = within;
+    for pressed in 0..=wait.nudges {
+        match heard {
+            Heard::Acked => return Ok(()),
+            Heard::Refused(why) => return Err(Unordered::Refused(format!("{seat} did not take the work order: {why}"))),
+            Heard::Unanswered => {}
+        }
+        if pressed == wait.nudges {
+            break;
+        }
+        match place.nudge(seat) {
+            Ok(()) => {}
+            Err(Refusal::Unsupported(_)) => break,
+            Err(e) => return Err(Unordered::Unanswered(format!("{seat} did not take the work order: {e}"))),
+        }
+        heard = match place.await_order(seat, order, wait.taken) {
+            Some(Ok(h)) => h,
+            Some(Err(e)) => return Err(Unordered::Unanswered(format!("{seat}'s work order went unheard: {e}"))),
+            None => Heard::Unanswered,
+        };
+        waited += wait.taken;
+    }
+    Err(Unordered::Unanswered(format!(
+        "{kind} started in {seat} and no order.acked came for its work order within {}s: \
+         the manager holds it and asks again under its id",
+        waited.as_secs()
+    )))
 }
 
 /// Say how to reach an agent a spawn could not, where the kind knows a way.
@@ -2083,14 +2351,35 @@ fn agrees(
 }
 
 pub fn spawn(store: &Store, args: &Args) -> i32 {
-    // No pre-flight question about a socket. `herdr::available()` used to guard
-    // this and printed a herdr sentence for a herdr fact; a backend that is not
+    // No pre-flight question about a socket. `backend::available()` used to guard
+    // this and printed a backend sentence for a backend fact; a backend that is not
     // answering now says so from the call that wanted it, which arrives at the
     // same moment and names what it stopped.
+    let place = match spawn_backend(args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
     if args.has("primary") {
-        return seat_primary(backend(args).as_ref(), &crate::cycle::Fleet, store, args);
+        return seat_primary(place.as_ref(), &crate::cycle::Fleet, store, args);
     }
-    place_work(backend(args).as_ref(), store, args)
+    place_work(place.as_ref(), store, args)
+}
+
+/// [`backend`] for a spawn: compound's host is `WSP_HOST`'s
+/// ([`crate::host::chosen`]; the in-process host by default), so under
+/// `manager` the seat is `seat.spawn`'s and its first order is heard acked.
+/// A manager that does not answer is the error, "host silent", and never the
+/// in-process host in its place.
+fn spawn_backend(args: &Args) -> Result<Box<dyn Place>, String> {
+    match chosen(args) {
+        Chosen::Headless => Ok(backend(args)),
+        Chosen::Compound => crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION"))
+            .map(|c| Box::new(c) as Box<dyn Place>)
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// The project whose root the primary interface stands in, absent `--cwd`.
@@ -2153,7 +2442,7 @@ fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Stor
         .collect();
     let mut flags: Vec<(&str, &str)> = vec![("govern", "true")];
     flags.extend(valued.iter().map(|(k, v)| (*k, v.as_str())));
-    for b in ["herdr", "headless", "compound", "json", "focus", "full", "subagents"] {
+    for b in ["headless", "compound", "json", "focus", "full", "subagents"] {
         if args.has(b) {
             flags.push((b, "true"));
         }
@@ -2197,7 +2486,7 @@ fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Stor
 }
 
 /// Which backend places this work: a terminal, a supervisor with none, or a
-/// compound session — a terminal wsp itself owns rather than herdr's.
+/// compound session — a terminal wsp itself owns rather than backend's.
 ///
 /// The flag is the whole of the choice and there is deliberately no inference
 /// behind it. What `--headless` buys is an agent that can be started, told,
@@ -2205,7 +2494,7 @@ fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Stor
 /// thing a supervisor cannot give you, which is an agent you can **sit down in
 /// front of** — no permission prompts, no input box, no attaching. `--compound`
 /// buys that back through a different multiplexer: a real pty, hosted by
-/// `compound-sup` rather than herdr (`compound-064`). That is a decision about
+/// `compound-sup` rather than backend (`compound-064`). That is a decision about
 /// how you mean to work with this agent rather than a detail of where it runs,
 /// so it is asked rather than guessed, and the two flags are mutually
 /// exclusive for the same reason a seat cannot be in two backends at once.
@@ -2229,7 +2518,6 @@ fn seat_primary(place: &dyn Place, seats: &dyn crate::cycle::Seats, store: &Stor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Chosen {
     Headless,
-    Herdr,
     Compound,
 }
 
@@ -2237,10 +2525,9 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
     // `--compound` is still accepted and still means compound; since the flip
     // it names the default rather than departing from it, so every script and
     // work order written during the migration keeps working.
-    match (args.has("headless"), args.has("herdr") && !args.has("compound")) {
-        (true, _) => Chosen::Headless,
-        (false, true) => Chosen::Herdr,
-        (false, false) => Chosen::Compound,
+    match args.has("headless") {
+        true => Chosen::Headless,
+        false => Chosen::Compound,
     }
 }
 
@@ -2249,7 +2536,7 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
 ///
 /// `claim` asks [`backend`] which census to read a seat off, and a claim run
 /// by `spawn` is a synthesised command line that carried none of the caller's
-/// flags — so `spawn --herdr` put the seat on herdr and the claim then looked
+/// flags — so `spawn --backend` put the seat on backend and the claim then looked
 /// for it on compound, found nothing, and recorded no session and no tree; for
 /// `--headless` the supervisor's seat was read off compound the same way. The
 /// seat and the claim are two halves of one act, and the second has to ask the
@@ -2258,7 +2545,6 @@ pub(crate) fn chosen(args: &Args) -> Chosen {
 pub(crate) fn backend_flag(c: Chosen) -> Option<(&'static str, &'static str)> {
     match c {
         Chosen::Headless => Some(("headless", "true")),
-        Chosen::Herdr => Some(("herdr", "true")),
         Chosen::Compound => None,
     }
 }
@@ -2272,18 +2558,6 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
     // They would have gone on passing had this copy drifted.
     match chosen(args) {
         Chosen::Headless => Box::new(crate::place_super::Supervisor::new()),
-        // **The default is compound** (`compound-112`), and `--herdr` is what
-        // asks for the fork by name. It was the other way round until the
-        // fleet had run a fortnight of agents on compound without one: the
-        // flag every spawn on `chrome-port`, `compound-parity`, `herdr-out`
-        // and `native-window` had to carry was `--compound`, which is the
-        // definition of a default pointing the wrong way.
-        //
-        // Reversible in one line, which is why it is a default and not a
-        // deletion. `place_herdr` stays, `--herdr` selects it, and
-        // `--on <machine>` still reaches another machine's. What changes is
-        // only what you get when you say nothing.
-        Chosen::Herdr => Box::new(Herdr::new()),
         Chosen::Compound => Box::new(crate::place_compound::Compound::new()),
     }
 }
@@ -2294,10 +2568,21 @@ pub(crate) fn backend(args: &Args) -> Box<dyn Place> {
 /// One caller — `wsp tell --anyway` — and it is deliberately a second function
 /// rather than a parameter on the one above, so that every OTHER reader of the
 /// fleet keeps the safe backend by construction and cannot acquire the unsafe
-/// one by passing the wrong bool. herdr is unchanged: it watches a pty and can
+/// one by passing the wrong bool. backend is unchanged: it watches a pty and can
 /// answer about now, so it has nothing to insist past.
-pub(crate) fn insisting_backends() -> [Box<dyn Place>; 2] {
-    [Box::new(Herdr::new()), Box::new(crate::place_compound::Compound::new().insisting())]
+pub(crate) fn insisting_backends() -> [Box<dyn Place>; 1] {
+    [Box::new(crate::place_compound::Compound::new().insisting())]
+}
+
+/// The backends a tell or a flush of held tells goes through: compound's host
+/// is `WSP_HOST`'s, so under `manager` the sentence is `order.deliver`. A host
+/// that does not answer is the error, and the caller holds the tell.
+pub(crate) fn told_backends(insist: bool) -> Result<[Box<dyn Place>; 1], crate::host::HostError> {
+    let c = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION"))?;
+    Ok([Box::new(match insist {
+        true => c.insisting(),
+        false => c,
+    })])
 }
 
 fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
@@ -2641,7 +2926,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // `!args.has("no-focus")`, so every spawn dragged the screen onto the new
     // seat unless the caller thought to say otherwise — and `spawn` is run by
     // the queue at least as often as by hand, which meant a batch starting
-    // overnight took the screen off whatever a person was reading. herdr's
+    // overnight took the screen off whatever a person was reading. backend's
     // `workspace.create` defaults `focus` to false and wsp was opting in; the
     // doc on [`Order::show`] already said `false` by default, so the port
     // stated the rule and this line contradicted it.
@@ -2651,7 +2936,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // the id after it rather than fail, which is a worse way to learn.
     //
     // The ask below is honoured and the screen still moves, which is not this
-    // line's doing: herdr's `workspace.created` runs wsp's own plugin hook, the
+    // line's doing: backend's `workspace.created` runs wsp's own plugin hook, the
     // hook installs the panel, and the `pane.swap` it needs focuses with no way
     // to decline. See `panel::install::install_one` and `fork-002`.
     // Only where an agent is actually going to be started. `--kind` on a bare
@@ -2823,6 +3108,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
         crate::piece_seat::record_tree(store, task, pc.n, &piece_prepared);
     }
+    let opened_at = util::now_iso();
     let seat = match place.open(&order) {
         Ok(v) => v,
         Err(e) => {
@@ -2844,6 +3130,14 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // left standing either way: it is a terminal in the right tree, which is
     // what you would have opened by hand, and closing something that already
     // has a shell in it to tidy up after a refusal is a worse trade.
+    // The spawn's key, read before the claim below writes this seat's start
+    // into the log (`spawn_key`). A verifier is not one of the row's attempts:
+    // keyed by the row it would share the key of the member seat after it, so
+    // the host mints it one of its own.
+    let key = match verifying {
+        true => None,
+        false => spawn_key(store, work.task.as_deref()),
+    };
     let claimed = match &work.task {
         // No claim: the member's own claim is its agent's, and a verifier is
         // somebody else. The pass is the record, and it gets the seat now —
@@ -2893,7 +3187,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             // string is the same string either way.
             let mut flags: Vec<(&str, &str)> = vec![("pane", seat.as_str())];
             // Where the seat was put, said by the one party that knows. The
-            // claim asks herdr otherwise, and a seat herdr does not draw came
+            // claim asks backend otherwise, and a seat backend does not draw came
             // back as no room and the tree the caller stood in — on a worklist
             // spawn, the previous member's (`wsp-142`).
             let room = place.room(&seat);
@@ -2937,8 +3231,9 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         },
     };
     if let (Some((list, at)), false) = (&checking, claimed) {
+        orphan_check_seat(place, store, list, *at, &seat, &opened_at);
         eprintln!(
-            "wsp: opened {seat} — but no check is open on group {at} of {list}, so no agent was started; \
+            "wsp: opened {seat} — but no check is open on group {at} of {list}, so no agent was started and {seat} was ended; \
              `wsp worklist advance {list}` opens one when it is owed"
         );
         return 1;
@@ -3007,7 +3302,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                     return 1;
                 }
             },
-            // The workspace id is herdr's word and the port has none for it, so
+            // The workspace id is backend's word and the port has none for it, so
             // this is the one fact `spawn` cannot get through `place`. Spoken
             // rather than fatal: the terminal is open and the agent is about to
             // be told what its job is, and the record is one command away from
@@ -3091,7 +3386,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 Some(l) => crate::packet::leg_order(t, l, leg_last),
                 None => format!(
                     "{}{}",
-                    crate::packet::order(t, crate::cmd_checkout::Flow::of_task(store, t)),
+                    crate::packet::order_in(store, t, crate::cmd_checkout::Flow::of_task(store, t)),
                     sent_back_note(store, t)
                 ) + &crate::duplicate::moved_note(store, t, cwd.as_deref()),
             }),
@@ -3158,7 +3453,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             .as_deref()
             .filter(|_| args.has("agent") && !args.has("govern") && !verifying && checking.is_none() && leg_name.is_none() && piece_rec.is_none());
         spawn_args.extend(crate::cmd_role::seat_spawn_args(&kind, member_row, verifying, &row_tags, &store.state));
-        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args };
+        let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args, key };
         let far_start = args.get("on").is_some();
         // Two waits, and they are different questions: `start` comes back when
         // the agent exists, `wait_ready` when it will listen. Both are inside
@@ -3174,7 +3469,58 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 _ => {}
             }
         }
-        match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience(far_start)) {
+        // Under a host with events (`WSP_HOST=manager`) a work order that is
+        // told rather than put in argv goes in the `seat.spawn` itself, and
+        // the spawn waits for it to be heard taken (4.3): no readiness poll,
+        // no screen read, no look for a turn. `None` is the in-process host.
+        let heard = match (&order, in_args) {
+            (Some(text), false) => start_ordered(place, &spawn, &agent, &kind, text, &spawn_patience(far_start)),
+            _ => None,
+        };
+        match heard {
+            Some(Ok(())) => {
+                started = Some(kind.clone());
+                ordered = true;
+                told = true;
+            }
+            // The manager said no: nothing is coming to the seat, so the
+            // terminal it opened is closed and a member's claim let go, and
+            // the row can be seated again (wsp-040: an empty terminal held
+            // the claim of a row the manager would never start).
+            Some(Err(Unordered::Denied(e))) => {
+                eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                let member = claimed && !verifying && leg_name.is_none() && piece_rec.is_none();
+                denied(place, store, &seat, member);
+            }
+            Some(Err(Unordered::Start(e))) => {
+                eprintln!("wsp: {kind} did not start in {seat}: {e}");
+                if let Some(text) = &order {
+                    crate::repair::owe_first_order(store, seat.as_str(), text, 0);
+                }
+                unreached(how, place, &spawn);
+            }
+            Some(Err(why)) => {
+                started = Some(kind.clone());
+                ordered = true;
+                match why {
+                    // Answered and not taken: nobody holds it now, so it is
+                    // owed to the repair tick as a failed tell is.
+                    Unordered::Refused(e) => {
+                        eprintln!("wsp: agent started but not working on it: {e}");
+                        if let Some(text) = &order {
+                            crate::repair::owe_first_order(store, seat.as_str(), text, 1);
+                        }
+                        eprintln!("wsp: send it again with `wsp tell {seat} -`");
+                    }
+                    // The manager still asks under its id: owing it too
+                    // would send it twice.
+                    Unordered::Unanswered(e) | Unordered::Start(e) | Unordered::Denied(e) => {
+                        eprintln!("wsp: agent started but not working on it: {e}");
+                    }
+                }
+                unreached(how, place, &spawn);
+            }
+            None => match start_agent(place, how, &spawn, &agent, &kind, &spawn_patience(far_start)) {
             Ok(()) => {
                 started = Some(kind.clone());
                 // A task gives an agent something to be told, and so — since
@@ -3241,6 +3587,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                 }
                 unreached(how, place, &spawn);
             }
+        },
         }
     }
 
@@ -3253,7 +3600,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // the value is cheapest: the backend has just been asked whether the agent
     // is ready, so it plainly has an opinion about what is in the seat.
     //
-    // Best-effort, and silent. A backend that cannot say yet — herdr's detection
+    // Best-effort, and silent. A backend that cannot say yet — backend's detection
     // lags a launch by a second or so — leaves the field empty and the daemon's
     // next `sync` fills it, which is why nothing here waits or complains.
     if started.is_some() {
@@ -3271,10 +3618,10 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         println!(
             "{}",
             json!({
-                // One handle where there were two. A herdr seat is the pane id
+                // One handle where there were two. A backend seat is the pane id
                 // this printed as `pane` before, so a caller doing
                 // `wsp release --pane $(...)` reads the same string out of a
-                // different key; what has gone is `workspace`, which was herdr's
+                // different key; what has gone is `workspace`, which was backend's
                 // second id and is not something the port hands back.
                 "seat": seat.as_str(),
                 "task": work.task,
@@ -3405,17 +3752,34 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
 /// the ending of a pane that is still the seated custodian, and that must only
 /// ever exist while a confirmed successor stands ready to inherit.
 pub fn rotate(store: &Store, args: &Args) -> i32 {
-    // The successor OPENS a seat, which is a spawn — so it opens wherever a
-    // spawn would, through the same one-copy choice (`compound-091`). It used
-    // to name herdr here, which meant `--compound` was honoured by every verb
-    // that starts an agent except the one that replaces a custodian.
-    rotate_on(backend(args).as_ref(), store, args, &Patience::default(), &|scope| {
-        arrange_ending(store, scope, args)
-    })
+    rotate_ending(store, args, &|scope| arrange_ending(store, scope, args))
+}
+
+/// [`rotate`] with its step 4 stated, so a test runs the verb's own choice of
+/// host and records the ending rather than starting the helper that would end
+/// the test runner's seat.
+///
+/// The successor OPENS a seat, which is a spawn — so it opens wherever a spawn
+/// would, through the same one-copy choice (`compound-091`). **Through
+/// [`spawn_backend`], as [`reseat`] is** (`wsp-041`, after `wsp-036`): under
+/// `WSP_HOST=manager` the successor is the manager's `seat.spawn`, journalled
+/// and in `wip`'s census. [`backend`] is the in-process host whatever
+/// `WSP_HOST` says. A manager that does not answer is the rotation refused
+/// before anything is recorded, and the caller still seated.
+fn rotate_ending(store: &Store, args: &Args, end: &dyn Fn(&str) -> Result<(), String>) -> i32 {
+    let place = match spawn_backend(args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            eprintln!("wsp: nothing moved - the seat is still yours");
+            return 1;
+        }
+    };
+    rotate_on(place.as_ref(), store, args, &Patience::default(), end)
 }
 
 /// [`rotate`] against a stated backend and clock, which is the shape every test
-/// of it takes: a herdr that answers from a script, and waits measured on a
+/// of it takes: a backend that answers from a script, and waits measured on a
 /// dial rather than on the machine. `end` is step 4, handed the scope: in a
 /// test it records that it was asked, where [`arrange_ending`] starts a
 /// process that would end the test runner's own seat.
@@ -3446,6 +3810,11 @@ fn rotate_on(
 /// seat is somebody else, possibly mid-turn on something it was told, so the
 /// helper waits for it to stop turning — [`END_WHEN_IDLE`].
 pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
+    rotate_on_behalf_ending(store, scope, &|scope| arrange_ending_when_idle(store, scope))
+}
+
+/// [`rotate_on_behalf`] with its ending stated, for [`rotate_ending`]'s reason.
+fn rotate_on_behalf_ending(store: &Store, scope: &str, end: &dyn Fn(&str) -> Result<(), String>) -> i32 {
     let governors = store.governors();
     let Some(seat) = crate::governors::seat_of_scope(scope, &governors) else {
         println!("wsp: nobody holds the {scope} seat - nothing to rotate");
@@ -3483,9 +3852,17 @@ pub(crate) fn rotate_on_behalf(store: &Store, scope: &str) -> i32 {
             ("effort", effort.as_deref().unwrap_or_default()),
         ],
     );
-    rotate_as(backend(&args).as_ref(), store, &args, &Patience::default(), &|scope| {
-        arrange_ending_when_idle(store, scope)
-    }, Hand::Predecessor(me))
+    // Through [`spawn_backend`], for [`rotate_ending`]'s reason (`wsp-041`):
+    // the run's rotation is a spawn under `WSP_HOST` like any other.
+    let place = match spawn_backend(&args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            eprintln!("wsp: nothing moved - {me} still holds the {scope} seat");
+            return 1;
+        }
+    };
+    rotate_as(place.as_ref(), store, &args, &Patience::default(), end, Hand::Predecessor(me))
 }
 
 /// Set on the `--ending` helper [`rotate_on_behalf`] starts: wait until the
@@ -3524,7 +3901,7 @@ pub(crate) fn end_exit_when_idle(store: &Store, seat: &str) -> Result<(), String
 /// Run `wsp <argv>` detached, under [`END_WHEN_IDLE`], with its output in the
 /// handover log.
 fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
+    let exe = wsp_base::util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -3535,8 +3912,8 @@ fn when_idle(store: &Store, argv: &[&str]) -> Result<(), String> {
     cmd.args(argv)
         .env(END_WHEN_IDLE, "1")
         .env_remove(crate::base::seat::SEAT_ENV)
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("WSP_BACKEND_PANE_ID")
+        .env_remove("WSP_BACKEND_WORKSPACE_ID")
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err)
@@ -3609,7 +3986,22 @@ pub(crate) fn reseat(store: &Store, scope: &str) -> i32 {
         return 1;
     }
     let args = reseat_args(&governors, scope);
-    reseat_on(backend(&args).as_ref(), store, &args, &Patience::default())
+    // **Through [`spawn_backend`], as `wsp spawn` is** (`wsp-036`): under
+    // `WSP_HOST=manager` the successor is the manager's `seat.spawn`, under
+    // its key, journalled and in `wip`'s census. [`backend`] is the
+    // in-process host whatever `WSP_HOST` says, and retro-2's cpd-241 was
+    // started that way, behind the manager's back. A manager that does not
+    // answer is the reseat failed, said on the seat, never the in-process host
+    // in its place.
+    let place = match spawn_backend(&args) {
+        Ok(place) => place,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            cmd_govern::reseat_failed(store, scope, &format!("no seat could be opened: {e}"));
+            return 1;
+        }
+    };
+    reseat_on(place.as_ref(), store, &args, &Patience::default())
 }
 
 /// The kind a reseat of this scope starts — the seat's own, read live or from
@@ -3704,7 +4096,7 @@ fn rotate_as(
     // Rotation is the seat's own act, from the seat's own pane. Anyone else
     // running it would be handing a position away behind its holder's back,
     // and "the caller stays seated" means nothing for a caller that was never
-    // seated. Off `my_pane()` and not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID`
+    // seated. Off `my_pane()` and not `WSP_BACKEND_WORKSPACE_ID`/`WSP_BACKEND_PANE_ID`
     // (`compound-105`): a compound-hosted agent has neither, only the seat
     // `my_pane()` already names, and `governs` matches an exact pane on its
     // own — no separate workspace to pass beside it (`compound-095`).
@@ -3954,12 +4346,24 @@ fn rotate_as(
     };
     let mut spawn_args = how.args(&spawn);
     spawn_args.extend(crate::cmd_role::settings_args(&kind, Some(&scope), work.primary));
-    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args };
+    // A governor has no row: its key is its seat's own (see `seat_key`).
+    let key = spawn_key(store, Some(&scope)).unwrap_or_else(|| seat_key(&seat));
+    let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args, key: Some(key) };
 
     // Step 2. Started, then heard from: a turn running is the only evidence
     // that the handover was taken, and everything after this point depends on
-    // it having been.
-    if let Err(e) = start_agent(place, how, &spawn, &agent, &kind, wait) {
+    // it having been. Under a host with events the order goes in the
+    // `seat.spawn` and both are heard rather than polled for (4.3).
+    let (started, handed) = match in_args {
+        false => match start_ordered(place, &spawn, &agent, &kind, &text, wait) {
+            Some(Ok(())) => (Ok(()), Some(Ok(()))),
+            Some(Err(Unordered::Start(e) | Unordered::Denied(e))) => (Err(e), None),
+            Some(Err(Unordered::Refused(e) | Unordered::Unanswered(e))) => (Ok(()), Some(Err(e))),
+            None => (start_agent(place, how, &spawn, &agent, &kind, wait), None),
+        },
+        true => (start_agent(place, how, &spawn, &agent, &kind, wait), None),
+    };
+    if let Err(e) = started {
         eprintln!("wsp: {kind} did not start in {seat}: {e}");
         if vacant {
             // No `unreached` line: it says `wsp tell` will reach the agent if
@@ -3974,7 +4378,8 @@ fn rotate_as(
         return 1;
     }
     if !in_args {
-        if let Err(e) = confirm_turn(place, how, &spawn, &text, wait) {
+        let handed = handed.unwrap_or_else(|| confirm_turn(place, how, &spawn, &text, wait));
+        if let Err(e) = handed {
             eprintln!("wsp: agent started but not working on it: {e}");
             if vacant {
                 // **Not "send the order again", and not "has the order in its
@@ -4002,7 +4407,7 @@ fn rotate_as(
     if !vacant {
         let Some(ws_new) = place.room(&seat) else {
             // A backend with rooms that could not say which one this seat is in:
-            // herdr, with its listing unanswered. Nothing here may guess, and the
+            // backend, with its listing unanswered. Nothing here may guess, and the
             // seat must not move onto a record that cannot name its room. So this
             // pane is still the seat, and nothing ends it. The record stays, so the
             // successor's brief keeps saying the seat is on its way. Once the move
@@ -4226,7 +4631,7 @@ const ROTATED_BY: &str = "WSP_ROTATED_BY";
 /// pane it is ending. The backend flags this rotation was given are passed on,
 /// so the helper looks where the rotation looked.
 fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("no path to this binary: {e}"))?;
+    let exe = wsp_base::util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -4235,15 +4640,15 @@ fn arrange_ending(store: &Store, scope: &str, args: &Args) -> Result<(), String>
     let err = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(["govern", scope, "--ending"]);
-    for flag in ["herdr", "compound", "headless"] {
+    for flag in ["compound", "headless"] {
         if args.has(flag) {
             cmd.arg(format!("--{flag}"));
         }
     }
     cmd.env(ROTATED_BY, std::process::id().to_string())
         .env_remove(crate::base::seat::SEAT_ENV)
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("WSP_BACKEND_PANE_ID")
+        .env_remove("WSP_BACKEND_WORKSPACE_ID")
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err)
@@ -4371,7 +4776,7 @@ fn end_owed(
 ///
 ///     wsp despawn <id>            ended the agent, released the claim
 ///     wsp checkout <id> --rm      removed the worktree
-///     herdr workspace close <ws>  closed the workspace the pane left behind
+///     backend workspace close <ws>  closed the workspace the pane left behind
 ///
 /// Only the first is a wsp verb anybody reaches for, so the other two were done
 /// by whoever noticed — which is why they were not done. What that cost is on
@@ -4382,7 +4787,7 @@ fn end_owed(
 ///
 /// So this verb does the whole ending. Two of the three are one call already —
 /// closing the last pane of a workspace takes the workspace with it, measured
-/// against herdr 0.8.0 on 2026-08-19 and argued in `place_herdr`'s module docs —
+/// against backend 0.8.0 on 2026-08-19 and argued in `place_backend`'s module docs —
 /// and the third is [`cmd_checkout::discard`], with `--rm`'s refusals and not
 /// the sweep's. There is a fourth nobody had counted: a build tree under the
 /// state directory is keyed on the workspace, so the workspace going takes its
@@ -4421,7 +4826,7 @@ fn end_owed(
 /// What a despawn does is a run of steps across a live backend, each one
 /// decided by the previous one's answer: the claim is released only if the seat
 /// closed, the tree is taken only if nobody is standing in it and it holds
-/// nothing uncommitted, the build trees go only if herdr says the workspace has
+/// nothing uncommitted, the build trees go only if backend says the workspace has
 /// actually gone. Every one of those is a question that can only be asked by
 /// doing the step before it. A preview would therefore print what it *intends*,
 /// which is exactly the sentence this verb was written to stop printing — and
@@ -4468,14 +4873,23 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
     // pane is: it is the one thing about the caller that comes out of the
     // environment, and `end_work` is tested without one.
     let governors = store.governors();
-    // Off `pane` and not `HERDR_WORKSPACE_ID` (`compound-105`): a
+    // Off `pane` and not `WSP_BACKEND_WORKSPACE_ID` (`compound-105`): a
     // compound-hosted seat has no workspace to read, only the pane already
     // read above, and `governs` matches an exact pane on its own.
     let governs =
         pane.as_deref().and_then(|p| crate::place::governs(&governors, &crate::place::Seat::new(p)));
     let bound = crate::cmd_role::bound_here(store, pane.as_deref());
     let me = Caller { pane: pane.as_deref(), governs: governs.as_deref(), bound, live: Some(seat_is_live) };
-    end_work(backend(args).as_ref(), store, args, me, &tidy)
+    // Under `WSP_HOST=manager` the stop goes to the manager, which names what
+    // it ended; one that does not answer is the despawn's error, "host silent".
+    let place = match spawn_backend(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+    end_work(place.as_ref(), store, args, me, &tidy)
 }
 
 /// `wsp despawn <row> --lost`: let go of a row held on a machine that is not
@@ -4491,65 +4905,18 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
 /// `wsp despawn` that does it; "lost" is a claim about a machine, and a verb
 /// that let it be made of one that is answering would release live work.
 fn despawn_lost(store: &Store, args: &Args) -> i32 {
-    let p = Paint::new();
     let index = Index::new(store.projects());
-    let (seat, task) = match seat_of(store, args, &index, None) {
-        Ok(v) => v,
+    let seat = match seat_of(store, args, &index, None) {
+        Ok((seat, _)) => seat,
         Err(e) => {
             eprintln!("wsp: {e}");
             return 2;
         }
     };
-    let Some(machine) = crate::herdr::host_of(seat.as_str()).map(str::to_string) else {
-        eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
-        return 2;
-    };
-    let (_, ended) = cmd_agent::release_pane(store, seat.as_str());
-    crate::lapse::seat_ended(store, seat.as_str());
-    store.end_agents_in(seat.as_str());
-    let task = ended.or(task);
-    crate::attention::seat_gone(store, task.as_deref(), Some(seat.as_str()));
-    for subject in task.iter() {
-        let _ = std::fs::remove_file(brief_path(store, subject));
-    }
-    let mut far = None;
-    if let Some(id) = &task {
-        if let Some(mut t) = store.task(id) {
-            if t.status() == crate::model::Status::Doing {
-                t.set_status(crate::model::Status::Todo);
-            }
-            let _ = crate::log::note(store, &mut t, &format!("lost with {machine} (seat {seat}) — the last checkpoint is in the seat's worktree"));
-        }
-        if let Some(mut m) = store.machine(&machine) {
-            let at = match m.exec_dir.trim_end_matches('/') {
-                "" => "its exec_dir".to_string(),
-                d => format!("{d}/trees/{id}"),
-            };
-            if !m.body.is_empty() && !m.body.ends_with('\n') {
-                m.body.push('\n');
-            }
-            m.body.push_str(&format!(
-                "- {} lost {id} (seat {seat}): its copy, if it returns, is at {at} — never read automatically\n",
-                util::now_iso()
-            ));
-            let _ = store.save_machine(&m);
-            far = Some(at);
-        }
-        store.log_event("task-lost", json!({ "id": id, "seat": seat.as_str(), "machine": machine }));
-    }
-    store.git_commit(&format!("wsp: despawn --lost {}", task.as_deref().unwrap_or(seat.as_str())));
-    if args.json() {
-        println!("{}", json!({ "seat": seat.as_str(), "machine": machine, "task": task, "far_copy": far, "tree": "kept" }));
-    } else {
-        match &task {
-            Some(t) => println!("  {}", p.dim(&format!("released {t} — back to todo; its worktree on the seat is kept as it was"))),
-            None => println!("  {}", p.dim("it was holding nothing")),
-        }
-        if let Some(at) = far {
-            println!("  {}", p.dim(&format!("{machine}'s copy ({at}) is named in its notes, and is not read")));
-        }
-    }
-    0
+    // A far seat was told by its `@machine` suffix, which only backend wrote; no
+    // seat carries one now, so every seat is this one's.
+    eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
+    2
 }
 
 /// Which pane is running this despawn, and what it holds the seat of.
@@ -4558,7 +4925,7 @@ fn despawn_lost(store: &Store, args: &Args) -> i32 {
 /// refusals turn on who is asking: ending the pane you are standing in, and
 /// ending the pane you are in the middle of taking a seat from. Both arrive as
 /// arguments for the reason on [`end_work`] — a test that had to export
-/// `HERDR_PANE_ID` to reach them would be changing a process-wide variable
+/// `WSP_BACKEND_PANE_ID` to reach them would be changing a process-wide variable
 /// every other test can see.
 #[derive(Default, Clone, Copy)]
 struct Caller<'a> {
@@ -4591,7 +4958,7 @@ struct Leftovers {
 ///
 /// Passed into [`end_work`] as a closure rather than called from inside it, for
 /// the reason `me` is passed in below: this is the half of the verb that needs
-/// a git repository and a live herdr under it, and a test of the *ordering* —
+/// a git repository and a live backend under it, and a test of the *ordering* —
 /// stop, release, then tidy — should not need either. It is also the half that
 /// removes directories, and a unit test that reached the real one would be
 /// running `git worktree remove` against whatever tree the test runner happens
@@ -4609,19 +4976,19 @@ fn swept_up(
     let cwd = std::env::current_dir().unwrap_or_default();
     let here = util::real(&cwd.display().to_string());
     // The seat this despawn has just closed is not somebody standing in the
-    // tree. herdr can go on listing a pane for a moment after `pane.close`
+    // tree. backend can go on listing a pane for a moment after `pane.close`
     // returns, and reading that back as an occupant is how a cleanup verb comes
     // to refuse on the pane it removed itself.
     //
-    // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
-    // alone: this used to read `herdr::panes()` only, so a despawn ending a
+    // Asked of every backend wsp can spawn onto (`compound-091`), not backend
+    // alone: this used to read `backend::panes()` only, so a despawn ending a
     // `cpd-` seat never asked who else was standing in the tree and reported
-    // "kept ~/…/compound-093 — herdr did not say who is standing in it" for a
-    // tree herdr never had an opinion about in the first place.
+    // "kept ~/…/compound-093 — backend did not say who is standing in it" for a
+    // tree backend never had an opinion about in the first place.
     //
     // `cmd_checkout::who_is_standing` — `Occupied` asks the identical question
     // for `--sweep`/`--rm` (`compound-120`) and this used to be its own copy
-    // of the same herdr-then-compound merge.
+    // of the same backend-then-compound merge.
     let seen: Result<Vec<(String, String)>, String> =
         cmd_checkout::who_is_standing().map(|rows| rows.into_iter().filter(|(id, _)| id != seat.as_str()).collect());
     let standing = |dir: &std::path::Path| -> Option<String> {
@@ -4667,23 +5034,17 @@ fn swept_up(
             // session kept running there rewrote the tree after the removal and
             // left the next seat a half-made one (`wsp-498`).
             let dir = cmd_checkout::tree_of(cmd_checkout::candidates(store, &cwd, t), t);
-            let left = dir.as_deref().map(crate::cmd_role::left_in).unwrap_or_default();
-            let tree = cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing);
-            if let (Tree::Removed { path, .. }, Some(dir)) = (&tree, &dir) {
-                let (term, kill) = crate::cmd_role::end_pids(&left);
-                if !term.is_empty() {
-                    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
-                    crate::store::log_line(
-                        store,
-                        &format!("despawn {seat} ({t}): ended what stood in the removed tree {path}: TERM {}{}", list(&term), if kill.is_empty() { String::new() } else { format!(", KILL {}", list(&kill)) }),
-                    );
-                    // Whatever it wrote between the removal and its end is not a tree.
-                    if dir.exists() && !dir.join(".git").exists() {
-                        let _ = std::fs::remove_dir_all(dir);
+            let discard = || cmd_checkout::discard(cmd_checkout::candidates(store, &cwd, t), t, &standing);
+            match &dir {
+                Some(dir) => {
+                    let (tree, said) = take_tree(dir, &discard, &LiveTree, standing(dir).is_none());
+                    for line in said {
+                        crate::store::log_line(store, &format!("despawn {seat} ({t}): {line}"));
                     }
+                    tree
                 }
+                None => discard(),
             }
-            tree
         }
         // A seat holding nothing names no tree. There is no path from a seat to
         // a checkout except through the task, and guessing one from the pane's
@@ -4691,14 +5052,10 @@ fn swept_up(
         None => Tree::Absent,
     };
 
-    // Only once herdr says the workspace has actually gone. A seat with
-    // siblings leaves its workspace standing, and a build tree keyed on a live
-    // workspace belongs to whoever is still in it.
-    let gone = |ws: &str| crate::herdr::workspaces().map(|all| !all.iter().any(|w| w.id == ws));
-    let builds = match workspace {
-        Some(ws) if gone(ws).unwrap_or(false) => crate::cmd_verify::clear_build_key(store, ws),
-        _ => Vec::new(),
-    };
+    // A build tree was released only once backend said its workspace had gone,
+    // and backend's list never answers now: none is.
+    let _ = workspace;
+    let builds = Vec::new();
     // And the row's finished legs' trees (wsp-297): the row's own is taken on
     // its rule above, and these on theirs, which wants the leg's branch merged.
     let legs = match task.filter(|_| !keep) {
@@ -4708,16 +5065,88 @@ fn swept_up(
     Leftovers { tree, legs, builds, far }
 }
 
+/// What stands in a seat's tree, and the stop for it. The live answers are
+/// [`crate::cmd_role::left_in`] and [`crate::cmd_role::end_pids`], which read
+/// nothing under `cfg(test)`; a test brings its own (`wsp-085`).
+trait InTree {
+    /// The pids the seat started that stand in `dir`.
+    fn left_in(&self, dir: &std::path::Path) -> Vec<u32>;
+    /// `TERM`, then `KILL` for what is left: what was signalled, each way.
+    fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>);
+}
+
+struct LiveTree;
+
+impl InTree for LiveTree {
+    fn left_in(&self, dir: &std::path::Path) -> Vec<u32> {
+        crate::cmd_role::left_in(dir)
+    }
+    fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        crate::cmd_role::end_pids(pids)
+    }
+}
+
+/// A seat's own tree taken away: **what the seat left running in it stopped
+/// first**, then the tree discarded, then anything that wrote in it during the
+/// removal stopped and its remnant removed — or the tree kept, with the pid
+/// that still holds it named. Returns the tree and the lines for `cycle.log`.
+///
+/// **Stopped before, not only after** (`wsp-085`). `wsp-498` ended what stood
+/// in a tree only once the tree read `Removed`, so a process still writing in
+/// it — the case the run's "Directory not empty — the tree is in use: a
+/// process still writes in it" names — was never stopped, and that refusal
+/// named no pid. Its writes are also what made a tree read as uncommitted
+/// work and be kept. `nobody_else` is that no other seat stands in the tree:
+/// what runs in a tree somebody is still using is theirs, and is not touched.
+///
+/// [`cmd_checkout::remove`] reports nothing of a removal that half failed, so
+/// a `Removed` tree whose directory is still there is the failure, read here.
+/// A remnant with a `.git` in it is left: that is a tree again, and possibly
+/// the next seat's.
+fn take_tree(dir: &std::path::Path, discard: &dyn Fn() -> Tree, inside: &dyn InTree, nobody_else: bool) -> (Tree, Vec<String>) {
+    let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+    let signalled = |(term, kill): (Vec<u32>, Vec<u32>)| match kill.is_empty() {
+        true => format!("TERM {}", list(&term)),
+        false => format!("TERM {}, KILL {}", list(&term), list(&kill)),
+    };
+    let mut said = Vec::new();
+    let path = util::contract(dir);
+    if nobody_else {
+        let left = inside.left_in(dir);
+        if !left.is_empty() {
+            said.push(format!("stopped what still ran in its tree {path} before removing it: {}", signalled(inside.end(&left))));
+        }
+    }
+    let tree = discard();
+    let Tree::Removed { path, .. } = &tree else { return (tree, said) };
+    if !dir.exists() {
+        return (tree, said);
+    }
+    let late = inside.left_in(dir);
+    if !late.is_empty() && nobody_else {
+        said.push(format!("ended what wrote in the tree {path} during its removal: {}", signalled(inside.end(&late))));
+    }
+    let err = match dir.join(".git").exists() {
+        true => Some("it is a tree again (it has a .git)".to_string()),
+        false => std::fs::remove_dir_all(dir).err().map(|e| e.to_string()).filter(|_| dir.exists()),
+    };
+    let Some(err) = err else { return (tree, said) };
+    let holds = inside.left_in(dir);
+    let why = match holds.is_empty() {
+        true => format!("could not be removed: {err}"),
+        false => format!("could not be removed: {err} — pid {} still writes in it", list(&holds)),
+    };
+    said.push(format!("kept {path}: {why}"));
+    (Tree::Kept { path: path.clone(), why }, said)
+}
+
 /// A far row's copy, ended with its seat (`docs/remote-agents.md` section 3):
 /// [`crate::treecopy::Copy::clear`] on the machine the row was copied to, with
 /// the far trust entry removed in the same ending. `None` for a row that was
 /// never copied, which is every local one.
-fn far_cleared(store: &Store, seat: &str, row: &str, tree: Option<std::path::PathBuf>) -> Option<crate::treecopy::Cleared> {
+fn far_cleared(store: &Store, _seat: &str, row: &str, tree: Option<std::path::PathBuf>) -> Option<crate::treecopy::Cleared> {
     let rec = crate::treecopy::record_of(store, row)?;
-    let m = crate::herdr::host_of(seat)
-        .and_then(|h| store.machine(h))
-        .filter(|m| m.ssh == rec.host)
-        .or_else(|| store.machines().into_iter().find(|m| m.ssh == rec.host));
+    let m = store.machines().into_iter().find(|m| m.ssh == rec.host);
     let Some(m) = m else {
         return Some(crate::treecopy::Cleared {
             done: Vec::new(),
@@ -4740,7 +5169,7 @@ fn far_cleared(store: &Store, seat: &str, row: &str, tree: Option<std::path::Pat
 /// A task resolves through its *binding*, which is the only record that names a
 /// seat — a claim names a workspace, and the port cannot turn one into a seat
 /// (`place::Seated` does not say where a seat is). So a task whose binding has
-/// been lost, which is what a herdr restart leaves behind, is refused with the
+/// been lost, which is what a backend restart leaves behind, is refused with the
 /// command that rebuilds it rather than a guess: `wsp reconcile` binds a claim
 /// back to a pane by label, and despawn works again afterwards.
 fn seat_of(store: &Store, args: &Args, index: &Index, live: Option<fn(&str) -> bool>) -> Result<(Seat, Option<String>), String> {
@@ -4774,7 +5203,7 @@ fn seat_of(store: &Store, args: &Args, index: &Index, live: Option<fn(&str) -> b
                 return Ok((Seat::new(seat), Some(task)));
             }
             Err(match (store.claims().contains_key(&task), store.task(&task).is_some_and(|t| t.status() == crate::model::Status::Done)) {
-                // The claim outlived the pane it was made in, which is what a herdr
+                // The claim outlived the pane it was made in, which is what a backend
                 // restart does. Nothing here can say which seat holds it.
                 (true, _) => format!(
                     "{task} is claimed but no seat is bound to it — `wsp reconcile` to bind it again, \
@@ -4813,12 +5242,12 @@ fn closed_row_seat(store: &Store, task: &str) -> Option<String> {
 /// the question, and a seat already gone says so), a local one is looked for
 /// in the backends' census.
 pub(crate) fn seat_is_live(seat: &str) -> bool {
-    crate::herdr::host_of(seat).is_some() || cmd_agent::locate_seat(&crate::place::local_backends(), seat).is_some()
+    cmd_agent::locate_seat(&crate::place::local_backends(), seat).is_some()
 }
 
 /// `me` is which seat this process is standing in, passed in rather than read
 /// here: the refusal below is the one behaviour of this verb that depends on the
-/// environment, and a test that had to export `HERDR_PANE_ID` to reach it would
+/// environment, and a test that had to export `WSP_BACKEND_PANE_ID` to reach it would
 /// be changing a process-wide variable every other test can see — which is a
 /// flake somebody else's test pays for. It has already happened once in this
 /// tree, to `cmd_install`'s lock test, from the first draft of these tests.
@@ -4920,30 +5349,41 @@ fn end_work(
 
     // Asked before the seat is closed, because after it there is nothing left
     // to ask: the workspace is the id a build tree is keyed on, and a pane that
-    // has gone cannot say which one it was in. herdr's room by name and not
-    // the target's: the tidy below releases a build tree only once herdr says
-    // the workspace has gone, which is a question about herdr's rooms alone.
-    let workspace = Herdr::new().room(&seat);
+    // has gone cannot say which one it was in. backend's room by name and not
+    // the target's: the tidy below releases a build tree only once backend says
+    // the workspace has gone, which is a question about backend's rooms alone.
+    let workspace: Option<String> = None;
 
     // Which backend actually holds this seat, asked rather than guessed
     // (`compound-091`'s fold, over `local_backends()`, same as `wsp tell` and
-    // `wsp answer`). `place` is a flag-selected default — herdr unless told
-    // otherwise — and a `cpd-` seat is never herdr's, so ending one with no
-    // `--compound` used to fail with "no socket at herdr.sock" although the
+    // `wsp answer`). `place` is a flag-selected default — backend unless told
+    // otherwise — and a `cpd-` seat is never backend's, so ending one with no
+    // `--compound` used to fail with "no socket at backend.sock" although the
     // seat id said exactly which backend it was on. Falling back to `place`
     // when nobody claims the seat keeps `--headless` working, since a
     // supervisor is not in `local_backends()`, and keeps the existing
-    // "already gone" reading for a herdr seat this census can no longer see.
+    // "already gone" reading for a backend seat this census can no longer see.
     let backends = crate::place::local_backends();
+    // A manager-hosted `place` is the one that stops it: `locate_seat`'s
+    // backends end seats in this process.
     let target: &dyn Place = match crate::cmd_agent::locate_seat(&backends, seat.as_str()) {
-        Some((found, _)) => found.as_ref(),
-        None => place,
+        Some((found, _)) if !place.hosted() => found.as_ref(),
+        _ => place,
     };
 
-    let closed = match target.stop(&seat) {
-        Ok(()) => true,
-        // Already gone. The first half of the verb is done, however it happened.
-        Err(Refusal::NoSeat(_)) => false,
+    let mut ended_pids: Vec<u32> = Vec::new();
+    let closed = match target.end(&seat) {
+        Ok(pids) => {
+            ended_pids = pids;
+            true
+        }
+        // Already gone. The first half of the verb is done, however it happened;
+        // its record says so, so `wip` stops drawing it and the daemon's sweep
+        // forgets it (wsp-094) — a seat a restart left had nothing else to end.
+        Err(Refusal::NoSeat(_)) => {
+            store.end_spawned(seat.as_str(), util::epoch_secs());
+            false
+        }
         Err(e) => {
             eprintln!("wsp: {seat} is still standing, so nothing was released: {e}");
             return 1;
@@ -5056,6 +5496,7 @@ fn end_work(
             json!({
                 "seat": seat.as_str(),
                 "closed": closed,
+                "ended_pids": target.hosted().then_some(&ended_pids),
                 "task": task,
                 "released": released,
                 "tree": match &tree {
@@ -5079,6 +5520,11 @@ fn end_work(
             true => format!("ended {seat}"),
             false => format!("{seat} was already gone"),
         }));
+        // The manager's own account of what it ended, where it is the host.
+        if closed && target.hosted() && !ended_pids.is_empty() {
+            let list = ended_pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+            println!("  {}", p.dim(&format!("the manager ended pids {list}")));
+        }
         match (&task, released) {
             (Some(t), _) if claim_is.is_some() => println!(
                 "  {}",
@@ -5146,10 +5592,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Agents,
                 order: 270,
                 text: r##"  wsp spawn <id> [-p proj] [--agent [--kind claude]] [--on <machine>]
-                 [--model <m>] [--effort <e>] [--subagents] [--herdr]
+                 [--model <m>] [--effort <e>] [--subagents]
                                     open a workspace on it and claim it there;
-                                    in a compound session by default — --herdr
-                                    opens it in the fork instead, and
+                                    in a compound session by default, or
                                     --headless in a supervisor with no terminal
                                     at all. --agent starts an agent in it too. --focus
                                     to go there, --on to run it on another
@@ -5336,13 +5781,9 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     }
 
     fn census(&self) -> Option<Vec<(String, String)>> {
-        let herdr_here = crate::herdr::available_now();
         let mut heard = false;
         let mut out = Vec::new();
-        for (backend, name) in crate::place::local_backends().into_iter().zip(crate::place::LOCAL_BACKEND_NAMES) {
-            if name == "herdr" && !herdr_here {
-                continue;
-            }
+        for backend in crate::place::local_backends() {
             if let Ok(census) = backend.census() {
                 heard = true;
                 out.extend(census.seats().map(|s| (s.seat.as_str().to_string(), s.label.clone())));
@@ -5353,15 +5794,10 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 }
 
 impl crate::cycle::Fleet {
-    /// The backends that could hold this seat: every local one, less herdr when
-    /// no herdr is running here to hold it. See [`Fleet`].
-    pub(crate) fn here(seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
-        let herdr_here = crate::herdr::split_host(seat).1.is_some() || crate::herdr::available_now();
-        crate::place::local_backends()
-            .into_iter()
-            .zip(crate::place::LOCAL_BACKEND_NAMES)
-            .filter(move |(_, name)| *name != "herdr" || herdr_here)
-            .map(|(b, _)| b)
+    /// The backends that could hold this seat: every local one, less backend when
+    /// no backend is running here to hold it. See [`Fleet`].
+    pub(crate) fn here(_seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
+        crate::place::local_backends().into_iter()
     }
 
     /// A compound opencode seat reading `Working` that opencode's own database
@@ -5415,7 +5851,7 @@ mod tests {
     /// with the arms the other way round.
     ///
     /// `--compound` is kept working deliberately: every spawn on `chrome-port`,
-    /// `compound-parity`, `herdr-out` and `native-window` carried it while the
+    /// `compound-parity`, `backend-out` and `native-window` carried it while the
     /// default pointed the other way, and a script or a work order that still
     /// says it should not start opening panes somewhere else.
     #[test]
@@ -5426,7 +5862,6 @@ mod tests {
             Args::parse(argv)
         };
         assert_eq!(chosen(&args(&[])), Chosen::Compound, "the default since compound-112");
-        assert_eq!(chosen(&args(&["--herdr"])), Chosen::Herdr, "--herdr asks for the fork by name");
         assert_eq!(
             chosen(&args(&["--compound"])),
             Chosen::Compound,
@@ -5437,14 +5872,9 @@ mod tests {
             Chosen::Headless,
             "headless is unchanged and still wins"
         );
-        assert_eq!(
-            chosen(&args(&["--headless", "--herdr"])),
-            Chosen::Headless,
-            "a seat with no terminal cannot also be a pane in one"
-        );
     }
 
-    /// `spawn --herdr` opened the seat on herdr and its claim then read compound's
+    /// `spawn --backend` opened the seat on backend and its claim then read compound's
     /// census, because the claim is a synthesised command line that carried none
     /// of the caller's flags — no session, no tree, and the held-by guard asked
     /// the wrong backend. Asserted as a round trip through [`chosen`], the one
@@ -5452,7 +5882,7 @@ mod tests {
     /// backend a spawn chose, the claim it makes chooses the same.
     #[test]
     fn the_claim_a_spawn_makes_reads_the_backend_the_spawn_opened_the_seat_on() {
-        for c in [Chosen::Headless, Chosen::Herdr, Chosen::Compound] {
+        for c in [Chosen::Headless, Chosen::Compound] {
             let flags: Vec<(&str, &str)> = backend_flag(c).into_iter().collect();
             assert_eq!(
                 chosen(&Args::synth("claim", &["t-1"], &flags)),
@@ -6097,7 +6527,7 @@ mod tests {
     /// backend before anything is running in it.
     ///
     /// `WSP_PROJECT` and `WSP_TASK` are the part that matters and the part
-    /// nothing else can supply: herdr does not persist an environment across a
+    /// nothing else can supply: backend does not persist an environment across a
     /// restart, so this is exact for the life of the session and the claim is
     /// what is durable. A seat opened without them leaves every pane inside it
     /// inferring what it is for from a path.
@@ -6345,8 +6775,8 @@ mod tests {
     #[test]
     fn a_list_governor_stands_at_the_root_its_members_are_in() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("govern-list-cwd");
         let (few, most) = (rooted(&store, "few"), rooted(&store, "most"));
         list_of(&store, "batch", &[("t-1", "few"), ("t-2", "most"), ("t-3", "most")]);
@@ -6364,8 +6794,8 @@ mod tests {
     #[test]
     fn a_list_with_no_rooted_member_is_refused_before_a_seat_is_opened() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("govern-list-unrooted");
         store.save_project(&Project::new("bare")).unwrap();
         list_of(&store, "batch", &[("t-1", "bare")]);
@@ -6488,8 +6918,8 @@ mod tests {
     #[test]
     fn a_row_whose_files_are_another_projects_is_refused_at_spawn_before_a_seat() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("wrong-project");
         let (mine, theirs) = (rooted(&store, "mine"), rooted(&store, "theirs"));
         std::fs::create_dir_all(format!("{theirs}/src")).unwrap();
@@ -6696,7 +7126,7 @@ mod tests {
     ///
     /// **`Route::Inline` is not `order_in_args`, and asserting that is the
     /// point of this test.** They were the same predicate for one commit: the
-    /// brief went into a `--prompt` argv element, herdr refuses `agent.start`
+    /// brief went into a `--prompt` argv element, backend refuses `agent.start`
     /// args holding any control character, and three spawns of three were
     /// refused with `invalid_agent_argument`.
     #[test]
@@ -6972,10 +7402,10 @@ mod tests {
         }
     }
 
-    fn starting(place: &Restarts, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
+    fn starting(place: &dyn Place, how: &dyn agent_commands::Kind, seat: &Seat, wait: &Patience) -> Result<(), String> {
         let spawn =
             crate::agent_commands::Spawn { full: false, subagents: false, packet: false, name: "robustness-080", seat, model: None, effort: None, order: None, resume: None, brief: None };
-        let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new() };
+        let agent = Agent { kind: "claude".into(), name: "robustness-080".into(), args: Vec::new(), key: None };
         start_agent(place, how, &spawn, &agent, "claude", wait)
     }
 
@@ -7002,10 +7432,221 @@ mod tests {
         assert_eq!(place.starts.get(), 2, "the first start died and the second was made");
     }
 
+    /// A seat whose starts the manager answers from a script, the keys each
+    /// start went out under kept, and its state read off `reads`.
+    struct Refuses {
+        said: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<()>>>,
+        keys: std::cell::RefCell<Vec<Option<crate::place::Key>>>,
+        reads: Reads,
+    }
+
+    impl Refuses {
+        fn of(said: Vec<crate::place::Result<()>>, reads: Vec<crate::place::Result<State>>) -> Refuses {
+            Refuses { said: std::cell::RefCell::new(said.into()), keys: std::cell::RefCell::new(Vec::new()), reads: Reads::of(reads) }
+        }
+    }
+
+    impl Place for Refuses {
+        fn start(&self, _: &Seat, agent: &Agent) -> crate::place::Result<()> {
+            self.keys.borrow_mut().push(agent.key.clone());
+            self.said.borrow_mut().pop_front().expect("a start the script did not expect")
+        }
+        fn state(&self, seat: &Seat) -> crate::place::Result<State> {
+            self.reads.state(seat)
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a start sends no work order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("a retry stays in the seat it was given")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a retry does not end the seat")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a retry is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("a retry does not subscribe")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// The manager's `seat.refused` for a key that already ran, as the Tcp
+    /// host words it.
+    fn ran_as(key: &str) -> crate::place::Result<()> {
+        let seat = key.split('/').next().unwrap();
+        Err(Refusal::Backend(format!(
+            "the manager refused seat {seat}: Duplicate key {key} already ran seat {seat} (epoch 1), which has stopped"
+        )))
+    }
+
+    #[test]
+    fn ran_key_reads_the_key_of_an_already_ran_refusal_and_nothing_else() {
+        let said = |r: crate::place::Result<()>| r.unwrap_err().to_string();
+        assert_eq!(ran_key(&said(ran_as("cpd-9/0"))), Some("cpd-9/0"));
+        assert_eq!(ran_key(&said(ran_as("wsp-038/1"))), Some("wsp-038/1"));
+        assert_eq!(ran_key("the manager refused seat cpd-9: Duplicate key cpd-9/1 is already starting seat cpd-9"), None);
+        assert_eq!(ran_key("the manager refused seat cpd-9: Full 4 seats run here"), None);
+        assert_eq!(ran_key("claude started and then stopped in cpd-9"), None);
+    }
+
+    /// wsp-063: a key-less seat (a verifier's, a governor's) whose start was
+    /// refused as a key that already ran is started again, and the retry that
+    /// goes out under the seat's next key (minted by the place) starts.
+    #[test]
+    fn a_keyless_start_refused_as_already_ran_is_retried_and_starts() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Refuses::of(vec![ran_as("cpd-9/0"), Ok(())], vec![Ok(State::Empty), Ok(State::Idle)]);
+        assert_eq!(starting(&place, &alive, &Seat::new("cpd-9"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.keys.borrow().len(), 2, "refused once, started on the retry");
+    }
+
+    /// wsp-063: and a retry refused again under the **same** key is not tried
+    /// a third time: it is said once, with the key, and the start stops,
+    /// rather than the run retrying the same refused start.
+    #[test]
+    fn a_start_refused_twice_under_the_same_key_is_not_retried_again() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Refuses::of(vec![ran_as("cpd-9/0"), ran_as("cpd-9/0"), Ok(())], vec![Ok(State::Empty)]);
+        let why = starting(&place, &alive, &Seat::new("cpd-9"), &retrying(&dial)).unwrap_err();
+        assert_eq!(place.keys.borrow().len(), 2, "two starts, never the third the patience allows");
+        assert!(why.contains("refused again under key cpd-9/0, so it was not tried again"), "{why}");
+        assert_eq!(why.matches("refused again").count(), 1, "said once: {why}");
+
+        // Refused under a fresh key each time is a retry that may yet start:
+        // the patience, not this rule, ends it.
+        let place = Refuses::of(vec![ran_as("cpd-9/1"), ran_as("cpd-9/2"), Ok(())], vec![Ok(State::Empty), Ok(State::Empty), Ok(State::Idle)]);
+        assert_eq!(starting(&place, &alive, &Seat::new("cpd-9"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.keys.borrow().len(), 3);
+    }
+
+    /// A manager-hosted seat (`WSP_HOST=manager`), faked: each `start` is a
+    /// `seat.spawn` and each `stop` a `seat.stop`, counted; what the events say
+    /// of a start is scripted; and a state read says what one said just after
+    /// `seat.started` on 2026-11-17 — an empty seat, which is not yet true.
+    struct Manages {
+        spawns: std::cell::Cell<u32>,
+        stops: std::cell::Cell<u32>,
+        polls: std::cell::Cell<u32>,
+        ups: std::cell::RefCell<std::collections::VecDeque<crate::place::Up>>,
+        asked: std::cell::RefCell<Vec<bool>>,
+    }
+
+    impl Manages {
+        fn of(ups: Vec<crate::place::Up>) -> Manages {
+            Manages {
+                spawns: std::cell::Cell::new(0),
+                stops: std::cell::Cell::new(0),
+                polls: std::cell::Cell::new(0),
+                ups: std::cell::RefCell::new(ups.into()),
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Place for Manages {
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            self.spawns.set(self.spawns.get() + 1);
+            Ok(())
+        }
+        fn await_up(&self, _: &Seat, by_turn: bool, _: Duration) -> Option<crate::place::Result<crate::place::Up>> {
+            self.asked.borrow_mut().push(by_turn);
+            Some(Ok(self.ups.borrow_mut().pop_front().expect("a start the script did not expect")))
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            self.polls.set(self.polls.get() + 1);
+            Ok(State::Empty)
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            self.stops.set(self.stops.get() + 1);
+            Ok(())
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a start sends no work order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("a start stays in the seat it was given")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a start is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("the host's subscription is its own")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// wsp-037: under the manager a seat that comes up normally is started
+    /// once — one `seat.spawn`, no `seat.stop` — because its start is judged by
+    /// the manager's events, and the state read that called it empty (and so
+    /// dead, and so started again at epoch 2) is never taken.
+    #[test]
+    fn under_a_manager_a_seat_that_comes_up_is_started_once() {
+        let blind = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Manages::of(vec![crate::place::Up::Ready]);
+        assert_eq!(starting(&place, &blind, &Seat::new("cpd-242"), &retrying(&dial)), Ok(()));
+        assert_eq!(place.spawns.get(), 1, "one seat.spawn");
+        assert_eq!(place.stops.get(), 0, "no seat.stop");
+        assert_eq!(place.polls.get(), 0, "nothing read the seat's state");
+        assert_eq!(*place.asked.borrow(), vec![false], "no order in argv: seat.started is ready");
+    }
+
+    /// And a start the manager says stopped is still the start that did not
+    /// survive: said as such, and retried as before.
+    #[test]
+    fn under_a_manager_a_start_heard_stopped_is_the_one_that_died() {
+        let blind = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Manages::of(vec![crate::place::Up::Stopped]);
+        let wait = Patience { attempts: 0, ..retrying(&dial) };
+        let why = starting(&place, &blind, &Seat::new("cpd-243"), &wait).unwrap_err();
+        assert!(why.contains("started and then stopped in cpd-243"), "{why}");
+        assert_eq!(place.spawns.get(), 1);
+        assert_eq!(place.polls.get(), 0, "heard, not read");
+    }
+
+    /// wsp-087: "never became ready for input" named no wait, so m1-fixes-3's
+    /// 67 s failure read as a death rather than a timeout of known length. The
+    /// line keeps its sentence, which readers match on, and adds the wait that
+    /// ran out and what was last seen: no `seat.started` under a manager.
+    #[test]
+    fn under_a_manager_a_start_never_ready_names_its_timeout() {
+        let blind = Says(None, std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Manages::of(vec![crate::place::Up::Unready]);
+        let wait = Patience { attempts: 0, ..retrying(&dial) };
+        let why = starting(&place, &blind, &Seat::new("cpd-401"), &wait).unwrap_err();
+        assert!(why.starts_with("claude started but never became ready for input"), "the sentence readers match: {why}");
+        assert!(why.contains("within 2 s"), "the wait that ran out: {why}");
+        assert!(why.contains("no seat.started heard"), "what was seen: {why}");
+    }
+
+    /// And the polled start (no events to wait by) says the same, with the
+    /// seat's last reading in place of the event that did not come.
+    #[test]
+    fn a_polled_start_never_ready_names_its_timeout_and_last_reading() {
+        let alive = Says(Some(true), std::cell::Cell::new(0));
+        let dial = util::Dial::new();
+        let place = Restarts::of(vec![Ok(State::Working)]);
+        let wait = Patience { attempts: 0, ..retrying(&dial) };
+        let why = starting(&place, &alive, &Seat::new("w64:p1"), &wait).unwrap_err();
+        assert!(why.starts_with("claude started but never became ready for input"), "{why}");
+        assert!(why.contains("within 2 s"), "the wait that ran out: {why}");
+        assert!(why.contains("last read Working"), "what the seat last said: {why}");
+    }
+
     /// And the seat that will not clear is the one a retry must leave alone.
     ///
     /// An agent alive and never ready is the case where a second `agent.start`
-    /// would either be refused by herdr — `is_agent_terminal()` still holds —
+    /// would either be refused by backend — `is_agent_terminal()` still holds —
     /// or, worse, land beside the first. So [`re_arm`] refuses and the spawn
     /// stops at reporting, which is what the governor's decision asked for: a
     /// partial retry, not a rewrite of the seat model.
@@ -7050,7 +7691,7 @@ mod tests {
     /// backend that cannot see a live agent must not end its spawn.
     ///
     /// The script is what was recorded on 2026-08-17: `start` returns, and the
-    /// seat reads empty for a stretch because herdr's detection has not caught
+    /// seat reads empty for a stretch because backend's detection has not caught
     /// up with the agent sitting in it. The old rule returned on the first of
     /// those readings, so the work order was never sent and a claimed task sat
     /// in front of an idle agent until somebody noticed.
@@ -7151,7 +7792,7 @@ mod tests {
         starts_after: Option<u32>,
         can_press: bool,
         /// Whether this backend *watched* for the turn and can say it never
-        /// started, which is what herdr's `agent.prompt` wait answers and what
+        /// started, which is what backend's `agent.prompt` wait answers and what
         /// the port spells [`Refusal::NotTaken`].
         ///
         /// `false` is every backend that cannot, and the composer's silence has
@@ -7318,6 +7959,214 @@ mod tests {
         assert!(repair_line(&dropped, &seat).contains("`wsp tell w3M:p1 -`"), "the pane, not the task");
     }
 
+    /// A backend whose host has events (`WSP_HOST=manager`), scripted: what
+    /// each `seat.spawn` with its first order is heard to come to, and what
+    /// each later wait hears. Every reading a poll would take (`state`, the
+    /// prompt off the screen) is counted, and a `tell` or plain `start` is a
+    /// failure: under a manager the order rides the spawn.
+    struct Hears {
+        starts: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<crate::place::Heard>>>,
+        later: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<crate::place::Heard>>>,
+        sent: std::cell::RefCell<Vec<(Option<crate::place::Key>, crate::place::FirstOrder)>>,
+        polls: std::cell::Cell<u32>,
+        pressed: std::cell::Cell<u32>,
+    }
+
+    impl Hears {
+        fn of(starts: Vec<crate::place::Result<crate::place::Heard>>, later: Vec<crate::place::Result<crate::place::Heard>>) -> Hears {
+            Hears {
+                starts: std::cell::RefCell::new(starts.into()),
+                later: std::cell::RefCell::new(later.into()),
+                sent: std::cell::RefCell::new(Vec::new()),
+                polls: std::cell::Cell::new(0),
+                pressed: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Place for Hears {
+        fn start_ordered(
+            &self,
+            _: &Seat,
+            agent: &Agent,
+            order: &crate::place::FirstOrder,
+            _: Duration,
+        ) -> Option<crate::place::Result<crate::place::Heard>> {
+            self.sent.borrow_mut().push((agent.key.clone(), order.clone()));
+            Some(self.starts.borrow_mut().pop_front().expect("a start the script did not expect"))
+        }
+        fn await_order(&self, _: &Seat, _: &crate::place::OrderId, _: Duration) -> Option<crate::place::Result<crate::place::Heard>> {
+            Some(self.later.borrow_mut().pop_front().unwrap_or(Ok(crate::place::Heard::Unanswered)))
+        }
+        fn nudge(&self, _: &Seat) -> crate::place::Result<()> {
+            self.pressed.set(self.pressed.get() + 1);
+            Ok(())
+        }
+        fn typed(&self, _: &Seat) -> Option<bool> {
+            self.polls.set(self.polls.get() + 1);
+            None
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            self.polls.set(self.polls.get() + 1);
+            Ok(State::Idle)
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("under a manager the work order goes in seat.spawn, not a later tell")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("under a manager the start carries its order")
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("the seat is open")
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a spawn that fails leaves the seat standing")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("a spawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("the host's subscription is its own")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    fn ordering(place: &dyn Place, dial: &util::Dial) -> Option<Result<(), Unordered>> {
+        let seat = Seat::new("cpd-26");
+        let spawn = crate::agent_commands::Spawn {
+            full: false,
+            subagents: false,
+            packet: false,
+            name: "wsp-026",
+            seat: &seat,
+            model: None,
+            effort: None,
+            order: None,
+            resume: None,
+            brief: None,
+        };
+        let key = crate::place::Key { row: crate::place::RowId("wsp-026".into()), attempt: 0 };
+        let agent = Agent { kind: "claude".into(), name: "wsp-026".into(), args: vec![], key: Some(key) };
+        start_ordered(place, &spawn, &agent, "claude", "the work order", &retrying(dial))
+    }
+
+    /// Under `manager` the spawn is one message and two events: the order goes
+    /// in `seat.spawn`, `order.acked` is heard, and nothing reads the seat's
+    /// state or its screen, nor waits on the clock (4.3).
+    #[test]
+    fn under_a_manager_the_order_rides_the_spawn_and_its_ack_is_heard_without_a_poll() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+        let place = Hears::of(vec![Ok(Heard::Acked)], vec![]);
+        assert_eq!(ordering(&place, &dial), Some(Ok(())));
+        let sent = place.sent.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.text, "the work order", "the work order is the spawn's first order");
+        assert!(sent[0].1.order.0.starts_with("cpd-26-first-"), "{:?}", sent[0].1.order);
+        assert_eq!(place.polls.get(), 0, "no state poll and no screen read");
+        assert_eq!(place.pressed.get(), 0);
+        assert_eq!(dial.elapsed(), Duration::ZERO, "nothing slept");
+
+        // The in-process host has no events: nothing is started, and the
+        // caller goes the old way.
+        let old = Composer::of(Some(0), true);
+        assert_eq!(ordering(&old, &dial), None);
+        assert!(old.heard.borrow().is_empty());
+    }
+
+    /// A refusal is said, worded, at once: the order's (`order.refused`),
+    /// the seat's (`seat.refused`, retried under the next attempt's key and
+    /// then said), and a silent manager's (said, never retried).
+    #[test]
+    fn a_refused_or_silent_spawn_under_a_manager_is_reported_not_hung() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+
+        let place = Hears::of(vec![Ok(Heard::Refused("cpd-26: busy".into()))], vec![]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Refused(e))) => assert!(e.contains("did not take the work order: cpd-26: busy"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!((place.polls.get(), place.pressed.get()), (0, 0), "a refusal is not pressed at");
+
+        let refused = || Err(Refusal::Backend("the manager refused seat cpd-26: Full 4 seats run here".into()));
+        let place = Hears::of(vec![refused(), refused(), refused()], vec![]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Denied(e))) => assert!(e.contains("refused seat cpd-26"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        let attempts: Vec<u32> = place.sent.borrow().iter().map(|(k, _)| k.as_ref().unwrap().attempt).collect();
+        assert_eq!(attempts, [0, 1, 2], "each retry is the next attempt's key");
+        let ids: std::collections::BTreeSet<String> = place.sent.borrow().iter().map(|(_, o)| o.order.0.clone()).collect();
+        assert_eq!(ids.len(), 3, "and each start a new order, never the last one's answer");
+        assert_eq!(place.polls.get(), 0);
+
+        let silent = Hears::of(vec![Err(Refusal::Unreachable("host silent: the manager at 127.0.0.1:1 did not answer".into()))], vec![]);
+        match ordering(&silent, &dial) {
+            Some(Err(Unordered::Start(e))) => assert!(e.starts_with("host silent"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(silent.sent.borrow().len(), 1, "a silent host is said, not retried");
+
+        // wsp-063: refused as a key that already ran, and again under that
+        // same key: said once with the key, and not sent a third time.
+        let ran = || Err(Refusal::Backend("the manager refused seat cpd-26: Duplicate key cpd-26/0 already ran seat cpd-26 (epoch 1), which has stopped".into()));
+        let place = Hears::of(vec![ran(), ran(), Ok(Heard::Acked)], vec![]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Denied(e))) => assert!(e.contains("refused again under key cpd-26/0, so it was not tried again"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place.sent.borrow().len(), 2, "the same key refused twice is not sent a third time");
+    }
+
+    /// No answer is the patience running out, kept from `hand_over`: submit is
+    /// pressed `nudges` times, each followed by `taken` of listening, and an ack
+    /// heard after a press is a turn taken. Never a poll.
+    #[test]
+    fn an_unanswered_order_under_a_manager_is_pressed_then_said_as_no_ack() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Ok(Heard::Unanswered), Ok(Heard::Unanswered)]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Unanswered(e))) => {
+                assert!(e.contains("no order.acked came for its work order"), "{e}");
+                assert!(e.contains("the manager holds it"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place.pressed.get(), PRESSES);
+        assert_eq!(place.polls.get(), 0);
+
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![Ok(Heard::Acked)]);
+        assert_eq!(ordering(&place, &dial), Some(Ok(())));
+        assert_eq!(place.pressed.get(), 1, "one press, then the ack");
+        assert_eq!(place.polls.get(), 0);
+    }
+
+    /// The manager gone after `seat.started` and before `order.acked`
+    /// (wsp-033): the host says the order unanswered, not the start failed, and
+    /// a later wait that cannot reach the manager is the order unconfirmed —
+    /// `Unanswered`, which keeps the seat and the claim and owes nothing —
+    /// never `Start`, "did not start", and never a second spawn.
+    #[test]
+    fn a_manager_lost_after_seat_started_leaves_the_order_unconfirmed_not_the_seat_unstarted() {
+        use crate::place::Heard;
+        let dial = util::Dial::new();
+        let silent = || Err(Refusal::Unreachable("host silent: the manager at 127.0.0.1:1 did not answer".into()));
+        let place = Hears::of(vec![Ok(Heard::Unanswered)], vec![silent()]);
+        match ordering(&place, &dial) {
+            Some(Err(Unordered::Unanswered(e))) => {
+                assert!(e.contains("cpd-26's work order went unheard"), "{e}");
+                assert!(e.contains("host silent"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place.sent.borrow().len(), 1, "a started seat is not spawned again");
+        assert_eq!(place.polls.get(), 0);
+    }
+
     /// The healthy handover, and the assertion is that nothing else happens: an
     /// agent that starts a turn is not typed at, and the sentence is not paid
     /// for twice.
@@ -7335,7 +8184,7 @@ mod tests {
     ///
     /// The sentence arrives, the submit is swallowed, the agent sits idle in
     /// front of it. One press starts the turn — which is exactly what
-    /// `herdr agent send-keys <pane> enter` did by hand, four times in one
+    /// `backend agent send-keys <pane> enter` did by hand, four times in one
     /// burst on 2026-08-17.
     ///
     /// The second assertion is the one that would be easy to lose: the retry is
@@ -7405,7 +8254,7 @@ mod tests {
     /// **A backend that watched the turn never start is believed rather than
     /// polled, and it reaches the same end.**
     ///
-    /// herdr's `agent.prompt` now holds its reply until the agent's status moves
+    /// backend's `agent.prompt` now holds its reply until the agent's status moves
     /// and refuses when it does not, so the five seconds this used to spend
     /// discovering that were being spent twice — once by the server, then again
     /// by wsp asking a question it had just been answered. The submit is pressed
@@ -7413,7 +8262,7 @@ mod tests {
     /// before the press, and what is waited for after it is the rescue.
     ///
     /// The recovery itself is untouched, and that is the point of pairing this
-    /// with the test above rather than replacing it. herdr can say a prompt was
+    /// with the test above rather than replacing it. backend can say a prompt was
     /// delivered and the agent unmoved; it cannot say why, and a folder-trust
     /// modal holding the keyboard looks from its side exactly like a composer
     /// that was not ready. Only one of those is a thing a keystroke fixes, so
@@ -7578,8 +8427,8 @@ mod tests {
     }
 
     fn claimed_row(tag: &str) -> Store {
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat(tag);
         rooted(&store, "core");
         let mut t = crate::model::Task::new("a member", "t-1");
@@ -7760,8 +8609,8 @@ mod tests {
     #[test]
     fn a_spawned_members_seat_has_its_exit_path_beside_its_verdict_and_kind() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("exit-env");
         let mut proj = Project::new("core");
         proj.roots = vec![rooted(&store, "core")];
@@ -7789,8 +8638,8 @@ mod tests {
         // running it would pass on the wrong brief being right by accident. It
         // removes rather than exports, so nothing else in the process trips
         // over it; see `a_despawn_will_not_end_the_seat_it_is_running_in`.
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("brief");
         let mut proj = Project::new("core");
         proj.roots = vec![rooted(&store, "core")];
@@ -7812,7 +8661,7 @@ mod tests {
 
         // The seat's environment names the file, and the file is where the
         // brief went. Read out of the order the backend was asked to open,
-        // because that is the value herdr actually receives.
+        // because that is the value backend actually receives.
         let opened = place.1.borrow().first().cloned().expect("no seat was opened");
         let cfg: serde_json::Value =
             serde_json::from_str(opened.env.get("OPENCODE_CONFIG_CONTENT").expect("no config on the seat"))
@@ -7844,10 +8693,10 @@ mod tests {
             .expect("no work order in the argv");
         assert!(order.contains("You have been claimed onto t-1"), "{order}");
         assert!(!order.contains("wsp brief --session"), "sent to fetch what it was given: {order}");
-        // One argv element, and nothing in it herdr will refuse: the encoder
+        // One argv element, and nothing in it backend will refuse: the encoder
         // rejects any control character, which is what put the brief in a file
         // rather than in this string.
-        assert!(!order.contains('\n'), "a multi-line work order is refused by herdr: {order:?}");
+        assert!(!order.contains('\n'), "a multi-line work order is refused by backend: {order:?}");
 
         // And the ending takes it away. A brief left behind is a stale answer
         // waiting to be handed to whoever is spawned onto the task next.
@@ -7857,15 +8706,15 @@ mod tests {
         assert!(!std::path::Path::new(&named).exists(), "the brief outlived the seat: {named}");
     }
 
-    /// `wsp-142`: a worklist spawn on a seat herdr does not draw claimed with
+    /// `wsp-142`: a worklist spawn on a seat backend does not draw claimed with
     /// no room, no kind, and the tree the detached `worklist advance` stood in
     /// — the previous member's. The spawn knows all three, so the claim says
     /// them; this process standing somewhere else is the case that failed.
     #[test]
     fn a_spawns_claim_records_the_seat_the_tree_and_the_kind_it_opened_and_not_where_the_caller_stood() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("claim-where");
         let tree = std::path::Path::new(&rooted(&store, "core")).join("elsewhere");
         std::fs::create_dir_all(&tree).unwrap();
@@ -7893,8 +8742,8 @@ mod tests {
     #[test]
     fn a_react_rows_verifier_spawn_names_its_packet_file_and_the_file_keeps_the_diffs_lines() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("verify-react");
         let sha = crate::verifier_packet::react_fixture(&store);
         let mut m = store.find_task("pj-001").unwrap();
@@ -7928,8 +8777,8 @@ mod tests {
     #[test]
     fn a_verifier_spawn_claims_nothing_writes_its_seat_on_the_pass_and_leaves_the_seats_alone() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("verify");
         rooted(&store, "core");
         let mut m = crate::model::Task::new("a member", "t-1");
@@ -7985,8 +8834,8 @@ mod tests {
     #[test]
     fn a_leg_spawn_claims_nothing_seats_the_entry_binds_the_row_and_runs_on_sonnet() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("leg");
         rooted(&store, "core");
         let mut m = crate::model::Task::new("a staged row", "t-1");
@@ -8059,8 +8908,8 @@ mod tests {
     #[test]
     fn a_piece_spawn_claims_nothing_seats_the_entry_binds_the_row_and_refuses_a_later_batch() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("piece");
         rooted(&store, "core");
         let mut m = crate::model::Task::new("a row of pieces", "t-1");
@@ -8125,8 +8974,8 @@ mod tests {
     #[test]
     fn a_check_spawn_claims_nothing_writes_its_seat_on_the_group_and_leaves_the_seats_alone() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("check");
         let mut core = Project::new("core");
         core.roots = vec![store.root.display().to_string()];
@@ -8167,6 +9016,50 @@ mod tests {
         for bad in [&[("agent", "true"), ("check", "1"), ("govern", "true")][..], &[("agent", "true"), ("check", "x")][..]] {
             assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], bad)), 2, "{bad:?}");
         }
+    }
+
+    /// `wsp-089`. A check spawned on a barrier that has already passed with no
+    /// agent finds no check to go on: the seat it opened is ended there and
+    /// then, its stretch goes on the log for effort.json, and the check's tree
+    /// is taken in the same step — not left for the sweep to keep for a seat
+    /// standing in it, which it did for thirteen hours.
+    #[test]
+    fn a_check_spawn_with_no_check_to_go_on_ends_its_seat_and_takes_its_tree() {
+        let _guard = no_backend();
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
+        let store = seat("check-orphan");
+        let repo = store.root.join("repo");
+        wsp_testkit::repo_at(&repo, &[(".gitignore", "target/\n.worktrees/\n")], "first");
+        let tree = repo.join(".worktrees").join(crate::barrier::subject("run", 1));
+        wsp_testkit::git(&repo, &["worktree", "add", "--quiet", "--detach", &tree.display().to_string()]);
+        let mut core = Project::new("core");
+        core.roots = vec![repo.display().to_string()];
+        store.save_project(&core).unwrap();
+        let mut m = crate::model::Task::new("a member", "t-1");
+        m.project = Some("core".into());
+        m.status_raw = crate::model::Status::Review.as_str().into();
+        store.save_task(&m).unwrap();
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["t-1".into()], stop: "it builds".into(), ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        // The barrier opens and passes with no agent ever seated on it.
+        assert!(crate::barrier::open(&store, &w, 1, None, None, &|_| false).is_some());
+        assert_eq!(crate::barrier::settle(&store, "run", 1, crate::barrier::State::Passes), None, "no seat was on it");
+
+        let place = Twinned(std::cell::RefCell::new(Vec::new()));
+        let flags = [("agent", "true"), ("check", "1"), ("kind", "opencode"), ("no-tree", "true")];
+        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["run"], &flags)), 1, "no check is open, so no agent");
+        assert_eq!(*place.0.borrow(), vec!["w9:p2".to_string()], "the seat it opened is ended");
+        assert_eq!(crate::barrier::seat_of(&store, "w9:p2"), None, "and no check names it");
+        assert!(!tree.exists(), "the check's tree is taken in the same step");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.contains("removed barrier check tree") && !log.contains("kept barrier check tree"), "{log}");
+        let ev = crate::timeline::list_events(&store, &["barrier-check-orphaned"]);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!((ev[0].2["id"].as_str(), ev[0].2["group"].as_u64(), ev[0].2["seat"].as_str()), (Some("run"), Some(1), Some("w9:p2")));
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 
     /// The whole of robustness-010, at the one line where it happens.
@@ -8279,6 +9172,102 @@ mod tests {
         }
     }
 
+    /// `wsp-040`: the key's attempt is the seats the row's log has already had,
+    /// read before this spawn's own claim. A row with one ended seat and a
+    /// reopen is attempt 1, not 0 again (the manager refused 0 as a key that
+    /// had already run). Leg and piece starts count; a note quoting a claim,
+    /// and wsp's own `started by` line, do not.
+    #[test]
+    fn a_reopened_row_with_one_ended_seat_is_keyed_at_attempt_1() {
+        let store = seat("key-reopen");
+        let mut t = crate::model::Task::new("reopened", "t-1");
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(spawn_key(&store, Some("t-1")).map(|k| k.attempt), Some(0), "a row's first seat");
+
+        t.log("started by wsp: m1-fixes group 1");
+        t.log("claimed by pane cpd-243 · spawned at opus/high · packet 8279");
+        t.log("wsp: started by this run m1-fixes group 1");
+        t.log("released after 4m · ran opus-5-5/high · 30 turns");
+        t.log("review: summary: done");
+        t.log("sent back: the row's case is different; it was claimed by pane cpd-243 and ended");
+        store.save_task(&t).unwrap();
+        let key = spawn_key(&store, Some("t-1")).expect("a row's key");
+        assert_eq!(key.row.0, "t-1");
+        assert_eq!(key.attempt, 1, "one ended seat and a reopen");
+
+        t.log("leg scout started by pane cpd-244 · spawned at sonnet/medium");
+        t.log("leg scout ended after 2m");
+        t.log("piece 1 started by pane cpd-245");
+        store.save_task(&t).unwrap();
+        assert_eq!(spawn_key(&store, Some("t-1")).map(|k| k.attempt), Some(3), "legs and pieces are seats too");
+        assert_eq!(spawn_key(&store, None), None, "no row, no key");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A backend that remembers which seats it was told to stop, and has
+    /// nothing else to say.
+    struct Stops(std::cell::RefCell<Vec<String>>);
+
+    impl Place for Stops {
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("the seat is open")
+        }
+        fn stop(&self, seat: &Seat) -> crate::place::Result<()> {
+            self.0.borrow_mut().push(seat.as_str().to_string());
+            Ok(())
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("a refused seat is not started")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("a refused seat is not told")
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            Ok(State::Empty)
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("nothing waited for")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// `wsp-040`: a spawn the manager refuses leaves no seat standing. The
+    /// terminal `open` put up is stopped, and the member's claim on it is let
+    /// go, so the row can be seated again; a seat with no claim (a verifier,
+    /// a leg) is stopped and nothing of the row's is touched.
+    #[test]
+    fn a_seat_the_manager_refused_is_closed_and_its_claim_let_go() {
+        let store = seat("denied");
+        let mut task = crate::model::Task::new("refused", "t-1");
+        task.status_raw = "doing".into();
+        store.save_task(&task).unwrap();
+        store.set_agent("a-1", json!({ "seat": "cpd-248", "started": "2026-11-17T18:54:00Z" }));
+        store.set_binding("cpd-248", json!({ "task_id": "t-1", "pane_id": "cpd-248" }));
+        store.set_claim("t-1", json!({ "agent_id": "a-1", "claimed_at": "2026-11-17T18:54:01Z" }));
+
+        let place = Stops(Default::default());
+        denied(&place, &store, &Seat::new("cpd-248"), true);
+        assert_eq!(*place.0.borrow(), vec!["cpd-248".to_string()], "the terminal it opened was closed");
+        assert!(store.panes_for_task("t-1").is_empty(), "no seat is bound to the row");
+        assert!(!store.claims().contains_key("t-1"), "the claim was let go");
+
+        // Not a member: the seat goes, a claim that is somebody else's stays.
+        store.set_agent("a-2", json!({ "seat": "cpd-250", "started": "2026-11-17T19:00:00Z" }));
+        store.set_binding("cpd-250", json!({ "task_id": "t-1", "pane_id": "cpd-250" }));
+        store.set_claim("t-1", json!({ "agent_id": "a-2", "claimed_at": "2026-11-17T19:00:01Z" }));
+        let place = Stops(Default::default());
+        denied(&place, &store, &Seat::new("cpd-251"), false);
+        assert_eq!(*place.0.borrow(), vec!["cpd-251".to_string()]);
+        assert!(store.claims().contains_key("t-1"), "the member's claim is untouched");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
     /// `wsp-603`, the first done-when: a spawn whose readiness retry brings up a
     /// second pane for a row that has a bound, claimed, standing seat ends the
     /// second at once, logs it, and leaves the one seat bound and the claim with
@@ -8349,7 +9338,7 @@ mod tests {
     /// moved onto every new seat unless the caller remembered to say otherwise —
     /// and `spawn` is run by the queue as much as by hand, which made a batch
     /// started overnight a sequence of jumps away from whatever was being read.
-    /// herdr's `workspace.create` defaults `focus` to false and [`Order::show`]
+    /// backend's `workspace.create` defaults `focus` to false and [`Order::show`]
     /// says the same, so the flip is wsp stopping opting in rather than a new
     /// rule. `--no-focus` still parses, and now names the default.
     #[test]
@@ -8378,7 +9367,7 @@ mod tests {
     ///
     /// In-process rather than the fake behind a socket, and for the reason the
     /// fake's own docs record: `stop` and the arrange port's close are the same
-    /// herdr method, so a socket can see that a pane was taken away and cannot
+    /// backend method, so a socket can see that a pane was taken away and cannot
     /// see which verb meant it. What is under test here is the *order* — which
     /// half ran, and what survived the other half failing — and that is a
     /// question about wsp, not about a wire.
@@ -8445,8 +9434,8 @@ mod tests {
         );
     }
 
-    /// Nothing in these tests may reach a herdr, and one of them would: `release`
-    /// re-syncs on its way out, and this machine has a live herdr with real
+    /// Nothing in these tests may reach a backend, and one of them would: `release`
+    /// re-syncs on its way out, and this machine has a live backend with real
     /// workspaces in it. A socket path that answers nothing makes every call fail
     /// at once rather than pushing a fixture's metadata onto somebody's pane.
     /// An empty store comes with it, on the same argument one step further out:
@@ -8454,14 +9443,14 @@ mod tests {
     /// `place_work` reads one — see [`crate::util::isolated`].
     fn no_backend() -> util::Isolated {
         let env = util::isolated("spawn-no-backend");
-        std::env::set_var("HERDR_SOCKET_PATH", "/nonexistent/wsp-despawn-tests.sock");
+        std::env::set_var("WSP_BACKEND_SOCKET_PATH", "/nonexistent/wsp-despawn-tests.sock");
         env
     }
 
     /// The tidying half, stubbed, and what each test asserts instead.
     ///
     /// [`swept_up`] is the only part of `despawn` that needs a git repository
-    /// and a live herdr, and the tests below are about the *ordering* — stop,
+    /// and a live backend, and the tests below are about the *ordering* — stop,
     /// release, then tidy — and about what is reported. Reaching the real one
     /// here would run `git worktree remove` in whatever tree the test runner is
     /// standing in, which is somebody's actual work. What it did is recorded so
@@ -8503,6 +9492,69 @@ mod tests {
         assert!(store.claims().contains_key("t-260816-095"), "the claim went with the agent still there");
         assert!(store.bindings().contains_key("w1:p1"), "and so did the binding");
         assert!(tidied.0.borrow().is_empty(), "a seat still standing keeps its tree too");
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// A manager-hosted place: its `end` is the one asked (not a backend found
+    /// by `locate_seat`), and it says what the manager ended or why it could not.
+    struct Managed(std::cell::RefCell<Vec<Seat>>, crate::place::Result<Vec<u32>>);
+
+    impl Place for Managed {
+        fn hosted(&self) -> bool {
+            true
+        }
+        fn stop(&self, _: &Seat) -> crate::place::Result<()> {
+            panic!("a hosted despawn asks `end`, which names the pids")
+        }
+        fn end(&self, seat: &Seat) -> crate::place::Result<Vec<u32>> {
+            self.0.borrow_mut().push(seat.clone());
+            self.1.clone()
+        }
+        fn open(&self, _: &Order) -> crate::place::Result<Seat> {
+            panic!("despawn does not open seats")
+        }
+        fn start(&self, _: &Seat, _: &Agent) -> crate::place::Result<()> {
+            panic!("despawn does not start agents")
+        }
+        fn tell(&self, _: &Seat, _: &str) -> crate::place::Result<Delivery> {
+            panic!("despawn does not talk to agents")
+        }
+        fn state(&self, _: &Seat) -> crate::place::Result<State> {
+            panic!("despawn does not poll")
+        }
+        fn census(&self) -> crate::place::Result<crate::place::Census> {
+            panic!("despawn is about one seat")
+        }
+        fn watch(&self, _: &mut dyn FnMut(crate::place::Event) -> bool) -> crate::place::Result<()> {
+            panic!("despawn does not wait for anything")
+        }
+        fn here(&self) -> Option<Seat> {
+            None
+        }
+    }
+
+    /// Under `WSP_HOST=manager` a despawn asks the hosted place to end the seat
+    /// and goes on as before once the manager has answered; a manager that is
+    /// silent keeps the claim and says so, and is no success.
+    #[test]
+    fn despawn_under_a_manager_asks_the_manager_and_a_silent_one_keeps_the_claim() {
+        let _env = no_backend();
+        let store = seat("managed-stop");
+        working(&store, "t-260816-095", "w1:p1");
+        let args = Args::synth("despawn", &["095"], &[]);
+
+        let silent = Managed(Default::default(), Err(Refusal::Unreachable("host silent: no seat.stopped for w1:p1".into())));
+        let tidied = Tidied::default();
+        assert_eq!(end_work(&silent, &store, &args, Caller::default(), &tidied.f()), 1);
+        assert_eq!(silent.0.borrow().len(), 1, "it asked the manager");
+        assert!(store.claims().contains_key("t-260816-095"), "a seat the manager did not end keeps its claim");
+        assert!(tidied.0.borrow().is_empty());
+
+        let heard = Managed(Default::default(), Ok(vec![4242, 4243]));
+        assert_eq!(end_work(&heard, &store, &args, Caller::default(), &tidied.f()), 0);
+        assert_eq!(heard.0.borrow().len(), 1);
+        assert!(!store.claims().contains_key("t-260816-095"), "the manager ended it, so the claim was released");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
@@ -8610,23 +9662,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// `wsp-649`: a row parked or put back by a cancel ends the records of the
-    /// seats that are gone, and keeps one whose seat still stands.
+    /// wsp-094: `wsp despawn --pane <seat> --force` on a seat a machine
+    /// restart left (its manager runs no such seat) used to answer "already
+    /// gone" and change nothing, and `wip` went on drawing it. Its record now
+    /// says it ended, and `wip` through the API stops drawing it — even with
+    /// its agent on record, which alone keeps a gone seat drawn for a day.
     #[test]
-    fn a_row_let_go_of_ends_the_agents_whose_seats_are_gone_only() {
+    fn despawn_of_a_seat_a_restart_left_ends_its_record_and_wip_stops_drawing_it() {
+        use wsp_store_contract as c;
         let _env = no_backend();
-        let store = seat("let-go-649");
-        working(&store, "t-260816-095", "w1:p1");
-        store.set_agent("a-gone", json!({ "seat": "cpd-9@eds", "started": "2026-11-15T00:00:00Z" }));
-        store.set_agent("a-far", json!({ "seat": "w1:p1", "started": "2026-11-15T00:00:00Z" }));
-        store.set_claim("t-260816-095", json!({ "agent_id": "a-gone" }));
-        let seats = crate::attention::seats_of_row(&store, "t-260816-095");
-        assert_eq!(seats, ["cpd-9@eds", "w1:p1"]);
-        // `cpd-9@eds` is a far seat, which is taken to stand; `w1:p1` is
-        // looked for in a census that has nothing in it.
-        crate::attention::row_let_go(&store, "t-260816-095", &seats);
-        assert!(store.agents_held()["a-far"]["ended"].is_string());
-        assert!(store.agents_held()["a-gone"].get("ended").is_none(), "a far seat is not known gone");
+        let store = seat("stop-restart");
+        let mut state = c::State::default();
+        let mut gone = c::Seat {
+            id: c::SeatId("cpd-1000".into()),
+            machine: c::MachineName("here".into()),
+            kind: "claude".into(),
+            model: None,
+            state: c::SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(19479),
+            fields: Default::default(),
+        };
+        gone.fields.insert(crate::mirror::AGENT.into(), r#"{"kind":"claude","name":"t-1","args":[]}"#.into());
+        state.seats.insert(gone.id.clone(), gone);
+        let drawn = |store: &Store| crate::cmd_agent::Wip::from_api(store, &state).agents.iter().any(|s| s.seat.as_str() == "cpd-1000");
+        assert!(drawn(&store), "gone a moment ago with its agent on record is still drawn");
+
+        let place = Ends::refusing(Refusal::NoSeat(Seat::new("cpd-1000")));
+        let tidied = Tidied::default();
+        let args = Args::synth("despawn", &[], &[("pane", "cpd-1000"), ("force", "")]);
+        assert_eq!(end_work(&place, &store, &args, Caller::default(), &tidied.f()), 0);
+
+        assert!(store.spawned()["cpd-1000"]["ended"]["at"].is_i64(), "{:?}", store.spawned());
+        assert!(!drawn(&store), "despawned and holding nothing: not drawn");
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
@@ -8666,7 +9736,7 @@ mod tests {
     /// Which seat a despawn is about, and the two ways there is not one.
     ///
     /// A claim names a workspace and a binding names a seat, so a task whose
-    /// binding was lost — a herdr restart, and the claim is the half that
+    /// binding was lost — a backend restart, and the claim is the half that
     /// survives — cannot be resolved to a seat by anything in the port. Said
     /// with the command that rebuilds the binding, rather than guessed at.
     #[test]
@@ -8711,7 +9781,7 @@ mod tests {
     /// saying so is more use than saying no.
     ///
     /// Which seat this is arrives as an argument, so this asserts the behaviour
-    /// without exporting `HERDR_PANE_ID` for every other test in the process to
+    /// without exporting `WSP_BACKEND_PANE_ID` for every other test in the process to
     /// trip over; see [`end_work`].
     #[test]
     fn a_despawn_will_not_end_the_seat_it_is_running_in() {
@@ -8730,49 +9800,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// A seat on a machine that is not coming back is let go of by name: the
-    /// claim goes, the row is todo, the worktree is not touched, the far copy is
-    /// written into the machine's notes — and a local seat is refused, with the
-    /// claim where it was.
+    /// A local seat is refused `--lost`, with the claim where it was.
     #[test]
-    fn despawn_lost_releases_a_far_seat_and_refuses_a_local_one() {
+    fn despawn_lost_refuses_a_local_seat() {
         let _env = no_backend();
         let store = seat("despawn-lost");
-        let mut m = crate::model::Machine::new("mb2", "mb2");
-        m.exec_dir = "/far/exec".into();
-        store.save_machine(&m).unwrap();
-        working(&store, "t-260816-095", "w1:p1@mb2");
         working(&store, "t-260816-096", "w1:p2");
-        let tree = store.root.join("tree-095");
-        std::fs::create_dir_all(&tree).unwrap();
-        std::fs::write(tree.join("checkpoint"), "x").unwrap();
 
         let local = despawn_lost(&store, &Args::synth("despawn", &["096"], &[("lost", "true")]));
         assert_eq!(local, 2, "a local seat is refused");
         assert!(store.claims().contains_key("t-260816-096"), "and its claim stays");
         assert!(store.bindings().contains_key("w1:p2"));
 
-        let far = despawn_lost(&store, &Args::synth("despawn", &["095"], &[("lost", "true")]));
-        assert_eq!(far, 0);
-        assert!(!store.claims().contains_key("t-260816-095"), "the claim is released");
-        assert!(store.panes_for_task("t-260816-095").is_empty());
-        assert_eq!(store.task("t-260816-095").unwrap().status(), crate::model::Status::Todo);
-        assert!(tree.join("checkpoint").exists(), "the worktree is kept");
-        let body = store.machine("mb2").unwrap().body;
-        assert!(body.contains("/far/exec/trees/t-260816-095") && body.contains("never read"), "{body}");
-
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
     // ---- rotation ----------------------------------------------------------
 
-    /// A herdr that is not herdr: answers every call with one fixture. That is
-    /// everything a rotation asks of a live herdr — one `pane.list`, so the
+    /// A backend that is not backend: answers every call with one fixture. That is
+    /// everything a rotation asks of a live backend — one `pane.list`, so the
     /// successor's workspace id is readable (`place` has no word for a room),
     /// and whatever renames a moved slot triggers, whose answers nothing here
-    /// reads. Same shape as herdr's own tests' stand-in; private to that file,
+    /// reads. Same shape as backend's own tests' stand-in; private to that file,
     /// which is why this is written out.
-    fn herdr_stand_in(path: &std::path::Path, n: usize, reply: serde_json::Value) {
+    fn backend_stand_in(path: &std::path::Path, n: usize, reply: serde_json::Value) {
         use std::io::{BufRead, BufReader, Write};
         let _ = std::fs::remove_file(path);
         let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
@@ -8828,11 +9879,11 @@ mod tests {
         told: std::cell::RefCell<Vec<String>>,
         states: std::cell::RefCell<std::collections::VecDeque<crate::place::Result<State>>>,
         last: crate::place::Result<State>,
-        /// herdr-shaped, with the seat in room `w9`; or compound-shaped, with
+        /// backend-shaped, with the seat in room `w9`; or compound-shaped, with
         /// no room above the seat, which is the port's default answer.
         rooms: bool,
         /// A backend that cannot say which room the seat is in at all —
-        /// herdr with its listing unanswered.
+        /// backend with its listing unanswered.
         lost: bool,
     }
 
@@ -8951,16 +10002,16 @@ mod tests {
     }
 
     /// A store of its own plus the caller env, which rotation reads the way
-    /// `govern` does: from herdr's context variables. `WSP_SEAT_ID` is
+    /// `govern` does: from backend's context variables. `WSP_SEAT_ID` is
     /// stripped rather than left alone (`compound-105`): `my_pane()` checks
-    /// the supervisor's variable ahead of herdr's, so a `cargo test` run
+    /// the supervisor's variable ahead of backend's, so a `cargo test` run
     /// inside a real compound seat — this one, for instance — would answer
-    /// `here` with the outer seat and never reach the herdr vars this test is
+    /// `here` with the outer seat and never reach the backend vars this test is
     /// actually about.
     fn rotating_as(tag: &str, ws: &str, pane: &str) -> (util::Isolated, Store) {
         let env = util::isolated(tag);
-        std::env::set_var("HERDR_WORKSPACE_ID", ws);
-        std::env::set_var("HERDR_PANE_ID", pane);
+        std::env::set_var("WSP_BACKEND_WORKSPACE_ID", ws);
+        std::env::set_var("WSP_BACKEND_PANE_ID", pane);
         std::env::remove_var("WSP_SEAT_ID");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -8971,60 +10022,8 @@ mod tests {
     /// isolation guard does not know them, and the test next door must not
     /// inherit this one's pane.
     fn stop_being_a_seat() {
-        std::env::remove_var("HERDR_WORKSPACE_ID");
-        std::env::remove_var("HERDR_PANE_ID");
-    }
-
-    /// **The whole verb, working:** the successor is seated, its first turn is
-    /// confirmed, and only then does the slot move. The ending rides the store,
-    /// addressed to the pane that inherited it.
-    #[test]
-    fn a_rotation_moves_the_seat_only_once_the_successors_turn_is_running() {
-        let (_env, store) = rotating_as("rotate-ok", "w1", "w1:p9");
-        let sock = _env.path("herdr.sock");
-        herdr_stand_in(&sock, 24, successor_pane());
-        std::env::set_var("HERDR_SOCKET_PATH", &sock);
-
-        rooted(&store, "core");
-        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-
-        let dial = util::Dial::new();
-        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
-        let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-        // Step 4 is asked for only once the slot has moved: the closure reads
-        // the record at the moment it is called.
-        let moved_first = std::cell::Cell::new(false);
-        let arranged = Arranged::default();
-        let end = |scope: &str| {
-            moved_first.set(store.governors()[scope]["pane"] == "w9:p2");
-            arranged.f()(scope)
-        };
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &end);
-        stop_being_a_seat();
-
-        assert_eq!(code, 0);
-        assert_eq!(place.started.get(), 1, "one successor");
-        assert_eq!(*arranged.0.borrow(), vec!["core".to_string()], "this pane's ending, arranged once");
-        assert!(moved_first.get(), "and only after the seat was the successor's");
-
-        // The slot moved, and to whom: the record names the successor's room
-        // and pane now, where before the verb ran it named the caller's.
-        let rec = &store.governors()["core"];
-        assert_eq!(rec["workspace"], "w9");
-        assert_eq!(rec["pane"], "w9:p2");
-
-        // The ending rode the store rather than the typed order, addressed to
-        // the pane that inherited it.
-        let h = store.handovers();
-        assert_eq!(h["core"]["from"], "w1:p9", "the pane to end");
-        assert_eq!(h["core"]["to"], "w9:p2", "the pane told to end it");
-
-        // Delivered once and confirmed - not sent twice on a healthy handover.
-        let told = place.told.borrow();
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert!(told[0].contains("custodian of the core project"), "{told:?}");
-
-        let _ = std::fs::remove_dir_all(&store.root);
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
     }
 
     // ---- a vacancy: the rotate path with no predecessor ----------------------
@@ -9075,8 +10074,8 @@ mod tests {
     fn a_govern_spawn_into_a_seat_that_has_verified_is_refused_before_an_agent_starts() {
         for (tag, pass) in [("now", Some(false)), ("earlier", Some(true)), ("never", None)] {
             let _guard = no_backend();
-            std::env::remove_var("HERDR_PANE_ID");
-            std::env::remove_var("HERDR_WORKSPACE_ID");
+            std::env::remove_var("WSP_BACKEND_PANE_ID");
+            std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
             let store = seat(&format!("govern-verifier-{tag}"));
             rooted(&store, "core");
             if let Some(finished) = pass {
@@ -9110,9 +10109,9 @@ mod tests {
     fn a_reseat_into_a_seat_that_has_verified_is_refused_and_writes_nothing() {
         for (tag, finished) in [("now", false), ("earlier", true)] {
             let (env, store) = vacated_seat(&format!("reseat-verifier-{tag}"), "opus", "high");
-            let sock = env.path("herdr.sock");
-            herdr_stand_in(&sock, 24, successor_pane());
-            std::env::set_var("HERDR_SOCKET_PATH", &sock);
+            let sock = env.path("backend.sock");
+            backend_stand_in(&sock, 24, successor_pane());
+            std::env::set_var("WSP_BACKEND_SOCKET_PATH", &sock);
             crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p2", finished);
             let before = governors_bytes(&store);
 
@@ -9139,36 +10138,6 @@ mod tests {
             );
             let was: Value = serde_json::from_slice(&before).unwrap();
             assert_eq!(rec, was["core"], "{tag}: and nothing else on the seat moved");
-            let _ = std::fs::remove_dir_all(&store.root);
-        }
-    }
-
-    /// A rotation moves the slot only after its successor's first turn, so a
-    /// successor that has verified is refused before it is told anything: the
-    /// caller stays seated and no handover is recorded.
-    #[test]
-    fn a_rotation_onto_a_seat_that_has_verified_is_refused_before_it_is_told() {
-        for (tag, finished) in [("now", false), ("earlier", true)] {
-            let (env, store) = rotating_as(&format!("rotate-verifier-{tag}"), "w1", "w1:p9");
-            let sock = env.path("herdr.sock");
-            herdr_stand_in(&sock, 24, successor_pane());
-            std::env::set_var("HERDR_SOCKET_PATH", &sock);
-            rooted(&store, "core");
-            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-            crate::cmd_govern::tests::verified_by(&store, "t-1", "w9:p2", finished);
-            let before = governors_bytes(&store);
-
-            let dial = util::Dial::new();
-            let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
-            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody);
-            stop_being_a_seat();
-
-            assert_eq!(code, 1, "{tag}");
-            assert_eq!(place.started.get(), 0, "{tag}: no successor started");
-            assert!(place.told.borrow().is_empty(), "{tag}: nobody was told they are the custodian");
-            assert!(store.handovers().is_empty(), "{tag}: {:?}", store.handovers());
-            assert_eq!(governors_bytes(&store), before, "{tag}: governors.json moved");
             let _ = std::fs::remove_dir_all(&store.root);
         }
     }
@@ -9200,9 +10169,9 @@ mod tests {
     #[test]
     fn a_reseat_writes_the_slot_before_the_agent_starts_and_ends_nobody() {
         let (env, store) = vacated_seat("reseat-ok", "opus", "high");
-        let sock = env.path("herdr.sock");
-        herdr_stand_in(&sock, 24, successor_pane());
-        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+        let sock = env.path("backend.sock");
+        backend_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("WSP_BACKEND_SOCKET_PATH", &sock);
 
         // What the record said at the moment the agent was started, which is the
         // moment a reconciler passing alongside would look at it.
@@ -9250,9 +10219,9 @@ mod tests {
     #[test]
     fn a_reseat_starts_the_successor_on_the_tier_the_seat_was_running_at() {
         let (env, store) = vacated_seat("reseat-tier", "opus", "high");
-        let sock = env.path("herdr.sock");
-        herdr_stand_in(&sock, 24, successor_pane());
-        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+        let sock = env.path("backend.sock");
+        backend_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("WSP_BACKEND_SOCKET_PATH", &sock);
 
         let dial = util::Dial::new();
         let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
@@ -9281,9 +10250,9 @@ mod tests {
     #[test]
     fn a_reseat_of_a_seat_with_no_recorded_tier_starts_on_the_settings_tier() {
         let (env, store) = rotating_as("reseat-no-tier", "w1", "w1:p9");
-        let sock = env.path("herdr.sock");
-        herdr_stand_in(&sock, 24, successor_pane());
-        std::env::set_var("HERDR_SOCKET_PATH", &sock);
+        let sock = env.path("backend.sock");
+        backend_stand_in(&sock, 24, successor_pane());
+        std::env::set_var("WSP_BACKEND_SOCKET_PATH", &sock);
         rooted(&store, "core");
         cmd_govern::vacate(&store, "core");
         stop_being_a_seat();
@@ -9427,8 +10396,8 @@ mod tests {
     #[test]
     fn a_govern_spawn_records_the_tier_it_was_given_on_the_seat() {
         let _guard = no_backend();
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         let store = seat("govern-tier");
         rooted(&store, "core");
         // The rotation's fake, because a claude seat is told its order and
@@ -9441,39 +10410,6 @@ mod tests {
 
         let rec = &store.governors()["core"];
         assert_eq!(rec["model"], "opus", "{rec}");
-        assert_eq!(rec["effort"], "high", "{rec}");
-        assert_eq!(rec["kind"], "claude", "{rec}");
-        let _ = std::fs::remove_dir_all(&store.root);
-    }
-
-    /// **And a rotation nobody passed a tier to keeps the seat's.** The run's
-    /// own rotation and the reconciler's reseat pass the record's tier in. A
-    /// person's `wsp govern <scope> --rotate` passed nothing, and the successor
-    /// started on the default kind at the settings file's tier.
-    #[test]
-    fn a_rotation_typed_with_no_flags_keeps_the_seats_kind_model_and_effort() {
-        let (_env, store) = rotating_as("rotate-keeps-tier", "w1", "w1:p9");
-        let sock = _env.path("herdr.sock");
-        herdr_stand_in(&sock, 24, successor_pane());
-        std::env::set_var("HERDR_SOCKET_PATH", &sock);
-        rooted(&store, "core");
-        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-        cmd_govern::note_started(&store, "core", "claude", Some("opus"), Some("high"));
-
-        let dial = util::Dial::new();
-        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
-        let args = Args::synth("govern", &["core"], &[("rotate", "true")]);
-        let arranged = Arranged::default();
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &arranged.f());
-        stop_being_a_seat();
-
-        assert_eq!(code, 0);
-        let started = place.agents.borrow()[0].clone();
-        assert!(started.contains("--model opus"), "the successor runs at the seat's tier: {started}");
-        assert!(started.contains("--effort high"), "{started}");
-        let rec = &store.governors()["core"];
-        assert_eq!(rec["pane"], "w9:p2", "the seat moved");
-        assert_eq!(rec["model"], "opus", "and the next successor will read the same tier: {rec}");
         assert_eq!(rec["effort"], "high", "{rec}");
         assert_eq!(rec["kind"], "claude", "{rec}");
         let _ = std::fs::remove_dir_all(&store.root);
@@ -9508,262 +10444,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// **The failure the verb exists for, degrading the way it was designed
-    /// to:** the successor started but never took the handover, so nothing is
-    /// ended, the record is taken back, and the caller is still the seat.
-    ///
-    /// **The record is taken back rather than left naming the predecessor**,
-    /// which is the safest of the states available and is what this asserts: the
-    /// slot never moved, so failing at step two is the predecessor still seated,
-    /// which is the state before the attempt and the safest one.
-    #[test]
-    fn a_rotation_that_never_starts_a_turn_ends_nothing_and_leaves_the_caller_seated() {
-        let (_env, store) = rotating_as("rotate-stall", "w1", "w1:p9");
-        rooted(&store, "core");
-        cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-
-        let dial = util::Dial::new();
-        // Idle for ever: ready to be told, never taking.
-        let place = Seats::of(vec![Ok(State::Idle)]);
-        let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody);
-        stop_being_a_seat();
-
-        assert_eq!(code, 1, "an unconfirmed handover is not a successful one");
-        // The slot never moved: failing at step two is the predecessor still
-        // seated, which is the state before the attempt and the safest one.
-        let rec = &store.governors()["core"];
-        assert_eq!(rec["workspace"], "w1");
-        assert_eq!(rec["pane"], "w1:p9");
-        // The promise was kept only while it could still be honoured: a stale
-        // record orders the death of a seated custodian's pane.
-        assert!(store.handovers().is_empty(), "{:?}", store.handovers());
-        // And the repair was tried before giving up - the resend is the half a
-        // person used to do after reading stderr.
-        assert_eq!(place.told.borrow().len(), 2, "{:?}", place.told.borrow());
-        assert_eq!(
-            place.opened.borrow().len(), 1,
-            "one successor was seated, and sits there idle"
-        );
-
-        let _ = std::fs::remove_dir_all(&store.root);
-    }
-
-    /// Rotation is the seat's own act. A pane holding nothing, holding another
-    /// scope, or standing outside any room at all is refused before anything
-    /// is opened, and a finished run has nothing to rotate into by the same
-    /// condition that puts the rotate line in front of a custodian.
-    #[test]
-    fn a_rotation_refuses_before_anything_is_opened_when_the_caller_or_the_run_do_not_qualify() {
-        use crate::model::{Group, Status, Task, Worklist, WorklistStatus};
-
-        // No caller identity at all.
-        {
-            let env = util::isolated("rotate-nobody");
-            std::env::remove_var("HERDR_WORKSPACE_ID");
-            std::env::remove_var("HERDR_PANE_ID");
-            let store = Store::at(env.home(), env.state());
-            store.ensure_dirs().unwrap();
-            rooted(&store, "core");
-            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-            let dial = util::Dial::new();
-            let place = Seats::of(vec![Ok(State::Idle)]);
-            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 2);
-            assert!(place.opened.borrow().is_empty(), "nothing was opened");
-            assert!(crate::place::governs(&store.governors(), &crate::place::seat_query("w1", Some("w1:p9"))).is_some(),
-                "and the seat stayed where it was");
-        }
-
-        // A caller that holds a different scope than the one named.
-        {
-            let (_env, store) = rotating_as("rotate-wrong-scope", "w2", "w2:p2");
-            rooted(&store, "core");
-            store.save_project(&Project::new("other")).unwrap();
-            cmd_govern::take(&store, "other", "w2", "w2:p2").unwrap();
-            let dial = util::Dial::new();
-            let place = Seats::of(vec![Ok(State::Idle)]);
-            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
-            assert!(place.opened.borrow().is_empty());
-            stop_being_a_seat();
-            let _ = std::fs::remove_dir_all(&store.root);
-        }
-
-        // A caller that holds nothing at all, naming a seat somebody else
-        // holds. The refusal names the holder - and stops, where a fall-through
-        // here would seat a successor for a handover nobody asked this pane to
-        // make.
-        {
-            let (_env, store) = rotating_as("rotate-unseated", "w3", "w3:p1");
-            rooted(&store, "core");
-            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-            let dial = util::Dial::new();
-            let place = Seats::of(vec![Ok(State::Idle)]);
-            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
-            assert!(place.opened.borrow().is_empty(), "{:?}", place.opened.borrow());
-            assert!(store.handovers().is_empty());
-            stop_being_a_seat();
-            let _ = std::fs::remove_dir_all(&store.root);
-        }
-
-        // A successor whose work order wsp could never see taken. Moving the
-        // slot into one would be exactly the promise the verb refuses to end
-        // anything on, so it is refused before the seat opens - and `opencode`
-        // is not merely an example here: it is the one kind that takes its
-        // order in argv today.
-        {
-            let (_env, store) = rotating_as("rotate-argv-kind", "w1", "w1:p9");
-            rooted(&store, "core");
-            cmd_govern::take(&store, "core", "w1", "w1:p9").unwrap();
-            let dial = util::Dial::new();
-            let place = Seats::of(vec![Ok(State::Idle)]);
-            let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "opencode")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 2);
-            assert!(place.opened.borrow().is_empty(), "no successor was seated");
-            stop_being_a_seat();
-            let _ = std::fs::remove_dir_all(&store.root);
-        }
-
-        // A run whose last barrier has been passed: `next` offers the rotate
-        // line only while `n < of`, and the verb refuses on the same fact -
-        // seating a successor at the end of a run seats an agent with nothing
-        // left to sequence.
-        {
-            let (_env, store) = rotating_as("rotate-finished", "w1", "w1:p9");
-            rooted(&store, "core");
-            let mut t = Task::new("landed", "t-1");
-            t.project = Some("core".into());
-            t.set_status(Status::Done);
-            store.save_task(&t).unwrap();
-            let mut w = Worklist::new("batch", "Overnight batch");
-            w.set_status(WorklistStatus::Running);
-            w.set_groups(&[Group {
-                members: vec!["t-1".into()],
-                cap: None,
-                stop: String::new(),
-                verdict: "2026-08-20T00:00:00Z clean".into(),
-                verdict_caption: String::new(),
-                landed: Vec::new(),
-                agent: String::new(),
-                member_agents: Default::default(),
-                checks: Vec::new(),
-                stop_checks: Vec::new(),
-                kind: String::new(),
-                together: false,
-                weight: String::new(),
-                member_weights: Default::default(),
-                id: None,
-                caption: String::new(),
-            }]);
-            store.save_worklist(&w).unwrap();
-            cmd_govern::take(&store, "batch", "w1", "w1:p9").unwrap();
-
-            let dial = util::Dial::new();
-            let place = Seats::of(vec![Ok(State::Idle)]);
-            let args = Args::synth("govern", &["batch"], &[("rotate", "true"), ("kind", "plain")]);
-            assert_eq!(rotate_on(&place, &store, &args, &handover_wait(&dial), &ends_nobody), 1);
-            assert!(place.opened.borrow().is_empty(), "no successor was seated");
-            assert_eq!(
-                crate::place::governs(&store.governors(), &crate::place::seat_query("w1", Some("w1:p9"))).as_deref(),
-                Some("batch"),
-                "the caller keeps the seat",
-            );
-            stop_being_a_seat();
-            let _ = std::fs::remove_dir_all(&store.root);
-        }
-    }
-
-    /// The boundary from the other side: with a group still owed behind the
-    /// barrier just passed, the rotation goes ahead - which is the ordinary
-    /// per-barrier case, scoped to a worklist rather than a project.
-    #[test]
-    fn a_run_with_a_group_still_owed_behind_the_barrier_still_rotates() {
-        use crate::model::{Group, Task, Worklist, WorklistStatus};
-
-        let (_env, store) = rotating_as("rotate-midrun", "w1", "w1:p9");
-        let sock = _env.path("herdr.sock");
-        herdr_stand_in(&sock, 24, successor_pane());
-        std::env::set_var("HERDR_SOCKET_PATH", &sock);
-
-        let root = store.root.join("core");
-        std::fs::create_dir_all(&root).unwrap();
-        let mut core = Project::new("core");
-        core.roots = vec![root.display().to_string()];
-        store.save_project(&core).unwrap();
-        let mut landed = Task::new("landed", "t-1");
-        landed.project = Some("core".into());
-        landed.set_status(crate::model::Status::Done);
-        store.save_task(&landed).unwrap();
-        let mut owed = Task::new("still running", "t-2");
-        owed.project = Some("core".into());
-        store.save_task(&owed).unwrap();
-
-        let mut w = Worklist::new("batch", "Overnight batch");
-        w.set_status(WorklistStatus::Running);
-        w.set_groups(&[
-            Group {
-                members: vec!["t-1".into()],
-                cap: None,
-                stop: String::new(),
-                verdict: "2026-08-20T00:00:00Z clean".into(),
-                verdict_caption: String::new(),
-                landed: Vec::new(),
-                agent: String::new(),
-                member_agents: Default::default(),
-                checks: Vec::new(),
-                stop_checks: Vec::new(),
-                kind: String::new(),
-                together: false,
-                weight: String::new(),
-                member_weights: Default::default(),
-                id: None,
-                caption: String::new(),
-            },
-            Group {
-                members: vec!["t-2".into()],
-                cap: None,
-                stop: String::new(),
-                verdict: String::new(),
-                verdict_caption: String::new(),
-                landed: Vec::new(),
-                agent: String::new(),
-                member_agents: Default::default(),
-                checks: Vec::new(),
-                stop_checks: Vec::new(),
-                kind: String::new(),
-                together: false,
-                weight: String::new(),
-                member_weights: Default::default(),
-                id: None,
-                caption: String::new(),
-            },
-        ]);
-        store.save_worklist(&w).unwrap();
-        cmd_govern::take(&store, "batch", "w1", "w1:p9").unwrap();
-
-        let dial = util::Dial::new();
-        let place = Seats::of(vec![Ok(State::Idle), Ok(State::Working)]);
-        let args = Args::synth("govern", &["batch"], &[("rotate", "true"), ("kind", "plain")]);
-        let arranged = Arranged::default();
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &arranged.f());
-        stop_being_a_seat();
-
-        assert_eq!(code, 0);
-        assert_eq!(arranged.0.borrow().len(), 1);
-        let rec = &store.governors()["batch"];
-        assert_eq!(rec["workspace"], "w9");
-        assert_eq!(store.handovers()["batch"]["to"], "w9:p2");
-        assert_eq!(
-            place.opened.borrow().first().and_then(|o| o.cwd.clone()).as_deref(),
-            Some(root.display().to_string().as_str()),
-            "a list's successor stands where its members' project governor would, not at home (wsp-219)"
-        );
-
-        let _ = std::fs::remove_dir_all(&store.root);
-    }
-
     /// The inherited ending is consumed by being done. Once the pane a record
     /// names has been despawned - or was already gone, which is the same fact
     /// to the verb - the record must go with it, or every later brief of that
@@ -9791,9 +10471,9 @@ mod tests {
     }
 
     /// `compound-111`: `wsp despawn` asked its flag-selected default —
-    /// herdr, unless told `--compound` by hand — rather than the seat's own
+    /// backend, unless told `--compound` by hand — rather than the seat's own
     /// id, so ending a `cpd-` seat with no flag failed with "no backend
-    /// answered: no socket at herdr.sock" although the seat named exactly
+    /// answered: no socket at backend.sock" although the seat named exactly
     /// which backend it was on. Now it asks `local_backends()`
     /// (`compound-091`'s fold, the same one `wsp tell` and `wsp answer`
     /// already use) and finds it there — the fallback `place` here is a
@@ -9807,7 +10487,7 @@ mod tests {
         let compound = crate::place_compound::Compound::new();
         let cpd_seat = compound.open(&Order::default()).expect("a compound seat");
         let _stops = crate::place_compound::StopsOnDrop::new(cpd_seat.clone());
-        compound.start(&cpd_seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![] }).expect("started");
+        compound.start(&cpd_seat, &Agent { kind: "claude".into(), name: "t-1".into(), args: vec![], key: None }).expect("started");
 
         struct MustNotBeAsked;
         impl Place for MustNotBeAsked {
@@ -9927,42 +10607,6 @@ mod tests {
     }
 
 
-    /// **`wsp-128`, the seat half.** The successor was a compound seat, which
-    /// herdr cannot see and has no room above, on a machine with no herdr
-    /// socket at all. The rotation confirmed its turn and then refused to move
-    /// the slot, because the room was asked of herdr. The seat stayed with the
-    /// predecessor, the successor governed for a whole barrier believing it was
-    /// nobody's seat, and nobody could rotate the scope after the predecessor
-    /// was ended. The seat is now its own room, as `wsp govern` has always
-    /// recorded one from inside it.
-    #[test]
-    fn a_rotation_onto_a_seat_herdr_cannot_see_still_moves_the_seat() {
-        let (_env, store) = rotating_as("rotate-roomless", "cpd-1", "cpd-1");
-        std::env::set_var("HERDR_SOCKET_PATH", _env.path("no-herdr-here.sock"));
-        rooted(&store, "core");
-        cmd_govern::take(&store, "core", "cpd-1", "cpd-1").unwrap();
-
-        let dial = util::Dial::new();
-        let place = Seats::roomless(vec![Ok(State::Idle), Ok(State::Working)]);
-        let args = Args::synth("govern", &["core"], &[("rotate", "true"), ("kind", "plain")]);
-        let arranged = Arranged::default();
-        let code = rotate_on(&place, &store, &args, &handover_wait(&dial), &arranged.f());
-        stop_being_a_seat();
-
-        assert_eq!(code, 0);
-        let rec = &store.governors()["core"];
-        assert_eq!(rec["pane"], "w9:p2", "the seat is the successor's");
-        assert_eq!(rec["workspace"], "w9:p2", "and recorded under the seat itself");
-        assert_eq!(
-            crate::place::governs(&store.governors(), &Seat::new("cpd-1")),
-            None,
-            "the predecessor holds nothing, so ending it is not ending a seat"
-        );
-        assert_eq!(arranged.0.borrow().len(), 1, "and its ending is arranged");
-
-        let _ = std::fs::remove_dir_all(&store.root);
-    }
-
     /// **`wsp-128`, the ending half, as the record's state transitions.** The
     /// successor never ends its predecessor, so a successor that cannot run
     /// `despawn` changes nothing. A Claude Code seat in auto mode is one. What
@@ -10020,8 +10664,8 @@ mod tests {
     /// takes. The test runner is itself an agent with a seat of its own, so
     /// each case says which it means rather than inheriting one.
     fn standing_in(seat: Option<&str>) {
-        std::env::remove_var("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         match seat {
             Some(s) => std::env::set_var(crate::base::seat::SEAT_ENV, s),
             None => std::env::remove_var(crate::base::seat::SEAT_ENV),
@@ -10426,5 +11070,253 @@ mod tests {
             assert_eq!(order.contains("split it if larger"), told, "{who}: {order}");
             assert!(!order.contains('\n') && order.is_ascii(), "{who}: one ASCII line");
         }
+    }
+
+    // ---- wsp-041: under the manager, a rotation is the manager's seat -------
+
+    /// **`wsp-041`: both rotations open the successor through the Host `wsp
+    /// spawn` does.** `wsp-036` moved a governor reseat onto [`spawn_backend`];
+    /// `rotate` and the run's rotation still named [`backend`], so under
+    /// `WSP_HOST=manager` a rotated governor's successor started on the
+    /// in-process host, out of the manager's journal and out of `wip`. Here a
+    /// governor is seated through a loopback manager (`wsp spawn --govern`),
+    /// the run's rotation replaces it, and then the verb, run from that
+    /// successor's own seat, replaces the successor: each successor is the
+    /// manager's `seat.spawn`, run by it, and read by `wip`'s census. Modelled
+    /// on repair's
+    /// `a_governor_reseat_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census`,
+    /// whose fake compound-sup it runs.
+    #[test]
+    fn a_rotated_governors_successor_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census() {
+        use crate::repair::tests::{Inproc, FAKE_SUP};
+        let env = util::isolated("rotate-mgr");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_SEAT_ID");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let _inproc = Inproc;
+        rooted(&store, "p");
+
+        let exec = env.path("x");
+        std::fs::create_dir_all(&exec).unwrap();
+        let sup = env.path("sup");
+        wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
+        let mut cfg = wsp_manager::Config::new(&exec, "test-host");
+        cfg.port = 0;
+        cfg.sup = Some(sup);
+        let m = wsp_manager::Manager::start(cfg).expect("the manager starts on loopback");
+        let token = std::fs::read_to_string(exec.join(wsp_manager::TOKEN_FILE)).unwrap();
+        let local = crate::manager::Local {
+            host: "test-host".into(),
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: m.addrs()[0].port(),
+            exec_dir: exec.clone(),
+        };
+        crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+
+        let ended = std::cell::RefCell::new(Vec::<String>::new());
+        let end = |scope: &str| -> Result<(), String> {
+            ended.borrow_mut().push(scope.to_string());
+            Ok(())
+        };
+        let pane = || store.governors()["p"]["pane"].as_str().unwrap_or_default().to_string();
+        // Claude Code's hook, played, as repair's test plays it: every seat
+        // with an agent on its record has its turn posted to the manager at
+        // the epoch the manager started it under, once per epoch.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let dial = wsp_host::hooks::Dial::Manager { addr: m.addrs()[0], token_file: exec.join(wsp_manager::TOKEN_FILE) };
+        let (first, behalf, own) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let seats = store.state.join(crate::place_compound::SEATS);
+                let mut posted = std::collections::BTreeSet::new();
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    for dir in std::fs::read_dir(&seats).into_iter().flatten().flatten().map(|e| e.path()) {
+                        let rec: serde_json::Value = std::fs::read_to_string(dir.join("seat.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                        let seat = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let Some(epoch) = m.seats().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch) else { continue };
+                        if rec.get("agent").is_some() && !posted.contains(&(seat.clone(), epoch.0)) {
+                            let payload = json!({ "session_id": format!("sess-{seat}") });
+                            if let wsp_host::hooks::Sent::Taken(_) = wsp_host::hooks::report(&dial, &seat, epoch, "UserPromptSubmit", &payload) {
+                                posted.insert((seat, epoch.0));
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+            let run = || {
+                // The governor the rotations replace, seated through the manager.
+                let code = spawn(&store, &Args::synth("spawn", &[], &[("project", "p"), ("govern", "true")]));
+                let first = (code, pane());
+                if code != 0 || first.1.is_empty() {
+                    return (first, (1, String::new()), (1, String::new()));
+                }
+                // The run's rotation, at a barrier: the predecessor off the record.
+                let code = rotate_on_behalf_ending(&store, "p", &end);
+                let behalf = (code, pane());
+                if code != 0 {
+                    return (first, behalf, (1, String::new()));
+                }
+                // The verb, from the seat it hands over.
+                std::env::set_var("WSP_SEAT_ID", &behalf.1);
+                let code = rotate_ending(&store, &Args::synth("govern", &["p"], &[("rotate", "true")]), &end);
+                std::env::remove_var("WSP_SEAT_ID");
+                (first, behalf, (code, pane()))
+            };
+            let out = run();
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            out
+        });
+        let said = || {
+            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            format!("handover.log:\n{}\nmanager.log:\n{}", read(store.handover_log()), read(m.log_path()))
+        };
+        assert_eq!(first.0, 0, "the governor was seated: {}", said());
+        assert_eq!(behalf.0, 0, "the run's rotation seated a successor: {}", said());
+        assert_eq!(own.0, 0, "the verb's rotation seated a successor: {}", said());
+        assert!(first.1 != behalf.1 && behalf.1 != own.1, "each rotation moved the seat: {first:?} {behalf:?} {own:?}");
+        assert_eq!(*ended.borrow(), vec!["p".to_string(), "p".to_string()], "each predecessor's ending was arranged");
+
+        let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
+        let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        for (who, seat) in [("the run's rotation", &behalf.1), ("the verb", &own.1)] {
+            // The manager took the seat.spawn and forked it: it runs the seat.
+            assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "{who}: the manager forked {seat}: {spawns:?}");
+            assert!(m.seats().iter().any(|s| &s.seat.0 == seat), "{who}: the manager runs {seat}: {:?}", m.seats());
+            // And `wip`'s census, which asks the manager, reads it.
+            assert!(reading.rows.contains_key(seat), "{who}: wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
+        }
+
+        // Every seat ended through the manager, as `wsp despawn` would.
+        let place = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION")).unwrap();
+        for seat in [&first.1, &behalf.1, &own.1] {
+            let _ = crate::place::Place::stop(&place, &crate::place::Seat::new(seat));
+        }
+        m.stop();
+    }
+
+    /// A process standing in a seat's tree, writing into it while it lives:
+    /// what [`take_tree`] reads and stops (`wsp-085`). `stubborn` outlives
+    /// every signal; `late` is not there at first and starts writing during
+    /// the removal.
+    struct Writer {
+        dir: std::path::PathBuf,
+        alive: std::cell::Cell<bool>,
+        stubborn: bool,
+        late: bool,
+        signalled: std::cell::RefCell<Vec<u32>>,
+    }
+
+    const WRITER: u32 = 4242;
+
+    impl Writer {
+        fn new(tag: &str, alive: bool, stubborn: bool, late: bool) -> Writer {
+            let dir = std::env::temp_dir().join(format!("wsp-085-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+            Writer { dir, alive: std::cell::Cell::new(alive), stubborn, late, signalled: std::cell::RefCell::new(Vec::new()) }
+        }
+
+        /// What `cmd_checkout::remove` does — every removal tried, none of
+        /// it answered — with this writer putting a file back while it lives.
+        fn discard(&self) -> Tree {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            if self.late {
+                self.alive.set(true);
+            }
+            if self.alive.get() {
+                std::fs::create_dir_all(self.dir.join("target")).unwrap();
+                std::fs::write(self.dir.join("target/out.log"), "still writing").unwrap();
+            }
+            Tree::Removed { path: util::contract(&self.dir), kept: None }
+        }
+    }
+
+    impl InTree for Writer {
+        fn left_in(&self, dir: &std::path::Path) -> Vec<u32> {
+            match self.alive.get() && dir == self.dir {
+                true => vec![WRITER],
+                false => Vec::new(),
+            }
+        }
+        fn end(&self, pids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+            self.signalled.borrow_mut().extend_from_slice(pids);
+            if !self.stubborn {
+                self.alive.set(false);
+            }
+            (pids.to_vec(), Vec::new())
+        }
+    }
+
+    /// The first done-when item of `wsp-085`: a process still writing in a
+    /// seat's tree is stopped by the end **before** the tree is removed, and the
+    /// tree is gone afterwards.
+    #[test]
+    fn a_process_still_writing_in_a_seat_tree_is_stopped_before_the_tree_is_removed() {
+        let w = Writer::new("writes", true, false, false);
+        let saw_alive = std::cell::Cell::new(None);
+        let discard = || {
+            saw_alive.set(Some(w.alive.get()));
+            w.discard()
+        };
+        let (tree, said) = take_tree(&w.dir, &discard, &w, true);
+        assert_eq!(*w.signalled.borrow(), vec![WRITER], "the writer is signalled");
+        assert_eq!(saw_alive.get(), Some(false), "and stopped before the removal began");
+        assert!(matches!(tree, Tree::Removed { .. }), "the tree reads removed");
+        assert!(!w.dir.exists(), "and is gone");
+        assert!(said.iter().any(|l| l.contains("before removing it") && l.contains("TERM 4242")), "{said:?}");
+    }
+
+    /// One that starts writing during the removal is ended after it, and the
+    /// remnant it wrote is removed: a `Removed` tree whose directory is still
+    /// there is the failure `cmd_checkout::remove` does not report.
+    #[test]
+    fn a_process_that_writes_during_the_removal_is_ended_and_its_remnant_removed() {
+        let w = Writer::new("late", false, false, true);
+        let (tree, said) = take_tree(&w.dir, &|| w.discard(), &w, true);
+        assert_eq!(*w.signalled.borrow(), vec![WRITER]);
+        assert!(matches!(tree, Tree::Removed { .. }) && !w.dir.exists(), "the remnant went too");
+        assert!(said.iter().any(|l| l.contains("during its removal") && l.contains("4242")), "{said:?}");
+    }
+
+    /// One that will not stop: the tree is kept, and why names the pid that
+    /// holds it — not a bare "Directory not empty".
+    #[test]
+    fn a_tree_held_by_a_process_that_will_not_stop_is_kept_naming_its_pid() {
+        let w = Writer::new("stubborn", true, true, false);
+        // A remnant that cannot be removed: a read-only directory under it.
+        let (tree, said) = take_tree(&w.dir, &|| {
+            let t = w.discard();
+            let locked = w.dir.join("target");
+            let _ = std::fs::write(locked.join("held"), "");
+            let mut perm = std::fs::metadata(&locked).unwrap().permissions();
+            perm.set_readonly(true);
+            std::fs::set_permissions(&locked, perm).unwrap();
+            t
+        }, &w, true);
+        let locked = w.dir.join("target");
+        let mut perm = std::fs::metadata(&locked).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&locked, perm).unwrap();
+        let _ = std::fs::remove_dir_all(&w.dir);
+        match tree {
+            Tree::Kept { why, .. } => assert!(why.contains("pid 4242 still writes in it"), "{why}"),
+            _ => panic!("a tree that would not go reads kept"),
+        }
+        assert!(said.iter().any(|l| l.starts_with("kept ") && l.contains("4242")), "{said:?}");
+    }
+
+    /// What runs in a tree another seat still stands in is that seat's: not
+    /// read, not signalled.
+    #[test]
+    fn what_runs_in_a_tree_another_seat_stands_in_is_not_stopped() {
+        let w = Writer::new("shared", true, false, false);
+        let (_, said) = take_tree(&w.dir, &|| Tree::Kept { path: util::contract(&w.dir), why: "cpd-9 is standing in it".into() }, &w, false);
+        assert!(w.signalled.borrow().is_empty() && said.is_empty(), "{said:?}");
+        let _ = std::fs::remove_dir_all(&w.dir);
     }
 }

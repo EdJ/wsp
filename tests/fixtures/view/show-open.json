@@ -1,0 +1,109 @@
+{
+  "after": [],
+  "body": "## Legs\n- found · claude sonnet medium · pending\n  order: Lay the ground.\n- build · claude sonnet medium · pending\n  order: Build on it.\n\n## Verification\n- 2026-11-18T10:00:00Z holds · read 0123456789ab · pane cpd-9 · on claude opus high · decided 2026-11-18T10:30:00Z · ended\n  the build holds\n",
+  "caption": {
+    "from": "authored",
+    "text": "the open one"
+  },
+  "claim": null,
+  "created": "2026-11-18T11:06:40Z",
+  "id": "alpha-001",
+  "legs": [
+    {
+      "after": [],
+      "agent": "claude sonnet medium",
+      "baton": "",
+      "caption": null,
+      "default": true,
+      "ended": null,
+      "name": "found",
+      "order": "Lay the ground.",
+      "pane": null,
+      "ready": true,
+      "rework_of": null,
+      "skipped": null,
+      "spent": null,
+      "started": null,
+      "state": "pending",
+      "tree": null,
+      "why": null
+    },
+    {
+      "after": [
+        "found"
+      ],
+      "agent": "claude sonnet medium",
+      "baton": "",
+      "caption": null,
+      "default": true,
+      "ended": null,
+      "name": "build",
+      "order": "Build on it.",
+      "pane": null,
+      "ready": false,
+      "rework_of": null,
+      "skipped": null,
+      "spent": null,
+      "started": null,
+      "state": "pending",
+      "tree": null,
+      "why": null
+    }
+  ],
+  "parent": null,
+  "pieces": [],
+  "priority": "high",
+  "project": "alpha",
+  "raised": [],
+  "refs": [
+    "docs/a.md"
+  ],
+  "stage": {
+    "at": "2026-11-18T10:30:00Z",
+    "from": "stage",
+    "since": "2026-11-18T10:30:00Z",
+    "text": "Holds · 10:30",
+    "word": "holds"
+  },
+  "stages": [
+    {
+      "at": "2026-11-18T11:06:40Z",
+      "word": "not started"
+    },
+    {
+      "at": "2026-11-18T10:00:00Z",
+      "word": "verifying"
+    },
+    {
+      "at": "2026-11-18T10:30:00Z",
+      "word": "holds"
+    }
+  ],
+  "status": "todo",
+  "tags": [
+    "ui",
+    "core"
+  ],
+  "title": "Open row",
+  "updated": "2026-11-18T11:06:40Z",
+  "verification": [
+    {
+      "at": "2026-11-18T10:00:00Z",
+      "caption": {
+        "at": "2026-11-18T10:30:00Z",
+        "from": "stage",
+        "text": "Holds · 10:30",
+        "word": "holds"
+      },
+      "checked": [],
+      "decided": "2026-11-18T10:30:00Z",
+      "did": null,
+      "landed": null,
+      "pane": "cpd-9",
+      "read": "0123456789ab",
+      "state": "holds",
+      "verdict": "the build holds"
+    }
+  ],
+  "worked": null
+}

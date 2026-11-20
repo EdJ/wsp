@@ -3,7 +3,6 @@
 use serde_json::json;
 
 use crate::cmd_agent::{claim_line, current_project, worked_line};
-use crate::herdr;
 use crate::message::{self, Ask, Message, Shape};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
@@ -403,19 +402,17 @@ pub fn find(store: &Store, args: &Args) -> i32 {
         // row at once, rather than a walk of the store per row.
         let asked: Vec<&Task> = hits.iter().chain(archived.iter()).collect();
         let stages = crate::stage::with_history(store, &asked);
+        let claims = store.claims();
         let out: Vec<_> = hits
             .iter()
             .map(|t| (t, false))
             .chain(archived.iter().map(|t| (t, true)))
             .map(|(t, filed)| {
-                let mut v = t.json();
-                v["archived"] = json!(filed);
-                // `wsp-274`: and since when, off the same timeline `show` gives.
-                v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
-                v
+                let stage = stages.get(&t.id).map(|(s, h)| crate::stage::view(s, h));
+                wsp_view::task::ls_row(&row_of(t, &claims), filed, stage.as_ref())
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        println!("{}", wsp_view::task::ls(&out));
         return 0;
     }
 
@@ -769,43 +766,24 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         }
     };
     if args.json() {
-        let mut v = t.json();
-        v["body"] = json!(t.body);
-        // Present only when it is, on the same rule as `list` below: a reader
-        // of this payload sees what it always saw until there is something to
-        // say. An agent reading a cited id back gets the record *and* the fact
-        // that it is no longer live, which is the difference between quoting a
-        // decision and reopening it.
-        if let Some(path) = &archived {
-            v["archived"] = json!(util::contract(path));
-        }
-        // Who has it and who had it. An agent reading this back is usually
-        // asking exactly that, and the alternative is reading two state files
-        // it has no business knowing the names of.
-        v["claim"] = store.claims().get(&t.id).cloned().unwrap_or(json!(null));
-        v["worked"] = store.worked().get(&t.id).cloned().unwrap_or(json!(null));
-        // Present only while a list is running, so a reader of this payload
-        // sees what it always saw until there is one — the text half follows
-        // the same rule and for the same reason.
-        if let Some(l) = crate::worklist::Running::read(store).of(&t.id) {
-            v["list"] = json!({ "list": l.list, "group": l.group, "of": l.of });
-        }
-        // The same rule as `claim` above: an agent reading this back is often
-        // asking exactly this, and the alternative is the one it actually
-        // reached for — reading a state file by hand.
-        v["raised"] = json!(raised_about(store, &t.id).iter().map(|m| m.to_json()).collect::<Vec<_>>());
-        // `wsp-241`: the passes, which were only ever inside `body`.
-        v["verification"] = crate::verification::json(&t);
-        v["legs"] = crate::legs::json(&t);
-        v["pieces"] = crate::pieces::json(&t);
-        // `wsp-242`: where it is, as a word wsp derives and the tail the step
-        // that put it there was given.
-        // `wsp-255`: and when it entered each stage it has been in.
+        // Each key's rule is `wsp_view::task::show`'s: this reads what it
+        // prints and hands it over.
+        let claims = store.claims();
         let staged = crate::stage::with_history(store, &[&t]);
-        let staged = staged.get(&t.id);
-        v["stage"] = json!(staged.map(|(s, h)| crate::stage::json(s, h)));
-        v["stages"] = json!(staged.map(|(_, h)| h.iter().map(|s| s.json()).collect::<Vec<_>>()));
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        let running = crate::worklist::Running::read(store);
+        let shown = wsp_view::task::Show {
+            body: &t.body,
+            archived: archived.as_ref().map(|path| util::contract(path)),
+            claim: claims.get(&t.id).cloned(),
+            worked: store.worked().get(&t.id).cloned(),
+            list: running.of(&t.id).map(|l| wsp_view::task::Running { list: l.list.clone(), group: l.group, of: l.of }),
+            raised: raised_about(store, &t.id).iter().map(|m| m.to_json()).collect(),
+            verification: crate::verification::view(&t),
+            legs: crate::legs::view(&t),
+            pieces: crate::pieces::view(&t),
+            stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
+        };
+        println!("{}", wsp_view::task::show(&row_of(&t, &claims), &shown));
         return 0;
     }
 
@@ -1245,17 +1223,7 @@ fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
             return 1;
         }
         for pane in store.panes_for_task(&t.id) {
-            if store.clear_binding(&pane) {
-                // And the name with it. This is the commonest way work is put
-                // down — an agent finishing and going spare is exactly the row
-                // the agents panel exists to draw — and until now it was the
-                // one door that left the pane wearing the task, so the panel
-                // showed the free agent still holding what it had just
-                // finished. While the task is still readable: the name only
-                // comes off where it is one we wrote, which is a question
-                // about the title.
-                crate::cmd_agent::unname_after_task(store, &pane, &t.id);
-            }
+            store.clear_binding(&pane);
         }
         crate::cmd_agent::hand_off(store, &t.id, None, "done");
     }
@@ -1466,7 +1434,7 @@ fn respawn(argv: &[String], json: bool) -> (String, i32) {
         tests::RESEATED.with(|r| r.borrow_mut().push(argv.to_vec()));
         return (String::new(), 0);
     }
-    let Ok(exe) = std::env::current_exe() else { return ("no wsp binary to run".to_string(), 1) };
+    let Ok(exe) = wsp_base::util::self_exe() else { return ("no wsp binary to run".to_string(), 1) };
     let mut cmd = wsp_base::calls::Command::new(exe);
     cmd.args(argv).stdin(std::process::Stdio::null());
     if json {
@@ -1592,7 +1560,7 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
         }
         return Told::Yes;
     }
-    let Ok(exe) = std::env::current_exe() else { return Told::No };
+    let Ok(exe) = wsp_base::util::self_exe() else { return Told::No };
     let mut argv = vec!["tell", id, "-"];
     if anyway {
         argv.push("--anyway");
@@ -1764,12 +1732,12 @@ pub fn review(store: &Store, args: &Args) -> i32 {
         }
         return 2;
     }
-    let (account, from) = match prose_payload(args, USAGE) {
+    let (account, kept, from) = match review_payload(args, USAGE) {
         Ok(v) => v,
         Err(code) => return code,
     };
     let said = from.map(|src| format!("{} characters from {src}", account.len()));
-    for line in exit_warnings(store, args, &account) {
+    for line in exit_warnings(store, args, &kept) {
         eprintln!("wsp: warning (a run seat's review is read as an exit; `wsp submit` will refuse this) — {line}");
     }
     accept(store, args, &account, said.as_deref())
@@ -1783,10 +1751,27 @@ pub(crate) fn exit_warnings(store: &Store, args: &Args, account: &str) -> Vec<St
     if !crate::worklist::verified_by_a_run(store, &t.id) {
         return Vec::new();
     }
-    let (first, rest) = account.split_once('\n').unwrap_or((account, ""));
-    let text = format!("summary: {}\n\n{}\n\nowed: nothing\n", first.trim(), rest.trim());
+    let text = crate::cmd_submit::exit_of_review(account);
     let c = crate::cmd_submit::validate(store, &t, &text, args.get("anyway").as_deref());
     crate::cmd_submit::refusal_lines(&c)
+}
+
+/// A review's account twice, from one read: folded to the one line the log
+/// keeps, and with its lines kept for [`exit_warnings`], which reads its
+/// sections by their headings (`wsp-137`: folded, a stream's `done-when:` was
+/// gone, and every review from a run seat warned that it had none — at the
+/// line after the five a one-line account wraps to). Then where it came from.
+pub(crate) fn review_payload(args: &Args, usage: &str) -> Result<(String, String, Option<String>), i32> {
+    match payload_source(args.rest.get(1..).unwrap_or_default()) {
+        Some(src) => {
+            let (kept, named) = prose_read(&src, |raw| raw.trim().to_string())?;
+            Ok((fold(&kept), kept, Some(named)))
+        }
+        None => {
+            let (folded, _) = prose_payload(args, usage)?;
+            Ok((folded, args.text(1).trim().to_string(), None))
+        }
+    }
 }
 
 /// **The review core**: what `wsp review` does once it holds an account, and
@@ -2656,16 +2641,13 @@ pub fn prio(store: &Store, args: &Args) -> i32 {
 ///
 /// The same bargain the panel's `Snapshot` makes. The interesting half of
 /// `next` is a join — which open task is *not* already in another live agent's
-/// hand — and while it read the store and asked herdr inline, checking the
+/// hand — and while it read the store and asked backend inline, checking the
 /// answer meant standing up two agents, binding one of them, and asking the
 /// other. Three idle agents set going at once and all handed the same task is
 /// the failure this filter exists to stop; there was nowhere to write it down.
 pub(crate) struct Backlog {
     pub tasks: Vec<Task>,
     pub bindings: std::collections::BTreeMap<String, serde_json::Value>,
-    /// Every pane herdr knows about — a binding to a pane that no longer
-    /// exists is stale rather than a holder.
-    pub panes: Vec<herdr::Pane>,
     /// This pane. A `doing` task in the caller's own hand is precisely the
     /// caller's next piece of work, so it is not "taken".
     pub me: Option<String>,
@@ -2679,8 +2661,7 @@ impl Backlog {
             // chosen is read in full before it is printed.
             tasks: store.task_heads().iter().map(|h| h.bodiless()).collect(),
             bindings: store.bindings(),
-            panes: if herdr::available() { herdr::panes().unwrap_or_default() } else { Vec::new() },
-            me: crate::herdr::Env::read().pane_id,
+            me: None,
         }
     }
 }
@@ -2716,7 +2697,7 @@ pub(crate) fn pick(b: &Backlog, scope_ids: Option<&[String]>) -> Pick {
     // agents set going at once would otherwise all be handed the same task and
     // all three bounce.
     let taken = |t: &Task| {
-        !crate::cmd_agent::live_holders(&b.bindings, &b.panes, &t.id, b.me.as_deref()).is_empty()
+        !crate::cmd_agent::live_holders(&b.bindings, &[], &t.id, b.me.as_deref()).is_empty()
     };
 
     let mut candidates: Vec<Task> = b
@@ -2778,7 +2759,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         // than a moment. This pane stays like this until somebody hands it
         // something, so of the two labels `say_looking` writes, this is the one
         // that is still on screen when a person comes looking.
-        crate::cmd_agent::say_looking(store, &b.panes, scope.as_deref(), false);
+        crate::cmd_agent::say_looking(store, scope.as_deref(), false);
 
         if args.json() {
             println!("null");
@@ -2794,7 +2775,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
 
     // Named, but not yet taken up: the claim is the agent's next move and the
     // reading of the task comes in between. The claim renames over this.
-    crate::cmd_agent::say_looking(store, &b.panes, scope.as_deref(), true);
+    crate::cmd_agent::say_looking(store, scope.as_deref(), true);
 
     if args.json() {
         println!("{}", t.json());
@@ -3521,6 +3502,17 @@ fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
             v
         })
         .collect()
+}
+
+/// The contract row a task is, as the mirror projects it, for `wsp-view`.
+fn row_of(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> wsp_store_contract::Row {
+    crate::mirror::rows(std::slice::from_ref(t), claims, &[], &Default::default())
+        .into_iter()
+        .find_map(|e| match e {
+            wsp_store_contract::Entity::Row(r) => Some(r),
+            _ => None,
+        })
+        .expect("a task projects to one row")
 }
 
 /// The verbs this module answers to, each with the help it carries. `main` and
@@ -4781,10 +4773,6 @@ pub(crate) mod tests {
         t
     }
 
-    fn live_pane(id: &str) -> herdr::Pane {
-        herdr::Pane { pane_id: id.to_string(), agent: "claude".into(), ..Default::default() }
-    }
-
     /// Four open tasks, one of them in another agent's hand.
     fn backlog() -> Backlog {
         let mut bindings = std::collections::BTreeMap::new();
@@ -4799,7 +4787,6 @@ pub(crate) mod tests {
                 open_task("t-006", "not yet, deliberately", "parked", "high"),
             ],
             bindings,
-            panes: vec![live_pane("w1:p1"), live_pane("w2:p1")],
             me: Some("w1:p1".into()),
         }
     }
@@ -4821,41 +4808,6 @@ pub(crate) mod tests {
         assert_eq!(nothing_because(&p), "");
     }
 
-    /// The failure this filter exists to stop: three idle agents set going at
-    /// once, all handed the same task, all three bounced off `claim`. Writable
-    /// now because the pick takes its inputs in — before this it needed two
-    /// live agents with a binding between them.
-    #[test]
-    fn next_does_not_name_work_another_live_agent_is_holding() {
-        let p = pick(&backlog(), None);
-        assert_eq!(p.task.map(|t| t.id), Some("t-001".to_string()));
-        assert_eq!(p.held, 1, "and it says how many it stepped over");
-
-        // The holder's own pane asking gets it back: a `doing` task in the
-        // caller's hand is precisely the caller's next piece of work.
-        let mut mine = backlog();
-        mine.me = Some("w2:p1".into());
-        let p = pick(&mine, None);
-        assert_eq!(p.task.map(|t| t.id), Some("t-002".to_string()), "doing outranks todo, and it is mine");
-        assert_eq!(p.held, 0);
-    }
-
-    /// A binding to a pane herdr no longer reports is stale, not a holder —
-    /// which is the state a re-claim exists to clear. A pane that is a person
-    /// at a terminal is not a holder either; they can be asked to move.
-    #[test]
-    fn a_dead_pane_is_not_holding_anything() {
-        let mut gone = backlog();
-        gone.panes.retain(|p| p.pane_id != "w2:p1");
-        let p = pick(&gone, None);
-        assert_eq!(p.task.map(|t| t.id), Some("t-002".to_string()), "the binding outlived the pane");
-        assert_eq!(p.held, 0);
-
-        let mut shell = backlog();
-        shell.panes[1].agent = String::new();
-        assert_eq!(pick(&shell, None).held, 0, "a shell is a person, who can be asked");
-    }
-
     /// `review` outranks `doing` and `todo`, so leaving it in the candidates
     /// did not merely offer it — it won, every time. Every agent asking what to
     /// do next was handed work it had already finished and given back.
@@ -4872,17 +4824,6 @@ pub(crate) mod tests {
         assert_eq!(nothing_because(&p), "1 at review, waiting on a person");
         let empty = pick(&Backlog { tasks: Vec::new(), ..backlog() }, None);
         assert_eq!(nothing_because(&empty), "", "an empty backlog needs no explaining");
-    }
-
-    /// Both reasons at once, in the order a person wants them: what is waiting
-    /// on you first, what is waiting on somebody else after.
-    #[test]
-    fn nothing_actionable_says_which_kind_of_nothing() {
-        let mut b = backlog();
-        b.tasks.retain(|t| t.id != "t-001" && t.id != "t-003");
-        let p = pick(&b, None);
-        assert!(p.task.is_none());
-        assert_eq!(nothing_because(&p), "1 at review, waiting on a person · 1 held by other agents");
     }
 
     /// Scope filters the candidates and the count of what is waiting with them:

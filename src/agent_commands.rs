@@ -1,13 +1,12 @@
 //! The second axis: not *where* the seat is, but *what is standing in it*.
 //!
-//! `place.rs` abstracts the backend — herdr today, a TTY-less supervisor or a
-//! web runtime later. It deliberately does not abstract the agent: `Agent::kind`
-//! is a string passed straight through, because herdr owns the catalogue of
-//! kinds and a list kept here would go stale. That is right for *starting* one
+//! `place.rs` abstracts the backend — compound today, a web runtime later. It
+//! deliberately does not abstract the agent: `Agent::kind` is a string passed
+//! straight through, because a list of kinds kept here would go stale. That is right for *starting* one
 //! and insufficient for everything after it. How you hand an agent a prompt, how
 //! you tell whether it is ready, how you resume its session and where its
 //! durable output lives are facts about the **agent**, not about the thing
-//! hosting it: a Claude Code in a herdr pane has a session channel of its own,
+//! hosting it: a Claude Code in a seat has a session channel of its own,
 //! and a `codex` in the identical pane can only be typed at.
 //!
 //! So the two axes are orthogonal, and this is the other one. The argument for
@@ -39,9 +38,9 @@
 //!
 //! `claude agents --json` closes it, and needs no new mechanism on either side.
 //! It is documented for scripting and does not require a TTY, and each row
-//! carries `sessionId`, `name`, `pid`, `cwd` and `status`. herdr's
-//! `agent_session.value` **is** that `sessionId` — `herdr.rs` parses it into
-//! `Pane::session_id` and [`Seated::session`] carries it across the port — so
+//! carries `sessionId`, `name`, `pid`, `cwd` and `status`. The session id a
+//! backend reports **is** that `sessionId` — [`Seated::session`] carries it
+//! across the port — so
 //! wsp already holds the key, and one call turns it into the handle. Verified
 //! 2026-08-17 against the exact pair recorded as underivable.
 //!
@@ -57,7 +56,7 @@
 //! undocumented, and there is no `claude` subcommand that sends on it: the whole
 //! command list is `agents`, `auth`, `auto-mode`, `doctor`, `gateway`, `import`,
 //! `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview` and
-//! `update`. So [`Claude::tell`] delivers the way `place_herdr` always has, and
+//! `update`. So [`Claude::tell`] delivers the way the backend's own `tell` does, and
 //! the channel lands in one function when there is a supported way to speak it.
 //!
 //! What the address buys in the meantime is recovery: [`Kind::address`] is asked
@@ -74,12 +73,12 @@
 //!
 //! **The deterministic one: the backend's census is the wrong place to recompute
 //! the handle from.** `address` used to mint from `Seated::agent.name`, and on
-//! the failure path there is no such name. Measured against herdr's live socket
-//! on 2026-08-17: an `agent.list` row carries `name` and `agent_session.value`,
-//! and a `pane.list` row carries the agent's *kind* and neither of the other
-//! two. `Herdr::census` merges them per pane and falls back to the pane row —
-//! and a seat herdr has gone blind on is precisely a seat with no `agent.list`
-//! row: `State::Empty` is `agent.get` answering that this pane has no agent, and
+//! the failure path there is no such name. Measured against the multiplexer
+//! wsp then ran on, on 2026-08-17: an `agent.list` row carried `name` and the
+//! session, and a `pane.list` row carried the agent's *kind* and neither of the
+//! other two. Its census merged them per pane and fell back to the pane row —
+//! and a seat the backend has gone blind on is precisely a seat with no
+//! `agent.list` row: `State::Empty` is `agent.get` answering that this pane has no agent, and
 //! a pane with no agent has no row in the list of them either, the same record
 //! read two ways. So on every failure of the sort robustness-041 reproduces, the
 //! census offers an empty name; [`mint`] turns that into a seat-only handle
@@ -122,7 +121,7 @@
 //! them and a first pass that took all five would have been unreviewable:
 //!
 //! - **robustness-041, readiness.** `wait_ready` declares an agent dead while it
-//!   is alive, because herdr's claude detection needs a rendered pane and the
+//!   is alive, because the backend's claude detection needed a rendered pane and the
 //!   focus decision forbids rendering one. `claude agents --json` answers
 //!   liveness and `idle`/`busy` per session with no pane involved at all, which
 //!   is a per-kind reading of exactly the sort this trait is for.
@@ -188,7 +187,7 @@
 //!
 //! So the handle is the task **and** the seat, and neither half is decoration.
 //! The task id is what a person reads; the seat is what makes it unique, because
-//! herdr issues at most one live agent per pane. Both are in wsp's hand *before*
+//! a backend issues at most one live agent per seat. Both are in wsp's hand *before*
 //! [`Place::start`] is called — the port splits `open` from `start` precisely so
 //! that the seat exists before the agent does — and both are on the census row
 //! afterwards, so [`Kind::address`] can recompute the same string it minted
@@ -197,16 +196,13 @@
 //! `--session-id <uuid>`, the other lead, remains unrun and is now unneeded.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use wsp_base::calls::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::cmd_spawn::Reach;
+use crate::host::{self, captured, opencode_bin, Host};
 use crate::place::{Delivery, Place, Refusal, Result, Seat, Seated};
 use crate::util;
 use crate::util::Clock;
@@ -235,8 +231,7 @@ pub trait Kind {
 
     /// The program a backend that execs this kind runs, when it is not the
     /// kind's own name — `None` for every kind that is a binary of that name.
-    /// Such a kind cannot be started by herdr, whose agent catalogue is closed,
-    /// and `spawn` refuses `--herdr` for it before a seat is opened.
+    /// A backend with a closed agent catalogue cannot start such a kind.
     fn program(&self) -> Option<&'static str> {
         None
     }
@@ -247,8 +242,8 @@ pub trait Kind {
     /// The gate in front of [`Spawn::model`] and [`Spawn::effort`], and it is
     /// here for two reasons that pull the same way.
     ///
-    /// **An unknown tier fails late and in the wrong place.** herdr starts the
-    /// process happily whatever is on its command line; what refuses is the
+    /// **An unknown tier fails late and in the wrong place.** A backend starts
+    /// the process happily whatever is on its command line; what refuses is the
     /// agent, in a pane nobody is looking at, and `cmd_spawn` reports that as
     /// "claude started but never became ready for input" — a sentence about
     /// readiness for what is a typo. Worse, measured 2026-08-18 against Claude
@@ -279,7 +274,7 @@ pub trait Kind {
     /// pass the first and fail the second, which is exactly the case that was
     /// paid for.
     ///
-    /// **Measured 2026-08-18, Claude Code 2.1.234**, two spawns into herdr panes
+    /// **Measured 2026-08-18, Claude Code 2.1.234**, two spawns into seats
     /// differing in nothing but `--model`, on the same task and the same
     /// worktree path minutes apart. The Sonnet 5 pane opened on `auto mode on
     /// (shift+tab to cycle)`; the Haiku 4.5 pane opened on `manual mode on`,
@@ -293,7 +288,7 @@ pub trait Kind {
     /// `~/.claude/settings.json` already allows, and that allow-list is written
     /// around the wsp verbs. The haiku run stopped twenty-five seconds in, on
     /// its third action, reaching into `~/wsp` with `find` for a record its
-    /// brief already held; herdr reported the pane blocked and nothing said why.
+    /// brief already held; the backend reported the pane blocked and nothing said why.
     /// A spawn that produces that is worse than a refused flag, because the
     /// refusal is read in the second it is typed and the hang is found later by
     /// somebody wondering why a lane went quiet.
@@ -373,8 +368,8 @@ pub trait Kind {
     /// `false` for every kind but one, and the exception was measured rather
     /// than designed. `core-026` drove `--kind opencode` end to end three
     /// times and the work order failed to arrive all three: opencode's TUI
-    /// refuses typed input for **~2s after herdr's `agent.start` returns and
-    /// reports `interactive_ready`**, and text sent inside that window is
+    /// refuses typed input for **~2s after the backend's `agent.start` returns
+    /// and reports `interactive_ready`**, and text sent inside that window is
     /// *discarded* — the composer is empty afterwards, not holding an unsent
     /// sentence. Sweep of two runs × four delays, start→prompt: 0s and 1s
     /// dropped, 2s and 4s landed.
@@ -445,7 +440,7 @@ pub trait Kind {
     ///
     /// **And not argv, which is the third carrier and the one that would have
     /// made `core-038` impossible.** An agent's command line reaches a seat wsp
-    /// did not open, since herdr's `agent.start` takes `args`; an environment
+    /// did not open, since a backend's `agent.start` takes `args`; an environment
     /// does not. It is unavailable rather than declined: opencode's TUI has no
     /// config flag at all — `opencode --help` at 1.18.x offers `--model`,
     /// `--session`, `--prompt` and `--agent`, and nothing that names a config —
@@ -501,8 +496,8 @@ pub trait Kind {
     /// It is what [`crate::cmd_spawn::Route::Inline`] selects on, and it
     /// deliberately is **not** [`Kind::order_in_args`]. Those were the same
     /// predicate for one commit and it was wrong: the brief went into a
-    /// `--prompt` argv element, and herdr refuses `agent.start` args holding any
-    /// control character — a brief is multi-line, so three spawns of three were
+    /// `--prompt` argv element, and the backend refused `agent.start` args holding
+    /// any control character — a brief is multi-line, so three spawns of three were
     /// refused with `invalid_agent_argument` and no agent started. Env is not
     /// argv and that guard does not reach it.
     fn brief_file(&self) -> bool {
@@ -513,7 +508,7 @@ pub trait Kind {
     /// to the **agent** rather than to wsp.
     ///
     /// True by default, because the default delivery is [`crate::place::Place::tell`]
-    /// — herdr typing at a pane — and what receives it is whatever the agent
+    /// — the backend typing at a seat — and what receives it is whatever the agent
     /// does with a prompt that arrives mid-turn. Driven against a real Claude
     /// Code on 2026-08-21 (`core-021` d2): it *queues* it and answers it at the
     /// turn boundary, and nothing is typed at a live composer. So this is not
@@ -528,7 +523,7 @@ pub trait Kind {
     ///
     /// The candidate for `false` was opencode's ACP server (`core-020`), and it
     /// was driven against a real opencode rather than read — `core-026`,
-    /// 2026-08-21, sandbox herdr — and it answers **true** anyway, without ACP
+    /// 2026-08-21, in a sandbox — and it answers **true** anyway, without ACP
     /// being needed to find that out. What was seen: a mid-turn `wsp tell`
     /// reaches opencode's *durable session record* immediately, as a `user`
     /// message in `opencode export`, and is answered at the turn boundary. Then
@@ -597,7 +592,7 @@ pub trait Kind {
     /// Keyed on the session rather than the seat, because the seat is gone by
     /// the time this is asked — it is read when a claim ends — and the session
     /// is the one handle that outlives it. `cwd` is a hint and not a key: see
-    /// [`transcript`], which falls back to a scan when the tree has moved.
+    /// [`Host::transcript_of`], which falls back to a scan when the tree has moved.
     ///
     /// # `since` is what makes this an attempt rather than a session
     ///
@@ -637,7 +632,7 @@ pub trait Kind {
     /// [`crate::cmd_resume::Thread::by_hand`] as though every agent shared it.
     /// What that printed for a live opencode was `claude --resume ses_…` —
     /// wrong binary and wrong flag in one line, offered to a person as the
-    /// recovery path for when herdr itself is broken.
+    /// recovery path for when the backend itself is broken.
     ///
     /// [`Kind::args`] reads it too, so a kind spells its resume in one place
     /// and the argv wsp builds and the line it prints cannot drift apart.
@@ -671,11 +666,11 @@ pub trait Kind {
         None
     }
 
-    /// Whether a clear of this kind leaves a **new session** where herdr can
-    /// see one — which is the only completion signal a clear has.
+    /// Whether a clear of this kind leaves a **new session** where the backend
+    /// can see one — which is the only completion signal a clear has.
     ///
     /// `true` by default, because waiting is the shape a clear was first built
-    /// around: Claude Code's `SessionStart` hook teaches herdr the replacement
+    /// around: Claude Code's `SessionStart` hook teaches the backend the replacement
     /// session's id within a few hundred milliseconds, and the wait is what
     /// keeps a work order from landing mid-reset. A kind answering `false`
     /// says the signal never comes, so waiting would be a stall with nothing
@@ -782,7 +777,7 @@ pub struct Spawn<'a> {
     /// carrier. `None` for a spawn with nothing to brief about, for one whose
     /// brief could not be written, and for every kind that reads it from its
     /// environment or is not given one. A path and not the text, because a
-    /// brief is multi-line and herdr refuses control characters in an arg.
+    /// brief is multi-line and an arg holding control characters is refused.
     pub brief: Option<&'a Path>,
 }
 
@@ -816,9 +811,9 @@ pub fn mint(name: &str, seat: &Seat) -> Option<String> {
 /// name whose file was *refused* is not registered and falls to [`Plain`] here;
 /// [`refusal_of`] is how a caller tells that from a name with no file.
 ///
-/// Unknown kinds are not refused here. herdr owns the catalogue and refuses an
-/// unknown kind with the whole of it in the message, which is a better list than
-/// one kept in wsp and left to go stale — so this falls through to the behaviour
+/// Unknown kinds are not refused here. The backend that starts one is the
+/// judge of whether it can, which is a better list than one kept in wsp and
+/// left to go stale — so this falls through to the behaviour
 /// `cmd_spawn` had before the layer existed, and adding the layer changed
 /// nothing for `codex` or `gemini`.
 pub fn of(kind: &str) -> &'static dyn Kind {
@@ -867,7 +862,7 @@ pub fn refusals() -> &'static [(PathBuf, String)] {
 }
 
 /// Why the kind file for `kind` was refused, if there is one and it was. A name
-/// with no file at all is `None`: that is a kind herdr may know, passed through.
+/// with no file at all is `None`: that is a kind a backend may know, passed through.
 pub fn refusal_of(kind: &str) -> Option<&'static str> {
     refusals()
         .iter()
@@ -880,10 +875,10 @@ pub fn refusal_of(kind: &str) -> Option<&'static str> {
 /// offers "New agent ▸" never keeps a second list that [`of`] could disagree
 /// with.
 ///
-/// This is the kinds the code has *measured*, not the kinds herdr can start:
+/// This is the kinds the code has *measured*, not the kinds a backend can start:
 /// a kind declared as a file is consulted after this table (see [`of`]), and any
-/// other name `--kind` is given is still passed through to herdr, which owns
-/// that catalogue.
+/// other name `--kind` is given is still passed through to the backend, which
+/// judges it.
 const KNOWN: &[(&str, &'static dyn Kind)] = &[
     ("claude", &Claude),
     ("opencode", &OpenCode),
@@ -917,13 +912,13 @@ pub(crate) mod stand_in {
     }
 
     fn script() -> PathBuf {
+        // The check and the write share a lock, so a second test thread never
+        // sees the file half-written (the rename this replaced did that job).
+        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let path = std::env::temp_dir().join(format!("wsp-stand-in-agent-{}", std::process::id()));
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
         if !path.is_file() {
-            use std::os::unix::fs::PermissionsExt;
-            let part = path.with_extension("part");
-            std::fs::write(&part, "#!/bin/sh\nexec sleep 600\n").unwrap();
-            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::fs::rename(&part, &path).unwrap();
+            wsp_testkit::script(&path, "#!/bin/sh\nexec sleep 600\n");
         }
         path
     }
@@ -931,8 +926,7 @@ pub(crate) mod stand_in {
 
 /// The program and argv a backend that execs a kind runs for it: the kind's
 /// name and `args` unless the kind runs under a program of its own
-/// ([`Kind::program`]). One copy, for the backends that fork or exec — herdr
-/// types the kind's name into a shell and cannot.
+/// ([`Kind::program`]). One copy, for the backends that fork or exec.
 pub fn command(kind: &str, args: &[String]) -> (String, Vec<String>) {
     #[cfg(test)]
     if let Some(stand_in) = stand_in::for_kind(kind) {
@@ -992,7 +986,7 @@ fn kinds_with(reg: &Registry) -> Vec<Info> {
 pub struct Clear {
     /// Typed into the pane as its own line.
     pub cmd: &'static str,
-    /// Whether to hold the next sentence until herdr reports a new session in
+    /// Whether to hold the next sentence until the backend reports a new session in
     /// that pane. See [`Kind::clear_replaces_session`].
     pub waits: bool,
 }
@@ -1037,7 +1031,7 @@ impl Kind for Plain {
     }
 
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     /// Nothing to ask. An agent wsp knows nothing about beyond its name is one
@@ -1060,7 +1054,7 @@ impl Kind for Plain {
 /// The second kind wsp knows by name, and the first that can be *chosen* — see
 /// `core-020`, whose point is balancing model usage and which cannot begin until
 /// wsp can say which model. Everything here was measured against opencode
-/// 1.18.20/1.18.21 in a sandbox herdr rather than read off `--help`; `core-026`
+/// 1.18.20/1.18.21 in a sandbox rather than read off `--help`; `core-026`
 /// holds the driving and `core-027` the decisions.
 ///
 /// [`Kind::running`] stays [`Plain`]'s answer of nothing: the backend is the
@@ -1292,12 +1286,12 @@ fn config(brief: Option<&Path>, reach: &Reach) -> String {
     //
     // **This key merges with the machine's own config rather than replacing
     // it**, which is the property the whole scheme rests on and the one worth
-    // naming: `~/.config/opencode/plugins/herdr-agent-state.js` is what reports
-    // an opencode's state to herdr, and a config that clobbered `plugin` would
-    // have turned off state reporting for every agent wsp starts — silently,
+    // naming: the machine's own opencode plugins are what report an opencode's
+    // state, and a config that clobbered `plugin` would have turned off state
+    // reporting for every agent wsp starts — silently,
     // and with `needs_a_person` among the things it took with it. Driven four
     // times now: `opencode debug config` with this exact value resolves
-    // `instructions` to the file below, `plugin` still to the herdr plugin, and
+    // `instructions` to the file below, `plugin` still to the machine's plugin, and
     // — the reason it was run again for `core-040` — the bash map in the order
     // wsp wrote it rather than reordered by the merge.
     if let Some(path) = brief {
@@ -1342,106 +1336,6 @@ fn opencode_models() -> std::result::Result<Vec<String>, String> {
         .collect())
 }
 
-/// opencode, wherever it is — the same reasoning as [`claude_bin`], and one
-/// extra reason of its own.
-///
-/// `~/.opencode/bin` reached `PATH` through `.zshrc`, which a **non-interactive**
-/// shell does not read, so `Command::new("opencode")` failed from a hook or a
-/// script on a machine that plainly had it. That was fixed at the source by
-/// moving the export to `~/.zshenv` on 2026-08-21, and this stays anyway: the
-/// lookup costs nothing and the failure it prevents reads as "opencode is not
-/// installed" on a machine where it is.
-fn opencode_bin() -> PathBuf {
-    if let Some(v) = std::env::var_os("OPENCODE_BIN") {
-        let p = PathBuf::from(v);
-        if !p.as_os_str().is_empty() {
-            return p;
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join("opencode");
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
-    util::home().join(".opencode/bin/opencode")
-}
-
-/// Everything one of these runtimes wrote to stdout, through a file rather
-/// than a pipe.
-///
-/// **The pipe was losing most of it, and saying nothing.** `opencode export
-/// --sanitize` on a 53-turn session writes 165,230 bytes. Asked for down a
-/// pipe, wsp received 65,536 of them — one pipe buffer — and an exit status of
-/// *zero*, so [`read_export`] was handed a JSON document cut off mid-string,
-/// returned nothing, and `ui-007` closed with no cost clause at all. That is
-/// `core-039`. It was read at first as `despawn` ending the agent before its
-/// runtime could be asked. Driven in a sandbox, both endings wrote the clause —
-/// `wsp release` on a live opencode and `wsp despawn` on another — and then the
-/// row that had lost one lost it again on a replay through `release`, with no
-/// agent left to kill. Nothing about the ending is the variable. The size of
-/// the export is.
-///
-/// The cause belongs to the runtime rather than to the subcommand: these are
-/// Bun-compiled binaries, their stdout writes are asynchronous, and the process
-/// exits without waiting for a pipe it has filled to drain. A file has no
-/// buffer to overrun and its writes complete before exit — the same export
-/// redirected to one came back 165,230 bytes three times out of three.
-///
-/// So every capture in this file goes through here, including the two that are
-/// small today: `opencode models` is 13KB and `claude agents --json` is 1.4KB,
-/// both grow with what is on the machine, and both fail plausibly rather than
-/// loudly when cut — a valid model refused, an agent that cannot be addressed.
-/// The defence is one temp file, and waiting to be the second row this costs is
-/// not a saving.
-///
-/// The file is this process's own, is opened `0600` because a sanitized export
-/// still carries the shape of one attempt and a temp directory is shared, and
-/// is removed however this ends.
-fn captured(bin: PathBuf, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
-    // Named as the reader would type it — `opencode models`, not the resolved
-    // path — because these strings reach a person inside a refusal that is
-    // about their `--model`, not about where wsp found the binary.
-    let said = format!(
-        "{} {}",
-        bin.file_name().unwrap_or(bin.as_os_str()).to_string_lossy(),
-        args.join(" ")
-    );
-    // Unique per call and not merely per process. Nothing here runs two at
-    // once today, and a name that would silently collide the day something
-    // does is a trap laid for a reader with no reason to look here.
-    static NTH: AtomicU64 = AtomicU64::new(0);
-    let at = std::env::temp_dir().join(format!(
-        "wsp-captured-{}-{}",
-        std::process::id(),
-        NTH.fetch_add(1, Ordering::Relaxed)
-    ));
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&at)
-        .map_err(|e| format!("{said}: {e}"))?;
-    let ran = Command::new(&bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(sink))
-        .stderr(Stdio::null())
-        .status();
-    let out = match ran {
-        Err(e) => Err(format!("{said}: {e}")),
-        Ok(s) if !s.success() => Err(format!("{said} failed")),
-        Ok(_) => std::fs::read(&at).map_err(|e| format!("{said}: {e}")),
-    };
-    // Whatever happened, including the failures: a capture that could not be
-    // read is exactly the one whose leftovers nobody comes back for.
-    let _ = std::fs::remove_file(&at);
-    out
-}
-
 impl Kind for OpenCode {
     /// The model, the session, and the work order.
     ///
@@ -1458,8 +1352,8 @@ impl Kind for OpenCode {
     /// there for the measurement; what matters here is that the order is a
     /// **single argv element** and is therefore safe for the prose a work order
     /// actually is. Verified rather than hoped: a prompt containing backticks
-    /// and `$(…)` was passed through herdr's `agent.start` and arrived intact,
-    /// with nothing executed — herdr does not put these through a shell.
+    /// and `$(…)` was passed through `agent.start` and arrived intact, with
+    /// nothing executed — argv does not go through a shell.
     fn args(&self, spawn: &Spawn) -> Vec<String> {
         let mut argv: Vec<String> = Vec::new();
         if let Some(model) = spawn.model {
@@ -1485,7 +1379,7 @@ impl Kind for OpenCode {
     }
 
     /// `/clear`, which this runtime spells only as an alias of `/new` — start
-    /// a new session. Driven 2026-08-23 against 1.18.21 in a sandbox herdr,
+    /// a new session. Driven 2026-08-23 against 1.18.21 in a sandbox,
     /// the same rig `core-026` used: typed at an idle composer it resets the
     /// transcript view at once; the next turn opened a session of its own;
     /// `opencode export` on the old id still showed every message it had, so
@@ -1494,7 +1388,7 @@ impl Kind for OpenCode {
     ///
     /// [`clear_replaces_session`] answers false on the same drive, and that is
     /// why both facts are recorded here rather than inferred from the docs:
-    /// herdr's `agent_session` keeps the **old** id through the clear — the
+    /// the reported session keeps the **old** id through the clear — the
     /// plugin learns the replacement only when the next message creates it —
     /// so the wait that completes a Claude Code clear can never fire for this
     /// kind, and every sentence would pay its full timeout for nothing. What
@@ -1599,7 +1493,7 @@ impl Kind for OpenCode {
     }
 
     /// Nothing, and it is [`Plain`]'s answer for [`Plain`]'s reason: opencode
-    /// has a session id, but herdr is where wsp learns it and only once the
+    /// has a session id, but the backend is where wsp learns it and only once the
     /// plugin has reported one. Minting a second name here would be a handle
     /// wsp cannot address anything with.
     fn address(&self, _place: &dyn Place, _spawn: &Spawn) -> Option<Address> {
@@ -1616,7 +1510,7 @@ impl Kind for OpenCode {
     /// The argument is on that method, which is where a later kind will read
     /// it.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     /// Nothing to ask. The backend is the only witness, as for [`Plain`].
@@ -1644,7 +1538,7 @@ impl Kind for OpenCode {
     ///
     /// **The session id is the whole join and `cwd` is not used.** `export`
     /// takes an id and finds the session wherever it ran, so unlike
-    /// [`transcript`] there is no path to derive and no scan to fall back to.
+    /// [`Host::transcript_of`] there is no path to derive and no scan to fall back to.
     /// A cwd fallback was considered and refused: `opencode session list` can
     /// name every session in a directory, but picking one of them by recency
     /// would attribute a person's own opencode in that tree to an agent's
@@ -1663,28 +1557,8 @@ impl Kind for OpenCode {
     /// exactly where it is paid — once when a claim ends, and on demand from
     /// `wsp attempts`. Never in `brief`, `ls` or `show`.
     fn ran(&self, session: &str, _cwd: &str, since: i64) -> Option<Ran> {
-        read_export(&export(session)?, since)
+        read_export(&host::LOCAL.opencode_export(session)?, since)
     }
-}
-
-/// One session as opencode publishes it, redacted of everything but the
-/// numbers.
-///
-/// The id is checked before it reaches a command line, for the reason
-/// [`transcript`] checks it before it reaches a path: it arrives from herdr,
-/// which got it from the agent, and `spawn` is a verb agents drive. opencode
-/// spells an id `ses_` and twenty-something alphanumerics; anything with a
-/// space, a slash or a dash in it is not one.
-///
-/// Taken through [`captured`] and not through a pipe, which is the whole of
-/// `core-039`: this is the longest thing wsp asks any runtime for, so it is the
-/// one that overran a pipe buffer and came back a truncated document under a
-/// successful exit status. The argument is there.
-fn export(session: &str) -> Option<Vec<u8>> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    captured(opencode_bin(), &["export", "--sanitize", session]).ok()
 }
 
 /// That export, reduced to what served the attempt and what it cost.
@@ -1778,14 +1652,11 @@ fn read_export(src: &[u8], since: i64) -> Option<Ran> {
 /// rather than a schema this repository has to know the shape of.
 ///
 /// **The id is checked before it reaches a command line**, for
-/// [`export`]'s reason: it arrives from a claim, which the agent behind it
+/// [`Host::opencode_export`]'s reason: it arrives from a claim, which the agent behind it
 /// wrote. opencode spells a session id `ses_` and alphanumerics; anything else
 /// is refused before a shell is anywhere near it.
 pub fn opencode_finished_at(session: &str) -> Option<i64> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    let rows = opencode_rows(session)?;
+    let rows = host::LOCAL.opencode_newest(session)?;
     newest_finished(&rows)
 }
 
@@ -1823,35 +1694,6 @@ fn newest_finished(rows: &[Value]) -> Option<i64> {
     // Milliseconds in the database, seconds in the store — opencode's own unit
     // boundary, and `read_export` makes the same crossing.
     Some(completed / 1_000)
-}
-
-/// `opencode db`'s rows for one session, newest first.
-///
-/// **`opencode db` and not a sqlite crate.** `serde_json` is the whole of this
-/// tree's dependency list and it stays that way, and opencode ships the reader:
-/// `opencode db <query> --format json` prints rows as JSON, so the query is
-/// `select` over the `message` table with `json_extract` on the `data` column
-/// rather than a schema this repository has to be right about.
-fn opencode_rows(session: &str) -> Option<Vec<Value>> {
-    let out = Command::new(opencode_bin())
-        .args([
-            "db",
-            &format!(
-                "select json_extract(data,'$.role') as role, \
-                 json_extract(data,'$.time.created') as created, \
-                 json_extract(data,'$.time.completed') as completed \
-                 from message where session_id = '{session}' order by time_created desc limit 2"
-            ),
-            "--format",
-            "json",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
 }
 
 /// pi.
@@ -1964,56 +1806,6 @@ fn pi_tier_in(m: &str, effort: Option<&str>, models: &[PiModel]) -> std::result:
         )),
         _ => Ok(()),
     }
-}
-
-/// The directory name pi derives from a cwd for its session store — the
-/// "mangling" pi's session-manager.js applies.
-///
-/// pi resolves the cwd, strips one leading `/` or `\`, and replaces every
-/// `/`, `\`, `:` with `-`, wrapped in `--...--`. This function is the pure
-/// half of that: given a canonical cwd, produce the directory name pi would
-/// store sessions under.
-fn pi_session_dir_name(cwd: &str) -> String {
-    let stripped = cwd.strip_prefix('/').or_else(|| cwd.strip_prefix('\\')).unwrap_or(cwd);
-    let mangled: String = stripped.chars().map(|c| match c {
-        '/' | '\\' | ':' => '-',
-        other => other,
-    }).collect();
-    format!("--{}--", mangled)
-}
-
-/// The session file for a pi session id under a cwd, or `None` if the id is
-/// invalid or no file is found.
-///
-/// The id is validated before it reaches a path — it arrives from herdr and
-/// must not be used to open arbitrary files. It must be non-empty and
-/// contain only alphanumerics, `-`, `_`, `.`.
-fn pi_session_file(session: &str, cwd: &str) -> Option<PathBuf> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-        return None;
-    }
-    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| util::home().join(".pi").join("agent"));
-    let dir_name = if let Ok(canonical) = std::fs::canonicalize(cwd) {
-        pi_session_dir_name(&canonical.to_string_lossy())
-    } else {
-        pi_session_dir_name(cwd)
-    };
-    let sessions = agent_dir.join("sessions").join(&dir_name);
-    let suffix = format!("_{session}.jsonl");
-    let mut best: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(&suffix) {
-            if best.as_ref().is_none_or(|(prev, _)| name.as_ref() > prev.as_str()) {
-                let ts = name.strip_suffix(&suffix).unwrap_or(&name).to_string();
-                best = Some((ts, entry.path()));
-            }
-        }
-    }
-    best.map(|(_, p)| p)
 }
 
 /// A pi session JSONL file, reduced to what served it and what it cost.
@@ -2252,7 +2044,7 @@ impl Kind for Pi {
 
     /// Typed at, like [`Plain`].
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     fn running(&self, _spawn: &Spawn) -> Option<bool> {
@@ -2260,8 +2052,8 @@ impl Kind for Pi {
     }
 
     fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
-        let file = pi_session_file(session, cwd)?;
-        let src = std::fs::read(&file).ok()?;
+        let file = host::LOCAL.pi_session_of(session, cwd)?;
+        let src = host::LOCAL.transcript_bytes(&file)?;
         read_pi_session(&src, since)
     }
 }
@@ -2296,8 +2088,8 @@ pub struct Claude;
 /// tokens of it, the rest is Claude Code's own.
 ///
 /// **Measured against a live spawn on 2026-08-17, not estimated.** Two
-/// `wsp spawn --agent` runs into a sandbox — its own herdr session, its own
-/// store — one with `--full` and one without, read back off the two transcripts:
+/// `wsp spawn --agent` runs into a sandbox — its own seats, its own store
+/// — one with `--full` and one without, read back off the two transcripts:
 ///
 /// | | first-request context |
 /// |---|---|
@@ -2506,8 +2298,8 @@ impl Kind for Claude {
         }
         // The order, last and after `--`, so one starting `-` is never read as
         // a flag and nothing that takes a value can eat it; see
-        // [`Kind::order_in_args`]. Folded to one line because herdr refuses a
-        // control character in an `agent.start` arg, and the packet's start is
+        // [`Kind::order_in_args`]. Folded to one line because a control character
+        // in an `agent.start` arg is refused, and the packet's start is
         // one line already.
         if let Some(order) = spawn.order {
             argv.push("--".into());
@@ -2624,13 +2416,13 @@ impl Kind for Claude {
     /// "nothing answers to X" is the whole of what a person is about to do next.
     ///
     /// What minting buys here is that the answer is **exact** where [`pick`] can
-    /// only be probable. `pick` needs herdr to have seen the session id — which
+    /// only be probable. `pick` needs the backend to have seen the session id — which
     /// is the whole of robustness-041, and it often has not — and then falls back
     /// to whoever is alone in the tree. A minted name is matched against itself.
     ///
     /// The census is read **once, and only for [`pick`]**. It is the one reading
-    /// here that cannot be waited into existence: a seat whose agent herdr has
-    /// no record of has no name and no session on its row however long you ask,
+    /// here that cannot be waited into existence: a seat whose agent the backend
+    /// has no record of has no name and no session on its row however long you ask,
     /// which is the measurement in the module docs. A census wsp could not read
     /// at all is no longer fatal to the sentence for the same reason — the
     /// handle does not come from there any more.
@@ -2652,7 +2444,7 @@ impl Kind for Claude {
     /// thing to do inside a spawn verb, so this delegates, and the failure path
     /// in `cmd_spawn` reports the address instead.
     fn tell(&self, place: &dyn Place, seat: &Seat, text: &str) -> Result<Delivery> {
-        crate::place::submit(place, seat, text, &crate::place::Pressing::default())
+        crate::place::submit(place, seat, text, &pressing())
     }
 
     /// The census, asked about the handle wsp minted — which is why minting had
@@ -2678,7 +2470,7 @@ impl Kind for Claude {
     /// session.
     ///
     /// Every other reading of what a Claude Code is running is a reading of
-    /// *now*: `claude agents --json` answers about live sessions, herdr's pane
+    /// *now*: `claude agents --json` answers about live sessions, a backend's
     /// row carries a session id and no tier at all, and both are gone by the
     /// time a claim ends. The transcript is written as the session goes and
     /// stays afterwards, and it carries the model on every assistant turn and
@@ -2690,57 +2482,17 @@ impl Kind for Claude {
     /// `~/.claude/projects/<cwd>/<session>.jsonl`, an assistant turn carrying
     /// `message.model` (`claude-opus-5`) and a top-level `effort` (`high`).
     fn ran(&self, session: &str, cwd: &str, since: i64) -> Option<Ran> {
-        let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
-        read_ran(&mut std::io::BufReader::new(file), since)
+        let mut src = host::LOCAL.read_transcript(&host::LOCAL.transcript_of(session, cwd)?)?;
+        read_ran(&mut src, since)
     }
 
     fn did(&self, session: &str, cwd: &str, since: i64) -> Option<crate::did::Did> {
-        let file = std::fs::File::open(transcript(session, cwd)?).ok()?;
-        crate::did::of_transcript(&mut std::io::BufReader::new(file), since)
+        let mut src = host::LOCAL.read_transcript(&host::LOCAL.transcript_of(session, cwd)?)?;
+        crate::did::of_transcript(&mut src, since)
     }
 }
 
 // ---- what actually ran ----------------------------------------------------
-
-/// The file the session was written to, most likely place first.
-///
-/// Claude Code names the directory after the cwd with every character that is
-/// not a letter, a digit or a hyphen replaced by one — `/Users/ed/.local` is
-/// `-Users-ed--local` — so the direct hit costs one `stat` and is what happens
-/// every time an agent stayed in the tree it was spawned into.
-///
-/// **The scan is not belt and braces.** A claim's cwd is where the *work* is
-/// and the transcript is named after where the *pane* was, `wsp resume` starts
-/// a session in a new workspace at a recorded cwd, and `wsp checkout` is free
-/// to move a worktree; every one of those makes the derived path wrong while
-/// the session id stays exactly right. A session id is a uuid, so a scan
-/// cannot find the wrong file — it can only fail to find one.
-///
-/// The id is checked before it is put in a path. It arrives from herdr, which
-/// got it from the agent, and `spawn` is a verb agents drive: a session id with
-/// a `/` in it is not a session id, and refusing it here is cheaper than
-/// discovering what it opened.
-pub(crate) fn transcript(session: &str, cwd: &str) -> Option<PathBuf> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return None;
-    }
-    let file = format!("{session}.jsonl");
-    let projects = util::home().join(".claude").join("projects");
-    let derived = projects.join(mangle(cwd)).join(&file);
-    if derived.is_file() {
-        return Some(derived);
-    }
-    std::fs::read_dir(&projects)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join(&file))
-        .find(|p| p.is_file())
-}
-
-/// A cwd as Claude Code spells it in a directory name.
-fn mangle(cwd: &str) -> String {
-    cwd.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
-}
 
 /// One transcript, reduced to what served it.
 ///
@@ -2877,8 +2629,8 @@ fn answers_to(live: &[Live], handle: &str) -> bool {
 /// the transport would need and is left unparsed until there is a transport.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Live {
-    /// `sessionId`, which is the same string herdr reports as
-    /// `agent_session.value` and the port carries as `Seated::session`.
+    /// `sessionId`, which is the same string a backend reports and
+    /// the port carries as `Seated::session`.
     pub session: String,
     /// `name` — the handle the session channel is addressed by.
     pub name: String,
@@ -2974,7 +2726,7 @@ fn confirmed(live: &[Live], spawn: &Spawn, row: Option<&Seated>) -> Option<Strin
 ///
 /// Two keys, and the order is the point. The session id is **exact**: the
 /// backend saw the agent and said which session it is, and no two sessions share
-/// one. The cwd is a fallback for the case that matters most — herdr failing to
+/// one. The cwd is a fallback for the case that matters most — a backend failing to
 /// detect a live agent is the whole of robustness-041, and it leaves a seat with a
 /// cwd and no session — and it answers only when exactly one live session is in
 /// that directory.
@@ -3023,9 +2775,8 @@ fn parse_listing(json: &str) -> Vec<Live> {
 
 /// Claude Code, wherever it is.
 ///
-/// The same reasoning as `herdr::herdr_bin`, which records it: a `wsp`
-/// started by herdr's plugin runner inherits whatever `PATH` herdr was launched
-/// with, so the binary is looked up by hand rather than trusted to be on it.
+/// A `wsp` started by a plugin runner inherits whatever `PATH` that runner was
+/// launched with, so the binary is looked up by hand rather than trusted to be on it.
 fn claude_bin() -> PathBuf {
     if let Some(v) = std::env::var_os("CLAUDE_BIN") {
         let p = PathBuf::from(v);
@@ -3052,8 +2803,7 @@ fn claude_bin() -> PathBuf {
 /// clause is why it is allowed to exist at all — the decision of 2026-08-17
 /// forbids a mechanism that only works when a person happens to be looking.
 ///
-/// This machine only. herdr's ids carry an `@machine` suffix and a far agent's
-/// registry is on the far machine, so a seat that is not local has no answer
+/// This machine only. A far agent's registry is on the far machine, so a seat that is not local has no answer
 /// here — [`pick`] gets an empty listing and says nothing, which is the right
 /// answer rather than a wrong one.
 fn listing() -> std::result::Result<Vec<Live>, String> {
@@ -3102,6 +2852,20 @@ pub fn recovery(address: Option<Address>) -> Option<String> {
 #[allow(dead_code)]
 pub fn no_channel() -> Refusal {
     Refusal::Unsupported("reach this agent except through its terminal")
+}
+
+/// The windows every `Kind::tell` presses submit through:
+/// [`crate::place::Pressing::default`], and in a test that asked for a quick
+/// spawn (`cmd_spawn::tests::quick`) the same four windows, each a few
+/// milliseconds, so a press is still a press and a test waits for none of
+/// the eighteen seconds.
+pub(crate) fn pressing() -> crate::place::Pressing<'static> {
+    #[cfg(test)]
+    if crate::cmd_spawn::quick_test() {
+        const QUICK: [std::time::Duration; 4] = [std::time::Duration::from_millis(5); 4];
+        return crate::place::Pressing { windows: &QUICK, poll: std::time::Duration::from_millis(1), ..crate::place::Pressing::default() };
+    }
+    crate::place::Pressing::default()
 }
 
 #[cfg(test)]
@@ -3194,12 +2958,12 @@ mod tests {
     /// name the session channel is addressed by.
     ///
     /// `7a188ba8-…` and `wsp-f3` are the exact pair recorded on robustness-042 as
-    /// underivable from each other — the id herdr reported for that agent, and
+    /// underivable from each other — the id the backend reported for that agent, and
     /// the name a work order actually reached it under after wsp's own delivery
     /// had failed for the fifth time running. They are one row of one documented
     /// listing apart.
     #[test]
-    fn the_session_id_herdr_reports_is_the_key_to_the_name_the_channel_wants() {
+    fn the_session_id_a_backend_reports_is_the_key_to_the_name_the_channel_wants() {
         let live = parse_listing(CAPTURE);
         assert_eq!(live.len(), 4, "{live:?}");
         assert_eq!(
@@ -3217,7 +2981,7 @@ mod tests {
 
     /// The fallback, and the case it must refuse.
     ///
-    /// A seat whose agent herdr cannot see carries a cwd and no session — that
+    /// A seat whose agent the backend cannot see carries a cwd and no session — that
     /// is the whole of robustness-041 — and one live session in that directory is
     /// an exact answer. Two are not, and this repo normally has three: a
     /// first-match rule would hand back a colleague's handle, and a work order
@@ -3265,7 +3029,7 @@ mod tests {
     /// and it wins in exactly the case the lookup cannot answer.
     ///
     /// The seat here is in `/Users/edjames/claude/wsp` with two other agents, and
-    /// its session id is empty — which is robustness-041's blind spot, herdr
+    /// its session id is empty — which is robustness-041's blind spot, a backend
     /// unable to see a live agent without a rendered pane. `pick` has nothing to
     /// go on and correctly refuses. A minted handle is matched against itself
     /// and needs neither.
@@ -3291,9 +3055,9 @@ mod tests {
     /// record for is still addressed, because the handle never needed the record.
     ///
     /// This is robustness-049's deterministic half and the row below is what was
-    /// measured on 2026-08-17: herdr's `agent.list` carries an agent's `name` and
-    /// its session, `pane.list` carries neither, and `Herdr::census` falls back
-    /// to the pane row for exactly the seat whose agent it has lost sight of —
+    /// measured on 2026-08-17: `agent.list` carried an agent's `name` and its
+    /// session, `pane.list` carried neither, and the census fell back to the
+    /// pane row for exactly the seat whose agent it has lost sight of —
     /// which is the seat every failed spawn asks about. So the old reading minted
     /// from an empty name, got a handle that is only the seat, and matched
     /// nothing; `pick` had no session id and a worktree it could not prove was
@@ -3548,7 +3312,7 @@ mod tests {
         let argv = of("claude").args(&sp);
         let n = argv.len();
         assert_eq!(&argv[n - 2..], ["--", "-dash order second line"], "after `--`, on one line");
-        assert!(argv.iter().all(|a| !a.contains('\n')), "herdr refuses a control character in an arg");
+        assert!(argv.iter().all(|a| !a.contains('\n')), "a control character in an arg is refused");
         let bare = of("claude").args(&spawn(false, "wsp-476", &seat));
         assert!(!bare.contains(&"--".to_string()), "no order, no `--`");
         assert!(of("claude").turn_marks_ready() && !of("pi").turn_marks_ready());
@@ -3843,8 +3607,7 @@ mod tests {
     /// denies would be the worst trade in this file. What cannot be asserted
     /// from here is the third and most important one, because it is opencode's
     /// behaviour and not wsp's: that this **merges** with the machine config
-    /// rather than replacing it, so
-    /// `~/.config/opencode/plugins/herdr-agent-state.js` survives. Driven
+    /// rather than replacing it, so the machine's own opencode plugins survive. Driven
     /// instead — see the note in [`config`].
     #[test]
     fn the_brief_arrives_on_the_same_variable_as_the_policy_and_does_not_disturb_it() {
@@ -4196,7 +3959,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
         let argv = of("claude").args(&packet);
         let at = |flag: &str| argv.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag} in {argv:?}"));
         assert_eq!(argv[at("--tools") + 1], "Bash,Read,Edit,Write", "Write, so a new file is not a heredoc");
-        assert!(!argv[at("--system-prompt") + 1].contains('\n'), "herdr refuses control characters in an arg");
+        assert!(!argv[at("--system-prompt") + 1].contains('\n'), "control characters in an arg are refused");
         assert!(argv.contains(&"--disable-slash-commands".to_string()) && argv.contains(&"--strict-mcp-config".to_string()));
         assert!(!argv.contains(&"--disallowedTools".to_string()), "the allowlist replaces the trim");
         assert_eq!(&argv[argv.len() - 2..], ["-n", "t-1-w2J:p1"], "still addressable");
@@ -4547,20 +4310,20 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     }
 
     /// The directory rule, which is the one thing here that is a guess about
-    /// somebody else's layout — hence the scan behind it in [`transcript`].
+    /// somebody else's layout — hence the scan behind it in [`Host::transcript_of`].
     #[test]
     fn a_cwd_becomes_a_directory_name_the_way_claude_code_spells_one() {
-        assert_eq!(mangle("/Users/ed/claude/wsp/.worktrees/wsp-060"), "-Users-ed-claude-wsp--worktrees-wsp-060");
-        assert_eq!(mangle("/Users/ed/.local/state"), "-Users-ed--local-state");
+        assert_eq!(host::mangle("/Users/ed/claude/wsp/.worktrees/wsp-060"), "-Users-ed-claude-wsp--worktrees-wsp-060");
+        assert_eq!(host::mangle("/Users/ed/.local/state"), "-Users-ed--local-state");
     }
 
-    /// A session id arrives from herdr, which got it from the agent, and
+    /// A session id arrives from the backend, which got it from the agent, and
     /// `spawn` is a verb agents drive. One with a path separator in it is not a
     /// session id, and refusing it is cheaper than finding out what it opened.
     #[test]
     fn a_session_id_that_is_not_one_never_reaches_the_filesystem() {
-        assert!(transcript("../../etc/passwd", "/tmp").is_none());
-        assert!(transcript("", "/tmp").is_none());
+        assert!(host::LOCAL.transcript_of("../../etc/passwd", "/tmp").is_none());
+        assert!(host::LOCAL.transcript_of("", "/tmp").is_none());
     }
 
     /// The same, one layer along: an opencode id reaches a command line rather
@@ -4568,9 +4331,9 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     /// never gets there.
     #[test]
     fn a_session_id_that_is_not_one_never_reaches_a_command_line() {
-        assert!(export("--help").is_none());
-        assert!(export("ses_a b").is_none());
-        assert!(export("").is_none());
+        assert!(host::LOCAL.opencode_export("--help").is_none());
+        assert!(host::LOCAL.opencode_export("ses_a b").is_none());
+        assert!(host::LOCAL.opencode_export("").is_none());
     }
 
     /// The defect this row found, and the reason every token total in wsp was
@@ -4941,7 +4704,7 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     /// which is the whole of why the fact lives here rather than in the panel.
     /// Claude Code's `/clear` is unchanged from the day it was written; the
     /// opencode spelling is the one render-062 drove, and it carries its own
-    /// wait semantics with it: herdr sees no replacement session until the
+    /// wait semantics with it: the backend sees no replacement session until the
     /// next prompt, so waiting for one would be a stall with nothing at the
     /// end. A kind nobody has measured answers `None`, and a caller that
     /// respects that offers nothing rather than typing a guess at somebody's
@@ -4966,11 +4729,11 @@ openrouter  z-ai/glm-5.3:batch                                  1.0M     131.1K 
     #[test]
     fn pi_session_dir_name_mangles_the_cwd_as_pi_does() {
         assert_eq!(
-            pi_session_dir_name("/Users/jesper/src/private/wsp"),
+            host::pi_session_dir_name("/Users/jesper/src/private/wsp"),
             "--Users-jesper-src-private-wsp--"
         );
         assert_eq!(
-            pi_session_dir_name("/private/tmp/pi-005-resume"),
+            host::pi_session_dir_name("/private/tmp/pi-005-resume"),
             "--private-tmp-pi-005-resume--"
         );
     }

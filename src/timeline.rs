@@ -13,6 +13,7 @@
 
 use serde_json::{json, Value};
 
+use crate::host::Host;
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
@@ -83,6 +84,16 @@ pub(crate) struct Inputs {
     /// The stretches a person parked the row's whole list (`worklist-parked` to
     /// `worklist-resumed`), which no row's own log says.
     pub parks: Vec<Park>,
+    /// The stretches the row's list stood held (`worklist-held` to the
+    /// `worklist-go` or `worklist-resumed` that took it back), `(start, end,
+    /// why)`: inside a barrier's check seat, a person's step and not the seat's
+    /// work (`wsp-090`).
+    pub holds: Vec<(i64, i64, String)>,
+    /// The group's barrier check seats as their own readings have them, `(group,
+    /// opened, ended)`: `ended` is the seat's stop (its burn reading's `ended`,
+    /// what `standing_seats` reads), 0 where none is read. A hold written while
+    /// the seat was still open starts at that stop (`wsp-090`).
+    pub check_ends: Vec<(usize, i64, i64)>,
 }
 
 /// One park of a list, from its park event to the resume that took it back.
@@ -109,16 +120,45 @@ impl Park {
 
 /// The parks of a list, read off the event log.
 pub(crate) fn list_parks(store: &Store, list: &str) -> Vec<Park> {
+    parks_of(&list_events(store, &["worklist-parked", "worklist-resumed"]), list, util::epoch_secs())
+}
+
+/// The events of the kinds named, off the event log, for any list.
+pub(crate) fn list_events(store: &Store, kinds: &[&str]) -> Vec<(i64, String, Value)> {
     let mut ev: Vec<(i64, String, Value)> = Vec::new();
     if let Ok(text) = std::fs::read_to_string(store.state_file("events.jsonl")) {
-        for line in text.lines().filter(|l| l.contains("\"worklist-parked\"") || l.contains("\"worklist-resumed\"")) {
+        for line in text.lines().filter(|l| kinds.iter().any(|k| l.contains(&format!("\"{k}\"")))) {
             let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
             if let (Some(ts), Some(kind)) = (v["ts"].as_str(), v["kind"].as_str()) {
                 ev.push((util::epoch_of(ts), kind.to_string(), v["data"].clone()));
             }
         }
     }
-    parks_of(&ev, list, util::epoch_secs())
+    ev
+}
+
+/// The holds of `list` in an event log's lines, in order, `(start, end, why)`:
+/// from a `worklist-held` to the first `worklist-go` or `worklist-resumed`
+/// after it; one with neither after it runs to `now`. A hold taken again while
+/// held is the same hold.
+pub(crate) fn holds_of(events: &[(i64, String, Value)], list: &str, now: i64) -> Vec<(i64, i64, String)> {
+    let mut at: Vec<&(i64, String, Value)> = events.iter().filter(|(_, k, d)| matches!(k.as_str(), "worklist-held" | "worklist-go" | "worklist-resumed") && d["id"].as_str() == Some(list)).collect();
+    at.sort_by_key(|e| e.0);
+    let mut out: Vec<(i64, i64, String)> = Vec::new();
+    let mut open: Option<(i64, String)> = None;
+    for (t, kind, d) in at {
+        if kind == "worklist-held" {
+            if open.is_none() {
+                open = Some((*t, d["why"].as_str().unwrap_or_default().trim().to_string()));
+            }
+        } else if let Some((s, why)) = open.take() {
+            out.push((s, *t, why));
+        }
+    }
+    if let Some((s, why)) = open {
+        out.push((s, now.max(s), why));
+    }
+    out
 }
 
 /// The parks of `list` in an event log's lines, in order. A park with no resume
@@ -205,6 +245,9 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
         // waited on, by whom and why, not nothing the logs name (`wsp-645`:
         // wsp-635's 65m between its check and the verifier's spawn).
         format!("{PARKED_LIST} — {}", park.words())
+    } else if let Some((_, _, why)) = (span > TICK + HAND_OFF && who == i.id).then(|| capped_reopen(i, from, to)).flatten() {
+        // The log has the reopen and the cap: that is what the step waited on.
+        why
     } else if span <= HAND_OFF {
         "the hand-off (a poke and a spawn)".into()
     } else if span <= TICK + HAND_OFF {
@@ -217,6 +260,55 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
 
 /// The cause of a stretch a person's park of the whole list covered.
 pub(crate) const PARKED_LIST: &str = "the list parked";
+
+/// The cause of the stretch from a leg's seat ending to the leg's close
+/// (`wsp-016`): the seat came up, worked and ended, and the leg's line stayed
+/// `running` with nobody in it. Not work.
+pub(crate) const LEG_SEAT_ENDED: &str = "a leg's seat ended, the leg not closed";
+
+/// The cause of the stretch from a reopen of a row at the leg cap to the next
+/// seat on it (`wsp-016`, the case in `wsp-011`): no rework leg can be added and
+/// the run seats no member, so nothing runs until a person starts one.
+pub(crate) const CAPPED_REOPEN: &str = "reopened at the leg cap with no member seated";
+
+/// The seat that came up for the row at `up` (its `session-learned`), and when
+/// it ended, where the cycle log says: the time its exit was accepted, or the
+/// line that ended it.
+fn seat_ended_after(i: &Inputs, up: i64) -> Option<(String, i64)> {
+    let pane = i.kind("session-learned", &i.id).into_iter().find(|(t, _)| *t == up).and_then(|(_, d)| d["pane"].as_str().map(str::to_string))?;
+    let exit = format!("{} ", crate::ending::EXIT_ENDED);
+    let named = format!(", {pane})");
+    let ended = format!("ended {pane}");
+    let at = i.cycle.iter().filter(|(t, _)| *t >= up).find_map(|(t, l)| {
+        if let Some((_, rest)) = l.split_once(&exit) {
+            let (at, tail) = rest.split_once(" (")?;
+            let accepted = util::epoch_of(at);
+            // The exit was accepted before the line that ended its seat.
+            let when = if accepted >= up && accepted <= *t { accepted } else { *t };
+            return tail.split_once(')').is_some_and(|(who, _)| format!(", {who})").ends_with(&named)).then_some(when);
+        }
+        (l == &ended || l.starts_with(&format!("{ended},"))).then_some(*t)
+    })?;
+    Some((pane, at))
+}
+
+/// The first reopen of the row at the leg cap inside `from..to`: the reopen,
+/// where the stretch with no member seated ends (the next claim or seat up,
+/// else `to`), and its cause. A second reopen before a seat is the same wait.
+fn capped_reopen(i: &Inputs, from: i64, to: i64) -> Option<(i64, i64, String)> {
+    if i.legs.iter().filter(|l| !l.skipped).count() < crate::legs::MAX_LEGS {
+        return None;
+    }
+    let id = i.id.as_str();
+    let at = i.events.iter().filter(|(t, k, d)| (k == "task-reopen" || k == "task-reopened") && d["id"] == id && *t >= from && *t < to).map(|(t, _, _)| *t).min()?;
+    let seated = i.events.iter().filter(|(t, k, d)| (k == "task-claimed" || k == "session-learned") && d["id"] == id && *t >= at).map(|(t, _, _)| *t).min();
+    let end = seated.map_or(to, |s| s.min(to));
+    let until = match seated.filter(|s| *s <= to) {
+        Some(s) => format!("until a seat was claimed at {}", clock(s)),
+        None => format!("still unseated at {}", clock(to)),
+    };
+    Some((at, end, format!("{CAPPED_REOPEN} — reopened at {} at the {}-leg cap: no rework leg could be added and the run seats no member, {until}", clock(at), crate::legs::MAX_LEGS)))
+}
 
 /// Seconds of `from..to` a park covers.
 fn parked_within(p: &Park, from: i64, to: i64) -> i64 {
@@ -600,13 +692,36 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                 out.push(Phase::gap(label, from, s, wait_name(i, from, s, id)));
             }
         }
-        let up = i.first_learned_after(s);
+        // A seat that came up only after the leg had ended is not this leg's.
+        let up = i.first_learned_after(s).filter(|u| finished.is_none_or(|f| *u <= f));
+        if let (None, Some(f)) = (up, finished) {
+            // No seat ever came up for the leg: the stretch is not work.
+            out.push(Phase::gap(format!("leg {} (no seat came up)", leg.name), s, f, format!("leg {}: no seat came up (not work)", leg.name)));
+            done.push((leg.name.clone(), f));
+            last_end = Some(last_end.map_or(f, |e| e.max(f)));
+            continue;
+        }
         let label = match up {
             Some(u) => format!("leg {} (seat up after {}s)", leg.name, u - s),
             None => format!("leg {}", leg.name),
         };
         if let Some(f) = finished {
-            out.push(Phase::work(label, s, f));
+            // A leg runs only while its seat is alive: a seat that ended before
+            // the leg was closed leaves the rest of the leg's line `running`
+            // with nobody in it (wsp-001's `finish`: cpd-121 ended at its Stop,
+            // the line read `running` an hour more).
+            match up.and_then(|u| seat_ended_after(i, u)).filter(|(_, e)| *e < f) {
+                Some((seat, e)) => {
+                    out.push(Phase::work(label, s, e));
+                    out.push(Phase::gap(
+                        format!("leg {}: its seat {seat} ended at {}, the leg not closed", leg.name, clock(e)),
+                        e,
+                        f,
+                        format!("{LEG_SEAT_ENDED} — {seat} ended at {} (not work)", util::iso_at(e)),
+                    ));
+                }
+                None => out.push(Phase::work(label, s, f)),
+            }
             done.push((leg.name.clone(), f));
             last_end = Some(last_end.map_or(f, |e| e.max(f)));
             if let (Some(b), Some((closed, _, d))) = (baton_at, done_event) {
@@ -634,7 +749,21 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let review = reviews.iter().copied().rev().find(|r| verdicts.iter().any(|v| v >= r)).or_else(|| reviews.last().copied());
     if let (Some(r), Some(e)) = (review, last_end) {
         if r > e {
-            out.push(Phase::gap("after the last leg → review typed", e, r, "the row's own seat finishing (not wsp)".into()));
+            let finishing = || "the row's own seat finishing (not wsp)".to_string();
+            match capped_reopen(i, e, r).filter(|(at, end, _)| end > at) {
+                // A reopen at the leg cap in it: from the reopen to the next seat
+                // nobody was on the row, and the log says why (`wsp-016`).
+                Some((at, end, why)) => {
+                    if at > e {
+                        out.push(Phase::gap("after the last leg → reopened", e, at, finishing()));
+                    }
+                    out.push(Phase::gap("reopened at the leg cap → a seat started", at, end, why));
+                    if r > end {
+                        out.push(Phase::gap("seat started → review typed", end, r, finishing()));
+                    }
+                }
+                None => out.push(Phase::gap("after the last leg → review typed", e, r, finishing())),
+            }
         }
     }
     let verdict = verdicts.iter().copied().find(|t| review.is_none_or(|r| *t >= r));
@@ -771,7 +900,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                         if u > *e {
                             out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), *e, u, wait_name(i, *e, u, &who)).shared());
                         }
-                        out.push(Phase::work(format!("barrier {at} check seat → settled (follow-ups added)"), u, d).shared());
+                        out.extend(check_seat(i, format!("barrier {at} check seat → settled (follow-ups added)"), u, d, &list, *at));
                     }
                 }
                 prev = *e;
@@ -783,7 +912,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                     out.push(Phase::gap(format!("barrier {at} run ended → check seat started"), end, b, wait_name(i, end, b, &who)).shared());
                 }
                 if let Some(p) = pass.filter(|p| *p >= b) {
-                    out.push(Phase::work(format!("barrier {at} check seat → passed"), b, p).shared());
+                    out.extend(check_seat(i, format!("barrier {at} check seat → passed"), b, p, &list, *at));
                 }
             } else if let Some(p) = pass.filter(|p| *p >= end) {
                 out.push(Phase::work(format!("barrier {at} run ended → passed"), end, p).shared());
@@ -799,6 +928,62 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     out.sort_by_key(|p| (p.start, p.end));
     out
 }
+
+/// A barrier's check seat from `from` to `to`, less the stretches its list
+/// stood held inside it (`wsp-090`): a check that holds the barrier for a
+/// person's step has done its work, and the night until a person's `go` is the
+/// group waiting on that step under its own cause, not the check seat's time
+/// (s0-state-core's barrier 3 booked 741 min as its check seat, 23 of them the
+/// seat's).
+fn check_seat(i: &Inputs, label: String, from: i64, to: i64, list: &str, at: usize) -> Vec<Phase> {
+    let hhmm = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+    let mut out = Vec::new();
+    let mut cur = from;
+    for (a, b, why) in i.holds.iter().filter(|(a, b, _)| *b > from && *a < to) {
+        let (written, b) = ((*a).max(cur), (*b).min(to));
+        // The seat that wrote the hold stays the check seat until it stops.
+        let a = seat_stop(i, list, at, written, b).map_or(written, |e| e.max(written));
+        if b <= a {
+            continue;
+        }
+        let stopped = if a > written { format!(" (the check seat stopped at {})", hhmm(a)) } else { String::new() };
+        if a > cur {
+            out.push(Phase::work(label.clone(), cur, a).shared());
+        }
+        let why: String = why.chars().take(200).collect();
+        let until = if b < to { format!("started again at {}", hhmm(b)) } else { "still held at the pass".to_string() };
+        let cause = format!(
+            "{}{HELD_FOR_STEP} — barrier {at} of {list} held at {}{stopped}, {until}{}",
+            crate::wallbuckets::BARRIER_HOLD,
+            hhmm(written),
+            if why.is_empty() { String::new() } else { format!(": {why}") }
+        );
+        out.push(Phase::gap(format!("barrier {at} held → started again"), a, b, cause).shared());
+        cur = b;
+    }
+    if to > cur || out.is_empty() {
+        out.push(Phase::work(label, cur, to).shared());
+    }
+    out
+}
+
+/// When the check seat open at `held` stopped, before `until`: the latest stop
+/// its reading records for a seat of barrier `at` opened by then, else the first
+/// `stopped in barrier check tree …<list>-check-<at>` line at or after `held`.
+/// `None`: no seat was open, or none is read to have stopped.
+fn seat_stop(i: &Inputs, list: &str, at: usize, held: i64, until: i64) -> Option<i64> {
+    let read = i.check_ends.iter().filter(|(g, o, e)| *g == at && *o <= held && *e > held).map(|(_, _, e)| *e).max();
+    let tree = format!("/{list}-check-{at}");
+    let line = || i.first_line(held, |l| l.starts_with(STOPPED_CHECK) && l.split(':').next().is_some_and(|p| p.ends_with(&tree)));
+    read.or_else(line).map(|e| e.min(until))
+}
+
+/// The line the sweep writes when it stops a barrier check tree's processes.
+const STOPPED_CHECK: &str = "stopped in barrier check tree ";
+
+/// What a barrier's hold is booked under, after [`crate::wallbuckets::BARRIER_HOLD`]:
+/// the list held inside its check seat, for a person's step (`wsp-090`).
+pub(crate) const HELD_FOR_STEP: &str = "held for a person's step";
 
 /// The row's own check runs that began with a review inside `from..to`: each
 /// review typed there, with the `task-checked` that ended its run before the
@@ -926,19 +1111,27 @@ fn names(line: &str, id: &str) -> bool {
     false
 }
 
-/// A session's Claude Code transcript, whole.
+/// A session's Claude Code transcript, whole, wherever it ran: the session id
+/// alone finds it, so no cwd is given.
 fn transcript(session: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    transcript_under(&std::path::Path::new(&home).join(".claude/projects"), session)
+    transcript_at(&crate::host::LOCAL.transcript_of(session, "")?)
 }
 
-fn transcript_under(root: &std::path::Path, session: &str) -> Option<String> {
-    for dir in std::fs::read_dir(root).ok()?.flatten() {
-        if let Ok(text) = std::fs::read_to_string(dir.path().join(format!("{session}.jsonl"))) {
-            return Some(text);
-        }
-    }
-    None
+/// A transcript file, whole, read through the host.
+fn transcript_at(file: &std::path::Path) -> Option<String> {
+    String::from_utf8(crate::host::LOCAL.transcript_bytes(file)?).ok()
+}
+
+/// A seat's first act (`wsp-066`): the first stamp in its transcript, named
+/// by an absolute path (a seat's `burn.json`) or a bare session id (the
+/// ledger's). `None` where neither is found.
+pub(crate) fn first_act(transcript_or_session: &str) -> Option<i64> {
+    let text = match transcript_or_session {
+        "" => return None,
+        t if t.starts_with('/') => transcript_at(std::path::Path::new(t))?,
+        s => transcript(s)?,
+    };
+    first_stamp(&text)
 }
 
 /// The first line of a transcript that carries a time: the seat's first act.
@@ -1036,7 +1229,8 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             }
             let (ts, rest) = line.split_at(20);
             let rest = rest.trim_start();
-            if names(rest, id) || list.as_deref().is_some_and(|l| names(rest, l) && (rest.contains("barrier") || rest.contains("Barrier") || rest.contains("--check"))) {
+            let stopped = |l: &str| rest.starts_with(STOPPED_CHECK) && rest.contains(&format!("{l}-check-"));
+            if names(rest, id) || list.as_deref().is_some_and(|l| stopped(l) || (names(rest, l) && (rest.contains("barrier") || rest.contains("Barrier") || rest.contains("--check")))) {
                 i.cycle.push((util::epoch_of(ts), rest.to_string()));
             }
         }
@@ -1048,7 +1242,18 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .collect();
     }
     if let Some(l) = &list {
-        i.parks = list_parks(store, l);
+        let ev = list_events(store, &["worklist-parked", "worklist-resumed", "worklist-held", "worklist-go"]);
+        i.parks = parks_of(&ev, l, util::epoch_secs());
+        i.holds = holds_of(&ev, l, util::epoch_secs());
+        if let Some(w) = store.worklist(l) {
+            for (n, g) in w.groups().iter().enumerate() {
+                for c in &g.checks {
+                    let Some(pane) = c.pane.as_deref() else { continue };
+                    let ended = crate::cmd_burn::reading_in(&store.state, pane).and_then(|r| r["ended"].as_str().map(util::epoch_of)).filter(|t| *t > 0).unwrap_or(0);
+                    i.check_ends.push((n + 1, util::epoch_of(&c.at), ended));
+                }
+            }
+        }
     }
     i.group = group;
     // The seats a cap line named as holders, and when they ended.
@@ -1294,7 +1499,7 @@ pub(crate) struct GovSource {
 
 fn read_source(src: &GovSource) -> Option<String> {
     if src.transcript.starts_with('/') {
-        std::fs::read_to_string(&src.transcript).ok()
+        transcript_at(std::path::Path::new(&src.transcript))
     } else {
         transcript(&src.transcript)
     }
@@ -2178,6 +2383,88 @@ mod tests {
     }
 
     #[test]
+    fn a_leg_with_no_seat_is_a_gap_not_work() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k != "session-learned");
+        let ph = build(&i);
+        let leg = ph.iter().find(|p| p.label.starts_with("leg a (no seat")).expect("the leg is named");
+        assert!(leg.gap && leg.seconds() > 0, "{leg:?}");
+        assert!(!ph.iter().any(|p| !p.gap && p.label.starts_with("leg a")), "{ph:?}");
+    }
+
+    /// A leg whose seat came up, worked and ended before the leg was closed
+    /// (`wsp-016`): the leg is work up to the seat's end, and the rest is a gap
+    /// named for the seat and when it ended.
+    #[test]
+    fn a_leg_whose_seat_ended_before_its_close_is_work_to_the_end_then_a_gap() {
+        let mut i = row();
+        for e in i.events.iter_mut().filter(|(t, k, _)| *t == 200 && k == "session-learned") {
+            e.2 = json!({"id": "r-1", "pane": "cpd-121"});
+        }
+        i.cycle.push((250, format!("r-1: {} {} (member, cpd-121), no pid of it running and its tree kept", crate::ending::EXIT_ENDED, util::iso_at(240))));
+        i.cycle.sort_by_key(|(t, _)| *t);
+        let ph = build(&i);
+        let work = ph.iter().find(|p| !p.gap && p.label.starts_with("leg a")).expect("the leg's work");
+        assert_eq!((work.start, work.end), (190, 240), "{ph:?}");
+        let gap = ph.iter().find(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(LEG_SEAT_ENDED))).expect("the stretch after the seat is named");
+        assert_eq!((gap.start, gap.end), (240, 300));
+        let why = gap.waiting_for.as_deref().unwrap();
+        assert!(why.contains("cpd-121") && why.contains(&util::iso_at(240)), "{why}");
+    }
+
+    /// A seat that ended after the leg was closed changes nothing.
+    #[test]
+    fn a_leg_whose_seat_ended_after_its_close_is_work_to_the_close() {
+        let mut i = row();
+        for e in i.events.iter_mut().filter(|(t, k, _)| *t == 200 && k == "session-learned") {
+            e.2 = json!({"id": "r-1", "pane": "cpd-121"});
+        }
+        i.cycle.push((302, "ended cpd-121, which ran leg a of r-1".into()));
+        i.cycle.sort_by_key(|(t, _)| *t);
+        let ph = build(&i);
+        let work = ph.iter().find(|p| !p.gap && p.label.starts_with("leg a")).expect("the leg's work");
+        assert_eq!((work.start, work.end), (190, 300));
+        assert!(!ph.iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(LEG_SEAT_ENDED))), "{ph:?}");
+    }
+
+    /// wsp-004 (`wsp-016`, the case in `wsp-011`): a row at the 8-leg cap is
+    /// reopened, no rework leg can be added and no member is seated, so the
+    /// step does not run. The log has the reopen: that is what it waited on,
+    /// not nothing the logs name.
+    #[test]
+    fn a_reopen_at_the_leg_cap_with_no_member_seated_is_named_from_the_log() {
+        let mut i = row();
+        i.legs = (0..crate::legs::MAX_LEGS).map(|n| LegIn { name: format!("l{n}"), ..Default::default() }).collect();
+        i.events.push(ev(1000, "task-reopen", json!({"id": "r-1"})));
+        let why = wait_name(&i, 990, 1545, "r-1");
+        assert!(why.starts_with(CAPPED_REOPEN) && why.contains("still unseated"), "{why}");
+        i.events.push(ev(1500, "task-claimed", json!({"id": "r-1"})));
+        let why = wait_name(&i, 990, 1545, "r-1");
+        assert!(why.starts_with(CAPPED_REOPEN) && why.contains(&format!("claimed at {}", clock(1500))), "{why}");
+        // Under the cap a reopen adds a rework leg and the run starts it: not this case.
+        i.legs.truncate(3);
+        assert!(wait_name(&i, 990, 1545, "r-1").starts_with("nothing the logs"));
+    }
+
+    /// The stretch after the last leg that holds a capped reopen: from the reopen
+    /// to the next seat it is named for the reopen, not the seat finishing.
+    #[test]
+    fn a_capped_reopen_after_the_last_leg_is_split_out_of_the_seat_finishing() {
+        let mut i = row();
+        i.legs.extend((1..crate::legs::MAX_LEGS).map(|n| LegIn { name: format!("l{n}"), skipped: false, after: vec!["x".into()] }));
+        // Only leg a starts; the review comes late, after a reopen and a claim.
+        i.events.retain(|(_, k, _)| k != "task-review" && k != "task-verified");
+        i.events.push(ev(400, "task-reopened", json!({"id": "r-1"})));
+        i.events.push(ev(700, "task-claimed", json!({"id": "r-1"})));
+        i.events.push(ev(800, "task-review", json!({"id": "r-1"})));
+        let ph = build(&i);
+        let capped = ph.iter().find(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(CAPPED_REOPEN))).expect("the reopen is named");
+        assert_eq!((capped.start, capped.end), (400, 700), "{ph:?}");
+        assert!(ph.iter().any(|p| p.gap && (p.start, p.end) == (300, 400)), "{ph:?}");
+        assert!(ph.iter().any(|p| p.gap && (p.start, p.end) == (700, 800)), "{ph:?}");
+    }
+
+    #[test]
     fn a_leg_closed_late_is_timed_to_its_baton_and_the_stall_is_a_gap_not_work() {
         let mut i = row();
         for e in i.events.iter_mut().filter(|(_, k, d)| k == "leg-done" && d["leg"] == "a") {
@@ -2336,6 +2623,98 @@ mod tests {
         assert_eq!(g.barrier_run, 223 + 10, "{g:?}");
         assert!(g.waits.iter().any(|((_, c), s)| c.starts_with(crate::wallbuckets::BARRIER_HOLD) && c.contains("m-abc") && *s >= 2500), "{g:?}");
         assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+    }
+
+    /// s0-state-core's barrier 3 (`wsp-090`): its check seat held the barrier
+    /// for a person's step at 21:10 on 11-17 and a person started it again at
+    /// 09:30 on 11-18; effort.json booked the night as the check seat, 741 min
+    /// of it, where the seat's own time was 23. Here the seat works 1260 s,
+    /// holds for 718 min, and passes 121 s after the `go`.
+    #[test]
+    fn a_barrier_held_for_a_persons_step_inside_its_check_seat_is_waiting_on_the_hold_not_the_check_seat() {
+        let mut i = row();
+        i.group = Some(("list".into(), 3, vec!["r-1".into()]));
+        let (seat, held, go) = (1010, 1010 + 1260, 1010 + 1260 + 718 * 60);
+        i.cycle.push((1000, "list group 3: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()));
+        i.cycle.push((seat, "spawn list --agent --check 3 --kind claude".into()));
+        i.cycle.push((go + 121, "tell list: Barrier 3 of list passed".into()));
+        let evs = vec![
+            (held, "worklist-held".to_string(), json!({"id": "list", "why": "the migration needs a person to run it on the box"})),
+            (held + 5, "worklist-held".to_string(), json!({"id": "other", "why": "not this list"})),
+            (go, "worklist-go".to_string(), json!({"id": "list", "passed": null, "started": true})),
+        ];
+        i.holds = holds_of(&evs, "list", 99_999_999);
+        assert_eq!(i.holds, vec![(held, go, "the migration needs a person to run it on the box".to_string())]);
+        let ph = build(&i);
+        let hold = ph.iter().find(|p| p.label == "barrier 3 held → started again").unwrap_or_else(|| panic!("{ph:?}"));
+        assert!(hold.gap && hold.shared && (hold.start, hold.end) == (held, go), "{hold:?}");
+        let why = hold.waiting_for.as_deref().unwrap_or_default();
+        assert!(why.starts_with(crate::wallbuckets::BARRIER_HOLD) && why.contains(HELD_FOR_STEP) && why.contains("barrier 3 of list") && why.contains("the migration"), "{why}");
+        let seats: Vec<i64> = ph.iter().filter(|p| p.shared && !p.gap && p.label.contains("check seat")).map(|p| p.seconds()).collect();
+        assert_eq!(seats, vec![1260, 121], "the seat before the hold and after the go: {ph:?}");
+
+        let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[r1], None, Some(go + 121)).unwrap();
+        assert_eq!(g.seconds("check_seat"), 10 + 1260 + 121, "the wait for the seat, its work, and the go to the pass: {g:?}");
+        let waited: i64 = g.waits.iter().filter(|((_, c), _)| c.contains(HELD_FOR_STEP) && c.contains("barrier 3 of list")).map(|(_, s)| s).sum();
+        assert_eq!(waited, 718 * 60, "the hold is its own waiting cause: {g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+    }
+
+    /// s0-state-core's barrier 3 as it ran (`wsp-090`, sent back): the check
+    /// seat opened at 21:08:59, wrote its hold 77 s later, and stayed open until
+    /// the sweep stopped it at 21:32:03; a person's `go` at 09:30:02 passed it.
+    /// The seat is the check seat to its stop, and the hold runs from that stop.
+    fn fixture_shaped(by_reading: bool) -> (Vec<Phase>, crate::wallbuckets::GroupWall, i64, i64) {
+        let mut i = row();
+        i.group = Some(("s0-state-core".into(), 3, vec!["r-1".into()]));
+        let (seat, held, stop) = (1010, 1010 + 77, 1010 + 1384);
+        let go = stop + 43_079;
+        i.cycle.push((1000, "s0-state-core group 3: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()));
+        i.cycle.push((seat, "spawn s0-state-core --agent --check 3 --kind claude".into()));
+        i.cycle.push((stop, "stopped in barrier check tree /c/trees/s0-state-core-check-3: TERM 3794".into()));
+        i.cycle.push((go, "tell s0-state-core: Barrier 3 of s0-state-core passed".into()));
+        if by_reading {
+            i.cycle.retain(|(_, l)| !l.starts_with(STOPPED_CHECK));
+            i.check_ends = vec![(2, 10, 900), (3, seat, stop)];
+        } else {
+            i.cycle.insert(0, (held + 10, "stopped in barrier check tree /c/trees/core-check-3: TERM 1".into()));
+        }
+        let evs = vec![
+            (held, "worklist-held".to_string(), json!({"id": "s0-state-core", "why": "a person runs the migration"})),
+            (go, "worklist-go".to_string(), json!({"id": "s0-state-core", "passed": 3, "started": true})),
+        ];
+        i.holds = holds_of(&evs, "s0-state-core", 99_999_999);
+        let ph = build(&i);
+        let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[r1], None, Some(go)).unwrap();
+        (ph, g, stop, go)
+    }
+
+    #[test]
+    fn a_check_seat_open_past_the_hold_it_wrote_is_the_check_seat_to_its_stop_and_the_hold_runs_from_there() {
+        for by_reading in [false, true] {
+            let (ph, g, stop, go) = fixture_shaped(by_reading);
+            let hold = ph.iter().find(|p| p.label == "barrier 3 held → started again").unwrap_or_else(|| panic!("{ph:?}"));
+            assert_eq!((hold.start, hold.end), (stop, go), "the hold runs from the seat's stop to the go ({by_reading}): {ph:?}");
+            assert!(hold.waiting_for.as_deref().is_some_and(|w| w.contains(&format!("held at {}", &util::iso_at(1087)[11..16])) && w.contains("the check seat stopped at")), "{hold:?}");
+            assert_eq!(g.seconds("check_seat"), 10 + 1384, "the wait for the seat and the seat open, 21:08:59 → 21:32:03 ({by_reading}): {g:?}");
+            let waited: i64 = g.waits.iter().filter(|((_, c), _)| c.contains(HELD_FOR_STEP) && c.contains("barrier 3 of s0-state-core") && c.contains("the migration")).map(|(_, s)| s).sum();
+            assert_eq!(waited, 43_079, "about 718 min, its own cause ({by_reading}): {g:?}");
+            assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+        }
+    }
+
+    #[test]
+    fn a_hold_with_no_go_after_it_runs_to_now_and_a_second_hold_while_held_is_the_same() {
+        let evs = vec![
+            (10, "worklist-held".to_string(), json!({"id": "l", "why": "a"})),
+            (20, "worklist-held".to_string(), json!({"id": "l", "why": "b"})),
+            (30, "worklist-resumed".to_string(), json!({"id": "l"})),
+            (40, "worklist-go".to_string(), json!({"id": "l"})),
+            (50, "worklist-held".to_string(), json!({"id": "l", "why": "c"})),
+        ];
+        assert_eq!(holds_of(&evs, "l", 90), vec![(10, 30, "a".to_string()), (50, 90, "c".to_string())]);
     }
 
     #[test]

@@ -14,11 +14,11 @@
 //! The output of the view layer is a **desired state** — a [`Spec`] — and not a
 //! sequence of calls. Something underneath reconciles the world to it, and that
 //! something is [`plan`], which is a pure function of what we saw and what we
-//! want. Nothing in this file talks to herdr.
+//! want. Nothing in this file talks to a runtime.
 //!
 //! # The sibling contract, and the line this port is on the other side of
 //!
-//! `place.rs` is the other herdr port (decision on robustness-026). It answers
+//! `place.rs` is the other runtime port (decision on robustness-026). It answers
 //! *start an agent on this task* and its first rule is that **nothing in it
 //! names a pane, a window, a tab or a terminal** — because a supervisor with no
 //! TTY has to be able to implement all of it.
@@ -26,7 +26,7 @@
 //! This port names panes on purpose, and a reader arriving from `place.rs` will
 //! otherwise think it is a mistake. It is not. Arranging panes is exactly what a
 //! program does when it *lives inside* a multiplexer, and every one of its ten
-//! herdr methods has its call site in `panel/` or `detail/` — wsp's own drawing
+//! multiplexer methods had its call site in `panel/` or `detail/` — wsp's own drawing
 //! code, standing in a pane, moving its own furniture. A backend with no screen
 //! does not implement a degraded version of this port; it implements none of it,
 //! and the view layer that would have produced a [`Spec`] produces a page or a
@@ -42,7 +42,7 @@
 //! `place.rs` lists this port's inheritance explicitly: `pane.split`,
 //! `pane.close`, `pane.focus`, `pane.layout`, `pane.swap`, `pane.send_text`,
 //! `tab.create`, `tab.close`, `tab.focus`, `workspace.focus`. Plus half of
-//! `pane.rename`: 081 demoted the claim-key use into the herdr adapter and left
+//! `pane.rename`: 081 demoted the claim-key use into the backend adapter and left
 //! the labelling done by `panel/install.rs:116`, `panel/verbs.rs:722`, `:777`,
 //! `:841`, `:922` and `detail/editors.rs:372` here — so this port needs a label
 //! verb of its own and does not inherit one.
@@ -50,7 +50,7 @@
 //! Eleven inbound, eight out, and the collapses are the design rather than
 //! tidying:
 //!
-//! | herdr method | fate |
+//! | multiplexer method | fate |
 //! |---|---|
 //! | `pane.list` + `pane.layout` | merged — [`Arrange::look`] |
 //! | `pane.split` + `tab.create` | merged — [`Arrange::open`], which takes a [`Where`] |
@@ -63,8 +63,8 @@
 //! **The three focus verbs are one verb** because no caller has ever wanted one
 //! of them. `panel/verbs.rs:698` calls `tab.focus` then `pane.focus`;
 //! `panel/run.rs:333` calls `workspace.focus` then `pane.focus`. Both are one
-//! sentence — *put this in front of me* — spelled twice because herdr's tree has
-//! three levels. Which levels have to be walked to make a pane visible is the
+//! sentence — *put this in front of me* — spelled twice because the multiplexer's
+//! tree had three levels. Which levels have to be walked to make a pane visible is the
 //! backend's business and nobody else's.
 //!
 //! **`pane.list` and `pane.layout` are one read** because they are never wanted
@@ -72,7 +72,7 @@
 //! the widest, having learned that "first in the list" is an arbitrary answer;
 //! `detail/run.rs:415` reads the rects to find the leftmost sibling, and says
 //! why in a line that is really this port's charter: *the geometry comes from
-//! herdr rather than from the layout this code happens to build, so it stays
+//! the multiplexer rather than from the layout this code happens to build, so it stays
 //! true if that layout ever changes.* A reading with no rect cannot answer
 //! either question.
 //!
@@ -93,8 +93,8 @@
 //! Focus is a statement about *what a person is looking at*. It is meaningless
 //! to a supervisor with no screen, so a port that must be implementable without
 //! one cannot carry it. `workspace.create`'s `focus` flag and `wsp spawn
-//! --focus` look like part of placing work only because herdr creates and
-//! shows in one call.
+//! --focus` look like part of placing work only because the multiplexer created
+//! and showed in one call.
 //!
 //! 081 priced the split at one extra call and a possible flicker. Under a spec
 //! that price is not paid at all: focus is not an extra call bolted onto the end
@@ -124,7 +124,7 @@
 //!
 //! It leaves one constraint on any backend implementing both ports: **a `Seat`
 //! and a [`Surface`] naming the same physical pane must be the same string.**
-//! herdr satisfies it for free — both are `w0:p3` — and a backend that does not
+//! A multiplexer whose ids are `w0:p3` for both satisfies it for free; a backend that does not
 //! must supply its own mapping, because otherwise wsp can start an agent it
 //! cannot then focus. Neither port parses the other's ids; they only have to
 //! agree.
@@ -174,13 +174,10 @@
 //! reason — a slot closed and remade is not the slot it replaces, so an op
 //! planned against the old one is refused rather than applied to the new pane.
 //!
-//! The generation used to be justified here by herdr reissuing pane ids, and
-//! that was the wrong argument for a rule that is right anyway. It guards
-//! *wsp's own* close-and-reopen: the reconciler plans against a slot and applies
-//! a beat later, and in between the pane it planned for can have been replaced.
-//! No property of herdr's numbering is involved, which is why the rule survived
-//! the numbering turning out to work differently (`robustness-084`; the
-//! measurement is in [`crate::place_herdr`]).
+//! The generation guards *wsp's own* close-and-reopen: the reconciler plans
+//! against a slot and applies a beat later, and in between the pane it planned
+//! for can have been replaced. No property of a backend's numbering is
+//! involved (`robustness-084`).
 //!
 //! And nothing is identified by position: `panel/install.rs:80` had to stop
 //! taking "first in the list" as "the pane to split off", which is D-53's
@@ -188,18 +185,19 @@
 //!
 //! **A binding is corroborated, not trusted — and the witness is not the
 //! label.** A generation on the slot says nothing about the [`Surface`] bound to
-//! it, and a surface *can* come round again: herdr's workspace counter is
-//! process-local and a restore reserves only `max(surviving) + 1`, so every id
-//! above that mark is handed out again and `w3:p1` with it (`robustness-084`).
+//! it, and a surface *can* come round again: the multiplexer this was written against
+//! kept a process-local workspace counter and a restore reserved only
+//! `max(surviving) + 1`, so every id above that mark was handed out again and
+//! `w3:p1` with it (`robustness-084`).
 //! [`plan`] used to read a bound surface that still resolved as ours, and so
 //! relabelled and re-pointed a pane in somebody else's workspace.
 //!
 //! So [`Held`] carries a **witness** — what the runtime says is *behind* a pane,
 //! recorded when the slot was bound — and [`Live::witness`] is what it says is
 //! behind it now. A binding is believed only while those two do not disagree.
-//! herdr supplies it for free as `terminal_id`, on every `pane.list` row.
-//! Measured against 0.8.0 on 2026-08-19 by driving a sandbox through the
-//! restarts rather than by reading it (`robustness-089`):
+//! The multiplexer supplied it as `terminal_id`, on every `pane.list` row,
+//! measured on 2026-08-19 by driving a sandbox through the restarts rather than
+//! by reading it (`robustness-089`):
 //!
 //! - It is per pane and never comes round. Four splits into one workspace, each
 //!   pane closed before the next: four ids, none reused.
@@ -242,7 +240,7 @@
 //! panes can implement this port at all.
 //!
 //! **2. Reconcile, never rebuild.** `panel/install.rs` opens with the scar:
-//! *never `layout.apply`: herdr rebuilds the whole tree from that call and every
+//! *never `layout.apply`: the multiplexer rebuilds the whole tree from that call and every
 //! pane in it gets a fresh terminal, which takes down any agent running in the
 //! workspace.* So the diff moves and swaps, and never recreates. Two
 //! consequences that are easy to miss:
@@ -256,8 +254,8 @@
 //!   is a second, separate decision by a person who has now said it twice.
 //!
 //! **3. Absence of evidence must not create.** This is robustness-015 inverted and
-//! it is the frightening one. That bug reaped every binding when herdr answered
-//! with an empty pane list. A reconciler handed the same empty list concludes
+//! it is the frightening one. That bug reaped every binding when the runtime
+//! answered with an empty pane list. A reconciler handed the same empty list concludes
 //! that *nothing exists* and opens everything — twenty-two agents, all at once,
 //! all real. The guard is the one `reconcile` already has
 //! (`cmd_agent::may_reap`): a world must have been **heard from** before
@@ -265,7 +263,7 @@
 //! different constructors and there is no `Default`, because the whole cost of
 //! this bug is a `Vec::new()` that looks like an answer.
 //!
-//! **4. In flight is a state, not a boolean.** herdr's agent lifecycle has three
+//! **4. In flight is a state, not a boolean.** An agent's lifecycle has three
 //! windows between "start it" and "talk to it"; `place.rs` names the first one
 //! [`crate::place::State::Starting`] because reading it as idle sent a work
 //! order into a pane still drawing its banner. A pane has the same window: the
@@ -290,21 +288,12 @@
 //! us. A declarative window manager that silently re-imposes geometry is
 //! resented for it.
 //!
-//! The first draft of this file said something stronger and false: that herdr
-//! has no resize outside `layout.apply`. It has `pane.resize` — direction,
-//! amount, no rebuild — and the reason it looked absent is the trap worth more
-//! than the fact. **`src/herdr.rs` is not a measurement of herdr.** wsp wraps
-//! about a third of the socket's methods, and `pane.resize`, `pane.move`,
-//! `pane.zoom`, `pane.neighbor`, `pane.edges`, `pane.focus_direction` and
-//! `pane.send_keys` are all in `herdr api schema --json` and in none of wsp.
-//! Reading capability off wsp's wrapper turns "we never needed it" into "it
-//! cannot be done", and a port is exactly the wrong file to make that mistake
-//! in: the whole document is a claim about what a backend must be able to do.
-//! Anything below asserting that the runtime cannot do something was checked
-//! against the schema, not against `herdr.rs`. (Found by the coordination seat
-//! reviewing this file, 2026-08-17.)
+//! A runtime that *can* resize does not change this: reading capability off
+//! wsp's own wrapper turns "we never needed it" into "it cannot be done", and a
+//! port is exactly the wrong file to make that mistake in — the whole document
+//! is a claim about what a backend must be able to do.
 //!
-//! **6. Two writers.** herdr's own UI changes panes underneath us — the same
+//! **6. Two writers.** The runtime's own UI changes panes underneath us — the same
 //! shape as the shared `.git/index` problem the store already had, and not a
 //! race that can be locked away. The answer is stated rather than hoped for:
 //! **the runtime wins, always.** wsp is authoritative over slots and never over
@@ -327,7 +316,7 @@
 //!   wsp's own state (`detail.json`) and no backend has ever heard of it.
 //!
 //! The reconciler needs none of the three, which is why it can be tested with no
-//! herdr, no processes and no clock.
+//! runtime, no processes and no clock.
 //!
 //! # What is deliberately absent
 //!
@@ -351,7 +340,7 @@
 //!   Rule 1's witness moves that line and is worth knowing about before the
 //!   observe half arrives, because it is the first evidence this port has ever
 //!   had on the question. A pane that is still there with a *different* witness
-//!   is a pane whose occupant was certainly replaced — after a herdr restart,
+//!   is a pane whose occupant was certainly replaced — after a runtime restart,
 //!   every one of them is. What the witness cannot say is whether the pane is
 //!   ours with a dead shell in it or a stranger's at a recycled id, so it is
 //!   half an answer: today both are treated the same way, by not believing the
@@ -401,7 +390,7 @@
 //! - **Reading a pane's contents.** `pane.read` is the observe half's
 //!   (robustness-016), and no arrange call site uses it.
 //! - **Migrating the call sites.** robustness-018's, exactly as it was for 081.
-//!   There is no herdr adapter here either, on purpose: an adapter written
+//!   There is no backend adapter here either, on purpose: an adapter written
 //!   before its two callers are known is a third opinion about what they need.
 
 #![allow(dead_code)]
@@ -426,10 +415,10 @@ pub const DRAW_PENDING_MS: u64 = 2_000;
 
 /// The runtime's handle for a pane, carried and never parsed.
 ///
-/// The same discipline as `place::Seat` and for the same reason: herdr's are
-/// `w0:p3` and `w0:p3@mb2`, a browser's would be a node id, and a seam that
-/// passes ids around as strings works where one that assumes herdr's *shape* of
-/// id does not.
+/// The same discipline as `place::Seat` and for the same reason: a
+/// multiplexer's are `w0:p3` and `w0:p3@mb2`, a browser's would be a node id,
+/// and a seam that passes ids around as strings works where one that assumes
+/// one backend's *shape* of id does not.
 ///
 /// Unlike a `Seat`, a surface is **not** durable and this port does not ask it
 /// to be — which is why identity is a [`Slot`] and a surface is only ever the
@@ -468,7 +457,7 @@ impl std::fmt::Display for Surface {
 /// the new pane by a reconciler that ran a beat late.
 ///
 /// It matters here more than it looks, and not for the reason first written
-/// down. The generation is not about herdr's numbering at all: the reconciler
+/// down. The generation is not about a backend's numbering at all: the reconciler
 /// plans against the world it read and applies against the world as it is, so a
 /// slot closed and remade in between must not swallow an op aimed at the pane it
 /// replaced. That race is wsp's own and needs no help from the backend.
@@ -517,7 +506,7 @@ pub struct Live {
     pub rect: Rect,
     /// What the runtime says is *behind* this pane right now. Rule 1's witness.
     ///
-    /// herdr's `terminal_id`, which is minted per pane, never comes round, and
+    /// A multiplexer's `terminal_id`, which is minted per pane, never comes round, and
     /// is fresh for every pane after a restart — including the panes whose ids
     /// survive one. Carried and never parsed, exactly like a [`Surface`], and
     /// only ever compared against another one read the same way.
@@ -619,7 +608,7 @@ impl Body {
     }
 }
 
-/// Which way a new pane goes, and what herdr's `ratio` means.
+/// Which way a new pane goes, and what a split's `ratio` means.
 ///
 /// The trap is in the ratio and it has bitten twice. **The target keeps
 /// `ratio`; the new pane gets the remainder.** `panel/install.rs:155` learned it
@@ -661,8 +650,8 @@ pub struct Want {
     pub label: String,
     pub at: Anchor,
     pub dir: Dir,
-    /// Creation-time only, by choice: see rule 5. herdr can resize a pane and
-    /// wsp declines to, because a width a person changed is a width they meant.
+    /// Creation-time only, by choice: see rule 5. A runtime may resize a pane
+    /// and wsp declines to, because a width a person changed is a width they meant.
     pub ratio: f64,
 }
 
@@ -741,7 +730,7 @@ impl Spec {
 /// pane with a view in it look identical from outside, and the difference
 /// decides whether the pane may be closed — so it is wsp's own record, written
 /// when the slot was opened, exactly as `panels.json` records what wsp installed
-/// rather than asking herdr what looks like a panel.
+/// rather than asking the runtime what looks like a panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub surface: Surface,
@@ -1251,8 +1240,8 @@ pub fn plan(world: &World, spec: &Spec) -> Plan {
 /// port to merge them for; two is a coincidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// Nothing answered. `herdr::available()`'s replacement, arriving from the
-    /// call that wanted it rather than a guard in front of it.
+    /// Nothing answered, arriving from the call that wanted an answer rather
+    /// than a guard in front of it.
     Unreachable(String),
     /// No such pane. Rule 6's ordinary outcome: somebody closed it under us.
     Gone(Surface),
@@ -1291,7 +1280,7 @@ pub enum Where {
 
 /// The screen wsp is standing in.
 ///
-/// Eight methods, from eleven herdr ones; the table in the module docs says
+/// Eight methods, from eleven multiplexer ones; the table in the module docs says
 /// which and why. Object-safe for the same reason `place::Place` is: the
 /// `Remote` decorator holds a `Box<dyn Arrange>` and qualifies ids on the way
 /// in, and a renderer is chosen at runtime rather than compiled in.
@@ -1355,7 +1344,7 @@ pub trait Arrange {
 
     /// Put a pane in front of the person, walking whatever tree it takes.
     ///
-    /// Three herdr calls behind one verb; see the module docs. A caller has
+    /// Three multiplexer calls behind one verb; see the module docs. A caller has
     /// never wanted "focus the tab but not the pane".
     fn focus(&self, surface: &Surface) -> Result<()>;
 
@@ -1376,7 +1365,7 @@ mod tests {
     use super::*;
 
     /// A pane with the runtime's own witness behind it. Every pane in these
-    /// tests has one, because every pane herdr reports has one — a `Live` with
+    /// tests has one, because every pane a multiplexer reports has one — a `Live` with
     /// an empty witness is the *other* case and is written out where it is meant.
     fn live(id: &str, label: &str, w: u32) -> Live {
         Live {
@@ -1604,7 +1593,7 @@ mod tests {
     /// distinction is the whole value of this test, because the reason is what a
     /// future reader will check before changing the behaviour.
     ///
-    /// herdr *can* resize: `pane.resize` takes a direction and an amount and
+    /// A runtime *can* resize: a resize takes a direction and an amount and
     /// rebuilds nothing. wsp declines to use it, because a width somebody
     /// dragged is a width they meant, and a reconciler that puts it back is one
     /// they will turn off. So a ratio applies once, at creation, and a resized
@@ -1625,7 +1614,7 @@ mod tests {
         }
     }
 
-    /// Rule 6. herdr's own UI moves panes underneath us and that is not a race
+    /// Rule 6. The runtime's own UI moves panes underneath us and that is not a race
     /// wsp can lock away, so every op that touches something that already exists
     /// carries the surface it was planned against. An executor that finds
     /// anything else refuses and re-reads.
@@ -1751,9 +1740,9 @@ mod tests {
         );
     }
 
-    /// Rule 1's second half, and the bug it was written for. herdr hands out a
-    /// workspace id above the surviving maximum again after a restart, so
-    /// `w3:p1` comes back on a workspace wsp has never seen. The binding still
+    /// Rule 1's second half, and the bug it was written for. A multiplexer
+    /// that hands out a workspace id above the surviving maximum again after a
+    /// restart brings `w3:p1` back on a workspace wsp has never seen. The binding still
     /// resolves and is still worthless: what is behind the pane is not what was
     /// behind it when the slot was bound, and relabelling and re-pointing it
     /// would be doing that to a stranger's work.

@@ -475,7 +475,9 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
                 reused += a;
                 ran_n += b;
                 for (item, ran) in items.iter().zip(ran) {
-                    if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_)) {
+                    if let Done::TreeMissing(_) = &ran.done {
+                        could_not.push(format!("{} — {}", u.project, check::why_failed(ran)));
+                    } else if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_)) {
                         failed.push(item.step.name.clone());
                         blames.push(blame(item, ran, &landed));
                     }
@@ -726,7 +728,7 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
     if std::fs::write(&file, &sentence).is_err() {
         return false;
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = wsp_base::util::self_exe() else { return false };
     if cfg!(test) {
         return false;
     }
@@ -735,8 +737,8 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
         .arg(&file)
         .args(["--caption", &caption])
         .env_remove(crate::base::seat::SEAT_ENV)
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("WSP_BACKEND_PANE_ID")
+        .env_remove("WSP_BACKEND_WORKSPACE_ID")
         .stdin(std::process::Stdio::null())
         .output()
         .map(|o| o.status.success())

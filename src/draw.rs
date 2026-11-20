@@ -14,12 +14,12 @@
 //!
 //! # Why two targets, and why the pair is the point
 //!
-//! A live herdr pane and a block of text for tests and storyboards. Neither is
+//! A live backend pane and a block of text for tests and storyboards. Neither is
 //! interesting alone — the terminal is what we already ship, and a text block is
 //! a debugging convenience. The pair is the falsifiable half of the whole
 //! partition, and it falsifies in one direction: **if a renderer can draw a view
 //! with nothing running, then the view really does carry what a renderer needs.**
-//! If a target has to reach past the view to the store or to herdr, the seam is
+//! If a target has to reach past the view to the store or to backend, the seam is
 //! in the wrong place, and the text block is what says so, on the day it is
 //! written, rather than the third target discovering it a year later.
 //!
@@ -33,7 +33,7 @@
 //! to be wrong. Both targets are handed the same [`Spec`] and both walk the same
 //! [`layout`]; what differs is how many cells they are usually given.
 //!
-//! - Standing in herdr, wsp's rendered panes are *separate processes* — `wsp
+//! - Standing in backend, wsp's rendered panes are *separate processes* — `wsp
 //!   view` in one pane, `wsp panel` in another. Each is handed a spec of one
 //!   pane, filling its own terminal, and the multiplexer composited the rest.
 //! - A storyboard has no multiplexer, so [`Block`] is handed the whole spec and
@@ -80,7 +80,7 @@
 //!
 //! It holds by construction rather than by discipline, and the seam holds the
 //! same line one layer down: `focused` does not reach the view layer either.
-//! herdr's two focus facts are carried on `live::Live`, beside the rows rather
+//! backend's two focus facts are carried on `live::Live`, beside the rows rather
 //! than inside them, because their only reader is the panel's event loop —
 //! picking the refresh interval, and deciding what a click means. A scheduling
 //! input travelling inside a view is one every renderer is handed and none of
@@ -88,25 +88,25 @@
 //!
 //! # The seam under this port, and why it is not the port's business
 //!
-//! This file names no herdr type, because [`Paint`] is a trait and the view
+//! This file names no backend type, because [`Paint`] is a trait and the view
 //! stays behind it. That was true before robustness-043 and did not mean much:
 //! all three views carried the runner's structs — `panel::Snapshot` held
-//! `Vec<herdr::Workspace>` and `Vec<herdr::Pane>`, `detail::Ctx` and
+//! `Vec<backend::Workspace>` and `Vec<backend::Pane>`, `detail::Ctx` and
 //! `kanban::Ctx` a pane list each — so the cost landed on whoever implemented
 //! the trait, and a canvas renderer for a phone would have had to link wsp's
-//! herdr socket client to compile.
+//! backend socket client to compile.
 //!
 //! It does not now. `crate::live` is where the socket call sits and
 //! `live::AgentRef` is what a view carries, so a target below this port is
 //! handed wsp's own types and nothing else. The rule that keeps it that way is
-//! falsifiable rather than argued: no `herdr::` in `panel/rows.rs`,
+//! falsifiable rather than argued: no `backend::` in `panel/rows.rs`,
 //! `detail/render.rs`, `kanban/mod.rs` or `story.rs`.
 //!
 //! # What is deliberately absent
 //!
 //! - **A view type.** [`Paint`] is a trait so that this file names none of the
 //!   three. A port that imported `Snapshot` would have tied the renderer to one
-//!   surface's answer, and — while the views still carried herdr — would have
+//!   surface's answer, and — while the views still carried backend — would have
 //!   made that dependency unavoidable rather than visible.
 //! - **Input.** A renderer draws; keys are `panel::keys` and `kanban::keys`,
 //!   and the state they mutate is the painter's — see [`Paint::paint`] taking
@@ -171,7 +171,7 @@ struct Region {
 
 /// Where a spec's panes end up, given an area to put them in.
 ///
-/// Pure, and the arithmetic is herdr's rather than ours — **the target keeps
+/// Pure, and the arithmetic is backend's rather than ours — **the target keeps
 /// `ratio` and the new pane gets the remainder** (`arrange::Dir`, learned twice:
 /// `panel/install.rs:155` and `panel/verbs.rs:862`). Getting this backwards
 /// offline would make every storyboard a picture of a layout we do not ship.
@@ -845,6 +845,7 @@ mod tests {
             kind: "claude".into(),
             name: "t-260816-092".into(),
             args: vec!["--dangerously-skip-permissions".into()],
+            key: None,
         };
         let said = describe(&Filler::Agent(a));
         assert_eq!(said, "claude on t-260816-092");

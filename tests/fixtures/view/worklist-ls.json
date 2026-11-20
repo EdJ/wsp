@@ -1,0 +1,43 @@
+[
+  {
+    "activity": "2026-11-18T11:06:40Z",
+    "after": null,
+    "at": 1,
+    "caption": {
+      "from": "title",
+      "text": "A list"
+    },
+    "created": "2026-11-18T11:06:40Z",
+    "flags": {
+      "held": false,
+      "parked": false,
+      "waiting_on_ed": false
+    },
+    "gone": [],
+    "groups": 2,
+    "id": "list-a",
+    "open": 2,
+    "outputs": [
+      {
+        "file": "work.html",
+        "kind": "html",
+        "name": "work",
+        "present": false
+      },
+      {
+        "file": "effort.html",
+        "kind": "html",
+        "name": "effort",
+        "present": false
+      }
+    ],
+    "outputs_dir": "<dir>/state/sandbox/wsp-golden/artefacts/list-a",
+    "planned": null,
+    "prio": "normal",
+    "segment": "running",
+    "status": "executing",
+    "stored": "running",
+    "title": "A list",
+    "unwritten": []
+  }
+]

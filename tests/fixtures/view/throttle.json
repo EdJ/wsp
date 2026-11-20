@@ -1,0 +1,31 @@
+{
+  "agents": null,
+  "builds": [],
+  "cores": 8,
+  "cpu_speed_limit": 100,
+  "hot_jobs": 2,
+  "hot_slots": 4,
+  "idle_secs": null,
+  "in_force": true,
+  "jobs": 3,
+  "load": [
+    1.5,
+    1.25,
+    1.0
+  ],
+  "load_warning": false,
+  "memory": {
+    "free_percent": 60,
+    "held": false,
+    "held_text": null,
+    "pageouts_per_min": null,
+    "swap_growth_mb_per_min": null,
+    "swap_total_mb": 4096,
+    "swap_used_mb": 512
+  },
+  "mode": "auto",
+  "slots": 2,
+  "suggested_agents": null,
+  "thermal_below": 70,
+  "thermally_limited": false
+}

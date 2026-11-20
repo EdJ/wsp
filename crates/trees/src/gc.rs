@@ -18,6 +18,7 @@
 //! two-week grace — plain `git gc`, never `prune --expire=now`.
 
 use std::path::{Path, PathBuf};
+use crate::host::Host;
 use std::process::Stdio;
 use wsp_base::calls::Command;
 use std::time::Duration;
@@ -50,8 +51,8 @@ fn pid_of(file: &Path) -> Option<u32> {
 }
 
 pub fn alive(pid: u32) -> bool {
-    pid != 0
-        && Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    // Could not ask reads as not alive, as it did before the Host.
+    crate::host::LOCAL.probe(pid).unwrap_or(false)
 }
 
 fn loose_in(git: &Path) -> usize {

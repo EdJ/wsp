@@ -102,7 +102,6 @@
 use serde_json::json;
 
 use crate::choices::Choices;
-use crate::herdr;
 use crate::message::{self, About, Kind, Landed, Message, Party, Shape, Waiting};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -134,10 +133,63 @@ pub fn ask(store: &Store, args: &Args) -> i32 {
     ask_with(store, args, &RealClock)
 }
 
+/// `wsp ask <row> --of <name> "…" --then "<step>"` (`wsp-098`) — a decision
+/// waiting on a named other party, who has no access to this store.
+///
+/// Recorded as an ask from the person (`from: human`) with `of: <name>`
+/// (lower-case) and `then: <step>`. Open, it is follow-up; once `wsp answer
+/// <id> --as <name>` closes it, it is needs-you with `then` as its action.
+/// Nobody is woken: no seat is asked. A reader tells it from a seat's ask by
+/// the `of` field; open or answered by `state`, and `answered_by` /
+/// `relayed_by` once answered.
+fn ask_of(store: &Store, args: &Args) -> i32 {
+    let name = args.get("of").unwrap_or_default().trim().to_lowercase();
+    if name.is_empty() {
+        eprintln!("wsp: --of takes the name of the party asked, e.g. `--of ed`");
+        return 2;
+    }
+    let then = args.get("then").unwrap_or_default().trim().to_string();
+    if then.is_empty() {
+        eprintln!("wsp: an ask --of {name} needs --then \"<step>\": what is done once {name} has answered");
+        return 2;
+    }
+    let Some(row) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp ask <row> --of <name> \"…\" --then \"<step>\"");
+        return 2;
+    };
+    let task = match store.task_or_why(&row) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let text = match crate::cmd_agent::prose(args, 1) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let mut q = Message::question(Party::Human, Kind::Note, &text, Waiting::new("", &task.id)).about(About::Task(task.id.clone()));
+    q.of = Some(name.clone());
+    q.then = Some(then);
+    if let Err(e) = message::raise(store, &q) {
+        eprintln!("wsp: {e}");
+        return 1;
+    }
+    if args.json() {
+        println!("{}", json!({ "id": q.id, "about": task.id, "of": name, "then": q.then }));
+    } else {
+        println!("? {}  asked of {name} · waiting · `wsp answer {} --as {name} \"…\"` records the reply", q.id, q.id);
+    }
+    0
+}
+
 /// [`ask`] with the clock a `--wait` reads passed in, so a test can be time.
 fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     if args.has("cancel") {
         return cancel(store, args);
+    }
+    if args.has("of") || args.has("then") {
+        return ask_of(store, args);
     }
     let Some(needle) = args.rest.first().cloned() else {
         return open(store, args);
@@ -757,6 +809,23 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         Ok(m) => m,
         Err(code) => return code,
     };
+    if args.has("step-done") {
+        // `wsp-098`: the --then step of an answered --of ask is done.
+        if q.of.is_none() || q.answered_by.is_none() {
+            eprintln!("wsp: {} is not an answered ask --of anyone; --step-done marks its step", q.id);
+            return 2;
+        }
+        return match message::step_done(store, &q.id) {
+            Ok(_) => {
+                println!("{}: step done", q.id);
+                0
+            }
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                1
+            }
+        };
+    }
     let giving_up = args.has("abandon");
     // A structured answer (`wsp-299`) is `--choice` or `--other`; the sentence
     // beside it, if any, is a deny's message, and otherwise there is none.
@@ -794,6 +863,28 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
         as_person: args.has("as-person"),
     };
+    // `--as <name>` (`wsp-098`): the named party's reply, typed in by the person.
+    let relayed = args.get("as").map(|a| a.trim().to_lowercase());
+    if let Some(name) = &relayed {
+        if q.of.as_deref() != Some(name.as_str()) {
+            match &q.of {
+                Some(of) => eprintln!("wsp: {} was asked of {of}, not {name}", q.id),
+                None => eprintln!("wsp: {} is not an ask --of anyone; --as is for one", q.id),
+            }
+            return 2;
+        }
+        if giving_up {
+            eprintln!("wsp: --as records a reply; to drop the ask, `wsp ask --cancel {}`", q.id);
+            return 2;
+        }
+        if let Err(why) = the_person(&caller) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    } else if q.of.is_some() && !giving_up {
+        eprintln!("wsp: {} was asked of {} — type their reply with `--as {}`", q.id, q.of.as_deref().unwrap_or_default(), q.of.as_deref().unwrap_or_default());
+        return 2;
+    }
     let me = match closer(store, &q, me, &caller) {
         Ok(me) => me,
         Err(why) => {
@@ -810,13 +901,19 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         (false, None) => message::answer(store, &q.id, &me, &text),
         (true, _) => message::abandon(store, &q.id, &me, &text),
     };
-    let closed = match closed {
+    let mut closed = match closed {
         Ok(c) => c,
         Err(e) => {
             eprintln!("wsp: {e}");
             return 1;
         }
     };
+    if let Some(name) = &relayed {
+        match message::relay(store, &closed.question.id, name, "person") {
+            Ok(m) => closed.question = m,
+            Err(e) => eprintln!("wsp: answered, but could not record who answered: {e}"),
+        }
+    }
 
     // The record is written by here and nothing below can unwrite it, which is
     // why the exit code is 0 for every delivery outcome except a refusal a
@@ -954,7 +1051,7 @@ struct Caller {
 /// environment, and an agent that lies about it can pass; nothing here can stop
 /// that. What it stops is the case `wsp-233` was filed for: a governor closing
 /// the loop on Ed's behalf because it was the one in the conversation. A person
-/// at a shell passes, in a herdr pane or out of one. `--as-person` is for Ed
+/// at a shell passes, in a backend pane or out of one. `--as-person` is for Ed
 /// typing `! wsp answer …` into an agent's own pane, which inherits that pane's
 /// environment, and it is a statement an agent would have to make falsely
 /// rather than a default it fell into.
@@ -1496,7 +1593,7 @@ fn open(store: &Store, args: &Args) -> i32 {
 ///
 /// **The task first, and the pane it was asked from second**, which is the
 /// whole reason [`crate::message::Waiting`] holds both: *the pane can go and
-/// the task cannot.* A pane id is the most perishable identifier herdr has — it
+/// the task cannot.* A pane id is the most perishable identifier backend has — it
 /// dies with its workspace and one cascade of `pane.exited` once cleared every
 /// binding on this machine at a stroke — so a question open long enough to be
 /// worth answering is a question whose pane may have been reused. Reading the
@@ -1599,7 +1696,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // closed, under the lock, against [`message::release`]. A waiter that has
     // gone (Esc killed the call) is no delivery, and the asker is told the old
     // way.
-    if let Some(w) = closed.question.awaited.as_ref().filter(|w| w.alive()) {
+    if let Some(w) = closed.question.awaited.as_ref().filter(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)) {
         receipt(false, false, &format!("{} is blocked in `wsp ask --wait` (pid {}) — the answer returns through its tool call, and nothing is typed", asker(closed), w.pid));
         return 0;
     }
@@ -1615,12 +1712,12 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
         receipt(false, false, "the hook holding the agent's dialog carries the answer — nothing is typed at the pane");
         return 0;
     }
-    // Asked of every backend wsp can spawn onto (`compound-091`), not herdr
+    // Asked of every backend wsp can spawn onto (`compound-091`), not backend
     // alone — the same fold `wsp tell` makes since `compound-077` and for the
-    // same reason: a seat is a herdr pane, a compound seat, or nothing this
+    // same reason: a seat is a backend pane, a compound seat, or nothing this
     // machine knows, and only the census that made it can say which. This verb
-    // used to gate on `herdr::available()` and then scan `herdr::panes()`, so
-    // an answer addressed to a compound-hosted agent was filed as "no herdr
+    // used to gate on `backend::available()` and then scan `backend::panes()`, so
+    // an answer addressed to a compound-hosted agent was filed as "no backend
     // socket" and never delivered, on a machine where the agent was running.
     let backends = crate::place::local_backends();
     let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
@@ -1639,7 +1736,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // that goes idle on an answered question is sitting still for nothing until
     // a person relays it by hand. So the reply is held on its own record and
     // the daemon's repair tick types it at the first idle — [`deliver_held`].
-    // Asked of the port's own `State` rather than herdr's screen-scraped one,
+    // Asked of the port's own `State` rather than backend's screen-scraped one,
     // so the gate holds for whichever backend answered.
     if !found.state.will_take_a_prompt() {
         let why = match crate::waiting::on_screen(found.state) {
@@ -1888,11 +1985,11 @@ fn addressed(store: &Store, task: &crate::model::Task) -> String {
 /// it, because a question asked from a seat still has to be answered back into
 /// the workspace the seat is sitting in.
 pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
-    // Off `my_pane()` and not `HERDR_WORKSPACE_ID`: after `compound-092` there
+    // Off `my_pane()` and not `WSP_BACKEND_WORKSPACE_ID`: after `compound-092` there
     // is no workspace to ask, only the seat, and `my_pane()` is already the
-    // one place that picks it — a supervisor's `WSP_SEAT_ID` first, herdr's
-    // `HERDR_PANE_ID` after — so a caller outside herdr is not told it is
-    // nobody just because this file used to reach for herdr's own variable.
+    // one place that picks it — a supervisor's `WSP_SEAT_ID` first, backend's
+    // `WSP_BACKEND_PANE_ID` after — so a caller outside backend is not told it is
+    // nobody just because this file used to reach for backend's own variable.
     let pane = crate::place::my_pane();
     let scope = pane
         .as_deref()
@@ -1901,12 +1998,12 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
         (Some(scope), _) => (Party::seat(&scope), pane.clone()),
         (None, Some(p)) => (
             // The workspace here is a byline's, for a panel to jump to — not a
-            // decision, so herdr's own variable is still the honest source for
+            // decision, so backend's own variable is still the honest source for
             // it, and empty (as it is under any other backend) is correct.
-            Party::pane(p, herdr::Env::read().workspace_id.as_deref().unwrap_or_default()),
+            Party::pane(p, ""),
             pane.clone(),
         ),
-        // Outside herdr entirely, which is a person at a shell. The fallback is
+        // Outside backend entirely, which is a person at a shell. The fallback is
         // the honest one rather than a convenience: unattributed is a human.
         (None, None) => (Party::Human, None),
     }
@@ -1921,8 +2018,7 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
 /// writing one log line has no other reason to touch.
 pub(crate) fn caller(store: &Store) -> String {
     let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string())
-        .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
+        .map(|s| s.to_string());
     match pane {
         Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
         None => "person".into(),
@@ -1962,8 +2058,7 @@ pub(crate) fn sender_of(
 /// reads it.
 pub(crate) fn sender(store: &Store) -> String {
     let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string())
-        .or_else(|| herdr::Env::read().pane_id.filter(|p| !p.is_empty()));
+        .map(|s| s.to_string());
     sender_of(&store.governors(), &store.bindings(), pane.as_deref())
 }
 
@@ -2190,8 +2285,8 @@ mod tests {
 
     /// **The inversion `wsp-095` Part 4 is for**: today, unattributed text
     /// reads as Ed, so attributed text has to be a seat or an agent and
-    /// unattributed text a person. wsp cannot make herdr attribute a keystroke
-    /// — that is herdr's — so what wsp can do is carry the sender *in the
+    /// unattributed text a person. wsp cannot make backend attribute a keystroke
+    /// — that is backend's — so what wsp can do is carry the sender *in the
     /// payload*, and this is the one place the payload is composed.
     ///
     /// The dated instance: `worklist-004`'s question was answered by text that
@@ -2293,7 +2388,7 @@ mod tests {
 
     /// `Waiting` holds a pane **and** a task because *the pane can go and the
     /// task cannot*, and this is the one call that spends the second field. A
-    /// pane id is the most perishable identifier herdr has — one cascade of
+    /// pane id is the most perishable identifier backend has — one cascade of
     /// `pane.exited` once cleared every binding on this machine at a stroke —
     /// so a question open long enough to be worth answering is one whose pane
     /// may since have been reused. Typing an answer at whoever is standing
@@ -3375,7 +3470,7 @@ mod tests {
         task(&store, "lone-1");
         let live = waited_on(&store, "lone-1", None);
         let c = message::answer(&store, &live.id, &Party::Human, "ok").unwrap();
-        assert!(c.question.awaited.as_ref().is_some_and(|w| w.alive()), "the close carries the waiter it found");
+        assert!(c.question.awaited.as_ref().is_some_and(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)), "the close carries the waiter it found");
         // `deliver` returns on it before it looks for a pane to type at; with
         // no backend here, the other road would have reported the pane gone.
         assert_eq!(deliver(&store, &c, &answer_args(&live.id, &[("json", "")], &[])), 0);
@@ -3388,7 +3483,7 @@ mod tests {
         q.awaited = Some(message::Awaited { pid: a_dead_pid(), at: util::now_iso() });
         message::raise(&store, &q).unwrap();
         let c = message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
-        assert!(!c.question.awaited.as_ref().unwrap().alive());
+        assert!(!crate::host::Host::is_alive(&crate::host::LOCAL, c.question.awaited.as_ref().unwrap().pid));
     }
 
     #[test]
@@ -3622,5 +3717,80 @@ mod tests {
             t.set_status(crate::model::Status::Doing);
             store.save_task(&t).unwrap();
         }
+    }
+
+    /// `wsp-098`: a decision waiting on a named party is an ask from the person
+    /// with `of` and `then`; refused without `--then`; `wsp answer --as` closes
+    /// it naming the answerer and the person as the relayer.
+    #[test]
+    fn an_ask_of_a_named_party_is_recorded_and_answered_as_them() {
+        let _env = util::isolated("ask-of");
+        let store = scratch("ask-of");
+        task(&store, "lone-1");
+        let n = |store: &Store| message::all(store).len();
+
+        let bare = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed")]);
+        assert_eq!(ask(&store, &bare), 2, "no --then is refused");
+        assert_eq!(n(&store), 0, "and nothing is recorded");
+
+        let asked = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "Ed"), ("then", "merge the bump")]);
+        assert_eq!(ask(&store, &asked), 0);
+        let q = message::all(&store).pop().unwrap();
+        assert_eq!((q.of.as_deref(), q.then.as_deref()), (Some("ed"), Some("merge the bump")));
+        assert_eq!(q.from, Party::Human, "an ask from the person");
+        assert!(q.is_open() && q.answered_by.is_none());
+        assert_eq!(q.about, About::Task("lone-1".into()));
+
+        let plain = answer_args(&q.id, &[], &["yes"]);
+        assert_eq!(answer(&store, &plain), 2, "an --of ask is answered --as its party");
+        let wrong = answer_args(&q.id, &[("as", "bob")], &["yes"]);
+        assert_eq!(answer(&store, &wrong), 2);
+        assert!(store.message(&q.id).unwrap().is_open());
+
+        assert_eq!(answer(&store, &answer_args(&q.id, &[("as", "ed")], &["yes, keep it"])), 0);
+        let after = store.message(&q.id).unwrap();
+        assert_eq!(after.state_raw, "answered");
+        assert_eq!((after.answered_by.as_deref(), after.relayed_by.as_deref()), (Some("ed"), Some("person")));
+        let j = after.to_json();
+        assert_eq!((j["of"].as_str(), j["answered_by"].as_str(), j["relayed_by"].as_str()), (Some("ed"), Some("ed"), Some("person")));
+        assert_eq!(after.closing().map(|h| h.by.clone()), Some(Party::Human));
+    }
+
+    /// The answered `--of` ask's action, run as the button would, ends it; and a
+    /// `seen` mark while it is open never pre-empts the step (`wsp-098`).
+    #[test]
+    fn the_done_action_of_an_answered_ask_of_runs_and_ends_the_item() {
+        use crate::classify::{self, Item};
+        let _env = util::isolated("ask-of-done");
+        let store = scratch("ask-of-done");
+        task(&store, "lone-1");
+        let asked = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed"), ("then", "merge the bump")]);
+        assert_eq!(ask(&store, &asked), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        let attention = |store: &Store| {
+            let msgs = store.messages();
+            let a = crate::mirror::asks(&msgs, &Default::default()).into_iter().find_map(|e| match e {
+                wsp_store_contract::Entity::Ask(a) => Some(a),
+                _ => None,
+            });
+            classify::of(Item::Ask(&a.unwrap()))
+        };
+        // looking at the card while open is not the step
+        let mut m = store.message(&id).unwrap();
+        m.seen = true;
+        store.save_message(&m).unwrap();
+        assert_eq!(answer(&store, &answer_args(&id, &[("as", "ed")], &["yes"])), 0);
+        let a = attention(&store).expect("seen while open: still needs-you once answered");
+        assert_eq!(a.text, "merge the bump");
+        // run the action's verb and args
+        let j = a.action.unwrap().json();
+        assert_eq!(j["verb"], "answer");
+        let typed: Vec<String> = j["args"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        let refs: Vec<&str> = typed.iter().map(String::as_str).collect();
+        let flags: Vec<(&str, &str)> = vec![("step-done", ""), ("as-person", "")];
+        let positional: Vec<&str> = refs.iter().copied().filter(|x| !x.starts_with("--")).collect();
+        assert_eq!(answer(&store, &crate::Args::synth("answer", &positional, &flags)), 0);
+        assert!(store.message(&id).unwrap().step_done_at.is_some());
+        assert_eq!(attention(&store), None, "neither once its step is done");
     }
 }

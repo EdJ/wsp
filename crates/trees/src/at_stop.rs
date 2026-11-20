@@ -32,6 +32,7 @@
 //! business (`dev.sh stop` does).
 
 use std::path::Path;
+use crate::host::Host;
 use std::process::Stdio;
 use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
@@ -95,7 +96,7 @@ pub fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
             Ok(None) if start.elapsed() >= limit => {
                 // The group, because `sh -c` runs the command as a child of
                 // its own and killing only `sh` would leave that running.
-                let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).status();
+                crate::host::LOCAL.signal_group(child.id(), "KILL");
                 let _ = child.kill();
                 let _ = child.wait();
                 break Ended::TimedOut;
@@ -116,12 +117,6 @@ fn tail_of(text: &str) -> String {
     let joined = lines[from..].join(" | ");
     let skip = joined.chars().count().saturating_sub(TAIL_CHARS);
     joined.chars().skip(skip).collect()
-}
-
-/// The line that says what happened, for the logs. `None` for a clean exit
-/// with nothing to say, which is what a teardown that worked looks like.
-fn said(path: &str, ran: &Ran) -> String {
-    said_of("at_stop", path, ran)
 }
 
 fn said_of(key: &str, path: &str, ran: &Ran) -> String {
@@ -408,7 +403,7 @@ mod tests {
         let ran = run_for(&store, &repo, &dir, LIMIT).unwrap();
         assert_eq!(ran.ended, Ended::Exited(3));
         assert!(ran.tail.contains("one") && ran.tail.contains("two"), "{}", ran.tail);
-        let line = said("t", &ran);
+        let line = said_of("at_stop", "t", &ran);
         assert!(line.contains("FAILED, exit 3") && line.contains("two"), "{line}");
         crate::cmd_checkout::remove(&repo, &dir);
         assert!(!dir.exists());

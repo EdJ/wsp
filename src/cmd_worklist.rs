@@ -434,8 +434,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
 /// and `new` has no other reason to touch one but its own.
 fn maker(store: &Store) -> Option<String> {
     let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string())
-        .or_else(|| crate::herdr::Env::read().pane_id.filter(|p| !p.is_empty()))?;
+        .map(|s| s.to_string())?;
     if let Some(scope) = crate::place::governs(&store.governors(), &crate::place::Seat::new(&pane)) {
         return match store.worklist(&scope) {
             Some(list) => worklist::home(store, &list).map(|h| h.project),
@@ -2606,20 +2605,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
         // No collapse and no `--all` here: an abridgement is a thing done for
         // a reader, and a parser is not one.
         let waits = crate::waits::read(store, &listed);
-        let out: Vec<_> = listed
-            .iter()
-            .map(|l| {
-                let mut o = listed_json(store, l);
-                // A planned list says where it queues and what it waits on;
-                // the rest carry neither key (`wsp-383`).
-                if let Some(n) = waits.iter().position(|(id, _)| *id == l.list.id) {
-                    o["queue"] = json!(n + 1);
-                    o["may_start"] = json!(waits[n].1.is_none());
-                    o["waits"] = json!(waits[n].1.as_ref().map(|w| w.text()));
-                }
-                o
-            })
-            .collect();
+        let out = wsp_view::worklist::list_json(&listing_of(store, &listed, &waits));
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -2751,25 +2737,26 @@ fn count(n: usize) -> String {
     }
 }
 
-/// One row for a parser: the worklist object every other verb emits, and the
-/// five facts this reading adds to it.
-///
-/// `gone` and the position's `unwritten` have no column in the table — the
-/// `AT` mark says only that one of them is not empty — so this is where a
-/// caller that wants to know *which* group, or *which* member, reads it
-/// without running `show`.
-fn listed_json(store: &Store, l: &worklist::Listed) -> serde_json::Value {
-    let mut out = worklist_json_at(&l.list, &l.at, l.phase(store));
-    if let Some(o) = out.as_object_mut() {
-        o.insert("segment".into(), json!(l.segment.word()));
-        o.insert("open".into(), json!(l.open));
-        o.insert("gone".into(), json!(l.gone));
-        o.insert("unwritten".into(), json!(l.at.unwritten));
-        o.insert("activity".into(), json!(util::iso_at(l.activity)));
-        o.insert("prio".into(), json!(crate::waits::Prio::of(&l.list).word()));
-        o.insert("after".into(), json!(l.list.after));
-    }
-    out
+/// The rows of `worklist ls --json`, read: each list's head, the facts the
+/// listing adds, and the queue place of a planned one. `wsp-view` draws them.
+fn listing_of(store: &Store, listed: &[worklist::Listed], waits: &[(String, Option<crate::waits::Wait>)]) -> Vec<wsp_view::worklist::Listing> {
+    listed
+        .iter()
+        .map(|l| wsp_view::worklist::Listing {
+            head: head_of(&l.list, &l.at, l.phase(store)),
+            segment: l.segment.word().to_string(),
+            open: l.open,
+            gone: l.gone.clone(),
+            unwritten: l.at.unwritten.clone(),
+            activity: l.activity,
+            prio: crate::waits::Prio::of(&l.list).word().to_string(),
+            after: l.list.after.clone(),
+            queue: waits.iter().position(|(id, _)| *id == l.list.id).map(|n| wsp_view::worklist::Queue {
+                n: n + 1,
+                waits: waits[n].1.as_ref().map(|w| w.text()),
+            }),
+        })
+        .collect()
 }
 
 // ---- what a passed group left behind ----------------------------------
@@ -3066,7 +3053,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     `go` passes the barrier; `wsp reopen` of a
                                     member the check held on is the other: the
                                     run goes back to that group, reseats the
-                                    member and checks the barrier afresh"##,
+                                    member and checks the barrier afresh.
+                                    --until WHEN (a time, or 24h/2d from now),
+                                    --on <row>… and --for "the person's act"
+                                    say what the hold waits on, so it is not
+                                    shown as needing the person before that is
+                                    all that is left; on a held list they
+                                    re-describe the wait, with no reason"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -4231,7 +4224,7 @@ fn seated(store: &Store, args: &Args) -> Option<Worklist> {
     // `-w` names a room this process is not standing in, so its own pane says
     // nothing about who is sitting there — the same rule `wsp govern` applies
     // to the pane it stamps on the record. With no `-w`, off `my_pane()` and
-    // not `HERDR_WORKSPACE_ID`/`HERDR_PANE_ID` (`compound-105`): a
+    // not `WSP_BACKEND_WORKSPACE_ID`/`WSP_BACKEND_PANE_ID` (`compound-105`): a
     // compound-hosted seat has neither, only the one string `my_pane()`
     // already resolves either way.
     let who = match args.get("workspace") {
@@ -5644,6 +5637,160 @@ pub fn hold(store: &Store, args: &Args) -> i32 {
     hold_by(store, args, None)
 }
 
+/// What a hold waits on (`wsp-095`): `--until`, `--on`, `--for`. Read off the
+/// list by [`crate::owed`], which lists a held barrier as needing the person
+/// only when the time has come, the rows have landed and no check is reading it.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Wait {
+    until: Option<String>,
+    on: Vec<String>,
+    act: Option<String>,
+}
+
+impl Wait {
+    fn given(&self) -> bool {
+        self.until.is_some() || !self.on.is_empty() || self.act.is_some()
+    }
+
+    /// Onto a list being held: the whole wait, replacing any before it.
+    fn put(self, w: &mut Worklist) {
+        w.held_until = self.until;
+        w.held_on = self.on;
+        w.held_for = self.act;
+    }
+
+    fn said(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(u) = &self.until {
+            parts.push(format!("until {u}"));
+        }
+        if !self.on.is_empty() {
+            parts.push(format!("on {}", self.on.join(" ")));
+        }
+        if let Some(a) = &self.act {
+            parts.push(format!("then for the person: {a}"));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// What `--until` reads, named in its refusal.
+const UNTIL_FORMS: &str = "2026-11-19T19:37Z, 2026-11-19T19:37:05Z, 2026-11-19T19:37+01:00 (or +0100), \
+                           a date 2026-11-19 (its midnight UTC), or 24h / 2d / 90m from now";
+
+/// `--until`: an ISO time, a date, or `<n>m|h|d` from `now`; written as
+/// [`util::iso_at`] writes a stamp.
+///
+/// The ISO forms are read strictly (`wsp-106`): `T` then `HH:MM`, optional
+/// `:SS`, then `Z` or an offset `±HH:MM` / `±HHMM`, or a plain date. Anything
+/// else — a time with no zone, a stray character — is refused naming the
+/// forms, never read as its date's midnight as the lenient [`util::epoch_of`]
+/// did with `2026-11-19T19:37Z`.
+fn until_of(said: &str, now: i64) -> Result<String, String> {
+    let t = said.trim();
+    let rel = t.char_indices().last().and_then(|(i, unit)| {
+        let n: i64 = t[..i].trim().parse().ok().filter(|n| *n > 0)?;
+        let per = match unit {
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        Some(now + n * per)
+    });
+    rel.or_else(|| iso_instant(t))
+        .map(util::iso_at)
+        .ok_or_else(|| format!("--until `{t}` is not a time: give {UNTIL_FORMS}"))
+}
+
+/// An ISO 8601 instant in epoch seconds, or `None` for anything not exactly
+/// one of the forms [`until_of`] names.
+fn iso_instant(t: &str) -> Option<i64> {
+    let b = t.as_bytes();
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let s = t.get(r)?;
+        s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok())?
+    };
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let (y, mo, d) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let (hh, mm, ss, zone) = if b.len() == 10 {
+        (0, 0, 0, 0)
+    } else {
+        if !matches!(b[10], b'T' | b't') || b.len() < 17 || b[13] != b':' {
+            return None;
+        }
+        let (hh, mm) = (digits(11..13)?, digits(14..16)?);
+        let (ss, rest) = if b[16] == b':' { (digits(17..19)?, t.get(19..)?) } else { (0, &t[16..]) };
+        let zone = match rest.as_bytes() {
+            [b'Z' | b'z'] => 0,
+            [sign @ (b'+' | b'-'), ..] => {
+                let off = &rest[1..];
+                // `get`, never `[..]`: a byte count is no char boundary, and
+                // `+1é1` must be refused, not panic (wsp-106 verification).
+                let (oh, om) = match off.len() {
+                    5 if off.as_bytes()[2] == b':' => (off.get(0..2)?, off.get(3..5)?),
+                    4 => (off.get(0..2)?, off.get(2..4)?),
+                    _ => return None,
+                };
+                let num = |s: &str| s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse::<i64>().ok())?;
+                let (oh, om) = (num(oh)?, num(om)?);
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                let secs = oh * 3_600 + om * 60;
+                if *sign == b'+' { secs } else { -secs }
+            }
+            _ => return None,
+        };
+        (hh, mm, ss, zone)
+    };
+    if !(1..=12).contains(&mo) || d < 1 || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let wall = util::epoch_of(&format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"));
+    // A day past its month's end (2026-02-30) rolls into the next month: refuse it.
+    if util::iso_at(wall).get(..10) != t.get(..10) {
+        return None;
+    }
+    Some(wall - zone).filter(|e| *e > 0)
+}
+
+pub(crate) fn hold_wait(args: &Args, now: i64) -> Result<Wait, String> {
+    let until = match args.get("until").filter(|u| u != "true") {
+        Some(u) => Some(until_of(&u, now)?),
+        None if args.has("until") => return Err("--until needs a time".into()),
+        None => None,
+    };
+    let on: Vec<String> = args.all("on").into_iter().flat_map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>()).filter(|s| s != "true").collect();
+    if args.has("on") && on.is_empty() {
+        return Err("--on needs the rows the hold waits on".into());
+    }
+    let act = args.get("for").map(|a| a.trim().to_string()).filter(|a| !a.is_empty() && a != "true");
+    if args.has("for") && act.is_none() {
+        return Err("--for needs the person's act, in words".into());
+    }
+    Ok(Wait { until, on, act })
+}
+
+/// A held list given a new wait and no new hold: the wait replaces the one
+/// before it, and the log says so.
+fn rewait(store: &Store, w: &mut Worklist, wait: Wait) -> i32 {
+    let said = wait.said();
+    wait.put(w);
+    w.log(&format!("hold waits {said}"));
+    let groups = w.groups();
+    let msg = format!("hold {} waits", w.id);
+    let code = save(store, w, &groups, "hold", &msg);
+    if code != 0 {
+        return code;
+    }
+    store.log_event("worklist-hold-waits", json!({ "id": w.id, "until": w.held_until, "on": w.held_on, "for": w.held_for }));
+    println!("{} {} {said}", w.id, Paint::new().dim("held, and waits"));
+    0
+}
+
 /// Rows a hold's reason names that stand on no list and were filed at this
 /// barrier: made after its check opened, or sub-tasks of a member. `wsp-530`.
 ///
@@ -5692,6 +5839,17 @@ pub(crate) fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i3
         Ok(v) => v,
         Err(code) => return code,
     };
+    // `wsp-095`: what the hold waits on — a time, rows, the person's act.
+    let wait = match hold_wait(args, util::epoch_secs()) {
+        Ok(v) => v,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
+    };
+    if w.status() == WorklistStatus::Held && wait.given() {
+        return rewait(store, &mut w, wait);
+    }
     // Given no reason: the verdict the check wrote at the place wsp keeps for it
     // (`wsp-374`), when it opens with `hold` and was written in this run.
     if said.trim().is_empty() {
@@ -5774,6 +5932,7 @@ pub(crate) fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i3
     let flight = front(store, w.groups().get(pos.at.unwrap_or(1) - 1), &pos.members, &BTreeMap::new());
 
     w.set_status(WorklistStatus::Held);
+    wait.put(&mut w);
     w.log(&with_caption(&format!("{HELD} {}", said.trim()), caption.as_deref()));
     let groups = w.groups();
     let msg = format!("hold {}", w.id);
@@ -6476,6 +6635,25 @@ pub(crate) fn done_when(t: &crate::model::Task) -> Option<String> {
 }
 
 // ---- park -------------------------------------------------------------
+
+/// Park a running list for a cause that is the same for every row of it, so
+/// the run stops on the first refusal and says why, rather than starting each
+/// row again to be refused the same way (wsp-017). `false` when the list is not
+/// running, or could not be written.
+pub(crate) fn park_for_cause(store: &Store, w: &mut Worklist, why: &str) -> bool {
+    if w.status() != WorklistStatus::Running {
+        return false;
+    }
+    w.set_status(WorklistStatus::Parked);
+    w.log(&format!("{PARKED} {why}"));
+    let groups = w.groups();
+    let msg = format!("park {}", w.id);
+    if save(store, w, &groups, "park", &msg) != 0 {
+        return false;
+    }
+    store.log_event("worklist-parked", json!({ "id": w.id, "why": why, "was": "running", "by": "wsp" }));
+    true
+}
 
 /// `wsp worklist park [<slug>] "why"` — a person's pause. `wsp-173`.
 ///
@@ -7433,22 +7611,38 @@ fn home_line(p: &Paint, id: &str, home: Option<&worklist::Home>) -> String {
 /// same groups is how a `--json` row comes to disagree with the table printed
 /// beside it, and it is the position that both of them are about.
 fn worklist_json_at(w: &Worklist, at: &Position, phase: worklist::Phase) -> serde_json::Value {
-    json!({
-        "id": w.id,
-        "title": w.title,
-        "caption": crate::caption::of_worklist(w).json(),
-        // wsp-382: the six words, with the stand-still reasons beside them.
-        // `stored` is the word on the record, for a reader who wants it.
-        "status": phase.status.word(),
-        "flags": phase.flags.json(),
-        "stored": w.status_raw.trim(),
-        "planned": w.planned,
-        "created": w.created,
-        "groups": at.of,
-        "at": at.at,
-        "outputs": crate::cmd_report::declared(w).iter().map(|o| json!({ "name": o.name, "kind": o.kind, "file": o.file(), "present": crate::cmd_report::dir(&w.id).join(o.file()).is_file() })).collect::<Vec<_>>(),
-        "outputs_dir": crate::cmd_report::dir(&w.id),
-    })
+    wsp_view::worklist::head_json(&head_of(w, at, phase))
+}
+
+/// What `wsp-view` draws a worklist's object from: the list, its position and
+/// phase, and which of its declared outputs are on disk.
+fn head_of(w: &Worklist, at: &Position, phase: worklist::Phase) -> wsp_view::worklist::Head {
+    let caption = crate::caption::of_worklist(w);
+    wsp_view::worklist::Head {
+        id: w.id.clone(),
+        title: w.title.clone(),
+        caption_text: caption.text.clone(),
+        caption_from: caption.from.to_string(),
+        status: phase.status.word().to_string(),
+        held: phase.flags.held,
+        waiting_on_ed: phase.flags.waiting_on_ed,
+        parked: phase.flags.parked,
+        stored: w.status_raw.trim().to_string(),
+        planned: w.planned.clone(),
+        created: w.created.clone(),
+        groups: at.of,
+        at: at.at,
+        outputs: crate::cmd_report::declared(w)
+            .iter()
+            .map(|o| wsp_view::worklist::Output {
+                name: o.name.clone(),
+                kind: o.kind.clone(),
+                file: o.file(),
+                present: crate::cmd_report::dir(&w.id).join(o.file()).is_file(),
+            })
+            .collect(),
+        outputs_dir: crate::cmd_report::dir(&w.id).display().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -8617,11 +8811,11 @@ mod tests {
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
         assert_eq!(flagged(&store, &["add", "run", "wl-004"], &[("group", "2")]), 0);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
-        let herdr = std::env::var_os("HERDR_PANE_ID");
-        std::env::remove_var("HERDR_PANE_ID");
+        let backend = std::env::var_os("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
         assert_eq!(flagged(&store, &["add", "run", "wl-005"], &[("group", "2")]), 0);
-        if let Some(h) = herdr {
-            std::env::set_var("HERDR_PANE_ID", h);
+        if let Some(h) = backend {
+            std::env::set_var("WSP_BACKEND_PANE_ID", h);
         }
         let w = store.worklist("run").unwrap();
         let groups = w.groups();
@@ -8783,8 +8977,8 @@ mod tests {
     /// its barrier reads each row against that row's own done-when.
     #[test]
     fn a_non_blocking_follow_up_becomes_the_next_group_ahead_of_a_planned_one() {
-        // `--next` goes on to `go_with`, whose sweep asks herdr who is standing
-        // in each tree, so this one needs a herdr of its own — it passed only
+        // `--next` goes on to `go_with`, whose sweep asks backend who is standing
+        // in each tree, so this one needs a backend of its own — it passed only
         // while another test's guard happened to be up in the same process.
         let _env = util::isolated("followup-next");
         let store = scratch("followup-next");
@@ -8823,8 +9017,8 @@ mod tests {
     /// and the check is told it still ends with `go` or `hold`.
     #[test]
     fn a_follow_up_groups_barrier_is_refused_more_and_its_findings_reach_the_governor() {
-        // `--next` goes on to `go_with`, whose sweep asks herdr who is standing
-        // in each tree, so this one needs a herdr of its own.
+        // `--next` goes on to `go_with`, whose sweep asks backend who is standing
+        // in each tree, so this one needs a backend of its own.
         let _env = util::isolated("followup-round");
         let store = scratch("followup-round");
         task(&store, "wl-001", "review");
@@ -9328,8 +9522,8 @@ mod tests {
     /// A store of its own **and** an environment of its own, which the verbs
     /// above do not need and the verbs below do.
     ///
-    /// `go` reaches `cmd_checkout::Occupied::now`, which asks herdr who is
-    /// standing in a tree — and on a machine where herdr is answering, that is
+    /// `go` reaches `cmd_checkout::Occupied::now`, which asks backend who is
+    /// standing in a tree — and on a machine where backend is answering, that is
     /// a test talking to whoever is working today. `util::isolated` points the
     /// socket at nothing and the store at a directory of its own; it holds an
     /// environment lock, so these run one at a time, which is the price of the
@@ -9357,7 +9551,7 @@ mod tests {
     /// set one.
     ///
     /// Like `running`, this isolates the environment too: landing reads real
-    /// worktrees under the repository, and the verbs around them ask herdr who
+    /// worktrees under the repository, and the verbs around them ask backend who
     /// is standing where.
     fn grounded(tag: &str) -> (util::Isolated, Store, std::path::PathBuf) {
         let env = util::isolated(&format!("wlground-{tag}"));
@@ -10208,6 +10402,97 @@ mod tests {
         assert_eq!(store.worklist("batch").unwrap().status(), WorklistStatus::Running);
     }
 
+    /// `wsp-095`: a hold says what it waits on — a time, rows, the person's
+    /// act — and a held list's wait is described again without a new hold.
+    #[test]
+    fn a_hold_records_what_it_waits_on_and_a_held_list_is_given_a_new_wait() {
+        let (_env, store) = running("hold-wait");
+        task(&store, "wl-001", "doing");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001"]);
+        run(&store, &["go", "batch"]);
+        let flags = [("until", "2026-11-19T15:15:00Z"), ("on", "wsp-093"), ("for", "rebuild web-chrome")];
+        assert_eq!(flagged(&store, &["hold", "batch", "a", "day", "on", "the", "trunk"], &flags), 0);
+        let w = store.worklist("batch").unwrap();
+        assert_eq!(w.held_until.as_deref(), Some("2026-11-19T15:15:00Z"));
+        assert_eq!(w.held_on, vec!["wsp-093".to_string()]);
+        assert_eq!(w.held_for.as_deref(), Some("rebuild web-chrome"));
+
+        // The person's step done: what is left is the day, and nothing else.
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("until", "24h")]), 0, "no reason needed to re-describe");
+        let w = store.worklist("batch").unwrap();
+        assert!(w.held_until.as_deref().is_some_and(|u| util::epoch_of(u) > util::epoch_secs() + 86_000));
+        assert!(w.held_on.is_empty() && w.held_for.is_none(), "the new wait replaces the old");
+        assert_eq!(flagged(&store, &["hold", "batch"], &[("until", "soon")]), 2, "a time it cannot read");
+
+        // Passing the barrier ends the hold, and its wait with it.
+        assert_eq!(run(&store, &["go", "batch", "a", "day", "passed"]), 0);
+        let w = store.worklist("batch").unwrap();
+        assert!(w.held_until.is_none() && w.held_on.is_empty() && w.held_for.is_none());
+    }
+
+    #[test]
+    fn until_reads_a_time_a_date_or_a_span_from_now() {
+        assert_eq!(until_of("2026-11-19T15:15:00Z", 0).unwrap(), "2026-11-19T15:15:00Z");
+        assert_eq!(until_of("2026-11-19", 0).unwrap(), "2026-11-19T00:00:00Z");
+        assert_eq!(until_of("24h", 1_000).unwrap(), util::iso_at(1_000 + 86_400));
+        assert_eq!(until_of("2d", 0).unwrap(), util::iso_at(2 * 86_400));
+        assert_eq!(until_of("90m", 0).unwrap(), util::iso_at(5_400));
+        assert!(until_of("tomorrow", 0).is_err());
+        assert!(until_of("0h", 0).is_err());
+    }
+
+    /// `wsp-106`: every ISO form reads as the instant meant — `19:37Z` was
+    /// stored as the date's midnight — and a form it does not take is refused
+    /// naming the ones it does.
+    #[test]
+    fn until_reads_each_iso_form_as_the_instant_meant_or_refuses_it_naming_the_forms() {
+        let reads = [
+            ("2026-11-19T19:37Z", "2026-11-19T19:37:00Z"),
+            ("2026-11-19T19:37:05Z", "2026-11-19T19:37:05Z"),
+            ("2026-11-19t19:37z", "2026-11-19T19:37:00Z"),
+            ("2026-11-19T19:37+01:00", "2026-11-19T18:37:00Z"),
+            ("2026-11-19T19:37:05+01:00", "2026-11-19T18:37:05Z"),
+            ("2026-11-19T19:37-0230", "2026-11-19T22:07:00Z"),
+            ("2026-11-19T00:30+02:00", "2026-11-18T22:30:00Z"),
+            ("2026-11-19T23:45-01:00", "2026-11-20T00:45:00Z"),
+            ("2026-11-19", "2026-11-19T00:00:00Z"),
+            ("  2026-11-19T19:37Z  ", "2026-11-19T19:37:00Z"),
+        ];
+        for (said, meant) in reads {
+            assert_eq!(until_of(said, 0).as_deref(), Ok(meant), "{said}");
+        }
+        let refused = [
+            "2026-11-19T19:37",       // no zone: whose 19:37?
+            "2026-11-19T19:37:05",    // no zone
+            "2026-11-19T19Z",         // no minutes
+            "2026-11-19T19:37:5Z",    // one-digit seconds
+            "2026-11-19T19:37:05.5Z", // fractions
+            "2026-11-19T24:00Z",
+            "2026-11-19T19:60Z",
+            "2026-11-19T19:37:60Z",
+            "2026-11-19T19:37+1:00",
+            "2026-11-19T19:37+01",
+            "2026-11-19T19:37+25:00",
+            "2026-11-19 19:37Z",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-11-19x",
+            "2026-1-19",
+            "2026-11-19T19:37+1é1",   // é straddles the offset's byte 2: refused, no panic
+            "2026-11-19T19:37+é1:00",
+            "2026-11-19T19:37+01:é",
+            "2026-11-19Té9:37Z",
+            "2026-11-19T19:37:éZ",
+            "2026-11-19T19:é7Z",
+            "é026-11-19",
+        ];
+        for said in refused {
+            let e = until_of(said, 0).expect_err(said);
+            assert!(e.contains("2026-11-19T19:37Z") && e.contains("+01:00") && e.contains("24h"), "{said}: {e}");
+        }
+    }
+
     /// `wsp-173`'s done-when: a person's pause at a barrier, and the way back
     /// from it, leave that barrier exactly as owed as they found it.
     ///
@@ -10988,7 +11273,7 @@ mod tests {
         projects(&store, &[("wsp", None)]);
         in_project(&store, "i-1", None);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
-        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
         assert_eq!(run(&store, &["new", "run", "r"]), 0);
         assert_eq!(home_of(&store, "run"), None, "nothing to read a home off");
         assert_eq!(run(&store, &["add", "run", "i-1"]), 0);
@@ -11342,7 +11627,7 @@ mod tests {
         assert_eq!(v["worklist"]["flags"], json!({ "held": false, "waiting_on_ed": false, "parked": false }));
         assert_eq!(v["worklist"]["stored"], "running");
         let listed = worklist::listing(&store, store.worklists());
-        let l = listed_json(&store, &listed[0]);
+        let l = wsp_view::worklist::listed_json(&listing_of(&store, &listed, &[]).remove(0));
         assert_eq!(l["status"], "executing");
         assert!(l["flags"].is_object());
     }

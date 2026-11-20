@@ -14,7 +14,8 @@
 //!   check or a verifier is running;
 //! - **waiting** — nobody is working and some member is started but not moving:
 //!   blocked (from the moment it blocks), an unclaimed start, a gap the logs
-//!   name, a seat idle in its own phase;
+//!   name, a seat idle in its own phase, a leg whose seat has ended and whose
+//!   line is still `running` (a leg is working only while its seat is alive);
 //! - **serialised** — nobody is started but a member is yet to start: it waits
 //!   behind the group's cap or an `after`;
 //! - **barrier run** — the group's barrier, from the last verdict to the check;
@@ -229,6 +230,9 @@ fn state(m: &MemberIn, t: i64, first: i64, last: i64) -> State {
         Some(Class::Verify) => State::Working,
         Some(Class::Seat) if !m.measured => State::Working,
         Some(Class::Start) => State::Waiting(1, "an unclaimed or slow start (spawn requested → the seat's first work)".into()),
+        // A leg whose seat ended with the leg not closed (`wsp-016`): waiting,
+        // under its own name, with the seat and when it ended.
+        Some(Class::Gap(why)) if why.starts_with(crate::timeline::LEG_SEAT_ENDED) => State::Waiting(2, why.clone()),
         Some(Class::Gap(why)) => State::Waiting(2, format!("a gap — {why}")),
         _ => State::Waiting(3, format!("{SEAT_IDLE} — {}", idle_reason(m, t))),
     }
@@ -540,6 +544,50 @@ mod tests {
         assert_eq!(g.legs, 800, "the legs alone, overlap counted once");
         assert_eq!(g.seconds("waiting"), 10, "the start only");
         assert!(seat_idle_reasons(g.waits.iter().map(|((_, c), s)| (c.as_str(), *s))).is_empty(), "{:?}", g.waits);
+    }
+
+    /// wsp-001's `finish` (`wsp-016`): the leg's seat came up, worked and ended
+    /// at T at its Stop, and the leg's line read `running` to T+60 min. The hour
+    /// is waiting, named for the seat and when it ended, and none of it is
+    /// working nor legs_running_seconds.
+    #[test]
+    fn a_leg_whose_seat_ended_is_waiting_from_the_end_not_working_nor_legs_running() {
+        use crate::timeline::{build, Inputs, LegIn, LEG_SEAT_ENDED};
+        use serde_json::json;
+        let b = 1_763_350_000i64;
+        let t = b + 1000;
+        let ev = |at: i64, kind: &str, data: serde_json::Value| (b + at, kind.to_string(), data);
+        let i = Inputs {
+            id: "r-1".into(),
+            events: vec![
+                ev(110, "task-claimed", json!({"id": "r-1"})),
+                ev(112, "session-learned", json!({"id": "r-1", "pane": "cpd-120"})),
+                ev(160, "leg-added", json!({"id": "r-1", "leg": "finish"})),
+                ev(165, "task-released", json!({"id": "r-1"})),
+                ev(200, "session-learned", json!({"id": "r-1", "pane": "cpd-121"})),
+                ev(1000 + 3600, "leg-done", json!({"id": "r-1", "leg": "finish"})),
+                ev(1000 + 3605, "task-review", json!({"id": "r-1"})),
+            ],
+            cycle: vec![
+                (b + 100, "starting r-1 on claude (new)".into()),
+                (b + 190, "list group 1: starting leg finish of r-1".into()),
+                (t + 10, format!("r-1: {} {} (member, cpd-121), no pid of it running and its tree kept", crate::ending::EXIT_ENDED, crate::util::iso_at(t))),
+            ],
+            legs: vec![LegIn { name: "finish".into(), ..Default::default() }],
+            first_request: Some(b + 118),
+            ..Default::default()
+        };
+        let spans: Vec<Span> = build(&i).iter().map(Span::of).collect();
+        let m = MemberIn { id: "r-1".into(), spans, active: vec![(b + 118, b + 165)], measured: true, ..Default::default() };
+        let g = group_wall(&[m], None, Some(t + 3605)).unwrap();
+        let ended: Vec<(&String, &i64)> = g.waits.iter().filter(|((_, c), _)| c.starts_with(LEG_SEAT_ENDED)).map(|((_, c), s)| (c, s)).collect();
+        assert_eq!(ended.len(), 1, "{:?}", g.waits);
+        let (cause, secs) = ended[0];
+        assert_eq!(*secs, 3600, "T to T+60 min: {:?}", g.waits);
+        assert!(cause.contains("cpd-121") && cause.contains(&crate::util::iso_at(t)), "the seat and when it ended: {cause}");
+        assert_eq!(g.legs, 1000 - 190, "the leg's run up to its seat's end, and no more");
+        assert_eq!(g.seconds("working"), (165 - 118) + (1000 - 190), "the member's own calls and the leg while its seat lived");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the window tiles");
     }
 
     #[test]

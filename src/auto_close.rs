@@ -548,6 +548,12 @@ mod tests {
             String::from_utf8_lossy(&o.stdout).to_string()
         };
         git(&["init", "--quiet"]);
+        // The store's own commits need an identity of the repository's: on a
+        // machine whose git cannot make one up (Linux, empty global config),
+        // the batch's commit is refused otherwise. Unsigned for the same reason.
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "commit.gpgsign", "false"]);
         git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "--quiet", "-m", "start"]);
         let before = git(&["rev-list", "--count", "HEAD"]);
         assert_eq!(before.trim(), "1", "the store is a repository for this test");

@@ -142,6 +142,10 @@ pub(crate) fn close_with(store: &Store, row: &str, batch: usize, standing: &dyn 
         let results = check::run_all(&row_dir, &steps, &dir.join(format!("{row}-batch-{batch}.log")), reuse.as_ref(), |_| {});
         let (r, n) = check::tally(&results);
         (reused, ran) = (r, n);
+        // `wsp-067`: a tree that went under the run is no red to file a fix for.
+        if let Some(gone) = results.iter().find(|r| matches!(r.done, check::Done::TreeMissing(_))) {
+            return Closed::Held(check::why_failed(gone));
+        }
         if let Some(bad) = results.iter().find(|r| r.done.is_red()) {
             let (piece, label, line) = wanted
                 .iter()

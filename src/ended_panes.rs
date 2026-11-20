@@ -73,16 +73,11 @@ fn live_find(store: &Store, min_age: u64) -> Vec<Ended> {
         return Vec::new();
     }
     let procs = crate::cmd_role::processes();
-    let sups: Vec<String> =
-        procs.iter().filter(|p| crate::cmd_role::session_label(&p.command).is_some()).map(|p| p.pid.to_string()).collect();
+    let sups: Vec<u32> = procs.iter().filter(|p| crate::cmd_role::session_label(&p.command).is_some()).map(|p| p.pid).collect();
     if sups.is_empty() {
         return Vec::new();
     }
-    let cwds = wsp_base::calls::Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-Fpn", "-p", &sups.join(",")])
-        .output()
-        .map(|o| crate::cmd_role::parse_cwds(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
+    let cwds = crate::host::Host::cwds(&crate::host::LOCAL, Some(&sups)).map(|o| crate::cmd_role::parse_cwds(&o)).unwrap_or_default();
     let bindings = store.bindings();
     let governors = store.governors();
     let live = |l: &str| bindings.contains_key(l) || crate::place::governs(&governors, &crate::place::Seat::new(l)).is_some();
@@ -108,10 +103,10 @@ pub(crate) fn wip_lines(store: &Store) -> Vec<String> {
 pub(crate) fn tidy(store: &Store) {
     for e in live_find(store, GRACE_MIN) {
         crate::store::log_line(store, &format!("closed {}", line(&e)));
-        crate::check_tree::signal("-HUP", &[e.shell]);
+        crate::check_tree::signal("HUP", &[e.shell]);
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let left: Vec<u32> = crate::util::alive(&e.pids).into_iter().collect();
-        crate::check_tree::signal("-TERM", &left);
+        let left: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, &e.pids).into_iter().collect();
+        crate::check_tree::signal("TERM", &left);
     }
 }
 

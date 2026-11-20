@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use wsp_base::calls::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -24,6 +25,7 @@ use serde_json::json;
 
 use crate::cmd_checkout::WORKTREES;
 use crate::store::Store;
+use crate::host::{Host, LOCAL};
 use crate::util;
 
 /// Under this the status surfaces say so, and name what could be reclaimed.
@@ -117,8 +119,7 @@ pub(crate) fn free_at(path: &Path) -> Option<u64> {
 }
 
 fn free_of(path: &Path) -> Option<(String, u64)> {
-    let out = Command::new("df").args(["-Pk"]).arg(path).output().ok().filter(|o| o.status.success())?;
-    parse_df(&String::from_utf8_lossy(&out.stdout))
+    parse_df(&LOCAL.disk_free(path)?)
 }
 
 /// Every `target/` wsp can rebuild: a tree under a repository's `.worktrees/`,
@@ -211,8 +212,7 @@ pub(crate) fn size_of(path: &Path) -> Option<Sized> {
     if let Some((bytes, upto)) = private_tree(path) {
         return Some(Sized { bytes, exact: true, upto });
     }
-    let out = Command::new("du").args(["-sk"]).arg(path).output().ok()?;
-    let kb: u64 = String::from_utf8_lossy(&out.stdout).split_whitespace().next()?.parse().ok()?;
+    let kb: u64 = LOCAL.disk_use(path)?.split_whitespace().next()?.parse().ok()?;
     Some(Sized { bytes: kb * 1024, exact: false, upto: kb * 1024 })
 }
 
@@ -443,7 +443,14 @@ fn record(state: &Path, volume: &str, found: &[Removable]) {
 }
 
 /// The volumes the project roots are on, deduplicated, with free space.
+///
+/// Under `WSP_HOST=manager`, the volumes of the newest beat folded (the
+/// manager reads the ones it was configured with, the project roots'), and no
+/// `df` here; none before a beat is folded (wsp-028).
 fn volumes(store: &Store) -> Vec<(String, u64)> {
+    if crate::fold::under_manager() {
+        return crate::fold::facts(store).map(|f| f.disks.into_iter().map(|d| (d.volume, d.free_bytes)).collect()).unwrap_or_default();
+    }
     let mut seen = BTreeSet::new();
     crate::check_tree::repos(store)
         .iter()
@@ -481,6 +488,24 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>, notes: &mut Vec<
             false => notes.push(disk.line()),
         }
     }
+}
+
+/// [`loud`] off the volumes a host's manager reported (`seats`'s host facts,
+/// `docs/agent-manager.md` 4.3): no `df` here.
+pub(crate) fn loud_of(store: &Store, disks: &[crate::host_tcp::DiskFree]) -> Option<String> {
+    let low: Vec<String> = disks
+        .iter()
+        .map(|d| {
+            let mut disk = Disk { volume: d.volume.clone(), free: d.free_bytes, limit: LOW, items: Vec::new() };
+            if disk.low() {
+                disk.items = recorded(&store.state, &disk.volume);
+            }
+            disk
+        })
+        .filter(Disk::low)
+        .map(|d| d.line())
+        .collect();
+    (!low.is_empty()).then(|| low.join("\n"))
 }
 
 /// The low volumes alone, for the headings that are for faults: `wsp wip`.

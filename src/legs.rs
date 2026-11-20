@@ -736,6 +736,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Tasks,
+                order: 135,
+                text: r##"  wsp leg reset <task> <name> "why" [--force]   a running leg whose seat is gone,
+                                         back to pending: the person, the primary
+                                         or the row's governor"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
                 order: 140,
                 text: r##"  wsp leg show <task> [<name>]           the legs, the tier and waits in full"##,
             },
@@ -1042,50 +1049,52 @@ pub(crate) fn rework_by(old: &[Leg], verdict: &str, head: &str) -> Result<Option
 
 // ---- the record, read ----------------------------------------------------------
 
-/// What a done leg cost, from its end line: `{usd, turns, peak, seconds}`, or
-/// null for a leg that has not ended (compound-561 A5). `usd` is null where the
-/// record kept nothing to price, which is not the same as free.
-fn spent(ran: &[crate::cmd_attempts::Attempt], l: &Leg) -> serde_json::Value {
-    let Some(a) = ran.iter().find(|a| a.leg.as_deref() == Some(l.name.as_str()) && !a.until.is_empty()) else {
-        return serde_json::Value::Null;
-    };
-    serde_json::json!({
-        "usd": crate::cmd_attempts::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
-        "turns": a.turns,
-        "peak": a.peak,
-        "seconds": a.seconds(),
+/// What a done leg cost, from its end line: null for a leg that has not ended
+/// (compound-561 A5). `usd` is null where the record kept nothing to price,
+/// which is not the same as free.
+fn spent(ran: &[crate::cmd_attempts::Attempt], l: &Leg) -> Option<wsp_view::task::Spent> {
+    let a = ran.iter().find(|a| a.leg.as_deref() == Some(l.name.as_str()) && !a.until.is_empty())?;
+    Some(wsp_view::task::Spent {
+        usd: crate::cmd_attempts::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
+        turns: a.turns,
+        peak: a.peak,
+        seconds: a.seconds(),
     })
 }
 
 /// The legs as `wsp show --json` gives them.
 pub(crate) fn json(t: &Task) -> serde_json::Value {
+    wsp_view::task::legs_json(&view(t))
+}
+
+/// The legs as `wsp-view` takes them.
+pub(crate) fn view(t: &Task) -> Vec<wsp_view::task::Leg> {
     let ls = legs(t);
     let w = waits(&ls);
     let ready = ready(&ls);
     let ran = crate::cmd_attempts::attempts_of(t);
-    serde_json::json!(ls
-        .iter()
+    ls.iter()
         .zip(w)
-        .map(|(l, w)| serde_json::json!({
-            "spent": spent(&ran, l),
-            "name": l.name,
-            "agent": policy_line(&l.policy),
-            "default": is_default(&l.policy),
-            "why": l.why,
-            "state": l.state.as_str(),
-            "ready": ready.contains(&l.name),
-            "after": w,
-            "pane": l.pane,
-            "tree": l.tree,
-            "caption": l.caption,
-            "skipped": l.skipped,
-            "started": l.started,
-            "ended": l.closed,
-            "order": l.order,
-            "baton": l.baton,
-            "rework_of": l.rework,
-        }))
-        .collect::<Vec<_>>())
+        .map(|(l, w)| wsp_view::task::Leg {
+            spent: spent(&ran, l),
+            name: l.name.clone(),
+            agent: policy_line(&l.policy),
+            default: is_default(&l.policy),
+            why: l.why.clone(),
+            state: l.state.as_str().to_string(),
+            ready: ready.contains(&l.name),
+            after: w,
+            pane: l.pane.clone(),
+            tree: l.tree.clone(),
+            caption: l.caption.clone(),
+            skipped: l.skipped.clone(),
+            started: l.started.clone(),
+            ended: l.closed.clone(),
+            order: l.order.clone(),
+            baton: l.baton.clone(),
+            rework_of: l.rework.clone(),
+        })
+        .collect()
 }
 
 /// One line a leg, for `wsp show` and `wsp leg show`: every tier printed, the
@@ -1136,7 +1145,7 @@ pub(crate) fn run(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         Some("add") => cmd_add(store, args, pane),
         Some("after") => cmd_after(store, args, pane),
         Some("skip") => cmd_skip(store, args, pane),
-        Some("reset") => cmd_reset(store, args),
+        Some("reset") => cmd_reset(store, args, pane),
         Some("done") => crate::leg_seat::cmd_done(store, args, pane),
         Some("show") | Some("ls") | None => cmd_show(store, args),
         Some(other) => {
@@ -1313,13 +1322,34 @@ fn cmd_skip(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     }
 }
 
+/// Who may put a leg back (`wsp-011`): the person, the primary seat, or the
+/// governor of the row's list or project — never a seat bound to a row, a leg
+/// of this one included, and never another list's governor.
+fn may_reset(store: &Store, t: &Task, pane: Option<&str>) -> Result<(), String> {
+    let Some(p) = pane else { return Ok(()) };
+    if let Some(scope) = crate::place::governs(&store.governors(), &crate::place::Seat::new(p)) {
+        let list = crate::cycle::list_of(store, t).map(|w| w.id);
+        if crate::governors::is_primary(&scope) || t.project.as_deref() == Some(scope.as_str()) || list.as_deref() == Some(scope.as_str()) {
+            return Ok(());
+        }
+        return Err(format!(
+            "{p} governs {scope}, and {} is not on it — a leg is reset by the person, the primary seat or the row's governor",
+            t.id
+        ));
+    }
+    if store.bindings().contains_key(p) {
+        return Err(format!("{p} is a seat bound to a row — a leg is reset by the person, the primary seat or the row's governor"));
+    }
+    Ok(())
+}
+
 /// `wsp leg reset <task> <name> "why" [--force]`: a running leg whose seat is
 /// gone goes back to pending, its misses are forgiven, and the run starts it.
 ///
 /// **Refused while the seat is there**, because a seat reading anything but
 /// gone or empty may be an agent at work in its own tree; `--force` ends it
 /// first. The `why` is on the row's log, so the reset is not a silent edit.
-fn cmd_reset(store: &Store, args: &Args) -> i32 {
+fn cmd_reset(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     let (Some(task), Some(name)) = (args.rest.get(1), args.rest.get(2)) else {
         eprintln!("{USAGE}");
         return 2;
@@ -1332,6 +1362,9 @@ fn cmd_reset(store: &Store, args: &Args) -> i32 {
         Ok(t) => t,
         Err(why) => return refuse(why),
     };
+    if let Err(why) = may_reset(store, &t, pane) {
+        return refuse(why);
+    }
     let Some(leg) = legs(&t).into_iter().find(|l| &l.name == name) else {
         return refuse(format!("{} has no leg called {name}", t.id));
     };
@@ -1952,6 +1985,49 @@ mod tests {
         assert_eq!(ls[4].skipped.as_deref(), Some("the split was wrong"));
         assert_eq!(ls[3].after, Some(vec![]));
         assert_eq!(go(&["leg", "bogus"]), 2);
+    }
+
+    /// `wsp-011`: a running leg whose seat is gone goes back to pending by
+    /// `wsp leg reset`, for the person, the primary or the row's governor; a
+    /// seat bound to a row and another project's governor are refused, and the
+    /// why is on the row's log.
+    #[test]
+    fn a_running_leg_whose_seat_is_gone_is_reset_by_the_person_or_the_rows_governor_only() {
+        let (env, store) = scratch("reset");
+        let order = env.home().join("order.md");
+        std::fs::write(&order, "do it").unwrap();
+        let order = order.to_string_lossy().to_string();
+        let go = |line: &[&str], pane: Option<&str>| run(&store, &parse(line), pane);
+        assert_eq!(go(&["leg", "add", "m-1", "build", "--order", &order], None), 0);
+        assert_eq!(go(&["leg", "add", "m-1", "finish", "--order", &order], None), 0);
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        let mut ls = legs(&t);
+        ls[0].state = State::Done;
+        ls[1].state = State::Running;
+        ls[1].pane = Some("cpd-gone-011".into());
+        ls[1].started = Some("2026-11-17T06:00:00Z".into());
+        write(&mut t, &ls);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-5", serde_json::json!({ "task_id": "m-2", "pane_id": "cpd-5" }));
+        store.set_governor("other", serde_json::json!({ "workspace": "cpd-8", "pane": "cpd-8" }));
+        store.set_governor("p", serde_json::json!({ "workspace": "cpd-9", "pane": "cpd-9" }));
+
+        let reset = |pane: Option<&str>| go(&["leg", "reset", "m-1", "finish", "its", "seat", "closed", "as", "a", "member"], pane);
+        assert_eq!(reset(Some("cpd-5")), 1, "a seat bound to a row resets no leg");
+        assert_eq!(reset(Some("cpd-8")), 1, "another project's governor is refused");
+        assert_eq!(go(&["leg", "reset", "m-1", "finish"], Some("cpd-9")), 1, "a reset takes the reason");
+        assert_eq!(legs(&store.find_task("m-1").unwrap())[1].state, State::Running, "a refusal changes nothing");
+
+        assert_eq!(reset(Some("cpd-9")), 0, "the row's governor resets it");
+        let t = store.find_task("m-1").unwrap();
+        let l = legs(&t)[1].clone();
+        assert_eq!((l.state, l.pane, l.started), (State::Pending, None, None));
+        assert!(t.section("Log").unwrap().contains("leg finish reset by hand: its seat closed as a member"));
+
+        // Pending now, so a second reset — by the person — is refused.
+        assert_eq!(reset(None), 1);
+        assert_eq!(go(&["leg", "reset", "m-1", "build", "why"], None), 1, "a done leg is not reset");
     }
 
     /// `wsp-499`: a planner, which holds no row, files legs on a row at todo, and

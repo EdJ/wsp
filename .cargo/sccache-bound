@@ -1,0 +1,98 @@
+#!/usr/bin/perl
+# `perl sccache-bound <sccache> <args...>`: run one sccache call, and exit 2 (what sccache itself
+# exits when it cannot reach its server) if the server is alive but never answers, so `cc-wrap` and
+# `rustc-wrap` fall back to the bare compiler exactly as for a dead server (wsp-343, wsp-083).
+#
+# Why this and not a timeout on the call: sccache 0.19 has no client timeout (no env var or config
+# key bounds the wait on its socket), and a compile that is merely slow (sqlite3.c release takes
+# 14 s, a loaded machine longer) must never be killed or run twice. So only the wait for the SERVER
+# is bounded:
+# - The call runs as a child. Every COMPOUND_SCCACHE_WAIT seconds (default 3) that it is still
+#   running, `sccache --show-stats` asks the same server for its stats, under a perl alarm of
+#   COMPOUND_SCCACHE_PROBE seconds (default 10; macOS has no `timeout`). An answer, of any exit
+#   code, says the server is alive and the compile is only slow: keep waiting, no limit. A probe
+#   that does not return in time says the server is wedged: the call is killed and this exits 2.
+#   A probe costs about 8 ms and only a compile slower than the wait pays it; perl's start costs
+#   about 4 ms per call.
+# - A wedged server is written down once, in `$TMPDIR/compound-sccache-hung-<port>`, and said once
+#   on stderr. For 5 minutes after, every call exits 2 at once without asking sccache, so one build
+#   pays the wait and the probe once, not once per compile.
+use strict;
+use warnings;
+use POSIX ();
+
+my @cmd = @ARGV or exit 2;
+my $wait  = $ENV{COMPOUND_SCCACHE_WAIT}  || 3;
+my $probe = $ENV{COMPOUND_SCCACHE_PROBE} || 10;
+my $server = $ENV{SCCACHE_SERVER_UDS} || $ENV{SCCACHE_SERVER_PORT} || 4226;
+$server =~ s/[^A-Za-z0-9._-]/_/g;
+my $tmp = $ENV{TMPDIR} || '/tmp';
+$tmp =~ s{/+$}{};
+my $marker = "$tmp/compound-sccache-hung-$server";
+
+# Found wedged in the last 5 minutes: do not wait on it again.
+if (-e $marker && -M _ < 5 / (24 * 60)) {
+    exit 2;
+}
+
+my $pid = fork;
+exit 2 unless defined $pid;
+if ($pid == 0) {
+    exec { $cmd[0] } @cmd or POSIX::_exit(2);
+}
+
+# Pass an INT or TERM sent to this process on to the call; it ends, and its status is ours.
+$SIG{INT}  = sub { kill 'INT',  $pid };
+$SIG{TERM} = sub { kill 'TERM', $pid };
+
+sub status_of {
+    my ($st) = @_;
+    return 128 + ($st & 127) if $st & 127;
+    return $st >> 8;
+}
+
+# Wait on the call for up to `$secs`; its exit code, or undef if it is still running.
+sub wait_for {
+    my ($secs) = @_;
+    my $got = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "alarm\n" };
+        alarm $secs;
+        $got = waitpid($pid, 0) while $got == 0 || ($got == -1 && $!{EINTR});
+        alarm 0;
+    };
+    alarm 0;
+    return undef unless $got == $pid;
+    return status_of($?);
+}
+
+# Does the server answer `--show-stats` within `$probe` seconds?
+sub server_answers {
+    my $p = fork;
+    return 1 unless defined $p;    # cannot ask: do not kill a compile on a guess
+    if ($p == 0) {
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        open STDIN,  '<', '/dev/null';
+        alarm $probe;    # survives exec; SIGALRM ends the probe
+        exec { $cmd[0] } $cmd[0], '--show-stats' or POSIX::_exit(0);
+    }
+    waitpid($p, 0);
+    my $st = $?;
+    return !(($st & 127) == POSIX::SIGALRM());
+}
+
+while (1) {
+    my $rc = wait_for($wait);
+    exit $rc if defined $rc;
+    next if server_answers();
+    # Wedged. The call may have finished while the probe waited.
+    $rc = wait_for(1);
+    exit $rc if defined $rc;
+    kill 'KILL', $pid;
+    waitpid($pid, 0);
+    if (open my $fh, '>', $marker) { close $fh }
+    print STDERR "sccache-bound: the sccache server ($server) did not answer in ${probe} s; "
+        . "compiling without sccache for 5 minutes\n";
+    exit 2;
+}

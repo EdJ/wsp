@@ -326,9 +326,9 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
         ),
         (
             "In the header, and among the agents",
-            "herdr says working or idle and nothing more. What an idle agent is \
+            "backend says working or idle and nothing more. What an idle agent is \
              waiting for comes from the task in its hands, which is the half \
-             the store knows — so the same two states from herdr become four \
+             the store knows — so the same two states from backend become four \
              different answers here. One mark per agent, what wants you first, \
              what is free next: there is nothing to do about an agent that is \
              working. Each mark is clickable and goes to that terminal.",
@@ -338,7 +338,7 @@ pub(crate) fn legend() -> Vec<(&'static str, &'static str, Vec<Mark>)> {
                 mark(&[(Style::Accent, g::WORKING)], "working", "running"),
                 mark(&[(Style::Muted, g::IDLE)], "spare", "stopped, holding nothing — a person's worth of attention going spare"),
                 mark(&[(Style::Accent, g::SEAT)], "coordinating", "stopped, and in a project's governor slot — a governor is idle between the agents it starts, which is most of the night, and none of that idleness is you being the blocker"),
-                mark(&[(Style::Dim, g::QUIET)], "quiet", "herdr says neither, usually an agent that has not spoken since it started"),
+                mark(&[(Style::Dim, g::QUIET)], "quiet", "backend says neither, usually an agent that has not spoken since it started"),
                 mark(&[(Style::Dim, g::MORE), (Style::Plain, " "), (Style::Dim, "11")], "too many to draw", "the strip is clipped, never the count beside it — click the ⋯ for the rest"),
             ],
         ),
@@ -679,7 +679,7 @@ pub(super) fn card_lines(card: &super::rows::Card, w: usize, room: usize) -> Vec
 /// The word in the footer that opens the menu, and the whole of what a click
 /// has to land on.
 ///
-/// herdr's own sidebar keeps its menu behind exactly this: the word `menu`,
+/// backend's own sidebar keeps its menu behind exactly this: the word `menu`,
 /// right-aligned in the sidebar's footer strip. Copied rather than invented,
 /// and copied as a word rather than as a hamburger — `≡` is already
 /// [`glyph::NOTES`] here and means "something is written", and a panel with one
@@ -763,7 +763,7 @@ pub(super) fn menu_lines(menu: &super::keys::Menu, w: usize) -> Vec<Line> {
 /// Which row of the menu a click at `x`,`y` landed on.
 ///
 /// The border is not a row and answers `None`: a click on the frame of a box is
-/// a click that missed, and the row nearest it is `quit herdr`.
+/// a click that missed, and the row nearest it is `quit backend`.
 pub(super) fn menu_at(
     menu: &super::keys::Menu,
     w: usize,
@@ -1494,7 +1494,7 @@ pub(crate) fn frame(ui: &Ui, view: &mut View, w: usize, h: usize) -> Vec<Line> {
         foot.push(Style::Plain, "  ");
         foot.push(Style::Accent, "machines");
     }
-    // And the door, at the right-hand edge, where herdr keeps its own. Fitted
+    // And the door, at the right-hand edge, where backend keeps its own. Fitted
     // rather than appended: the counts are what give way if a pane is narrow
     // enough for the two to meet, because a count that is one column short is
     // still a count and a menu that is one column short is not a door.
@@ -1726,24 +1726,6 @@ pub(crate) fn ansi_of(style: Style) -> &'static str {
     }
 }
 
-/// The same colour, as three numbers.
-///
-/// A third surface — herdr's sidebar drawn natively — is handed cells rather
-/// than escapes, because a colour that only exists as an escape sequence is a
-/// colour only a terminal can be told. This is the same table as [`ansi_of`]
-/// and not a second one: the test below parses that function's output and
-/// fails if the two ever disagree, which is the only way a table copied by
-/// hand stays copied correctly.
-pub(crate) fn rgb_of(style: Style) -> Option<(u8, u8, u8)> {
-    match style {
-        Style::Plain | Style::Dim | Style::Bold => None,
-        Style::Muted => Some((125, 140, 150)),
-        Style::Accent => Some((95, 191, 164)),
-        Style::Warn => Some((224, 138, 75)),
-        Style::Query => Some((176, 140, 217)),
-    }
-}
-
 /// What the live panel prints.
 ///
 /// The one-cell case of [`crate::draw::Ansi`], and delegating rather than
@@ -1866,42 +1848,6 @@ mod tests {
         let target = Target::Task("t1".into());
         assert!(!has(&keymap(&target, false), "x"));
         assert!(has(&keymap(&target, true), "x"));
-    }
-
-    /// A colour has one definition, whichever surface asks for it.
-    ///
-    /// `ansi_of` and `rgb_of` are two spellings of one table, and a table
-    /// spelled twice drifts the first time somebody adjusts a hue in the one
-    /// they happen to be reading. This parses the escape the terminal is sent
-    /// and asserts the numbers a cell-based surface is handed are the same
-    /// ones, so the drift fails here instead of showing up as a sidebar that
-    /// is a slightly different green from the panel beside it.
-    #[test]
-    fn a_style_is_the_same_colour_whether_it_is_drawn_as_an_escape_or_as_cells() {
-        for style in [
-            Style::Plain,
-            Style::Dim,
-            Style::Bold,
-            Style::Muted,
-            Style::Accent,
-            Style::Warn,
-            Style::Query,
-        ] {
-            let escape = ansi_of(style);
-            let from_escape = escape.strip_prefix("\x1b[38;2;").and_then(|rest| {
-                let mut n = rest.trim_end_matches('m').split(';');
-                Some((
-                    n.next()?.parse().ok()?,
-                    n.next()?.parse().ok()?,
-                    n.next()?.parse().ok()?,
-                ))
-            });
-            assert_eq!(
-                from_escape,
-                rgb_of(style),
-                "{style:?} is a different colour depending on which surface asks"
-            );
-        }
     }
 
     /// The group drifted once already: it described the first column as the

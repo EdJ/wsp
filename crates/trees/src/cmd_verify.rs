@@ -246,6 +246,12 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::sharing::{self, Share};
+
+/// Which build-slot holders are running, asked of the in-process host.
+fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
+    use wsp_wire::host::Host;
+    wsp_wire::host::LOCAL.alive(pids)
+}
 use crate::store::Store;
 use crate::util;
 use crate::base::args::Args;
@@ -260,7 +266,7 @@ pub use crate::base::git::{git, git_ok, toplevel};
 /// not (`robustness-084`). It is that an agent is a workspace and not a pane: it
 /// splits, it opens a shell beside itself, and `wsp verify` run from any of them
 /// is the same agent asking for the same tree. Keyed on the pane, every split
-/// would be a cold build. Outside herdr there is no workspace, and `solo` is
+/// would be a cold build. Outside backend there is no workspace, and `solo` is
 /// honest: one shell at a terminal gets one tree and shares it with the next.
 ///
 /// A reissued workspace id therefore inherits the previous occupant's warm tree,
@@ -276,10 +282,7 @@ pub fn agent_key() -> String {
             return util::slugify(v.trim());
         }
     }
-    match crate::herdr::Env::read().workspace_id {
-        Some(ws) if !ws.trim().is_empty() => util::slugify(ws.trim()),
-        _ => "solo".to_string(),
-    }
+    "solo".to_string()
 }
 
 /// Where an agent standing in the *trunk* keeps its build tree: under the state
@@ -296,24 +299,46 @@ pub fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
     store.state.join("build").join(format!("{}-{}", util::slugify(name), key))
 }
 
-/// Remove the build trees under the state directory that no live workspace
+/// The keys a build tree may still be named for: the seats compound holds, and
+/// the `solo` key of a shell that is no seat at all.
+///
+/// `None` is compound not answering, which is the guard [`clear_build_dirs`]
+/// describes: a census that was not taken is not a machine with nothing on it.
+fn live_keys() -> Option<Vec<String>> {
+    use crate::place::Place;
+    let census = crate::place_compound::Compound::new().census().ok()?;
+    keys_of(&census)
+}
+
+/// [`live_keys`] off a census already taken, so a test can stand seats without
+/// a compound.
+fn keys_of(census: &crate::place::Census) -> Option<Vec<String>> {
+    if !census.answered("") {
+        return None;
+    }
+    let mut keys: Vec<String> = census.seats().map(|s| s.seat.as_str().to_string()).collect();
+    keys.push("solo".to_string());
+    Some(keys)
+}
+
+/// Remove the build trees under the state directory that no live seat
 /// owns, and say which went.
 ///
 /// The residue of keying on the workspace. Those trees outlived the workspaces
 /// that named them, so no agent alive can name one to remove it — 9.6G in 30 of
 /// them on 2026-08-17 — and the arrangement that made them is gone.
 ///
-/// `live` is the workspace ids herdr reported, and `None` is herdr not
+/// `live` is the workspace ids backend reported, and `None` is backend not
 /// answering. That distinction is the whole guard, and it is the same one
 /// [`crate::cmd_agent::may_reap`] makes for the same reason: silence is not
-/// evidence that the work stopped. A herdr that is down, or slow, reports
+/// evidence that the work stopped. A backend that is down, or slow, reports
 /// nothing, which looks exactly like a machine with no agents on it — and this
 /// would then delete the tree every running agent is mid-build in. So `None`
-/// removes nothing at all, and an empty list is only believed when herdr said
+/// removes nothing at all, and an empty list is only believed when backend said
 /// it.
 ///
 /// Passed in rather than read here so the judgement can be tested without a
-/// live herdr, which is the one thing that would make it untestable and it is
+/// live backend, which is the one thing that would make it untestable and it is
 /// the only thing here worth testing.
 ///
 /// Directories only. A stale `git worktree` registration left behind is pruned
@@ -326,7 +351,7 @@ pub fn build_dir(store: &Store, repo: &Path, key: &str) -> PathBuf {
 /// The judgement is [`stale_build_dirs`] and this is the removal of what it
 /// picked. Split for `worklist-051`: a preview computed *beside* the act is a
 /// second opinion about a directory listing crossed with a live workspace list,
-/// and the one run where the two would disagree is the run where herdr changed
+/// and the one run where the two would disagree is the run where backend changed
 /// its answer between them. Asking once and removing that answer is the only
 /// arrangement where the preview cannot be wrong about the act.
 fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<String> {
@@ -347,9 +372,9 @@ fn clear_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<
 /// preview and the act both print it and a directory listing arrives in
 /// whatever order the filesystem felt like.
 ///
-/// `None` for `live` is herdr not answering, and it is the guard rather than an
+/// `None` for `live` is backend not answering, and it is the guard rather than an
 /// error path: see [`clear_build_dirs`] above. It matters twice as much to the
-/// preview, because "herdr is silent, so nothing here would go" and "there is
+/// preview, because "backend is silent, so nothing here would go" and "there is
 /// no residue" are the same empty list and very much not the same fact — which
 /// is why the caller says which one it got rather than printing a bare zero.
 fn stale_build_dirs(store: &Store, live: Option<&[String]>, mine: &Path) -> Vec<PathBuf> {
@@ -386,7 +411,7 @@ fn keyed_on(name: &str, workspace: &str) -> bool {
 /// the guard rather than the mechanism. That one asks which workspaces are
 /// alive and removes everything else, which is right for a sweep and wrong for
 /// a single ending: it would make `wsp despawn` reach every dead workspace's
-/// residue on a list that is only as good as herdr's last answer. This one is
+/// residue on a list that is only as good as backend's last answer. This one is
 /// told the workspace whose last pane has just been closed, so the only tree it
 /// can touch is one that provably has no owner left.
 ///
@@ -549,7 +574,7 @@ fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: boo
 /// a preview without it would name three trees on a machine that has one.
 fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crate::sharing::Warm> {
     let claimed = if all {
-        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES)
+        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES, &alive)
     } else {
         // Which one it was is not a guess: the build wrote it down.
         std::fs::read_to_string(dir.join(BUILT_AT))
@@ -557,7 +582,7 @@ fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crat
             .map(|s| PathBuf::from(s.trim()))
             .and_then(|target| target.parent().map(Path::to_path_buf))
             .filter(|d| d.starts_with(store.state.join("warm")))
-            .and_then(|d| crate::sharing::warm_named(&d))
+            .and_then(|d| crate::sharing::warm_named(&d, &alive))
             .into_iter()
             .collect()
     };
@@ -1186,7 +1211,7 @@ fn alone(
     // as one would hand every other agent a smaller slice of the cores for the
     // whole of it, and this pass wants one core and the machine quiet.
     let exes = {
-        let share = sharing::take(state);
+        let share = sharing::take(state, &alive);
         if !json_out {
             if let Some(note) = share.note() {
                 println!("{} {}", p.dim("machine"), p.dim(&note));
@@ -1300,12 +1325,12 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         //
         // `live` is kept rather than folded into the call because `None` and
         // `Some([])` produce the same empty residue and are not the same fact:
-        // one is "herdr did not answer, so this half was skipped" and the other
+        // one is "compound did not answer, so this half was skipped" and the other
         // is "there is nothing here". Said out loud in both branches — a
         // preview more candid than the act would be the wrong way round.
-        let live: Option<Vec<String>> = all
-            .then(|| crate::herdr::workspaces().ok().map(|w| w.into_iter().map(|x| x.id).collect()))
-            .flatten();
+        // The live keys are compound's seat list now: a build tree is keyed on
+        // the agent that built in it, and a seat is that agent while it is held.
+        let live: Option<Vec<String>> = if all { live_keys() } else { None };
         let residue: Vec<String> = if !all {
             Vec::new()
         } else if dry {
@@ -1313,7 +1338,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         } else {
             clear_build_dirs(store, live.as_deref(), &dir)
         };
-        let herdr_silent = all && live.is_none();
+        let backend_silent = all && live.is_none();
         if json_out {
             println!(
                 "{}",
@@ -1324,7 +1349,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     "also_paths": residue,
                     "warm": warm,
                     "warm_paths": warm_paths,
-                    "herdr_silent": herdr_silent,
+                    "backend_silent": backend_silent,
                     "dry_run": dry,
                 })
             );
@@ -1346,7 +1371,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 }
             }
             if !residue.is_empty() {
-                println!("{did} {} left by earlier workspaces", residue.len());
+                println!("{did} {} left by earlier seats", residue.len());
             }
             if warm > 0 {
                 let cold = if dry { "would be cold" } else { "is cold" };
@@ -1363,11 +1388,11 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                     println!("  {}", p.dim(path));
                 }
             }
-            if herdr_silent {
+            if backend_silent {
                 println!(
                     "{}",
                     p.yellow(&format!(
-                        "herdr did not answer, so nothing left by earlier workspaces {}",
+                        "compound did not answer, so nothing left by earlier seats {}",
                         if dry { "is listed" } else { "was removed" }
                     ))
                 );
@@ -1449,7 +1474,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // agent's own tree instead and pays 21s for it.
     let alone_pass_asked = args.has("alone");
     let warm = (!alone_pass_asked)
-        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES))
+        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES, &alive))
         .flatten();
     let (tree, target) = match &warm {
         Some(w) => (w.tree(), w.target()),
@@ -1501,7 +1526,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // Registered here rather than at the top of the command: the share is
     // held for as long as it is being used, so a verify that spends a minute
     // resolving a patch is not counted against the builds running while it does.
-    let share = sharing::take(&store.state);
+    let share = sharing::take(&store.state, &alive);
     if !json_out {
         if let Some(note) = share.note() {
             println!("{} {}", p.dim("machine"), p.dim(&note));
@@ -1708,8 +1733,7 @@ mod tests {
     fn a_test_that_never_answers_is_a_failure_rather_than_a_hung_pass() {
         let dir = scratch_dir("alone-hang");
         let exe = dir.join("hangs");
-        std::fs::write(&exe, "#!/bin/sh\nexec sleep 300\n").unwrap();
-        chmod_x(&exe);
+        wsp_testkit::script(&exe, "#!/bin/sh\nexec sleep 300\n");
 
         let out = run_alone(
             &exe,
@@ -1743,8 +1767,7 @@ mod tests {
     fn a_slow_test_is_not_a_hung_one_unless_a_budget_was_asked_for() {
         let dir = scratch_dir("alone-slow");
         let exe = dir.join("slow");
-        std::fs::write(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n").unwrap();
-        chmod_x(&exe);
+        wsp_testkit::script(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n");
         let log = dir.join("log");
 
         // A budget it cannot meet accuses a test that passes.
@@ -1772,12 +1795,10 @@ mod tests {
         let dir = scratch_dir("alone-red");
         let exe = dir.join("fails");
         // libtest's own shape, which is what the real binary prints.
-        std::fs::write(
+        wsp_testkit::script(
             &exe,
             "#!/bin/sh\ncat <<'OUT'\nrunning 1 test\ntest a::b ... FAILED\n\nfailures:\n\n---- a::b stdout ----\nthread 'a::b' panicked at src/a.rs:12:9:\nthe seat was empty\n\nfailures:\n    a::b\n\ntest result: FAILED. 0 passed; 1 failed\nOUT\nexit 101\n",
-        )
-        .unwrap();
-        chmod_x(&exe);
+        );
 
         // No budget: this is about what the parser makes of a red test, and a
         // clock here has nothing to measure and one thing to get wrong. With
@@ -1790,8 +1811,7 @@ mod tests {
         assert_eq!(f.message.as_deref(), Some("the seat was empty"), "the assertion was lost");
 
         let ok = dir.join("passes");
-        std::fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
-        chmod_x(&ok);
+        wsp_testkit::script(&ok, "#!/bin/sh\nexit 0\n");
         assert!(
             run_alone(&ok, "a::b", &dir.join("log"), None).is_none(),
             "a passing test was reported as a failure"
@@ -1833,12 +1853,6 @@ bench::b: benchmark
         );
     }
 
-    /// `chmod +x`, without a dependency for it.
-    fn chmod_x(p: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wsp-verify-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1847,13 +1861,27 @@ bench::b: benchmark
     }
 
     /// A repository with one commit, and `git` configured enough to make it.
+    ///
+    /// The commit is made against a git of its own: an empty global config
+    /// under the test's directory, no system config, and no signing — so a
+    /// machine whose global config signs every commit (`commit.gpgsign=true`
+    /// with no key) still gets its fixture. All of it is set on the child, so
+    /// no other test's environment is touched.
     fn repo(dir: &Path) {
+        let home = dir.join(".test-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let global = home.join("gitconfig");
+        std::fs::write(&global, "").unwrap();
         let run = |args: &[&str]| {
             let out = Command::new("git")
                 .arg("-C")
                 .arg(dir)
+                .args(["-c", "commit.gpgsign=false"])
                 .args(args)
                 .env_remove("GIT_INDEX_FILE")
+                .env("HOME", &home)
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -1863,6 +1891,8 @@ bench::b: benchmark
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         run(&["init", "--quiet", "-b", "master"]);
+        // The fixture's own git home is no part of the tree under test.
+        std::fs::write(dir.join(".git/info/exclude"), ".test-home/\n").unwrap();
         std::fs::write(dir.join("kept.txt"), "one\n").unwrap();
         run(&["add", "kept.txt"]);
         run(&["commit", "--quiet", "-m", "first"]);
@@ -1878,28 +1908,52 @@ bench::b: benchmark
     /// exported still gets its own staging read correctly.
     #[test]
     fn a_caller_holding_a_private_index_still_gets_its_own_diff() {
-        // `GIT_INDEX_FILE` is process-wide, and this test exports one over
-        // the whole process while it runs — so any test in another thread that
-        // shells out to git during it would read this staging instead of its
-        // own. One process-wide resource, one lock.
-        let _env = util::env_lock();
+        // `GIT_INDEX_FILE` is process-wide, so it is exported in a process of
+        // its own — this test binary again, running only
+        // `patch_built_under_an_exported_index` — and never over the threads
+        // of the other tests here, which would read this staging as theirs.
         let dir = scratch_dir("index");
         repo(&dir);
         std::fs::write(dir.join("kept.txt"), "one\ntwo\n").unwrap();
 
         // Somebody else's index, exported over us, holding nothing at all.
         let theirs = dir.join("their-index");
-        std::env::set_var("GIT_INDEX_FILE", &theirs);
-
-        let scratch = dir.join("scratch");
-        std::fs::create_dir_all(&scratch).unwrap();
-        let mine = scratch.join("index");
-        let patch = build_patch(&dir, &dir, &mine, &scratch, &[]).unwrap();
-        std::env::remove_var("GIT_INDEX_FILE");
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cmd_verify::tests::patch_built_under_an_exported_index"])
+            .args(["--ignored", "--nocapture", "--test-threads=1"])
+            .env("GIT_INDEX_FILE", &theirs)
+            .env(EXPORTED_INDEX_REPO, &dir)
+            .output()
+            .unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child failed:\n{said}");
+        let patch = std::fs::read_to_string(dir.join("scratch/patch-out"))
+            .unwrap_or_else(|e| panic!("the child built no patch ({e}):\n{said}"));
 
         assert!(patch.contains("+two"), "the change was not in the patch:\n{patch}");
         assert!(!theirs.exists(), "we wrote to the caller's index");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Names the repository `patch_built_under_an_exported_index` works in.
+    const EXPORTED_INDEX_REPO: &str = "WSP_TEST_EXPORTED_INDEX_REPO";
+
+    /// The half of `a_caller_holding_a_private_index_still_gets_its_own_diff`
+    /// that runs with `GIT_INDEX_FILE` exported: only ever in the child that
+    /// test starts, which sets both variables. Run any other way it does
+    /// nothing.
+    #[test]
+    #[ignore = "run by a_caller_holding_a_private_index_still_gets_its_own_diff, in a process of its own"]
+    fn patch_built_under_an_exported_index() {
+        let Some(dir) = std::env::var_os(EXPORTED_INDEX_REPO).map(PathBuf::from) else {
+            return;
+        };
+        assert!(std::env::var_os("GIT_INDEX_FILE").is_some(), "the caller's index was not exported");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mine = scratch.join("index");
+        let patch = build_patch(&dir, &dir, &mine, &scratch, &[]).unwrap();
+        std::fs::write(scratch.join("patch-out"), patch).unwrap();
     }
 
     /// A new file is the commonest thing an agent adds and the easiest thing
@@ -1979,16 +2033,16 @@ bench::b: benchmark
     /// same agent wanting the same warm tree.
     #[test]
     fn the_build_tree_is_this_agents_and_not_this_panes() {
-        // `WSP_AGENT` and `HERDR_WORKSPACE_ID` are what every caller of
+        // `WSP_AGENT` and `WSP_BACKEND_WORKSPACE_ID` are what every caller of
         // `agent_key` reads, and this test removes one of them — so a test in
         // another thread asking which agent it is would be answered by this
         // one's teardown. Bare rather than `isolated`: `Store::at` is explicit
-        // here and nothing reaches a herdr.
+        // here and nothing reaches a backend.
         let _env = util::env_lock();
         std::env::set_var("WSP_AGENT", "w1");
         assert_eq!(agent_key(), "w1");
         std::env::set_var("WSP_AGENT", "  ");
-        std::env::remove_var("HERDR_WORKSPACE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
         assert_eq!(agent_key(), "solo");
         std::env::remove_var("WSP_AGENT");
 
@@ -2133,6 +2187,32 @@ bench::b: benchmark
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The feed for the residue sweep: a seat compound holds keeps its tree,
+    /// the shell's `solo` key is never residue, and a census nobody answered
+    /// is no list at all — so the sweep sees a live seat and a residue, and
+    /// removes nothing on silence.
+    #[test]
+    fn the_residue_sweep_is_fed_by_the_seats_compound_holds() {
+        use crate::place::{Census, Refusal, Seat, Seated, State};
+        let dir = scratch_dir("seat-feed");
+        let store = Store::at(dir.join("store"), dir.join("state"));
+        let build = store.state.join("build");
+        for t in ["wsp-cpd-1", "wsp-cpd-2", "wsp-solo"] {
+            std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
+        }
+        let seated = Seated { seat: Seat::new("cpd-1"), state: State::Working, ..Default::default() };
+        let live = keys_of(&Census::heard("", vec![seated])).expect("an answered census is a list");
+
+        let said = stale_build_dirs(&store, Some(&live), Path::new("/nowhere"));
+        assert_eq!(said, vec![build.join("wsp-cpd-2")], "the residue is the tree no seat holds");
+        assert_eq!(clear_build_dirs(&store, Some(&live), Path::new("/nowhere")).len(), 1);
+        assert!(build.join("wsp-cpd-1").exists(), "a live seat lost the tree it was building in");
+        assert!(build.join("wsp-solo").exists(), "a shell's tree was taken for residue");
+
+        assert!(keys_of(&Census::silent("", Refusal::Unreachable("down".into()))).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The narrow half, aimed at one workspace, and it must stay narrow.
     ///
     /// `wsp despawn` calls this the moment a seat's workspace goes, so the
@@ -2146,14 +2226,14 @@ bench::b: benchmark
         let dir = scratch_dir("one-key");
         let store = Store::at(dir.join("store"), dir.join("state"));
         let build = store.state.join("build");
-        for t in ["wsp-w2x", "herdr-w2x", "wsp-w2y", "my-wsp-w2x"] {
+        for t in ["wsp-w2x", "backend-w2x", "wsp-w2y", "my-wsp-w2x"] {
             std::fs::create_dir_all(build.join(t).join("tree")).unwrap();
         }
 
         let gone = clear_build_key(&store, "w2x");
         assert_eq!(gone.len(), 3, "the wrong trees went: {gone:?}");
         assert!(!build.join("wsp-w2x").exists());
-        assert!(!build.join("herdr-w2x").exists(), "a workspace can build more than one repository");
+        assert!(!build.join("backend-w2x").exists(), "a workspace can build more than one repository");
         assert!(!build.join("my-wsp-w2x").exists(), "the workspace was matched as part of the repo name");
         assert!(build.join("wsp-w2y").exists(), "another workspace lost the tree it was building in");
 
@@ -2163,14 +2243,14 @@ bench::b: benchmark
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one line standing between a herdr that is down and every running
-    /// agent losing the tree it is mid-build in. A herdr that cannot be reached
+    /// The one line standing between a backend that is down and every running
+    /// agent losing the tree it is mid-build in. A backend that cannot be reached
     /// reports no workspaces, which looks exactly like a machine with nothing
     /// running on it — so `None` removes nothing, and an empty list is believed
-    /// only because herdr said it. The same judgement `may_reap` makes, and for
+    /// only because backend said it. The same judgement `may_reap` makes, and for
     /// the same reason.
     #[test]
-    fn a_herdr_that_did_not_answer_is_not_a_machine_with_no_agents_on_it() {
+    fn a_backend_that_did_not_answer_is_not_a_machine_with_no_agents_on_it() {
         let dir = scratch_dir("silence");
         let store = Store::at(dir.join("store"), dir.join("state"));
         let build = store.state.join("build");
@@ -2178,11 +2258,11 @@ bench::b: benchmark
 
         assert!(
             clear_build_dirs(&store, None, Path::new("/nowhere")).is_empty(),
-            "silence from herdr was read as nothing running"
+            "silence from backend was read as nothing running"
         );
-        assert!(build.join("wsp-w2x").exists(), "a tree went on herdr saying nothing");
+        assert!(build.join("wsp-w2x").exists(), "a tree went on backend saying nothing");
 
-        // Said, and meant: an empty answer from a herdr that answered is a
+        // Said, and meant: an empty answer from a backend that answered is a
         // machine with no agents on it, and its trees are residue.
         assert_eq!(clear_build_dirs(&store, Some(&[]), Path::new("/nowhere")).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2196,7 +2276,7 @@ bench::b: benchmark
     ///
     /// This is the strongest case for a dry run in the whole of `worklist-051`
     /// and the fixture says why in three directories. What `--all` matches is a
-    /// listing of a directory nobody types crossed with herdr's live workspace
+    /// listing of a directory nobody types crossed with backend's live workspace
     /// list — a wildcard over two things the caller cannot see from where they
     /// are standing. And the removal *does not name what it took*: it prints a
     /// count. So the preview is not a convenience here, it is the only place
@@ -2234,13 +2314,13 @@ bench::b: benchmark
         expected.sort();
         assert_eq!(said_names, expected, "the preview printed a directory listing in filesystem order");
 
-        // And herdr's silence reaches the preview as it reaches the act:
+        // And backend's silence reaches the preview as it reaches the act:
         // nothing named, because nothing would go. The caller is told which of
         // the two it got by `verify` rather than by this, which is why the
         // empty list is not enough on its own.
         assert!(
             stale_build_dirs(&store, None, &mine).is_empty(),
-            "silence from herdr was previewed as a machine with no agents on it"
+            "silence from backend was previewed as a machine with no agents on it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

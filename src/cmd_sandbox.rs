@@ -1,19 +1,19 @@
-//! `wsp sandbox` — a whole isolated wsp: its own herdr, its own store, its own
+//! `wsp sandbox` — a whole isolated wsp: its own backend, its own store, its own
 //! state, in one command.
 //!
 //! `wsp verify` isolates the *build*. This isolates the *run*. A worktree gets
 //! you a compile that means something; it does nothing for the verbs that write
 //! — `sync`, `reconcile --reap`, `adopt`, `spawn`, the panel's keys — because
-//! those talk to the one herdr everybody is standing in and the one store
+//! those talk to the one backend everybody is standing in and the one store
 //! everybody's claims are in. Testing them in the live instance is how an agent
 //! ends another agent's claim while checking that reaping works.
 //!
 //! It needs no new mechanism. Three environment variables wsp has always read,
-//! and one herdr feature we had not noticed:
+//! and one backend feature we had not noticed:
 //!
-//!     herdr --session <name> server
+//!     backend --session <name> server
 //!
-//! brings up a second headless server under `~/.config/herdr/sessions/<name>/`
+//! brings up a second headless server under `~/.config/backend/sessions/<name>/`
 //! with its own socket and log, beside the running one and without disturbing
 //! it. With `WSP_HOME` and `WSP_STATE` that is a complete instance. Proved on
 //! 2026-08-16 with four agents working in this checkout: a probe session came
@@ -35,10 +35,10 @@
 //! followed for a day. So the sandbox holds a `bin/wsp` symlink at whichever
 //! binary invoked it, and puts that directory first on `PATH`. Inside the
 //! sandbox, `wsp` *is* the binary under test — including for anything the child
-//! shells out to, and for `herdr-plugin/run.sh`, which checks `WSP_BIN` before
+//! shells out to, and for the launcher, which checks `WSP_BIN` before
 //! `~/.local/bin/wsp`.
 //!
-//! # …or no herdr at all
+//! # …or no backend at all
 //!
 //! `--fake` swaps the one part of the instance that has to be real for one that
 //! does not: [`crate::fake`] answers the same socket out of a state written
@@ -46,25 +46,25 @@
 //! `wsp` shim — because the value of it is precisely that nothing downstream
 //! can tell.
 //!
-//! It is for the states a live herdr cannot be put in, which is most of the
+//! It is for the states a live backend cannot be put in, which is most of the
 //! ones that have cost this store anything: a machine that stops answering
 //! mid-tick, an agent stuck in its launch window, twenty-two workspaces, a
-//! pane list that goes empty. A herdr you can start in 0.1s is not the problem
+//! pane list that goes empty. A backend you can start in 0.1s is not the problem
 //! and never was.
 //!
 //! The division stays explicit: **the fake is for wsp's reaction to a state,
-//! and the herdr sandbox stays the contract check against real behaviour**. A
-//! fake that is wrong about herdr makes tests green on a lie, so anything
-//! asserting what herdr *does* is recorded from a live one — see the module
+//! and the backend sandbox stays the contract check against real behaviour**. A
+//! fake that is wrong about backend makes tests green on a lie, so anything
+//! asserting what backend *does* is recorded from a live one — see the module
 //! docs there, including the two things it found the port had wrong.
 //!
 //! # What a sandbox is not
 //!
-//! Its herdr starts empty, and manufacturing twenty-two workspaces is not a
+//! Its backend starts empty, and manufacturing twenty-two workspaces is not a
 //! thing this can do. (`--fake` can, which is the point of it.) `--seed` copies the store — projects and tasks, so `ls`,
 //! `tree`, `show` and the panel have something to draw — and deliberately not
 //! the machine state, because a claim names a workspace id that exists in
-//! nobody's herdr but the live one. When what you need is this machine's actual
+//! nobody's backend but the live one. When what you need is this machine's actual
 //! workspaces and agents, no sandbox reproduces it; that residue is
 //! robustness-014.
 //!
@@ -91,25 +91,26 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::base::procs::{ancestors, processes};
+use crate::base::procs::ancestors;
+use crate::host::{Host, LOCAL};
 use crate::store::Store;
 use crate::util;
 use crate::Args;
 
 /// How long to wait for a session's socket to answer. Measured at well under a
-/// second on this machine; the deadline is for the case where herdr is not
+/// second on this machine; the deadline is for the case where backend is not
 /// coming up at all, and it has to be long enough that a loaded machine is not
 /// mistaken for a broken one.
 const READY: Duration = Duration::from_secs(20);
 
-/// Every sandbox session is named `wsp-…`, so `herdr session list` says whose
+/// Every sandbox session is named `wsp-…`, so `backend session list` says whose
 /// it is and `wsp sandbox ls` can find one whose directory has been removed
 /// from underneath it.
 const PREFIX: &str = "wsp-";
 
 /// A whole instance, in the five variables that address it.
 struct Sandbox {
-    /// The herdr session name, which is also the directory name and the handle
+    /// The backend session name, which is also the directory name and the handle
     /// `wsp sandbox rm` takes.
     name: String,
     /// `<state>/sandbox/<name>` — everything below is inside it.
@@ -126,7 +127,7 @@ struct Sandbox {
     bin: PathBuf,
     /// The directory holding the `wsp` symlink, which goes first on `PATH`.
     shim: PathBuf,
-    /// herdr's socket, once the session answers. Empty until then.
+    /// backend's socket, once the session answers. Empty until then.
     socket: PathBuf,
 }
 
@@ -145,9 +146,9 @@ impl Sandbox {
         }
     }
 
-    /// Which instance this is, without saying where its herdr is.
+    /// Which instance this is, without saying where its backend is.
     ///
-    /// Split out because the herdr *server* has to be started with these and
+    /// Split out because the backend *server* has to be started with these and
     /// cannot be told the socket: it has not chosen one yet. That is not a
     /// detail. A session server hands its own environment to every plugin it
     /// starts, and the `[[startup]]` entry in the global `plugins.json` is `wsp
@@ -169,25 +170,25 @@ impl Sandbox {
     /// reach it.
     fn env(&self) -> Vec<(String, String)> {
         let mut env = self.store_env();
-        env.insert(0, ("HERDR_SOCKET_PATH".into(), self.socket.display().to_string()));
+        env.insert(0, ("WSP_BACKEND_SOCKET_PATH".into(), self.socket.display().to_string()));
         env
     }
 }
 
-/// The two `HERDR_` variables that are about *where herdr is* rather than about
+/// The two `WSP_BACKEND_` variables that are about *where backend is* rather than about
 /// which pane the caller is standing in. Everything else with that prefix is a
 /// fact about the caller's session, and false in here.
-const KEEP: &[&str] = &["HERDR_SOCKET_PATH", "HERDR_BIN"];
+const KEEP: &[&str] = &["WSP_BACKEND_SOCKET_PATH", "WSP_BACKEND_BIN"];
 
 /// What a sandbox has to forget.
 ///
-/// The caller's environment is full of things its herdr told it — pane id,
+/// The caller's environment is full of things its backend told it — pane id,
 /// workspace id, tab id, the plugin event it was invoked from — and in a
-/// sandbox every one of them names something that herdr has never heard of.
+/// sandbox every one of them names something that backend has never heard of.
 /// Left in place, `wsp claim` inside a sandbox binds a task to a pane that does
 /// not exist there: a phantom binding, which is the class of bug this codebase
 /// has spent the most time on. So the rule is the prefix rather than a list of
-/// the ones we happen to know about — a variable herdr adds next month is a
+/// the ones we happen to know about — a variable backend adds next month is a
 /// fact about the caller's session too — and the two locators are kept.
 ///
 /// `GIT_INDEX_FILE` goes for the same reason it goes in `verify`: an agent
@@ -195,15 +196,15 @@ const KEEP: &[&str] = &["HERDR_SOCKET_PATH", "HERDR_BIN"];
 /// here would stage into their commit.
 ///
 /// [`crate::base::seat::SEAT_ENV`] is named because it is the same fact under a
-/// prefix this rule does not cover: it is what a backend that is not herdr calls
+/// prefix this rule does not cover: it is what a backend that is not backend calls
 /// the caller's pane id, and a phantom binding made through it would be the
-/// identical bug. Nothing sets it today — herdr's name for the seat is
-/// `HERDR_PANE_ID` — so this is inert, and it is here because the moment to
+/// identical bug. Nothing sets it today — backend's name for the seat is
+/// `WSP_BACKEND_PANE_ID` — so this is inert, and it is here because the moment to
 /// write it down is before the first backend that does.
 fn forgettable(key: &str) -> bool {
     key == "GIT_INDEX_FILE"
         || key == crate::base::seat::SEAT_ENV
-        || (key.starts_with("HERDR_") && !KEEP.contains(&key))
+        || (key.starts_with("WSP_BACKEND_") && !KEEP.contains(&key))
 }
 
 /// The same rule, against this process's actual environment: what a caller
@@ -254,24 +255,24 @@ fn path_with(shim: &Path, current: Option<&str>) -> String {
     }
 }
 
-fn herdr(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(crate::herdr::herdr_bin())
+fn backend(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("backend")
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("herdr {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("backend {}: {e}", args.join(" ")))?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
     let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if msg.is_empty() { format!("herdr {} failed", args.join(" ")) } else { msg })
+    Err(if msg.is_empty() { format!("backend {} failed", args.join(" ")) } else { msg })
 }
 
-/// What herdr says its sessions are: name, running, socket. Asked rather than
-/// computed — the layout under `~/.config/herdr` is herdr's business, and a
+/// What backend says its sessions are: name, running, socket. Asked rather than
+/// computed — the layout under `~/.config/backend` is backend's business, and a
 /// path we built ourselves would go stale silently.
 fn sessions() -> Vec<(String, bool, PathBuf)> {
-    let Ok(text) = herdr(&["session", "list", "--json"]) else {
+    let Ok(text) = backend(&["session", "list", "--json"]) else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -299,7 +300,7 @@ fn session(name: &str) -> Option<(bool, PathBuf)> {
 
 /// Bring the session up and wait until its socket actually answers.
 ///
-/// The socket file appearing is not the same as herdr being ready to speak, and
+/// The socket file appearing is not the same as backend being ready to speak, and
 /// the difference is a race that only shows up on a busy machine — so this
 /// connects, which is the only question worth asking.
 ///
@@ -311,7 +312,7 @@ fn session(name: &str) -> Option<(bool, PathBuf)> {
 /// starts the processes.
 fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
     let name = &sb.name;
-    let mut c = Command::new(crate::herdr::herdr_bin());
+    let mut c = Command::new("backend");
     c.args(["--session", name, "server"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -320,11 +321,11 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
     // Not in `forget_keys` — it is how a *child* is told where the sandbox is,
     // and we do not know that yet. What we do know is that the caller's is
     // wrong, and the server sets its own for everything it starts.
-    c.env_remove("HERDR_SOCKET_PATH");
+    c.env_remove("WSP_BACKEND_SOCKET_PATH");
     for (k, v) in sb.store_env() {
         c.env(k, v);
     }
-    c.spawn().map_err(|e| format!("cannot start herdr: {e}"))?;
+    c.spawn().map_err(|e| format!("cannot start backend: {e}"))?;
 
     let deadline = Instant::now() + READY;
     loop {
@@ -335,10 +336,10 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "herdr session `{name}` did not come up in {}s — its log is {}",
+                "backend session `{name}` did not come up in {}s — its log is {}",
                 READY.as_secs(),
                 util::contract(&util::home().join(format!(
-                    ".config/herdr/sessions/{name}/herdr-server.log"
+                    ".config/backend/sessions/{name}/backend-server.log"
                 )))
             ));
         }
@@ -348,11 +349,11 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
 
 /// What the sandbox started and still has running.
 ///
-/// A herdr session server hands `HERDR_SESSION` to the plugins it starts, but a
+/// A backend session server hands `WSP_BACKEND_SESSION` to the plugins it starts, but a
 /// seat placed through the compound backend (`compound-sup`, `compound-render`,
 /// and the agent they start) carries no such variable and outlives the session.
 /// What every process of a sandbox does carry is `WSP_HOME` and `WSP_STATE`
-/// under `<root>/<name>/`, so that is the main handle; `HERDR_SESSION=<name>`
+/// under `<root>/<name>/`, so that is the main handle; `WSP_BACKEND_SESSION=<name>`
 /// stays as the second. Both match with a boundary, so `wsp-w1` does not reap
 /// `wsp-w12`.
 ///
@@ -360,7 +361,7 @@ fn start_session(sb: &Sandbox) -> Result<PathBuf, String> {
 /// `wsp sandbox rm` can have the session name on its own command line, and `ps
 /// -E` puts the command and the environment in one field.
 fn session_children(root: &Path, name: &str) -> Vec<u32> {
-    let all = processes();
+    let all = LOCAL.processes();
     children_of(&all, root, name)
 }
 
@@ -401,10 +402,10 @@ pub(crate) fn strays(real: &Store) -> Vec<PathBuf> {
     dirs.iter().flat_map(|d| strays_of(real, d)).map(|(_, t)| t).collect()
 }
 
-/// `HERDR_SESSION=<name>` in a process's environment, with a boundary after it
+/// `WSP_BACKEND_SESSION=<name>` in a process's environment, with a boundary after it
 /// so `wsp-w1` does not match `wsp-w12`.
 fn holds_session(rest: &str, name: &str) -> bool {
-    let needle = format!("HERDR_SESSION={name}");
+    let needle = format!("WSP_BACKEND_SESSION={name}");
     rest.match_indices(&needle)
         .any(|(i, _)| matches!(rest.as_bytes().get(i + needle.len()), None | Some(b' ') | Some(b'\t')))
 }
@@ -448,8 +449,8 @@ fn sandboxes_named_in(rest: &str, root: &Path) -> Vec<String> {
             out.push(name);
         }
     };
-    for (i, _) in rest.match_indices("HERDR_SESSION=") {
-        add(rest[i + "HERDR_SESSION=".len()..].chars().take_while(|c| !c.is_whitespace()).collect());
+    for (i, _) in rest.match_indices("WSP_BACKEND_SESSION=") {
+        add(rest[i + "WSP_BACKEND_SESSION=".len()..].chars().take_while(|c| !c.is_whitespace()).collect());
     }
     let base = format!("{}/", root.display());
     for key in ["WSP_HOME=", "WSP_STATE="] {
@@ -468,10 +469,10 @@ fn sandboxes_named_in(rest: &str, root: &Path) -> Vec<String> {
 ///
 /// The third place a sandbox can be, after the session list and the state
 /// directory — and the one `ls` was blind to. It said "no sandboxes" with a
-/// stray daemon up, because it asked herdr what sessions existed and a session
+/// stray daemon up, because it asked backend what sessions existed and a session
 /// is not the only thing a sandbox creates.
 fn sessions_with_processes(root: &Path) -> Vec<(String, usize)> {
-    let all = processes();
+    let all = LOCAL.processes();
     let mine = ancestors(&all);
     let mut out: Vec<(String, usize)> = Vec::new();
     for (pid, _, rest) in &all {
@@ -504,19 +505,14 @@ fn kill(pids: &[u32], signal: &str) {
     if pids.is_empty() {
         return;
     }
-    let mut c = Command::new("kill");
-    c.arg(signal);
-    for p in pids {
-        c.arg(p.to_string());
-    }
-    let _ = c.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    LOCAL.signal(pids, signal);
 }
 
 /// Stop it, reap what it started, and delete it. Best-effort throughout: what
 /// this is usually clearing up is a half-torn-down sandbox, where some of it
 /// has already happened.
 ///
-/// The reaping is the part `herdr session stop` does not do and cannot be
+/// The reaping is the part `backend session stop` does not do and cannot be
 /// expected to: it ends the server, and the server's children are reparented to
 /// `launchd` and carry on. One did — a `wsp daemon` holding the socket of a
 /// session that no longer existed and, because it had not been told otherwise,
@@ -527,7 +523,7 @@ fn kill(pids: &[u32], signal: &str) {
 /// Returns whether there was a session, and how many processes it left.
 fn stop_session(root: &Path, name: &str) -> (bool, usize) {
     let existed = session(name).is_some();
-    let _ = herdr(&["session", "stop", name]);
+    let _ = backend(&["session", "stop", name]);
 
     // Freeze the whole set before ending any of it: the daemon places seats, and
     // a daemon that is still running while its seats are killed places new ones.
@@ -540,13 +536,13 @@ fn stop_session(root: &Path, name: &str) -> (bool, usize) {
         if fresh.is_empty() {
             break;
         }
-        kill(&fresh, "-STOP");
+        kill(&fresh, "STOP");
         children.extend(fresh);
     }
     if !children.is_empty() {
-        kill(&children, "-TERM");
+        kill(&children, "TERM");
         // TERM stays pending on a stopped process until it runs again.
-        kill(&children, "-CONT");
+        kill(&children, "CONT");
         // A daemon in the middle of a sync has a store lock and a socket read
         // to finish. Long enough to let it, short enough that a teardown is
         // still something you wait for.
@@ -557,11 +553,11 @@ fn stop_session(root: &Path, name: &str) -> (bool, usize) {
             }
         }
         let left = session_children(root, name);
-        kill(&left, "-STOP");
-        kill(&left, "-KILL");
+        kill(&left, "STOP");
+        kill(&left, "KILL");
     }
 
-    let _ = herdr(&["session", "delete", name]);
+    let _ = backend(&["session", "delete", name]);
     (existed, children.len())
 }
 
@@ -589,7 +585,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Everything about a sandbox that is not the herdr session: the directories,
+/// Everything about a sandbox that is not the backend session: the directories,
 /// the `wsp` shim, and a store that exists.
 ///
 /// Separate from bringing the session up so it can be tested, and so the
@@ -653,7 +649,7 @@ pub fn sandbox(store: &Store, args: &Args) -> i32 {
 /// Not a second command surface, which is why it is a subcommand of the one
 /// that already means *an isolated instance*: `--fake` spawns this, and nobody
 /// is expected to type it. It exists as a verb at all because the fake has to
-/// outlive the process that asked for it, exactly as the herdr session does.
+/// outlive the process that asked for it, exactly as the backend session does.
 fn serve(args: &Args) -> i32 {
     let Some(socket) = args.get("socket") else {
         eprintln!("wsp sandbox serve: --socket <path> is what it binds");
@@ -671,11 +667,11 @@ fn serve(args: &Args) -> i32 {
 
 /// The socket a fake sandbox binds, and the marker that it is one.
 ///
-/// Inside the sandbox directory rather than under `~/.config/herdr`, because
-/// there is no herdr here to own it — which is also what makes it a reliable
+/// Inside the sandbox directory rather than under `~/.config/backend`, because
+/// there is no backend here to own it — which is also what makes it a reliable
 /// answer to "is this sandbox a fake" for `ls`.
 fn fake_socket(dir: &Path) -> PathBuf {
-    dir.join("herdr.sock")
+    dir.join("backend.sock")
 }
 
 /// The stage a fake starts from, and goes on watching.
@@ -703,8 +699,8 @@ fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
     for (k, v) in sb.store_env() {
         c.env(k, v);
     }
-    c.env("HERDR_SESSION", &sb.name);
-    c.env("HERDR_SOCKET_PATH", &socket);
+    c.env("WSP_BACKEND_SESSION", &sb.name);
+    c.env("WSP_BACKEND_SOCKET_PATH", &socket);
     c
 }
 
@@ -716,9 +712,9 @@ fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
 /// to be patient about. A fake that has not answered in two seconds is not
 /// coming.
 ///
-/// `HERDR_SESSION` is put back into the child's environment on purpose, having
+/// `WSP_BACKEND_SESSION` is put back into the child's environment on purpose, having
 /// just been stripped with the rest of the caller's. It is not a claim that
-/// there is a herdr session: it is the one handle `stop_session` and
+/// there is a backend session: it is the one handle `stop_session` and
 /// `sandbox ls` have for "which sandbox does this process belong to", and a
 /// second mechanism for the same question is how a stray ends up invisible to
 /// both — which is the defect robustness-021 was opened for.
@@ -746,7 +742,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let json_out = args.json();
 
-    let Ok(bin) = std::env::current_exe() else {
+    let Ok(bin) = wsp_base::util::self_exe() else {
         eprintln!("wsp: cannot tell which binary is running, so cannot put it in a sandbox");
         return 2;
     };
@@ -769,7 +765,7 @@ fn up(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
-    // A fake instead of a herdr: everything above this line is the same
+    // A fake instead of a backend: everything above this line is the same
     // instance — the store, the state, the `wsp` shim — and the only thing that
     // changes is what is answering the socket. That is the whole claim of
     // robustness-023, and it is why this is a flag rather than a command.
@@ -847,7 +843,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     println!("{} {}", p.dim("sandbox"), p.bold(&sb.name));
     println!(
         "{} {} {}",
-        p.dim(if fake { "fake   " } else { "herdr  " }),
+        p.dim(if fake { "fake   " } else { "backend  " }),
         util::contract(&sb.socket),
         p.dim(&format!("(up in {up_secs:.1}s, empty)"))
     );
@@ -867,7 +863,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     installed_warning(&p, &sb.bin);
 
     println!();
-    println!("export HERDR_SOCKET_PATH={}", sb.socket.display());
+    println!("export WSP_BACKEND_SOCKET_PATH={}", sb.socket.display());
     println!("export WSP_HOME={}", sb.home.display());
     println!("export WSP_STATE={}", sb.state.display());
     println!("export WSP_ARTEFACTS={}", sb.artefacts.display());
@@ -880,10 +876,10 @@ fn up(store: &Store, args: &Args) -> i32 {
     println!();
     println!("{} wsp <anything> — `wsp` here is the binary above", p.dim("then   "));
     // A fake has nothing to attach to, and saying so is better than printing a
-    // herdr command that would open the caller's own session.
+    // backend command that would open the caller's own session.
     match fake {
         true => println!("{} nothing to attach to — it is a state, not a terminal", p.dim("attach ")),
-        false => println!("{} herdr --session {}", p.dim("attach "), sb.name),
+        false => println!("{} backend --session {}", p.dim("attach "), sb.name),
     }
     println!("{} wsp sandbox rm {}", p.dim("finish "), sb.name);
     0
@@ -909,7 +905,7 @@ fn installed_warning(p: &util::Paint, bin: &Path) {
 fn child(sb: &Sandbox, cmd: &str) -> Command {
     let mut c = Command::new("sh");
     c.arg("-c").arg(cmd);
-    // Forgotten first, set second: `HERDR_SOCKET_PATH` is both a variable the
+    // Forgotten first, set second: `WSP_BACKEND_SOCKET_PATH` is both a variable the
     // caller may hold and the one thing the sandbox most needs to say.
     forget(&mut c);
     for (k, v) in sb.env() {
@@ -1019,7 +1015,7 @@ fn ls(store: &Store, args: &Args) -> i32 {
         .iter()
         .map(|n| {
             let s = live.iter().find(|(m, _, _)| m == n);
-            // A fake has no herdr session to be found in, so its socket is the
+            // A fake has no backend session to be found in, so its socket is the
             // only thing that says it exists — and without this the row would
             // read "N process(es), no session" in red, which is what a *stray*
             // looks like. The one state this list exists to make loud must not
@@ -1060,9 +1056,9 @@ fn ls(store: &Store, args: &Args) -> i32 {
         } else {
             let n = r["processes"].as_u64().unwrap_or(0);
             match n {
-                0 => p.dim("herdr stopped"),
-                1 => p.red("herdr stopped · 1 process"),
-                n => p.red(&format!("herdr stopped · {n} processes")),
+                0 => p.dim("backend stopped"),
+                1 => p.red("backend stopped · 1 process"),
+                n => p.red(&format!("backend stopped · {n} processes")),
             }
         };
         // The process count is loud when the session is gone, because that is
@@ -1071,7 +1067,7 @@ fn ls(store: &Store, args: &Args) -> i32 {
         let procs = match (r["processes"].as_u64().unwrap_or(0), r["running"].as_bool(), fake) {
             (0, _, _) => String::new(),
             (n, Some(true), _) | (n, _, true) => p.dim(&format!("{n} process(es)")),
-            // Said in the state column already, as "herdr stopped · N processes".
+            // Said in the state column already, as "backend stopped · N processes".
             (_, _, _) if r["orphan"].as_bool() != Some(true) => String::new(),
             (n, _, _) => p.red(&format!("{n} process(es), no session")),
         };
@@ -1103,7 +1099,7 @@ pub(crate) fn dir_of(store: &Store) -> Option<PathBuf> {
 fn outside_only(store: &Store, verb: &str) -> Option<i32> {
     let name = inside_of(&store.state)?;
     eprintln!(
-        "wsp: this shell has sandbox {name}'s variables exported, so `sandbox {verb}` would look in its state and not in the real one — run it outside: `env -u WSP_HOME -u WSP_STATE -u HERDR_SOCKET_PATH wsp sandbox {verb} …`, or in a shell that did not export them"
+        "wsp: this shell has sandbox {name}'s variables exported, so `sandbox {verb}` would look in its state and not in the real one — run it outside: `env -u WSP_HOME -u WSP_STATE -u WSP_BACKEND_SOCKET_PATH wsp sandbox {verb} …`, or in a shell that did not export them"
     );
     Some(2)
 }
@@ -1112,14 +1108,14 @@ fn outside_only(store: &Store, verb: &str) -> Option<i32> {
 ///
 /// **`-n` is read here, and `--all` is why.** Every other flag on this verb
 /// names what it acts on; `--all` is the one that does not, and what it matches
-/// is a directory listing crossed with herdr's session list crossed with a
+/// is a directory listing crossed with backend's session list crossed with a
 /// process table — three sources, none of which the caller can see from where
 /// they are typing. A wildcard whose extent is only knowable by running it is
 /// the exact case a dry run is for, and until `worklist-050` this verb parsed
 /// `-n`, ignored it, and dropped every sandbox that was up.
 ///
 /// What the dry run reads is what the real run reads, one call short of acting:
-/// [`session`] rather than `herdr session stop`, [`session_children`] rather
+/// [`session`] rather than `backend session stop`, [`session_children`] rather
 /// than the signal to them. So the counts printed are the counts that would be
 /// reaped, taken from the same place at the same moment.
 fn rm(store: &Store, args: &Args) -> i32 {
@@ -1229,7 +1225,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
                 order: 210,
-                text: r##"  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own herdr session,
+                text: r##"  wsp sandbox [--seed] [--name N]   a whole isolated wsp — its own backend session,
                                     store and state — and the exports to use it;
                                     inside it `wsp` is the binary you ran"##,
             },
@@ -1241,10 +1237,10 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
                 order: 230,
-                text: r##"  wsp sandbox --fake [--stage F]    …or with no herdr at all: a backend that
+                text: r##"  wsp sandbox --fake [--stage F]    …or with no backend at all: a backend that
                                     answers the socket out of a state you write
                                     down, so wsp can be driven through the ones
-                                    a real herdr cannot be put in"##,
+                                    a real backend cannot be put in"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
@@ -1281,13 +1277,13 @@ mod tests {
     fn nothing_in_it_points_at_the_live_instance() {
         let dir = scratch("env");
         let mut sb = sandbox_at(&dir, "wsp-w1");
-        sb.socket = sb.dir.join("herdr.sock");
+        sb.socket = sb.dir.join("backend.sock");
         let env: std::collections::HashMap<String, String> = sb.env().into_iter().collect();
 
-        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS", "WSP_BIN"] {
+        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS", "WSP_BIN"] {
             assert!(env.contains_key(key), "{key} is not in the sandbox environment");
         }
-        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS"] {
+        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS"] {
             let v = &env[key];
             assert!(
                 v.starts_with(&sb.dir.display().to_string()),
@@ -1331,7 +1327,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A pane id and a workspace id name things in the *caller's* herdr, and
+    /// A pane id and a workspace id name things in the *caller's* backend, and
     /// the sandbox's has never heard of either. Inherited, `wsp claim` in a
     /// sandbox binds a task to a pane that does not exist there. `--run` has to
     /// take them back out, and the check is what the child is actually handed
@@ -1340,11 +1336,11 @@ mod tests {
     fn a_command_in_a_sandbox_does_not_inherit_the_callers_pane() {
         let dir = scratch("forget");
         let mut sb = sandbox_at(&dir, "wsp-w1");
-        sb.socket = sb.dir.join("herdr.sock");
+        sb.socket = sb.dir.join("backend.sock");
 
-        // The rule is the prefix, so a variable herdr adds next month is
+        // The rule is the prefix, so a variable backend adds next month is
         // forgotten too — and the two locators survive it.
-        for key in ["HERDR_PANE_ID", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_SOMETHING_NEW", "GIT_INDEX_FILE"] {
+        for key in ["WSP_BACKEND_PANE_ID", "WSP_BACKEND_WORKSPACE_ID", "WSP_BACKEND_TAB_ID", "WSP_BACKEND_SOMETHING_NEW", "GIT_INDEX_FILE"] {
             assert!(forgettable(key), "{key} would have been inherited");
         }
         for key in KEEP {
@@ -1366,14 +1362,14 @@ mod tests {
         }
         // …and the socket, which is forgettable-looking and set by us, is the
         // sandbox's. Order matters here and this is what checks it.
-        let socket = envs.iter().find(|(k, _)| k == "HERDR_SOCKET_PATH").and_then(|(_, v)| v.clone());
-        assert_eq!(socket, Some(sb.socket.display().to_string()), "the child was pointed at the wrong herdr");
+        let socket = envs.iter().find(|(k, _)| k == "WSP_BACKEND_SOCKET_PATH").and_then(|(_, v)| v.clone());
+        assert_eq!(socket, Some(sb.socket.display().to_string()), "the child was pointed at the wrong backend");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The defect in robustness-021, at the line it turned on.
     ///
-    /// The herdr *server* is what starts plugins, and it starts them with its
+    /// The backend *server* is what starts plugins, and it starts them with its
     /// own environment. Started without the store, its `wsp daemon` came up on
     /// the sandbox's socket and the *live* store — the one pair of facts that
     /// makes `sync` reap every binding in the real store. So the store has to be
@@ -1381,7 +1377,7 @@ mod tests {
     /// socket must not be: it is the live one, and we have no sandbox socket to
     /// give yet.
     #[test]
-    fn the_herdr_a_sandbox_starts_is_told_which_store_it_is_for() {
+    fn the_backend_a_sandbox_starts_is_told_which_store_it_is_for() {
         let dir = scratch("server-env");
         let sb = sandbox_at(&dir, "wsp-w1");
         let env: std::collections::HashMap<String, String> = sb.store_env().into_iter().collect();
@@ -1394,15 +1390,15 @@ mod tests {
             );
         }
         assert!(
-            !env.contains_key("HERDR_SOCKET_PATH"),
+            !env.contains_key("WSP_BACKEND_SOCKET_PATH"),
             "the server was handed a socket, and the only one we have here is the live one"
         );
         // …and a command run *in* the sandbox does get one, or it would talk to
-        // whatever herdr the caller was standing in.
+        // whatever backend the caller was standing in.
         let mut sb = sb;
-        sb.socket = sb.dir.join("herdr.sock");
+        sb.socket = sb.dir.join("backend.sock");
         let full: std::collections::HashMap<String, String> = sb.env().into_iter().collect();
-        assert_eq!(full.get("HERDR_SOCKET_PATH"), Some(&sb.socket.display().to_string()));
+        assert_eq!(full.get("WSP_BACKEND_SOCKET_PATH"), Some(&sb.socket.display().to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1419,7 +1415,7 @@ mod tests {
     /// rather than against the map we meant to build — the same reason
     /// `fake_command` exists as a function at all.
     #[test]
-    fn the_herdr_a_sandbox_starts_is_not_handed_the_callers_session() {
+    fn the_backend_a_sandbox_starts_is_not_handed_the_callers_session() {
         let _env = util::env_lock();
         std::env::set_var("CLAUDE_CODE_MESSAGING_TOKEN", "the-callers-credential");
         let dir = scratch("server-session");
@@ -1449,10 +1445,10 @@ mod tests {
 
     #[test]
     fn teardown_reaps_by_session_and_never_reaps_itself() {
-        assert!(holds_session("wsp daemon HERDR_SESSION=wsp-w1", "wsp-w1"));
-        assert!(holds_session("HERDR_SESSION=wsp-w1 WSP_HOME=/x", "wsp-w1"));
-        assert!(!holds_session("HERDR_SESSION=wsp-w12 WSP_HOME=/x", "wsp-w1"), "reaped a neighbour");
-        assert!(!holds_session("HERDR_SESSION=wsp-w1x", "wsp-w1"), "reaped a neighbour");
+        assert!(holds_session("wsp daemon WSP_BACKEND_SESSION=wsp-w1", "wsp-w1"));
+        assert!(holds_session("WSP_BACKEND_SESSION=wsp-w1 WSP_HOME=/x", "wsp-w1"));
+        assert!(!holds_session("WSP_BACKEND_SESSION=wsp-w12 WSP_HOME=/x", "wsp-w1"), "reaped a neighbour");
+        assert!(!holds_session("WSP_BACKEND_SESSION=wsp-w1x", "wsp-w1"), "reaped a neighbour");
         assert!(!holds_session("wsp daemon", "wsp-w1"));
 
         // A shell with the session name on its own command line is the caller,
@@ -1461,9 +1457,9 @@ mod tests {
         let me = std::process::id();
         let all = vec![
             (1u32, 0u32, "launchd".to_string()),
-            (me, 900, format!("wsp sandbox rm HERDR_SESSION=wsp-w1")),
-            (900, 1, "zsh -c HERDR_SESSION=wsp-w1 wsp sandbox rm".to_string()),
-            (901, 1, "wsp daemon HERDR_SESSION=wsp-w1".to_string()),
+            (me, 900, format!("wsp sandbox rm WSP_BACKEND_SESSION=wsp-w1")),
+            (900, 1, "zsh -c WSP_BACKEND_SESSION=wsp-w1 wsp sandbox rm".to_string()),
+            (901, 1, "wsp daemon WSP_BACKEND_SESSION=wsp-w1".to_string()),
         ];
         let root = Path::new("/state/sandbox");
         assert_eq!(
@@ -1474,7 +1470,7 @@ mod tests {
     }
 
     /// The leak behind wsp-368: a seat placed through the compound backend has
-    /// `WSP_HOME`/`WSP_STATE` under the sandbox and no `HERDR_SESSION`, and it
+    /// `WSP_HOME`/`WSP_STATE` under the sandbox and no `WSP_BACKEND_SESSION`, and it
     /// outlived `rm`.
     #[test]
     fn a_compound_placed_seat_is_reaped_by_its_store_and_a_sibling_prefix_is_not() {
@@ -1490,7 +1486,7 @@ mod tests {
                 "compound-sup spawn PATH=/usr/bin WSP_HOME=/state/sandbox/wsp-tla/wsp WSP_STATE=/state/sandbox/wsp-tla/state"
                     .to_string(),
             ),
-            (911, 910, "claude -p WSP_STATE=/state/sandbox/wsp-tla/state HERDR_SOCKET_PATH=/state/sandbox/wsp-tla/herdr.sock".to_string()),
+            (911, 910, "claude -p WSP_STATE=/state/sandbox/wsp-tla/state WSP_BACKEND_SOCKET_PATH=/state/sandbox/wsp-tla/backend.sock".to_string()),
             (912, 1, "wsp daemon WSP_HOME=/state/sandbox/wsp-tla".to_string()),
             (920, 1, "compound-sup spawn WSP_HOME=/state/sandbox/wsp-tla2/wsp WSP_STATE=/state/sandbox/wsp-tla2/state".to_string()),
             (921, 1, "claude XWSP_HOME=/state/sandbox/wsp-tla/wsp".to_string()),
@@ -1516,7 +1512,7 @@ mod tests {
     /// Two things have to be true and one of them looks wrong at first glance.
     /// The store and socket must point inside the sandbox — a fake serving the
     /// sandbox's socket with the live store is the pair from robustness-021. And
-    /// `HERDR_SESSION` must be *put back* after the caller's `HERDR_` variables
+    /// `WSP_BACKEND_SESSION` must be *put back* after the caller's `WSP_BACKEND_` variables
     /// are stripped, because it is the only handle `stop_session` has: without
     /// it the fake outlives the teardown and `sandbox ls` cannot see it either.
     #[test]
@@ -1532,11 +1528,11 @@ mod tests {
             .collect();
 
         assert_eq!(
-            env.get("HERDR_SESSION").cloned().flatten().as_deref(),
+            env.get("WSP_BACKEND_SESSION").cloned().flatten().as_deref(),
             Some("wsp-w1"),
             "the fake cannot be reaped: nothing on it says which sandbox it belongs to"
         );
-        for key in ["HERDR_SOCKET_PATH", "WSP_HOME", "WSP_STATE"] {
+        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE"] {
             let v = env.get(key).cloned().flatten().unwrap_or_default();
             assert!(
                 v.starts_with(&sb.dir.display().to_string()),
@@ -1544,7 +1540,7 @@ mod tests {
             );
         }
         assert_eq!(
-            env.get("HERDR_PANE_ID").cloned().flatten(),
+            env.get("WSP_BACKEND_PANE_ID").cloned().flatten(),
             None,
             "the fake inherited the caller's pane"
         );
@@ -1596,7 +1592,7 @@ mod tests {
         std::fs::write(sb.artefacts.join("proof.html"), "x").unwrap();
 
         // `rm` removes `<state>/sandbox/<name>` whole (its dry half is below, the
-        // real half shells out to herdr), so what is inside that directory goes
+        // real half shells out to backend), so what is inside that directory goes
         // with it.
         assert_eq!(sb.dir, dir.join("state").join("sandbox").join("wsp-w1"));
         std::fs::remove_dir_all(&sb.dir).unwrap();
@@ -1651,7 +1647,7 @@ mod tests {
 
         // A name given by hand is still recognisably ours, however it is typed,
         // because `ls` and `rm --all` find sandboxes by that prefix — and it is
-        // still a herdr session name, which is a directory name.
+        // still a backend session name, which is a directory name.
         for given in ["probe", "wsp-probe", "Probe!", "  ../etc  "] {
             let name = session_name(Some(given), "w24");
             assert!(name.starts_with(PREFIX), "--name {given} produced a session nobody can find again");
@@ -1659,7 +1655,7 @@ mod tests {
         }
     }
 
-    /// `worklist-050`: `--all` is a wildcard over directories, herdr sessions
+    /// `worklist-050`: `--all` is a wildcard over directories, backend sessions
     /// and a process table, and `wsp sandbox rm --all -n` — the invocation you
     /// type *because* you cannot see what it matched — parsed the word, ignored
     /// it, and dropped every sandbox that was up.
@@ -1667,7 +1663,7 @@ mod tests {
     /// Asserted on the directory rather than on the printed line: a sandbox is
     /// a directory, a session and a set of processes, and the directory is the
     /// one of the three a test can own outright. Only the dry half runs here —
-    /// the other half shells out to herdr, and a unit test that stopped a
+    /// the other half shells out to backend, and a unit test that stopped a
     /// session would be reaching for the live one.
     #[test]
     fn a_dry_run_of_rm_all_leaves_every_sandbox_where_it_is() {

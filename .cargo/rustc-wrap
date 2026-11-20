@@ -14,6 +14,9 @@
 rustc="$1"; shift
 here=$(dirname "$0")
 root=$(cd "$here/.." && pwd -P)
+# The sha256 command: sha256sum where it exists (Linux), shasum on macOS. A command string, not a
+# function, because xargs cannot call a shell function.
+if command -v sha256sum >/dev/null 2>&1; then SHA256="sha256sum"; else SHA256="shasum -a 256"; fi
 
 crate=""; extra=""; pm=""; lib=""; prev=""; src=""
 for a in "$@"; do
@@ -38,8 +41,8 @@ case "$src" in */.cargo/registry/src/*) canon_out=1 ;; esac
 if [ -n "$canon_out" ]; then
     {
         if [ -n "${OUT_DIR:-}" ] && [ -d "$OUT_DIR" ]; then
-            h=$(cd "$OUT_DIR" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 2>/dev/null \
-                | shasum -a 256 | cut -c1-32)
+            h=$(cd "$OUT_DIR" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 $SHA256 2>/dev/null \
+                | $SHA256 | cut -c1-32)
             canon="${COMPOUND_OUT_CACHE:-$HOME/.cache/compound/out}/$h"
             if [ -n "$h" ] && [ ! -d "$canon" ]; then
                 mkdir -p "$canon.tmp.$$" 2>/dev/null && cp -Rp "$OUT_DIR/." "$canon.tmp.$$/" \
@@ -76,8 +79,16 @@ if [ -z "${COMPOUND_NO_SCCACHE:-}" ]; then
             # Not `exec`: sccache exits 2 when it cannot reach or start its server ("failed to
             # execute compile", "failed to fill whole buffer"), which rustc itself does not do, and
             # a build must not depend on a cache server that died (wsp-343). Fall back to the compiler.
-            COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
-                "$candidate" "$here/rustc-remap" "$@"
+            # A server alive but never answering held `sccache rustc-remap -vV` 5+ min (wsp-083), and
+            # sccache 0.19 has no client timeout: `sccache-bound` probes the server while a call is
+            # slow and exits 2 when the probe goes unanswered; the compile itself is never bounded.
+            if command -v perl >/dev/null 2>&1; then
+                COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
+                    perl "$here/sccache-bound" "$candidate" "$here/rustc-remap" "$@"
+            else
+                COMPOUND_REAL_RUSTC="$rustc" COMPOUND_TREE="$root" \
+                    "$candidate" "$here/rustc-remap" "$@"
+            fi
             rc=$?
             [ "$rc" = 2 ] || exit "$rc"
             break
