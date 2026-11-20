@@ -2,8 +2,10 @@
 //! way the root sends an order to a seat and waits for its answer once the
 //! orders machine owns orders, behind `WSP_ORDERS`.
 //!
-//! - [`mode`]: under `WSP_HOST=manager`, [`Mode::Store`] is the default
-//!   (wsp-128): `WSP_ORDERS` unset, empty or `store`. `WSP_ORDERS=files` is
+//! - [`mode`]: under the manager, [`Mode::Store`] is the default
+//!   (wsp-128): `WSP_ORDERS` unset, empty or `store`. The manager is
+//!   `WSP_HOST=manager` and, since wsp-029, `WSP_HOST` unset or empty too, by
+//!   the host's own rule (`host_tcp::Choice::parse`; wsp-358). `WSP_ORDERS=files` is
 //!   the rollback, [`Mode::Files`], until wsp-130 deletes the files path; so is
 //!   any other word. Any other host is `Files` whatever the flag (part 2 of the
 //!   person's answer on wsp-115: the in-process host keeps the files until
@@ -70,10 +72,13 @@ pub fn mode() -> Mode {
 }
 
 /// [`mode`], pure: `store` holds only under the manager, where it is the
-/// default and `files` (or any word but `store`) is the rollback.
+/// default and `files` (or any word but `store`) is the rollback. The manager
+/// is whatever `WSP_HOST` the host chooses it for: `manager`, unset or empty
+/// (wsp-029, wsp-358); `inproc` and an unknown word are not.
 pub fn mode_of(orders: Option<&str>, host: Option<&str>) -> Mode {
-    match (orders.map(str::trim), host.map(str::trim)) {
-        (None | Some("") | Some("store"), Some("manager")) => Mode::Store,
+    let manager = matches!(crate::host_tcp::Choice::parse(host), Ok(crate::host_tcp::Choice::Manager));
+    match orders.map(str::trim) {
+        None | Some("") | Some("store") if manager => Mode::Store,
         _ => Mode::Files,
     }
 }
@@ -82,14 +87,14 @@ pub fn mode_of(orders: Option<&str>, host: Option<&str>) -> Mode {
 pub fn describe(mode: Mode, orders: Option<&str>) -> String {
     match (mode, orders.map(str::trim).filter(|v| !v.is_empty())) {
         (Mode::Store, None) => {
-            "orders: store, the default under WSP_HOST=manager (the orders machine owns them; WSP_ORDERS=files is the rollback)".into()
+            "orders: store, the default under the manager (WSP_HOST=manager or unset; the orders machine owns them; WSP_ORDERS=files is the rollback)".into()
         }
         (Mode::Store, _) => "orders: store (the orders machine owns them; the daemon delivers under deliver:<seat>)".into(),
-        // Unset WSP_HOST is the manager too, but store follows only the
-        // explicit word until wsp-358; say which, not "not the manager".
-        (Mode::Files, None) => "orders: files (store is the default only under an explicit WSP_HOST=manager until wsp-358)".into(),
+        // Unset WSP_HOST is the manager (wsp-358), so files with the flag
+        // unset is a host that is not the manager.
+        (Mode::Files, None) => "orders: files (WSP_HOST is not the manager)".into(),
         (Mode::Files, Some("files")) => "orders: files (WSP_ORDERS=files, the rollback)".into(),
-        (Mode::Files, Some("store")) => "orders: files (WSP_ORDERS=store holds only under WSP_HOST=manager)".into(),
+        (Mode::Files, Some("store")) => "orders: files (WSP_ORDERS=store holds only under the manager)".into(),
         (Mode::Files, Some(v)) => format!("orders: files (WSP_ORDERS={v}; only store, or unset, is the store)"),
     }
 }
@@ -602,30 +607,37 @@ pub(crate) mod tests {
 
     /// wsp-128: under the manager `store` is the default, unset or empty
     /// included, and `files` is the rollback; elsewhere it is `files`.
+    /// wsp-358: an unset or empty `WSP_HOST` is the manager (wsp-029), so the
+    /// default holds there too, and `files` rolls it back there too.
     #[test]
     fn store_holds_only_under_the_manager_and_anything_else_is_files() {
         assert_eq!(mode_of(Some("store"), Some("manager")), Mode::Store);
         assert_eq!(mode_of(Some(" store "), Some("manager")), Mode::Store);
         assert_eq!(mode_of(None, Some("manager")), Mode::Store, "the default under the manager");
         assert_eq!(mode_of(Some(" "), Some("manager")), Mode::Store, "empty is unset");
+        assert_eq!(mode_of(None, None), Mode::Store, "unset WSP_HOST is the manager");
+        assert_eq!(mode_of(None, Some(" ")), Mode::Store, "empty WSP_HOST is unset");
+        assert_eq!(mode_of(Some("store"), None), Mode::Store);
         for (orders, host) in [
-            (None, None),
+            (Some("files"), None),
+            (Some("files"), Some("")),
             (None, Some("inproc")),
+            (None, Some("elsewhere")),
             (Some("files"), Some("manager")),
             (Some(" files "), Some("manager")),
-            (Some("store"), None),
             (Some("store"), Some("inproc")),
             (Some("yes"), Some("manager")),
+            (Some("yes"), None),
         ] {
             assert_eq!(mode_of(orders, host), Mode::Files, "{orders:?} under {host:?}");
         }
         assert_eq!(server_mode(Mode::Store), wsp_server::Mode::Owned);
         assert_eq!(server_mode(Mode::Files), wsp_server::Mode::Mirrored);
-        assert!(describe(Mode::Store, None).contains("the default under WSP_HOST=manager"));
+        assert!(describe(Mode::Store, None).contains("the default under the manager (WSP_HOST=manager or unset"));
         assert!(describe(Mode::Store, None).contains("WSP_ORDERS=files is the rollback"));
         assert!(describe(Mode::Files, Some("files")).contains("the rollback"));
-        assert!(describe(Mode::Files, None).contains("only under an explicit WSP_HOST=manager"));
-        assert!(describe(Mode::Files, Some("store")).contains("only under WSP_HOST=manager"));
+        assert!(describe(Mode::Files, None).contains("WSP_HOST is not the manager"));
+        assert!(describe(Mode::Files, Some("store")).contains("only under the manager"));
         assert!(describe(Mode::Store, Some("store")).starts_with("orders: store"));
     }
 
