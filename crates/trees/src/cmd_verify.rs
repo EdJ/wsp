@@ -361,95 +361,10 @@ impl<'a> Jobs<'a> {
 }
 
 // Where a verify job runs: `place_of(row, verify)`, the one function a check,
-// a verifier and a barrier take a job's place from (wsp-053). Until wsp-053
-// lands it is `place_stub` below, written against the same signature; the
-// swap is this one line, to `crate::job_place::{…}`.
-use place_stub::{host_of, place_of, TreeKind, Whose};
-
-/// A stand-in for wsp-053's `job_place` (its signature, `place_of(whose:
-/// Whose, kind: TreeKind, tree: &Path) -> Result<Place, String>`), holding
-/// only what verify uses, until that row lands and this module goes. It
-/// answers what `place_of` answers at M3: a `HostDir` on the row's host (this
-/// machine until rows record their seat's host) relative to the tree root
-/// (the home directory, the manager's default), for the tree verify made
-/// here; never a path on wsp's machine.
-#[allow(dead_code)]
-mod place_stub {
-    use std::path::{Path, PathBuf};
-    use wsp_wire::host::{HostDir, HostId, JobAt};
-
-    #[derive(Clone, Copy, Debug)]
-    pub enum Whose<'a> {
-        Row(&'a str),
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum TreeKind {
-        Verify,
-    }
-
-    pub struct Place {
-        pub at: JobAt,
-        pub dir: PathBuf,
-        pub row: String,
-        pub kind: TreeKind,
-    }
-
-    impl Place {
-        pub fn host(&self) -> &str {
-            match &self.at {
-                JobAt::Tree(t) => &t.host.0,
-                JobAt::Dir(d) => &d.host.0,
-            }
-        }
-    }
-
-    /// The host a row's work happens on: this machine, until rows record
-    /// their seat's host.
-    pub fn host_of(_whose: Whose<'_>) -> String {
-        crate::util::hostname()
-    }
-
-    #[cfg(test)]
-    thread_local! {
-        static TREE_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// A test's own tree root, kept to its thread.
-    #[cfg(test)]
-    pub fn set_tree_root(root: Option<PathBuf>) {
-        TREE_ROOT.with(|r| *r.borrow_mut() = root);
-    }
-
-    /// The host's tree root, as its manager's `--tree-root`.
-    pub fn tree_root() -> PathBuf {
-        #[cfg(test)]
-        if let Some(root) = TREE_ROOT.with(|r| r.borrow().clone()) {
-            return root;
-        }
-        crate::util::home()
-    }
-
-    pub fn place_of(whose: Whose<'_>, kind: TreeKind, tree: &Path) -> Result<Place, String> {
-        let Whose::Row(row) = whose;
-        if !tree.is_dir() {
-            std::fs::create_dir_all(tree).map_err(|e| format!("could not make the verify tree {}: {e}", tree.display()))?;
-        }
-        let root = tree_root();
-        let (Ok(root_real), Ok(real)) = (root.canonicalize(), tree.canonicalize()) else {
-            return Err(format!("the verify tree {} or the tree root {} does not read", tree.display(), root.display()));
-        };
-        let Ok(rel) = real.strip_prefix(&root_real) else {
-            return Err(format!("the verify tree {} is not under the tree root {}", tree.display(), root.display()));
-        };
-        let path = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
-        let at = HostDir { host: HostId(host_of(whose)), path };
-        if at.escapes() {
-            return Err(format!("the verify tree {} is the tree root itself or outside it", tree.display()));
-        }
-        Ok(Place { at: JobAt::Dir(at), dir: tree.to_path_buf(), row: row.to_string(), kind })
-    }
-}
+// a verifier and a barrier take a job's place from (wsp-053). It answers a
+// `HostDir` on the row's host relative to that host's tree root, never a
+// path on wsp's machine.
+use crate::job_place::{host_of, place_of, TreeKind, Whose};
 
 /// `to` as seen from `from`, both on the jobs' host: how a job names its
 /// target directory and a test binary without a path on wsp's machine.
@@ -2895,7 +2810,7 @@ mod jobs_tests {
 
     /// Jobs placed under this test's tree root, on this thread.
     fn rooted(place: &Place) {
-        place_stub::set_tree_root(Some(place.root.clone()));
+        crate::job_place::set_tree_root(Some(place.root.clone()));
     }
 
     /// A tree root with a `tree` and a `target` in it, an exec dir and a
