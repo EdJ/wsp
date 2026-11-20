@@ -3106,8 +3106,19 @@ esac
         let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
         assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "the manager forked {seat}: {spawns:?}");
         assert!(m.seats().iter().any(|s| s.seat.0 == seat), "the manager runs {seat}: {:?}", m.seats());
-        // And `wip`'s census, which asks the manager, reads it.
-        let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        // And `wip`'s census, which asks the manager, reads it. The census
+        // gives a manager `SILENT` (1 s) to answer and reads it silent past
+        // that, which a loaded machine overruns: asked again until the
+        // manager is heard (bounded generously, as wsp-114's waits are), and
+        // only a heard census is held to having the seat.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let reading = loop {
+            let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+            if reading.heard() {
+                break reading;
+            }
+            assert!(std::time::Instant::now() < deadline, "wip's census never heard the manager within 120s");
+        };
         assert!(reading.rows.contains_key(&seat), "wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
 
         // The seat ended through the manager, as `wsp despawn` would.

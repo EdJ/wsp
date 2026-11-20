@@ -716,16 +716,21 @@ mod tests {
         msgs.into_iter().map(|msg| m.emit(msg).unwrap().0).collect()
     }
 
-    /// Ask until `want` frames were folded or ten seconds passed.
-    fn pump(store: &Store, sub: &mut Subscription, want: usize) -> usize {
-        let mut n = 0;
-        let start = Instant::now();
-        while n < want && start.elapsed() < Duration::from_secs(10) {
-            if step(store, None, HOST, sub, Duration::from_millis(500)).unwrap() {
-                n += 1;
-            }
+    /// The upper bound on every wait here for a frame to come and be folded:
+    /// generous, so a machine under load is slow and not failed. Each wait
+    /// ends as soon as what it waits for is seen (as wsp-114's do).
+    const WAIT: Duration = Duration::from_secs(120);
+
+    /// Ask until the fold has reached event `id`, and fail if `WAIT` runs out.
+    /// What it waits on is the folded id, not a count of frames: a manager
+    /// that comes back beats first, and under load that beat can be the frame
+    /// a count would stop at, before the event the test emitted.
+    fn fold_to(store: &Store, sub: &mut Subscription, id: u64) {
+        let deadline = Instant::now() + WAIT;
+        while read_folded(&store.state, HOST).is_none_or(|EventId(n)| n < id) {
+            assert!(Instant::now() < deadline, "event {id} not folded within {WAIT:?}: at {:?}", read_folded(&store.state, HOST));
+            step(store, None, HOST, sub, Duration::from_millis(500)).unwrap();
         }
-        n
     }
 
     fn lines(path: &Path) -> usize {
@@ -749,9 +754,9 @@ mod tests {
         // manager runs in this test's process and reads its facts with its
         // own probes; those are its, so the tick below starts after them.
         let mut sub = Subscription::new(addr, token(&exec), HOST, &store.state, "test");
-        let start = Instant::now();
+        let deadline = Instant::now() + WAIT;
         while !beat_path(&store.state, HOST).exists() {
-            assert!(start.elapsed() < Duration::from_secs(10), "no beat with host facts within 10s");
+            assert!(Instant::now() < deadline, "no beat with host facts within {WAIT:?}");
             step(&store, None, HOST, &mut sub, Duration::from_millis(500)).unwrap();
         }
         assert!(read(&beat_path(&store.state, HOST))["beat"]["host"]["cpus"].as_u64().is_some_and(|n| n > 0));
@@ -760,7 +765,7 @@ mod tests {
         wsp_base::calls::tick_begin();
         wsp_base::calls::phase("fold");
         let ids = script(&m);
-        assert_eq!(pump(&store, &mut sub, ids.len()), ids.len(), "every event folded");
+        fold_to(&store, &mut sub, *ids.last().unwrap());
         wsp_base::calls::tick_end();
         let ticks: Vec<Value> =
             wsp_base::calls::read_all(&store.state).into_iter().filter(|l| l["k"] == "tick" && l["phases"].get("fold").is_some()).collect();
@@ -803,7 +808,7 @@ mod tests {
         let later = m
             .emit(Message::SeatSaid(SeatSaid { seat: seat(), epoch: Epoch(1), at: At(1_700_000_009_000), text: "again".into() }))
             .unwrap();
-        assert_eq!(pump(&store, &mut sub, 1), 1);
+        fold_to(&store, &mut sub, later.0);
         assert!(sub.subscribed >= 2, "it resubscribed: {}", sub.subscribed);
         assert_eq!(LOCAL.said(&dir)["said"], "again");
         sub.close();
@@ -813,9 +818,9 @@ mod tests {
         // fold skips every one of them.
         let _ = std::fs::remove_file(wsp_wire::host_tcp::last_path(&store.state, HOST));
         let mut again = Subscription::new(addr, token(&exec), HOST, &store.state, "test");
-        let start = Instant::now();
+        let deadline = Instant::now() + WAIT;
         let mut heard = 0;
-        while heard < ids.len() + 1 && start.elapsed() < Duration::from_secs(10) {
+        while heard < ids.len() + 1 && Instant::now() < deadline {
             if let Some(f) = again.next(Duration::from_millis(500)).unwrap() {
                 if f.id.is_some() {
                     heard += 1;
