@@ -5334,48 +5334,58 @@ fn wip_attention(w: &Wip, rows: &[WipRow]) -> serde_json::Value {
 fn wip_json(w: &Wip) -> serde_json::Value {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
-    json!({
-        "attention": wip_attention(w, &rows),
-        "agents": rows.iter().map(|r| {
-            json!({
-            "project": r.project, "task": r.task, "task_id": r.task_id,
-            "pane": r.pane, "workspace": r.workspace, "state": r.state,
-            "turning": r.turning, "needs_you": r.needs_you, "seat": r.seat,
-            "said": r.said,
-            "held": r.held,
-            "since": r.since,
-            "direction": r.direction,
-            "waiting": r.waiting.as_ref().map(|w| w.json()),
-            "wait": r.wait.as_ref().map(|w| w.json()),
-            "members_waiting": r.seat.as_ref().map(|_| r.members_waiting),
-            "kind": r.runs.kind, "model": r.runs.model, "effort": r.runs.effort,
-            "role": r.role.json(),
-            "answers_to": r.answers_to, "answers_to_empty": r.answers_to_empty,
-            "spawned_by": r.spawned_by,
-            "unsent": r.unsent, "queued": r.queued, "dropped": r.dropped, "full_suite": r.full_suite, "stuck": r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })), "was_governor": r.was_governor, "closed_row": r.closed_row,
-            "leg": r.leg.as_ref().map(|s| json!({
+    let agents: Vec<wsp_view::wip::Agent> = rows
+        .iter()
+        .map(|r| wsp_view::wip::Agent {
+            project: r.project.clone(),
+            task: r.task.clone(),
+            task_id: r.task_id.clone(),
+            pane: r.pane.clone(),
+            workspace: r.workspace.clone(),
+            state: r.state.clone(),
+            turning: r.turning,
+            needs_you: r.needs_you,
+            seat: r.seat.clone(),
+            said: r.said.clone(),
+            held: r.held.clone(),
+            since: r.since.clone(),
+            direction: r.direction.clone(),
+            waiting: r.waiting.as_ref().map(|w| w.json()),
+            wait: r.wait.as_ref().map(|w| w.json()),
+            members_waiting: r.members_waiting,
+            kind: r.runs.kind.clone(),
+            model: r.runs.model.clone(),
+            effort: r.runs.effort.clone(),
+            role: r.role.json(),
+            answers_to: r.answers_to.clone(),
+            answers_to_empty: r.answers_to_empty.clone(),
+            spawned_by: r.spawned_by.clone(),
+            unsent: r.unsent,
+            queued: r.queued,
+            dropped: r.dropped,
+            full_suite: r.full_suite,
+            stuck: r.stuck.map(|(k, secs)| json!({ "kind": k.key(), "word": k.word(), "secs": secs })),
+            was_governor: r.was_governor.clone(),
+            closed_row: r.closed_row.clone(),
+            leg: r.leg.as_ref().map(|s| json!({
                 "name": s.leg.name, "after": s.after, "index": s.index, "of": s.of,
             })),
-            })
-        }).collect::<Vec<_>>(),
-        "turning": rows.iter().filter(|r| r.turning).count(),
-        "needs_you": rows.iter().filter(|r| r.needs_you).count(),
-        // Seats waiting on somebody: one waiting on its own shell says so on
-        // its row and is nobody's to count (`wsp-214`).
-        "waiting": rows.iter().filter(|r| r.waiting.as_ref().is_some_and(|w| w.owed())).count(),
-        // The sentence, not a boolean: `doctor`'s is the only other place it is
-        // said, and a caller that has to ask "no daemon, or a daemon whose `ps`
-        // would not answer?" cannot tell those apart from a flag either.
-        "daemon": w.daemon,
-        "unreachable": w.silent.line,
-        "disk": w.disk,
-        "load": w.load,
-        "throttle": w.throttle,
-        "idle_memory": w.idle_memory.json(),
-        "blocked": blocked.iter().map(|t| t.json()).collect::<Vec<_>>(),
-        "review": in_review.iter().map(|t| t.json()).collect::<Vec<_>>(),
-        "inbox": inbox,
-    })
+            owed: r.waiting.as_ref().is_some_and(|w| w.owed()),
+        })
+        .collect();
+    let head = wsp_view::wip::Head {
+        attention: wip_attention(w, &rows),
+        daemon: w.daemon.clone(),
+        unreachable: w.silent.line.clone(),
+        disk: w.disk.clone(),
+        load: w.load.clone(),
+        throttle: w.throttle.clone(),
+        idle_memory: w.idle_memory.json(),
+        blocked: blocked.iter().map(|t| t.json()).collect(),
+        review: in_review.iter().map(|t| t.json()).collect(),
+        inbox,
+    };
+    wsp_view::wip::wip_json(&agents, &head)
 }
 
 /// What the `REVIEW` line says to do about a row at `review` (`wsp-323`).
