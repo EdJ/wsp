@@ -8,8 +8,9 @@
 //!   outside the daemon) is typed into the seat once, under the store's order
 //!   id, and a subscriber reads `queued` → `typed` → `delivered` →
 //!   `acknowledged` within 2 s of the seat reading idle.
-//! - `with_orders_unset_no_order_is_written`: the daemon's domain mirrors
-//!   orders as before, `order.send` is refused `illegal`, state `mirrored`,
+//! - `with_orders_files_no_order_is_written`: under `WSP_ORDERS=files`, the
+//!   rollback (unset is `store` under the manager since wsp-128), the daemon's
+//!   domain mirrors orders as before, `order.send` is refused `illegal`, state `mirrored`,
 //!   and the store holds no order.
 //!
 //! The worker's own cases (busy, three refusals, a worker killed mid-delivery,
@@ -283,8 +284,9 @@ fn under_store_an_order_sent_from_outside_reaches_the_seat_once_and_is_acknowled
 }
 
 #[test]
-fn with_orders_unset_no_order_is_written() {
-    let rig = Rig::up("files", None);
+fn with_orders_files_no_order_is_written() {
+    // `files`, the rollback: unset is `store` under the manager (wsp-128).
+    let rig = Rig::up("files", Some("files"));
     let mut ed = rig.client(Principal::Person("ed".into()));
     let refused = ed.apply(&Cmd::OrderSend { to: SeatId("cpd-none".into()), text: "go".into(), first: false });
     match refused {

@@ -235,7 +235,8 @@ fn turn_ended(rig: &Rig, seat: &wsp_wire::place::Seat) {
 }
 
 /// `wsp tell <seat> -` from the shell of seat `cpd-from`, under `orders`
-/// (`None`: unset), `extra` after the text's dash.
+/// (`None`: unset, which is `store` under the manager since wsp-128), `extra`
+/// after the text's dash.
 fn tell(rig: &Rig, seat: &str, text: &str, orders: Option<&str>, extra: &[&str]) -> (i32, String, String) {
     use std::io::Write;
     let mut cmd = wsp(&rig.state);
@@ -287,7 +288,7 @@ fn a_tell_under_store_says_what_files_says_and_is_one_acknowledged_order() {
     assert!(ordered[0].text.contains("the line"), "{ordered:?}");
 
     turn_ended(&rig, &seat);
-    let (code, filed, err) = tell(&rig, s, "the line", None, &["--again"]);
+    let (code, filed, err) = tell(&rig, s, "the line", Some("files"), &["--again"]);
     assert_eq!(code, 0, "under files: {filed}{err}");
     assert_eq!(stored, filed, "the same line under store as under files");
     assert!(stored.contains("delivered"), "acknowledged prints as delivered: {stored}");
@@ -303,7 +304,7 @@ fn a_tell_under_store_says_what_files_says_and_is_one_acknowledged_order() {
     let (code, stored, err) = tell(&rig, s, "the json", Some("store"), &["--json"]);
     assert_eq!(code, 0, "under store --json: {stored}{err}\n{}", rig.cycle_log());
     turn_ended(&rig, &seat);
-    let (code, filed, err) = tell(&rig, s, "the json", None, &["--json", "--again"]);
+    let (code, filed, err) = tell(&rig, s, "the json", Some("files"), &["--json", "--again"]);
     assert_eq!(code, 0, "under files --json: {filed}{err}");
     assert_eq!(stored, filed, "--json is byte-identical");
     let v: serde_json::Value = serde_json::from_str(stored.trim()).unwrap();

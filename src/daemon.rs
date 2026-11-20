@@ -393,6 +393,33 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
     Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver })
 }
 
+/// What `doctor` says of orders (wsp-122, wsp-128): which path owns them,
+/// always, whether or not a daemon answers; and under `store`, how long the
+/// oldest order still `queued` has waited, read from the daemon's API.
+pub(crate) fn orders_health(store: &Store, notes: &mut Vec<String>) {
+    let mode = crate::orders::mode();
+    let flag = std::env::var(crate::orders::ENV).ok();
+    notes.push(crate::orders::describe(mode, flag.as_deref()));
+    if mode == crate::orders::Mode::Store {
+        let now = crate::util::epoch_secs() * 1000;
+        notes.push(queue_line(crate::orders::oldest_queued(store, std::time::Duration::from_secs(2)), now));
+    }
+}
+
+/// [`orders_health`]'s second line, from the oldest queued order's time and
+/// now, both in epoch milliseconds.
+fn queue_line(oldest: Result<Option<wsp_store_contract::At>, crate::orders::Error>, now_ms: i64) -> String {
+    match oldest {
+        Ok(None) => "orders: nothing queued".into(),
+        Ok(Some(at)) => {
+            let secs = (now_ms - at.0 as i64).max(0) / 1000;
+            format!("orders: the oldest queued order has waited {}", crate::util::duration_human(secs))
+        }
+        Err(crate::orders::Error::Silent(why)) => format!("orders: the queue was not read: no API answered ({why})"),
+        Err(e) => format!("orders: the queue was not read ({e:?})"),
+    }
+}
+
 /// What `doctor` says about the daemon: that there is one, that there are two,
 /// or that there is none.
 ///
@@ -411,11 +438,6 @@ pub(crate) fn health(
     problems: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) {
-    // Which path owns orders (wsp-122), said whether or not a daemon answers,
-    // wherever `WSP_ORDERS` is set at all: unset is today's path, said nothing.
-    if let Some(orders) = std::env::var(crate::orders::ENV).ok().filter(|v| !v.trim().is_empty()) {
-        notes.push(crate::orders::describe(crate::orders::mode(), Some(&orders)));
-    }
     let Some(running) = running else { return };
     let list = |pids: &[u32]| {
         pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
@@ -1105,7 +1127,7 @@ mod tests {
 
     /// The tick under `WSP_HOST=manager` and under `inproc` (wsp-028, leg 2).
     mod tick_by_host {
-        use super::super::repairs;
+        use super::super::{queue_line, repairs};
         use crate::fold;
         use crate::place::State;
         use crate::store::Store;
@@ -1264,6 +1286,9 @@ mod tests {
             let exec = env.state().join("exec");
             let (m, thread, stop) = manager(&store, &exec);
             script(&store, &m);
+            // `store` is the default under the manager (wsp-128): the tick's
+            // tells go through an orders store, as the daemon's in-process one.
+            let _door = crate::refusals::tests::open(&store, &["cpd-t1"]);
 
             let line = tick(&store);
             for probe in PROBES {
@@ -1298,6 +1323,101 @@ mod tests {
             stop.store(true, Ordering::SeqCst);
             m.stop();
             let _ = thread.join();
+        }
+
+        /// `WSP_ORDERS` for one test, unset or set, and unset again however it
+        /// ends. Taken after [`util::isolated`], whose lock it is held under.
+        struct OrdersVar;
+        impl OrdersVar {
+            fn set(v: Option<&str>) -> OrdersVar {
+                match v {
+                    Some(v) => std::env::set_var(crate::orders::ENV, v),
+                    None => std::env::remove_var(crate::orders::ENV),
+                }
+                OrdersVar
+            }
+        }
+        impl Drop for OrdersVar {
+            fn drop(&mut self) {
+                std::env::remove_var(crate::orders::ENV);
+            }
+        }
+
+        /// The files the store mode retires (docs/state-core.md, step 2).
+        const ORDER_FILES: &[&str] =
+            &["typed-unsent.json", "first-orders.json", "stuck-commands.json", "refused-deliveries.json"];
+
+        /// One tick under the manager with `WSP_ORDERS` as given: the delivery
+        /// worker as `start_api` starts it (running or not), the tick's line,
+        /// and which of [`ORDER_FILES`] it left behind.
+        fn tick_under(tag: &str, orders: Option<&str>) -> (crate::orders::Mode, bool, Value, Vec<&'static str>) {
+            let env = util::isolated(tag);
+            let _host = HostVar::set("manager");
+            let _orders = OrdersVar::set(orders);
+            let store = Store::open();
+            let exec = env.state().join("exec");
+            let (m, thread, stop) = manager(&store, &exec);
+            script(&store, &m);
+
+            let mode = crate::orders::mode();
+            let db = crate::orders::tests::db(&env.state().join("db"), crate::orders::server_mode(mode));
+            // Under `store` the tick's tells go through the daemon's open store,
+            // which a test stands in for with the door's.
+            let _door = (mode == crate::orders::Mode::Store).then(|| crate::refusals::tests::open(&store, &["cpd-t1"]));
+            let worker = crate::deliver::start(&store, db);
+            let running = worker.as_ref().is_some_and(|(t, _)| !t.is_finished());
+            let line = tick(&store);
+            let left = ORDER_FILES.iter().copied().filter(|f| store.state_file(f).exists()).collect();
+
+            if let Some((t, flag)) = worker {
+                flag.store(true, Ordering::SeqCst);
+                let _ = t.join();
+            }
+            stop.store(true, Ordering::SeqCst);
+            m.stop();
+            let _ = thread.join();
+            (mode, running, line, left)
+        }
+
+        /// wsp-128's done-when: with `WSP_ORDERS` unset under the manager the
+        /// mode is `store`, the delivery worker runs, the tick runs no
+        /// `repair:unsent`, and none of the four order files is written.
+        #[test]
+        fn under_the_manager_orders_default_to_the_store_and_the_tick_writes_no_order_file() {
+            let (mode, running, line, left) = tick_under("tick-orders-default", None);
+            assert_eq!(mode, crate::orders::Mode::Store, "store is the default under the manager");
+            assert!(running, "the delivery worker runs");
+            assert!(line["phases"].get("repair:unsent").is_none(), "repair:unsent ran: {}", line["phases"]);
+            for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
+                assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
+            }
+            assert!(left.is_empty(), "the tick wrote {left:?}");
+        }
+
+        /// The rollback: `WSP_ORDERS=files` under the manager is the files
+        /// path, no worker, and the tick's phases as before.
+        #[test]
+        fn under_the_manager_orders_files_is_the_rollback_and_the_tick_runs_as_before() {
+            let (mode, running, line, _) = tick_under("tick-orders-files", Some("files"));
+            assert_eq!(mode, crate::orders::Mode::Files);
+            assert!(!running, "no delivery worker under files");
+            for gone in ["repair:unsent", "sweep:ended-panes"] {
+                assert!(line["phases"].get(gone).is_none(), "{gone} ran: {}", line["phases"]);
+            }
+            for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
+                assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
+            }
+        }
+
+        /// doctor's queue line: nothing queued, an age, or why it was not read.
+        #[test]
+        fn doctor_dates_the_queue_by_its_oldest_order() {
+            assert_eq!(queue_line(Ok(None), 10_000), "orders: nothing queued");
+            let aged = queue_line(Ok(Some(wsp_store_contract::At(10_000))), 10_000 + 90 * 60 * 1000);
+            assert!(aged.starts_with("orders: the oldest queued order has waited "), "{aged}");
+            assert_eq!(aged, format!("orders: the oldest queued order has waited {}", util::duration_human(90 * 60)));
+            let silent = queue_line(Err(crate::orders::Error::Silent("refused".into())), 0);
+            assert!(silent.contains("no API answered"), "{silent}");
         }
 
         /// The second tick, its line left uncounted by [`tick`]'s filter.

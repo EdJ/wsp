@@ -6947,6 +6947,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    crate::daemon::orders_health(store, &mut notes);
     crate::mirror::api_health(
         &store.state,
         crate::daemon::running(&store.state).as_deref(),
@@ -9230,7 +9231,11 @@ mod tests {
         file("refused-deliveries.json", json!({ "wsp": { "n": 4, "since": now - 100, "why": "from the file" } }));
         file("stuck-commands.json", json!({ "w9:p9": { "kind": "self", "command": STALL, "at": now - 100, "told": true } }));
 
+        // The files path is the rollback under the manager (wsp-128): `store`
+        // is the default there, so the files read names it.
+        std::env::set_var(crate::orders::ENV, "files");
         let by_files = Wip::live(&store);
+        std::env::remove_var(crate::orders::ENV);
         assert!(by_files.refusing.contains_key("w9:p9"), "the files path reads refused-deliveries.json: {:?}", by_files.refusing);
         assert!(by_files.stuck.contains_key("w9:p9"), "the files path reads stuck-commands.json: {:?}", by_files.stuck);
 

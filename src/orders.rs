@@ -2,11 +2,13 @@
 //! way the root sends an order to a seat and waits for its answer once the
 //! orders machine owns orders, behind `WSP_ORDERS`.
 //!
-//! - [`mode`]: `WSP_ORDERS=store` under `WSP_HOST=manager` is [`Mode::Store`];
-//!   anything else, unset included, is [`Mode::Files`], today's path (part 2
-//!   of the person's answer on wsp-115: the in-process host keeps the files
-//!   until M1's contraction). Under `Store` the daemon opens `state.db` with
-//!   the orders machine deciding ([`server_mode`], `Owned`) and starts the
+//! - [`mode`]: under `WSP_HOST=manager`, [`Mode::Store`] is the default
+//!   (wsp-128): `WSP_ORDERS` unset, empty or `store`. `WSP_ORDERS=files` is
+//!   the rollback, [`Mode::Files`], until wsp-130 deletes the files path; so is
+//!   any other word. Any other host is `Files` whatever the flag (part 2 of the
+//!   person's answer on wsp-115: the in-process host keeps the files until
+//!   M1's contraction). Under `Store` the daemon opens `state.db` with the
+//!   orders machine deciding ([`server_mode`], `Owned`) and starts the
 //!   delivery worker (`crate::deliver`).
 //! - [`send`] applies `order.send` and returns the order's id. In the daemon
 //!   (which named its open store with [`serve_in_process`]) it goes through
@@ -67,10 +69,11 @@ pub fn mode() -> Mode {
     mode_of(var(ENV).as_deref(), var(crate::host_tcp::ENV).as_deref())
 }
 
-/// [`mode`], pure: `store` holds only under the manager.
+/// [`mode`], pure: `store` holds only under the manager, where it is the
+/// default and `files` (or any word but `store`) is the rollback.
 pub fn mode_of(orders: Option<&str>, host: Option<&str>) -> Mode {
     match (orders.map(str::trim), host.map(str::trim)) {
-        (Some("store"), Some("manager")) => Mode::Store,
+        (None | Some("") | Some("store"), Some("manager")) => Mode::Store,
         _ => Mode::Files,
     }
 }
@@ -78,10 +81,14 @@ pub fn mode_of(orders: Option<&str>, host: Option<&str>) -> Mode {
 /// What `doctor` says of the mode, one line.
 pub fn describe(mode: Mode, orders: Option<&str>) -> String {
     match (mode, orders.map(str::trim).filter(|v| !v.is_empty())) {
+        (Mode::Store, None) => {
+            "orders: store, the default under WSP_HOST=manager (the orders machine owns them; WSP_ORDERS=files is the rollback)".into()
+        }
         (Mode::Store, _) => "orders: store (the orders machine owns them; the daemon delivers under deliver:<seat>)".into(),
-        (Mode::Files, None) => "orders: files (WSP_ORDERS unset)".into(),
+        (Mode::Files, None) => "orders: files (WSP_HOST is not manager)".into(),
+        (Mode::Files, Some("files")) => "orders: files (WSP_ORDERS=files, the rollback)".into(),
         (Mode::Files, Some("store")) => "orders: files (WSP_ORDERS=store holds only under WSP_HOST=manager)".into(),
-        (Mode::Files, Some(v)) => format!("orders: files (WSP_ORDERS={v})"),
+        (Mode::Files, Some(v)) => format!("orders: files (WSP_ORDERS={v}; only store, or unset, is the store)"),
     }
 }
 
@@ -391,21 +398,78 @@ pub fn typed_since(store: &Store, since: wsp_store_contract::At, wait: Duration)
         None => {
             let mut client = wsp_client::Client::dial(&store.state, Principal::Wsp("wip".into()), wait)
                 .map_err(|s| Error::Silent(s.to_string()))?;
-            let mut read = |from: u64, limit: usize| -> Result<(Vec<wsp_store_contract::Event>, u64), Error> {
-                let reply = client
-                    .request("events", serde_json::json!({ "from": from, "limit": limit }))
-                    .map_err(from_client)?;
-                match reply.outcome {
-                    wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, head }) => Ok((events, head.0)),
-                    wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("events was answered {other:?}"))),
-                    wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
-                }
-            };
-            // An empty read past every id: nothing but the head.
-            let (_, head) = read(i64::MAX as u64, 1)?;
-            typed_back(&mut |from, limit| read(from, limit).map(|(e, _)| e), head, since)
+            let head = api_head(&mut client)?;
+            typed_back(&mut |from, limit| api_events(&mut client, from, limit).map(|(e, _)| e), head, since)
         }
     }
+}
+
+/// The API's `events` read: the events after id `from`, at most `limit`, and the head.
+fn api_events(client: &mut wsp_client::Client, from: u64, limit: usize) -> Result<(Vec<wsp_store_contract::Event>, u64), Error> {
+    let reply = client.request("events", serde_json::json!({ "from": from, "limit": limit })).map_err(from_client)?;
+    match reply.outcome {
+        wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, head }) => Ok((events, head.0)),
+        wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("events was answered {other:?}"))),
+        wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
+    }
+}
+
+/// The head, through the API: an empty read past every id.
+fn api_head(client: &mut wsp_client::Client) -> Result<u64, Error> {
+    api_events(client, i64::MAX as u64, 1).map(|(_, head)| head)
+}
+
+/// When the oldest order still `queued` was sent: its `order.queued` event's
+/// time, or `None` with nothing queued. What `doctor` dates the queue by
+/// (wsp-128). In the daemon its open store, anywhere else the API, dialled
+/// within `wait`.
+pub fn oldest_queued(store: &Store, wait: Duration) -> Result<Option<wsp_store_contract::At>, Error> {
+    match in_process() {
+        Some(db) => oldest_queued_in(db),
+        None => {
+            let mut client = wsp_client::Client::dial(&store.state, Principal::Wsp("doctor".into()), wait)
+                .map_err(|s| Error::Silent(s.to_string()))?;
+            let queued = queued_ids(read_orders(&mut client, serde_json::json!({}))?);
+            let head = api_head(&mut client)?;
+            queued_back(&mut |from, limit| api_events(&mut client, from, limit).map(|(e, _)| e), head, queued)
+        }
+    }
+}
+
+/// [`oldest_queued`] on an open store.
+pub fn oldest_queued_in(db: &SharedStore) -> Result<Option<wsp_store_contract::At>, Error> {
+    let queued = queued_ids(all_in(db)?);
+    let head = db.head().map_err(from_store)?;
+    queued_back(&mut |from, limit| db.events_after(EventId(from), limit).map_err(from_store), head.0, queued)
+}
+
+fn queued_ids(orders: Vec<Order>) -> std::collections::BTreeSet<OrderId> {
+    orders.into_iter().filter(|o| o.state == OrderState::Queued).map(|o| o.id).collect()
+}
+
+/// [`oldest_queued`]'s walk, back from `head` a page at a time until every
+/// order in `queued` has had its `order.queued` event read: the earliest of
+/// their times.
+fn queued_back(
+    read: &mut dyn FnMut(u64, usize) -> Result<Vec<wsp_store_contract::Event>, Error>,
+    head: u64,
+    mut queued: std::collections::BTreeSet<OrderId>,
+) -> Result<Option<wsp_store_contract::At>, Error> {
+    let mut oldest: Option<wsp_store_contract::At> = None;
+    let mut top = head;
+    while top > 0 && !queued.is_empty() {
+        let after = top.saturating_sub(TYPED_PAGE);
+        let page = read(after, (top - after) as usize)?;
+        for e in page.iter().filter(|e| e.kind == EventKind::OrderQueued) {
+            if let Subject::Order(id) = &e.subject {
+                if queued.remove(id) {
+                    oldest = Some(oldest.map_or(e.at, |o| o.min(e.at)));
+                }
+            }
+        }
+        top = after;
+    }
+    Ok(oldest)
 }
 
 /// [`typed_since`] on an open store.
@@ -508,14 +572,19 @@ pub(crate) mod tests {
         Principal::Person("ed".into())
     }
 
+    /// wsp-128: under the manager `store` is the default, unset or empty
+    /// included, and `files` is the rollback; elsewhere it is `files`.
     #[test]
     fn store_holds_only_under_the_manager_and_anything_else_is_files() {
         assert_eq!(mode_of(Some("store"), Some("manager")), Mode::Store);
         assert_eq!(mode_of(Some(" store "), Some("manager")), Mode::Store);
+        assert_eq!(mode_of(None, Some("manager")), Mode::Store, "the default under the manager");
+        assert_eq!(mode_of(Some(" "), Some("manager")), Mode::Store, "empty is unset");
         for (orders, host) in [
             (None, None),
-            (None, Some("manager")),
+            (None, Some("inproc")),
             (Some("files"), Some("manager")),
+            (Some(" files "), Some("manager")),
             (Some("store"), None),
             (Some("store"), Some("inproc")),
             (Some("yes"), Some("manager")),
@@ -524,9 +593,42 @@ pub(crate) mod tests {
         }
         assert_eq!(server_mode(Mode::Store), wsp_server::Mode::Owned);
         assert_eq!(server_mode(Mode::Files), wsp_server::Mode::Mirrored);
-        assert!(describe(Mode::Files, None).contains("unset"));
+        assert!(describe(Mode::Store, None).contains("the default under WSP_HOST=manager"));
+        assert!(describe(Mode::Store, None).contains("WSP_ORDERS=files is the rollback"));
+        assert!(describe(Mode::Files, Some("files")).contains("the rollback"));
+        assert!(describe(Mode::Files, None).contains("WSP_HOST is not manager"));
         assert!(describe(Mode::Files, Some("store")).contains("only under WSP_HOST=manager"));
         assert!(describe(Mode::Store, Some("store")).starts_with("orders: store"));
+    }
+
+    /// wsp-128: doctor's date for the queue is the oldest still-`queued`
+    /// order's `order.queued`; a settled order does not count, and an empty
+    /// queue has none.
+    #[test]
+    fn the_oldest_queued_order_is_dated_by_its_queued_event() {
+        let env = crate::util::isolated("orders-oldest-queued");
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        seat(&db, "cpd-1", SeatState::Idle);
+        assert_eq!(oldest_queued_in(&db).unwrap(), None, "nothing queued");
+        let send = |text: &str| {
+            send_in(&db, Command::OrderSend { to: SeatId("cpd-1".into()), text: text.into(), first: false }, &ed()).unwrap()
+        };
+        let first = send("one");
+        let second = send("two");
+        let at = |id: &OrderId| {
+            db.events_after(EventId(0), 1000)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.kind == EventKind::OrderQueued && e.subject == Subject::Order(id.clone()))
+                .map(|e| e.at)
+                .unwrap()
+        };
+        let (first_at, second_at) = (at(&first), at(&second));
+        assert_eq!(oldest_queued_in(&db).unwrap(), Some(first_at.min(second_at)));
+        db.apply(Command::OrderCancel { order: first }, IdempotencyKey("c1".into()), ed()).unwrap();
+        assert_eq!(oldest_queued_in(&db).unwrap(), Some(second_at), "a cancelled order is not queued");
+        db.apply(Command::OrderCancel { order: second }, IdempotencyKey("c2".into()), ed()).unwrap();
+        assert_eq!(oldest_queued_in(&db).unwrap(), None);
     }
 
     /// In process: `order.send` through the open store gives the machine's id,
