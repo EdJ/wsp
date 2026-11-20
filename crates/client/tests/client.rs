@@ -4,7 +4,8 @@
 //! with the right token, subscribing, and refused with a wrong one; `request` for each read verb; `subscribe` handing
 //! out the snapshot and then each event once, across a server restart (a
 //! `Resumed`, and no id twice) and through a `too_old` (a fresh `State`); and a
-//! duplicate id dropped.
+//! duplicate id dropped; `throttle`, `spend` and `show` handing back the
+//! server's documents, and their refusals (wsp-307).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, to_value, Value};
 use wsp_api::{Answer, ApiToken, Code, Listen, Outcome, Reply, LISTEN_FILE, MISSED_BEATS, TOKEN_FILE};
-use wsp_client::{Client, Feed, Item, Silent};
+use wsp_client::{Client, Feed, Item, Silent, ViewError};
 use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
@@ -317,6 +318,53 @@ fn request_gets_each_read_verbs_answer_matched_by_id() {
         Outcome::Err(f) => assert_eq!(f.code, Code::Unsupported),
         other => panic!("{other:?}"),
     }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The daemon's documents, faked, for the view calls (wsp-307).
+struct Docs;
+
+impl wsp_server::Views for Docs {
+    fn throttle(&self) -> std::result::Result<Value, wsp_api::Failure> {
+        Ok(json!({ "mode": "on", "in_force": true, "load": [2.5, 2.0, 1.75] }))
+    }
+    fn spend(&self) -> std::result::Result<Value, wsp_api::Failure> {
+        Ok(json!({ "today": "2026-11-20", "currency": "USD" }))
+    }
+    fn show(&self, id: &str) -> std::result::Result<Value, wsp_api::Failure> {
+        match id {
+            "wsp-1" => Ok(json!({ "id": "wsp-1", "title": "one" })),
+            _ => Err(wsp_api::Failure { code: Code::NotFound, text: format!("no task matches '{id}'"), refusal: None }),
+        }
+    }
+}
+
+#[test]
+fn throttle_spend_and_show_return_the_documents_and_a_refusal_says_why() {
+    let d = dir("views");
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.beat = BEAT;
+    cfg.views = Some(Arc::new(Docs));
+    let server = Server::start(Arc::new(mirror_store()), cfg).unwrap();
+    let mut c = dial(&d);
+    assert_eq!(c.throttle().unwrap(), json!({ "mode": "on", "in_force": true, "load": [2.5, 2.0, 1.75] }));
+    assert_eq!(c.spend().unwrap(), json!({ "today": "2026-11-20", "currency": "USD" }));
+    assert_eq!(c.show("wsp-1").unwrap(), json!({ "id": "wsp-1", "title": "one" }));
+    match c.show("wsp-9") {
+        Err(ViewError::Refused(f)) => assert_eq!((f.code, f.text.as_str()), (Code::NotFound, "no task matches 'wsp-9'")),
+        other => panic!("a show of nothing gave {other:?}"),
+    }
+    server.stop();
+    assert!(matches!(c.spend(), Err(ViewError::Request(_))), "the server is gone");
+    let _ = fs::remove_dir_all(&d);
+
+    // A server with no views refuses them `unsupported`, as one from before them would.
+    let d = dir("no-views");
+    let server = start(Arc::new(mirror_store()), &d);
+    let mut c = dial(&d);
+    assert!(matches!(c.throttle(), Err(ViewError::Refused(f)) if f.code == Code::Unsupported));
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }

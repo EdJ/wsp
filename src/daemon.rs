@@ -339,6 +339,37 @@ fn tailnet_addrs() -> Vec<std::net::IpAddr> {
         .collect()
 }
 
+/// The API's view verbs (wsp-307): `throttle`, `spend` and `show` answer the
+/// documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+/// --json` print, from the very functions those print, over a store opened
+/// afresh for each call (so nothing a call reads is older than the call). The
+/// server links nothing of this crate, so this is how it gets them.
+struct Views {
+    root: std::path::PathBuf,
+    state: std::path::PathBuf,
+}
+
+impl Views {
+    fn store(&self) -> Store {
+        Store::at(self.root.clone(), self.state.clone())
+    }
+}
+
+impl wsp_server::Views for Views {
+    fn throttle(&self) -> Result<serde_json::Value, wsp_api::Failure> {
+        Ok(crate::throttle::document(&self.store()))
+    }
+
+    fn spend(&self) -> Result<serde_json::Value, wsp_api::Failure> {
+        Ok(crate::spend::report(&self.store(), crate::util::epoch_secs()))
+    }
+
+    fn show(&self, id: &str) -> Result<serde_json::Value, wsp_api::Failure> {
+        crate::cmd_task::show_json(&self.store(), id)
+            .map_err(|text| wsp_api::Failure { code: wsp_api::Code::NotFound, text, refusal: None })
+    }
+}
+
 /// What `start_api` started; ended with the daemon.
 pub(crate) struct Api {
     pub(crate) db: wsp_server::SharedStore,
@@ -371,6 +402,7 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
     let mut cfg = wsp_server::Config::new(&store.state);
     cfg.port = crate::mirror::api_port();
     cfg.addrs = tailnet_addrs();
+    cfg.views = Some(std::sync::Arc::new(Views { root: store.root.clone(), state: store.state.clone() }));
     let server = match wsp_server::Server::start(db.clone(), cfg) {
         Ok(s) => Some(s),
         Err(e) => {

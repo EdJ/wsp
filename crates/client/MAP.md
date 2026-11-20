@@ -13,7 +13,10 @@ dependencies to hold this.
 ## Holds
 
 - `src/lib.rs`: `Client::dial(state_dir, by, wait)`, `Client::{request, request_keyed, set_timeout, server, head,
-  subscribe}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`, `Refused`, `Failed`, `Unexpected`), `REQUEST_TIMEOUT`. `request(verb, args)` builds the
+  subscribe, wip, throttle, spend, show}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`, `Refused`, `Failed`, `Unexpected`),
+  `ViewError` (`Request`, `Refused`, `Answer`), `REQUEST_TIMEOUT`. `throttle()`, `spend()` and `show(id)` return the
+  documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id> --json` print, as the `Value` (wsp-307); a
+  refusal (`not_found`, `unsupported` from a server without them) is `ViewError::Refused`. `request(verb, args)` builds the
   envelope from a verb name and JSON `args` (so a verb this build does not know still goes out, and the server
   answers `unsupported`), and returns the `Reply` whose id matches; a refusal is a `Reply` with `err`. One timeout
   covers send to reply; on a timeout or a lost connection the connection is dropped, and the next request dials
@@ -55,7 +58,8 @@ dependencies to hold this.
 for no `api.json`, a wrong token, no token file, a bad file, a stopped server, and a listener that never welcomes;
 `request` for each read verb, and a request after the server was away; `subscribe` for the snapshot then each event
 once, a restart mid-stream (`Resumed`, then every later event once, ids contiguous), a feed that never connected
-(no `Resumed`), `too_old` (a fresh `State`), and, against a fake server, a repeated id dropped and a silent
+(no `Resumed`), `too_old` (a fresh `State`), `throttle`, `spend` and `show` against a server with fake views (and
+`unsupported` without them), and, against a fake server, a repeated id dropped and a silent
 connection dialled again; a connection lost before it delivered anything backed off, each wait longer than the
 last, and a snapshot in parts handed out as one `State` with the event after it following.
 

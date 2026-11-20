@@ -11,6 +11,9 @@
 //! - [`Client::apply`] sends a command under one idempotency key, again under
 //!   the same key after a lost reply; [`Client::await_order`] follows an order
 //!   to a state.
+//! - [`Client::throttle`], [`Client::spend`] and [`Client::show`] return the
+//!   documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+//!   --json` print, the same value (wsp-307).
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
 //!
@@ -76,6 +79,31 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Why a view verb ([`Client::throttle`], [`Client::spend`], [`Client::show`])
+/// gave no document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewError {
+    /// The request got no reply.
+    Request(Error),
+    /// The server refused it: `not_found` for a `show` of nothing,
+    /// `unsupported` from a server that answers no views (or predates them).
+    Refused(Failure),
+    /// The reply's `ok` was another verb's answer.
+    Answer(Box<Answer>),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Request(e) => write!(f, "{e}"),
+            ViewError::Refused(r) => write!(f, "refused {:?}: {}", r.code, r.text),
+            ViewError::Answer(a) => write!(f, "the server answered another verb: {a:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ViewError {}
 
 /// What it takes to dial again: where the server is, who for, and how long to wait.
 #[derive(Debug, Clone)]
@@ -172,6 +200,40 @@ impl Client {
             Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
             Outcome::Ok(other) => Err(Error::Unexpected(format!("wip was answered {other:?}"))),
             Outcome::Err(f) => Err(orders::refused(f)),
+        }
+    }
+
+    /// The document `wsp throttle --json` prints: this machine's build
+    /// throttle and the readings it acts on, as the server's machine reads them.
+    pub fn throttle(&mut self) -> Result<Value, ViewError> {
+        match self.view("throttle", json!({}))? {
+            Answer::Throttle(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    /// The document `wsp spend --json` prints: the last 30 days' tokens and cost.
+    pub fn spend(&mut self) -> Result<Value, ViewError> {
+        match self.view("spend", json!({}))? {
+            Answer::Spend(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    /// The document `wsp show <id> --json` prints, `id` as `wsp show` takes it
+    /// (a row's id or prefix, or a piece's id). None is [`ViewError::Refused`]
+    /// with `not_found`, and the CLI's sentence as its text.
+    pub fn show(&mut self, id: &str) -> Result<Value, ViewError> {
+        match self.view("show", json!({ "id": id }))? {
+            Answer::Show(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    fn view(&mut self, verb: &str, args: Value) -> Result<Answer, ViewError> {
+        match self.request(verb, args).map_err(ViewError::Request)?.outcome {
+            Outcome::Ok(a) => Ok(a),
+            Outcome::Err(f) => Err(ViewError::Refused(f)),
         }
     }
 

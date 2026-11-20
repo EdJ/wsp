@@ -12,7 +12,9 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
 
 ## Holds
 
-- `src/lib.rs`: `Server::start(store, Config { addrs, state_dir, port, instance, beat })`, `Server::{addrs,
+- `src/lib.rs`: `Server::start(store, Config { addrs, state_dir, port, instance, beat, views })`, `Views` (the
+  view verbs' documents, handed in by whatever starts the server: the daemon passes the CLI's own functions,
+  wsp-307), `Server::{addrs,
   token, clients, log_path, stop}`, `StartError`. Also `allowed` (the peer and bind rule: `127.0.0.0/8`, `::1`,
   `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, copied from the manager), `ensure_token` (`api.token`: 32 random bytes as
   hex, 0600, narrowed back and logged when widened), `DEFAULT_PORT` (7488, one past the manager's), `LOG_FILE`
@@ -26,7 +28,8 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   good hello gets `welcome { server, protocol, head }`. After that, each request gets one reply by id. A read verb
   is one store call. `lists`, `asks`, `machines`, and `orders` with no seat have no `Reads` verb, so they read the
   one `snapshot`. A command verb is `unsupported`, an unknown verb is `unsupported`, and a known verb with bad
-  `args` is `malformed`. A request whose `by` is not the hello's is `forbidden`, and one whose `v` is not 1 is
+  `args` is `malformed`. `throttle`, `spend` and `show` are answered by `Config::views` whole (its `Err` as the
+  reply's `err`), `unsupported` without one. A request whose `by` is not the hello's is `forbidden`, and one whose `v` is not 1 is
   `protocol`. A line that does not decode is answered `malformed` and the connection stays up. If an `id` can be
   read from the line, the answer is a reply to that id; otherwise it is `refused`. A client silent for
   `MISSED_BEATS` beats is dropped.
@@ -53,6 +56,12 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   named, the mirror's silence on unchanged entities, and 2.3 case 6 run with `Mirror` as the domain.
 
 ## Choices beyond the packet
+
+- **The view verbs come from `Views`, not from the store (wsp-307).** Their inputs (this machine's readings, the
+  stop ledger, the store's files) are not in a `dyn Store`, and this crate may link neither the CLI nor
+  `wsp-view`'s callers, so the daemon hands in an implementation over the very functions `--json` prints from,
+  which is what keeps the two byte-identical (`tests/view_golden.rs` holds it). The checks before them are every
+  read's: the hello's token and peer, the request's `by` and `v`.
 
 - **`Config` has `port`, `instance` and `beat`** beside `addrs` and `state_dir`. Tests need an ephemeral port and
   a beat of milliseconds. `Config::new` gives `DEFAULT_PORT`, `wsp` and `BEAT_SECS`.

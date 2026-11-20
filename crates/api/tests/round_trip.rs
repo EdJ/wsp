@@ -274,7 +274,7 @@ fn every_frame_type_round_trips() {
 // ---------------------------------------------------------------- verbs
 
 /// Read verbs, then the contract's commands, then the unknown verb.
-const VERBS: usize = 13;
+const VERBS: usize = 16;
 const COMMANDS: usize = 25;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
@@ -293,6 +293,9 @@ fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
         Verb::Events { .. } => (10, "events"),
         Verb::Subscribe(_) => (11, "subscribe"),
         Verb::Wip(_) => (12, "wip"),
+        Verb::Throttle(_) => (13, "throttle"),
+        Verb::Spend(_) => (14, "spend"),
+        Verb::Show { .. } => (15, "show"),
     }
 }
 
@@ -379,6 +382,11 @@ fn requests() -> Vec<Frame> {
             from: Some(EventId(400)),
         }),
         Verb::Wip(NoArgs {}),
+        Verb::Throttle(NoArgs {}),
+        Verb::Spend(NoArgs {}),
+        Verb::Show {
+            id: "wsp-307".into(),
+        },
     ];
     let commands = vec![
         Command::RowAdd {
@@ -534,7 +542,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 14;
+const ANSWERS: usize = 17;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -559,6 +567,9 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Subscribed => (11, "subscribed"),
         Answer::Applied => (12, "applied"),
         Answer::Wip { .. } => (13, "wip"),
+        Answer::Throttle(_) => (14, "throttle"),
+        Answer::Spend(_) => (15, "spend"),
+        Answer::Show(_) => (16, "show"),
     }
 }
 
@@ -608,6 +619,9 @@ fn answers() -> Vec<Frame> {
             vec![],
         ),
         ok(13, Answer::Applied, vec![412, 413]),
+        ok(15, Answer::Throttle(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "agents": null })), vec![]),
+        ok(16, Answer::Spend(json!({ "currency": "USD", "rows": { "landed_30d": 0 } })), vec![]),
+        ok(17, Answer::Show(json!({ "id": "wsp-307", "tags": ["api"] })), vec![]),
     ]
 }
 
@@ -842,8 +856,8 @@ fn wire_spelling_is_pinned() {
         json!({
             "type": "request",
             "v": 1,
-            "id": 16,
-            "key": "k-16",
+            "id": 19,
+            "key": "k-19",
             "by": "seat:cpd-3698",
             "verb": "row.claim",
             "args": {
@@ -852,6 +866,16 @@ fn wire_spelling_is_pinned() {
                 "fence": {"lease": "claim:wsp-071", "token": 3}
             }
         })
+    );
+
+    // wsp-307's view verbs: `show` names its id; a view's `ok` is the CLI's
+    // document under the verb's name.
+    let show = requests().into_iter().find(|f| matches!(call_of(f), Call::Verb(Verb::Show { .. }))).unwrap();
+    let show = serde_json::to_value(&show).unwrap();
+    assert_eq!((&show["verb"], &show["args"]), (&json!("show"), &json!({"id": "wsp-307"})));
+    assert_eq!(
+        serde_json::to_value(ok(4, Answer::Throttle(json!({"mode": "auto"})), vec![])).unwrap(),
+        json!({"type": "reply", "id": 4, "ok": {"throttle": {"mode": "auto"}}, "events": []})
     );
 
     let rows = serde_json::to_value(&requests()[2]).unwrap();
@@ -866,7 +890,7 @@ fn wire_spelling_is_pinned() {
     );
 
     assert_eq!(
-        serde_json::to_value(answers().last().unwrap()).unwrap(),
+        serde_json::to_value(&answers()[12]).unwrap(),
         json!({"type": "reply", "id": 13, "ok": "applied", "events": [412, 413]})
     );
     assert_eq!(
@@ -942,6 +966,8 @@ fn a_verb_without_arguments_decodes_either_way() {
             ("state", Verb::State(NoArgs {})),
             ("lists", Verb::Lists(NoArgs {})),
             ("machines", Verb::Machines(NoArgs {})),
+            ("throttle", Verb::Throttle(NoArgs {})),
+            ("spend", Verb::Spend(NoArgs {})),
         ] {
             let l = line(verb, args);
             assert_eq!(call_of(&decode(&l)), &Call::Verb(want), "{l}");

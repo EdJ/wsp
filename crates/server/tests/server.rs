@@ -9,6 +9,8 @@
 //! `order.queued` reaches a subscriber, refuses a seat's `order.acked`
 //! `unauthorised` and a `mirror` putting an order `illegal`, state `owned`;
 //! under `Mirrored`, `order.send` is `illegal`, state `mirrored`.
+//! The view verbs (wsp-307): whatever the `Views` hand in, whole, and
+//! `unsupported` without them.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -478,6 +480,81 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     // `state` is unchanged: the done row's body is there.
     assert_eq!(c.read(Verb::State(NoArgs {})), Answer::State { state: full.clone(), at });
     assert!(full.rows[&RowId("wsp-4".into())].fields.contains_key("body"));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// What a daemon hands in for the view verbs, faked: fixed documents, a `show`
+/// that knows one id, and a count of the calls (wsp-307).
+struct FakeViews {
+    calls: AtomicUsize,
+}
+
+impl wsp_server::Views for FakeViews {
+    fn throttle(&self) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "builds": [] }))
+    }
+    fn spend(&self) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "currency": "USD", "rows": { "landed_30d": 2, "cost_per_landed_row": 1.75 } }))
+    }
+    fn show(&self, id: &str) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match id {
+            "wsp-1" => Ok(json!({ "id": "wsp-1", "body": "the body\n" })),
+            _ => Err(wsp_api::Failure { code: Code::NotFound, text: format!("no task {id}"), refusal: None }),
+        }
+    }
+}
+
+#[test]
+fn the_view_verbs_answer_what_the_views_hand_in_whole_and_are_unsupported_without_them() {
+    let d = dir("views");
+    let views = Arc::new(FakeViews { calls: AtomicUsize::new(0) });
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.views = Some(views.clone());
+    let server = Server::start(Arc::new(mirror_store()), cfg).unwrap();
+    let mut c = connect(&d);
+    assert_eq!(
+        c.read(Verb::Throttle(NoArgs {})),
+        Answer::Throttle(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "builds": [] }))
+    );
+    assert_eq!(
+        c.read(Verb::Spend(NoArgs {})),
+        Answer::Spend(json!({ "currency": "USD", "rows": { "landed_30d": 2, "cost_per_landed_row": 1.75 } }))
+    );
+    assert_eq!(
+        c.read(Verb::Show { id: "wsp-1".into() }),
+        Answer::Show(json!({ "id": "wsp-1", "body": "the body\n" }))
+    );
+    match c.call(Call::Verb(Verb::Show { id: "wsp-404".into() })) {
+        Outcome::Err(f) => assert_eq!((f.code, f.text.as_str()), (Code::NotFound, "no task wsp-404")),
+        other => panic!("a show of no row was answered {other:?}"),
+    }
+    // `show` needs its id: without one it is malformed, and no view is asked.
+    let asked = views.calls.load(Ordering::SeqCst);
+    assert!(matches!(c.call(Call::Unknown { verb: "show".into(), args: json!({}) }), Outcome::Err(f) if f.code == Code::Malformed));
+    // A request by another principal than the hello's is forbidden, as any read's is.
+    let id = ReqId(600);
+    let other = Request { v: PROTOCOL, id, key: None, by: Principal::Seat(SeatId("cpd-9".into())), call: Call::Verb(Verb::Spend(NoArgs {})) };
+    c.conn.send(&Frame::Request(other)).unwrap();
+    assert!(matches!(c.reply(id).outcome, Outcome::Err(f) if f.code == Code::Forbidden));
+    assert_eq!(views.calls.load(Ordering::SeqCst), asked, "neither a malformed nor a forbidden request reaches the views");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+
+    // A server started with no views answers each one unsupported.
+    let d = dir("no-views");
+    let server = start(Arc::new(mirror_store()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+    for verb in [Verb::Throttle(NoArgs {}), Verb::Spend(NoArgs {}), Verb::Show { id: "wsp-1".into() }] {
+        match c.call(Call::Verb(verb)) {
+            Outcome::Err(f) => assert_eq!(f.code, Code::Unsupported, "{f:?}"),
+            other => panic!("a view verb with no views was answered {other:?}"),
+        }
+    }
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }

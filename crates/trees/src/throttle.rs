@@ -2390,32 +2390,10 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
         }
     }
     ensure_shims(&store.state, &s);
-    let v = View::read(&store.state);
     match args.json() {
-        true => println!(
-            "{}",
-            serde_json::to_string_pretty(&wsp_view::throttle::json(&wsp_view::throttle::Throttle {
-                mode: v.settings.mode.word().to_string(),
-                in_force: v.in_force,
-                idle_secs: v.idle,
-                cores: v.cores,
-                slots: v.settings.slot_count(v.cores),
-                jobs: v.settings.job_cap(v.cores),
-                load: v.load,
-                load_warning: v.load_warning(),
-                memory: memory_json(store),
-                cpu_speed_limit: v.thermal,
-                thermal_below: v.settings.thermal_below,
-                thermally_limited: v.hot(),
-                hot_slots: v.settings.slots_at(v.cores, true),
-                hot_jobs: v.settings.jobs_at(v.cores, true),
-                suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
-                agents: store.seat_cap(),
-                builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
-            }))
-            .unwrap_or_default()
-        ),
+        true => println!("{}", serde_json::to_string_pretty(&document(store)).unwrap_or_default()),
         false => {
+            let v = View::read(&store.state);
             println!("{}", v.render());
             match holding_back(store) {
                 Some(h) => println!("new work: held — {}", h.text().trim_start_matches("throttle: ")),
@@ -2432,6 +2410,31 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
         }
     }
     0
+}
+
+/// `wsp throttle --json`'s document, as of now: what the bare verb prints
+/// under `--json`, and what the API's `throttle` verb answers (wsp-307).
+pub fn document(store: &Store) -> Value {
+    let v = View::read(&store.state);
+    wsp_view::throttle::json(&wsp_view::throttle::Throttle {
+        mode: v.settings.mode.word().to_string(),
+        in_force: v.in_force,
+        idle_secs: v.idle,
+        cores: v.cores,
+        slots: v.settings.slot_count(v.cores),
+        jobs: v.settings.job_cap(v.cores),
+        load: v.load,
+        load_warning: v.load_warning(),
+        memory: memory_json(store),
+        cpu_speed_limit: v.thermal,
+        thermal_below: v.settings.thermal_below,
+        thermally_limited: v.hot(),
+        hot_slots: v.settings.slots_at(v.cores, true),
+        hot_jobs: v.settings.jobs_at(v.cores, true),
+        suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
+        agents: store.seat_cap(),
+        builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
+    })
 }
 
 fn bad(k: &str, v: &str) -> i32 {
