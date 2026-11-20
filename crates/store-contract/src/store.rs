@@ -24,6 +24,7 @@
 //! | `Texts::set_text` | `text.set` | `Row(row)` | `{"section", "rev"}` | `Wsp(`[`STORE_INSTANCE`]`)` |
 //! | `Commands::apply` of `mirror`, each `put` | `mirror.put` | the entity's | the [`Entity`] | the command's |
 //! | `Commands::apply` of `mirror`, each `gone` | `mirror.gone` | the subject | `null` | the command's |
+//! | `Commands::apply` of `mirror`, a beat-only machine `put` | `machine.beat` | `Machine(name)` | the `Machine` | the command's |
 //!
 //! A renewal is a `lease.taken` again (there is no `lease.renewed`): the fold
 //! keeps `expires` current by replacing the lease, so `evolve` reads `taken`
@@ -32,12 +33,15 @@
 //! `renew` or `release` under a stale token, a refused take or claim) writes
 //! no event.
 //!
-//! The two `mirror` rows (wsp-070, step 1 alone) are not the backend's: the
+//! The three `mirror` rows (wsp-070, step 1 alone) are not the backend's: the
 //! server's mirror domain (wsp-073) drafts them from `decide`, and the backend
 //! stamps them as any command's. They are in the table so that every `evolve`
 //! folds them alike: `mirror.put` replaces the entity at its subject (a
 //! `Claim`'s subject is `Claim(row)`), and `mirror.gone` removes what the
-//! subject names. A real domain refuses `mirror` as `illegal`.
+//! subject names. `machine.beat` (wsp-304) is a `put` of a machine whose beat
+//! and liveness facts alone moved, and is folded as a `put` is; it has its own
+//! kind so that a subscriber can tell a heartbeat from a change. A real domain
+//! refuses `mirror` as `illegal`.
 
 use std::time::Duration;
 

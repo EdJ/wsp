@@ -209,7 +209,8 @@ pub fn fold_into(store: &Store, db: Option<&SharedStore>, host: &str, frame: &Fr
 fn mirror_apply(store: &Store, db: &SharedStore, host: &str, id: &str, cmd: Command) {
     // An event's key is its id, so a replay after a restart is the same
     // command; a beat's is its own moment, so each beat (every 10 s) writes one
-    // mirror.put, its `beat` time having moved.
+    // machine.beat (wsp-304), its `beat` time having moved (a mirror.put where
+    // more than its beat and liveness facts moved).
     let key = match id {
         "beat" => format!(
             "fold:{host}:beat:{}",
