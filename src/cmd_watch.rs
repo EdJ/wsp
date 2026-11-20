@@ -2688,6 +2688,18 @@ impl Source for Poll<'_> {
                     &t.id,
                     "stopped on a question — wsp show <id> has it",
                 )),
+                // Sent back at the leg (or piece) cap: no rework could be
+                // added, so the run starts nothing and seats nobody — a level
+                // until it moves (`wsp-690`).
+                Status::Doing => {
+                    if let Some(cap) = crate::verification::stalled_at_cap(t) {
+                        out.push(Signal::new(
+                            Kind::Blocked,
+                            &t.id,
+                            &format!("sent back at the {cap}: no rework was added and nothing will start — the governor decides · wsp show <id>"),
+                        ));
+                    }
+                }
                 _ => {}
             }
         }

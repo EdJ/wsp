@@ -806,6 +806,11 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
 fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
     let tasks = store.tasks_shared();
     let Some(p) = crate::verification::blocked(&tasks, &t.id) else { return };
+    // A send-back at the cap has told the governor already, once, with its
+    // choices (`verification::tell_if_capped`): not a second time here.
+    if store.find_task(&t.id).is_some_and(|now| crate::verification::stall_told(&now)) {
+        return;
+    }
     tell(store, w, &format!(
         "A verifier found a problem in the {} run: {} ({}) was sent back to doing{}. \
          `wsp show {}` has the verdict under ## Verification. {} \
