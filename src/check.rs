@@ -99,7 +99,7 @@ use crate::util::{self, Paint};
 use crate::verification::{self as v, Run, RunState};
 use crate::Args;
 use crate::host::Host;
-use crate::host::{HostDir, HostId, JobAt, JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobState};
+use crate::host::{JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobState};
 
 /// The heading a project or a task lists its checks under.
 pub(crate) const SECTION: &str = "Checks";
@@ -1192,119 +1192,10 @@ impl Drop for TreeLock {
 
 // ---- where a step runs (M3 under T2, wsp-053) -------------------------------
 
-/// Whose tree a job runs in: a row's, or a barrier's (`<list>#<group>`, as a
-/// barrier's job key names it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Whose<'a> {
-    Row(&'a str),
-    Barrier(&'a str),
-}
-
-impl Whose<'_> {
-    fn id(&self) -> &str {
-        match self {
-            Whose::Row(r) | Whose::Barrier(r) => r,
-        }
-    }
-}
-
-/// Which of its trees: the row's own (`work`), the tree its check runs in, the
-/// verifier's, or the barrier's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TreeKind {
-    Work,
-    Check,
-    /// The verifier's tree: placed here by the verify row (wsp-053 leaves it named).
-    #[allow(dead_code)]
-    Verify,
-    Barrier,
-}
-
-impl TreeKind {
-    fn word(self) -> &'static str {
-        match self {
-            TreeKind::Work => "work",
-            TreeKind::Check => "check",
-            TreeKind::Verify => "verify",
-            TreeKind::Barrier => "barrier",
-        }
-    }
-}
-
-/// Where a job runs, as [`place_of`] answers it: the host-api's [`JobAt`],
-/// which is all a job is given, and the tree as this process reaches it for
-/// what is still done here (the checkout, the lock, "tree missing").
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Place {
-    pub at: JobAt,
-    /// The tree on this machine. At M4, when the tree is made on its host by
-    /// `tree.checkout`, this goes, and nothing a job is sent reads it.
-    pub dir: PathBuf,
-    /// The row (or barrier) a job here is keyed under.
-    pub row: String,
-    pub kind: TreeKind,
-}
-
-impl Place {
-    /// The host the place is on.
-    pub(crate) fn host(&self) -> &str {
-        match &self.at {
-            JobAt::Tree(t) => &t.host.0,
-            JobAt::Dir(d) => &d.host.0,
-        }
-    }
-}
-
-/// The host a row's work happens on: the host its seat was spawned on, which
-/// holds its trees under T2 (`docs/agent-manager.md` 6.2, "M3 under T2").
-/// Until rows record their seat's host (M4) every seat is this machine's.
-pub(crate) fn host_of(_whose: Whose<'_>) -> String {
-    util::hostname()
-}
-
-/// The directory a host's manager keeps the trees it runs jobs in under (its
-/// `--tree-root`): the home directory, the manager's default.
-pub(crate) fn tree_root() -> PathBuf {
-    #[cfg(test)]
-    if let Some(root) = TREE_ROOT.with(|r| r.borrow().clone()) {
-        return root;
-    }
-    util::home()
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A test's own tree root, kept to its thread.
-    static TREE_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Where `whose`'s `kind` tree is, as every job sent to it is placed: the one
-/// function the check, the verifier and the barrier take a job's place from,
-/// so none of them joins a path on wsp's machine into a job.
-///
-/// It makes the tree if it is not there. In this row the tree is made here,
-/// on this machine, at `tree` as today (its checkout follows under the lock),
-/// and answered as a [`HostDir`] on the row's host relative to the tree root.
-/// At M4 the body becomes `tree.checkout` on the place's host, `tree` goes,
-/// and no caller moves again.
-pub(crate) fn place_of(whose: Whose<'_>, kind: TreeKind, tree: &Path) -> Result<Place, String> {
-    if !tree.is_dir() {
-        std::fs::create_dir_all(tree).map_err(|e| format!("could not make the {} tree {}: {e}", kind.word(), util::contract(tree)))?;
-    }
-    let root = tree_root();
-    let (Ok(root_real), Ok(real)) = (root.canonicalize(), tree.canonicalize()) else {
-        return Err(format!("the {} tree {} or the tree root {} does not read", kind.word(), util::contract(tree), util::contract(&root)));
-    };
-    let Ok(rel) = real.strip_prefix(&root_real) else {
-        return Err(format!("the {} tree {} is not under the tree root {}", kind.word(), util::contract(tree), util::contract(&root)));
-    };
-    let path = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
-    let at = HostDir { host: HostId(host_of(whose)), path };
-    if at.escapes() {
-        return Err(format!("the {} tree {} is the tree root itself or outside it", kind.word(), util::contract(tree)));
-    }
-    Ok(Place { at: JobAt::Dir(at), dir: tree.to_path_buf(), row: whose.id().to_string(), kind })
-}
+/// Where a job runs: [`place_of`] and its types live in `wsp-trees`
+/// (`crates/trees/src/job_place.rs`), so `wsp verify` there takes its place from
+/// the same function.
+pub(crate) use wsp_trees::job_place::{place_of, Place, TreeKind, Whose};
 
 /// What runs a step: this process, as before M3 (`WSP_JOBS=inproc`, the
 /// default and the rollback), or a host's manager, as one `job.run` per step
@@ -3374,6 +3265,8 @@ mod tests {
         assert!(!calls("wsp-638", "wsp show wsp-638"));
     }
     use super::*;
+    use crate::host::JobAt;
+    use wsp_trees::job_place::host_of;
 
     fn step(text: &str) -> Step {
         parse_steps(text, Of::Project).remove(0)
@@ -3572,7 +3465,7 @@ mod tests {
     /// and its jobs' files beside it.
     fn both(dir: &Path) -> Vec<(&'static str, Runner<'static>)> {
         let root = dir.parent().unwrap().to_path_buf();
-        TREE_ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
+        wsp_trees::job_place::set_tree_root(Some(root.clone()));
         let exec = root.join(format!("{}-jobs", dir.file_name().unwrap().to_string_lossy()));
         let _ = std::fs::remove_dir_all(&exec);
         let host: &'static crate::host::InProcess = Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&exec, &root)));
