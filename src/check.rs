@@ -1321,11 +1321,14 @@ impl Runner<'static> {
         if JobsChoice::from_env().map_err(|e| e.to_string())? == JobsChoice::Inproc {
             return Ok(Runner::Inproc);
         }
-        let place = place_of(whose, kind, tree)?;
+        // Whether this host has a manager is asked before anything is placed:
+        // a tree outside the tree root is an error only for a manager's job
+        // (wsp-346), and a host with none runs here wherever the tree is.
         let managed = crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host);
-        if managed.as_deref() != Some(place.host()) {
+        if managed.as_deref() != Some(wsp_trees::job_place::host_of(whose).as_str()) {
             return Ok(Runner::Inproc);
         }
+        let place = place_of(whose, kind, tree)?;
         let host = crate::host::choose_jobs(JobsChoice::Manager, &store.state, env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
         Ok(Runner::Jobs(Jobs::new(host, place, lock.map(Path::to_path_buf))))
     }
@@ -3574,6 +3577,35 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(20), "ended when hung, not at its limit");
         assert!(matches!(r.done, Done::Hung(_)), "{:?}", r.done);
         assert!(why_failed(&r).starts_with("hung") && r.done.is_red(), "{}", r.tail);
+    }
+
+    /// Under the default `WSP_JOBS` (`manager`), a host with no manager
+    /// record runs here whatever the tree root is, and places nothing; once
+    /// this host has a manager, a tree outside the root is refused before
+    /// the manager is dialled (wsp-346).
+    #[test]
+    fn a_host_with_no_manager_stays_in_process_and_one_with_a_manager_refuses_a_tree_outside_the_root() {
+        let env = util::isolated("check-chosen-unmanaged");
+        let store = Store::open();
+        let root = env.path("root");
+        std::fs::create_dir_all(&root).unwrap();
+        wsp_trees::job_place::set_tree_root(Some(root.clone()));
+        let tree = env.path("trees/m-1");
+        let lock = env.path("lock");
+        let chosen = |tree: &Path| Runner::chosen(&store, Whose::Row("m-1"), TreeKind::Check, tree, Some(&lock));
+
+        assert!(matches!(chosen(&tree), Ok(Runner::Inproc)), "no manager here: in-process");
+        assert!(!tree.exists(), "an in-process run places nothing");
+        assert!(matches!(chosen(Path::new("/")), Ok(Runner::Inproc)), "whatever the tree root");
+
+        let local = crate::manager::Local::new(&env.path("exec"), 1);
+        crate::manager::write_record(&store.state, &local, "token").unwrap();
+        assert!(matches!(chosen(&tree), Ok(Runner::Inproc)), "the in-process host's record names no manager here");
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+        let refused = chosen(&tree).err().expect("a manager here refuses a tree outside its root");
+        std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
+        assert!(refused.contains("not under the tree root"), "{refused}");
+        wsp_trees::job_place::set_tree_root(None);
     }
 
     /// Every job a check sends takes its place from `place_of`: the row's
