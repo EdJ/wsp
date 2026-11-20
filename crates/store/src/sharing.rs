@@ -153,12 +153,14 @@ pub struct Seen {
 pub type Table<'a> = &'a dyn Fn(&str) -> Option<Vec<Seen>>;
 
 /// How long a run's claim is held with no job of its own running: the setup
-/// between taking a warm tree and its first `job.run` (the worktree, the reset,
-/// the patch), which runs no job for the table to show. A run touches its lock
-/// before each job ([`Warm::touch`]), and a job of the run that started since
-/// that touch and has ended frees it at once; this bound is only for a run
-/// killed before it ran anything.
-pub const SETUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// between taking a warm tree and its first `job.run` (`ensure_tree` and the
+/// patch apply), which runs no job for the table to show. 120s, the
+/// governor's bound (m3-agent-manager, 2026-11-20). The claim's time is its
+/// lock's mtime, stamped when it is taken and again before each job
+/// ([`Warm::touch`]); a job of the run that started since that stamp and has
+/// ended frees it at once, so this bound only matters for a run killed before
+/// it ran anything.
+pub const SETUP_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Older than this, a holder of the *other* choice's kind is dead whatever it
 /// says: a pid lock read under `manager`, or a run's lock read under `inproc`,

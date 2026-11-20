@@ -410,13 +410,15 @@ fn relative(from: &Path, to: &Path) -> PathBuf {
 }
 
 /// The run this verify is, under `manager`: its row is the checkout's when it
-/// stands in one, else the agent's (`agent:<key>`, a verify outside any row);
-/// the mark is the start in milliseconds and this pid, unique per run.
+/// stands in one, else [`agent_key`]'s workspace, standing in for a row as a
+/// barrier's list and group do (the governor's answer, 2026-11-20); the mark
+/// is the start in milliseconds and this pid, so each run's keys are its own
+/// (wsp-051).
 fn this_run(host: &str, checkout: Option<&Path>, key: &str) -> sharing::Run {
     let row = checkout
         .and_then(|c| c.file_name())
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!("agent:{key}"));
+        .unwrap_or_else(|| key.to_string());
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     sharing::Run { host: host.to_string(), row, attempt: 0, mark: format!("{ms}-{}", std::process::id()) }
 }
@@ -1475,6 +1477,7 @@ fn alone_pass(runs: &Runs, p: &util::Paint, dir: &Path, tree: &Path, exes: &[Pat
 /// Everything before this point is ordinary `verify` — the private index, the
 /// patch, a tree reset to HEAD with the patch on it — so what is measured is
 /// this agent's change and not whatever is in the checkout.
+#[allow(clippy::too_many_arguments)]
 fn alone(
     runs: &Runs,
     p: &util::Paint,
@@ -3147,5 +3150,17 @@ mod jobs_tests {
         for program in ["ps", "kill", "lsof"] {
             assert!(calls.get(program).is_none(), "wsp ran {program}: {line}");
         }
+    }
+
+    /// A verify in a checkout is keyed by its row; one outside any row by the
+    /// agent's workspace, and two runs never share a mark.
+    #[test]
+    fn a_verify_with_no_row_is_keyed_by_its_workspace_and_each_run_by_its_mark() {
+        let in_row = this_run(HOST, Some(Path::new("/x/.worktrees/wsp-054")), "cpd-185");
+        assert_eq!(in_row.row, "wsp-054");
+        let bare = this_run(HOST, None, "cpd-185");
+        assert_eq!(bare.row, "cpd-185", "the workspace stands in for the row");
+        std::thread::sleep(Duration::from_millis(2));
+        assert_ne!(this_run(HOST, None, "cpd-185").mark, bare.mark, "unique per run");
     }
 }
