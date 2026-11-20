@@ -237,7 +237,14 @@ impl Server {
         let mut port = cfg.port;
         for ip in &ips {
             let addr = SocketAddr::new(*ip, port);
-            let l = TcpListener::bind(addr).map_err(|e| {
+            let l = match TcpListener::bind(addr) {
+                Err(e) if !ip.is_loopback() && e.kind() == io::ErrorKind::AddrNotAvailable => {
+                    log.line(&format!("not on the tailnet: cannot bind {addr}: {e}; serving the other addresses"));
+                    continue;
+                }
+                bound => bound,
+            };
+            let l = l.map_err(|e| {
                 log.line(&format!("refused to start: cannot bind {addr}: {e}"));
                 if e.kind() == io::ErrorKind::AddrInUse {
                     StartError::Answered { addr, who: format!("something (the port is in use: {e})") }
@@ -439,7 +446,23 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// A store no test reaches: the start is refused before it is used.
+    #[test]
+    fn a_tailnet_address_this_machine_does_not_hold_is_skipped_and_loopback_still_serves() {
+        let d = std::env::temp_dir().join(format!("wsp-server-unheld-{}", std::process::id()));
+        let mut cfg = Config::new(&d);
+        let unheld: IpAddr = "100.127.255.254".parse().unwrap();
+        cfg.addrs = vec![unheld];
+        let store: SharedStore = Arc::new(NoStore);
+        let server = Server::start(store, cfg).expect("loopback serves when a tailnet address cannot be bound");
+        assert!(server.addrs().iter().all(|a| a.ip().is_loopback()), "only loopback is bound: {:?}", server.addrs());
+        assert!(d.join(LISTEN_FILE).exists(), "{LISTEN_FILE} is written");
+        let log = fs::read_to_string(d.join(LOG_FILE)).unwrap();
+        assert!(log.contains("not on the tailnet") && log.contains(&unheld.to_string()), "the skip is logged: {log}");
+        server.stop();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A store no test reaches: the start is refused before it is used, or no client connects.
     struct NoStore;
     macro_rules! never {
         () => {
