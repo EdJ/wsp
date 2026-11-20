@@ -3489,22 +3489,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
             Some(Err(Unordered::Start(e))) => {
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
-                if let Some(text) = &order {
-                    crate::repair::owe_first_order(store, seat.as_str(), text, 0);
-                }
                 unreached(how, place, &spawn);
             }
             Some(Err(why)) => {
                 started = Some(kind.clone());
                 ordered = true;
                 match why {
-                    // Answered and not taken: nobody holds it now, so it is
-                    // owed to the repair tick as a failed tell is.
+                    // Answered and not taken: nobody holds it now.
                     Unordered::Refused(e) => {
                         eprintln!("wsp: agent started but not working on it: {e}");
-                        if let Some(text) = &order {
-                            crate::repair::owe_first_order(store, seat.as_str(), text, 1);
-                        }
                         eprintln!("wsp: send it again with `wsp tell {seat} -`");
                     }
                     // The manager still asks under its id: owing it too
@@ -3545,11 +3538,6 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                             Ok(()) => told = true,
                             Err(e) => {
                                 eprintln!("wsp: agent started but not working on it: {e}");
-                                // The spawn has sent it twice by now, or
-                                // left it typed; the repair tick submits a
-                                // typed one, and flags one still dropped.
-                                let tries = if place.typed(&seat) == Some(true) { 0 } else { 1 };
-                                crate::repair::owe_first_order(store, seat.as_str(), text, tries);
                                 // The repair first, and spelled so it can be
                                 // pasted. The pane, not the task: a task names
                                 // its holder, and a verifier's task is held by
@@ -3574,12 +3562,6 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
                     None => e,
                 };
                 eprintln!("wsp: {kind} did not start in {seat}: {e}");
-                // The order was never sent. If the agent draws its prompt
-                // after this gives up (cpd-3135, 2026-11-05), the repair tick
-                // sends it then.
-                if let (Some(text), false) = (&order, in_args) {
-                    crate::repair::owe_first_order(store, seat.as_str(), text, 0);
-                }
                 unreached(how, place, &spawn);
             }
         },
@@ -5706,11 +5688,6 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     fn absent(&self, seat: &str) -> bool {
         let seat_id = Seat::new(seat);
         crate::cycle::Fleet::here(seat).all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
-    }
-
-    fn turn_began_since(&self, seat: &str, since: i64) -> Option<bool> {
-        let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find_map(|b| b.turn_began_since(&seat_id, since))
     }
 
     fn pids(&self, seat: &str) -> Option<Vec<u32>> {
@@ -8440,75 +8417,21 @@ mod tests {
     }
 
     /// `wsp-420`, cpd-3100: the order is dropped and the spawn sends it again.
-    /// One send that is taken needs nothing owed; two that are dropped leave the
-    /// seat owed with the spawn's resend counted, so the tick only flags.
+    /// One send that is taken is a spawn that succeeded; two that are dropped
+    /// leave it failed, and the spawn never sends a third.
     #[test]
-    fn a_spawn_whose_first_order_is_dropped_sends_it_again_and_records_what_is_still_owed() {
+    fn a_spawn_whose_first_order_is_dropped_sends_it_again_once() {
         let _guard = no_backend();
         let _quick = quick();
         let place = Dropping::new(1, true, Some(false));
-        let (code, store) = owed_after(&place, "dropped-once");
+        let (code, _store) = owed_after(&place, "dropped-once");
         assert_eq!(code, 0, "the resend started a turn");
         assert_eq!(place.heard.borrow().len(), 2, "sent again once");
-        assert!(crate::repair::owed_seats(&store).is_empty(), "and nothing is owed");
 
         let place = Dropping::new(5, true, Some(false));
-        let (code, store) = owed_after(&place, "dropped-twice");
+        let (code, _store) = owed_after(&place, "dropped-twice");
         assert_eq!(code, 1);
         assert_eq!(place.heard.borrow().len(), 2, "never a third in the spawn");
-        let owed = crate::repair::owed_all(&store);
-        assert_eq!(owed["w9:p1"].tries, 1, "dropped twice: the tick has only the flag left");
-        assert_eq!(owed["w9:p1"].order, place.heard.borrow()[0]);
-    }
-
-    #[test]
-    fn a_spawn_that_leaves_the_order_typed_is_owed_a_submit_not_a_flag() {
-        let _guard = no_backend();
-        let _quick = quick();
-        let place = Dropping::new(5, true, Some(true));
-        let (code, store) = owed_after(&place, "dropped-typed");
-        assert_eq!(code, 1);
-        assert_eq!(place.heard.borrow().len(), 1, "not typed over what is already there");
-        assert_eq!(crate::repair::owed_all(&store)["w9:p1"].tries, 0);
-    }
-
-    /// cpd-3135, driven end to end: the agent has not drawn its prompt when the
-    /// spawn gives up, so nothing is sent; it draws it afterwards, and the tick
-    /// sends the order, starts the turn, and says so in the log.
-    #[test]
-    fn a_spawn_that_gave_up_before_the_prompt_drew_has_its_order_sent_by_the_tick() {
-        let _guard = no_backend();
-        let _quick = quick();
-        let place = Dropping::new(0, false, Some(false));
-        let (code, store) = owed_after(&place, "late-prompt");
-        assert_eq!(code, 1, "the spawn failed");
-        assert!(place.heard.borrow().is_empty(), "and sent nothing");
-        let owed = crate::repair::owed_all(&store);
-        assert_eq!(owed["w9:p1"].tries, 0);
-
-        place.ready.set(true);
-        let mut aged = owed;
-        aged.get_mut("w9:p1").unwrap().at -= 100;
-        crate::repair::owed_save(&store, &aged);
-        crate::repair::first_order_tick(&store, &Beside(&place));
-        assert_eq!(place.heard.borrow().len(), 1, "the tick sent the order");
-        assert!(place.took());
-        let said = crate::cycle::tests::SAID.with(|s| s.borrow().clone());
-        assert!(said.iter().any(|l| l.contains("w9:p1") && l.contains("sent it again")), "{said:?}");
-        crate::repair::first_order_tick(&store, &Beside(&place));
-        assert!(crate::repair::owed_seats(&store).is_empty(), "a turn clears it");
-    }
-
-    /// A kind that takes its order in argv has nothing to resend and nothing owed.
-    #[test]
-    fn an_order_carried_in_argv_is_never_recorded_as_owed() {
-        let _guard = no_backend();
-        let _quick = quick();
-        let store = claimed_row("argv-owed");
-        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
-        let flags = [("agent", "true"), ("kind", "opencode"), ("no-tree", "true")];
-        assert_eq!(place_work(&place, &store, &Args::synth("spawn", &["t-1"], &flags)), 0);
-        assert!(crate::repair::owed_seats(&store).is_empty());
     }
 
     /// A backend that remembers what it was asked to open and what it was asked

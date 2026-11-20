@@ -1,7 +1,7 @@
 //! Agent binding, context resolution, and the views that join the store to
 //! the live seats.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -2471,57 +2471,20 @@ pub(crate) fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crat
 /// What the seat's agent did since `since` (`wsp-325`): [`ran_of_seat`]'s
 /// reading of the same session, for the lines a verdict carries.
 ///
-/// Under `WSP_HOST=manager`, the seat's `seat.did` digests as folded
-/// ([`crate::fold::did_since`]), and no transcript is read (wsp-028).
+/// The seat's `seat.did` digests as folded ([`crate::fold::did_since`]), and no
+/// transcript is read (wsp-028).
 pub(crate) fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::did::Did> {
-    if crate::fold::under_manager() {
-        return crate::fold::did_since(store, seat, util::epoch_of(since));
-    }
-    let (kind, session, cwd) = session_of_seat(store, seat)?;
-    crate::agent_commands::of(&kind).did(&session, &cwd, util::epoch_of(since))
-}
-
-/// What the seat's transcript says of its fixed parts (`wsp-429`): the seconds
-/// its test and build commands ran, and when its first line was written.
-pub(crate) fn fixed_of_seat(store: &Store, seat: &str) -> Option<(i64, String)> {
-    let (kind, session, _) = session_of_seat(store, seat)?;
-    if kind != "claude" {
-        return None;
-    }
-    crate::timeline::session_fixed(&session)
-}
-
-/// A seat's model seconds and tool seconds since `since`, from its session's
-/// transcript, for a verifier's pass to keep.
-pub(crate) fn secs_of_seat(store: &Store, seat: &str, since: &str) -> Option<(i64, i64)> {
-    let (kind, session, _) = session_of_seat(store, seat)?;
-    if kind != "claude" {
-        return None;
-    }
-    crate::timeline::session_secs(&session, util::epoch_of(since))
+    crate::fold::did_since(store, seat, util::epoch_of(since))
 }
 
 /// The stalled shell commands in the end of a seat's transcript (`wsp-397`),
-/// open ones counted to `now`. Claude Code's transcript only. Under
-/// `WSP_HOST=manager` it is the manager's `seat.stuck` as folded
-/// ([`crate::fold::stall`]) instead, its start kept at the `recorded` one
-/// when the command is the same.
+/// open ones counted to `now`: the manager's `seat.stuck` as folded
+/// ([`crate::fold::stall`]), its start kept at the `recorded` one when the
+/// command is the same (wsp-028). No transcript is read.
 pub(crate) fn stuck_of_seat(store: &Store, seat: &str, now: i64, recorded: Option<(&str, i64)>) -> Vec<crate::stuck::Stall> {
-    if crate::fold::under_manager() {
-        // The manager's `seat.stuck` as folded (wsp-028): no transcript read.
-        let Some(r) = crate::fold::stall(store, seat, now, recorded) else { return Vec::new() };
-        let kind = crate::stuck::classify(&r.command).unwrap_or(crate::stuck::Kind::TimedOut);
-        return vec![crate::stuck::Stall { kind, command: r.command, at: r.at, secs: r.secs, open: r.open }];
-    }
-    let Some((kind, session, cwd)) = session_of_seat(store, seat) else { return Vec::new() };
-    if kind != "claude" {
-        return Vec::new();
-    }
-    use crate::host::Host;
-    match crate::host::LOCAL.transcript_of(&session, &cwd) {
-        Some(path) => crate::stuck::in_tail(&path, now),
-        None => Vec::new(),
-    }
+    let Some(r) = crate::fold::stall(store, seat, now, recorded) else { return Vec::new() };
+    let kind = crate::stuck::classify(&r.command).unwrap_or(crate::stuck::Kind::TimedOut);
+    vec![crate::stuck::Stall { kind, command: r.command, at: r.at, secs: r.secs, open: r.open }]
 }
 
 /// The kind, session and cwd a seat's binding records, when it has a session.
@@ -3907,28 +3870,14 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
             }
         },
     };
-    let manager = api.is_none() && wip_reads_manager();
-    let w = match (&api, manager) {
-        (Some(state), _) => Wip::from_api(store, state),
-        (None, true) => Wip::from_managers(store),
-        (None, false) => Wip::live(store),
+    let w = match &api {
+        Some(state) => Wip::from_api(store, state),
+        None => Wip::from_managers(store),
     };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
     let mut picked_up = crate::pickup::wip_lines(store);
     picked_up.extend(silent_lines(store));
-    match manager || api.is_some() {
-        // No `ps` and no `lsof` under the manager (4.3) or the API: the
-        // finished trees as the daemon's last scan left them, and the ended
-        // panes are the daemon's to close.
-        true => picked_up.extend(crate::ending::finished_wip_lines_held(store)),
-        false => {
-            // wsp-453: a finished row's tree that still has processes.
-            picked_up.extend(crate::ending::finished_wip_lines(store));
-            // wsp-637: a pane whose seat has ended.
-            picked_up.extend(crate::ended_panes::wip_lines(store));
-        }
-    }
     match args.json() {
         true => {
             let mut v = wip_json(&w);
@@ -4052,8 +4001,9 @@ pub(crate) struct Wip {
     /// governor's spawn a `helper`.
     pub spawned: std::collections::BTreeMap<String, serde_json::Value>,
     /// Seats whose prompt has held typed text, never submitted, for more than a
-    /// tick (`wsp-386`) — [`crate::repair::unsent_seats`]. Drawn as `typed, not
-    /// sent` in place of `idle`.
+    /// tick (`wsp-386`). Drawn as `typed, not sent` in place of `idle`. Nothing
+    /// fills it since wsp-030 deleted `typed-unsent.json`: the manager's
+    /// `order.refused` is the cause, and is `refusing`.
     pub unsent: std::collections::BTreeSet<String>,
     /// Tells queued for a seat's next idle, or held for its link (`wsp-659`):
     /// seat -> how many. Drawn as `· N tells queued`; published as `queued`.
@@ -4063,8 +4013,8 @@ pub(crate) struct Wip {
     /// which is what is true when `typed, not sent` is not — nothing was typed.
     pub refusing: std::collections::BTreeMap<String, (u64, String)>,
     /// Seats whose first work order was sent again and still started no turn
-    /// (`wsp-420`) — [`crate::repair::dropped_seats`]. Drawn as `order not
-    /// received` in place of `idle`.
+    /// (`wsp-420`). Drawn as `order not received` in place of `idle`. Nothing
+    /// fills it since wsp-030 deleted `first-orders.json`.
     pub dropped: std::collections::BTreeSet<String>,
     /// Seats that started a full-suite `cargo test` (`wsp-389`):
     /// [`crate::throttle::full_suite_seats`]. By seat, so a row reopened into a
@@ -4130,33 +4080,11 @@ impl Gathering {
     }
 }
 
-/// Note this census's seats against `seat-since.json` and say since when each
-/// has been in its state — [`Store::note_seat_states`], fed the seats `wip`
-/// draws (a seat with nobody in it has no state worth a clock), each with the
-/// source it was read from when the caller knows it. `answered` is the
-/// sources that answered this reading in full, the only ones whose missing
-/// seats may lose their entries; `at` is now, the time a change is first seen.
-pub(crate) fn seat_clocks<'a>(
-    store: &Store,
-    seats: impl IntoIterator<Item = (&'a crate::place::Seated, Option<String>)>,
-    answered: &BTreeSet<String>,
-    at: i64,
-) -> std::collections::BTreeMap<String, String> {
-    let seen: Vec<(String, String, String, Option<String>)> = seats
-        .into_iter()
-        .filter(|(s, _)| s.state != State::Empty)
-        .map(|(s, from)| (s.seat.as_str().to_string(), s.state.as_str().to_string(), s.session.clone(), from))
-        .collect();
-    store.note_seat_states(&seen, at, &|from| answered.contains(from))
-}
-
-/// The name [`seat_clocks`] files a seat's source under: the backend, and the
-/// machine when it is not this one — `compound`, `compound@mb2`.
-fn clock_source(backend: &str, machine: &str) -> String {
-    match machine {
-        "" => backend.to_string(),
-        m => format!("{backend}@{m}"),
-    }
+/// Since when each seat `wip` draws has been in its state: what the fold dated
+/// it at ([`crate::fold::state_since`]) when the manager's turn edge or stop
+/// reached it. A seat with nobody in it has no state worth a clock.
+pub(crate) fn seat_clocks<'a>(store: &Store, seats: impl IntoIterator<Item = &'a crate::place::Seated>) -> std::collections::BTreeMap<String, String> {
+    crate::fold::state_since(store, seats.into_iter().filter(|s| s.state != State::Empty).map(|s| s.seat.as_str()))
 }
 
 /// Every standing barrier check's seat, named against its list and placed in
@@ -4202,14 +4130,6 @@ fn daemon_by_stamp(last: Option<i64>, heard: bool, now: i64) -> Option<String> {
     })
 }
 
-/// Whether `wip` reads `seats` from the managers (`docs/agent-manager.md`
-/// 4.3) rather than surveying in this process: under both choices since
-/// wsp-030 ([`crate::fold::under_manager`]), `inproc` asking the manager run
-/// in-process.
-fn wip_reads_manager() -> bool {
-    crate::fold::under_manager()
-}
-
 impl Wip {
     /// `wip` under `WSP_HOST=manager` (`docs/agent-manager.md` 4.3): one
     /// `seats` to each host in the machine records, in parallel, each heard or
@@ -4220,14 +4140,8 @@ impl Wip {
     pub(crate) fn from_managers(store: &Store) -> Wip {
         let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
         let census = &reading.census;
-        let mut from: BTreeMap<String, String> = BTreeMap::new();
-        let mut answered: BTreeSet<String> = BTreeSet::new();
-        for (machine, seats) in census.answers() {
-            answered.insert(clock_source("manager", machine));
-            from.extend(seats.iter().map(|s| (s.seat.as_str().to_string(), clock_source("manager", machine))));
-        }
         let seen: Vec<crate::place::Seated> = census.seats().filter(|s| s.state != State::Empty).cloned().collect();
-        let since = seat_clocks(store, seen.iter().map(|s| (s, from.get(s.seat.as_str()).cloned())), &answered, util::epoch_secs());
+        let since = seat_clocks(store, seen.iter());
         let rss: BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
         let counts: BTreeMap<String, u32> = reading.rows.iter().map(|(s, r)| (s.clone(), r.shells)).collect();
         let disks: Vec<crate::host_tcp::DiskFree> = reading.facts.values().flat_map(|f| f.disks.iter().cloned()).collect();
@@ -4273,21 +4187,14 @@ impl Wip {
         w
     }
 
+    #[cfg(test)]
     pub(crate) fn live(store: &Store) -> Wip {
         let backends = crate::place::local_backends();
         let mut agents = Vec::new();
         let mut heard = false;
-        // Which source each seat was read from, and which sources answered:
-        // a seat is forgotten only by its own machine answering without it.
-        let mut from: BTreeMap<String, String> = BTreeMap::new();
-        let mut answered: BTreeSet<String> = BTreeSet::new();
-        for (backend, name) in backends.iter().zip(crate::place::LOCAL_BACKEND_NAMES) {
+        for backend in backends.iter() {
             let Ok(census) = backend.census() else { continue };
             heard = true;
-            for (machine, seats) in census.answers() {
-                answered.insert(clock_source(name, machine));
-                from.extend(seats.iter().map(|s| (s.seat.as_str().to_string(), clock_source(name, machine))));
-            }
             // Each gone seat is dated by the backend that holds it: the
             // clock lives in that backend's record of the seat, and
             // nothing above the port may read it off a path.
@@ -4296,14 +4203,7 @@ impl Wip {
                 (s.clone(), quiet)
             }));
         }
-        // Before the gone seats are forgotten below, so a seat that is still
-        // in the census keeps its clock while `wip` stops drawing it.
-        let since = seat_clocks(
-            store,
-            agents.iter().map(|(s, _)| (s, from.get(s.seat.as_str()).cloned())),
-            &answered,
-            util::epoch_secs(),
-        );
+        let since = seat_clocks(store, agents.iter().map(|(s, _)| s));
         Wip::gathered(store, Gathering::files(store, agents, since), |agents, bindings| Probed {
             shells: idle_members_shells(agents, bindings),
             memory: crate::memory::read(&store.state, agents, bindings, || crate::host::Host::seat_memory(&crate::host::LOCAL)),
@@ -4362,9 +4262,7 @@ impl Wip {
             .filter(|s| s.state != State::Empty)
             .map(|s| (s, None))
             .collect();
-        // No source answered in full, so no seat's clock is forgotten; each
-        // keeps the source the files path last noted it under.
-        let since = seat_clocks(store, agents.iter().map(|(s, _)| (s, None)), &BTreeSet::new(), util::epoch_secs());
+        let since = seat_clocks(store, agents.iter().map(|(s, _)| s));
         let read = Gathering {
             tasks,
             bindings,
@@ -4455,7 +4353,7 @@ impl Wip {
             lists,
             since,
             spawned,
-            unsent: crate::repair::unsent_seats(store),
+            unsent: Default::default(),
             queued: crate::wake::queued_tells(store),
             refusing: {
                 let governors = store.governors();
@@ -4464,7 +4362,7 @@ impl Wip {
                     .filter_map(|(scope, v)| crate::cmd_govern::seat_held(&scope, &governors).map(|s| (s.pane, v)))
                     .collect()
             },
-            dropped: crate::repair::dropped_seats(store),
+            dropped: Default::default(),
             full_suite: crate::throttle::full_suite_seats(&store.state),
             stuck: crate::repair::stuck_seats(store),
             silent: crate::far::Silence::read(store),
@@ -4583,25 +4481,19 @@ fn ended_by_despawn(spawned: &BTreeMap<String, Value>, seat: &str) -> bool {
 }
 
 /// The seats among `seats` that `wip` no longer draws, read against the
-/// store as `wip` reads it: [`mute`], and [`forgotten`] dated by when this
-/// machine first saw each gone (`seat-since.json`). What the daemon's sweep
+/// store as `wip` reads it: [`mute`], and [`forgotten`] dated by when the
+/// manager said each stopped (`said.json`, folded). What the daemon's sweep
 /// forgets (wsp-094).
 pub(crate) fn mute_seats(store: &Store, seats: &[crate::place::Seated]) -> Vec<String> {
     if !seats.iter().any(|s| s.state == State::Gone) {
         return Vec::new();
     }
     let now = util::epoch_secs();
-    let since: BTreeMap<String, i64> = std::fs::read_to_string(store.state.join("seat-since.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.as_object().cloned())
-        .map(|m| {
-            m.into_iter()
-                .filter_map(|(k, e)| Some((k, util::epoch_of(e.get("since")?.as_str()?))))
-                .filter(|(_, t)| *t > 0)
-                .collect()
-        })
-        .unwrap_or_default();
+    let since: BTreeMap<String, i64> = crate::fold::state_since(store, seats.iter().filter(|s| s.state == State::Gone).map(|s| s.seat.as_str()))
+        .into_iter()
+        .map(|(k, iso)| (k, util::epoch_of(&iso)))
+        .filter(|(_, t)| *t > 0)
+        .collect();
     // The cheap half first, as if nothing held them: the tasks are read only
     // when some seat would be dropped but for what it holds.
     let (said, spawned) = (store.said(), store.spawned());
@@ -9780,64 +9672,14 @@ mod tests {
         assert!(row("w3:p1").get("held").is_some(), "the keys are always present");
     }
 
-    /// `wsp-250`. `since` is when the seat entered its current state, dated by
-    /// the census that first saw it there: one seat driven working → idle →
-    /// working → gone through four readings a few minutes apart, each read
-    /// twice, moves its clock at every change and at no other reading. `held`,
-    /// the claim's age, is a different clock and is not touched; and a seat
-    /// stopped on a prompt says how long it has been waiting.
+    /// `wsp-250`. A seat stopped on a prompt says how long it has been waiting,
+    /// from the `since` the fold dated.
     #[test]
-    fn wip_json_says_since_when_each_seat_has_been_in_its_state() {
-        let (_iso, store) = scratch("seat-since");
+    fn a_seat_on_a_prompt_says_how_long_it_has_been_waiting() {
         let mut w = wip_world();
-        let claimed = util::iso_at(util::epoch_secs() - 3 * 3600);
-        w.claims.insert("t-001".into(), json!({ "claimed_at": claimed }));
-        let t0 = util::epoch_secs() - 3600;
-        let compound: BTreeSet<String> = ["compound".to_string()].into();
-        let clocks = |w: &Wip, answered: &BTreeSet<String>, at: i64| {
-            seat_clocks(&store, w.agents.iter().map(|s| (s, Some("compound".to_string()))), answered, at)
-        };
-        let read_at = |w: &mut Wip, state: State, at: i64| {
-            w.agents[0].state = state;
-            w.since = clocks(w, &compound, at);
-            let v = wip_json(w);
-            let row = v["agents"].as_array().unwrap().iter().find(|a| a["pane"] == "w1:p1").unwrap().clone();
-            (row["since"].as_str().map(str::to_string), row["held"].clone())
-        };
-        let mut last = None;
-        for (i, (state, moves)) in [
-            (State::Working, true),
-            (State::Working, false),
-            (State::Idle, true),
-            (State::Idle, false),
-            (State::Working, true),
-            (State::Working, false),
-            (State::Gone, true),
-            (State::Gone, false),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let at = t0 + 300 * i as i64;
-            let (since, held) = read_at(&mut w, state, at);
-            let expected = if moves { Some(util::iso_at(at)) } else { last.clone() };
-            assert_eq!(since, expected, "reading {i}, {state:?}: moves only on a change");
-            assert_eq!(held, "3h", "the claim's clock is its own");
-            last = since;
-        }
-        // Every seat in the census has one, the ones holding no claim too.
-        let v = wip_json(&w);
-        assert!(v["agents"].as_array().unwrap().iter().all(|a| a["since"].is_string()), "{v:#}");
-
-        // A different agent in a reused seat id starts again, in the same state.
-        w.agents[0].session = "another".into();
-        let (since, _) = read_at(&mut w, State::Gone, t0 + 3000);
-        assert_eq!(since, Some(util::iso_at(t0 + 3000)));
-
-        // On the TUI: a seat on a prompt, stopped twelve minutes ago.
         let twelve = util::epoch_secs() - 12 * 60 - 5;
         w.agents[0].state = State::Blocked;
-        w.since = clocks(&w, &compound, twelve);
+        w.since.insert(w.agents[0].seat.as_str().to_string(), util::iso_at(twelve));
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         let line = text.lines().find(|l| l.contains("w1:p1")).unwrap_or_default();
         assert!(line.contains("waiting 12m · person"), "{text}");

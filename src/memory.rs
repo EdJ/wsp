@@ -293,27 +293,6 @@ const BRIDGE: i64 = 3 * SAMPLE_EVERY;
 /// Stretches whose last sample is older than this are dropped from the file.
 const KEEP: i64 = 30 * 86_400;
 
-/// Samples every seated agent among `agents` through one `ps` and banks them.
-/// Under test there is no table to ask: tests fold readings with [`fold`].
-pub(crate) fn sample(state: &Path, agents: &[Seated], ps: impl FnOnce() -> Option<String>, now: i64) {
-    let seats: Vec<(String, String)> =
-        agents.iter().filter(|a| a.state != State::Empty).map(|a| (a.seat.as_str().to_string(), a.seat.as_str().to_string())).collect();
-    if seats.is_empty() || cfg!(test) {
-        return;
-    }
-    let backends = crate::cmd_spawn::local_backends();
-    let roots: Vec<(String, u32)> = seats
-        .iter()
-        .filter_map(|(s, _)| {
-            let seat = crate::place::Seat::new(s);
-            backends.iter().find_map(|b| b.root(&seat)).map(|pid| (s.clone(), pid))
-        })
-        .collect();
-    let Some(ps) = ps() else { return };
-    let read = of(&ps, &seats, &roots, 0);
-    bank(state, &read.panes.iter().map(|p| (p.seat.clone(), p.kb)).collect::<Vec<_>>(), now);
-}
-
 /// Banks the managers' readings: `rss` is each seat's resident bytes as its
 /// `seats` reply said (`docs/agent-manager.md` 4.3).
 pub(crate) fn sample_rss(state: &Path, rss: &BTreeMap<String, u64>, now: i64) {

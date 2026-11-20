@@ -8,15 +8,15 @@
 //!
 //! | event | file |
 //! |---|---|
-//! | `seat.started` | `spawned.json` (`started`), `bindings.json` and `claims.json` (the row the spawn's key named, where none is held) |
+//! | `seat.started` | `manager/<host>.turns.json` (the seat's entry), `spawned.json` (`started`), `bindings.json` and `claims.json` (the row the spawn's key named, where none is held) |
 //! | `seat.refused` | `spawned.json` (`refused`) |
-//! | `turn` | the seat's `said.json` (`working`/`idle`), `seat-since.json`, `burn.json`'s `turns` |
+//! | `turn` | the seat's `said.json` (`working`/`idle`), `manager/<host>.turns.json`, `burn.json`'s `turns` |
 //! | `seat.said` | the seat's `said.json` (`said`, `said_at`) |
 //! | `seat.spent` | the seat's `burn.json` (tokens and cost) |
-//! | `seat.stopped` | `spent.jsonl` (the burn banked), `said.json` and `seat-since.json` (`gone`), `manager/<host>.ended.json` |
+//! | `seat.stopped` | `spent.jsonl` (the burn banked), `said.json` (`gone`), `manager/<host>.ended.json` |
 //! | `seat.did` | `manager/<host>.did.jsonl`, one line per digest |
 //! | `seat.stuck` | `manager/<host>.stuck.json`, the newest per seat |
-//! | `order.*` | `manager/<host>.orders.json`, the newest per order |
+//! | `order.*` | `manager/<host>.orders.json`, the newest per order (`order.acked` also `turns.json`) |
 //! | `beat` (with `HostFacts`) | `manager/<host>.beat.json` |
 //!
 //! Nothing here asks the OS: no `ps`, no renderer, no `df`. The facts are the
@@ -53,7 +53,7 @@ use crate::util;
 const ASK: Duration = Duration::from_secs(2);
 /// The longest wait between attempts to reach a manager that did not answer.
 const RETRY_MAX: Duration = Duration::from_secs(30);
-/// Where `seat-since.json` says a seat's state came from.
+/// Where `said.json` says a seat's state came from.
 const FROM: &str = "manager";
 
 // ---------------------------------------------------------------- where it is kept
@@ -89,6 +89,16 @@ pub fn stuck_path(state: &Path, host: &str) -> PathBuf {
 /// ended, for the phase that tidies their panes.
 pub fn ended_path(state: &Path, host: &str) -> PathBuf {
     beside(state, host, "ended.json")
+}
+
+/// seat -> `{ began }`, the epoch seconds of the newest turn the manager says
+/// began at it (a `turn` edge, or the turn an `order.acked` names): what the
+/// ending and the untaken-order looks read in place of a transcript or a
+/// screen. A seat's entry is made when its start is folded, at `0`, so a seat
+/// with an entry and no turn since is a fact (`false`) and a seat with none is
+/// not (`None`).
+pub fn turns_path(state: &Path, host: &str) -> PathBuf {
+    beside(state, host, "turns.json")
 }
 
 /// order -> its newest `order.delivered` / `order.acked` / `order.refused`.
@@ -160,10 +170,54 @@ fn burn(store: &Store, seat: &str, f: impl FnOnce(&mut serde_json::Map<String, V
     write(&path, &Value::Object(m));
 }
 
-/// The seat's state as `seat-since.json` keeps it, dated now.
-fn since(store: &Store, seat: &str, state: &str) {
-    let seen = [(seat.to_string(), state.to_string(), String::new(), Some(FROM.to_string()))];
-    store.note_seat_states(&seen, util::epoch_secs(), &|_| false);
+/// `turns.json` with the seat's newest turn start, at `began_ms` (epoch ms) if
+/// that is newer than the one held; `None` makes the seat's entry and no more.
+fn turned(state: &Path, host: &str, seat: &str, began_ms: Option<u64>) {
+    let path = turns_path(state, host);
+    let held = read(&path)[seat]["began"].as_i64();
+    let at = began_ms.map(|ms| (ms / 1000) as i64);
+    let next = match (held, at) {
+        (Some(h), Some(a)) => h.max(a),
+        (Some(h), None) => h,
+        (None, a) => a.unwrap_or(0),
+    };
+    if held != Some(next) {
+        put(&path, seat, json!({ "began": next }));
+    }
+}
+
+/// Since when each of `seats` has been in its state, RFC 3339, as the fold
+/// dated it: the turn edge's time while it turns or idles, the stop's once it
+/// is gone, in the seat's own `said.json`. A seat the manager said nothing of
+/// has none.
+pub(crate) fn state_since<'a>(store: &Store, seats: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, String> {
+    let compound = Compound::at(store.state.join(crate::place_compound::SEATS));
+    seats
+        .into_iter()
+        .filter_map(|seat| {
+            let said = LOCAL.said(&compound.dir_of(&Seat::new(seat)).ok()?);
+            Some((seat.to_string(), said.get("at")?.as_str()?.to_string()))
+        })
+        .collect()
+}
+
+/// Whether a turn began at `seat` at or after `since` (epoch seconds), as the
+/// manager's events folded say: `Some(false)` for a seat whose start was
+/// folded and began no turn since, `None` for one nothing was heard of. A
+/// caller holds on `None`.
+pub(crate) fn turn_began_since(store: &Store, seat: &str, since: i64) -> Option<bool> {
+    let dir = store.state.join("manager");
+    let mut said = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().ends_with(".turns.json") {
+            continue;
+        }
+        if let Some(began) = read(&e.path())[seat]["began"].as_i64() {
+            said = Some(said.unwrap_or(false) || began >= since);
+        }
+    }
+    said
 }
 
 /// Fold one frame heard from `host`'s manager. `true` when it was written,
@@ -292,8 +346,8 @@ fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: S
 /// each tick, the state core's seats that `wip` would not draw
 /// (`cmd_agent::mute_seats`: gone and holding nothing, and either
 /// ended by a despawn, with no sentence and no agent on record, or gone past
-/// `GONE_FOR`) are mirrored gone, and their `spawned.json` and
-/// `seat-since.json` entries dropped. What a machine restart leaves — every
+/// `GONE_FOR`) are mirrored gone, and their `spawned.json`
+/// entry dropped. What a machine restart leaves — every
 /// seat that ran, ended by the fold and named for good — clears on the first
 /// tick; one that said something, a day after it was first seen gone.
 /// Returns the seats forgotten. `pick` is that reading, passed in by the
@@ -440,7 +494,7 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                     }
                 });
             }
-            since(store, seat, "starting");
+            turned(state, host, seat, None);
         }
         Message::SeatRefused(r) => {
             let seat = r.seat.0.as_str();
@@ -472,7 +526,7 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                     m.insert("turns".into(), json!(n + 1));
                 });
             }
-            since(store, seat, word);
+            turned(state, host, seat, (t.edge == TurnEdge::Began).then_some(t.at.0));
         }
         Message::SeatSaid(s) => say(store, &s.seat.0, |m| {
             m.insert("said".into(), json!(s.text));
@@ -496,7 +550,6 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                 m.insert("state".into(), json!("gone"));
                 m.insert("at".into(), json!(util::now_iso()));
             });
-            since(store, seat, "gone");
             put(&ended_path(state, host), seat, with_heard(serde_json::to_value(s)));
         }
         Message::SeatDid(d) => {
@@ -508,7 +561,10 @@ fn apply(store: &Store, host: &str, msg: &Message) {
         }
         Message::SeatStuck(s) => put(&stuck_path(state, host), &s.seat.0, with_heard(serde_json::to_value(s))),
         Message::OrderDelivered(o) => put(&orders_path(state, host), &o.order.0, json!({ "seat": o.seat.0, "delivered": util::epoch_secs() })),
-        Message::OrderAcked(o) => put(&orders_path(state, host), &o.order.0, json!({ "seat": o.seat.0, "acked": o.turn_began.0 })),
+        Message::OrderAcked(o) => {
+            put(&orders_path(state, host), &o.order.0, json!({ "seat": o.seat.0, "acked": o.turn_began.0 }));
+            turned(state, host, &o.seat.0, Some(o.turn_began.0));
+        }
         Message::OrderRefused(o) => put(&orders_path(state, host), &o.order.0, json!({ "seat": o.seat.0, "refused": o.why })),
         _ => {}
     }
@@ -522,21 +578,9 @@ fn apply(store: &Store, host: &str, msg: &Message) {
 // reads [`did_since`] and the stuck tick reads [`stalls`]. A fact not folded
 // yet is no fact: nothing here falls back to the probe it replaces.
 
-/// The manager's events are the cause, and the phases they replace do not
-/// run: under both choices since wsp-030, where `WSP_HOST=inproc` runs the
-/// manager's own code in this process ([`crate::host_tcp::record`]). Kept as a
-/// function until the daemon-tick and verbs legs delete the branches it
-/// guards; it no longer says no.
-pub fn under_manager() -> bool {
-    true
-}
-
 /// The host whose manager is folded: the one `$WSP_HOST` chooses, the
 /// in-process manager or the machine record's; `None` when there is none.
 fn folded_host(store: &Store) -> Option<String> {
-    if !under_manager() {
-        return None;
-    }
     crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host)
 }
 
@@ -640,9 +684,6 @@ pub fn follow(store: &Store, db: Option<&SharedStore>, host: &str, sub: &mut Sub
 /// under `manager` the one the local machine record names. `None` with
 /// neither.
 pub fn start(store: &Store, db: Option<SharedStore>) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
-    if !under_manager() {
-        return None;
-    }
     let (local, token) = crate::host_tcp::record(&store.state).ok()?;
     let (root, state) = (store.root.clone(), store.state.clone());
     let stop = Arc::new(AtomicBool::new(false));
@@ -786,7 +827,7 @@ mod tests {
         let said = LOCAL.said(&dir);
         assert_eq!(said["said"], "folded it", "{said}");
         assert_eq!(said["state"], "gone", "{said}");
-        assert_eq!(read(&store.state.join("seat-since.json"))["cpd-f1"]["state"], "gone");
+        assert!(state_since(&store, ["cpd-f1"]).contains_key("cpd-f1"), "and dated the gone");
 
         // The burn tally, and spent.jsonl once the seat stopped.
         let burn = read(&dir.join(crate::host::BURN_FILE));
@@ -878,6 +919,29 @@ mod tests {
         assert_eq!((&s["epoch"], &s["pid"]), (&json!(2), &json!(4343)), "the new start is recorded: {s}");
         assert_eq!(spawned["cpd-a2"]["started"]["row"], "", "{spawned:?}");
         assert_eq!(spawned["cpd-a3"]["started"]["row"], "", "{spawned:?}");
+    }
+
+    /// A seat's start makes its entry, a `turn` edge and an `order.acked` date
+    /// the newest turn begun, and [`turn_began_since`] answers from them: `None`
+    /// for a seat nothing was heard of, `Some(false)` for one that began none
+    /// since, `Some(true)` once one did.
+    #[test]
+    fn the_folded_turns_say_whether_a_turn_began_since() {
+        let env = util::isolated("fold-turns");
+        let store = Store::open();
+        let s = seat();
+        assert_eq!(turn_began_since(&store, "cpd-1", 0), None, "nothing heard");
+        let started = SeatStarted { key: Key { row: RowId("r".into()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 1, sockets: vec![] };
+        apply(&store, "h", &Message::SeatStarted(started));
+        assert_eq!(turn_began_since(&store, s.0.as_str(), 100), Some(false), "started, no turn");
+        let turn = |at: u64| Message::Turn(Turn { seat: s.clone(), epoch: Epoch(1), edge: TurnEdge::Began, at: At(at), order: None });
+        apply(&store, "h", &turn(200_000));
+        assert_eq!(turn_began_since(&store, s.0.as_str(), 200), Some(true));
+        assert_eq!(turn_began_since(&store, s.0.as_str(), 201), Some(false), "an older turn is not since");
+        let acked = wsp_host_api::OrderAcked { order: OrderId("o".into()), seat: s.clone(), turn_began: At(300_000) };
+        apply(&store, "h", &Message::OrderAcked(acked));
+        assert_eq!(turn_began_since(&store, s.0.as_str(), 300), Some(true), "the acked turn counts");
+        drop(env);
     }
 
     /// A beat's host facts are kept where `sweep:disk` and `sweep:throttle`
@@ -1079,7 +1143,7 @@ mod mirror_tests {
     /// wsp-094: after a machine restart the manager journalled every seat
     /// stopped and the fold put each gone; nothing ever forgot them. The tick's
     /// sweep forgets a gone seat with nothing to say — in the state core and in
-    /// `spawned.json` and `seat-since.json` — keeps one that said something,
+    /// `spawned.json` — keeps one that said something,
     /// forgets a seat mirrored before the census word was carried, and a
     /// second sweep finds nothing.
     #[test]
@@ -1113,7 +1177,7 @@ mod mirror_tests {
         };
         db.apply(put_cmd(vec![Entity::Seat(old)]), IdempotencyKey("old".into()), Principal::Wsp("test".into())).unwrap();
         assert!(store.spawned().contains_key("cpd-r1"), "the fold recorded the start");
-        assert!(read(&store.state.join("seat-since.json")).get("cpd-r1").is_some(), "and dated the gone");
+        assert!(state_since(&store, ["cpd-r1"]).contains_key("cpd-r1"), "and dated the gone");
 
         let mut forgot = sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s));
         forgot.sort();
@@ -1123,14 +1187,13 @@ mod mirror_tests {
         assert!(seats.contains_key(&c::SeatId("cpd-r2".into())), "it said something");
         assert!(!store.spawned().contains_key("cpd-r1"));
         assert!(store.spawned().contains_key("cpd-r2"));
-        assert!(read(&store.state.join("seat-since.json")).get("cpd-r1").is_none());
         assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "nothing left to forget");
 
         // A day after it was first seen gone, the one that said something goes too.
         let day_ago = util::epoch_secs() - crate::cmd_agent::GONE_FOR - 60;
-        let mut since = read(&store.state.join("seat-since.json"));
-        since["cpd-r2"]["since"] = json!(util::iso_at(day_ago));
-        write(&store.state.join("seat-since.json"), &since);
+        say(&store, "cpd-r2", |m| {
+            m.insert("at".into(), json!(util::iso_at(day_ago)));
+        });
         assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-r2"]);
     }
 

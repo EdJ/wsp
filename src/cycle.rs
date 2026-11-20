@@ -208,12 +208,12 @@ pub(crate) trait Seats {
         false
     }
 
-    /// Whether a turn began at this seat at or after `since` —
-    /// [`crate::place::Place::turn_began_since`] over every backend here.
-    /// `None` is nobody can say, and the default, for the reason
-    /// [`Seats::absent`] gives: a caller holds on `None`.
-    fn turn_began_since(&self, _seat: &str, _since: i64) -> Option<bool> {
-        None
+    /// Whether a turn began at this seat at or after `since`, as the manager's
+    /// events folded say ([`crate::fold::turn_began_since`]): the `turn` edge,
+    /// or the turn an `order.acked` names. `None` is nobody can say, a seat
+    /// nothing was heard of, and a caller holds on `None`. A fake overrides it.
+    fn turn_began_since(&self, store: &Store, seat: &str, since: i64) -> Option<bool> {
+        crate::fold::turn_began_since(store, seat, since)
     }
 
     /// Whether the seat's prompt is holding typed text —
@@ -4973,15 +4973,10 @@ pub(crate) fn end_passes_keeping(
             }
         };
         // Read before the despawn: it clears the binding the session is found by.
-        // Under `WSP_HOST=manager` no transcript is read (wsp-028): the spend is
-        // the pass's own and the folded `seat.spent`'s, and what it did the
-        // `seat.did` digests'.
-        let transcripts = !crate::fold::under_manager();
-        let ran = transcripts.then(|| crate::cmd_agent::ran_of_seat(store, &seat, &p.at)).flatten();
-        let secs = transcripts.then(|| crate::cmd_agent::secs_of_seat(store, &seat, &p.at)).flatten();
-        let fixed = transcripts.then(|| crate::cmd_agent::fixed_of_seat(store, &seat)).flatten();
-        let spent = crate::verification::Spent::ending(p.spent.as_ref(), ran.as_ref(), secs);
-        let spent = crate::verification::Spent::with_session(spent, fixed);
+        // No transcript is read (wsp-028): the spend is the pass's own and the
+        // folded `seat.spent`'s, and what it did the `seat.did` digests'.
+        let spent = crate::verification::Spent::ending(p.spent.as_ref(), None, None);
+        let spent = crate::verification::Spent::with_session(spent, None);
         let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
         let outcome = despawn_seat_keeping(&seat, keep).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
@@ -6774,65 +6769,6 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&ENDED).is_empty(), "ended once: nothing is standing any more");
     }
 
-    /// `wsp-325`: the seat's transcript is read when its pass is ended, and the
-    /// entry carries what the verifier ran, drove and read — beside the
-    /// `checked` lines the verifier wrote itself, which ending leaves alone.
-    #[test]
-    fn ending_a_verifier_writes_what_it_did_from_its_transcript_and_keeps_what_it_checked() {
-        use crate::repair::Pass;
-        use crate::verification::State as V;
-
-        let (env, store) = scratch("didending");
-        task(&store, "m-1", Status::Review);
-        let w = list(&store, &[(&["m-1"], "claude")]);
-        step(&store, &w, &Blind);
-        let _ = spawned();
-        crate::verification::name_seat(&store, "m-1", "cpd-9");
-        let checked = vec![crate::did::Checked { item: "the gate holds".into(), held: false }];
-        crate::verification::record_checked(&store, "m-1", V::Blocks, "it does not", Some("cpd-9"), None, checked.clone(), None).unwrap();
-
-        // The transcript Claude Code would have written, where it looks for it.
-        let home = env.path("home");
-        let cwd = "/w/m-1";
-        let dir = home.join(".claude/projects").join(cwd.replace('/', "-"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let line = |v: serde_json::Value| format!("{v}\n");
-        let call = |id: &str, name: &str, input: serde_json::Value| {
-            line(serde_json::json!({"type": "assistant", "cwd": cwd, "timestamp": util::now_iso(), "message": {"id": id, "model": "claude-sonnet-5-5",
-                "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}))
-        };
-        let said = |id: &str, text: &str| {
-            line(serde_json::json!({"type": "user", "cwd": cwd, "timestamp": util::now_iso(), "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}}))
-        };
-        std::fs::write(
-            dir.join("sess-1.jsonl"),
-            call("t1", "Bash", serde_json::json!({"command": "cargo test cycle:: 2>&1 | tail -3"}))
-                + &said("t1", "test result: FAILED. 1 passed; 1 failed")
-                + &call("t2", "Read", serde_json::json!({"file_path": "/w/m-1/src/cycle.rs", "offset": 10, "limit": 5})),
-        )
-        .unwrap();
-        store.set_binding("cpd-9", serde_json::json!({ "agent_session_id": "sess-1", "agent_kind": "claude", "cwd": cwd }));
-
-        let before = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
-        crate::repair::tick(&store, &Exits, &mut Pass::new());
-        match before {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-
-        let p = &passes_on(&store, "m-1")[0];
-        assert_eq!(p.ending, crate::verification::Ending::Ended);
-        let did = p.did.as_ref().expect("the transcript was read");
-        assert_eq!(did.ran.len(), 1);
-        assert_eq!(did.ran[0].text, "cargo test cycle::");
-        assert_eq!(did.ran[0].last(), crate::did::Outcome::Failed, "a pipe hid the exit status; the output did not");
-        assert_eq!(did.read.files[0].text(), "src/cycle.rs:10-14");
-        assert_eq!(p.checked, checked);
-        let body = store.find_task("m-1").unwrap().body;
-        assert!(body.contains("\n  - **ran:** cargo test cycle:: · failed\n") && body.contains("\n  - **checked:** the gate holds · not held"), "{body}");
-    }
-
     /// `wsp-158` item 2, and the one nothing could find. A governor spawns a
     /// helper — the agent that installs a binary mid-group — and that row is a
     /// member of nothing and a verifier of nothing, so every group left one more
@@ -8371,7 +8307,7 @@ fn only_a_working_screen_is_ever_overruled() {
         fn state(&self, _seat: &str) -> Option<State> {
             Some(State::Idle)
         }
-        fn turn_began_since(&self, _seat: &str, _since: i64) -> Option<bool> {
+        fn turn_began_since(&self, _store: &Store, _seat: &str, _since: i64) -> Option<bool> {
             Some(false)
         }
         fn typed(&self, _seat: &str) -> Option<bool> {

@@ -791,32 +791,20 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
 }
 
 /// One sample of every seated agent's resident memory into
-/// `seat-memory.json`: off the managers' `seats` replies under
-/// `WSP_HOST=manager`, else one `ps` over the local backends' census.
+/// `seat-memory.json`, off the manager's `seats` replies.
 fn sample_seat_memory(store: &Store, now: i64) {
-    if crate::fold::under_manager() {
-        let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
-        let rss: std::collections::BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
-        crate::memory::sample_rss(&store.state, &rss, now);
-        return;
-    }
-    let agents: Vec<crate::place::Seated> =
-        crate::place::local_backends().iter().filter_map(|b| b.census().ok()).flat_map(|c| c.seats().cloned().collect::<Vec<_>>()).collect();
-    crate::memory::sample(&store.state, &agents, || crate::host::Host::seat_memory(&crate::host::LOCAL), now);
+    let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+    let rss: std::collections::BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
+    crate::memory::sample_rss(&store.state, &rss, now);
 }
 
 /// The repair pass, and the sweeps after it, as one tick runs them.
 ///
-/// **Under `WSP_HOST=manager`** (wsp-028, `docs/agent-manager.md` 4.3) the
-/// manager's `seat.stopped` is the cause `sweep:ended-panes` looked for, and it
-/// is folded ([`crate::fold`]): the phase does not run, and is not marked.
+/// The manager's `seat.stopped` is the cause `sweep:ended-panes` looked for, and
+/// it is folded ([`crate::fold`]) (wsp-028, `docs/agent-manager.md` 4.3): that
+/// sweep is gone.
 fn repairs(store: &Store, seats: &dyn crate::cycle::Seats, pass: &mut crate::repair::Pass) {
     store.steady(|| crate::repair::tick(store, seats, pass));
-    // A pane whose seat has ended, its agent gone (`wsp-637`).
-    if !crate::fold::under_manager() {
-        wsp_base::calls::phase("sweep:ended-panes");
-        store.steady(|| crate::ended_panes::tidy(store));
-    }
     // Answered retro questions plan their list (`wsp-472`); idempotent.
     wsp_base::calls::phase("retro");
     store.steady(|| crate::retro_series::sweep(store));
@@ -1243,7 +1231,7 @@ mod tests {
         /// wsp-028's second leg, its done-when: under `manager` the tick runs
         /// against a loopback manager's scripted events; no `ps`, render or
         /// `df` (nor the throttle's probes) is in the call log for it;
-        /// `repair:unsent` and `sweep:ended-panes` do not run; and disk,
+        /// `repair:unsent` and `sweep:ended-panes` are gone; and disk,
         /// throttle, ending and stuck read the folded facts.
         #[test]
         fn under_the_manager_the_tick_reads_the_folded_events_and_probes_nothing() {
@@ -1294,41 +1282,6 @@ mod tests {
             wsp_base::calls::tick_begin();
             repairs(store, &Seats, &mut crate::repair::Pass::new());
             wsp_base::calls::tick_end();
-        }
-
-        /// The same tick under `inproc` runs as before: `repair:unsent` and
-        /// `sweep:ended-panes` run, and what a manager folded is not read.
-        #[test]
-        fn under_inproc_the_tick_runs_as_before_and_reads_nothing_folded() {
-            let _env = util::isolated("tick-inproc");
-            let _host = HostVar::set("inproc");
-            let store = Store::open();
-            assert!(fold::start(&store, None).is_none(), "no fold under inproc");
-            // Files a manager would have left: none of them is read here.
-            let facts = HostFacts {
-                load_centi: 4000,
-                cpus: 4,
-                memory: MemoryPressure::Normal,
-                swap_used_bytes: 0,
-                disks: vec![DiskFree { volume: "/Volumes/Scripted".into(), free_bytes: 10 << 30, total_bytes: 100 << 30 }],
-                thermal: Thermal::Nominal,
-                load5_centi: None,
-                load15_centi: None,
-                speed_limit_pct: None,
-                hid_idle_secs: None,
-                free_memory_bytes: None,
-                pageouts: None,
-            };
-            let beat = Frame { id: None, req: None, msg: Message::Beat(Beat { at: At(1), host: Some(facts), seats: vec![] }) };
-            assert!(fold::fold(&store, HOST, &beat));
-            assert!(fold::facts(&store).is_none());
-
-            let line = tick(&store);
-            for ran in ["repair:unsent", "sweep:ended-panes", "sweep:disk", "sweep:throttle", "ending:verification", "retro"] {
-                assert!(line["phases"].get(ran).is_some(), "{ran} did not run: {}", line["phases"]);
-            }
-            assert!(!cycle_log(&store).contains("load is 40.0"), "{}", cycle_log(&store));
-            assert!(crate::disk::read(&store, crate::disk::LOW, false).iter().all(|d| d.volume != "/Volumes/Scripted"));
         }
     }
 }
