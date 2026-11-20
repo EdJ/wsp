@@ -321,6 +321,12 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
         }),
     };
 
+    // **`wsp-694`: what is about something closed, or a repeat, goes** —
+    // before it can be typed, and each one said in `cycle.log`.
+    if let Some(left) = drop_stale(store, scope, &spool, at) {
+        spool = left;
+    }
+
     // **`wsp-166`: a governor is typed decisions and nothing else.** What is
     // withheld stays in the record, so `wsp watch --drain` still reads it and
     // the logs still say it, and it is neither typed nor counted as owed.
@@ -337,9 +343,20 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
     // Taken before the flush, because a flush empties the copy in hand and the
     // number is what says *everything up to here has gone*.
     let mut tell = Tell::new(store, seats, scope);
-    let sent: Vec<u64> =
-        Stream::new(&spec, &mut tell).tick(at, &mut spool).iter().map(|h| h.seq).collect();
+    let (sent, folded): (Vec<u64>, Vec<u64>) = {
+        let mut stream = Stream::new(&spec, &mut tell);
+        let sent = stream.tick(at, &mut spool).iter().map(|h| h.seq).collect();
+        (sent, std::mem::take(&mut stream.folded))
+    };
     let written = sent.len();
+    if !folded.is_empty() {
+        crate::store::log_line(store, &format!(
+            "told {scope}: {} held entries were more than one delivery carries — typed a summary and the newest {written}, \
+             folded {} for `wsp watch --drain`",
+            written + folded.len(),
+            folded.len()
+        ));
+    }
     // What is left is read out of the record *inside* the write that settles it,
     // rather than by a second read of `watches.json` after it: the pass asks
     // this question for every seat with anything held, every tick, and the
@@ -353,8 +370,9 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
         // of `Delivery::Unconfirmed` is *the text is there and nothing has read
         // it yet* — so it is stamped rather than cleared, and the stamp is what
         // stops the next tick typing it again. See the module docs.
-        if written > 0 {
+        if written > 0 || !folded.is_empty() {
             Spool::settle_these(rec, &sent);
+            Spool::fold(rec, at, &folded);
         } else if tell.typed {
             Spool::stamp_typed(rec, at, &typed_batch);
         }
@@ -365,7 +383,66 @@ stamp(rec, scope, delivered + written, &tell.why, &now);
         owed.withhold_for_a_seat(store);
         (owed.depth(), tell.why)
     });
-    Report { scope: scope.to_string(), settled: written, held: left, typed_at: tell.typed_at, why }
+    Report { scope: scope.to_string(), settled: written + folded.len(), held: left, typed_at: tell.typed_at, why }
+}
+
+/// Take off a scope's spool what [`Spool::stale`] names, inside the lock, and
+/// say each in `cycle.log` (`wsp-694`). Hands back what the record holds after,
+/// or `None` when nothing went.
+///
+/// **Judged outside the lock, removed by identity inside it**, so the store
+/// reads `closed` makes — a worklist, a row — never run under the watch lock,
+/// and an entry a `--drain` took first is simply not there to remove.
+fn drop_stale(store: &Store, scope: &str, spool: &Spool, at: i64) -> Option<Spool> {
+    if spool.held.is_empty() {
+        return None;
+    }
+    // One read per name: a backlog names the same row hundreds of times.
+    let known = std::cell::RefCell::new(BTreeMap::<String, bool>::new());
+    let closed = |name: &str| {
+        if let Some(c) = known.borrow().get(name) {
+            return *c;
+        }
+        let c = match store.worklist(name) {
+            Some(w) => w.status() == crate::model::WorklistStatus::Done,
+            None => store.task(name).is_some_and(|t| !t.status().is_open()),
+        };
+        known.borrow_mut().insert(name.to_string(), c);
+        c
+    };
+    let gone = spool.stale(at, &closed);
+    if gone.is_empty() {
+        return None;
+    }
+    let seqs: Vec<u64> = gone.iter().map(|(q, _)| *q).collect();
+    let left = store.update_watch(&key_for(scope), |rec| {
+        Spool::settle_these(rec, &seqs);
+        Spool::of_json(rec.get("spool").unwrap_or(&Value::Null))
+    });
+    for (seq, why) in &gone {
+        crate::store::log_line(store, &format!("told {scope}: dropped held entry {seq} unread — {why}"));
+    }
+    Some(left)
+}
+
+/// A seat ended for refusing is not the last to be typed its payload (`wsp-694`):
+/// what was typed at it and never confirmed is folded, so its successor's first
+/// wake is what arrived since and a count of these, not the same text again.
+/// Returns how many were folded.
+pub(crate) fn fold_what_was_typed(store: &Store, scope: &str) -> usize {
+    let at = util::epoch_secs();
+    let n = store.update_watch(&key_for(scope), |rec| {
+        let held = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        let seqs: Vec<u64> = held.held.iter().filter(|h| h.typed > 0 && h.folded == 0).map(|h| h.seq).collect();
+        Spool::fold(rec, at, &seqs);
+        seqs.len()
+    });
+    if n > 0 {
+        crate::store::log_line(store, &format!(
+            "told {scope}: folded the {n} held entries typed at the refusing seat, so its successor is not handed the same text — `wsp watch --drain` reads them"
+        ));
+    }
+    n
 }
 
 /// What happened to a seat's spool, in the words a receipt prints.
@@ -817,6 +894,13 @@ fn took_nothing(why: &str) -> bool {
     ["no_composer", "no composer", "session_gone", "session gone", "refused", "refusing"].iter().any(|r| why.contains(r))
 }
 
+/// A refusal whose seat is holding a draft of its own in the input box — named
+/// by the backend (`place_compound::DRAFT_STUCK`), so nothing was taken *and*
+/// typing again would not be either.
+fn draft_stuck(why: &str) -> bool {
+    why.contains(crate::place_compound::DRAFT_STUCK)
+}
+
 /// The seat reads occupied and the agent in it could not be found to type at.
 /// Not a vacancy, and deliberately not worded as one: see [`Tell::deliver`].
 const NOT_FOUND: &str = "somebody is in the seat and wsp could not find them to type at";
@@ -1107,6 +1191,7 @@ impl Sink for Tell<'_> {
         // being typed, and three verifier blocks were answered `nothing worth a
         // wake yet · 0 held`.
         let mut owed = load(self.store, &key_for(&self.scope));
+        let folded = owed.folded();
         owed.withhold_for_a_seat(self.store);
         if let Some(at) = owed.typed_at() {
             // **Or a turn that began and ended since the type**, which a sample
@@ -1175,7 +1260,14 @@ impl Sink for Tell<'_> {
             }
         }
 
-        let text = format!("{}\n{}", preamble(&self.scope), said.join("\n"));
+        let mut text = format!("{}\n{}", preamble(&self.scope), said.join("\n"));
+        // What was folded is still this seat's, and a seat is told it is there.
+        if folded > 0 {
+            text.push_str(&format!(
+                "\n· {folded} earlier entr{} folded on this seat and not typed — `wsp watch --drain` prints them",
+                if folded == 1 { "y is" } else { "ies are" }
+            ));
+        }
         // No `Sent`, no `already_sent`, no `twice` — see this type's docs.
         //
         // **Three answers and the middle one is the row.** `Started` is a turn
@@ -1248,7 +1340,15 @@ impl Tell<'_> {
                         &format!("told {}: refused {n} ticks running — retrying; the last answer was `{last}`", self.scope),
                     );
                 }
-                if !took_nothing(&why) {
+                // **`wsp-694`: a draft stuck in the input box is not typed at
+                // again.** `no composer` with text in the box is the seat that
+                // wedged on 2026-11-19: retrying every tick only offers the same
+                // text to a box that will not take it. Held as typed, for the
+                // retype window, and the refusal names the draft.
+                if draft_stuck(&why) {
+                    self.why = format!("held, not typed again — {why}");
+                }
+                if !took_nothing(&why) || draft_stuck(&why) {
                     self.typed = true;
                     self.typed_at = Some(before);
                 }
@@ -1835,6 +1935,57 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let mut tell = Tell::new(&store, &Working, "demo");
         assert!(!tell.settle(Err(Refusal::Failed("cpd-1: no_composer".into())), before));
         assert!(!tell.typed && tell.typed_at.is_none(), "not stamped: nothing was typed");
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **`wsp-694`: a draft stuck in the input box is not typed at again.** A
+    /// bare `no composer` took nothing and is retried next tick; the same
+    /// refusal naming a draft in the box is held as typed for the retype
+    /// window, and the reason `--status` prints names the draft.
+    #[test]
+    fn a_no_composer_refusal_naming_a_stuck_draft_is_held_and_not_retyped() {
+        use crate::place::Refusal;
+        let env = util::isolated("wake-draft");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let before = util::epoch_secs();
+        let why = format!("cpd-6187: no composer — {} (81814 chars: \"wsp · nobody typed this…\")", crate::place_compound::DRAFT_STUCK);
+
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed(why.clone())), before));
+        assert!(tell.typed && tell.typed_at == Some(before), "stamped, so the next tick does not offer it again");
+        assert!(tell.why.contains("held, not typed again") && tell.why.contains("81814 chars"), "{}", tell.why);
+
+        let mut tell = Tell::new(&store, &Working, "demo");
+        assert!(!tell.settle(Err(Refusal::Failed("cpd-6187: no composer".into())), before));
+        assert!(!tell.typed, "a box that is merely refusing is still asked again");
+        let _ = std::fs::remove_dir_all(&env.state());
+    }
+
+    /// **`wsp-694`: a seat ended for refusing does not hand its successor the
+    /// payload it refused.** What was typed at it is folded — withheld, and kept
+    /// for `--drain` — and what was never typed is still owed.
+    #[test]
+    fn a_reseat_folds_what_the_refusing_seat_was_typed() {
+        let env = util::isolated("wake-fold");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let key = key_for("demo");
+        let line = |t: &str| Spooled::of(0, Line::Note(crate::cmd_watch::Class::Message, t.into()));
+        let typed = store.update_watch(&key, |rec| {
+            let s = Spool::append(rec, vec![line("the 81 KB one")]);
+            let seqs: Vec<u64> = s.held.iter().map(|h| h.seq).collect();
+            Spool::stamp_typed(rec, 100, &seqs);
+            Spool::append(rec, vec![line("raised since")]);
+            seqs
+        });
+        assert_eq!(fold_what_was_typed(&store, "demo"), typed.len());
+        let held = load(&store, &key);
+        assert_eq!((held.depth(), held.folded()), (2, 1), "kept for the drain");
+        assert_eq!(owed_to(&store, "demo"), 1, "and only what arrived since is owed");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.contains("folded the 1 held entries typed at the refusing seat"), "{log}");
+        assert_eq!(fold_what_was_typed(&store, "demo"), 0, "once");
         let _ = std::fs::remove_dir_all(&env.state());
     }
 

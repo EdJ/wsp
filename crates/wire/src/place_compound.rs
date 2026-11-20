@@ -395,12 +395,48 @@ const STARTING_WINDOW: i64 = 120;
 /// rules only, that box had one rule, the composer read `None`, and the
 /// refusal fallback never typed at an idle governor.
 fn composer(screen: &str) -> Option<bool> {
+    draft(screen).map(|d| !d.is_empty())
+}
+
+/// What [`composer`] reads in the box: the text held, or empty for a box
+/// holding nothing (or only the greyed suggestion). `None` when no box is drawn.
+fn draft(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
     let rules: Vec<usize> = (0..lines.len()).filter(|&i| is_rule(lines[i])).collect();
     let [.., top, bottom] = rules[..] else { return None };
     let held: String = lines[top + 1..bottom].iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
     let held = held.trim_start_matches(['❯', '>']).trim();
-    Some(!held.is_empty() && !held.starts_with("Try \""))
+    Some(match held.starts_with("Try \"") {
+        true => String::new(),
+        false => held.to_string(),
+    })
+}
+
+/// What a refusal says when the seat's own input box is holding a draft
+/// (`wsp-694`): the wake path reads it and holds rather than typing again.
+pub const DRAFT_STUCK: &str = "a draft is stuck in the seat's input box";
+
+/// A refusal that took nothing, at a box holding text, says what the text is
+/// (`wsp-694`). On 2026-11-19 an 81 KB wake sat unsubmitted in a custodian's
+/// box and every delivery after it came back `no composer` — true, and no help
+/// to anybody reading why the seat had stopped answering for fifteen hours.
+fn name_the_draft(answer: Result<Delivery>, draft: impl FnOnce() -> Option<String>) -> Result<Delivery> {
+    match &answer {
+        Err(Refusal::Failed(why)) if took_nothing(why) && !why.contains(DRAFT_STUCK) => match draft() {
+            Some(d) if !d.is_empty() => {
+                let head: String = d.chars().take(60).collect();
+                let more = if d.chars().count() > 60 { "…" } else { "" };
+                Err(Refusal::Failed(format!("{why} — {DRAFT_STUCK} ({} chars: \"{head}{more}\")", d.chars().count())))
+            }
+            _ => answer,
+        },
+        _ => answer,
+    }
+}
+
+/// A supervisor's answer that says nothing reached the seat.
+fn took_nothing(why: &str) -> bool {
+    ["refused", "no composer", "no_composer", "no-composer"].iter().any(|r| why.contains(r))
 }
 
 /// A horizontal rule of Claude Code's prompt box — see [`composer`]: at least
@@ -1217,7 +1253,6 @@ fn past_a_refusal(
     holds_text: impl FnOnce() -> Option<bool>,
     type_it: impl FnOnce() -> Result<()>,
 ) -> Result<Delivery> {
-    let took_nothing = |why: &str| ["refused", "no composer", "no_composer", "no-composer"].iter().any(|r| why.contains(r));
     match &answer {
         Err(Refusal::Failed(why)) if took_nothing(why) && holds_text() == Some(false) => match type_it() {
             Ok(()) => Ok(Delivery::Unconfirmed),
@@ -1236,6 +1271,15 @@ fn delivers(rec: &Value) -> bool {
 
 
 impl Compound<'_> {
+    /// The text in this seat's input box, for [`name_the_draft`] — `Some("")`
+    /// for an empty box, `None` where `Place::typed` is.
+    fn draft_in(&self, seat: &Seat) -> Option<String> {
+        let rec = self.record(seat).ok()?;
+        if rec.get("agent").map(|a| str_of(a, "kind")).as_deref() != Some("claude") {
+            return None;
+        }
+        draft(&self.read_screen(seat).ok()?)
+    }
 
     /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
     /// (see the module docs on why this backend does not mint into
@@ -1798,10 +1842,11 @@ impl Place for Compound<'_> {
             if delivers(&rec) {
                 let dir = self.dir_of(seat)?;
                 let answer = deliver_waited(|wait| deliver_through(self.host, &session, &dir, seat, text, wait));
-                return past_a_refusal(answer, || self.typed(seat), || {
+                let answer = past_a_refusal(answer, || self.typed(seat), || {
                     let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
                     self.host.type_in(&socket, text)
                 });
+                return name_the_draft(answer, || self.draft_in(seat));
             }
         }
         let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
@@ -3127,6 +3172,21 @@ mod tests {
         assert_eq!(composer(&format!("{other}\n❯\n{}\n", "─".repeat(80))), Some(false), "cpd-5900's frame");
         assert!(!is_rule("── a sentence that happens to start with a dash and ends ─"), "prose is no rule");
         assert!(!is_rule("─── short ──"), "too narrow to be the box");
+    }
+
+    /// `wsp-694`: a refusal that took nothing, at a box holding text, names the
+    /// draft; an empty box, an unread one, or another answer is left as it was.
+    #[test]
+    fn a_no_composer_refusal_at_a_box_holding_a_draft_names_the_draft() {
+        let no_composer = || Err(Refusal::Failed("cpd-6187: no composer".into()));
+        let held = named_session_screen("❯ wsp · nobody typed this. You are the custodian of `compounding`");
+        let Err(Refusal::Failed(why)) = name_the_draft(no_composer(), || draft(&held)) else { panic!("still a refusal") };
+        assert!(why.starts_with("cpd-6187: no composer — ") && why.contains(DRAFT_STUCK), "{why}");
+        assert!(why.contains("\"wsp · nobody typed this."), "the draft is named: {why}");
+        assert_eq!(name_the_draft(no_composer(), || draft(&named_session_screen("❯ "))), no_composer());
+        assert_eq!(name_the_draft(no_composer(), || None), no_composer());
+        let busy = Err(Refusal::Failed("cpd-1: timeout".into()));
+        assert_eq!(name_the_draft(busy.clone(), || Some("text".into())), busy, "only a refusal that took nothing");
     }
 
     /// Item 3 through the real read, not a stub: a `refused` answer to a seat

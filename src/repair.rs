@@ -666,6 +666,9 @@ pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
         }
         // The successor starts its own count.
         crate::refusals::accepted(store, &scope);
+        // And not the payload this seat refused (`wsp-694`): what was typed at
+        // it is folded, so the successor is told it is there, not typed it.
+        crate::wake::fold_what_was_typed(store, &scope);
         let line = format!(
             "{scope}: {} refused delivery {n} ticks running ({why}) — ended so a successor is seated",
             seat.pane
