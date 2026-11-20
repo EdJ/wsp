@@ -600,7 +600,7 @@ fn fake_feed(
                 if r.read_line(&mut text).unwrap_or(0) == 0 {
                     return;
                 }
-                writeln!(s, "{}", r#"{"type":"welcome","server":"fake","protocol":1,"head":3}"#).unwrap();
+                writeln!(s, r#"{{"type":"welcome","server":"fake","protocol":1,"head":3}}"#).unwrap();
                 text.clear();
                 if r.read_line(&mut text).unwrap_or(0) == 0 {
                     return;
