@@ -17,6 +17,7 @@ use wsp_client::{Client, Feed, Item, Silent};
 use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
+use wsp_store_contract::Feed as Feed2;
 
 /// The upper bound on every wait for an item, a reply or a state the feed comes
 /// to: generous, so a machine under load is slow and not failed. Each wait ends
@@ -568,6 +569,138 @@ fn an_event_id_already_handed_out_is_dropped_and_a_silent_server_costs_the_conne
     drop(f);
     drop(c);
     // The listener takes three connections: the client's, the feed's and its second.
+    let _ = accepts.join();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A server of our own at `d`, taking `conns` connections: each is welcomed, and
+/// each subscribe is answered `subscribed` and then given `then(n, stream)` (n
+/// counts subscribes from 0). Returns when each subscribe came, and the thread.
+#[allow(clippy::type_complexity)]
+fn fake_feed(
+    d: &Path,
+    conns: usize,
+    then: fn(usize, &mut std::net::TcpStream),
+) -> (Arc<std::sync::Mutex<Vec<Instant>>>, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::create_dir_all(d).unwrap();
+    let listen = Listen { addrs: vec![l.local_addr().unwrap().to_string()] };
+    fs::write(d.join(LISTEN_FILE), serde_json::to_string(&listen).unwrap()).unwrap();
+    fs::write(d.join(TOKEN_FILE), "t").unwrap();
+    let came = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let times = came.clone();
+    let accepts = std::thread::spawn(move || {
+        let mut threads = vec![];
+        for stream in l.incoming().take(conns) {
+            let (mut s, times) = (stream.unwrap(), times.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut text = String::new();
+                if r.read_line(&mut text).unwrap_or(0) == 0 {
+                    return;
+                }
+                writeln!(s, "{}", r#"{"type":"welcome","server":"fake","protocol":1,"head":3}"#).unwrap();
+                text.clear();
+                if r.read_line(&mut text).unwrap_or(0) == 0 {
+                    return;
+                }
+                let n = {
+                    let mut t = times.lock().unwrap();
+                    t.push(Instant::now());
+                    t.len() - 1
+                };
+                let id = serde_json::from_str::<Value>(&text).unwrap()["id"].clone();
+                writeln!(s, "{}", json!({"type":"reply","id":id,"ok":"subscribed","events":[]})).unwrap();
+                then(n, &mut s);
+                loop {
+                    text.clear();
+                    if r.read_line(&mut text).unwrap_or(0) == 0 {
+                        return;
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+    });
+    (came, accepts)
+}
+
+#[test]
+fn a_connection_lost_before_it_delivered_anything_backs_off_and_each_wait_is_longer() {
+    // wsp-702: the server answers `subscribed` and hangs up, as a client meets a
+    // snapshot line it cannot read. The feed must not ask again at once, forever.
+    let d = dir("backoff");
+    // The client's request connection, then five subscribes.
+    const SUBS: usize = 5;
+    let (came, accepts) = fake_feed(&d, 1 + SUBS, |_, s| {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    });
+    let c = Client::dial(&d, ed(), WAIT).unwrap();
+    let mut f = c.subscribe(None);
+    f.set_beat(BEAT);
+    let deadline = Instant::now() + WAIT;
+    while came.lock().unwrap().len() < SUBS {
+        assert!(Instant::now() < deadline, "the subscribes never came: {:?}", f.why_silent());
+        assert_eq!(f.next_within(Duration::from_millis(20)), None, "nothing is delivered");
+    }
+    drop(f);
+    drop(c);
+    let t = came.lock().unwrap().clone();
+    let gaps: Vec<Duration> = t.windows(2).map(|w| w[1] - w[0]).collect();
+    // The waits are 25, 50, 100, 200 ms: each a floor on its gap, so a machine
+    // under load is slower and never failed. Before the fix every gap was the
+    // dial's few ms.
+    for (i, gap) in gaps.iter().enumerate() {
+        let floor = Duration::from_millis(25 << i);
+        assert!(*gap >= floor, "reconnect {} came after {gap:?}, under its backoff of {floor:?}: {gaps:?}", i + 1);
+    }
+    assert!(gaps[1] >= Duration::from_millis(50), "the second reconnect waits longer than the first: {gaps:?}");
+    let _ = accepts.join();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_snapshot_in_parts_is_handed_out_as_one_state_and_the_events_after_it_follow() {
+    // wsp-702: Parts closed by a State, then an event; the caller sees one
+    // Item::State with every piece in it, as from a snapshot that came whole.
+    let d = dir("parts");
+    let (_, accepts) = fake_feed(&d, 2, |_, s| {
+        use std::io::Write;
+        let store = mirror_store();
+        apply(&store, everything(), vec![], "all");
+        rows(&store, 0, 40);
+        let (state, at) = store.snapshot().unwrap();
+        let mut pieces = state.split(600);
+        assert!(pieces.len() > 3, "the fixture splits: {}", pieces.len());
+        let last = pieces.pop().unwrap();
+        let line = |f: Feed2| format!("{}\n", serde_json::to_string(&wsp_api::Frame::Feed(f)).unwrap());
+        for part in pieces {
+            s.write_all(line(Feed2::Part { part, at }).as_bytes()).unwrap();
+        }
+        s.write_all(line(Feed2::State { state: last, at }).as_bytes()).unwrap();
+        rows(&store, 40, 1);
+        let e = store.events_after(at, 1).unwrap().remove(0);
+        s.write_all(line(Feed2::Event(e)).as_bytes()).unwrap();
+    });
+    let c = Client::dial(&d, ed(), WAIT).unwrap();
+    let mut f = c.subscribe(None);
+    f.set_beat(BEAT);
+    let want = {
+        let store = mirror_store();
+        apply(&store, everything(), vec![], "all");
+        rows(&store, 0, 40);
+        store.snapshot().unwrap()
+    };
+    assert_eq!(f.next_within(WAIT), Some(Item::State { state: want.0, at: want.1 }));
+    match f.next_within(WAIT) {
+        Some(Item::Event(e)) => assert_eq!(e.id, EventId(want.1 .0 + 1)),
+        other => panic!("expected the event after the snapshot, got {other:?}"),
+    }
+    drop(f);
+    drop(c);
     let _ = accepts.join();
     let _ = fs::remove_dir_all(&d);
 }

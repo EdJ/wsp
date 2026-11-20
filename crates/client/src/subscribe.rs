@@ -9,6 +9,13 @@
 //! announced as one [`Item::Resumed`] so that a caller with derived state knows
 //! to re-read. A `too_old` answer leads to `subscribe {}` and a fresh
 //! [`Item::State`]. Ids at or before the last handed out are dropped.
+//!
+//! A snapshot too large for one line comes as `Feed::Part`s closed by a
+//! `Feed::State` (wsp-702); the feed puts them back together and hands out
+//! one [`Item::State`], as for a snapshot that came whole. A connection lost
+//! before it delivered anything (no item, no beat) is dialled again after a
+//! backoff that doubles each time, as a failed dial is, so that a snapshot the
+//! client cannot read does not cost the server one every 25 ms.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -55,6 +62,11 @@ pub struct Feed {
     dropped: u64,
     reconnects: u64,
     connected_before: bool,
+    /// Whether this connection has delivered an item or a beat: a loss before
+    /// it does backs off.
+    delivered: bool,
+    /// The pieces of a split snapshot so far, and the id they are at.
+    parts: Option<(State, EventId)>,
     silent: Option<String>,
     backoff: Duration,
     retry_at: Instant,
@@ -81,6 +93,8 @@ impl Feed {
             dropped: 0,
             reconnects: 0,
             connected_before: false,
+            delivered: false,
+            parts: None,
             silent: None,
             backoff: BACKOFF_FIRST,
             retry_at: Instant::now(),
@@ -188,12 +202,28 @@ impl Feed {
         self.heard = Instant::now();
         self.quiet = 0;
         match frame {
-            Frames::Beat { .. } => self.beats += 1,
+            Frames::Beat { .. } => {
+                self.beats += 1;
+                self.delivered = true;
+            }
+            Frames::Part { part, at } => match &mut self.parts {
+                Some((held, held_at)) if *held_at == at => held.absorb(part),
+                _ => self.parts = Some((part, at)),
+            },
             Frames::State { state, at } => {
+                let state = match self.parts.take() {
+                    Some((mut held, held_at)) if held_at == at => {
+                        held.absorb(state);
+                        held
+                    }
+                    _ => state,
+                };
                 self.last = Some(at);
+                self.delivered = true;
                 self.pending.push_back(Item::State { state, at });
             }
             Frames::Event(e) => {
+                self.delivered = true;
                 if self.last.is_some_and(|last| e.id <= last) {
                     self.dropped += 1;
                 } else {
@@ -221,9 +251,21 @@ impl Feed {
         if let Some(c) = self.conn.take() {
             c.shutdown();
         }
-        self.silent = Some(why);
-        self.backoff = BACKOFF_FIRST;
-        self.retry_at = Instant::now();
+        self.parts = None;
+        if self.delivered {
+            self.silent = Some(why);
+            self.backoff = BACKOFF_FIRST;
+            self.retry_at = Instant::now();
+        } else {
+            // It subscribed and gave nothing: dialling again at once would ask
+            // the same of the server, as fast as it answers.
+            self.failed(why);
+        }
+    }
+
+    /// When the feed dials next, while it is not connected.
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.conn.is_none().then_some(self.retry_at)
     }
 
     fn failed(&mut self, why: String) {
@@ -268,7 +310,8 @@ impl Feed {
         self.sent = Instant::now();
         self.heard = Instant::now();
         self.quiet = 0;
-        self.backoff = BACKOFF_FIRST;
+        self.delivered = false;
+        self.parts = None;
     }
 
     fn reject(&mut self, conn: Tcp, why: String) {

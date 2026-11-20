@@ -23,14 +23,104 @@ pub struct Subscribe {
     pub from: Option<EventId>,
 }
 
+/// The most a [`Feed::Part`] or the closing [`Feed::State`] of a snapshot is
+/// filled to, in bytes of JSON: a quarter of the API's 16 MiB line, so that a
+/// frame stays under it with room for the one entity that overruns a part.
+pub const SNAPSHOT_PART: usize = 4 * 1024 * 1024;
+
 /// One frame of a subscription.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Feed {
     /// The snapshot `subscribe {}` sends first, and the id it is consistent at.
+    /// A snapshot too large for one frame comes as [`Feed::Part`]s and closes
+    /// with this frame, which holds the rest: the snapshot is all of them
+    /// [`absorbed`](State::absorb) in order.
     State { state: State, at: EventId },
+    /// A piece of a snapshot that a [`Feed::State`] closes (wsp-702). Pieces
+    /// are disjoint: each entity is in one of them.
+    Part { part: State, at: EventId },
     /// One event, in commit order.
     Event(Event),
     /// The heartbeat: the head's id, and when.
     Beat { beat: EventId, at: At },
+}
+
+impl State {
+    /// Take `other`'s entities into this one: how the pieces of a split
+    /// snapshot are put back together. Runs are appended, so pieces taken in
+    /// the order they were sent keep the runs' order.
+    pub fn absorb(&mut self, other: State) {
+        let State { rows, lists, seats, claims, orders, asks, mut runs, machines, leases } = other;
+        self.rows.extend(rows);
+        self.lists.extend(lists);
+        self.seats.extend(seats);
+        self.claims.extend(claims);
+        self.orders.extend(orders);
+        self.asks.extend(asks);
+        self.runs.append(&mut runs);
+        self.machines.extend(machines);
+        self.leases.extend(leases);
+    }
+
+    /// The length of this state's JSON, counted without writing it out.
+    pub fn json_len(&self) -> usize {
+        json_len(self)
+    }
+
+    /// Split into pieces of about `budget` bytes of JSON each, in the order
+    /// [`absorb`](State::absorb) puts them back: never empty (a small state is
+    /// one piece, itself), and an entity larger than `budget` is a piece alone.
+    pub fn split(mut self, budget: usize) -> Vec<State> {
+        let mut pieces = Vec::new();
+        let mut cur = State::default();
+        let mut size = 0usize;
+        // Close the piece being filled when `n` more bytes would overrun it.
+        let mut room = |n: usize, cur: &mut State, pieces: &mut Vec<State>| {
+            if size > 0 && size + n > budget {
+                pieces.push(std::mem::take(cur));
+                size = 0;
+            }
+            size += n;
+        };
+        macro_rules! take {
+            ($field:ident) => {
+                for (k, v) in std::mem::take(&mut self.$field) {
+                    room(json_len(&k) + json_len(&v) + 2, &mut cur, &mut pieces);
+                    cur.$field.insert(k, v);
+                }
+            };
+        }
+        take!(rows);
+        take!(lists);
+        take!(seats);
+        take!(claims);
+        take!(orders);
+        take!(asks);
+        for run in std::mem::take(&mut self.runs) {
+            room(json_len(&run) + 1, &mut cur, &mut pieces);
+            cur.runs.push(run);
+        }
+        take!(machines);
+        take!(leases);
+        pieces.push(cur);
+        pieces
+    }
+}
+
+/// The length of a value's JSON, counted without keeping it.
+fn json_len<T: Serialize>(v: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    let _ = serde_json::to_writer(&mut n, v);
+    n.0
 }
