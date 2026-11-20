@@ -31,7 +31,8 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   read from the line, the answer is a reply to that id; otherwise it is `refused`. A client silent for
   `MISSED_BEATS` beats is dropped.
 - `src/subscribe.rs`: `open` runs before the reply, so `too_old` is the reply. It reads the snapshot (`Feed::State`
-  with its id) or the first page after `from`. `follow` then runs on a thread of its own and writes through the
+  with its id; past `MAX_LINE`, `Feed::Part`s of `SNAPSHOT_PART` bytes and a closing `Feed::State` with the rest,
+  wsp-702) or the first page after `from`. `follow` then runs on a thread of its own and writes through the
   connection's shared writer. It follows the head with `wait_for` (at most 200 ms per wait), reads with
   `events_after` from the last id sent, and sends a `Feed::Beat` every beat. It ends with the connection, and
   closes the connection when a write or the store fails.

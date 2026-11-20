@@ -30,8 +30,8 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
 - `src/store.rs` — 2.2's trait family: `Reads`, `Events` (`events_after`, `head`, `wait_for`), `Commands`
   (`apply`), `Leases`, `Claims`, `Texts`, and `Store`, all six, blanket-implemented; `RowFilter`, `SeatFilter`;
   `STORE_INSTANCE`; `Reads::wip_snapshot` (wsp-695: what `wip` draws) and the `WIP_BODIES` it leaves out; the module docs' table of the events a store writes itself, and of `mirror`'s two
-- `src/subscribe.rs` — 4.3: `Subscribe { from? }`, `Feed` (a snapshot, an event, a beat), `BEAT_SECS`,
-  `MISSED_BEATS`
+- `src/subscribe.rs` — 4.3: `Subscribe { from? }`, `Feed` (a snapshot, a piece of one, an event, a beat), `BEAT_SECS`,
+  `MISSED_BEATS`, `SNAPSHOT_PART`, and `State::split`, `absorb` and `json_len` for a snapshot past one line (wsp-702)
 - `tests/round_trip.rs` — every command, event kind, entity, entity state and refusal round-tripped under its wire name,
   each table's coverage held by an exhaustive match; `FENCED_VERBS` held to the variants carrying `args.fence`; one
   `State` of every entity, with `fields`; frames from before the `fields` maps decode; a trivial `Store` and `Domain`

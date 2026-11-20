@@ -263,11 +263,6 @@ impl Feed {
         }
     }
 
-    /// When the feed dials next, while it is not connected.
-    pub fn retry_at(&self) -> Option<Instant> {
-        self.conn.is_none().then_some(self.retry_at)
-    }
-
     fn failed(&mut self, why: String) {
         self.silent = Some(why);
         self.retry_at = Instant::now() + self.backoff;
