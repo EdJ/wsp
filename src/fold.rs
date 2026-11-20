@@ -19,6 +19,24 @@
 //! | `order.*` | `manager/<host>.orders.json`, the newest per order (`order.acked` also `turns.json`) |
 //! | `beat` (with `HostFacts`) | `manager/<host>.beat.json` |
 //!
+//! **The orders machine's second reporter** (wsp-123). Under
+//! `orders::mode() == store` the fold applies the manager's answers to the
+//! orders machine beside the delivery worker (`crate::deliver`), under the
+//! worker's keys, so an answer both hear applies once, and one heard after a
+//! restart with no worker waiting on it still lands: `order.delivered` is
+//! `order.delivered` (`order:<id>:delivered`), `order.acked` is
+//! `order.acked { turn_began }` (`order:<id>:acked`), and `order.refused` is
+//! `order.refused { why, counts }`, `counts` false for compound-sup's `busy`,
+//! applied only while the order is `typed` (under the `deliver:<seat>` lease's
+//! token where one is held, the worker's own key). A `turn` that began on an
+//! order names it (wsp-032, kept as the seat's `order` in `turns.json`), and
+//! when that turn ends with the order `acknowledged` the fold applies
+//! `order.done` (`order:<id>:done`). An order the store does not hold (sent
+//! before the switch, or by a tell on the files path) goes to the files alone
+//! and is not mirrored, which the server refuses under `Owned`. Under `files`
+//! each `order.*` is mirrored as an `Order`, as before. `orders.json` is
+//! written in both modes.
+//!
 //! Nothing here asks the OS: no `ps`, no renderer, no `df`. The facts are the
 //! event's.
 //!
@@ -172,9 +190,11 @@ fn burn(store: &Store, seat: &str, f: impl FnOnce(&mut serde_json::Map<String, V
 
 /// `turns.json` with the seat's newest turn start, at `began_ms` (epoch ms) if
 /// that is newer than the one held; `None` makes the seat's entry and no more.
+/// The entry's other keys (its turn's `order`) stand.
 fn turned(state: &Path, host: &str, seat: &str, began_ms: Option<u64>) {
     let path = turns_path(state, host);
-    let held = read(&path)[seat]["began"].as_i64();
+    let entry = read(&path)[seat].clone();
+    let held = entry["began"].as_i64();
     let at = began_ms.map(|ms| (ms / 1000) as i64);
     let next = match (held, at) {
         (Some(h), Some(a)) => h.max(a),
@@ -182,8 +202,32 @@ fn turned(state: &Path, host: &str, seat: &str, began_ms: Option<u64>) {
         (None, a) => a.unwrap_or(0),
     };
     if held != Some(next) {
-        put(&path, seat, json!({ "began": next }));
+        let mut m = match entry {
+            Value::Object(m) => m,
+            _ => serde_json::Map::new(),
+        };
+        m.insert("began".into(), json!(next));
+        put(&path, seat, Value::Object(m));
     }
+}
+
+/// `turns.json`'s `order` for the seat: the order whose ack began its newest
+/// turn (wsp-032), or none when that turn began on no order.
+fn turn_order(state: &Path, host: &str, seat: &str, order: Option<&str>) {
+    let path = turns_path(state, host);
+    let entry = read(&path)[seat].clone();
+    if entry["order"].as_str() == order {
+        return;
+    }
+    let mut m = match entry {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    match order {
+        Some(o) => m.insert("order".into(), json!(o)),
+        None => m.remove("order"),
+    };
+    put(&path, seat, Value::Object(m));
 }
 
 /// Since when each of `seats` has been in its state, RFC 3339, as the fold
@@ -231,6 +275,13 @@ pub fn fold(store: &Store, host: &str, frame: &Frame) -> bool {
 /// are written and before `.folded` moves (wsp-075). Built from the event and
 /// from what `apply` just wrote, never from a probe.
 pub fn fold_into(store: &Store, db: Option<&SharedStore>, host: &str, frame: &Frame) -> bool {
+    fold_as(store, db, host, frame, crate::orders::mode())
+}
+
+/// [`fold_into`] under the orders mode `orders`: under `Store` an `order.*`
+/// is applied to the orders machine rather than mirrored, and a turn's end
+/// after its order's ack is `order.done` (wsp-123).
+fn fold_as(store: &Store, db: Option<&SharedStore>, host: &str, frame: &Frame, orders: crate::orders::Mode) -> bool {
     if let Message::Beat(b) = &frame.msg {
         if b.host.is_none() {
             return false;
@@ -248,8 +299,17 @@ pub fn fold_into(store: &Store, db: Option<&SharedStore>, host: &str, frame: &Fr
     }
     apply(store, host, &frame.msg);
     if let Some(db) = db {
-        if let Some(cmd) = mirror_of(store, db, host, &frame.msg) {
+        let owned = orders == crate::orders::Mode::Store;
+        let is_order = matches!(frame.msg, Message::OrderDelivered(_) | Message::OrderAcked(_) | Message::OrderRefused(_));
+        if owned && is_order {
+            answer(store, db, host, &frame.msg);
+        } else if let Some(cmd) = mirror_of(store, db, host, &frame.msg) {
             mirror_apply(store, db, host, &id.0.to_string(), cmd);
+        }
+        if let (true, Message::Turn(t)) = (owned, &frame.msg) {
+            if t.edge == TurnEdge::Ended {
+                done(store, db, host, &t.seat.0);
+            }
         }
     }
     let path = folded_path(&store.state, host);
@@ -275,6 +335,66 @@ fn mirror_apply(store: &Store, db: &SharedStore, host: &str, id: &str, cmd: Comm
     if let Err(e) = db.apply(cmd, IdempotencyKey(key), Principal::Manager(MachineName(host.to_string()))) {
         wsp_store::store::log_line(store, &format!("mirror: fold of {host} {id} not applied: {e:?}"));
     }
+}
+
+/// One of the orders machine's commands, applied as the manager `host`.
+fn machine_apply(store: &Store, db: &SharedStore, host: &str, cmd: Command, key: String) {
+    if let Err(e) = db.apply(cmd, IdempotencyKey(key.clone()), Principal::Manager(MachineName(host.to_string()))) {
+        wsp_store::store::log_line(store, &format!("orders: fold of {host} {key} not applied: {e:?}"));
+    }
+}
+
+/// The manager's answer to an order, applied to the orders machine under the
+/// delivery worker's keys. Nothing for an order the store does not hold: it
+/// went to the files alone.
+fn answer(store: &Store, db: &SharedStore, host: &str, msg: &Message) {
+    let order = match msg {
+        Message::OrderDelivered(o) => &o.order,
+        Message::OrderAcked(o) => &o.order,
+        Message::OrderRefused(o) => &o.order,
+        _ => return,
+    };
+    let id = c::OrderId(order.0.clone());
+    let Ok((state, _)) = db.snapshot() else { return };
+    let Some(held) = state.orders.get(&id) else { return };
+    let (cmd, key) = match msg {
+        Message::OrderDelivered(_) => (Command::OrderDelivered { order: id.clone() }, format!("order:{}:delivered", id.0)),
+        Message::OrderAcked(o) => {
+            (Command::OrderAcked { order: id.clone(), turn_began: CAt(o.turn_began.0) }, format!("order:{}:acked", id.0))
+        }
+        Message::OrderRefused(o) => {
+            // Answered already (by the worker, or by this fold before a
+            // restart): the order is queued again, or failed.
+            if held.state != OrderState::Typed {
+                return;
+            }
+            let why = serde_json::to_value(o.why).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            let counts = o.why != wsp_host_api::OrderFail::Busy;
+            // The worker keys a refusal by its lease's token; while it holds
+            // the lease this is its key, else the attempt it ends.
+            let tail = match state.leases.get(&c::LeaseName::deliver(&held.to)) {
+                Some(l) => l.token.0.to_string(),
+                None => format!("a{}", held.attempts),
+            };
+            (Command::OrderRefused { order: id.clone(), why, counts }, format!("order:{}:refused:{tail}", id.0))
+        }
+        _ => return,
+    };
+    machine_apply(store, db, host, cmd, key);
+}
+
+/// A turn ended at `seat`: the order whose ack began that turn, if the store
+/// holds it `acknowledged` at this seat, is `done`.
+fn done(store: &Store, db: &SharedStore, host: &str, seat: &str) {
+    let Some(order) = read(&turns_path(&store.state, host))[seat]["order"].as_str().map(str::to_string) else { return };
+    let id = c::OrderId(order);
+    let Ok((state, _)) = db.snapshot() else { return };
+    let Some(held) = state.orders.get(&id) else { return };
+    if held.state != OrderState::Acknowledged || held.to.0 != seat {
+        return;
+    }
+    let key = format!("order:{}:done", id.0);
+    machine_apply(store, db, host, Command::OrderDone { order: id }, key);
 }
 
 fn scalars(m: &serde_json::Map<String, Value>, keys: &[&str], into: &mut BTreeMap<String, String>) {
@@ -529,6 +649,9 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                 });
             }
             turned(state, host, seat, (t.edge == TurnEdge::Began).then_some(t.at.0));
+            if t.edge == TurnEdge::Began {
+                turn_order(state, host, seat, t.order.as_ref().map(|o| o.0.as_str()));
+            }
         }
         Message::SeatSaid(s) => say(store, &s.seat.0, |m| {
             m.insert("said".into(), json!(s.text));
@@ -1215,5 +1338,178 @@ mod mirror_tests {
         assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "it said something");
         store.end_spawned("cpd-d1", util::epoch_secs());
         assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-d1"]);
+    }
+}
+
+#[cfg(test)]
+mod orders_tests {
+    //! wsp-123: under `store` the fold is the orders machine's second reporter.
+    use super::*;
+    use crate::orders::tests::{db, ed, seat};
+    use crate::orders::Mode;
+    use wsp_host_api::{At, Epoch, OrderAcked, OrderDelivered, OrderFail, OrderId, OrderRefused, Turn};
+    use wsp_store_contract::{EventId as CEventId, EventKind, Fence, LeaseName, Leases, Subject};
+
+    fn frame(id: u64, msg: Message) -> Frame {
+        Frame { id: Some(EventId(id)), req: None, msg }
+    }
+
+    fn send(db: &SharedStore, to: &str) -> c::OrderId {
+        let cmd = Command::OrderSend { to: SeatId(to.into()), text: "do it".into(), first: false };
+        crate::orders::send_in(db, cmd, &ed()).unwrap()
+    }
+
+    /// `queued` → `typed`, as the worker does it, under its lease and key.
+    fn typed(db: &SharedStore, id: &c::OrderId, to: &str) {
+        let lease = LeaseName::deliver(&SeatId(to.into()));
+        let by = Principal::Wsp("wsp".into());
+        let t = db.take(&lease, &by, Duration::from_secs(60)).unwrap().unwrap();
+        let cmd = Command::OrderDeliver { order: id.clone(), fence: Fence { lease: lease.clone(), token: t } };
+        db.apply(cmd, IdempotencyKey(format!("order:{}:deliver:{}", id.0, t.0)), by).unwrap();
+        Leases::release(&**db, &lease, t).unwrap();
+    }
+
+    fn state(db: &SharedStore, id: &c::OrderId) -> c::Order {
+        db.snapshot().unwrap().0.orders[id].clone()
+    }
+
+    fn count(db: &SharedStore, id: &c::OrderId, kind: EventKind) -> usize {
+        db.events_after(CEventId(0), 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.subject == Subject::Order(id.clone()) && e.kind == kind)
+            .count()
+    }
+
+    fn hid(id: &c::OrderId) -> OrderId {
+        OrderId(id.0.clone())
+    }
+
+    fn delivered(id: &c::OrderId, to: &str) -> Message {
+        Message::OrderDelivered(OrderDelivered { order: hid(id), seat: wsp_host_api::SeatId(to.into()) })
+    }
+
+    fn acked(id: &c::OrderId, to: &str) -> Message {
+        Message::OrderAcked(OrderAcked { order: hid(id), seat: wsp_host_api::SeatId(to.into()), turn_began: At(500_000) })
+    }
+
+    fn turn(to: &str, edge: TurnEdge, order: Option<&c::OrderId>) -> Message {
+        Message::Turn(Turn { seat: wsp_host_api::SeatId(to.into()), epoch: Epoch(1), edge, at: At(500_000), order: order.map(hid) })
+    }
+
+    /// A manager's `order.acked` for a typed order moves it to `acknowledged`
+    /// once, and a new fold over the same file (a restart, `.folded` lost)
+    /// writes nothing more; `orders.json` is written as under `files`.
+    #[test]
+    fn a_managers_ack_moves_a_typed_order_to_acknowledged_once_across_a_restart() {
+        let env = util::isolated("fold-orders-ack");
+        let store = Store::open();
+        let dir = env.state().join("db");
+        let db = db(&dir, wsp_server::Mode::Owned);
+        seat(&db, "cpd-1", SeatState::Idle);
+        let id = send(&db, "cpd-1");
+        typed(&db, &id, "cpd-1");
+        assert!(fold_as(&store, Some(&db), "h", &frame(1, delivered(&id, "cpd-1")), Mode::Store));
+        assert!(fold_as(&store, Some(&db), "h", &frame(2, acked(&id, "cpd-1")), Mode::Store));
+        assert_eq!(state(&db, &id).state, OrderState::Acknowledged);
+        assert_eq!(count(&db, &id, EventKind::OrderAcknowledged), 1);
+        assert_eq!(read(&orders_path(&store.state, "h"))[&id.0]["acked"].as_u64(), Some(500_000));
+        let head = db.head().unwrap();
+        drop(db);
+
+        let db: SharedStore = Arc::new(
+            wsp_store_sqlite::SqliteStore::open(dir.join("state.db"), Arc::new(wsp_server::Composed::new(wsp_server::Mode::Owned)))
+                .unwrap(),
+        );
+        assert!(!fold_as(&store, Some(&db), "h", &frame(2, acked(&id, "cpd-1")), Mode::Store), ".folded keeps it once");
+        let _ = std::fs::remove_file(folded_path(&store.state, "h"));
+        fold_as(&store, Some(&db), "h", &frame(1, delivered(&id, "cpd-1")), Mode::Store);
+        fold_as(&store, Some(&db), "h", &frame(2, acked(&id, "cpd-1")), Mode::Store);
+        assert_eq!(db.head().unwrap(), head, "the same keys write nothing");
+        assert_eq!(count(&db, &id, EventKind::OrderAcknowledged), 1);
+    }
+
+    /// The worker heard the ack first: the fold's same answer is no second
+    /// `acknowledged`.
+    #[test]
+    fn an_ack_the_worker_applied_first_is_applied_once() {
+        let env = util::isolated("fold-orders-worker");
+        let store = Store::open();
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        seat(&db, "cpd-1", SeatState::Idle);
+        let id = send(&db, "cpd-1");
+        let mut w = crate::deliver::Worker::new(db.clone(), "wsp", Box::new(|_, _, _| Ok(crate::place::Delivery::Acked)));
+        assert_eq!(w.pass(), vec![id.clone()]);
+        assert_eq!(state(&db, &id).state, OrderState::Acknowledged);
+        let head = db.head().unwrap();
+        fold_as(&store, Some(&db), "h", &frame(1, delivered(&id, "cpd-1")), Mode::Store);
+        fold_as(&store, Some(&db), "h", &frame(2, acked(&id, "cpd-1")), Mode::Store);
+        assert_eq!(db.head().unwrap(), head);
+        assert_eq!(count(&db, &id, EventKind::OrderAcknowledged), 1);
+    }
+
+    /// The turn the ack began ends: `done`. A turn begun on another order, or
+    /// on none, ends: the acknowledged order stays so.
+    #[test]
+    fn a_turn_that_ends_after_its_orders_ack_is_done_and_another_turn_is_not() {
+        let env = util::isolated("fold-orders-done");
+        let store = Store::open();
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        seat(&db, "cpd-1", SeatState::Idle);
+        let a = send(&db, "cpd-1");
+        typed(&db, &a, "cpd-1");
+        let mut n = 0;
+        let mut fold = |msg: Message| {
+            n += 1;
+            fold_as(&store, Some(&db), "h", &frame(n, msg), Mode::Store)
+        };
+        fold(acked(&a, "cpd-1"));
+        fold(turn("cpd-1", TurnEdge::Began, None));
+        fold(turn("cpd-1", TurnEdge::Ended, None));
+        assert_eq!(state(&db, &a).state, OrderState::Acknowledged, "a turn on no order");
+        let other = c::OrderId("o-other".into());
+        fold(turn("cpd-1", TurnEdge::Began, Some(&other)));
+        fold(turn("cpd-1", TurnEdge::Ended, None));
+        assert_eq!(state(&db, &a).state, OrderState::Acknowledged, "a turn on another order");
+        fold(turn("cpd-1", TurnEdge::Began, Some(&a)));
+        assert_eq!(state(&db, &a).state, OrderState::Acknowledged, "still turning");
+        fold(turn("cpd-1", TurnEdge::Ended, None));
+        assert_eq!(state(&db, &a).state, OrderState::Done);
+        assert_eq!(count(&db, &a, EventKind::OrderDone), 1);
+    }
+
+    /// An order the store does not hold goes to the files alone: no `Order`
+    /// is mirrored, and nothing is refused.
+    #[test]
+    fn an_order_the_store_does_not_hold_is_written_to_the_files_only() {
+        let env = util::isolated("fold-orders-unheld");
+        let store = Store::open();
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        let id = c::OrderId("o-files".into());
+        let head = db.head().unwrap();
+        assert!(fold_as(&store, Some(&db), "h", &frame(1, acked(&id, "cpd-1")), Mode::Store));
+        assert_eq!(db.head().unwrap(), head);
+        assert!(db.snapshot().unwrap().0.orders.is_empty());
+        assert_eq!(read(&orders_path(&store.state, "h"))["o-files"]["acked"].as_u64(), Some(500_000));
+    }
+
+    /// compound-sup's `busy` is a refusal that counts nothing: the order is
+    /// queued again with no attempt spent, and a second hearing writes nothing.
+    #[test]
+    fn a_busy_refusal_counts_no_attempt() {
+        let env = util::isolated("fold-orders-busy");
+        let store = Store::open();
+        let db = db(&env.state().join("db"), wsp_server::Mode::Owned);
+        seat(&db, "cpd-1", SeatState::Idle);
+        let id = send(&db, "cpd-1");
+        typed(&db, &id, "cpd-1");
+        let busy = Message::OrderRefused(OrderRefused { order: hid(&id), seat: wsp_host_api::SeatId("cpd-1".into()), why: OrderFail::Busy });
+        fold_as(&store, Some(&db), "h", &frame(1, busy.clone()), Mode::Store);
+        let o = state(&db, &id);
+        assert_eq!((o.state, o.attempts, o.why.as_deref()), (OrderState::Queued, 0, Some("busy")));
+        let head = db.head().unwrap();
+        let _ = std::fs::remove_file(folded_path(&store.state, "h"));
+        fold_as(&store, Some(&db), "h", &frame(1, busy), Mode::Store);
+        assert_eq!(db.head().unwrap(), head);
     }
 }
