@@ -10,11 +10,18 @@
 //! first, then `gone`, each in the order given, and each against the state as
 //! the drafts before it leave it, so a subject put twice is written once and a
 //! subject put and then gone is written put, gone. An entity equal to what is
-//! there writes nothing, so a re-mirror of an unchanged store is silent. Every
+//! there writes nothing, so a re-mirror of an unchanged store is silent. A
+//! machine that differs from the one held only in its liveness (its `beat`
+//! and the [`LIVENESS`] facts: `last_seen` and the gauges a beat carries) is a
+//! heartbeat, not a change: it becomes a `machine.beat` carrying the whole
+//! [`Machine`] instead of a `mirror.put` (wsp-304), so a subscriber that wakes
+//! on entity events is not woken every beat, while the log keeps every beat in
+//! order and a resume replays them as it replays the rest. Every
 //! other verb is refused `illegal`, with the state `mirrored`: step 1's store
 //! owns nothing, so no machine's verb applies to it.
 //!
 //! **`evolve`** folds `mirror.put` (the entity replaces what its subject held),
+//! `machine.beat` (the machine replaces what its name held, as a put does),
 //! `mirror.gone` (what the subject names is removed), and the events the store
 //! writes itself (the `store` module's table in the contract): `lease.taken`
 //! puts its [`Lease`], `lease.released` removes it, `claim.taken` puts its
@@ -29,7 +36,8 @@
 
 use serde_json::Value;
 use wsp_store_contract::{
-    Claim, Command, Domain, Draft, Entity, Event, EventKind, Lease, Principal, ProjectId, Refusal, State, Subject,
+    Claim, Command, Domain, Draft, Entity, Event, EventKind, Lease, Machine, Principal, ProjectId, Refusal, State,
+    Subject,
 };
 
 /// The state a refused verb names: step 1's store owns nothing, it mirrors.
@@ -50,6 +58,36 @@ pub fn subject_of(entity: &Entity) -> Subject {
         Entity::Ask(a) => Subject::Ask(a.id.clone()),
         Entity::Machine(m) => Subject::Machine(m.name.clone()),
     }
+}
+
+/// A machine's facts that move with every beat and say nothing new of it:
+/// `last_seen` (`machines.json`, written by the tunnel supervisor) and the
+/// gauges a manager's beat carries (`HostFacts`: the load averages, swap and
+/// free memory, pageouts, HID idle, the speed limit and the disks' free
+/// bytes). What a beat carries that is a state — `memory` and `thermal`
+/// (banded), `cpus` — and every fact of the record (`reachable`, `ready`,
+/// `status`, `error`, ...) is not here: a change in one is a change.
+pub const LIVENESS: &[&str] = &[
+    "last_seen",
+    "load_centi",
+    "load5_centi",
+    "load15_centi",
+    "swap_used_bytes",
+    "free_memory_bytes",
+    "pageouts",
+    "hid_idle_secs",
+    "speed_limit_pct",
+    "disks",
+];
+
+/// Whether `now` differs from `held` only in its liveness: the same name and
+/// transport, and the same facts once the [`LIVENESS`] ones are set aside
+/// (its `beat` may be anything).
+pub fn beat_only(held: &Machine, now: &Machine) -> bool {
+    fn rest(m: &Machine) -> Vec<(&String, &String)> {
+        m.facts.iter().filter(|(k, _)| !LIVENESS.contains(&k.as_str())).collect()
+    }
+    held.name == now.name && held.transport == now.transport && rest(held) == rest(now)
 }
 
 /// What `state` holds at `subject`, as an entity; `None` when nothing, or when
@@ -186,9 +224,15 @@ impl Domain for Mirror {
             if now.as_ref() == Some(entity) {
                 continue;
             }
-            let payload = serde_json::to_value(entity)
-                .map_err(|e| Refusal::Invalid { reason: format!("an entity that does not serialize: {e}") })?;
-            drafts.push(Draft { kind: EventKind::MirrorPut, subject: subject.clone(), payload });
+            let (kind, payload) = match (&now, entity) {
+                (Some(Entity::Machine(held)), Entity::Machine(m)) if beat_only(held, m) => {
+                    (EventKind::MachineBeat, serde_json::to_value(m))
+                }
+                _ => (EventKind::MirrorPut, serde_json::to_value(entity)),
+            };
+            let payload =
+                payload.map_err(|e| Refusal::Invalid { reason: format!("an entity that does not serialize: {e}") })?;
+            drafts.push(Draft { kind, subject: subject.clone(), payload });
             touched.insert(subject, Some(entity.clone()));
         }
         for subject in gone {
@@ -211,6 +255,11 @@ impl Domain for Mirror {
             EventKind::MirrorPut => {
                 if let Ok(entity) = serde_json::from_value::<Entity>(p.clone()) {
                     put(&mut state, entity);
+                }
+            }
+            EventKind::MachineBeat => {
+                if let Ok(m) = serde_json::from_value::<Machine>(p.clone()) {
+                    state.machines.insert(m.name.clone(), m);
                 }
             }
             EventKind::MirrorGone => remove(&mut state, &event.subject),
@@ -368,5 +417,48 @@ mod tests {
         assert_eq!(s2, s);
         let s3 = Mirror.evolve(s.clone(), &ev(EventKind::TextSet, Subject::Row(RowId("r-1".into())), Value::Null));
         assert_eq!(s3, s);
+    }
+
+    fn machine(beat: u64, facts: &[(&str, &str)]) -> Machine {
+        Machine {
+            name: wsp_store_contract::MachineName("mb2".into()),
+            transport: wsp_store_contract::Transport::Tcp { addr: "mb2".into() },
+            beat: Some(At(beat)),
+            facts: facts.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    /// wsp-304: a heartbeat (the beat, `last_seen`, a beat's gauges) is a
+    /// `machine.beat` that still moves the state, and no `mirror.put`; a real
+    /// change of the machine, and a machine not held before, is a `mirror.put`.
+    #[test]
+    fn a_beat_only_machine_update_is_a_machine_beat_and_a_real_change_a_put() {
+        let first = machine(1, &[("reachable", "true"), ("last_seen", "10:00"), ("load_centi", "120")]);
+        let drafts = Mirror.decide(&State::default(), &mirror(vec![Entity::Machine(first.clone())], vec![]), &ed()).unwrap();
+        assert_eq!(drafts.iter().map(|d| d.kind).collect::<Vec<_>>(), vec![EventKind::MirrorPut], "a new machine is a put");
+        let state = fold(State::default(), drafts);
+
+        let beat = machine(2, &[("reachable", "true"), ("last_seen", "10:01"), ("load_centi", "340")]);
+        let drafts = Mirror.decide(&state, &mirror(vec![Entity::Machine(beat.clone())], vec![]), &ed()).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!((drafts[0].kind, &drafts[0].subject), (EventKind::MachineBeat, &Subject::Machine(beat.name.clone())));
+        assert!(drafts.iter().all(|d| d.kind != EventKind::MirrorPut), "a beat is no entity event");
+        assert_eq!(serde_json::from_value::<Machine>(drafts[0].payload.clone()).unwrap(), beat);
+        let state = fold(state, drafts);
+        assert_eq!(state.machines.get(&beat.name), Some(&beat), "the beat still moves the state");
+
+        let again = Mirror.decide(&state, &mirror(vec![Entity::Machine(beat.clone())], vec![]), &ed()).unwrap();
+        assert_eq!(again, vec![], "the same beat twice writes nothing");
+
+        let down = machine(3, &[("reachable", "false"), ("last_seen", "10:01"), ("load_centi", "340")]);
+        let drafts = Mirror.decide(&state, &mirror(vec![Entity::Machine(down.clone())], vec![]), &ed()).unwrap();
+        assert_eq!(drafts.iter().map(|d| d.kind).collect::<Vec<_>>(), vec![EventKind::MirrorPut], "a real change is a put");
+        let state = fold(state, drafts);
+        assert_eq!(state.machines.get(&down.name), Some(&down));
+
+        let mut moved = down.clone();
+        moved.transport = wsp_store_contract::Transport::Local;
+        let drafts = Mirror.decide(&state, &mirror(vec![Entity::Machine(moved)], vec![]), &ed()).unwrap();
+        assert_eq!(drafts[0].kind, EventKind::MirrorPut, "a transport change is a put");
     }
 }
