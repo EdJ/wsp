@@ -314,7 +314,14 @@ impl Manager {
         let mut port = cfg.port;
         for ip in &cfg.addrs {
             let addr = SocketAddr::new(*ip, port);
-            let l = TcpListener::bind(addr).map_err(|e| {
+            let l = match TcpListener::bind(addr) {
+                Err(e) if !ip.is_loopback() && e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    log.line(&format!("not on the tailnet: cannot bind {addr}: {e}; serving the other addresses"));
+                    continue;
+                }
+                bound => bound,
+            };
+            let l = l.map_err(|e| {
                 log.line(&format!("refused to start: cannot bind {addr}: {e}"));
                 if e.kind() == std::io::ErrorKind::AddrInUse {
                     StartError::Answered { addr, who: format!("the port is in use ({e})") }
@@ -579,6 +586,22 @@ mod tests {
         let out = "100.101.102.103\nfd7a:115c:a1e0::1234\n";
         assert_eq!(tailnet_addrs(out), vec!["100.101.102.103".parse::<IpAddr>().unwrap(), "fd7a:115c:a1e0::1234".parse().unwrap()]);
         assert!(tailnet_addrs("no tailscale here\n").is_empty());
+    }
+
+    #[test]
+    fn a_tailnet_address_this_machine_does_not_hold_is_skipped_and_loopback_still_serves() {
+        let dir = std::env::temp_dir().join(format!("wsp-manager-unheld-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut cfg = Config::new(&dir, "t");
+        let unheld: IpAddr = "100.127.255.254".parse().unwrap();
+        cfg.addrs = vec![IpAddr::V4(Ipv4Addr::LOCALHOST), unheld];
+        cfg.port = 0;
+        let manager = Manager::start(cfg).expect("loopback serves when a tailnet address cannot be bound");
+        assert!(manager.addrs().iter().all(|a| a.ip().is_loopback()), "only loopback is bound: {:?}", manager.addrs());
+        let log = fs::read_to_string(dir.join(LOG_DIR).join(log::FILE)).unwrap();
+        assert!(log.contains("not on the tailnet") && log.contains(&unheld.to_string()), "the skip is logged: {log}");
+        manager.stop();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
