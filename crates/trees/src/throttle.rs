@@ -72,7 +72,7 @@ use serde_json::{json, Value};
 
 use crate::store::Store;
 use crate::host::LOCAL;
-use crate::host::{HostDir, HostId, JobAt, JobClass, JobError, JobKey, JobRow, JobRun, JobState};
+use crate::host::{HostId, JobAt, JobClass, JobError, JobKey, JobRow, JobRun, JobState};
 use wsp_host_api::{HostFacts, Thermal};
 use crate::util;
 use crate::base::args::Args;
@@ -1527,15 +1527,6 @@ extern "C" fn on_interrupt(_: i32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// The relative place of `cwd` under `root`, `/` between its parts.
-fn place_under(cwd: &Path, root: &Path) -> Option<String> {
-    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let rel = cwd.strip_prefix(&root).ok()?;
-    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-    Some(if parts.is_empty() { ".".to_string() } else { parts.join("/") })
-}
-
 /// One `job.run` of `argv` at the shim's cwd on this host, its output to
 /// [`Jobs::out`] as it comes, ^C turned into `job.stop`, and the shim's exit
 /// the job's: its exit status (a tool's signal is the shell's 128+n), 130 for
@@ -1544,7 +1535,7 @@ fn place_under(cwd: &Path, root: &Path) -> Option<String> {
 /// queued, not failed; any other refusal, and a silent manager, run nothing
 /// here instead.
 fn as_job(ctx: &Ctx, j: &Jobs, key: JobKey, class: JobClass, argv: Vec<String>, holds: &[Hold]) -> i32 {
-    let Some(path) = place_under(&ctx.cwd, &j.tree_root) else {
+    let Some(at) = crate::job_place::dir_under(&j.on, &ctx.cwd, &j.tree_root) else {
         (ctx.say)(&format!(
             "wsp: {} is not under the manager's tree root {}, so the build cannot run as its job (WSP_JOBS=manager)",
             ctx.cwd.display(),
@@ -1556,7 +1547,7 @@ fn as_job(ctx: &Ctx, j: &Jobs, key: JobKey, class: JobClass, argv: Vec<String>, 
         key: key.clone(),
         class,
         argv,
-        at: JobAt::Dir(HostDir { host: j.on.clone(), path }),
+        at: JobAt::Dir(at),
         timeout_secs: JOB_TIMEOUT_SECS,
         hung_after_secs: None,
         detach: false,

@@ -282,7 +282,7 @@ impl<'a> Jobs<'a> {
         wsp_wire::host::job_key(&self.run.row, self.run.attempt, &format!("verify:{what}:{n}@{}", self.run.mark))
     }
 
-    /// The host's job table, as [`sharing::Live::Jobs`] reads it: the rows
+    /// The host's job table, as [`sharing::Live`] reads it: the rows
     /// of the host this run's jobs go to, `None` for any other host or a table
     /// that could not be read.
     fn table(&self, host: &str) -> Option<Vec<sharing::Seen>> {
@@ -416,7 +416,7 @@ impl Jobs<'_> {
     /// How a warm lock's holder is asked whether it is still there: by the
     /// job table of the host the run's jobs go to.
     fn live<'s>(&'s self, table: &'s dyn Fn(&str) -> Option<Vec<sharing::Seen>>) -> sharing::Live<'s> {
-        sharing::Live::Jobs { me: &self.run, table }
+        sharing::Live { me: &self.run, table }
     }
 }
 use crate::store::Store;
@@ -1980,13 +1980,15 @@ bench::b: benchmark
         Jobs::new(host, run)
     }
 
-    /// Whether `pid` runs, for the warm-tree tests' locks.
-    fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
+    /// The warm-tree tests' run, on host `h` with no job yet: a lock it takes
+    /// is held through the setup grace and freed when it lets go.
+    fn live() -> sharing::Live<'static> {
+        fn no_jobs(_: &str) -> Option<Vec<sharing::Seen>> {
+            Some(Vec::new())
         }
-        // SAFETY: signal 0 only asks.
-        pids.iter().copied().filter(|p| unsafe { kill(*p as i32, 0) } == 0).collect()
+        static ME: std::sync::OnceLock<sharing::Run> = std::sync::OnceLock::new();
+        let me = ME.get_or_init(|| sharing::Run { host: "h".into(), row: "t".into(), attempt: 0, mark: "m".into() });
+        sharing::Live { me, table: &no_jobs }
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
@@ -2478,7 +2480,7 @@ bench::b: benchmark
         let dir = scratch_dir("foresee-warm");
         repo(&dir);
         let store = Store::at(dir.join("store"), dir.join("state"));
-        let warm = store.state.join("warm");
+        let warm = store.state.join("warm").join("h");
         let named = util::slugify(dir.file_name().unwrap().to_str().unwrap());
         std::fs::create_dir_all(&warm).unwrap();
         for slot in [0, 1] {
@@ -2489,7 +2491,7 @@ bench::b: benchmark
         assert!(!warm.join(format!("{named}-2")).exists());
 
         let said: Vec<String> =
-            free_warm(&store, sharing::Live::Pids(&alive), &dir, Path::new("/nowhere"), true).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, Path::new("/nowhere"), true).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(said.len(), 2, "a slot nothing has built in was named as a tree: {said:?}");
         assert!(warm.join(format!("{named}-0")).exists(), "a dry run removed a warm tree");
         assert!(warm.join(format!("{named}-1")).exists(), "a dry run removed a warm tree");
@@ -2497,7 +2499,7 @@ bench::b: benchmark
         // The claims are dropped with the `Warm`s above, so the removal can
         // take them: a preview that held its locks past the line it printed
         // would make the next real `--rm` a no-op.
-        let did = clear_warm(&store, sharing::Live::Pids(&alive), &dir, &dir, Path::new("/nowhere"), true);
+        let did = clear_warm(&store, live(), &dir, &dir, Path::new("/nowhere"), true);
         assert_eq!(did, said.len(), "the removal disagreed with the preview");
         assert!(!warm.join(format!("{named}-0")).exists(), "the tree the preview named was left standing");
         assert!(!warm.join(format!("{named}-1")).exists(), "the tree the preview named was left standing");
@@ -2511,8 +2513,8 @@ bench::b: benchmark
     /// The old shape computed the narrow answer first, unconditionally: it
     /// claimed the tree the last build wrote down, *held that claim*, and then
     /// under `--all` asked [`crate::sharing::warm_each`] for every free tree.
-    /// The lock it was still holding is a lock, and the pid inside it is this
-    /// process, which `ps` reports as alive — so the claim it had just taken
+    /// The lock it was still holding is a lock, and the run inside it is this
+    /// one, which reads as alive — so the claim it had just taken
     /// made its own tree read as busy, and the widest removal in wsp left
     /// standing the one tree the caller most certainly meant.
     ///
@@ -2523,7 +2525,7 @@ bench::b: benchmark
     fn rm_all_takes_the_tree_the_caller_last_built_in_and_not_only_the_others() {
         let dir = scratch_dir("foresee-mine");
         let store = Store::at(dir.join("store"), dir.join("state"));
-        let warm = store.state.join("warm");
+        let warm = store.state.join("warm").join("h");
         let named = util::slugify(dir.file_name().unwrap().to_str().unwrap());
         for slot in [0, 1, 2] {
             std::fs::create_dir_all(warm.join(format!("{named}-{slot}")).join("tree")).unwrap();
@@ -2539,21 +2541,21 @@ bench::b: benchmark
         .unwrap();
 
         let narrow: Vec<String> =
-            free_warm(&store, sharing::Live::Pids(&alive), &dir, &scratch, false).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, &scratch, false).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(narrow.len(), 1, "the pointer did not name one tree: {narrow:?}");
 
         // The mechanism, reproduced rather than argued: hold the narrow claim
         // across the wide question, which is exactly what the old shape did to
         // itself, and the wide answer comes back short of the tree being held.
-        let held = free_warm(&store, sharing::Live::Pids(&alive), &dir, &scratch, false);
+        let held = free_warm(&store, live(), &dir, &scratch, false);
         let while_held: Vec<String> =
-            free_warm(&store, sharing::Live::Pids(&alive), &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(while_held.len(), 2, "a held claim did not take its slot out of the wide answer");
         assert!(!while_held.contains(&narrow[0]), "the held tree was claimed twice at once");
         drop(held);
 
         let wide: Vec<String> =
-            free_warm(&store, sharing::Live::Pids(&alive), &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(wide.len(), 3, "--all did not reach every free tree: {wide:?}");
         assert!(
             wide.contains(&narrow[0]),
@@ -2875,8 +2877,8 @@ mod jobs_tests {
         let jobs_b = Jobs::new(tcp, b.clone());
         let table_a = |h: &str| jobs_a.table(h);
         let table_b = |h: &str| jobs_b.table(h);
-        let live_a = sharing::Live::Jobs { me: &a, table: &table_a };
-        let live_b = sharing::Live::Jobs { me: &b, table: &table_b };
+        let live_a = sharing::Live { me: &a, table: &table_a };
+        let live_b = sharing::Live { me: &b, table: &table_b };
 
         let warm = sharing::warm(&place.state(), &repo, 1, live_a).expect("a free tree");
         assert!(warm.dir.starts_with(place.state().join("warm").join(crate::util::slugify(&host()))), "warm trees are per host: {:?}", warm.dir);

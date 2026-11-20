@@ -9,6 +9,7 @@ pub mod decisions;
 pub mod governors;
 pub mod agent_kind;
 pub mod lapse;
+pub mod lease;
 pub mod log;
 pub mod message;
 pub mod model;

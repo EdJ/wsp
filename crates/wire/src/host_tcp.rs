@@ -951,9 +951,6 @@ impl Host for Tcp {
     fn answers(&self, socket: &Path) -> bool {
         self.local.answers(socket)
     }
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.local.started(pid)
-    }
     fn shells(&self) -> Option<String> {
         self.local.shells()
     }
@@ -971,9 +968,6 @@ impl Host for Tcp {
     }
     fn signal_group(&self, group: u32, sig: &str) {
         self.local.signal_group(group, sig)
-    }
-    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
-        self.local.cwds(pids)
     }
 
     // ---- seat.read

@@ -393,8 +393,9 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
         log_line(store, &format!("{list} group {at}: the barrier's run was asked for and nothing is waiting on it"));
         return 0;
     }
-    // Who is making the run, so that being killed is seen and not waited out.
-    barrier::note_pid(store, list, at);
+    // Who is making the run, and the lease it beats until it returns, so that
+    // being killed is seen and not waited out.
+    let _lease = barrier::note_run_lease(store, list, at);
     // A run that builds waits while the disk is nearly full (`wsp-373`) rather
     // than failing partway; it says so once and goes on when room appears.
     if let Some(repo) = repo_of(store, &w.project.clone().unwrap_or_default()) {
@@ -559,7 +560,8 @@ pub(crate) fn run(store: &Store, list: &str, at: usize) -> i32 {
 /// Whether a live run holds the tree lock of one of group `at`'s units: a run
 /// in its steps, or writing its result. Under `WSP_JOBS=manager` the lock names
 /// the job running in the tree and is read by key from the job table of the
-/// tree's host's manager ([`check::TreeLock::live`]); in-process, by its pid.
+/// tree's host's manager ([`check::TreeLock::live`]); in-process, by the
+/// lock's own lease, which its holder beats.
 pub(crate) fn lock_held(store: &Store, w: &Worklist, at: usize) -> bool {
     plan(store, w, at).units.iter().any(|u| check::TreeLock::live(&check::barrier_dir(store, &u.project, &u.repo).join("lock")))
 }
@@ -872,24 +874,22 @@ mod tests {
         assert_eq!(ran[0].1, Done::Failed { exit: None, timed_out: true }, "{ran:?}");
     }
 
-    /// The call log of a whole barrier run under `manager` holds no `ps`,
-    /// `kill` or `lstart` from wsp (nor any `lsof`: the run reads no process's
-    /// working directory): the steps, their bounds and the lock are the
-    /// manager's and its job table's. Under `inproc` they are `wsp-host`'s
-    /// runner's in this process, and wsp probes nothing either (wsp-057).
+    /// A whole barrier run under `manager` leaves the steps, their bounds and
+    /// the lock to the manager and its job table; under `inproc` they are
+    /// `wsp-host`'s runner's in this process. wsp has no process probe left to
+    /// make (wsp-057: the lock and the run are leases, and
+    /// `tests/host_seam.rs` fails a spawn outside a job).
     #[test]
     fn a_barrier_run_under_manager_probes_no_process_from_wsp() {
         let (env, store) = world("probes", "exit 1\n", "");
         let w = store.worklist("run").unwrap();
         assert!(barrier::open_within(&store, &w, 1, Some("abc".into()), None, barrier::Mechanical::Yes, &|_: &str| false, &|| true).is_some());
-        check::PROBES.with(|p| p.borrow_mut().clear());
         assert_eq!(under_manager(&store, |_| run(&store, "run", 1)), 0);
         assert_eq!(barrier::suite_of(&store, "run", 1), Some(Suite::Red));
-        assert_eq!(check::PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "wsp probed a process under manager");
         drop((store, env));
         let (_b, here) = world("probes-inproc", "exit 1\n", "");
-        run_unit(&here, &plan(&here, &here.worklist("run").unwrap(), 1).units[0], "barrier run 1");
-        assert_eq!(check::PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "inproc runs jobs too, and probes nothing (wsp-057)");
+        let ranged = run_unit(&here, &plan(&here, &here.worklist("run").unwrap(), 1).units[0], "barrier run 1");
+        assert!(matches!(ranged, Ranged::Ran(_)), "inproc runs jobs too (wsp-057)");
     }
 
     fn step(name: &str, command: &str) -> Step {

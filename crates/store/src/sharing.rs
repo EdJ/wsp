@@ -93,16 +93,10 @@
 //! the contention was handing a child process the 20ms it needed. Rescheduling
 //! the tests quietly would move that ground while other tasks stand on it.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use wsp_base::calls::Command;
 
-/// Which of these pids are running: the host's answer (`wire::host::Host::alive`),
-/// passed in because this layer sits below the host and asks it nothing itself.
-/// A host that cannot tell keeps every pid, so a failed read reaps no claim.
-pub type Alive<'a> = &'a dyn Fn(&[u32]) -> BTreeSet<u32>;
-
-/// One `wsp verify` run under `WSP_JOBS=manager` (wsp-054): the host its jobs
+/// One `wsp verify` run (wsp-054; under both `WSP_JOBS` choices since wsp-057): the host its jobs
 /// run on, and the row, attempt and mark every one of its job keys carries
 /// (`verify:<what>:<n>@<mark>`). It is what a warm lock and a build's
 /// registration name in place of a pid, so whether its holder is still there
@@ -148,8 +142,7 @@ pub struct Seen {
 }
 
 /// A host's job table, asked by host id: `None` when it could not be read,
-/// and then every holder on that host is kept, as a failed pid read keeps
-/// every pid.
+/// and then every holder on that host is kept.
 pub type Table<'a> = &'a dyn Fn(&str) -> Option<Vec<Seen>>;
 
 /// How long a run's claim is held with no job of its own running: the setup
@@ -162,28 +155,24 @@ pub type Table<'a> = &'a dyn Fn(&str) -> Option<Vec<Seen>>;
 /// it ran anything.
 pub const SETUP_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Older than this, a holder of the *other* choice's kind is dead whatever it
-/// says: a pid lock read under `manager`, or a run's lock read under `inproc`,
-/// which neither can ask about. The same day [`live_slots`] already allows.
+/// Older than this, a holder that names no run is dead whatever it says: a pid
+/// lock an older wsp left, which nothing asks about since wsp-057. The same
+/// day [`live_slots`] already allows.
 const STALE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// How a lock's holder is asked whether it is still there.
+/// How a lock's holder is asked whether it is still there: the lock holds
+/// `me`, and a holder is read from its host's job table (wsp-057: no pid is
+/// asked, under either `WSP_JOBS` choice).
 #[derive(Clone, Copy)]
-pub enum Live<'a> {
-    /// `WSP_JOBS=inproc`: the lock holds this process's pid, asked of the host.
-    Pids(Alive<'a>),
-    /// `WSP_JOBS=manager`: the lock holds `me`, and a holder is read from its
-    /// host's job table.
-    Jobs { me: &'a Run, table: Table<'a> },
+pub struct Live<'a> {
+    pub me: &'a Run,
+    pub table: Table<'a>,
 }
 
 impl Live<'_> {
     /// What this process writes into a lock it takes.
     fn mine(&self) -> String {
-        match self {
-            Live::Pids(_) => std::process::id().to_string(),
-            Live::Jobs { me, .. } => me.line(),
-        }
+        self.me.line()
     }
 
     /// Whether the holder `text` names, its file last touched at `touched`, is
@@ -191,22 +180,18 @@ impl Live<'_> {
     fn holds(&self, text: &str, touched: Option<std::time::SystemTime>) -> bool {
         let age = touched.and_then(|t| t.elapsed().ok());
         let pid: Option<u32> = text.lines().next().and_then(|l| l.trim().parse().ok());
-        match (self, pid, Run::parse(text)) {
-            (Live::Pids(alive), Some(pid), _) => alive(&[pid]).contains(&pid),
-            (Live::Jobs { table, .. }, None, Some(run)) => run_holds(&run, touched, table),
-            // The other choice's holder, or nothing readable: kept until a day
-            // old, because nothing here can ask it.
-            _ => age.is_some_and(|a| a < STALE) && (pid.is_some() || Run::parse(text).is_some()),
+        match (pid, Run::parse(text)) {
+            (None, Some(run)) => run_holds(&run, touched, self.table),
+            // A pid an older wsp wrote: kept until a day old, because nothing
+            // here asks a pid.
+            (Some(_), _) => age.is_some_and(|a| a < STALE),
+            (None, None) => false,
         }
     }
 
-    /// Where this choice keeps its warm trees: one pool per host under
-    /// `manager` (6.2, "M3 under T2"), the machine's one under `inproc`.
+    /// Where the warm trees are kept: one pool per host (6.2, "M3 under T2").
     fn warm_root(&self, state: &Path) -> PathBuf {
-        match self {
-            Live::Pids(_) => state.join("warm"),
-            Live::Jobs { me, .. } => state.join("warm").join(crate::util::slugify(&me.host)),
-        }
+        state.join("warm").join(crate::util::slugify(&self.me.host))
     }
 }
 
@@ -393,9 +378,9 @@ impl Drop for Share {
 
 /// Register this build and work out what it may take.
 ///
-/// The registration is a file named for the pid, which is what lets a build
+/// The registration is a file named for the run, which is what lets a build
 /// killed with `-9` be cleaned up by the next one: nothing is left to run a
-/// release step, so liveness has to be readable from outside.
+/// release step, so liveness is read from its host's job table.
 ///
 /// Under the state directory rather than some machine-wide path, which is the
 /// bargain every other machine-local fact wsp keeps makes. It costs a `wsp
@@ -405,14 +390,10 @@ pub fn take(state: &Path, live: Live) -> Share {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let dir = state.join("building");
     let _ = std::fs::create_dir_all(&dir);
-    // Under `inproc` the file's name is what matters, a pid; what is in it is
-    // for whoever is standing in `~/.local/state/wsp/building` wondering what
-    // these are. Under `manager` it is named for the run and says which run it
-    // is, which its host's job table answers for.
-    let (slot, body) = match live {
-        Live::Pids(_) => (dir.join(std::process::id().to_string()), String::new()),
-        Live::Jobs { me, .. } => (dir.join(format!("run-{}", crate::util::slugify(&me.mark))), format!("{}\n", me.line())),
-    };
+    // Named for the run and saying which run it is, which its host's job
+    // table answers for.
+    let slot = dir.join(format!("run-{}", crate::util::slugify(&live.me.mark)));
+    let body = format!("{}\n", live.me.line());
     let ok = std::fs::write(&slot, format!("started {}\n{body}", crate::util::now_iso())).is_ok();
     // Counted after registering, so this build is in the count. Two builds
     // starting at the same instant both see two and both take half, which is
@@ -520,17 +501,8 @@ fn live_slots(dir: &Path, live: Live) -> usize {
         }
     }
     let mut n = 0;
-    // The pids in one question, as before: the host is asked once a call.
-    let running = match live {
-        Live::Pids(alive) => Some(alive(&pids.iter().map(|(p, _)| *p).collect::<Vec<_>>())),
-        Live::Jobs { .. } => None,
-    };
     for (pid, path) in pids {
-        let held = match &running {
-            Some(set) => set.contains(&pid),
-            None => live.holds(&pid.to_string(), touched(&path)),
-        };
-        if held {
+        if live.holds(&pid.to_string(), touched(&path)) {
             n += 1;
         } else {
             let _ = std::fs::remove_file(&path);
@@ -553,15 +525,16 @@ mod tests {
 
     /// Everything is alive, which is the ordinary case and the one a test of
     /// the claim itself wants out of the way.
-    fn all(pids: &[u32]) -> BTreeSet<u32> {
-        pids.iter().copied().collect()
+    fn no_jobs(_: &str) -> Option<Vec<Seen>> {
+        Some(Vec::new())
     }
 
-    fn none(_: &[u32]) -> BTreeSet<u32> {
-        BTreeSet::new()
+    /// A run of its own with no job yet: what it locks is held through the
+    /// setup grace and freed when it lets go.
+    fn me() -> Live<'static> {
+        static ME: std::sync::OnceLock<Run> = std::sync::OnceLock::new();
+        Live { me: ME.get_or_init(|| run("me")), table: &no_jobs }
     }
-
-    const ALL: Live<'static> = Live::Pids(&all);
 
     #[test]
     fn one_build_alone_takes_the_whole_machine() {
@@ -595,15 +568,16 @@ mod tests {
     }
 
     #[test]
-    fn a_registration_whose_process_has_gone_is_removed_rather_than_counted() {
-        let iso = crate::util::isolated("sharing-dead");
+    fn a_pid_registration_an_older_wsp_left_counts_until_a_day_old_and_is_never_asked() {
+        let iso = crate::util::isolated("sharing-pids");
         let dir = iso.path("building");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("101"), "").unwrap();
         std::fs::write(dir.join("102"), "").unwrap();
-        let live = live_slots(&dir, Live::Pids(&|_: &[u32]| BTreeSet::from([101])));
-        assert_eq!(live, 1, "only the live pid counts");
-        assert!(!dir.join("102").exists(), "the dead one is cleaned up, not left to be recounted");
+        backdate(&dir.join("102"), STALE + std::time::Duration::from_secs(5));
+        let asked = |_: &str| -> Option<Vec<Seen>> { panic!("a pid was asked of a job table") };
+        assert_eq!(live_slots(&dir, Live { me: &run("c"), table: &asked }), 1, "only the day-young one counts");
+        assert!(!dir.join("102").exists(), "the old one is cleaned up, not left to be recounted");
         assert!(dir.join("101").exists());
     }
 
@@ -613,7 +587,7 @@ mod tests {
         let dir = iso.path("building");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.txt"), "").unwrap();
-        assert_eq!(live_slots(&dir, Live::Pids(&none)), 0);
+        assert_eq!(live_slots(&dir, me()), 0);
         assert!(dir.join("notes.txt").exists(), "somebody else's file is left where it was");
     }
 
@@ -621,14 +595,14 @@ mod tests {
     fn taking_a_share_registers_this_build_and_releases_it_on_drop() {
         let iso = crate::util::isolated("sharing-slot");
         let state = iso.state();
-        let slot = state.join("building").join(std::process::id().to_string());
+        let slot = state.join("building").join("run-me");
         // No job count in the environment, or this measures whoever ran the
         // suite rather than the budget. `isolated` holds the environment lock,
         // so no other test can be looking while it is unset.
         let asked = std::env::var_os("CARGO_BUILD_JOBS");
         std::env::remove_var("CARGO_BUILD_JOBS");
         {
-            let share = take(&state, ALL);
+            let share = take(&state, me());
             assert!(slot.exists(), "a running build is visible to the next one");
             assert!(share.live >= 1 && share.jobs >= 1);
             assert!(share.jobs <= share.cores);
@@ -657,8 +631,8 @@ mod tests {
     fn two_builds_in_one_repository_get_a_warm_tree_each() {
         let iso = crate::util::isolated("warm-two");
         let root = iso.path("warm");
-        let first = claim(&root, "wsp", 3, ALL).unwrap();
-        let second = claim(&root, "wsp", 3, ALL).unwrap();
+        let first = claim(&root, "wsp", 3, me()).unwrap();
+        let second = claim(&root, "wsp", 3, me()).unwrap();
         assert_ne!(first.dir, second.dir, "one tree cannot hold two builds");
         assert!(first.target().starts_with(&first.dir));
     }
@@ -667,10 +641,10 @@ mod tests {
     fn a_build_beyond_the_last_warm_tree_is_told_no_rather_than_made_to_wait() {
         let iso = crate::util::isolated("warm-full");
         let root = iso.path("warm");
-        let held: Vec<Warm> = (0..2).filter_map(|_| claim(&root, "wsp", 2, ALL)).collect();
+        let held: Vec<Warm> = (0..2).filter_map(|_| claim(&root, "wsp", 2, me())).collect();
         assert_eq!(held.len(), 2);
         assert!(
-            claim(&root, "wsp", 2, ALL).is_none(),
+            claim(&root, "wsp", 2, me()).is_none(),
             "the third build takes the private cold tree it would have had anyway"
         );
     }
@@ -679,31 +653,9 @@ mod tests {
     fn a_tree_is_free_again_when_the_build_holding_it_finishes() {
         let iso = crate::util::isolated("warm-release");
         let root = iso.path("warm");
-        let dir = claim(&root, "wsp", 1, ALL).unwrap().dir.clone();
-        let again = claim(&root, "wsp", 1, ALL).expect("released on drop");
+        let dir = claim(&root, "wsp", 1, me()).unwrap().dir.clone();
+        let again = claim(&root, "wsp", 1, me()).expect("released on drop");
         assert_eq!(again.dir, dir, "and it is the same tree, which is the point of it");
-    }
-
-    #[test]
-    fn a_tree_locked_by_a_build_that_died_is_taken_back() {
-        let iso = crate::util::isolated("warm-dead");
-        let root = iso.path("warm");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("wsp-0.lock"), "424242\n").unwrap();
-        let got = claim(&root, "wsp", 1, Live::Pids(&none)).expect("a dead lock is not a holder");
-        assert!(got.dir.ends_with("wsp-0"));
-    }
-
-    #[test]
-    fn a_tree_locked_by_a_build_that_is_still_running_is_left_alone() {
-        let iso = crate::util::isolated("warm-held");
-        let root = iso.path("warm");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("wsp-0.lock"), "424242\n").unwrap();
-        assert!(
-            claim(&root, "wsp", 1, Live::Pids(&|_: &[u32]| BTreeSet::from([424242]))).is_none(),
-            "somebody else is building in it"
-        );
     }
 
     #[test]
@@ -711,32 +663,32 @@ mod tests {
         let iso = crate::util::isolated("warm-named");
         let root = iso.path("warm");
         let dir = {
-            let held = claim(&root, "wsp", 3, ALL).unwrap();
+            let held = claim(&root, "wsp", 3, me()).unwrap();
             held.dir.clone()
         };
-        let again = warm_named(&dir, ALL).expect("the pointer names a free tree");
+        let again = warm_named(&dir, me()).expect("the pointer names a free tree");
         assert_eq!(again.dir, dir);
-        assert!(warm_named(&dir, ALL).is_none(), "and it is held while somebody holds it");
+        assert!(warm_named(&dir, me()).is_none(), "and it is held while somebody holds it");
     }
 
     #[test]
     fn a_pointer_at_something_that_is_not_a_warm_tree_names_nothing() {
         let iso = crate::util::isolated("warm-nonsense");
-        assert!(warm_named(&iso.path("warm/wsp-nine"), ALL).is_none(), "no slot number in it");
-        assert!(warm_named(&iso.path("warm"), ALL).is_none());
+        assert!(warm_named(&iso.path("warm/wsp-nine"), me()).is_none(), "no slot number in it");
+        assert!(warm_named(&iso.path("warm"), me()).is_none());
     }
 
     #[test]
     fn two_repositories_do_not_take_each_others_trees() {
         let iso = crate::util::isolated("warm-repos");
         let root = iso.path("warm");
-        let mine = claim(&root, "wsp", 1, ALL).unwrap();
-        let theirs = claim(&root, "backend", 1, ALL).unwrap();
+        let mine = claim(&root, "wsp", 1, me()).unwrap();
+        let theirs = claim(&root, "backend", 1, me()).unwrap();
         assert_ne!(mine.dir, theirs.dir, "a tree warm for one crate is cold for another");
     }
 
-    // ---- under `WSP_JOBS=manager` (wsp-054): a holder is a run, read from
-    // its host's job table, never a pid.
+    // ---- a holder is a run, read from its host's job table, never a pid
+    // (wsp-054; under both `WSP_JOBS` choices since wsp-057).
 
     fn run(mark: &str) -> Run {
         Run { host: "h".into(), row: "wsp-054".into(), attempt: 0, mark: mark.into() }
@@ -772,17 +724,17 @@ mod tests {
         let (a, b) = (run("a"), run("b"));
         let rows: std::cell::RefCell<Vec<Seen>> = Default::default();
         let table = |_: &str| Some(rows.borrow().clone());
-        let held = claim(&root, "wsp", 1, Live::Jobs { me: &a, table: &table }).unwrap();
+        let held = claim(&root, "wsp", 1, Live { me: &a, table: &table }).unwrap();
         assert!(std::fs::read_to_string(root.join("wsp-0.lock")).unwrap().contains("\ta"), "the lock names the run");
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &table }).is_none(), "held through setup");
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &table }).is_none(), "held through setup");
 
         *rows.borrow_mut() = vec![seen("verify:cargo-test:0@a", now(), true)];
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &table }).is_none(), "held while it builds");
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &table }).is_none(), "held while it builds");
 
         // Killed: the job ended and nothing removed the lock.
         *rows.borrow_mut() = vec![seen("verify:cargo-test:0@a", now(), false)];
         std::mem::forget(held);
-        let got = claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &table }).expect("free by the table");
+        let got = claim(&root, "wsp", 1, Live { me: &b, table: &table }).expect("free by the table");
         assert!(got.touch(), "the new run holds it");
     }
 
@@ -792,10 +744,10 @@ mod tests {
         let root = iso.path("warm");
         let (a, b) = (run("a"), run("b"));
         let empty = |_: &str| Some(Vec::new());
-        std::mem::forget(claim(&root, "wsp", 1, Live::Jobs { me: &a, table: &empty }).unwrap());
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &empty }).is_none());
+        std::mem::forget(claim(&root, "wsp", 1, Live { me: &a, table: &empty }).unwrap());
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &empty }).is_none());
         backdate(&root.join("wsp-0.lock"), SETUP_GRACE + std::time::Duration::from_secs(5));
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &empty }).is_some(), "past the grace with no job");
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &empty }).is_some(), "past the grace with no job");
     }
 
     #[test]
@@ -804,13 +756,13 @@ mod tests {
         let root = iso.path("warm");
         let (a, b) = (run("a"), run("b"));
         let silent = |_: &str| None;
-        std::mem::forget(claim(&root, "wsp", 1, Live::Jobs { me: &a, table: &silent }).unwrap());
+        std::mem::forget(claim(&root, "wsp", 1, Live { me: &a, table: &silent }).unwrap());
         backdate(&root.join("wsp-0.lock"), SETUP_GRACE * 2);
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &silent }).is_none(), "silence is not a dead run");
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &silent }).is_none(), "silence is not a dead run");
     }
 
     #[test]
-    fn a_lock_of_the_other_choice_is_kept_until_a_day_old_and_never_asked() {
+    fn a_pid_lock_an_older_wsp_left_is_kept_until_a_day_old_and_never_asked() {
         let iso = crate::util::isolated("warm-other");
         let root = iso.path("warm");
         let b = run("b");
@@ -821,13 +773,10 @@ mod tests {
         };
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("wsp-0.lock"), "424242\n").unwrap();
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &table }).is_none(), "a pid lock is not probed");
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &table }).is_none(), "a pid lock is not probed");
         backdate(&root.join("wsp-0.lock"), STALE + std::time::Duration::from_secs(5));
-        assert!(claim(&root, "wsp", 1, Live::Jobs { me: &b, table: &table }).is_some());
+        assert!(claim(&root, "wsp", 1, Live { me: &b, table: &table }).is_some());
         assert_eq!(asked.get(), 0, "no table was asked about a pid");
-
-        std::fs::write(root.join("wsp-1.lock"), format!("{}\n", run("a").line())).unwrap();
-        assert!(claim_at(&root, "wsp", 1, Live::Pids(&none)).is_none(), "a run's lock is kept under inproc");
     }
 
     #[test]
@@ -840,7 +789,7 @@ mod tests {
         std::fs::write(dir.join("run-b"), format!("started x\n{}\n", b.line())).unwrap();
         let rows = vec![seen("verify:cargo-test:0@a", now(), true), seen("verify:cargo-test:0@b", now() + 1, false)];
         let table = |_: &str| Some(rows.clone());
-        assert_eq!(live_slots(&dir, Live::Jobs { me: &run("c"), table: &table }), 1);
+        assert_eq!(live_slots(&dir, Live { me: &run("c"), table: &table }), 1);
         assert!(dir.join("run-a").exists());
         assert!(!dir.join("run-b").exists(), "the ended run's registration is removed");
     }

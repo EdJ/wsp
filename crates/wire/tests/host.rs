@@ -379,9 +379,6 @@ impl Host for Counting<'_> {
     fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
         self.inner.alive(pids)
     }
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.inner.started(pid)
-    }
     fn shells(&self) -> Option<String> {
         self.inner.shells()
     }
@@ -426,9 +423,6 @@ impl Host for Counting<'_> {
     }
     fn signal_group(&self, group: u32, sig: &str) {
         self.inner.signal_group(group, sig)
-    }
-    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
-        self.inner.cwds(pids)
     }
     fn answers(&self, socket: &Path) -> bool {
         self.inner.answers(socket)

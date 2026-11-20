@@ -162,6 +162,32 @@ pub fn dir_on(host: &str, dir: &Path, what: &str) -> Result<HostDir, String> {
     Ok(at)
 }
 
+/// `dir` (on this machine) as a [`HostDir`] on `host`, relative to `root`:
+/// how the throttle's shim places a build at its cwd under the root its jobs
+/// host was made with — the manager's tree root, or `/` for the in-process
+/// runner (wsp-057's d1). `None` where `dir` is not under `root`.
+pub fn dir_under(host: &HostId, dir: &Path, root: &Path) -> Option<HostDir> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rel = dir.strip_prefix(&root).ok()?;
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    Some(HostDir { host: host.clone(), path: if parts.is_empty() { ".".to_string() } else { parts.join("/") } })
+}
+
+/// A check's tree run in this process, wherever it is (wsp-057's d1, after
+/// wsp-346): the tree's parent is the in-process runner's root, which the
+/// caller makes its host with, and the place is the tree's name under it on
+/// the row's host. In-process there is no host boundary, so a tree outside
+/// the tree root is not refused here as [`place_of`] refuses it.
+pub fn own_root(dir: &Path) -> (PathBuf, Place) {
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let root = real.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let row = if name.is_empty() { "tree".to_string() } else { name.clone() };
+    let at = HostDir { host: HostId(host_of(Whose::Row(&row))), path: name };
+    (root, Place { at: JobAt::Dir(at), dir: dir.to_path_buf(), row, kind: TreeKind::Check })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,6 +27,23 @@
 //! And it fails when **"herdr"** appears anywhere under `src/` or `crates/`,
 //! tests and comments included (wsp-120: there is no herdr executor, D15).
 //!
+//! **Tree work has no exception** (M3, wsp-057). Every run of a tree's work is
+//! a job, sent through `Host::run_job`, under both `WSP_JOBS` choices. So in
+//! tree work's code (`crates/trees/src/`, `src/check.rs`, `src/barrier_run.rs`)
+//! the guard also fails:
+//!
+//! - **a spawn of a tree's tools**: `Command::new` of `sh`, `bash`, `cargo` or
+//!   `rustc` (the shell a step runs in and the throttled tools), which only
+//!   the job runner (`crates/host/src/`) may start;
+//! - **a place built by hand**: a `HostDir`, `TreeRef` or `Place` literal,
+//!   which is a job's place made from a path on wsp's machine. A place is
+//!   taken from `job_place` (`place_of`, `dir_on`, `dir_under`, `own_root`),
+//!   the one module that makes them.
+//!
+//! `crates/trees/src/treecopy.rs`, the remote-agents copy, stays under T2
+//! (wsp-093) until M4 retires it, and is not read by this clause. Nothing of
+//! tree work is on the list beside it, which must hold no tree-work line.
+//!
 //! **What is product code.** Comments are not. String literals are kept,
 //! because a probe hides in one, but a probe word in a string counts only in
 //! shell position (see [`shell_hits`]). An item under `#[cfg(test)]`, or under
@@ -679,7 +696,7 @@ fn nothing_outside_the_in_process_host_reaches_the_os_for_a_seat() {
             String::new()
         } else {
             format!(
-                "reached outside {HOST} (go through `host::Host`; tree work's processes ask `host::LOCAL`):\n{}",
+                "reached outside {HOST} (go through `host::Host`):\n{}",
                 new.iter().map(|(p, k)| format!("  {p}: {k}\n")).collect::<String>()
             )
         },
@@ -706,6 +723,115 @@ fn nothing_outside_the_in_process_host_reaches_the_os_for_a_seat() {
             );
         }
     }
+}
+
+// ------------------------------------------------- tree work (M3, wsp-057)
+
+/// Tree work's code: where every run of a tree's work is a job.
+const TREE_WORK: &[&str] = &["crates/trees/src/", "src/check.rs", "src/barrier_run.rs"];
+
+/// Kept under T2 (wsp-093): the remote-agents copy, which M4 retires.
+const TREE_WORK_KEPT: &[&str] = &["crates/trees/src/treecopy.rs"];
+
+/// The one module that makes a job's place.
+const PLACES: &str = "crates/trees/src/job_place.rs";
+
+/// The programs a tree's work runs: the shell a step is, and the throttled
+/// tools. Only the job runner starts them.
+const TREE_TOOLS: &[&str] = &["sh", "bash", "cargo", "rustc"];
+
+/// The types a job's place is made of.
+const PLACE_TYPES: &[&str] = &["HostDir", "TreeRef", "Place"];
+
+/// What one tree-work file does outside a job: a tool spawned, or a place
+/// built by hand (`PLACES` may build them).
+fn tree_hits(src: &Src, places_here: bool) -> BTreeSet<String> {
+    let sk = src.skeleton();
+    let mut out = BTreeSet::new();
+    for at in words(src, &sk, "Command::new") {
+        let rest = &src.text[at + "Command::new".len()..];
+        let Some(lit) = rest.trim_start().strip_prefix('(') else { continue };
+        let Some(body) = lit.trim_start().strip_prefix('"') else { continue };
+        let Some(end) = body.find('"') else { continue };
+        let prog = body[..end].rsplit('/').next().unwrap_or("");
+        if TREE_TOOLS.contains(&prog) {
+            out.insert(format!("spawns {prog} outside a job"));
+        }
+    }
+    if !places_here {
+        for ty in PLACE_TYPES {
+            for at in words(src, &sk, ty) {
+                if !sk[at + ty.len()..].trim_start().starts_with('{') {
+                    continue;
+                }
+                // A declaration or a signature, not a literal.
+                let before = sk[..at].trim_end();
+                if ["struct", "enum", "impl", "for", "->", "union", "trait"].iter().any(|w| before.ends_with(w)) {
+                    continue;
+                }
+                out.insert(format!("builds a {ty} by hand"));
+            }
+        }
+    }
+    out
+}
+
+/// `path: kind` for every tree-work file's product code.
+fn scan_tree_work(root: &Path) -> BTreeSet<(String, String)> {
+    let mut found = BTreeSet::new();
+    for r in roots(root) {
+        let files = rust_files(&r);
+        let mut srcs: BTreeMap<PathBuf, Src> = BTreeMap::new();
+        for f in &files {
+            srcs.insert(f.clone(), Src::new(fs::read_to_string(f).unwrap()));
+        }
+        let mut test_files: BTreeSet<PathBuf> = BTreeSet::new();
+        for (f, s) in &srcs {
+            for m in &s.test_mods {
+                let dir = child_dir(f);
+                test_files.insert(dir.join(format!("{m}.rs")));
+                test_files.insert(dir.join(m));
+            }
+        }
+        for (f, s) in &srcs {
+            let rel = f.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            let tree_work = TREE_WORK.iter().any(|t| rel.starts_with(t));
+            if !tree_work || TREE_WORK_KEPT.contains(&rel.as_str()) || test_files.iter().any(|t| f == t || f.starts_with(t)) {
+                continue;
+            }
+            for h in tree_hits(s, rel == PLACES) {
+                found.insert((rel.clone(), h));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn tree_work_runs_nothing_outside_a_job_and_builds_no_place_by_hand() {
+    let root = root();
+    let found = scan_tree_work(&root);
+    assert!(
+        found.is_empty(),
+        "tree work outside a job (docs/agent-manager.md 6.2, M3; wsp-057): send it as a job through `Host::run_job`, its place from `job_place`:\n{}",
+        found.iter().map(|(p, k)| format!("  {p}: {k}\n")).collect::<String>()
+    );
+    let allow = parse_allow(&fs::read_to_string(root.join(ALLOW)).unwrap_or_default());
+    let tree_lines: Vec<_> = allow.iter().filter(|(p, _)| TREE_WORK.iter().chain(TREE_WORK_KEPT).any(|t| p.starts_with(t))).collect();
+    assert!(tree_lines.is_empty(), "{ALLOW} holds tree-work lines; it must hold none:\n{tree_lines:?}");
+}
+
+#[test]
+fn the_tree_work_clause_reads_spawns_and_hand_built_places() {
+    let kinds = |code: &str, places_here: bool| tree_hits(&Src::new(code.to_string()), places_here).into_iter().collect::<Vec<_>>();
+    assert_eq!(kinds("fn f() { Command::new(\"cargo\").arg(\"build\").status(); }", false), ["spawns cargo outside a job"]);
+    assert_eq!(kinds("fn f() { std::process::Command::new(\"/bin/sh\").arg(\"-c\"); }", false), ["spawns sh outside a job"]);
+    assert_eq!(kinds("fn f() { let at = JobAt::Dir(HostDir { host: h, path }); }", false), ["builds a HostDir by hand"]);
+    assert_eq!(kinds("fn f() { Place { at, dir, row, kind } }", false), ["builds a Place by hand"]);
+    assert!(kinds("fn f() { let at = HostDir { host: h, path }; }", true).is_empty(), "job_place makes them");
+    assert!(kinds("pub struct Place { at: JobAt }\nimpl Place { }\nfn g() -> Place { place_of(w, k, t).unwrap() }", false).is_empty());
+    assert!(kinds("fn f() { Command::new(\"git\").arg(\"status\"); let v = [\"sh\", \"-c\", \"x\"]; }", false).is_empty(), "git, and a job's argv");
+    assert!(kinds("#[cfg(test)]\nmod tests { fn f() { Command::new(\"sh\"); } }", false).is_empty(), "test code");
 }
 
 #[test]

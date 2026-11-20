@@ -2,6 +2,7 @@
 //! The run that opens, reads and ends checks is `barrier`.
 
 use crate::util;
+use std::path::PathBuf;
 
 
 /// Where a check is.
@@ -97,91 +98,78 @@ pub struct Check {
     /// The mechanical part, run by wsp before any agent is asked (`wsp-326`).
     /// `None` where nothing was declared to run.
     pub suite: Option<Suite>,
-    /// The process making the mechanical run, while `suite` is running, and when
-    /// it started, so a pid that has been reused is not taken for it. A run that
-    /// is killed leaves its entry at `suite:running`; this is how that is seen.
+    /// The process making the mechanical run, while `suite` is running, and the
+    /// lease it beats. A run that is killed leaves its entry at
+    /// `suite:running` and its lease untouched; this is how that is seen.
     pub run: Option<Run>,
     /// Who settled it, when it was not an agent: `wsp`.
     pub by: Option<String>,
 }
 
-/// The process of a barrier's mechanical run: `pid:25037@Tue_Nov_4_11:19:05_2026`.
+/// The process of a barrier's mechanical run and its lease (wsp-057):
+/// `pid:25037@lease=25037-1763639349.run`. The run beats its lease
+/// ([`crate::lease::Lease`]) while it lives, so whether it is gone is the
+/// lease's age and no process is asked. An entry an older wsp wrote,
+/// `pid:25037@<lstart>`, names no lease and reads as no run: believed for
+/// [`SUITE_WEDGED_AFTER`] at most.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     pub pid: u32,
-    /// `ps -o lstart=` for the pid, its spaces written as `_`.
-    pub started: String,
+    /// The lease file's name, in [`Run::dir`]. A name and not a path, because
+    /// the `checks:` block wraps at a line's width and splits on whitespace,
+    /// and a whole path would not survive it.
+    pub lease: String,
 }
 
 impl Run {
-    /// The running process's own. `start_of` is the host's reading of when a
-    /// pid started (`wire::host::Host::started`): this layer asks it nothing.
-    pub fn this(start_of: StartOf) -> Option<Run> {
-        let pid = std::process::id();
-        Some(Run { pid, started: start_of(pid).ok()?? })
+    /// Where every barrier run's lease is: `<state>/barrier/`, the state being
+    /// `WSP_STATE`'s or the default one, as a store opened here reads it.
+    pub fn dir() -> PathBuf {
+        std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(crate::store::Store::default_state).join("barrier")
+    }
+
+    /// Where a new run of this process keeps its lease, for
+    /// [`crate::lease::Lease::take`].
+    pub fn lease_for_this() -> PathBuf {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        Self::dir().join(format!("{}-{secs}.run", std::process::id()))
+    }
+
+    /// The running process's own, beating `lease`. `None` for a lease that is
+    /// not in [`Run::dir`] or whose name an entry could not hold.
+    pub fn this(lease: &crate::lease::Lease) -> Option<Run> {
+        let path = lease.path();
+        let name = path.file_name()?.to_str()?;
+        let ok = path.parent() == Some(Self::dir().as_path()) && !name.chars().any(char::is_whitespace);
+        ok.then(|| Run { pid: std::process::id(), lease: name.to_string() })
     }
 
     fn parse(v: &str) -> Option<Run> {
-        let (pid, started) = v.split_once('@')?;
-        Some(Run { pid: pid.parse().ok()?, started: started.to_string() })
+        let (pid, lease) = v.split_once('@')?;
+        let lease = lease.strip_prefix("lease=")?;
+        if lease.is_empty() || lease.contains('/') {
+            return None;
+        }
+        Some(Run { pid: pid.parse().ok()?, lease: lease.to_string() })
     }
 
     fn text(&self) -> String {
-        format!("{}@{}", self.pid, self.started)
+        format!("{}@lease={}", self.pid, self.lease)
     }
 
-    /// Whether the process is gone: no such pid, or one that started at another
-    /// time. A `ps` that cannot be run says nothing, and the run is believed.
-    /// A run named by its job ([`Run::of_job`]) is not a pid's to read: it is
-    /// [`Run::gone_by`]'s.
-    pub fn gone(&self, start_of: StartOf) -> bool {
-        if self.job().is_some() {
-            return false;
-        }
-        match start_of(self.pid) {
-            Ok(now) => now.as_deref() != Some(self.started.as_str()),
-            Err(()) => false,
-        }
+    /// Whether the run is gone: its lease is not there, or was last touched
+    /// longer than [`crate::lease::GRACE`] ago.
+    pub fn gone(&self) -> bool {
+        !crate::lease::fresh(&Self::dir().join(&self.lease), crate::lease::GRACE)
     }
 
-    /// The run as the job that makes it under `WSP_JOBS=manager` (wsp-053):
-    /// its start is that job's key on the tree's host, written
-    /// `pid:<pid>@job=<host>/<row>/<attempt>/<job>`, and read back from that
-    /// host's job table rather than from `ps -o lstart=`.
-    pub fn of_job(host: &str, key: &str) -> Run {
-        Run { pid: std::process::id(), started: format!("job={host}/{key}") }
-    }
-
-    /// The job a run is named by, as `(host, key)`.
-    pub fn job(&self) -> Option<(&str, &str)> {
-        self.started.strip_prefix("job=")?.split_once('/')
-    }
-
-    /// Whether the run is gone: a run named by its job, when `job_runs` (the
-    /// host's job table, read by key) says that job is not running; any other
-    /// run, as [`Run::gone`] reads it. A table that could not be read says
-    /// nothing, and the run is believed.
-    pub fn gone_by(&self, start_of: StartOf, job_runs: JobRuns) -> bool {
-        match self.job() {
-            Some((host, key)) => job_runs(host, key) == Some(false),
-            None => self.gone(start_of),
+    /// Removes the lease of a run that is gone: what a retake leaves no more.
+    pub fn forget(&self) {
+        if self.gone() {
+            let _ = std::fs::remove_file(Self::dir().join(&self.lease));
         }
     }
 }
-
-/// Whether job `key` on `host` is running (`Some(true)`), ended or not in that
-/// host's job table (`Some(false)`), or could not be asked (`None`): the
-/// manager's answer, passed in by a caller that can name the host.
-pub type JobRuns<'a> = &'a dyn Fn(&str, &str) -> Option<bool>;
-
-/// When process `pid` started, as the host's `ps` says it, or `None` where
-/// there is none; `Err` where the host could not tell.
-pub type StartOf<'a> = &'a dyn Fn(u32) -> Result<Option<String>, ()>;
-
-/// What a finished `ps -o lstart= -p <pid>` says: moved down to `wsp-base`'s
-/// `procs` with the other readings of `ps` (wsp-020), because the in-process
-/// host (`wsp-host`) reads it and links no store.
-pub use wsp_base::base::procs::ps_says;
 
 /// Where the barrier's mechanical run is: the project's full suite, the
 /// members' recorded checks and the stop condition's `stop-checks`.
@@ -231,8 +219,8 @@ impl Check {
 
     /// Its mechanical run was started by a process that is no longer there, and
     /// left no result.
-    pub fn run_died(&self, start_of: StartOf) -> bool {
-        self.suite == Some(Suite::Running) && self.pane.is_none() && self.run.as_ref().is_some_and(|r| r.gone(start_of))
+    pub fn run_died(&self) -> bool {
+        self.suite == Some(Suite::Running) && self.pane.is_none() && self.run.as_ref().is_some_and(Run::gone)
     }
 
     /// How long this entry waits with no seat before its agent is started
@@ -240,8 +228,8 @@ impl Check {
     /// never. A run known to be dead waits for nothing (while it has tries
     /// left, each retake being one); one whose process is alive, or unknown, is
     /// believed for [`SUITE_WEDGED_AFTER`] at most.
-    pub fn wait_before_next_try(&self, start_of: StartOf) -> Option<i64> {
-        if self.run_died(start_of) {
+    pub fn wait_before_next_try(&self) -> Option<i64> {
+        if self.run_died() {
             return (self.tries < TRIES).then_some(-1);
         }
         if self.suite == Some(Suite::Running) {
@@ -394,23 +382,21 @@ pub const SUITE_WEDGED_AFTER: i64 = 3 * 60 * 60;
 mod tests {
     use super::*;
 
-    /// wsp-053: a run named by its job is read by key from the host's job
-    /// table, and no `lstart` is asked of it; it reads back as written.
+    /// wsp-057: a run is its lease, and reads back as written; an entry
+    /// that names an lstart where its lease would be is no run.
     #[test]
-    fn a_run_named_by_its_job_reads_its_liveness_from_the_job_table() {
-        let run = Run::of_job("mac", "m3#5/0/barrier:suite@1.0");
+    fn a_run_is_known_by_its_lease_and_not_by_a_start_time() {
+        let _iso = crate::util::isolated("checks-run-lease");
+        let lease = crate::lease::Lease::take(Run::lease_for_this(), crate::lease::GRACE).unwrap();
+        let run = Run::this(&lease).unwrap();
+        assert!(run.text().len() < 50, "short enough for one wrapped line: {}", run.text());
         assert_eq!(Run::parse(&run.text()), Some(run.clone()), "it reads back as written");
-        assert_eq!(run.job(), Some(("mac", "m3#5/0/barrier:suite@1.0")));
-        let no_lstart: StartOf = &|_| panic!("lstart was asked of a run named by its job");
-        let asked = |want: Option<bool>| move |host: &str, key: &str| {
-            assert_eq!((host, key), ("mac", "m3#5/0/barrier:suite@1.0"));
-            want
-        };
-        assert!(run.gone_by(no_lstart, &asked(Some(false))), "its job ended: gone");
-        assert!(!run.gone_by(no_lstart, &asked(Some(true))), "running");
-        assert!(!run.gone_by(no_lstart, &asked(None)), "a table not read believes the run");
-        assert!(!run.gone(no_lstart), "not a pid's to read");
-        let pid = Run { pid: 7, started: "Tue_Nov_4_11:19:05_2026".into() };
-        assert!(pid.gone_by(&|_| Ok(None), &|_, _| panic!("a pid's run asked the job table")));
+        assert!(!run.gone(), "its holder beats it");
+        drop(lease);
+        assert!(run.gone(), "the lease went with its holder");
+        assert_eq!(Run::parse("25037@Tue_Nov_4_11:19:05_2026"), None, "an older entry names no lease");
+        assert_eq!(Run::parse("25037@lease=../x"), None, "a name, never a path");
+        let elsewhere = crate::lease::Lease::take(_iso.path("other/1.run"), crate::lease::GRACE).unwrap();
+        assert_eq!(Run::this(&elsewhere), None, "a lease outside the barrier's directory");
     }
 }

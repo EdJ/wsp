@@ -25,17 +25,16 @@
 //! # What it may not do
 //!
 //! It is bounded by [`LIMIT`], and one still running at the limit has its whole
-//! process group killed. It never blocks the teardown: a failure, a timeout or
+//! process group killed. It runs as a job (wsp-057): `sh -c` its command on
+//! `wsp-host`'s runner in this process, the tree its own place
+//! ([`crate::job_place::own_root`]), so wsp spawns no shell in a tree itself. It never blocks the teardown: a failure, a timeout or
 //! a command that will not start is said — to `cycle.log`, to the row's log
 //! when the tree is a row's, and to stderr — and the tree goes regardless. It
 //! kills nothing by pattern; ending its own processes by pid is the command's
 //! business (`dev.sh stop` does).
 
-use std::path::Path;
-use crate::host::Host;
-use std::process::Stdio;
-use wsp_base::calls::Command;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::store::Store;
 use crate::util;
@@ -55,7 +54,7 @@ pub enum Ended {
     Signalled,
     /// Still running at the limit, and killed.
     TimedOut,
-    /// `sh` could not be started.
+    /// The job could not be started.
     NotStarted(String),
 }
 
@@ -66,48 +65,45 @@ pub struct Ran {
     pub tail: String,
 }
 
-/// Run `command` under `sh -c` in `dir`, its output to a file read back for its
-/// tail. A file and not a pipe: a command that leaves a daemon running holds a
-/// pipe's write end open, and reading to the end would wait on the daemon.
+/// Run `command` under `sh -c` in `dir` as one job on `wsp-host`'s runner in
+/// this process, bounded by `limit` (in whole seconds, one at least), and read
+/// its log back for its tail. The runner writes the output to a file and not
+/// a pipe, so a command that leaves a daemon running does not hold the read
+/// open, and it kills the job's whole group at its end, so `sh -c`'s children
+/// do not outlive a cut-off.
 pub fn run_command(dir: &Path, command: &str, limit: Duration) -> Ran {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let log = std::env::temp_dir().join(format!(
-        "wsp-at-stop-{}-{}.log",
-        std::process::id(),
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
     let not_started = |why: String| Ran { ended: Ended::NotStarted(why), tail: String::new() };
-    let Ok(out) = std::fs::File::create(&log) else { return not_started(format!("could not write {}", log.display())) };
-    let Ok(err) = out.try_clone() else { return not_started("could not share the log".into()) };
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(dir).stdin(Stdio::null()).stdout(out).stderr(err).process_group(0);
-    crate::util::clean_env(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&log);
-            return not_started(format!("sh: {e}"));
-        }
+    let (root, place) = crate::job_place::own_root(dir);
+    let host = crate::host::InProcess::new().with_jobs(&exec_dir(), &root);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let run = crate::host::JobRun {
+        key: crate::host::job_key(&place.row, 0, &format!("at-stop:{n}@{}.{nanos}", std::process::id())),
+        class: crate::host::JobClass::Check,
+        argv: vec!["sh".into(), "-c".into(), command.into()],
+        at: place.at,
+        timeout_secs: limit.as_secs().max(1),
+        hung_after_secs: None,
+        detach: false,
     };
-    let start = Instant::now();
-    let ended = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s.code().map(Ended::Exited).unwrap_or(Ended::Signalled),
-            Ok(None) if start.elapsed() >= limit => {
-                // The group, because `sh -c` runs the command as a child of
-                // its own and killing only `sh` would leave that running.
-                crate::host::LOCAL.signal_group(child.id(), "KILL");
-                let _ = child.kill();
-                let _ = child.wait();
-                break Ended::TimedOut;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => break Ended::NotStarted(format!("wait: {e}")),
-        }
+    let end = match crate::host::Host::run_job(&host, &run, &mut |_| {}) {
+        Ok(end) => end,
+        Err(e) => return not_started(format!("{e:?}")),
     };
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = std::fs::remove_file(&log);
+    let text = std::fs::read_to_string(&end.log.path).unwrap_or_default();
+    let ended = match (end.timed_out || end.hung, end.exit) {
+        (true, _) => Ended::TimedOut,
+        (false, Some(code)) => Ended::Exited(code),
+        (false, None) => Ended::Signalled,
+    };
     Ran { ended, tail: tail_of(&text) }
+}
+
+/// Where the runner keeps these jobs' files: `<state>/inproc`, as the
+/// in-process host's other jobs.
+fn exec_dir() -> PathBuf {
+    std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(Store::default_state).join("inproc")
 }
 
 /// The last few lines of `text`, and no more than a few hundred characters.
@@ -239,10 +235,10 @@ fn limit() -> Duration {
 mod tests {
     use super::*;
     use crate::model::Project;
-    use std::path::PathBuf;
+    use std::time::Instant;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)

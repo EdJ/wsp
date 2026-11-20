@@ -87,8 +87,6 @@
 pub(crate) use crate::model::project_of;
 pub(crate) use crate::util::captures;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use wsp_base::calls::Command;
 use std::time::{Duration, Instant};
 
 use crate::cmd_verify::{git, git_ok};
@@ -98,7 +96,6 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::verification::{self as v, Run, RunState};
 use crate::Args;
-use crate::host::Host;
 use crate::host::{JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobState};
 
 /// The heading a project or a task lists its checks under.
@@ -211,13 +208,7 @@ pub(crate) fn unparsable(command: &str) -> Option<String> {
             "`{label}:` reads as a label but is not one — write `label (10m): command` (a limit in s, m or h) or `label: command`"
         ));
     }
-    let out = Command::new("sh").arg("-n").arg("-c").arg(command).stdin(Stdio::null()).output().ok()?;
-    if out.status.success() {
-        return None;
-    }
-    let said = String::from_utf8_lossy(&out.stderr);
-    let said = said.lines().next().unwrap_or("it does not parse").trim();
-    Some(said.trim_start_matches("sh: ").trim_start_matches("-c: ").to_string())
+    wsp_base::base::shell::parse_error(command)
 }
 
 /// Each step of `steps` that cannot start, with why: `name — reason`.
@@ -309,15 +300,7 @@ pub(crate) fn unrunnable(command: &str) -> Option<String> {
     if first.is_empty() || first.contains('/') || first.starts_with(['$', '`', '"', '\'', '[']) {
         return None;
     }
-    let known = Command::new("sh")
-        .arg("-c")
-        .arg("command -v \"$1\" >/dev/null 2>&1")
-        .arg("sh")
-        .arg(first)
-        .stdin(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    (!known).then(|| format!("`{first}` is not a command here (not a builtin, a path, or on PATH)"))
+    (!wsp_base::base::shell::knows(first)).then(|| format!("`{first}` is not a command here (not a builtin, a path, or on PATH)"))
 }
 
 /// What a line is refused for where it is written: it cannot start
@@ -1054,15 +1037,22 @@ pub(crate) fn checkout_started(repo: &Path, tree: &Path, sha: &str) -> Result<St
     Ok(Start::of(tree, seed))
 }
 
-/// One check at a time in a tree: a file beside it holding the pid that has it,
-/// and under `WSP_JOBS=manager` the job running in the tree.
-pub(crate) struct TreeLock(PathBuf);
+/// One check at a time in a tree: a file beside it holding the pid that has it
+/// (who it is, never asked), and under `WSP_JOBS=manager` the job running in
+/// the tree. The file is a lease (wsp-057): its holder beats it while it
+/// holds it, so a holder that is killed leaves a lock that ages out, and no
+/// process is probed.
+pub(crate) struct TreeLock {
+    path: PathBuf,
+    beat: Option<crate::lease::Beat>,
+}
 
-/// How long a lock whose job is not running stands before it is stale: the
-/// moment between two steps of a run, with room to spare. A run that sends no
-/// job for longer (the wsp-067 wait for a missing tree) touches its lock as it
-/// waits ([`Runner::keep_held`]), so a live run's lock never ages past it.
-const HOLD_GRACE: Duration = Duration::from_secs(60);
+/// How long a lock that is not touched, and whose job is not running, stands
+/// before it is stale. Its holder's beat touches it four times a grace, and a
+/// run touches it as each job is sent and ends; a run that sends no job for
+/// longer (the wsp-067 wait for a missing tree) touches it as it waits
+/// ([`Runner::keep_held`]), so a live run's lock never ages past it.
+const HOLD_GRACE: Duration = crate::lease::GRACE;
 
 /// [`HOLD_GRACE`], or a test's own.
 fn hold_grace() -> Duration {
@@ -1097,7 +1087,8 @@ impl TreeLock {
                 Ok(mut f) => {
                     use std::io::Write;
                     let _ = writeln!(f, "{} {}", std::process::id(), util::now_iso());
-                    return Ok(TreeLock(path));
+                    let beat = crate::lease::Beat::start(path.clone(), crate::lease::every(hold_grace()), Self::ours);
+                    return Ok(TreeLock { path, beat: Some(beat) });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if Self::dead(&path) {
@@ -1127,42 +1118,32 @@ impl TreeLock {
         Some((pid, it.next().unwrap_or_default().to_string()))
     }
 
-    /// Whether the lock at `path` is held by a process that is alive: `kill -0`
-    /// is a better witness of a live process than a `ps` that can fail empty.
+    /// Whether the lock at `path` is held by a holder that is still there.
     pub(crate) fn live(path: &Path) -> bool {
         Self::holder(path).is_some() && !Self::dead(path)
     }
 
     /// Whether the lock's holder is gone, which is the only reason to break
-    /// one. A lock that names a job (`WSP_JOBS=manager`) is read by key from
-    /// the job table of its tree's host's manager, and no process is probed;
-    /// one that names none is its pid's, asked with `kill -0`.
+    /// one. No process is probed: a lock that names a job (`WSP_JOBS=manager`)
+    /// is read by key from the job table of its tree's host's manager, and any
+    /// lock is its lease, beaten by its holder.
     fn dead(path: &Path) -> bool {
-        Self::dead_with(
-            path,
-            hold_grace(),
-            |pid| {
-                note_probe("kill");
-                crate::host::LOCAL.signal(&[pid], "0")
-            },
-            jobs_of,
-        )
+        Self::dead_with(path, hold_grace(), jobs_of)
     }
 
-    /// [`TreeLock::dead`] with the pid probe, the job table and the grace
-    /// given. A lock naming a job is stale when that job is not running in its
-    /// host's table (ended, or forgotten by a manager that restarted) and the
-    /// lock has not been touched for `grace`: a run touches it as each job is
-    /// sent and as it ends, so the moment between two steps is not stale. A
-    /// table that could not be read keeps the lock, as a probe that could not
-    /// ask does.
-    fn dead_with(path: &Path, grace: Duration, probe: impl Fn(u32) -> Option<bool>, table: impl Fn(&str) -> Option<Vec<JobRow>>) -> bool {
-        let Some((host, key)) = Self::job_of(path) else { return Self::dead_by(path, probe) };
-        let Some(rows) = table(&host) else { return false };
-        if rows.iter().any(|r| key_text(&r.key) == key && r.state == JobState::Running) {
+    /// [`TreeLock::dead`] with the job table and the grace given. A lock is
+    /// stale when it has not been touched for `grace` and names no job
+    /// running in its host's table (ended, or forgotten by a manager that
+    /// restarted). A lock naming a job whose table could not be read is kept,
+    /// since a second check in a tree still in use is the worse mistake. A
+    /// lock being written this instant, or garbage, ages out the same way.
+    fn dead_with(path: &Path, grace: Duration, table: impl Fn(&str) -> Option<Vec<JobRow>>) -> bool {
+        if crate::lease::fresh(path, grace) {
             return false;
         }
-        std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().unwrap_or_default() >= grace)
+        let Some((host, key)) = Self::job_of(path) else { return true };
+        let Some(rows) = table(&host) else { return false };
+        !rows.iter().any(|r| key_text(&r.key) == key && r.state == JobState::Running)
     }
 
     /// The job a lock names, as `(host, row/attempt/job)`: the third word of
@@ -1192,9 +1173,7 @@ impl TreeLock {
     /// that holds a tree and sends no job keeps its lock from aging out.
     pub(crate) fn touch(path: &Path) {
         if Self::ours(path) {
-            if let Ok(f) = std::fs::File::options().write(true).open(path) {
-                let _ = f.set_modified(std::time::SystemTime::now());
-            }
+            crate::lease::touch(path);
         }
     }
 
@@ -1202,29 +1181,15 @@ impl TreeLock {
     fn ours(path: &Path) -> bool {
         Self::holder(path).is_some_and(|(pid, _)| pid == std::process::id())
     }
-
-    /// [`TreeLock::dead`] with the probe given. Only a definite "not there"
-    /// (`Some(false)`) breaks the lock: a probe that could not ask (`None`, a
-    /// `kill` that would not spawn, or at M1 a manager that does not answer)
-    /// keeps it, since a second check in a tree still in use is the worse
-    /// mistake.
-    fn dead_by(path: &Path, probe: impl Fn(u32) -> Option<bool>) -> bool {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let Some(pid) = text.split_whitespace().next().filter(|p| p.chars().all(|c| c.is_ascii_digit())) else {
-            // Being written this instant, or garbage: garbage ages out.
-            return std::fs::metadata(path).and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(60)).unwrap_or(false);
-        };
-        // A pid that does not parse (past u32) names no process.
-        pid.parse().map_or(true, |pid| probe(pid) == Some(false))
-    }
 }
 
 impl Drop for TreeLock {
     /// Removes the lock only while it is still this process's: one that was
     /// broken and taken by another run is that run's to remove.
     fn drop(&mut self) {
-        if Self::ours(&self.0) {
-            let _ = std::fs::remove_file(&self.0);
+        drop(self.beat.take());
+        if Self::ours(&self.path) {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -1303,8 +1268,8 @@ impl<'a> Jobs<'a> {
 impl Runner<'_> {
     /// Keeps the run's tree lock held through a stretch in which it sends no
     /// job (the wsp-067 wait for a missing tree): touched, so it does not age
-    /// past the grace and read free while the run is alive. In-process, a
-    /// live holder's pid keeps it, and there is nothing to do.
+    /// past the grace and read free while the run is alive. The lock's own
+    /// beat does the same; this is the run saying so where it knows the lock.
     pub(crate) fn keep_held(&self) {
         if let Runner::Jobs(Jobs { lock: Some(lock), .. }) = self {
             TreeLock::touch(lock);
@@ -1378,19 +1343,6 @@ pub(crate) fn job_runs(host: &str, key: &str) -> Option<bool> {
 /// spaces (a row id and a check's job name have none).
 pub(crate) fn key_text(key: &JobKey) -> String {
     format!("{}/{}/{}", key.row.0, key.attempt, key.job)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The probes of processes wsp made itself on this thread (`ps`, `kill`,
-    /// `lstart`): what a check under `manager` must leave empty.
-    pub(crate) static PROBES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Notes a probe of processes wsp makes itself, for the call log a test reads.
-fn note_probe(_what: &'static str) {
-    #[cfg(test)]
-    PROBES.with(|p| p.borrow_mut().push(_what));
 }
 
 // ---- running ----------------------------------------------------------------
@@ -1506,9 +1458,7 @@ fn in_process(dir: &Path) -> Jobs<'static> {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
     static HOSTS: OnceLock<Mutex<BTreeMap<(PathBuf, PathBuf), &'static crate::host::InProcess>>> = OnceLock::new();
-    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let root = real.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
-    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (root, place) = wsp_trees::job_place::own_root(dir);
     let exec = inproc_exec();
     let host = *HOSTS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1516,9 +1466,6 @@ fn in_process(dir: &Path) -> Jobs<'static> {
         .unwrap_or_else(|e| e.into_inner())
         .entry((exec.clone(), root.clone()))
         .or_insert_with(|| Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&exec, &root))));
-    let row = if name.is_empty() { "tree".to_string() } else { name.clone() };
-    let at = crate::host::HostDir { host: crate::host::HostId(wsp_trees::job_place::host_of(Whose::Row(&row))), path: name };
-    let place = Place { at: crate::host::JobAt::Dir(at), dir: dir.to_path_buf(), row, kind: TreeKind::Check };
     Jobs::new(host, place, None)
 }
 
@@ -3237,18 +3184,29 @@ mod tests {
         assert!(!TreeLock::live(&path));
     }
 
-    /// wsp-008: a probe that could not ask (a `kill` that would not spawn, or
-    /// at M1 a manager that does not answer) keeps a held lock; only a definite
-    /// "not there" breaks it.
+    /// wsp-057: a lock is a lease. Its holder's beat keeps it past the grace
+    /// with no job named; a lock nobody beats (its holder killed) ages out
+    /// whatever pid it names, and no process is asked.
     #[test]
-    fn a_tree_lock_whose_holder_cannot_be_asked_about_is_kept() {
-        let env = util::isolated("check-lock-unasked");
+    fn a_tree_lock_is_held_while_its_holder_beats_it_and_free_once_it_stops() {
+        let env = util::isolated("check-lock-lease");
         let path = env.state().join("lock");
+        GRACE.with(|g| g.set(Some(Duration::from_millis(400))));
         let held = TreeLock::take(path.clone(), Duration::from_secs(1)).unwrap();
-        assert!(!TreeLock::dead_by(&path, |_| None), "could not ask broke the lock");
-        assert!(!TreeLock::dead_by(&path, |_| Some(true)));
-        assert!(TreeLock::dead_by(&path, |_| Some(false)), "a holder that is gone frees it");
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(TreeLock::live(&path), "the beat kept it past the grace");
+        assert!(TreeLock::take(path.clone(), Duration::ZERO).is_err());
         drop(held);
+
+        // Left by a holder that was killed: this process's pid, so a pid
+        // probe would have kept it, and untouched past the grace.
+        std::fs::write(&path, format!("{} {}\n", std::process::id(), util::now_iso())).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        assert!(!TreeLock::live(&path), "nobody beats it: free");
+        let again = TreeLock::take(path.clone(), Duration::ZERO).expect("taken back");
+        GRACE.with(|g| g.set(None));
+        drop(again);
     }
 
     #[test]
@@ -3484,34 +3442,34 @@ mod tests {
     }
 
     /// A stale lock whose job ended reads free, read by key from the job
-    /// table, and no `kill -0` is asked; a running job, a job just ended (the
+    /// table; a running job, a job just ended (the
     /// moment between two steps) and a table that cannot be read keep it.
     #[test]
     fn a_lock_whose_job_ended_reads_free_with_no_kill() {
         let env = util::isolated("check-lock-job");
         let path = env.state().join("lock");
-        let held = TreeLock::take(path.clone(), Duration::from_secs(1)).unwrap();
+        // Written by hand, so no beat touches it while the test ages it.
+        std::fs::write(&path, format!("{} {}\n", std::process::id(), util::now_iso())).unwrap();
         let key = crate::host::job_key("pj-001", 0, "check:s@1.0");
         TreeLock::name_job(&path, "mac", &key);
         assert_eq!(TreeLock::holder(&path).map(|(p, _)| p), Some(std::process::id()), "the holder is kept");
         let row = |state| JobRow { key: key.clone(), class: JobClass::Check, pgid: 1, started: crate::host::At(0), state };
-        let no_kill = |_: u32| -> Option<bool> { panic!("kill -0 was asked of a lock that names a job") };
         let table = |rows: Option<Vec<JobRow>>| move |host: &str| -> Option<Vec<JobRow>> {
             assert_eq!(host, "mac", "asked of the tree's host");
             rows.clone()
         };
-        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(vec![row(JobState::Ended)]))), "just ended: between two steps");
+        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, table(Some(vec![row(JobState::Ended)]))), "just ended: between two steps");
         let old = std::time::SystemTime::now() - Duration::from_secs(600);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
-        assert!(TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(vec![row(JobState::Ended)]))), "its job ended: free");
-        assert!(TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(Vec::new()))), "its job is gone from the table: free");
-        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(Some(vec![row(JobState::Running)]))), "running: held");
-        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, no_kill, table(None)), "a table not read keeps it");
+        assert!(TreeLock::dead_with(&path, HOLD_GRACE, table(Some(vec![row(JobState::Ended)]))), "its job ended: free");
+        assert!(TreeLock::dead_with(&path, HOLD_GRACE, table(Some(Vec::new()))), "its job is gone from the table: free");
+        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, table(Some(vec![row(JobState::Running)]))), "running: held");
+        assert!(!TreeLock::dead_with(&path, HOLD_GRACE, table(None)), "a table not read keeps it");
         JOB_TABLE.with(|t| *t.borrow_mut() = Some(Some(vec![row(JobState::Ended)])));
         assert!(!TreeLock::live(&path), "TreeLock::live reads the same table");
         JOB_TABLE.with(|t| *t.borrow_mut() = None);
         assert_eq!(job_runs("mac", &key_text(&key)), None, "no manager here: not asked");
-        drop(held);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// cpd-197's block: a run under `manager` that waits for its missing tree
@@ -3551,10 +3509,10 @@ mod tests {
         JOB_TABLE.with(|t| *t.borrow_mut() = None);
     }
 
-    /// The call log of a check under `manager` holds no `ps`, `kill` or
-    /// `lstart` probe from wsp: the steps, their bounds and the lock are the
-    /// manager's and its job table's. Under `inproc` they are `wsp-host`'s
-    /// runner's, and wsp probes nothing either (wsp-057).
+    /// A check under `manager` leaves the steps, their bounds and the lock to
+    /// the manager and its job table; under `inproc` they are `wsp-host`'s
+    /// runner's. wsp has no process probe left to make (wsp-057: the lock is
+    /// a lease, and `tests/host_seam.rs` fails a spawn outside a job).
     #[test]
     fn a_check_under_manager_probes_no_process_from_wsp() {
         let env = util::isolated("check-no-probes");
@@ -3566,7 +3524,6 @@ mod tests {
         if let Runner::Jobs(jobs) = &mut manager {
             jobs.lock = Some(lock.clone());
         }
-        PROBES.with(|p| p.borrow_mut().clear());
         let held = TreeLock::take(lock.clone(), Duration::from_secs(1)).unwrap();
         let steps = [sh("echo a", 10), sh("exit 1", 10), sh("sleep 3", 1)];
         let ran = run_every(&dir, &steps, &log, None, &manager, |_| {});
@@ -3576,9 +3533,7 @@ mod tests {
         assert!(TreeLock::live(&lock), "touched as the last job ended");
         JOB_TABLE.with(|t| *t.borrow_mut() = None);
         drop(held);
-        assert_eq!(PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "wsp probed a process under manager");
-        run_step(&dir, &sh("true", 10), &log, &inproc);
-        assert_eq!(PROBES.with(|p| p.borrow().clone()), Vec::<&str>::new(), "inproc is a job too: wsp probes nothing (wsp-057)");
+        assert_eq!(run_step(&dir, &sh("true", 10), &log, &inproc).done, Done::Passed, "inproc is a job too (wsp-057)");
     }
 
     /// `wsp-453`: a step that passes still has its group killed — the Vite and
@@ -3591,7 +3546,7 @@ mod tests {
             let r = run_step(&dir, &sh(&format!("sleep 60 > /dev/null 2>&1 & echo $! > {}", pidfile.display()), 20), &log, &runner);
             assert_eq!(r.done, Done::Passed, "{how}");
             let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
-            let alive = || pid.parse().is_ok_and(|pid| crate::host::LOCAL.probe(pid) == Some(true));
+            let alive = || pid.parse().is_ok_and(|pid| crate::host::Host::probe(&crate::host::LOCAL, pid) == Some(true));
             let until = Instant::now() + Duration::from_secs(5);
             while alive() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(50));
@@ -3649,7 +3604,7 @@ mod tests {
     use crate::model::Project;
 
     fn git_run(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)

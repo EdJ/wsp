@@ -1305,6 +1305,18 @@ doctor names `hello`'s capacities and holds them to `jobs.json`. `cmd_install.rs
 install -n` compares against carries the throttle's settings and a root covering the projects.
 `job_place.rs` checks that wsp reads back the root the install wrote.
 
+#### M3 group 7: the contract (wsp-057, 2026-11-20)
+
+wsp-057 deleted what the jobs replaced. Gone: check_tree's process sweep, `leaked_agents` and `wsp reap <pid>`; the
+throttle's slot probes and check slots; sharing's `alive`, the barrier run's pid start time (`checks::Run`'s
+`started`, `lstart`) and the `TreeLock`'s `kill -0`; and every direct spawn of tree work: check's steps, verify's
+cargo, the throttle's runs, warm's removal and the `at_stop:` teardown are each a job through `Host::run_job` under
+both `WSP_JOBS` choices. With them went the Host methods nothing called (`cwds`, `parents`, the trait's `started`).
+A holder's liveness is now its job in a job table or a lease it beats (`wsp_store::lease`: a tree lock, a barrier
+run), and no process is probed. `tests/host_seam.rs` lost its tree-work exception: a spawn of `sh`, `cargo` or
+`rustc` in tree work's code, or a place built by hand, fails it. Kept under T2 (wsp-093): `place_of` and the rest of
+`job_place`, where M4's `tree.checkout` goes, and treecopy.rs, which M4 retires once no host takes copies.
+
 #### M3 under T2 (wsp-093, 2026-11-18)
 
 Ed answered Q6 on 2026-11-18 (relayed by Jesper; the full set is on his wsp-652): **trees go straight to T2.**

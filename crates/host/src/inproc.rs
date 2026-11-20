@@ -451,19 +451,6 @@ impl InProcess {
         signal_group(group, sig)
     }
 
-    pub fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
-        let mut cmd = Command::new("lsof");
-        match pids {
-            Some(pids) => {
-                let list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-                cmd.args(["-a", "-d", "cwd", "-Fpn", "-p", &list])
-            }
-            None => cmd.args(["-d", "cwd", "-Fpn"]),
-        };
-        let out = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
     pub fn answers(&self, socket: &Path) -> bool {
         UnixStream::connect(socket).is_ok()
     }

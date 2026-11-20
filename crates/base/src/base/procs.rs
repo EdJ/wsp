@@ -1,6 +1,6 @@
 //! The processes on this machine, as `ps` lists them: the reading of its
 //! output. The `ps` itself is the host's (`wsp_wire::host::Host::table`, and
-//! its `processes` and `parents`), so this module runs nothing.
+//! its `processes`), so this module runs nothing.
 
 /// A `ps -A -E -o pid=,ppid=,command=` table as `(pid, ppid, the rest of the
 /// line)` — where "the rest" includes the environment.
@@ -11,18 +11,6 @@
 /// once (see [`ps_line`]).
 pub fn read_processes(table: &str) -> Vec<(u32, u32, String)> {
     table.lines().filter_map(ps_line).collect()
-}
-
-/// A `ps -A -o pid=,ppid=` table as `(pid, ppid, "")`: the parent links alone,
-/// for a caller that only walks [`ancestors`].
-pub fn read_parents(table: &str) -> Vec<(u32, u32, String)> {
-    table
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace().map(|x| x.parse::<u32>().ok());
-            Some((it.next()??, it.next()??, String::new()))
-        })
-        .collect()
 }
 
 /// One line of that, as `(pid, ppid, the rest)`.
@@ -62,16 +50,18 @@ pub fn ancestors(all: &[(u32, u32, String)]) -> Vec<u32> {
     out
 }
 
-/// What a finished `ps -o lstart=,stat= -p <pid>` says. A defunct (zombie)
-/// process, its `stat` starting with `Z`, still has a pid and a start time but
-/// is no run: it reads as no process at all, so a barrier whose run died
-/// unreaped is not waited on forever. It says there is no such
+/// What a finished `ps -o lstart=,stat= -p <pid>` says: how `wsp-host`'s job
+/// runner tells a job it re-adopts from a later process given its pid (wsp
+/// itself asks no pid's start since wsp-057). A defunct (zombie) process, its
+/// `stat` starting with `Z`, still has a pid and a start time but is no job:
+/// it reads as no process at all, so a job that died unreaped is not waited
+/// on forever. It says there is no such
 /// process by exiting 1 with nothing on stdout (stderr is free text, and a pid
 /// too large for the system gets a complaint there with the same exit). Any
 /// other end — killed by a signal, or another exit status — says nothing about
 /// the pid, so it is `Err` and a live run is not read as dead on it. A `ps` that
 /// itself fails with exit 1 and prints nothing cannot be told from a missing
-/// pid, and reads as gone: the lock (`open_unless_held`) is what covers that.
+/// pid, and reads as gone.
 pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
     if code != Some(0) && !(code == Some(1) && stdout.iter().all(u8::is_ascii_whitespace)) {
         return Err(());
@@ -89,6 +79,18 @@ pub fn ps_says(code: Option<i32>, stdout: &[u8]) -> Result<Option<String>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_exit_one_with_nothing_printed_from_ps_is_a_pid_that_is_gone() {
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Ss\n"), Ok(Some("Tue_Nov_4_11:19:05_2026".into())));
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Z+\n"), Ok(None), "a defunct process is gone");
+        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Zs\n"), Ok(None));
+        assert_eq!(ps_says(Some(1), b""), Ok(None), "no such process");
+        assert_eq!(ps_says(Some(1), b"\n"), Ok(None));
+        assert_eq!(ps_says(None, b""), Err(()), "killed by a signal says nothing of the pid");
+        assert_eq!(ps_says(Some(2), b""), Err(()));
+        assert_eq!(ps_says(Some(1), b"Tue Nov  4 11:19:05 2026\n"), Err(()));
+    }
 
     /// `backend session stop` ends the server, not what it started: the daemon it
     /// left was reparented to launchd and went on holding the live store. The

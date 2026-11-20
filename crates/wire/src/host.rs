@@ -34,15 +34,11 @@
 //! host's manager, chosen by `WSP_HOST=inproc|manager` ([`chosen`]; `inproc`
 //! until wsp-029).
 //!
-//! The `ps`, `kill` and `lsof` of seat and tree work are there too, as
-//! `seats`'s process table, signals and working directories (wsp-008). Tree
-//! work's check_tree sweep, the throttle's and gc's liveness probes and a
-//! check's kill on timeout ask [`LOCAL`], so at M3 their jobs move and their
-//! calls do not.
-//!
-//! The layers below this crate (base, store) cannot name the host, so where
-//! they need a fact (a pid's liveness, when it started) their callers pass the
-//! host's answer in: `sharing::Alive`, `checks::StartOf`.
+//! The `ps` and `kill` of seat work are there too, as `seats`'s process table
+//! and signals (wsp-008). Tree work asks none of them since wsp-057: its
+//! sweep, slot probes and pid start times are gone, every run is a job
+//! ([`Host::run_job`]), and a holder's liveness is its job in a job table or
+//! a lease it beats (`wsp_store::lease`), never a probed pid.
 //!
 //! Tree work's jobs (M3, wsp-051) are [`Host::run_job`], [`Host::stop_job`]
 //! and [`Host::jobs`]: `job.run`, `job.stop` and `jobs` on [`Tcp`], and
@@ -217,9 +213,6 @@ pub trait Host: Sync {
     fn is_alive(&self, pid: u32) -> bool {
         self.alive(&[pid]).contains(&pid)
     }
-    /// When `pid` started, as `ps -o lstart=,stat=` says it with its spaces written
-    /// as `_`; `None` for no such process or a defunct one, `Err` where `ps` could not tell.
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()>;
     /// The process table a seat's running shells are read from:
     /// `ps -A -o pid=,ppid=,etime=,time=,command=`. `None` when `ps` did not run.
     fn shells(&self) -> Option<String>;
@@ -247,9 +240,6 @@ pub trait Host: Sync {
     /// `sig` to a whole process group, by its leader's id — never this
     /// process's own group.
     fn signal_group(&self, group: u32, sig: &str);
-    /// `lsof -d cwd -Fpn`, of `pids` alone when given: every process's working
-    /// directory as lsof's field lines. `None` when `lsof` would not run.
-    fn cwds(&self, pids: Option<&[u32]>) -> Option<String>;
 
     /// Whether `pid` is running: `kill -0`, which a zombie still answers.
     /// `None` when `kill` would not run, as [`Host::signal`].
@@ -270,12 +260,6 @@ pub trait Host: Sync {
     /// ([`wsp_base::base::procs::ancestors`]).
     fn processes(&self) -> Vec<(u32, u32, String)> {
         wsp_base::base::procs::read_processes(&self.table("pid=,ppid=,command=", true).unwrap_or_default())
-    }
-    /// Every process as `(pid, ppid, "")`: the parent links alone, for a caller
-    /// that only walks `ancestors`. Without `-E` the table is a fifth of the
-    /// work to read.
-    fn parents(&self) -> Vec<(u32, u32, String)> {
-        wsp_base::base::procs::read_parents(&self.table("pid=,ppid=", false).unwrap_or_default())
     }
 
     // ---- seat.read
@@ -487,9 +471,6 @@ impl Host for InProcess {
     fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
         self.host.alive(pids)
     }
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.host.started(pid)
-    }
     fn shells(&self) -> Option<String> {
         self.host.shells()
     }
@@ -534,9 +515,6 @@ impl Host for InProcess {
     }
     fn signal_group(&self, group: u32, sig: &str) {
         self.host.signal_group(group, sig)
-    }
-    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
-        self.host.cwds(pids)
     }
     fn answers(&self, socket: &Path) -> bool {
         self.host.answers(socket)

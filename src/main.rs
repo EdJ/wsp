@@ -14,7 +14,7 @@ mod affected;
 pub(crate) use wsp_trees::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
 mod base;
 pub(crate) use wsp_base::{choices, input, risk, util};
-pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, log, message, model, resolve, sharing, store, tags, verbs};
+pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, lease, log, message, model, resolve, sharing, store, tags, verbs};
 pub(crate) use wsp_wire::{fake, far, host, host_tcp, launchd, manager, place, place_compound, place_super, systemd, tunnel};
 mod artefact;
 mod registry;
