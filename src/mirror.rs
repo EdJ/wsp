@@ -300,8 +300,26 @@ pub fn texts_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, String> {
 /// verbatim, for each list `texts` holds (wsp-076), so [`list_of`] rebuilds
 /// the `Worklist` with the store's own parser — a list's groups and settings
 /// are more than its fields say.
-pub fn lists(lists: &[Worklist], tasks: &[Task], texts: &BTreeMap<String, String>) -> Vec<Entity> {
-    lists_with(lists, &settled_in(tasks), texts, wsp_base::util::epoch_secs())
+///
+/// A done list that still has a seat on it — a check whose entry names a pane
+/// and has not ended ([`crate::barrier::seats`] reads every list for it), or a
+/// governor's post `governors` still has filled — also carries
+/// [`c::WIP_SEATED`], so `wip_snapshot` keeps its `body` (wsp-695).
+pub fn lists(lists: &[Worklist], tasks: &[Task], texts: &BTreeMap<String, String>, governors: &BTreeMap<String, serde_json::Value>) -> Vec<Entity> {
+    lists_with(lists, &settled_in(tasks), texts, &|id| post_filled(governors, id), wsp_base::util::epoch_secs())
+}
+
+/// Whether a governor's post is filled: its record names a workspace, as a
+/// seated one does from any machine and a vacated one (`{vacated, last}`)
+/// does not.
+fn post_filled(governors: &BTreeMap<String, serde_json::Value>, scope: &str) -> bool {
+    governors.get(scope).and_then(|r| r.get("workspace")).and_then(serde_json::Value::as_str).is_some_and(|w| !w.is_empty())
+}
+
+/// Whether a done list still has a seat on it: a standing check, or its
+/// governor's post filled (`governed`).
+fn seated(w: &Worklist, governed: &dyn Fn(&str) -> bool) -> bool {
+    w.groups().iter().flat_map(|g| g.checks.iter()).any(|c| c.standing().is_some()) || governed(&w.id)
 }
 
 /// The `Worklist` a list was projected from, as `Store::worklists` reads it:
@@ -399,7 +417,13 @@ pub(crate) fn finished_item(finished: &BTreeMap<String, crate::classify::Attenti
 /// (`wsp-105`).
 pub const ATTENTION_GROUP: &str = "attention_group";
 
-fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeMap<String, String>, now: i64) -> Vec<Entity> {
+fn lists_with(
+    lists: &[Worklist],
+    settled: &dyn Fn(&str) -> bool,
+    texts: &BTreeMap<String, String>,
+    governed: &dyn Fn(&str) -> bool,
+    now: i64,
+) -> Vec<Entity> {
     lists
         .iter()
         .map(|w| {
@@ -463,6 +487,9 @@ fn lists_with(lists: &[Worklist], settled: &dyn Fn(&str) -> bool, texts: &BTreeM
             put(&mut f, "planned", w.planned.as_deref().unwrap_or(""));
             if let Some(text) = texts.get(&w.id) {
                 f.insert(BODY.into(), text.clone());
+            }
+            if status == WorklistStatus::Done && seated(w, governed) {
+                f.insert(c::WIP_SEATED.into(), "true".into());
             }
             Entity::List(c::List { id: ListId(w.id.clone()), state: list_state(status), groups, fields: f })
         })
@@ -752,7 +779,7 @@ pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let texts = texts_of(store, &tasks);
     let mut out = rows(&tasks, &claims_file, &worklists, &texts);
     out.extend(claims(&claims_file));
-    out.extend(lists(&worklists, &tasks, &list_texts_of(store, &worklists)));
+    out.extend(lists(&worklists, &tasks, &list_texts_of(store, &worklists), &store.governors()));
     out.extend(machines(&store.machines(), &store.machines_live(), local));
     out
 }
@@ -829,14 +856,15 @@ pub(crate) fn api_health(state: &std::path::Path, running: Option<&[u32]>, probl
 /// The machine name `read_rows_etc` marks `Transport::Local`.
 pub const LOCAL: &str = "local";
 
-/// What moves a half: the stamp, plus (for the rows half) the mtimes of the two
-/// state files neither stamp covers, `claims.json` and `machines.json`.
-fn stamp_of(store: &Store, half: Half) -> (u64, [Option<std::time::SystemTime>; 2]) {
+/// What moves a half: the stamp, plus (for the rows half) the mtimes of the
+/// state files neither stamp covers, `claims.json`, `machines.json` and
+/// `governors.json` (a vacated post takes a done list's [`c::WIP_SEATED`] off).
+fn stamp_of(store: &Store, half: Half) -> (u64, [Option<std::time::SystemTime>; 3]) {
     match half {
-        Half::Attention => (store.attention_stamp(), [None, None]),
+        Half::Attention => (store.attention_stamp(), [None, None, None]),
         Half::RowsEtc => {
             let m = |n: &str| std::fs::metadata(store.state_file(n)).ok().and_then(|m| m.modified().ok());
-            (store.fingerprint(), [m("claims.json"), m("machines.json")])
+            (store.fingerprint(), [m("claims.json"), m("machines.json"), m("governors.json")])
         }
     }
 }
@@ -903,7 +931,7 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
             let store = Store::at(root, state);
             let say = |line: String| wsp_store::store::log_line(&store, &format!("mirror: {line}"));
             let mut seq = 0u64;
-            let mut stamps: [Option<(u64, [Option<std::time::SystemTime>; 2])>; 2] = [None, None];
+            let mut stamps: [Option<(u64, [Option<std::time::SystemTime>; 3])>; 2] = [None, None];
             let mut last: [Option<BTreeMap<Subject, Entity>>; 2] = [None, None];
             // The soonest `until` a held barrier waits for (`wsp-095`): no file
             // moves when it comes, so the rows half is re-read then.
@@ -1135,7 +1163,7 @@ mod tests {
         w.set_status(WorklistStatus::Held);
         w.set_groups(&[wsp_store::model::Group { members: vec!["a-1".into()], agent: "claude".into(), ..Default::default() }]);
         w.held_until = Some(wsp_base::util::iso_at(2_000));
-        let fields = |now: i64| match &lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), now)[0] {
+        let fields = |now: i64| match &lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), &|_| false, now)[0] {
             Entity::List(l) => l.groups[0].fields.clone(),
             _ => unreachable!(),
         };
@@ -1165,9 +1193,9 @@ mod tests {
         // Read in the other order, the answers are the same: nothing was kept.
         assert_eq!(fields(3_000).get("attention").map(String::as_str), Some("needs-you"));
         assert_eq!(fields(1_000).get("attention").map(String::as_str), Some("follow-up"));
-        let es = lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), 1_000);
+        let es = lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), &|_| false, 1_000);
         assert_eq!(next_due(&es), Some(2_000));
-        assert_eq!(next_due(&lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), 3_000)), None);
+        assert_eq!(next_due(&lists_with(std::slice::from_ref(&w), &|_| true, &BTreeMap::new(), &|_| false, 3_000)), None);
     }
 
     /// `wsp-096`: a group waiting on rows is follow-up and names them; one
@@ -1178,7 +1206,7 @@ mod tests {
         w.set_status(WorklistStatus::Held);
         w.set_groups(&[wsp_store::model::Group { members: vec!["a-1".into()], agent: "claude".into(), ..Default::default() }]);
         w.held_on = vec!["wsp-093".into()];
-        let group = |w: &Worklist, settled: &dyn Fn(&str) -> bool| match &lists_with(std::slice::from_ref(w), settled, &BTreeMap::new(), 1_000)[0] {
+        let group = |w: &Worklist, settled: &dyn Fn(&str) -> bool| match &lists_with(std::slice::from_ref(w), settled, &BTreeMap::new(), &|_| false, 1_000)[0] {
             Entity::List(l) => l.groups[0].fields.clone(),
             _ => unreachable!(),
         };
@@ -1351,6 +1379,70 @@ mod tests {
         assert_eq!((finished.state, finished.groups.len()), (ListState::Finished, 1), "a finished list keeps its state and groups");
         assert!(c::WIP_BODIES.iter().all(|k| !finished.fields.contains_key(*k)), "a finished list loses its text");
         assert!(list_of(finished).is_none(), "so list_of reads no list from it");
+    }
+
+    /// wsp-695: a list that has just finished can still have seats on it, and
+    /// wip reads them off it. Its check stands until the tick ends it
+    /// ([`crate::barrier::seats`] reads every list for that), and its governor
+    /// stays seated until it is stood down. The cut keeps such a list whole:
+    /// through `wip_snapshot`, `barrier::seats` over what [`list_of`] reads
+    /// back still names the check seat with its list and group, and the
+    /// governed list is still in wip's lists. Once the check has ended and the
+    /// post is vacated, the mark goes and the list loses its text again.
+    #[test]
+    fn wip_snapshot_keeps_a_finished_list_whole_while_a_check_or_a_governor_is_still_seated_on_it() {
+        use c::{Commands, Reads};
+        let s = seed("mirror-wip-seated");
+        let done = |id: &str, check: Option<&str>| {
+            let mut w = Worklist::new(id, "A list that has just finished");
+            let mut g = model::Group::default();
+            g.members = vec!["wsp-5".into()];
+            g.verdict = "holds".into();
+            if let Some(pane) = check {
+                let mut c = wsp_store::checks::Check::opened(Some("55c4839abcde".into()), None);
+                c.pane = Some(pane.into());
+                g.checks = vec![c];
+            }
+            w.set_groups(&[model::Group { members: vec!["wsp-1".into()], ..Default::default() }, g]);
+            w.set_status(WorklistStatus::Done);
+            s.save_worklist(&w).unwrap();
+        };
+        done("list-checked", Some("cpd-77"));
+        done("list-governed", None);
+        done("list-old", None);
+        s.set_governor("list-governed", json!({ "workspace": "w-9", "pane": "cpd-78" }));
+        s.set_governor("list-old", json!({ "vacated": "2026-11-20T09:00:00Z", "last": { "workspace": "w-8", "pane": "cpd-70" } }));
+
+        let cut = |s: &Store, tag: &str| {
+            let es: Vec<Entity> = read_rows_etc(s, "here").into_iter().filter(|e| matches!(e, Entity::List(_))).collect();
+            let db = wsp_store_sqlite::SqliteStore::open(s.state.join(format!("{tag}.db")), Arc::new(wsp_server::Mirror)).unwrap();
+            db.apply(Command::Mirror { put: es, gone: Vec::new() }, IdempotencyKey("t".into()), Principal::Wsp("test".into())).unwrap();
+            db.wip_snapshot().unwrap().0
+        };
+        let got = cut(&s, "seated");
+        let kept = |id: &str| got.lists[&ListId(id.into())].fields.contains_key(BODY);
+        assert!(kept("list-checked"), "a standing check keeps its finished list whole");
+        assert!(kept("list-governed"), "a filled governor's post keeps its finished list whole");
+        assert!(!kept("list-old"), "a finished list nobody sits on loses its text");
+
+        let lists: Vec<Worklist> = got.lists.values().filter_map(list_of).collect();
+        let seats = crate::barrier::seats(&lists);
+        assert_eq!(seats.get("cpd-77"), Some(&("list-checked".to_string(), 2)), "wip still reads the check seat's list and group");
+        assert!(lists.iter().any(|l| l.id == "list-governed"), "wip still reads the governor's scope as a list");
+
+        // The check ends and the post is vacated: nothing is seated, and the
+        // next re-read cuts both lists as it cuts any finished one.
+        let mut w = s.worklist("list-checked").unwrap();
+        let mut gs = w.groups();
+        gs[1].checks[0].ending = wsp_store::checks::Ending::Ended;
+        w.set_groups(&gs);
+        s.save_worklist(&w).unwrap();
+        s.set_governor("list-governed", json!({ "vacated": "2026-11-20T09:30:00Z", "last": { "workspace": "w-9", "pane": "cpd-78" } }));
+        let got = cut(&s, "ended");
+        for id in ["list-checked", "list-governed"] {
+            let l = &got.lists[&ListId(id.into())];
+            assert!(c::WIP_BODIES.iter().all(|k| !l.fields.contains_key(*k)) && !l.fields.contains_key(c::WIP_SEATED), "{id} is cut once nobody sits on it");
+        }
     }
 
     /// An ask carries its message's record, and the store's reader rebuilds the

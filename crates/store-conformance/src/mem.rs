@@ -383,7 +383,7 @@ impl Reads for MemStore {
             .lists
             .into_iter()
             .map(|(id, l)| match l.state {
-                ListState::Finished => (id, List { fields: bodiless(l.fields), ..l }),
+                ListState::Finished if !l.fields.contains_key(WIP_SEATED) => (id, List { fields: bodiless(l.fields), ..l }),
                 _ => (id, l),
             })
             .collect();

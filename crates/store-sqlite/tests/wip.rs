@@ -1,5 +1,6 @@
-//! `wip_snapshot` (wsp-695): what `wip` draws of the state, cut in SQL. Open rows and lists
-//! not finished keep their bodies, every other row and list loses its `WIP_BODIES` fields and
+//! `wip_snapshot` (wsp-695): what `wip` draws of the state, cut in SQL. Open rows, lists
+//! not finished and finished lists marked `WIP_SEATED` keep their bodies, every other row
+//! and list loses its `WIP_BODIES` fields and
 //! keeps the rest, only
 //! raised asks come back, seats and claims are whole, and the rest is empty. `snapshot()` is
 //! unchanged beside it, and the in-memory store cuts the same state to the same reply.
@@ -128,6 +129,12 @@ fn world() -> Vec<Entity> {
         }],
         fields: fields(&[("body", "# a finished list's file"), ("title", "old"), ("status", "done")]),
     }));
+    es.push(Entity::List(List {
+        id: ListId("seated-list".into()),
+        state: ListState::Finished,
+        groups: vec![],
+        fields: fields(&[("body", "# a finished list a check still sits on"), ("status", "done"), (WIP_SEATED, "true")]),
+    }));
     for (id, st) in [("q-raised", AskState::Raised), ("q-acked", AskState::Acked), ("q-answered", AskState::Answered)] {
         es.push(ask(id, st));
     }
@@ -213,6 +220,9 @@ fn wip_snapshot_keeps_bodies_on_open_rows_alone_and_raised_asks_alone() {
     }
     assert_eq!(list.fields, fields(&[("title", "old"), ("status", "done")]));
     assert_eq!((&list.groups, list.state), (&whole_list.groups, whole_list.state));
+    // A finished list a seat still sits on (`WIP_SEATED`) is whole, as wip reads it.
+    let seated = ListId("seated-list".into());
+    assert_eq!(wip.lists[&seated], whole.lists[&seated], "a finished list with a seat on it is whole");
 
     // Only the raised ask.
     assert_eq!(wip.asks.keys().map(|a| a.0.as_str()).collect::<Vec<_>>(), ["q-raised"]);
@@ -243,6 +253,7 @@ fn the_sql_cut_and_the_memory_cut_agree() {
     assert!(back["rows"]["done-body"]["fields"].get("body").is_none());
     assert!(back["lists"]["old-list"]["fields"].get("body").is_none());
     assert!(back["lists"]["wsp-read-api"]["fields"].get("body").is_some());
+    assert!(back["lists"]["seated-list"]["fields"].get("body").is_some());
 }
 
 #[test]
