@@ -4173,7 +4173,7 @@ impl Wip {
                 memory,
                 daemon: daemon_by_stamp(store.daemon_tick(), heard, util::epoch_secs()),
                 disk: crate::disk::loud_of(store, &disks),
-                load: crate::throttle::loud(store),
+                load: load_with_burners(crate::throttle::loud(store), crate::cmd_role::burners_now(store)),
                 throttle: Some(crate::throttle::status_line(store)),
             }
         });
@@ -4387,6 +4387,15 @@ fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> Strin
     };
     let idle = f.and_then(|f| f.hid_idle_secs);
     crate::throttle::View::of_beat(&store.state, given, idle, &|pid| crate::host::LOCAL.pid_runs(pid)).status_line()
+}
+
+/// The load warning with the tree-less CPU burners (wsp-691) under it: either
+/// alone is a line, both are two.
+fn load_with_burners(load: Option<String>, burners: Option<String>) -> Option<String> {
+    match (load, burners) {
+        (Some(l), Some(b)) => Some(format!("{l}\n{b}")),
+        (l, b) => l.or(b),
+    }
 }
 
 /// [`crate::throttle::loud`] from a manager's host facts rather than `sysctl`
@@ -7094,6 +7103,16 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn burners_join_the_load_line() {
+        let l = || Some("load 12".to_string());
+        let b = || Some("1 CPU burner".to_string());
+        assert_eq!(load_with_burners(l(), b()).as_deref(), Some("load 12\n1 CPU burner"));
+        assert_eq!(load_with_burners(None, b()), b());
+        assert_eq!(load_with_burners(l(), None), l());
+        assert_eq!(load_with_burners(None, None), None);
+    }
+
     use super::*;
 
     /// A store of our own, with the state beside it — a raised hand lives in

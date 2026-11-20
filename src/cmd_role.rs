@@ -429,6 +429,64 @@ pub(crate) fn is_busy_loop(p: &Proc) -> bool {
     prog.rsplit('/').next() == Some("zsh") && p.command.contains("while :") && p.cpu > LOOP_CPU && p.ppid == 1
 }
 
+/// How old a tree-less burner is before `wsp wip` names it.
+const BURNER_AGE: u64 = 10 * 60;
+
+/// A CPU burner: a `yes`, a `stress`, or a busy `while :` loop, orphaned to
+/// launchd, busy, and older than [`BURNER_AGE`].
+pub(crate) fn is_burner(p: &Proc) -> bool {
+    if p.ppid != 1 || p.age <= BURNER_AGE || p.cpu <= LOOP_CPU {
+        return false;
+    }
+    let prog = p.command.split_whitespace().next().unwrap_or_default();
+    matches!(prog.rsplit('/').next(), Some("yes" | "stress" | "stress-ng")) || is_busy_loop(p)
+}
+
+/// Whether a working directory is in a tree: under a project root or a
+/// `.worktrees/` directory.
+fn in_a_tree(cwd: &str, roots: &[String]) -> bool {
+    tree_named(cwd).is_some()
+        || roots.iter().any(|r| {
+            let r = r.trim_end_matches('/');
+            !r.is_empty() && (cwd == r || cwd.starts_with(&format!("{r}/")))
+        })
+}
+
+/// The burners standing in no tree, as one line for the load warning, from
+/// the process table and a working-directory read passed in. They are named,
+/// never stopped: they are outside every tree. A burner whose directory is
+/// unknown is not named.
+pub(crate) fn burners_line(procs: &[Proc], cwd_of: &dyn Fn(&[u32]) -> BTreeMap<u32, String>, roots: &[String]) -> Option<String> {
+    let cand: Vec<&Proc> = procs.iter().filter(|p| is_burner(p)).collect();
+    if cand.is_empty() {
+        return None;
+    }
+    let pids: Vec<u32> = cand.iter().map(|p| p.pid).collect();
+    let cwds = cwd_of(&pids);
+    let loose: Vec<String> = cand
+        .iter()
+        .filter(|p| cwds.get(&p.pid).is_some_and(|c| !in_a_tree(c, roots)))
+        .map(|p| format!("{} {}", p.pid, util::truncate(&p.command, 40)))
+        .collect();
+    if loose.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} CPU burner{} in no tree, orphaned for over 10 minutes: {} — not stopped, they are outside every tree (`kill <pid>`)",
+        loose.len(),
+        if loose.len() == 1 { "" } else { "s" },
+        loose.join("; ")
+    ))
+}
+
+/// [`burners_line`] from the machine.
+pub(crate) fn burners_now(store: &Store) -> Option<String> {
+    let procs = processes();
+    let roots: Vec<String> = store.projects().into_iter().flat_map(|p| p.roots).collect();
+    let cwd_of = |pids: &[u32]| crate::host::Host::cwds(&crate::host::LOCAL, Some(pids)).map(|o| parse_cwds(&o)).unwrap_or_default();
+    burners_line(&procs, &cwd_of, &roots)
+}
+
 /// What the guards ask of the store, so the rule is testable without one.
 pub(crate) struct Facts<'a> {
     /// A row's status, by its tree's name.
@@ -1071,6 +1129,47 @@ mod tests {
     }
 
     const VITE: &str = "node /r/.worktrees/x/node_modules/.bin/vite --port 5173";
+
+    #[test]
+    fn burners_are_named_only_when_in_no_tree() {
+        let orphan = |pid, age, cpu, ppid, cmd: &str| Proc { pid, ppid, age, cpu, cputime: 9, command: cmd.into() };
+        let procs = vec![
+            orphan(10, 700, 90.0, 1, "/usr/bin/yes"),
+            orphan(11, 700, 90.0, 1, "yes"),
+            orphan(12, 700, 90.0, 1, "/usr/local/bin/stress --cpu 4"),
+            orphan(13, 700, 90.0, 1, "/bin/zsh -c while :; do :; done"),
+            orphan(14, 300, 90.0, 1, "yes"),
+            orphan(15, 700, 90.0, 400, "yes"),
+            orphan(16, 700, 2.0, 1, "yes"),
+            orphan(17, 700, 90.0, 1, "/usr/bin/yes"),
+            orphan(18, 700, 90.0, 1, "sleep 100"),
+        ];
+        let cwds: BTreeMap<u32, String> = [
+            (10, "/Users/e/scratch"),
+            (11, "/Users/e/claude/wsp/.worktrees/wsp-693"),
+            (12, "/tmp/x"),
+            (13, "/Users/e/claude/wsp"),
+            (14, "/tmp"),
+            (15, "/tmp"),
+            (16, "/tmp"),
+        ]
+        .into_iter()
+        .map(|(p, c)| (p, c.to_string()))
+        .collect();
+        let read = std::cell::RefCell::new(Vec::new());
+        let cwd_of = |pids: &[u32]| {
+            read.borrow_mut().extend_from_slice(pids);
+            cwds.clone()
+        };
+        let line = burners_line(&procs, &cwd_of, &["/Users/e/claude/wsp".to_string()]).unwrap();
+        assert!(line.starts_with("2 CPU burners in no tree"), "{line}");
+        assert!(line.contains("10 /usr/bin/yes") && line.contains("12 /usr/local/bin/stress"), "{line}");
+        assert!(!line.contains("11 yes") && !line.contains("13 ") && !line.contains("17 "), "{line}");
+        // only the candidates were looked up, and none is named without a cwd
+        assert_eq!(*read.borrow(), vec![10, 11, 12, 13, 17]);
+        assert!(burners_line(&procs[..1], &|_| BTreeMap::new(), &[]).is_none());
+        assert!(burners_line(&procs[4..], &cwd_of, &[]).is_none());
+    }
 
     #[test]
     fn reap_allows_a_pid_in_the_tree_of_a_doing_row_with_no_seat_and_refuses_one_a_seat_holds() {
