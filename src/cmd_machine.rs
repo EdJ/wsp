@@ -305,33 +305,17 @@ fn agents_on<'a>(here: &'a [Standing], name: &str) -> Vec<&'a Standing> {
     here.iter().filter(|s| s.machine == name).collect()
 }
 
-fn agents_json(rows: &[&Standing]) -> Value {
-    json!(rows
-        .iter()
-        .map(|s| json!({
-            "pane": s.pane, "agent": s.agent, "state": s.state, "holding": s.holding,
-        }))
-        .collect::<Vec<_>>())
-}
-
+/// `machine ls --json`: the fleet's reads handed to `wsp-view` as plain values.
 fn list_json(f: &Fleet) -> Value {
-    let here = standing(f);
-    let rows: Vec<_> = f
-        .machines
-        .iter()
-        .map(|m| {
-            let mut v = machine_json(m, f.live.get(&m.name));
-            v["agents"] = agents_json(&agents_on(&here, &m.name));
-            v
-        })
-        .collect();
-    json!({
-        "seat": f.seat,
-        // Null and not 0 with no cap, for `machine_json`'s reason.
-        "seat_cap": f.seat_cap,
-        "seat_working": f.seat_working,
-        "machines": rows,
-        "seat_agents": agents_json(&agents_on(&here, "")),
+    wsp_view::machine::list_json(&wsp_view::machine::Fleet {
+        machines: f.machines.iter().map(|m| (record_of(m), f.live.get(&m.name).map(live_of))).collect(),
+        agents: standing(f)
+            .into_iter()
+            .map(|s| wsp_view::machine::Standing { machine: s.machine, pane: s.pane, agent: s.agent, state: s.state, holding: s.holding })
+            .collect(),
+        seat: f.seat.clone(),
+        seat_cap: f.seat_cap,
+        seat_working: f.seat_working.clone(),
     })
 }
 
@@ -1368,23 +1352,43 @@ mod tests {
 
 }
 
+/// The machine's object, drawn by `wsp-view` from the record and its live facts.
 fn machine_json(m: &Machine, live: Option<&MachineLive>) -> serde_json::Value {
-    json!({
-        "name": m.name,
-        "ssh": m.ssh,
-        "os": m.os,
-        "arch": m.arch,
-        "backend_at": m.backend_at,
-        "exec_dir": m.exec_dir,
-        "sup_at": m.sup_at,
-        // Null and not 0 when there is no cap: a governor asking for the
-        // number wants to be able to tell "nobody has decided" from a number,
-        // and `0` is the one answer that reads as an instruction.
-        "agents": m.agents,
-        "lease": m.lease_secs(),
-        "link": crate::model::LINK_REQUIRED,
-        "status": m.status,
-        "added": m.added,
-        "live": live.map(|l| l.to_value()),
-    })
+    wsp_view::machine::machine_json(&record_of(m), live.map(live_of).as_ref())
+}
+
+fn record_of(m: &Machine) -> wsp_view::machine::Record {
+    wsp_view::machine::Record {
+        name: m.name.clone(),
+        ssh: m.ssh.clone(),
+        os: m.os.clone(),
+        arch: m.arch.clone(),
+        backend_at: m.backend_at.clone(),
+        exec_dir: m.exec_dir.clone(),
+        sup_at: m.sup_at.clone(),
+        agents: m.agents,
+        lease: m.lease_secs(),
+        status: m.status.clone(),
+        added: m.added.clone(),
+    }
+}
+
+fn live_of(l: &MachineLive) -> wsp_view::machine::Live {
+    wsp_view::machine::Live {
+        reachable: l.reachable,
+        last_seen: l.last_seen.clone(),
+        heard: l.heard.clone(),
+        leases: l.leases.clone(),
+        tunnel: l.tunnel.clone(),
+        socket: l.socket.clone(),
+        wire: l.wire,
+        wire_oldest: l.wire_oldest,
+        ready: l.ready,
+        checked: l.checked.clone(),
+        check_error: l.check_error.clone(),
+        shim_warning: l.shim_warning.clone(),
+        error: l.error.clone(),
+        tick_secs: l.tick_secs,
+        beat_at: l.beat_at.clone(),
+    }
 }

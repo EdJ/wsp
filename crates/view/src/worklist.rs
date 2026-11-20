@@ -1,0 +1,159 @@
+//! `worklist ls --json` (and the object every worklist verb emits): pure
+//! functions over plain values the CLI has already read.
+//!
+//! A worklist's phase, position and queue come from the store's files and the
+//! machine's seats, so the caller works them out and hands the answers in as
+//! [`Head`], [`Listing`] and [`Queue`]; this module only draws them.
+
+use serde_json::{json, Value};
+
+use crate::common::iso_at;
+
+/// One declared output of a worklist and whether its file is there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Output {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub present: bool,
+}
+
+/// The object every worklist verb emits, before `project` is added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Head {
+    pub id: String,
+    pub title: String,
+    pub caption_text: String,
+    pub caption_from: String,
+    /// The status word (`executing`, ...).
+    pub status: String,
+    pub held: bool,
+    pub waiting_on_ed: bool,
+    pub parked: bool,
+    /// The word on the record, trimmed.
+    pub stored: String,
+    pub planned: Option<String>,
+    pub created: String,
+    /// How many groups there are.
+    pub groups: usize,
+    /// The group the run is at, if any.
+    pub at: Option<usize>,
+    pub outputs: Vec<Output>,
+    pub outputs_dir: String,
+}
+
+/// Where a planned list queues and what it waits on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Queue {
+    /// One-based place in the queue.
+    pub n: usize,
+    /// The text of what it waits on; `None` may start.
+    pub waits: Option<String>,
+}
+
+/// One row of `worklist ls --json`: the head and the facts the listing adds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listing {
+    pub head: Head,
+    pub segment: String,
+    pub open: usize,
+    pub gone: Vec<String>,
+    pub unwritten: Vec<usize>,
+    /// When anything last happened, epoch seconds.
+    pub activity: i64,
+    pub prio: String,
+    pub after: Option<String>,
+    /// Present for a planned list only.
+    pub queue: Option<Queue>,
+}
+
+/// The worklist object where the position is already in hand.
+pub fn head_json(h: &Head) -> Value {
+    json!({
+        "id": h.id,
+        "title": h.title,
+        "caption": json!({ "text": h.caption_text, "from": h.caption_from }),
+        "status": h.status,
+        "flags": json!({ "held": h.held, "waiting_on_ed": h.waiting_on_ed, "parked": h.parked }),
+        "stored": h.stored,
+        "planned": h.planned,
+        "created": h.created,
+        "groups": h.groups,
+        "at": h.at,
+        "outputs": h.outputs.iter().map(|o| json!({ "name": o.name, "kind": o.kind, "file": o.file, "present": o.present })).collect::<Vec<_>>(),
+        "outputs_dir": h.outputs_dir,
+    })
+}
+
+/// One row for a parser: the head and the facts a listing adds to it.
+pub fn listed_json(l: &Listing) -> Value {
+    let mut out = head_json(&l.head);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("segment".into(), json!(l.segment));
+        o.insert("open".into(), json!(l.open));
+        o.insert("gone".into(), json!(l.gone));
+        o.insert("unwritten".into(), json!(l.unwritten));
+        o.insert("activity".into(), json!(iso_at(l.activity)));
+        o.insert("prio".into(), json!(l.prio));
+        o.insert("after".into(), json!(l.after));
+        // A planned list says where it queues and what it waits on; the rest
+        // carry neither key (`wsp-383`).
+        if let Some(q) = &l.queue {
+            o.insert("queue".into(), json!(q.n));
+            o.insert("may_start".into(), json!(q.waits.is_none()));
+            o.insert("waits".into(), json!(q.waits));
+        }
+    }
+    out
+}
+
+/// `worklist ls --json`: every list, no collapse and no `--all`.
+pub fn list_json(listed: &[Listing]) -> Value {
+    Value::Array(listed.iter().map(listed_json).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head() -> Head {
+        Head {
+            id: "w".into(),
+            title: "W".into(),
+            caption_text: "W".into(),
+            caption_from: "title".into(),
+            status: "executing".into(),
+            held: false,
+            waiting_on_ed: false,
+            parked: false,
+            stored: "running".into(),
+            planned: None,
+            created: "2026-01-01T00:00:00Z".into(),
+            groups: 2,
+            at: Some(1),
+            outputs: vec![],
+            outputs_dir: "/x".into(),
+        }
+    }
+
+    #[test]
+    fn a_queued_list_carries_queue_may_start_and_waits_and_the_rest_do_not() {
+        let mut l = Listing {
+            head: head(),
+            segment: "running".into(),
+            open: 1,
+            gone: vec![],
+            unwritten: vec![],
+            activity: 0,
+            prio: "normal".into(),
+            after: None,
+            queue: None,
+        };
+        assert!(listed_json(&l).get("queue").is_none());
+        l.queue = Some(Queue { n: 2, waits: Some("room: 1 slot short".into()) });
+        let v = listed_json(&l);
+        assert_eq!((v["queue"].clone(), v["may_start"].clone()), (json!(2), json!(false)));
+        assert_eq!(v["waits"], "room: 1 slot short");
+        assert_eq!(v["activity"], "1970-01-01T00:00:00Z");
+    }
+}
