@@ -393,33 +393,6 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
     Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver })
 }
 
-/// What `doctor` says of orders (wsp-122, wsp-128): which path owns them,
-/// always, whether or not a daemon answers; and under `store`, how long the
-/// oldest order still `queued` has waited, read from the daemon's API.
-pub(crate) fn orders_health(store: &Store, notes: &mut Vec<String>) {
-    let mode = crate::orders::mode();
-    let flag = std::env::var(crate::orders::ENV).ok();
-    notes.push(crate::orders::describe(mode, flag.as_deref()));
-    if mode == crate::orders::Mode::Store {
-        let now = crate::util::epoch_secs() * 1000;
-        notes.push(queue_line(crate::orders::oldest_queued(store, std::time::Duration::from_secs(2)), now));
-    }
-}
-
-/// [`orders_health`]'s second line, from the oldest queued order's time and
-/// now, both in epoch milliseconds.
-fn queue_line(oldest: Result<Option<wsp_store_contract::At>, crate::orders::Error>, now_ms: i64) -> String {
-    match oldest {
-        Ok(None) => "orders: nothing queued".into(),
-        Ok(Some(at)) => {
-            let secs = (now_ms - at.0 as i64).max(0) / 1000;
-            format!("orders: the oldest queued order has waited {}", crate::util::duration_human(secs))
-        }
-        Err(crate::orders::Error::Silent(why)) => format!("orders: the queue was not read: no API answered ({why})"),
-        Err(e) => format!("orders: the queue was not read ({e:?})"),
-    }
-}
-
 /// What `doctor` says about the daemon: that there is one, that there are two,
 /// or that there is none.
 ///
@@ -1127,7 +1100,7 @@ mod tests {
 
     /// The tick under `WSP_HOST=manager` and under `inproc` (wsp-028, leg 2).
     mod tick_by_host {
-        use super::super::{queue_line, repairs};
+        use super::super::repairs;
         use crate::fold;
         use crate::place::State;
         use crate::store::Store;
@@ -1407,17 +1380,6 @@ mod tests {
             for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
                 assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
             }
-        }
-
-        /// doctor's queue line: nothing queued, an age, or why it was not read.
-        #[test]
-        fn doctor_dates_the_queue_by_its_oldest_order() {
-            assert_eq!(queue_line(Ok(None), 10_000), "orders: nothing queued");
-            let aged = queue_line(Ok(Some(wsp_store_contract::At(10_000))), 10_000 + 90 * 60 * 1000);
-            assert!(aged.starts_with("orders: the oldest queued order has waited "), "{aged}");
-            assert_eq!(aged, format!("orders: the oldest queued order has waited {}", util::duration_human(90 * 60)));
-            let silent = queue_line(Err(crate::orders::Error::Silent("refused".into())), 0);
-            assert!(silent.contains("no API answered"), "{silent}");
         }
 
         /// The second tick, its line left uncounted by [`tick`]'s filter.

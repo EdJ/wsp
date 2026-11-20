@@ -6947,7 +6947,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
-    crate::daemon::orders_health(store, &mut notes);
+    crate::orders::health(store, &mut notes);
     crate::mirror::api_health(
         &store.state,
         crate::daemon::running(&store.state).as_deref(),

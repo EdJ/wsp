@@ -92,6 +92,32 @@ pub fn describe(mode: Mode, orders: Option<&str>) -> String {
     }
 }
 
+/// What `doctor` says of orders (wsp-122, wsp-128): which path owns them,
+/// always, whether or not a daemon answers; and under `store`, how long the
+/// oldest order still `queued` has waited, read from the daemon's API.
+pub fn health(store: &Store, notes: &mut Vec<String>) {
+    let mode = mode();
+    notes.push(describe(mode, std::env::var(ENV).ok().as_deref()));
+    if mode == Mode::Store {
+        let now = crate::util::epoch_secs() * 1000;
+        notes.push(queue_line(oldest_queued(store, Duration::from_secs(2)), now));
+    }
+}
+
+/// [`health`]'s second line, from the oldest queued order's time and now,
+/// both in epoch milliseconds.
+fn queue_line(oldest: Result<Option<wsp_store_contract::At>, Error>, now_ms: i64) -> String {
+    match oldest {
+        Ok(None) => "orders: nothing queued".into(),
+        Ok(Some(at)) => {
+            let secs = (now_ms - at.0 as i64).max(0) / 1000;
+            format!("orders: the oldest queued order has waited {}", crate::util::duration_human(secs))
+        }
+        Err(Error::Silent(why)) => format!("orders: the queue was not read: no API answered ({why})"),
+        Err(e) => format!("orders: the queue was not read ({e:?})"),
+    }
+}
+
 /// The domain mode the daemon opens `state.db` with.
 pub fn server_mode(mode: Mode) -> wsp_server::Mode {
     match mode {
@@ -599,6 +625,16 @@ pub(crate) mod tests {
         assert!(describe(Mode::Files, None).contains("WSP_HOST is not manager"));
         assert!(describe(Mode::Files, Some("store")).contains("only under WSP_HOST=manager"));
         assert!(describe(Mode::Store, Some("store")).starts_with("orders: store"));
+    }
+
+    /// doctor's queue line: nothing queued, an age, or why it was not read.
+    #[test]
+    fn doctor_dates_the_queue_by_its_oldest_order() {
+        assert_eq!(queue_line(Ok(None), 10_000), "orders: nothing queued");
+        let aged = queue_line(Ok(Some(wsp_store_contract::At(10_000))), 10_000 + 90 * 60 * 1000);
+        assert_eq!(aged, format!("orders: the oldest queued order has waited {}", crate::util::duration_human(90 * 60)));
+        let silent = queue_line(Err(Error::Silent("refused".into())), 0);
+        assert!(silent.contains("no API answered"), "{silent}");
     }
 
     /// wsp-128: doctor's date for the queue is the oldest still-`queued`
