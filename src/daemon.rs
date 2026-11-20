@@ -353,8 +353,11 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         return None;
     }
     let say = |line: String| wsp_store::store::log_line(store, &line);
+    // The composed domain, the mirror still putting orders (wsp-121): the
+    // live daemon is unchanged until group 4's flag turns on `Owned`.
+    let domain = std::sync::Arc::new(wsp_server::Composed::new(wsp_server::Mode::Mirrored));
     let db: wsp_server::SharedStore =
-        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), std::sync::Arc::new(wsp_server::Mirror)) {
+        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), domain) {
             Ok(db) => std::sync::Arc::new(db),
             Err(e) => {
                 say(format!("api: state.db did not open ({e:?}); the daemon runs without the API"));

@@ -2,7 +2,7 @@
 name = "wsp-server"
 version = "0.1.0"
 edition = "2021"
-description = "The state core's server (docs/state-core.md section 6), step 1's part: the read verbs and subscribe on TCP over any dyn Store, and the mirror domain"
+description = "The state core's server (docs/state-core.md section 6): the read verbs and subscribe on TCP over any dyn Store, the mirror domain, and from step 2 the orders machine composed beside it with its commands"
 
 [lib]
 path = "src/lib.rs"
@@ -11,6 +11,8 @@ path = "src/lib.rs"
 # Frames are lines of JSON; a mirrored entity is an event's JSON payload.
 serde_json = "1"
 wsp-api = { path = "../api" }
+# Step 2: the orders machine, composed beside the mirror (src/domain.rs).
+wsp-machines = { path = "../machines" }
 wsp-store-contract = { path = "../store-contract" }
 
 [dev-dependencies]

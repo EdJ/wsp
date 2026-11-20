@@ -2,9 +2,12 @@
 //! only what step 1 serves: the read verbs of 4.2 and `subscribe` (4.3), on TCP
 //! on loopback and the tailnet from the start (D19, agent-manager 3.4), over
 //! any `dyn Store`, and [`mirror::Mirror`], the domain step 1's store runs.
-//! Commands, leased once-only work and the executor half come at steps 2-5;
-//! until then every command verb is answered `unsupported`. Nothing starts
-//! the server until step 1's group 6. See `MAP.md`.
+//! Step 2 (wsp-121) adds [`domain::Composed`], the mirror and the orders
+//! machine under a [`domain::Mode`], and the orders machine's commands over
+//! the API (`conn`'s module docs): `order.send` and `order.cancel` from a
+//! person or a seat, the answers and `order.deliver` from the instance itself
+//! or a manager. Every other command verb is answered `unsupported` until its
+//! step. See `MAP.md`.
 //!
 //! **Listening** ([`Server::start`]). It binds loopback and the tailnet
 //! addresses it is given, on one port; it refuses any address, and any peer,
@@ -20,8 +23,8 @@
 //! replay, then the head followed through `wait_for`, with a beat. The
 //! carrier is [`tcp::Tcp`].
 //!
-//! It goes through `Store` only, and links `wsp-api` and `wsp-store-contract`
-//! alone of the workspace (never the sqlite crate: section 6).
+//! It goes through `Store` only, and links `wsp-api`, `wsp-store-contract` and
+//! `wsp-machines` alone of the workspace (never the sqlite crate: section 6).
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -39,10 +42,12 @@ use wsp_api::{
 use wsp_store_contract::{At, Store};
 
 mod conn;
+pub mod domain;
 pub mod mirror;
 mod subscribe;
 pub mod tcp;
 
+pub use domain::{Composed, Mode, OWNED};
 pub use mirror::Mirror;
 
 /// The store a server serves: any backend, shared with its threads.
