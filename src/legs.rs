@@ -1049,50 +1049,52 @@ pub(crate) fn rework_by(old: &[Leg], verdict: &str, head: &str) -> Result<Option
 
 // ---- the record, read ----------------------------------------------------------
 
-/// What a done leg cost, from its end line: `{usd, turns, peak, seconds}`, or
-/// null for a leg that has not ended (compound-561 A5). `usd` is null where the
-/// record kept nothing to price, which is not the same as free.
-fn spent(ran: &[crate::cmd_attempts::Attempt], l: &Leg) -> serde_json::Value {
-    let Some(a) = ran.iter().find(|a| a.leg.as_deref() == Some(l.name.as_str()) && !a.until.is_empty()) else {
-        return serde_json::Value::Null;
-    };
-    serde_json::json!({
-        "usd": crate::cmd_attempts::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
-        "turns": a.turns,
-        "peak": a.peak,
-        "seconds": a.seconds(),
+/// What a done leg cost, from its end line: null for a leg that has not ended
+/// (compound-561 A5). `usd` is null where the record kept nothing to price,
+/// which is not the same as free.
+fn spent(ran: &[crate::cmd_attempts::Attempt], l: &Leg) -> Option<wsp_view::task::Spent> {
+    let a = ran.iter().find(|a| a.leg.as_deref() == Some(l.name.as_str()) && !a.until.is_empty())?;
+    Some(wsp_view::task::Spent {
+        usd: crate::cmd_attempts::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
+        turns: a.turns,
+        peak: a.peak,
+        seconds: a.seconds(),
     })
 }
 
 /// The legs as `wsp show --json` gives them.
 pub(crate) fn json(t: &Task) -> serde_json::Value {
+    wsp_view::task::legs_json(&view(t))
+}
+
+/// The legs as `wsp-view` takes them.
+pub(crate) fn view(t: &Task) -> Vec<wsp_view::task::Leg> {
     let ls = legs(t);
     let w = waits(&ls);
     let ready = ready(&ls);
     let ran = crate::cmd_attempts::attempts_of(t);
-    serde_json::json!(ls
-        .iter()
+    ls.iter()
         .zip(w)
-        .map(|(l, w)| serde_json::json!({
-            "spent": spent(&ran, l),
-            "name": l.name,
-            "agent": policy_line(&l.policy),
-            "default": is_default(&l.policy),
-            "why": l.why,
-            "state": l.state.as_str(),
-            "ready": ready.contains(&l.name),
-            "after": w,
-            "pane": l.pane,
-            "tree": l.tree,
-            "caption": l.caption,
-            "skipped": l.skipped,
-            "started": l.started,
-            "ended": l.closed,
-            "order": l.order,
-            "baton": l.baton,
-            "rework_of": l.rework,
-        }))
-        .collect::<Vec<_>>())
+        .map(|(l, w)| wsp_view::task::Leg {
+            spent: spent(&ran, l),
+            name: l.name.clone(),
+            agent: policy_line(&l.policy),
+            default: is_default(&l.policy),
+            why: l.why.clone(),
+            state: l.state.as_str().to_string(),
+            ready: ready.contains(&l.name),
+            after: w,
+            pane: l.pane.clone(),
+            tree: l.tree.clone(),
+            caption: l.caption.clone(),
+            skipped: l.skipped.clone(),
+            started: l.started.clone(),
+            ended: l.closed.clone(),
+            order: l.order.clone(),
+            baton: l.baton.clone(),
+            rework_of: l.rework.clone(),
+        })
+        .collect()
 }
 
 /// One line a leg, for `wsp show` and `wsp leg show`: every tier printed, the

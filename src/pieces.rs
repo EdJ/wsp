@@ -44,7 +44,9 @@
 //!   was already wrong in the same way before the write does not make an
 //!   unrelated write refuse.
 
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
 use crate::model::{Policy, Status, Task};
 use crate::util;
@@ -939,17 +941,32 @@ pub(crate) fn section_for_show(t: &Task, whole_entries: bool) -> Option<String> 
 
 /// One piece for `--json`: `{n, id, title, batch, state, seat, tree, caption}`.
 pub(crate) fn piece_json(row: &str, p: &Piece) -> Value {
-    json!({
-        "n": p.n, "id": p.id(row), "title": p.title, "batch": p.batch,
-        "state": p.state.as_str(), "seat": p.pane, "tree": p.tree, "caption": p.caption,
-    })
+    wsp_view::task::piece_json(&piece_view(row, p))
+}
+
+/// One piece as `wsp-view` takes it.
+fn piece_view(row: &str, p: &Piece) -> wsp_view::task::Piece {
+    wsp_view::task::Piece {
+        n: p.n,
+        id: p.id(row),
+        title: p.title.clone(),
+        batch: p.batch,
+        state: p.state.as_str().to_string(),
+        seat: p.pane.clone(),
+        tree: p.tree.clone(),
+        caption: p.caption.clone(),
+    }
 }
 
 /// A row's pieces for `--json`: `[{n, id, title, batch, state, seat, tree,
 /// caption}]`.
 pub(crate) fn json(t: &Task) -> Value {
-    let rec = record(t);
-    Value::Array(rec.pieces.iter().map(|p| piece_json(&t.id, p)).collect())
+    wsp_view::task::pieces_json(&view(t))
+}
+
+/// A row's pieces as `wsp-view` takes them.
+pub(crate) fn view(t: &Task) -> Vec<wsp_view::task::Piece> {
+    record(t).pieces.iter().map(|p| piece_view(&t.id, p)).collect()
 }
 
 // ---- addressed ----------------------------------------------------------------------

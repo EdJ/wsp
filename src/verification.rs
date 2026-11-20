@@ -547,41 +547,49 @@ fn entries(t: &Task) -> (Vec<Pass>, Vec<Run>) {
 /// them. `caption` is §17.6's shape on a pass that has a verdict, and null on
 /// one still reading or superseded: those have no verdict to caption, and
 /// what they are is `wsp-242`'s stage.
-pub(crate) fn json(t: &Task) -> serde_json::Value {
-    serde_json::json!(passes(t)
+#[cfg(test)]
+fn json(t: &Task) -> serde_json::Value {
+    wsp_view::task::verification_json(&view(t))
+}
+
+/// The passes as `wsp-view` takes them, oldest first.
+pub(crate) fn view(t: &Task) -> Vec<wsp_view::task::Pass> {
+    passes(t)
         .iter()
         .map(|p| {
             let decided = matches!(p.state, State::Holds | State::Blocks);
             let at = p.decided.as_deref().unwrap_or(&p.at);
-            serde_json::json!({
-                "state": p.state.as_str(),
-                "verdict": p.text,
-                "caption": decided.then(|| crate::caption::of_pass(p.state.as_str(), p.caption.as_deref(), at).json()),
-                "at": p.at,
-                "decided": p.decided,
-                "read": p.read,
-                "landed": p.landed,
-                "pane": p.pane,
-                "did": p.did.as_ref().map(did_json),
-                "checked": p.checked.iter().map(|c| serde_json::json!({ "item": c.item, "held": c.held })).collect::<Vec<_>>(),
-            })
+            wsp_view::task::Pass {
+                state: p.state.as_str().to_string(),
+                verdict: p.text.clone(),
+                caption: decided.then(|| crate::stage::told_view(&crate::caption::of_pass(p.state.as_str(), p.caption.as_deref(), at))),
+                at: p.at.clone(),
+                decided: p.decided.clone(),
+                read: p.read.clone(),
+                landed: p.landed.clone(),
+                pane: p.pane.clone(),
+                did: p.did.as_ref().map(did_view),
+                checked: p.checked.iter().map(|c| (c.item.clone(), c.held)).collect(),
+            }
         })
-        .collect::<Vec<_>>())
+        .collect()
 }
 
-/// What a verifier did, as `wsp show --json` gives it (`wsp-325`).
-fn did_json(d: &crate::did::Did) -> serde_json::Value {
-    serde_json::json!({
-        "ran": d.ran.iter().map(|c| serde_json::json!({ "command": c.text, "test": c.is_test(), "outcome": c.last().word() })).collect::<Vec<_>>(),
-        "ran_more": d.more_ran,
-        "drove": d.drove,
-        "read": {
-            "files": d.read.files.iter().map(|f| serde_json::json!({ "path": f.path, "lines": f.lines.iter().map(|(a, b)| serde_json::json!([a, b])).collect::<Vec<_>>() })).collect::<Vec<_>>(),
-            "files_more": d.read.more_files,
-            "diffs": d.read.diffs,
-            "diffs_more": d.read.more_diffs,
-        },
-    })
+/// What a verifier did, as `wsp-view` takes it (`wsp-325`).
+fn did_view(d: &crate::did::Did) -> wsp_view::task::Did {
+    wsp_view::task::Did {
+        ran: d
+            .ran
+            .iter()
+            .map(|c| wsp_view::task::Ran { command: c.text.clone(), test: c.is_test(), outcome: c.last().word().to_string() })
+            .collect(),
+        ran_more: d.more_ran,
+        drove: d.drove.clone(),
+        files: d.read.files.iter().map(|f| wsp_view::task::FileRead { path: f.path.clone(), lines: f.lines.clone() }).collect(),
+        files_more: d.read.more_files,
+        diffs: d.read.diffs.clone(),
+        diffs_more: d.read.more_diffs,
+    }
 }
 
 /// Write the passes back under the heading, in time order, with the check runs
