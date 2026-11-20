@@ -85,7 +85,9 @@ pub fn describe(mode: Mode, orders: Option<&str>) -> String {
             "orders: store, the default under WSP_HOST=manager (the orders machine owns them; WSP_ORDERS=files is the rollback)".into()
         }
         (Mode::Store, _) => "orders: store (the orders machine owns them; the daemon delivers under deliver:<seat>)".into(),
-        (Mode::Files, None) => "orders: files (WSP_HOST is not manager)".into(),
+        // Unset WSP_HOST is the manager too, but store follows only the
+        // explicit word until wsp-358; say which, not "not the manager".
+        (Mode::Files, None) => "orders: files (store is the default only under an explicit WSP_HOST=manager until wsp-358)".into(),
         (Mode::Files, Some("files")) => "orders: files (WSP_ORDERS=files, the rollback)".into(),
         (Mode::Files, Some("store")) => "orders: files (WSP_ORDERS=store holds only under WSP_HOST=manager)".into(),
         (Mode::Files, Some(v)) => format!("orders: files (WSP_ORDERS={v}; only store, or unset, is the store)"),
@@ -622,7 +624,7 @@ pub(crate) mod tests {
         assert!(describe(Mode::Store, None).contains("the default under WSP_HOST=manager"));
         assert!(describe(Mode::Store, None).contains("WSP_ORDERS=files is the rollback"));
         assert!(describe(Mode::Files, Some("files")).contains("the rollback"));
-        assert!(describe(Mode::Files, None).contains("WSP_HOST is not manager"));
+        assert!(describe(Mode::Files, None).contains("only under an explicit WSP_HOST=manager"));
         assert!(describe(Mode::Files, Some("store")).contains("only under WSP_HOST=manager"));
         assert!(describe(Mode::Store, Some("store")).starts_with("orders: store"));
     }
