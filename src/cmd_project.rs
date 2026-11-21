@@ -217,10 +217,12 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
 
     let p = Paint::new();
     let seats = seat_lines(store, &p);
+    let inits = crate::cmd_initiative::tree_lines(store);
     fn walk(
         index: &Index,
         counts: &std::collections::BTreeMap<String, resolve::Counts>,
         seats: &std::collections::BTreeMap<String, Vec<String>>,
+        inits: &std::collections::BTreeMap<String, Vec<String>>,
         parent: Option<&str>,
         prefix: &str,
         paint: &Paint,
@@ -259,7 +261,10 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
             for line in seats.get(&kid.id).into_iter().flatten() {
                 println!("{next_prefix}{line}");
             }
-            walk(index, counts, seats, Some(&kid.id), &next_prefix, paint);
+            for line in inits.get(&kid.id).into_iter().flatten() {
+                println!("{next_prefix}{line}");
+            }
+            walk(index, counts, seats, inits, Some(&kid.id), &next_prefix, paint);
         }
     }
 
@@ -284,7 +289,10 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
         for line in seats.get(&root.id).into_iter().flatten() {
             println!("{line}");
         }
-        walk(&index, &counts, &seats, Some(&root.id), "", &p);
+        for line in inits.get(&root.id).into_iter().flatten() {
+            println!("{line}");
+        }
+        walk(&index, &counts, &seats, &inits, Some(&root.id), "", &p);
         if i + 1 < roots.len() {
             println!();
         }
@@ -980,6 +988,7 @@ fn product_show(store: &Store, args: &Args) -> i32 {
             .collect();
         let mut v = project_json(&prod, &index);
         v["projects"] = json!(list);
+        v["initiatives"] = json!(crate::cmd_initiative::all(store).iter().filter(|i| i.product == prod.id).map(|i| i.json()).collect::<Vec<_>>());
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return 0;
     }
@@ -987,6 +996,13 @@ fn product_show(store: &Store, args: &Args) -> i32 {
     println!("{}  {}", p.bold(&prod.id), prod.name);
     if !prod.brief.is_empty() {
         println!("{}", prod.brief);
+    }
+    let inits: Vec<_> = crate::cmd_initiative::all(store).into_iter().filter(|i| i.product == prod.id).collect();
+    if !inits.is_empty() {
+        println!("\n{}", p.dim("INITIATIVES"));
+        for i in &inits {
+            println!("{}  {}  {}", util::pad(&i.id, 8), util::pad(&i.state, 12), i.title);
+        }
     }
     if members.is_empty() {
         println!("\nno projects yet — wsp project set <p> parent={}", prod.id);

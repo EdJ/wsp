@@ -4,6 +4,11 @@ PROJECTS
   wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…
   wsp product add <slug> [--name N] [--brief …] | ls | show <slug>  a grouping of
                                     projects (move one in: wsp project set <p> parent=<product>)
+  wsp initiative add "title" --product P [-p proj]… | ls [--product P] | show <id>
+                                    | edit <id> --brief|--requirements|… [--from F|-]
+                                    | set <id> k=v… | link <id> --list L|--task T [--clear]
+                                    | brief <id>  a record below a product: artefacts and
+                                    decisions (wsp decide init-N "…"), ids init-N
   wsp project ls|projects [--tag T] list projects
   wsp tree                          hierarchy with open counts
   wsp project show <id> [--decisions] [--handbook]  brief, tags, roots, tasks

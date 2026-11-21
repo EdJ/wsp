@@ -2210,6 +2210,12 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    if needle.starts_with("init-") {
+        if let Some(code) = crate::cmd_initiative::decide(store, &needle, &text, &supersedes, args.json()) {
+            return code;
+        }
+    }
+
     if let Some(t) = store.find_task(&needle) {
         if let Err(code) = check_supersedes(&t.body, &supersedes, &t.id) {
             return code;

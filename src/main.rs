@@ -59,6 +59,7 @@ mod cmd_machine;
 mod cmd_mandate;
 mod cmd_message;
 mod cmd_migrate;
+mod cmd_initiative;
 mod cmd_project;
 mod cmd_resume;
 mod cmd_sandbox;
