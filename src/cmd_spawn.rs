@@ -1165,6 +1165,13 @@ fn tier(
     Ok((model, effort))
 }
 
+/// Flags added to a seat's argv go before the `--` that opens its order, never
+/// after it, where they would be read as the order's words.
+fn add_before_order(argv: &mut Vec<String>, extra: Vec<String>) {
+    let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv.splice(at..at, extra);
+}
+
 /// What `--kind attention` needs that no other kind does (wsp-330), refused
 /// before a seat is opened: a backend that can start it, a plain member's row
 /// that opted in with `attention:` in its `## Packet`, and a command to end at.
@@ -3446,7 +3453,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             false => Vec::new(),
         };
         let has_role = !role.is_empty();
-        spawn_args.extend(role);
+        add_before_order(&mut spawn_args, role);
         // A retro seat is told to search every project's rows; it gets the
         // read-only verbs that do it (compounding-614). A member seat gets
         // `wsp check <its row> --set`, which wsp limits itself (wsp-681).
@@ -3456,7 +3463,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             .as_deref()
             .filter(|_| args.has("agent") && !args.has("govern") && !verifying && checking.is_none() && leg_name.is_none() && piece_rec.is_none());
         if !has_role {
-            spawn_args.extend(crate::cmd_role::seat_spawn_args(&kind, member_row, verifying, &row_tags, &store.state));
+            add_before_order(&mut spawn_args, crate::cmd_role::seat_spawn_args(&kind, member_row, verifying, &row_tags, &store.state));
         }
         let agent = Agent { kind: kind.clone(), name: name.clone(), args: spawn_args, key };
         let far_start = args.get("on").is_some();
@@ -4332,7 +4339,7 @@ fn rotate_as(
         brief: None,
     };
     let mut spawn_args = how.args(&spawn);
-    spawn_args.extend(crate::cmd_role::settings_args(&kind, Some(&scope), work.primary));
+    add_before_order(&mut spawn_args, crate::cmd_role::settings_args(&kind, Some(&scope), work.primary));
     // A governor has no row: its key is its seat's own (see `seat_key`).
     let key = spawn_key(store, Some(&scope)).unwrap_or_else(|| seat_key(&seat));
     let agent = Agent { kind: kind.clone(), name: subject.clone(), args: spawn_args, key: Some(key) };
