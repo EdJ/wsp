@@ -353,7 +353,7 @@ impl Window {
 
 pub fn new(store: &Store, args: &Args) -> i32 {
     let Some(raw) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp worklist new <slug> \"title\"");
+        eprintln!("usage: wsp worklist new <slug> \"title\" [--initiative init-N]");
         return 2;
     };
     // Slugified on the way in, exactly as `project add` does it. The two share
@@ -398,6 +398,19 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         None => (None, maker(store)),
     };
 
+    // `--initiative`: linked as it is made (`wsp-731`), so the initiative is
+    // asked for before anything is written.
+    let initiative = match args.get("initiative").filter(|v| v != "true") {
+        Some(n) => match crate::cmd_initiative::find(store, &n) {
+            Some(i) => Some(i),
+            None => {
+                eprintln!("wsp: no initiative `{n}`");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
     let mut w = Worklist::new(&slug, &title);
     w.caption = caption;
     w.project = project;
@@ -410,6 +423,16 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         return 1;
     }
     store.log_event("worklist-added", json!({ "id": w.id }));
+    if let Some(mut i) = initiative {
+        if !i.worklists.contains(&w.id) {
+            i.worklists.push(w.id.clone());
+        }
+        if let Err(e) = crate::cmd_initiative::save(store, &i) {
+            eprintln!("wsp: write failed: {e}");
+            return 1;
+        }
+        store.log_event("initiative-changed", json!({ "id": i.id, "what": "linked" }));
+    }
     store.git_commit(&format!("wsp: add worklist {}", w.id));
 
     if args.json() {
@@ -2898,7 +2921,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     --caption "…" is its line for a glance;
                                     -p <project> is where it stands, whose
                                     governor its seat answers to — unsaid,
-                                    the project its members share"##,
+                                    the project its members share;
+                                    --initiative init-N links it as it's made"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,

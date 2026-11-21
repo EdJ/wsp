@@ -4,8 +4,9 @@
 //!
 //! One file each at `<store>/initiatives/init-N.md`, ids from one global
 //! sequence (compound's artefact owner is `init-N`, folder
-//! `~/.compound/artefacts/init-N/`). Planning, increments and aligns are not
-//! here: `worklists` and `tasks` are links only.
+//! `~/.compound/artefacts/init-N/`). `worklists` and `tasks` are links; the
+//! plan is `## Increments` (`wsp-731`), its order kept by the worklists'
+//! `after` relation, and read back as one graph by `plan show`.
 
 use serde_json::json;
 use std::path::PathBuf;
@@ -92,6 +93,7 @@ impl Initiative {
             "decisions": decisions,
             "criteria": self.criteria().iter().map(|r| r.json()).collect::<Vec<_>>(),
             "assumption_records": self.assumptions().iter().map(|r| r.json()).collect::<Vec<_>>(),
+            "increments": self.increments().iter().map(|r| r.json()).collect::<Vec<_>>(),
             "questions": self.section("Questions"),
             "assumptions": self.section("Assumptions"),
             "sources": self.section("Sources"),
@@ -117,7 +119,33 @@ pub const CRITERIA_STATUS: [&str; 2] = ["draft", "confirmed"];
 pub const ASSUME_STATUS: [&str; 3] = ["assumed", "accepted", "changed"];
 const CRIT_SEC: &str = "Criteria";
 const ASSUME_SEC: &str = "Assumption records";
-const ALL_SECTIONS: [&str; 8] = ["Brief", "Requirements", CRIT_SEC, "Decisions", "Questions", "Assumptions", ASSUME_SEC, "Sources"];
+const INC_SEC: &str = "Increments";
+const ALL_SECTIONS: [&str; 9] = ["Brief", "Requirements", CRIT_SEC, INC_SEC, "Decisions", "Questions", "Assumptions", ASSUME_SEC, "Sources"];
+
+/// One step of an initiative's plan (`wsp-731`): the criteria it delivers and
+/// the worklists it owns, one JSON line each in `## Increments`, in plan
+/// order. The order between increments is not kept here a second time: each
+/// list of increment n+1 is put `after` the last list of increment n (the
+/// worklist `after` relation, [`sync_after`]), which is what the queue reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Increment {
+    pub id: String,
+    pub caption: String,
+    pub criteria: Vec<String>,
+    pub lists: Vec<String>,
+}
+
+impl Increment {
+    fn json(&self) -> serde_json::Value {
+        json!({ "id": self.id, "caption": self.caption, "criteria": self.criteria, "lists": self.lists })
+    }
+}
+
+/// The gate after a group in the plan graph. Every gate is a barrier today;
+/// `align` is reserved for the last group of an increment, where the
+/// increment's lists meet before the next increment starts.
+pub const GATE_BARRIER: &str = "barrier";
+pub const GATE_ALIGN: &str = "align";
 
 impl Rec {
     fn json(&self) -> serde_json::Value {
@@ -145,6 +173,23 @@ impl Initiative {
     }
     pub fn assumptions(&self) -> Vec<Rec> {
         self.recs(ASSUME_SEC)
+    }
+    pub fn increments(&self) -> Vec<Increment> {
+        let Some(t) = self.section(INC_SEC) else { return vec![] };
+        let strs = |v: &serde_json::Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        t.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .map(|v| Increment {
+                id: v["id"].as_str().unwrap_or("").into(),
+                caption: v["caption"].as_str().unwrap_or("").into(),
+                criteria: strs(&v["criteria"]),
+                lists: strs(&v["lists"]),
+            })
+            .collect()
+    }
+    fn put_increments(&mut self, v: &[Increment]) {
+        let text = v.iter().map(|r| r.json().to_string()).collect::<Vec<_>>().join("\n");
+        crate::model::set_section_in_order(&mut self.body, INC_SEC, &text, &ALL_SECTIONS);
     }
     fn put_recs(&mut self, sec: &str, v: &[Rec]) {
         let text = v.iter().map(|r| r.json().to_string()).collect::<Vec<_>>().join("\n");
@@ -250,8 +295,10 @@ pub fn initiative(store: &Store, args: &Args) -> i32 {
         "brief" => brief(store, args),
         "criterion" | "criteria" => records(store, args, true),
         "assume" | "assumption" => records(store, args, false),
+        "increment" | "inc" => increment(store, args),
+        "plan" => plan(store, args),
         other => {
-            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume)");
+            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan)");
             2
         }
     }
@@ -652,6 +699,329 @@ fn records(store: &Store, args: &Args, criteria: bool) -> i32 {
     finish(store, &i, &what, args)
 }
 
+/// `wsp initiative increment add|edit|rm <id> …`
+fn increment(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "wsp initiative increment add <init> [\"caption\"] [--criteria C1,C2] [--list L]… | edit <init> I1 [\"caption\"] [--criteria …] [--list …] | rm <init> I1";
+    let (Some(verb), Some(needle)) = (args.rest.get(1).map(|s| s.as_str()), args.rest.get(2)) else {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    };
+    let Some(mut i) = find(store, needle) else {
+        eprintln!("wsp: no initiative `{needle}`");
+        return 1;
+    };
+    let before = i.increments();
+    let mut incs = before.clone();
+    let criteria = args.has("criteria").then(|| args.all("criteria").into_iter().map(|c| c.to_uppercase()).collect::<Vec<_>>());
+    if let Some(cs) = &criteria {
+        let have: Vec<String> = i.criteria().into_iter().map(|r| r.id).collect();
+        if let Some(bad) = cs.iter().find(|c| !have.contains(c)) {
+            eprintln!("wsp: no criterion `{bad}` on {} — it has {}", i.id, if have.is_empty() { "none".into() } else { have.join(" ") });
+            return 1;
+        }
+    }
+    let lists = if args.has("list") {
+        let mut out = Vec::new();
+        for l in args.all("list") {
+            let Some(w) = store.worklist(&l) else {
+                eprintln!("wsp: no worklist `{l}`");
+                return 1;
+            };
+            if !out.contains(&w.id) {
+                out.push(w.id);
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
+    let what;
+    let mut touched = None;
+    match verb {
+        "add" => {
+            let caption = util::fold(&args.text(3));
+            if let Some(why) = util::terminal_output(&caption) {
+                eprintln!("wsp: {why}");
+                return 2;
+            }
+            let n = incs.iter().filter_map(|r| r.id.get(1..)?.parse::<u32>().ok()).max().unwrap_or(0);
+            let id = format!("I{}", n + 1);
+            incs.push(Increment { id: id.clone(), caption, criteria: criteria.unwrap_or_default(), lists: lists.clone().unwrap_or_default() });
+            touched = Some(incs.len() - 1);
+            what = format!("increment {id} added");
+        }
+        "edit" | "rm" => {
+            let Some(rid) = args.rest.get(3).map(|s| s.to_uppercase()) else {
+                eprintln!("usage: {USAGE}");
+                return 2;
+            };
+            let Some(pos) = incs.iter().position(|r| r.id == rid) else {
+                eprintln!("wsp: no increment `{rid}` on {} — it has {}", i.id, if incs.is_empty() { "none".into() } else { incs.iter().map(|r| r.id.clone()).collect::<Vec<_>>().join(" ") });
+                return 1;
+            };
+            if verb == "rm" {
+                incs.remove(pos);
+                what = format!("increment {rid} removed");
+            } else {
+                let caption = util::fold(&args.text(4));
+                if let Some(why) = util::terminal_output(&caption) {
+                    eprintln!("wsp: {why}");
+                    return 2;
+                }
+                let r = &mut incs[pos];
+                if !caption.is_empty() {
+                    r.caption = caption;
+                }
+                if let Some(c) = criteria {
+                    r.criteria = c;
+                }
+                if let Some(l) = &lists {
+                    r.lists = l.clone();
+                }
+                touched = Some(pos);
+                what = format!("increment {rid} edited");
+            }
+        }
+        other => {
+            eprintln!("wsp initiative increment: unknown `{other}` — {USAGE}");
+            return 2;
+        }
+    }
+    // A list is owned by one increment: two would put it after itself.
+    if let (Some(at), Some(l)) = (touched, &lists) {
+        for w in l {
+            if let Some(other) = incs.iter().enumerate().find(|(k, r)| *k != at && r.lists.contains(w)) {
+                eprintln!("wsp: `{w}` is already in increment {} — a list belongs to one increment", other.1.id);
+                return 1;
+            }
+        }
+    }
+    // What a list of the plan is, the initiative links: `increment --list`
+    // is a `link --list` too.
+    for inc in &incs {
+        for w in &inc.lists {
+            if !i.worklists.contains(w) {
+                i.worklists.push(w.clone());
+            }
+        }
+    }
+    if let Err(why) = sync_after(store, &before, &incs) {
+        eprintln!("{why}");
+        return 1;
+    }
+    i.put_increments(&incs);
+    finish(store, &i, &what, args)
+}
+
+/// Each list of increment n+1 waits on increment n: it is put `after` the
+/// last list of the nearest increment before it that has one. A list the plan
+/// let go of is let go by its `after` too, where that named a list of the
+/// plan. A chain that would come back round is refused before anything is
+/// written.
+fn sync_after(store: &Store, before: &[Increment], after: &[Increment]) -> Result<(), String> {
+    let mut want: Vec<(String, Option<String>)> = Vec::new();
+    let mut prev: Option<String> = None;
+    for inc in after {
+        for l in &inc.lists {
+            want.push((l.clone(), prev.clone()));
+        }
+        if let Some(last) = inc.lists.last() {
+            prev = Some(last.clone());
+        }
+    }
+    let planned: Vec<&String> = before.iter().chain(after).flat_map(|r| &r.lists).collect();
+    for l in before.iter().flat_map(|r| &r.lists) {
+        if !want.iter().any(|(w, _)| w == l) {
+            if let Some(w) = store.worklist(l) {
+                if w.after.as_ref().is_some_and(|a| planned.contains(&a)) {
+                    want.push((l.clone(), None));
+                }
+            }
+        }
+    }
+    // The chain each list would stand in, read with the new edges in place.
+    let edge = |id: &str| -> Option<String> {
+        match want.iter().find(|(w, _)| w == id) {
+            Some((_, a)) => a.clone(),
+            None => store.worklist(id).and_then(|w| w.after),
+        }
+    };
+    for (l, a) in &want {
+        let mut at = a.clone();
+        let mut hops = 0;
+        while let Some(x) = at {
+            if &x == l {
+                return Err(format!("wsp: `{l}` after `{}` would wait for itself", a.as_deref().unwrap_or("")));
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            at = edge(&x);
+        }
+    }
+    store.locked(|| -> Result<(), String> {
+        for (l, a) in &want {
+            let Some(mut w) = store.worklist(l) else { continue };
+            if &w.after == a {
+                continue;
+            }
+            w.after = a.clone();
+            w.log(&match a {
+                Some(o) => format!("after {o} (initiative plan)"),
+                None => "no longer after any list (initiative plan)".to_string(),
+            });
+            store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+            store.log_event("worklist-edited", json!({ "id": w.id, "what": "after", "after": w.after }));
+        }
+        Ok(())
+    })
+}
+
+/// The plan as one graph (`wsp-731`): increments → worklists → groups → rows,
+/// each node with what the web chrome draws, so it needs no second call per
+/// list. A list linked to the initiative and in no increment is `unplanned`.
+pub fn plan_graph(store: &Store, i: &Initiative) -> serde_json::Value {
+    let crit = i.criteria();
+    let incs = i.increments();
+    let (mut n_lists, mut n_groups, mut n_rows) = (0usize, 0usize, 0usize);
+    let task_caption = |m: &str| store.task(m).map(|t| crate::caption::of_task(&t));
+    let mut list_json = |id: &str, last_of_increment: bool| -> serde_json::Value {
+        let Some(w) = store.worklist(id) else {
+            return json!({ "id": id, "missing": true, "groups": [] });
+        };
+        n_lists += 1;
+        let groups = w.groups();
+        let ng = groups.len();
+        let gs: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .map(|(gi, g)| {
+                n_groups += 1;
+                let rows: Vec<_> = g
+                    .members
+                    .iter()
+                    .map(|m| {
+                        n_rows += 1;
+                        let pol = g.policy_for(m);
+                        let tier = pol.as_ref().map(|p| json!({ "kind": p.kind, "model": p.model, "effort": p.effort }));
+                        match store.task(m) {
+                            Some(t) => json!({
+                                "id": t.id, "title": t.title, "caption": crate::caption::of_task(&t).text,
+                                "tier": tier, "model": pol.as_ref().map(|p| p.label()),
+                                "status": t.status().as_str(), "after": t.after,
+                            }),
+                            None => json!({
+                                "id": m, "title": null, "caption": m, "tier": tier, "model": pol.as_ref().map(|p| p.label()),
+                                "status": "missing", "after": [],
+                            }),
+                        }
+                    })
+                    .collect();
+                let end = last_of_increment && gi + 1 == ng;
+                json!({
+                    "id": g.id, "ordinal": gi + 1,
+                    "caption": crate::caption::of_group(g, &task_caption).text,
+                    "kind": g.kind, "agent": g.agent,
+                    "gate": GATE_BARRIER, "increment_end": end,
+                    "rows": rows,
+                })
+            })
+            .collect();
+        json!({
+            "id": w.id, "title": w.title, "caption": crate::caption::of_worklist(&w).text,
+            "status": w.status().as_str(), "after": w.after, "groups": gs,
+        })
+    };
+    let mut out_incs = Vec::new();
+    for (k, inc) in incs.iter().enumerate() {
+        let lists: Vec<_> = inc.lists.iter().enumerate().map(|(li, l)| list_json(l, li + 1 == inc.lists.len())).collect();
+        let criteria: Vec<_> = inc
+            .criteria
+            .iter()
+            .map(|c| match crit.iter().find(|r| &r.id == c) {
+                Some(r) => json!({ "id": r.id, "text": r.text, "status": r.status }),
+                None => json!({ "id": c, "text": null, "status": "missing" }),
+            })
+            .collect();
+        out_incs.push(json!({ "id": inc.id, "ordinal": k + 1, "caption": inc.caption, "criteria": criteria, "lists": lists }));
+    }
+    let planned: Vec<&String> = incs.iter().flat_map(|r| &r.lists).collect();
+    let unplanned: Vec<_> = i.worklists.iter().filter(|w| !planned.contains(w)).map(|w| list_json(w, false)).collect();
+    json!({
+        "initiative": i.id, "title": i.title, "state": i.state,
+        "increments": out_incs,
+        "unplanned": unplanned,
+        "totals": { "increments": incs.len(), "lists": n_lists, "groups": n_groups, "rows": n_rows },
+    })
+}
+
+/// `wsp initiative plan show <id> [--json]`
+fn plan(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "wsp initiative plan show <id> [--json]";
+    let (Some("show"), Some(needle)) = (args.rest.get(1).map(|s| s.as_str()), args.rest.get(2)) else {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    };
+    let Some(i) = find(store, needle) else {
+        eprintln!("wsp: no initiative `{needle}`");
+        return 1;
+    };
+    let g = plan_graph(store, &i);
+    if args.json() {
+        println!("{}", serde_json::to_string_pretty(&g).unwrap_or_default());
+        return 0;
+    }
+    print!("{}", plan_text(&g));
+    0
+}
+
+/// The "planned" board, compact: an increment a block, a list a line, a group
+/// a line under it, its rows indented below.
+pub fn plan_text(g: &serde_json::Value) -> String {
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let t = &g["totals"];
+    let mut o = format!(
+        "{}  {}  [{}] · {} increments · {} lists · {} groups · {} rows\n",
+        s(&g["initiative"]), s(&g["title"]), s(&g["state"]), t["increments"], t["lists"], t["groups"], t["rows"]
+    );
+    let list = |o: &mut String, l: &serde_json::Value| {
+        if l["missing"] == json!(true) {
+            o.push_str(&format!("  {}  (no such worklist)\n", s(&l["id"])));
+            return;
+        }
+        let after = l["after"].as_str().map(|a| format!(" · after {a}")).unwrap_or_default();
+        o.push_str(&format!("  {}  {} [{}]{after}\n", s(&l["id"]), s(&l["caption"]), s(&l["status"])));
+        for gr in l["groups"].as_array().into_iter().flatten() {
+            let kind = if s(&gr["kind"]).is_empty() { String::new() } else { format!(" · {}", s(&gr["kind"])) };
+            let agent = if s(&gr["agent"]).is_empty() { String::new() } else { format!(" · {}", s(&gr["agent"])) };
+            o.push_str(&format!("    g{}  {}{kind}{agent}\n", gr["ordinal"], s(&gr["caption"])));
+            for r in gr["rows"].as_array().into_iter().flatten() {
+                let after: Vec<String> = r["after"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+                let after = if after.is_empty() { String::new() } else { format!(" · after {}", after.join(",")) };
+                o.push_str(&format!("      {}  {} [{}]{after}\n", s(&r["id"]), s(&r["caption"]), s(&r["status"])));
+            }
+            o.push_str(&format!("      ── {}\n", s(&gr["gate"])));
+        }
+    };
+    for inc in g["increments"].as_array().into_iter().flatten() {
+        let cs: Vec<String> = inc["criteria"].as_array().into_iter().flatten().map(|c| s(&c["id"])).collect();
+        let cs = if cs.is_empty() { String::new() } else { format!("  delivers {}", cs.join(" ")) };
+        o.push_str(&format!("\n{}  {}{cs}\n", s(&inc["id"]), s(&inc["caption"])));
+        for l in inc["lists"].as_array().into_iter().flatten() {
+            list(&mut o, l);
+        }
+    }
+    let un = g["unplanned"].as_array().cloned().unwrap_or_default();
+    if !un.is_empty() {
+        o.push_str("\nunplanned (linked, in no increment)\n");
+        for l in &un {
+            list(&mut o, l);
+        }
+    }
+    o
+}
+
 /// What an agent popped out on the initiative is told.
 pub fn brief_text(store: &Store, i: &Initiative) -> String {
     let mut o = String::new();
@@ -747,6 +1117,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
                                     | edit <id> --brief|--requirements|… [--from F|-]
                                     | set <id> k=v… | link <id> --list L|--task T [--clear]
                                     | criterion add|edit|rm <id> …  | assume add|edit|accept|rm <id> …
+                                    | increment add <id> ["caption"] [--criteria C1,C2] [--list L]…
+                                    | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
+                                    | plan show <id> [--json]  increments → lists → groups → rows
                                     | brief <id>  a record below a product: artefacts and
                                     decisions (wsp decide init-N "…"), ids init-N"##,
     }],
@@ -873,5 +1246,114 @@ mod tests {
         assert!(b.contains("C1 [confirmed") && b.contains("A1 [accepted effect 1"), "{b}");
         run(&store, &["assume", "add", "init-1", "again"], &[]);
         assert_eq!(find(&store, "init-1").unwrap().assumptions()[1].id, "A2");
+    }
+
+    /// `wsp-731`: increments over 2 lists, 5 groups, 2 increments — the verbs'
+    /// refusals, the `after` they keep, and the plan graph's JSON shape.
+    #[test]
+    fn increments_order_their_lists_and_plan_show_is_one_graph() {
+        use crate::model::{Group, Task, Worklist};
+        let store = crate::testkit::store("initiative-plan");
+        let mut prod = Project::new("compound");
+        prod.kind = "product".into();
+        store.save_project(&prod).unwrap();
+        assert_eq!(run(&store, &["add", "Plan"], &[("product", "compound")]), 0);
+        assert_eq!(run(&store, &["criterion", "add", "init-1", "one"], &[]), 0);
+        assert_eq!(run(&store, &["criterion", "add", "init-1", "two"], &[]), 0);
+        let mut t = Task::new("Write the first thing, with a clause", "p-1");
+        t.caption = Some("first".into());
+        store.save_task(&t).unwrap();
+        let mut t = Task::new("Second", "p-2");
+        t.after = vec!["p-1".into()];
+        store.save_task(&t).unwrap();
+        for id in ["p-3", "p-4", "p-5", "p-6"] {
+            store.save_task(&Task::new(id, id)).unwrap();
+        }
+        let g = |m: &[&str], kind: &str, agent: &str| Group {
+            members: m.iter().map(|s| s.to_string()).collect(),
+            kind: kind.into(),
+            agent: agent.into(),
+            ..Group::default()
+        };
+        let mut a = Worklist::new("pa", "List A");
+        a.set_groups(&[g(&["p-1", "p-2"], "contract", "claude opus high"), g(&["p-3"], "", "claude sonnet")]);
+        store.save_worklist(&a).unwrap();
+        let mut b = Worklist::new("pb", "List B");
+        b.set_groups(&[g(&["p-4"], "wiring", "claude"), g(&["p-5"], "", ""), g(&["p-6", "p-gone"], "", "")]);
+        store.save_worklist(&b).unwrap();
+        // `worklist new --initiative` links as it makes.
+        let wl = |rest: &[&str], flags: &[(&str, &str)]| crate::cmd_worklist::dispatch(&store, &Args::synth("worklist", rest, flags));
+        assert_eq!(wl(&["new", "pc", "List C"], &[("initiative", "init-9")]), 1);
+        assert!(store.worklist("pc").is_none(), "a refused initiative writes no list");
+        assert_eq!(wl(&["new", "pc", "List C"], &[("initiative", "init-1")]), 0);
+        assert_eq!(find(&store, "init-1").unwrap().worklists, vec!["pc"]);
+
+        let cases: &[(&[&str], &[(&str, &str)], i32)] = &[
+            (&["increment", "add", "init-1", "Contract first"], &[("criteria", "c1"), ("list", "pa")], 0),
+            (&["increment", "add", "init-1", "Then wiring"], &[("criteria", "C2"), ("list", "pb,pc")], 0),
+            (&["increment", "add", "init-1", "bad"], &[("criteria", "C9")], 1),
+            (&["increment", "add", "init-1", "bad"], &[("list", "nope")], 1),
+            (&["increment", "add", "init-1", "dup"], &[("list", "pa")], 1),
+            (&["increment", "add", "init-9", "x"], &[], 1),
+            (&["increment", "edit", "init-1", "I7"], &[], 1),
+            (&["increment", "edit", "init-1", "i2"], &[("list", "pb")], 0),
+            (&["increment", "add", "init-1", "spare"], &[], 0),
+            (&["increment", "rm", "init-1", "I3"], &[], 0),
+            (&["increment", "bogus", "init-1"], &[], 2),
+            (&["increment"], &[], 2),
+            (&["plan", "show"], &[], 2),
+            (&["plan", "show", "init-9"], &[], 1),
+            (&["plan", "show", "init-1"], &[], 0),
+            (&["plan", "show", "init-1"], &[("json", "true")], 0),
+        ];
+        for (rest, flags, want) in cases {
+            assert_eq!(run(&store, rest, flags), *want, "{rest:?} {flags:?}");
+        }
+        let i = find(&store, "init-1").unwrap();
+        assert_eq!(i.increments().iter().map(|r| (r.id.as_str(), r.lists.clone())).collect::<Vec<_>>(), vec![("I1", vec!["pa".to_string()]), ("I2", vec!["pb".to_string()])]);
+        assert!(i.worklists.contains(&"pa".to_string()) && i.worklists.contains(&"pb".to_string()), "an increment's lists are linked");
+        assert_eq!(store.worklist("pb").unwrap().after.as_deref(), Some("pa"), "increment 2 waits on increment 1");
+        assert_eq!(store.worklist("pa").unwrap().after, None);
+        assert_eq!(store.worklist("pc").unwrap().after, None, "a list let go of the plan is let go by its after");
+
+        let v = plan_graph(&store, &i);
+        assert_eq!(v["totals"], json!({ "increments": 2, "lists": 3, "groups": 5, "rows": 7 }), "pc is counted, unplanned: {v}");
+        assert_eq!(v["unplanned"][0]["id"], json!("pc"));
+        // Every node carries what the chrome draws, at every level.
+        let shape: &[(&str, &serde_json::Value, &[&str])] = &[
+            ("graph", &v, &["initiative", "title", "state", "increments", "unplanned", "totals"]),
+            ("increment", &v["increments"][0], &["id", "ordinal", "caption", "criteria", "lists"]),
+            ("criterion", &v["increments"][0]["criteria"][0], &["id", "text", "status"]),
+            ("list", &v["increments"][1]["lists"][0], &["id", "title", "caption", "status", "after", "groups"]),
+            ("group", &v["increments"][0]["lists"][0]["groups"][0], &["id", "ordinal", "caption", "kind", "agent", "gate", "increment_end", "rows"]),
+            ("row", &v["increments"][0]["lists"][0]["groups"][0]["rows"][1], &["id", "title", "caption", "tier", "model", "status", "after"]),
+        ];
+        for (what, node, keys) in shape {
+            for k in *keys {
+                assert!(node.get(k).is_some(), "{what} lacks {k}: {node}");
+            }
+        }
+        let inc1 = &v["increments"][0];
+        assert_eq!(inc1["criteria"][0]["text"], json!("one"));
+        let ga = &inc1["lists"][0]["groups"];
+        assert_eq!((ga[0]["kind"].clone(), ga[0]["gate"].clone(), ga[0]["increment_end"].clone()), (json!("contract"), json!(GATE_BARRIER), json!(false)));
+        assert_eq!(ga[1]["increment_end"], json!(true), "the last group of an increment is where an align will stand");
+        assert_eq!(ga[0]["caption"], json!("first and 1 more"));
+        let r = &ga[0]["rows"];
+        assert_eq!((r[0]["caption"].clone(), r[0]["status"].clone()), (json!("first"), json!("todo")));
+        assert_eq!(r[1]["after"], json!(["p-1"]));
+        assert_eq!(r[0]["tier"], json!({ "kind": "claude", "model": "opus", "effort": "high" }));
+        let gb = &v["increments"][1]["lists"][0]["groups"];
+        assert_eq!(v["increments"][1]["lists"][0]["after"], json!("pa"));
+        assert_eq!(gb.as_array().unwrap().len(), 3);
+        assert_eq!(gb[2]["rows"][1]["status"], json!("missing"), "a member no task answers to is drawn as missing");
+        assert_eq!(gb[0]["rows"][0]["tier"], json!({ "kind": "claude", "model": null, "effort": null }));
+        assert_eq!(gb[1]["rows"][0]["tier"], json!(null), "a group with no agent line is run by hand");
+
+        let text = plan_text(&v);
+        for want in ["2 increments · 3 lists · 5 groups · 7 rows", "I1  Contract first  delivers C1", "pb  List B [draft] · after pa", "p-2  Second [todo] · after p-1", "── barrier", "unplanned"] {
+            assert!(text.contains(want), "text lacks `{want}`:\n{text}");
+        }
+        assert!(i.json()["increments"][1]["lists"] == json!(["pb"]));
     }
 }
