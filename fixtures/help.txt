@@ -8,6 +8,9 @@ PROJECTS
                                     | edit <id> --brief|--requirements|… [--from F|-]
                                     | set <id> k=v… | link <id> --list L|--task T [--clear]
                                     | criterion add|edit|rm <id> …  | assume add|edit|accept|rm <id> …
+                                    | increment add <id> ["caption"] [--criteria C1,C2] [--list L]…
+                                    | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
+                                    | plan show <id> [--json]  increments → lists → groups → rows
                                     | brief <id>  a record below a product: artefacts and
                                     decisions (wsp decide init-N "…"), ids init-N
   wsp project ls|projects [--tag T] list projects
@@ -552,7 +555,8 @@ WORKLISTS
                                     --caption "…" is its line for a glance;
                                     -p <project> is where it stands, whose
                                     governor its seat answers to — unsaid,
-                                    the project its members share
+                                    the project its members share;
+                                    --initiative init-N links it as it's made
   wsp worklist add <slug> <task>…   one call, one group; its members run at
                                     the same time. --group N joins a group
                                     that exists instead of making one;
