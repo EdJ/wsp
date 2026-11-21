@@ -7,6 +7,7 @@ PROJECTS
   wsp initiative add "title" --product P [-p proj]… | ls [--product P] | show <id>
                                     | edit <id> --brief|--requirements|… [--from F|-]
                                     | set <id> k=v… | link <id> --list L|--task T [--clear]
+                                    | criterion add|edit|rm <id> …  | assume add|edit|accept|rm <id> …
                                     | brief <id>  a record below a product: artefacts and
                                     decisions (wsp decide init-N "…"), ids init-N
   wsp project ls|projects [--tag T] list projects

@@ -90,11 +90,72 @@ impl Initiative {
             "brief": self.section("Brief"),
             "requirements": self.section("Requirements"),
             "decisions": decisions,
+            "criteria": self.criteria().iter().map(|r| r.json()).collect::<Vec<_>>(),
+            "assumption_records": self.assumptions().iter().map(|r| r.json()).collect::<Vec<_>>(),
             "questions": self.section("Questions"),
             "assumptions": self.section("Assumptions"),
             "sources": self.section("Sources"),
         })
     }
+}
+
+/// A criterion or an assumption: one JSON line in the `Criteria` /
+/// `Assumption records` section (the prose `Assumptions` section stays prose).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Rec {
+    pub id: String,
+    pub text: String,
+    pub source: String,
+    pub status: String,
+    /// Assumptions only: how much it matters if it is wrong, 1 (most) upward.
+    pub effect: Option<u32>,
+    /// `agent` or `person`.
+    pub by: String,
+}
+
+pub const CRITERIA_STATUS: [&str; 2] = ["draft", "confirmed"];
+pub const ASSUME_STATUS: [&str; 3] = ["assumed", "accepted", "changed"];
+const CRIT_SEC: &str = "Criteria";
+const ASSUME_SEC: &str = "Assumption records";
+const ALL_SECTIONS: [&str; 8] = ["Brief", "Requirements", CRIT_SEC, "Decisions", "Questions", "Assumptions", ASSUME_SEC, "Sources"];
+
+impl Rec {
+    fn json(&self) -> serde_json::Value {
+        json!({ "id": self.id, "text": self.text, "source": self.source, "status": self.status, "effect": self.effect, "by": self.by })
+    }
+}
+
+impl Initiative {
+    fn recs(&self, sec: &str) -> Vec<Rec> {
+        let Some(t) = self.section(sec) else { return vec![] };
+        t.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .map(|v| Rec {
+                id: v["id"].as_str().unwrap_or("").into(),
+                text: v["text"].as_str().unwrap_or("").into(),
+                source: v["source"].as_str().unwrap_or("").into(),
+                status: v["status"].as_str().unwrap_or("").into(),
+                effect: v["effect"].as_u64().map(|n| n as u32),
+                by: v["by"].as_str().unwrap_or("").into(),
+            })
+            .collect()
+    }
+    pub fn criteria(&self) -> Vec<Rec> {
+        self.recs(CRIT_SEC)
+    }
+    pub fn assumptions(&self) -> Vec<Rec> {
+        self.recs(ASSUME_SEC)
+    }
+    fn put_recs(&mut self, sec: &str, v: &[Rec]) {
+        let text = v.iter().map(|r| r.json().to_string()).collect::<Vec<_>>().join("\n");
+        crate::model::set_section_in_order(&mut self.body, sec, &text, &ALL_SECTIONS);
+    }
+}
+
+fn rec_line(prefix: &str, r: &Rec) -> String {
+    let eff = r.effect.map(|e| format!(" effect {e}")).unwrap_or_default();
+    let src = if r.source.is_empty() { String::new() } else { format!(" ← {}", r.source) };
+    format!("{prefix}{} [{}{eff}, {}] {}{src}", r.id, r.status, r.by, r.text)
 }
 
 pub fn dir(store: &Store) -> PathBuf {
@@ -187,8 +248,10 @@ pub fn initiative(store: &Store, args: &Args) -> i32 {
         "set" => set(store, args),
         "link" => link(store, args),
         "brief" => brief(store, args),
+        "criterion" | "criteria" => records(store, args, true),
+        "assume" | "assumption" => records(store, args, false),
         other => {
-            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief)");
+            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume)");
             2
         }
     }
@@ -299,6 +362,19 @@ fn show(store: &Store, args: &Args) -> i32 {
     println!("product {} · {} · projects {} · created {}", i.product, i.state, list_or_dash(&i.projects), i.created);
     println!("worklists {} · tasks {}", list_or_dash(&i.worklists), list_or_dash(&i.tasks));
     println!("artefacts {}", i.artefacts().display());
+    let (cs, asm) = (i.criteria(), i.assumptions());
+    if !cs.is_empty() {
+        println!("\n## Criteria");
+        for r in &cs {
+            println!("{}", rec_line("- ", r));
+        }
+    }
+    if !asm.is_empty() {
+        println!("\n## Assumption records");
+        for r in &asm {
+            println!("{}", rec_line("- ", r));
+        }
+    }
     for s in SECTIONS {
         if s == "Decisions" {
             let ds = crate::model::decisions_of(&i.body);
@@ -447,6 +523,135 @@ fn link(store: &Store, args: &Args) -> i32 {
     finish(store, &i, "linked", args)
 }
 
+/// `wsp initiative criterion|assume add|edit|accept|rm <id> …`
+fn records(store: &Store, args: &Args, criteria: bool) -> i32 {
+    let (noun, letter, sec) = if criteria { ("criterion", 'C', CRIT_SEC) } else { ("assume", 'A', ASSUME_SEC) };
+    let usage = if criteria {
+        "wsp initiative criterion add <init> \"text\" [--source S] [--status draft|confirmed] | edit <init> C1 [\"text\"] [--source S] [--status …] | rm <init> C1"
+    } else {
+        "wsp initiative assume add <init> \"text\" [--source S] [--effect N] | edit <init> A1 [\"text\"] [--source S] [--status assumed|accepted|changed] [--effect N] | accept <init> A1 | rm <init> A1"
+    };
+    let Some(verb) = args.rest.get(1).map(|s| s.as_str()) else {
+        eprintln!("usage: {usage}");
+        return 2;
+    };
+    let Some(needle) = args.rest.get(2) else {
+        eprintln!("usage: {usage}");
+        return 2;
+    };
+    let Some(mut i) = find(store, needle) else {
+        eprintln!("wsp: no initiative `{needle}`");
+        return 1;
+    };
+    let statuses: &[&str] = if criteria { &CRITERIA_STATUS } else { &ASSUME_STATUS };
+    let val = |k: &str| args.get(k).filter(|v| v != "true");
+    let mut recs = i.recs(sec);
+    let status = match val("status") {
+        Some(s) if !statuses.contains(&s.as_str()) => {
+            eprintln!("wsp: `{s}` is not a status — {}", statuses.join("|"));
+            return 2;
+        }
+        s => s,
+    };
+    let effect = match val("effect") {
+        None => None,
+        Some(_) if criteria => {
+            eprintln!("wsp: only assumptions have an effect");
+            return 2;
+        }
+        Some(e) => match e.parse::<u32>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                eprintln!("wsp: effect is a rank, 1 or more");
+                return 2;
+            }
+        },
+    };
+    let by = match val("by") {
+        Some(b) if b == "agent" || b == "person" => b,
+        Some(b) => {
+            eprintln!("wsp: `{b}` is not agent|person");
+            return 2;
+        }
+        None => if std::env::var_os("WSP_SEAT_ID").is_some() { "agent" } else { "person" }.to_string(),
+    };
+    let what;
+    match verb {
+        "add" => {
+            let text = util::fold(&args.text(3));
+            if text.is_empty() {
+                eprintln!("usage: {usage}");
+                return 2;
+            }
+            if let Some(why) = util::terminal_output(&text) {
+                eprintln!("wsp: {why}");
+                return 2;
+            }
+            let n = recs.iter().filter_map(|r| r.id[1..].parse::<u32>().ok()).max().unwrap_or(0);
+            let id = format!("{letter}{}", n + 1);
+            recs.push(Rec {
+                id: id.clone(),
+                text,
+                source: val("source").unwrap_or_default(),
+                status: status.unwrap_or_else(|| statuses[0].to_string()),
+                effect,
+                by,
+            });
+            what = format!("{noun} {id} added");
+        }
+        "edit" | "accept" | "rm" => {
+            let Some(rid) = args.rest.get(3).map(|s| s.to_uppercase()) else {
+                eprintln!("usage: {usage}");
+                return 2;
+            };
+            let Some(pos) = recs.iter().position(|r| r.id == rid) else {
+                eprintln!("wsp: no {noun} `{rid}` on {} — it has {}", i.id, if recs.is_empty() { "none".into() } else { recs.iter().map(|r| r.id.clone()).collect::<Vec<_>>().join(" ") });
+                return 1;
+            };
+            match verb {
+                "rm" => {
+                    recs.remove(pos);
+                    what = format!("{noun} {rid} removed");
+                }
+                "accept" if criteria => {
+                    eprintln!("usage: {usage}");
+                    return 2;
+                }
+                "accept" => {
+                    recs[pos].status = "accepted".into();
+                    what = format!("{noun} {rid} accepted");
+                }
+                _ => {
+                    let text = util::fold(&args.text(4));
+                    let r = &mut recs[pos];
+                    if !text.is_empty() {
+                        r.text = text;
+                    }
+                    if let Some(s) = val("source") {
+                        r.source = s;
+                    }
+                    if let Some(s) = status {
+                        r.status = s;
+                    }
+                    if effect.is_some() {
+                        r.effect = effect;
+                    }
+                    if val("by").is_some() {
+                        r.by = by;
+                    }
+                    what = format!("{noun} {rid} edited");
+                }
+            }
+        }
+        other => {
+            eprintln!("wsp initiative {noun}: unknown `{other}` — {usage}");
+            return 2;
+        }
+    }
+    i.put_recs(sec, &recs);
+    finish(store, &i, &what, args)
+}
+
 /// What an agent popped out on the initiative is told.
 pub fn brief_text(store: &Store, i: &Initiative) -> String {
     let mut o = String::new();
@@ -462,6 +667,14 @@ pub fn brief_text(store: &Store, i: &Initiative) -> String {
     }
     if !i.tasks.is_empty() {
         o.push_str(&format!("tasks: {}\n", i.tasks.join(", ")));
+    }
+    for (title, recs) in [("Criteria", i.criteria()), ("Assumption records", i.assumptions())] {
+        if !recs.is_empty() {
+            o.push_str(&format!("\n## {title}\n"));
+            for r in &recs {
+                o.push_str(&format!("{}\n", rec_line("- ", r)));
+            }
+        }
     }
     for s in SECTIONS {
         if s == "Decisions" {
@@ -533,6 +746,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
         text: r##"  wsp initiative add "title" --product P [-p proj]… | ls [--product P] | show <id>
                                     | edit <id> --brief|--requirements|… [--from F|-]
                                     | set <id> k=v… | link <id> --list L|--task T [--clear]
+                                    | criterion add|edit|rm <id> …  | assume add|edit|accept|rm <id> …
                                     | brief <id>  a record below a product: artefacts and
                                     decisions (wsp decide init-N "…"), ids init-N"##,
     }],
@@ -610,5 +824,54 @@ mod tests {
         assert!(v["artefacts"].as_str().unwrap().ends_with("init-1"));
         assert!(brief_text(&store, &find(&store, "init-1").unwrap()).contains("wsp project show ui --handbook"));
         assert_eq!(tree_lines(&store)["compound"].len(), 2);
+    }
+
+    /// Table-driven over criterion and assume: add/edit/accept/rm, bad input, and where they show.
+    #[test]
+    fn criteria_and_assumptions_are_records_shown_in_json_and_the_brief() {
+        let store = crate::testkit::store("initiative-recs");
+        let mut prod = Project::new("compound");
+        prod.kind = "product".into();
+        store.save_project(&prod).unwrap();
+        assert_eq!(run(&store, &["add", "X"], &[("product", "compound")]), 0);
+
+        let cases: &[(&[&str], &[(&str, &str)], i32)] = &[
+            (&["criterion", "add", "init-1", "has records"], &[("source", "doc.md")], 0),
+            (&["criterion", "add", "init-1", "second"], &[("by", "agent")], 0),
+            (&["criterion", "add", "init-1", "bad"], &[("status", "accepted")], 2),
+            (&["criterion", "add", "init-1", "bad"], &[("effect", "2")], 2),
+            (&["criterion", "add", "init-1", "bad"], &[("by", "robot")], 2),
+            (&["criterion", "add", "init-1"], &[], 2),
+            (&["criterion", "add", "init-9", "x"], &[], 1),
+            (&["criterion", "edit", "init-1", "C1", "renamed"], &[("status", "confirmed")], 0),
+            (&["criterion", "edit", "init-1", "C7"], &[], 1),
+            (&["criterion", "accept", "init-1", "C1"], &[], 2),
+            (&["criterion", "rm", "init-1", "C2"], &[], 0),
+            (&["assume", "add", "init-1", "users have git, with commas"], &[("effect", "1")], 0),
+            (&["assume", "add", "init-1", "second"], &[("effect", "zero")], 2),
+            (&["assume", "edit", "init-1", "A1"], &[("status", "changed")], 0),
+            (&["assume", "accept", "init-1", "a1"], &[], 0),
+            (&["assume", "rm", "init-1", "A5"], &[], 1),
+            (&["assume", "bogus", "init-1"], &[], 2),
+            (&["assume"], &[], 2),
+            (&["show", "init-1"], &[], 0),
+            (&["brief", "init-1"], &[], 0),
+        ];
+        for (rest, flags, want) in cases {
+            assert_eq!(run(&store, rest, flags), *want, "{rest:?} {flags:?}");
+        }
+        let i = find(&store, "init-1").unwrap();
+        let c = i.criteria();
+        assert_eq!((c.len(), c[0].id.as_str(), c[0].text.as_str(), c[0].status.as_str(), c[0].source.as_str()), (1, "C1", "renamed", "confirmed", "doc.md"));
+        let a = i.assumptions();
+        assert_eq!((a[0].status.as_str(), a[0].effect, a[0].text.as_str()), ("accepted", Some(1), "users have git, with commas"));
+        let v = i.json();
+        assert_eq!(v["criteria"][0]["id"], json!("C1"));
+        assert_eq!(v["assumption_records"][0]["effect"], json!(1));
+        assert!(["person", "agent"].contains(&v["criteria"][0]["by"].as_str().unwrap()));
+        let b = brief_text(&store, &i);
+        assert!(b.contains("C1 [confirmed") && b.contains("A1 [accepted effect 1"), "{b}");
+        run(&store, &["assume", "add", "init-1", "again"], &[]);
+        assert_eq!(find(&store, "init-1").unwrap().assumptions()[1].id, "A2");
     }
 }
