@@ -209,6 +209,8 @@ pub const OWNED_AFTER: &[(&str, &str)] = &[
     ("decide", "supersedes"),
     // A review of a commit a verifier already blocked, put up as it is (`wsp-529`).
     ("review", "anyway"),
+    // `wsp ask <row> --person --set FILE` files a set; elsewhere `set` stands alone.
+    ("ask", "set"),
     // The verdict's own two words, which come after the member as often as not.
     ("verified", "holds"),
     ("verified", "blocks"),

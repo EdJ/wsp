@@ -1819,6 +1819,57 @@ pub fn answer_choice(store: &Store, id: &str, by: &Party, typed: &str, choice: &
     close(store, id, by, Act::Answered, typed, Some(choice))
 }
 
+/// Save one question of a set (`wsp answer <mid> --question H --choice L`).
+///
+/// **Kept on the ask and on the row as it is saved**: the answer goes into the
+/// set's own `answers`, and the row gets a decision for it at once (superseding
+/// the question's earlier one on a re-save) and a log line, "n of m answered".
+/// The ask stays open; ending it is [`answer_choice`] with `{finish}`. Checked
+/// against the set under the lock, so a refusal writes nothing.
+pub fn save_set_answer(
+    store: &Store,
+    id: &str,
+    key: &str,
+    picks: &[String],
+    other: Option<&str>,
+    note: &str,
+) -> Result<crate::choices::Saved, Refused> {
+    store.locked(|| {
+        let mut q = store.message(id).ok_or_else(|| Refused::NoSuchMessage(id.into()))?;
+        if !q.is_open() {
+            return Err(Refused::NotOpen(q.state_raw.clone()));
+        }
+        let Some(c) = q.choices.clone().filter(|c| c.kind() == "set") else {
+            return Err(Refused::BadChoice("that question is not a set — `--question` answers one question of a set".into()));
+        };
+        let mut task = q.about.task().and_then(|t| store.task(t));
+        let mut decide = |text: &str, sup: &[String]| match task.as_mut() {
+            Some(t) => crate::decisions::decide_task(t, text, sup),
+            None => String::new(),
+        };
+        let (next, saved) = c
+            .save_answer(&q.id, key, picks, other, note, &util::now_iso(), &mut decide)
+            .map_err(Refused::BadChoice)?;
+        let line = format!("{id}: {} of {} answered ({})", saved.answered, saved.total, saved.header);
+        match task.as_mut() {
+            Some(t) => {
+                t.log(&line);
+                t.touch();
+                store.save_task(t).map_err(|e| Refused::BadChoice(format!("could not write {}: {e}", t.id)))?;
+            }
+            None => {
+                if let Some(mut w) = q.about.scope().and_then(|l| store.worklist(l)) {
+                    w.log(&line);
+                    store.save_worklist(&w).map_err(|e| Refused::BadChoice(format!("could not write {}: {e}", w.id)))?;
+                }
+            }
+        }
+        q.choices = Some(next);
+        store.save_message(&q)?;
+        Ok(saved)
+    })
+}
+
 /// Abandon a question, with a reason, and tell the asker.
 ///
 /// The other way a question may end, and it goes home by the same path for the
