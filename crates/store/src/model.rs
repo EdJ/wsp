@@ -188,6 +188,11 @@ pub struct Project {
     /// one. Empty is no light rows, which is every project before this. A
     /// group's `weight:` and a member's `weight <member>:` override it.
     pub light: String,
+    /// `kind:` — `product` marks a node that only groups the projects under it
+    /// (`wsp-721`); empty is an ordinary project, which is every project before
+    /// this, so the schema is not bumped. A product holds no tasks by
+    /// convention; nothing refuses one.
+    pub kind: String,
     /// Highest number this project has handed out — a hint, not the truth.
     ///
     /// [`crate::store::Store::alloc_task_id`] reads it to skip the directory
@@ -240,6 +245,7 @@ impl Project {
             at_review: doc.opt("at_review").unwrap_or_default(),
             auto_close: doc.opt("auto_close").unwrap_or_default(),
             light: doc.opt("light").unwrap_or_default(),
+            kind: doc.opt("kind").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             body: doc.body.clone(),
         }
@@ -268,10 +274,18 @@ impl Project {
         if !self.light.trim().is_empty() {
             d.set_str("light", &self.light);
         }
+        if !self.kind.trim().is_empty() {
+            d.set_str("kind", &self.kind);
+        }
         d.set_str("seq", &self.seq.to_string());
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
+    }
+
+    /// Whether this node is a product, a grouping of projects.
+    pub fn is_product(&self) -> bool {
+        self.kind == "product"
     }
 
     /// The tags `light:` declares.

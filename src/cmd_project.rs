@@ -68,6 +68,11 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
 }
 
 pub fn add(store: &Store, args: &Args) -> i32 {
+    add_kind(store, args, "")
+}
+
+/// `add`, for a project or (`kind` = `product`) a product.
+fn add_kind(store: &Store, args: &Args, kind: &str) -> i32 {
     let Some(slug_raw) = args.rest.get(1).cloned() else {
         eprintln!("usage: wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…");
         if !args.flag_names().is_empty() {
@@ -108,6 +113,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 
     let index = Index::new(store.projects());
     let mut p = Project::new(&slug);
+    p.kind = kind.to_string();
     p.name = args.get("name").unwrap_or_else(|| slug_raw.clone());
     p.tags = args.all("tag");
     p.roots = args.all("root").iter().map(|r| util::contract(&util::expand(r))).collect();
@@ -144,7 +150,8 @@ pub fn add(store: &Store, args: &Args) -> i32 {
         println!("{}", project_json(&p, &Index::new(store.projects())));
     } else {
         let parent = p.parent.clone().unwrap_or_else(|| "—".into());
-        println!("added project {} ({}), parent {}", p.id, p.name, parent);
+        let what = if p.is_product() { "product" } else { "project" };
+        println!("added {what} {} ({}), parent {}", p.id, p.name, parent);
     }
     0
 }
@@ -245,7 +252,8 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
             } else {
                 paint.dim(&format!("  [{}]", kid.tags.join(" ")))
             };
-            println!("{prefix}{branch}{}{}   {}", paint.bold(&kid.id), own_tags, badge);
+            let mark = if kid.is_product() { paint.dim("  [product]") } else { String::new() };
+            println!("{prefix}{branch}{}{}{}   {}", paint.bold(&kid.id), mark, own_tags, badge);
 
             let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
             for line in seats.get(&kid.id).into_iter().flatten() {
@@ -271,7 +279,8 @@ pub fn tree(store: &Store, args: &Args) -> i32 {
         } else {
             p.dim(&format!("  [{}]", root.tags.join(" ")))
         };
-        println!("{}{}   {}", p.bold(&root.id), tags, badge.join(p.dim(" · ").as_str()));
+        let mark = if root.is_product() { p.dim("  [product]") } else { String::new() };
+        println!("{}{}{}   {}", p.bold(&root.id), mark, tags, badge.join(p.dim(" · ").as_str()));
         for line in seats.get(&root.id).into_iter().flatten() {
             println!("{line}");
         }
@@ -892,6 +901,105 @@ pub fn set(store: &Store, args: &Args) -> i32 {
     0
 }
 
+/// `wsp product add|ls|show`: a product is a project node marked `kind: product`,
+/// and its projects are the ones parented under it.
+pub fn product(store: &Store, args: &Args) -> i32 {
+    match args.rest.first().map(|s| s.as_str()).unwrap_or("ls") {
+        "add" | "new" => add_kind(store, args, "product"),
+        "ls" | "list" => product_ls(store, args),
+        "show" | "get" => product_show(store, args),
+        other => {
+            eprintln!("wsp product: unknown subcommand `{other}` (add|ls|show)");
+            2
+        }
+    }
+}
+
+fn product_ls(store: &Store, args: &Args) -> i32 {
+    let index = Index::new(store.projects());
+    let counts = resolve::counts_by_project(&index, &store.tasks());
+    let mut rows: Vec<&Project> = index.projects.iter().filter(|p| p.is_product()).collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let n_projects = |id: &str| index.subtree(id).iter().filter(|x| x.as_str() != id).count();
+    if args.json() {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|p| {
+                let mut v = project_json(p, &index);
+                v["projects"] = json!(n_projects(&p.id));
+                v["open"] = json!(counts.get(&p.id).map(|c| c.open).unwrap_or(0));
+                v
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return 0;
+    }
+    if rows.is_empty() {
+        println!("no products yet — wsp product add <slug>");
+        return 0;
+    }
+    let p = Paint::new();
+    let w = rows.iter().map(|r| r.id.chars().count()).max().unwrap_or(7).max(7);
+    println!("{}  {}  {}", p.dim(&util::pad("PRODUCT", w)), p.dim(&util::pad("PROJECTS", 8)), p.dim("OPEN"));
+    for r in rows {
+        let open = counts.get(&r.id).map(|c| c.open).unwrap_or(0);
+        println!("{}  {}  {}", util::pad(&r.id, w), util::pad(&n_projects(&r.id).to_string(), 8), open);
+    }
+    0
+}
+
+fn product_show(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.get(1).cloned() else {
+        eprintln!("usage: wsp product show <slug>");
+        return 2;
+    };
+    let index = Index::new(store.projects());
+    let Some(prod) = index.find(&needle).cloned() else {
+        eprintln!("{}", no_project(store, &needle));
+        return 1;
+    };
+    if !prod.is_product() {
+        eprintln!("wsp: `{}` is a project, not a product", prod.id);
+        return 1;
+    }
+    let counts = resolve::counts_by_project(&index, &store.tasks());
+    let members: Vec<&Project> = index
+        .subtree(&prod.id)
+        .iter()
+        .filter(|id| id.as_str() != prod.id)
+        .filter_map(|id| index.projects.iter().find(|p| &p.id == id))
+        .collect();
+    if args.json() {
+        let list: Vec<_> = members
+            .iter()
+            .map(|m| {
+                let mut v = project_json(m, &index);
+                v["open"] = json!(counts.get(&m.id).map(|c| c.open).unwrap_or(0));
+                v
+            })
+            .collect();
+        let mut v = project_json(&prod, &index);
+        v["projects"] = json!(list);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{}  {}", p.bold(&prod.id), prod.name);
+    if !prod.brief.is_empty() {
+        println!("{}", prod.brief);
+    }
+    if members.is_empty() {
+        println!("\nno projects yet — wsp project set <p> parent={}", prod.id);
+        return 0;
+    }
+    let w = members.iter().map(|r| r.id.chars().count()).max().unwrap_or(7).max(7);
+    println!("\n{}  {}", p.dim(&util::pad("PROJECT", w)), p.dim("OPEN"));
+    for m in members {
+        println!("{}  {}", util::pad(&m.id, w), counts.get(&m.id).map(|c| c.open).unwrap_or(0));
+    }
+    0
+}
+
 pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
     json!({
         "id": p.id,
@@ -903,6 +1011,8 @@ pub fn project_json(p: &Project, index: &Index) -> serde_json::Value {
         "at_stop": p.at_stop,
         "at_review": p.at_review,
         "light": p.light,
+        "kind": p.kind,
+        "product": p.is_product(),
         "status": p.status,
         "brief": p.brief,
         "handbook": crate::model::section_of(&p.body, "Handbook"),
@@ -960,6 +1070,18 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 text: r##"  wsp project rm <id> [--force] [-n]  retire it to the archive; --force orphans
                                     the tasks and children it still held, and -n
                                     names them without moving anything"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["product"],
+        run: product,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 25,
+                text: r##"  wsp product add <slug> [--name N] [--brief …] | ls | show <slug>  a grouping of
+                                    projects (move one in: wsp project set <p> parent=<product>)"##,
             },
         ],
     },
@@ -1250,5 +1372,33 @@ mod tests {
         assert!(!after.contains("architecture.md"), "{after}");
 
         let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-721`: add/ls/show of a product and its marking in the tree json.
+    #[test]
+    fn a_product_groups_the_projects_reparented_under_it() {
+        let store = scratch("product-group");
+        let cases: &[(&[&str], i32)] = &[
+            (&["add", "compound", "--brief", "the whole"], 0),
+            (&["add", "compound"], 1),
+            (&["show", "nope"], 1),
+            (&["bogus"], 2),
+        ];
+        for (rest, want) in cases {
+            assert_eq!(product(&store, &Args::synth("product", rest, &[])), *want, "{rest:?}");
+        }
+        assert!(store.project("compound").unwrap().is_product());
+        proj(&store, "ui", None);
+        assert_eq!(set(&store, &Args::synth("project", &["set", "ui", "parent=compound"], &[])), 0);
+        assert_eq!(product(&store, &Args::synth("product", &["show", "compound"], &[])), 0);
+        assert_eq!(product(&store, &Args::synth("product", &["show", "ui"], &[])), 1, "a project is not a product");
+        assert_eq!(product(&store, &Args::synth("product", &["ls"], &[])), 0);
+
+        let index = Index::new(store.projects());
+        assert_eq!(project_json(index.find("compound").unwrap(), &index)["product"], json!(true));
+        assert_eq!(project_json(index.find("ui").unwrap(), &index)["product"], json!(false));
+        assert_eq!(index.find("ui").unwrap().parent.as_deref(), Some("compound"));
+        // And it survives the file.
+        assert_eq!(store.project("compound").unwrap().kind, "product");
     }
 }
