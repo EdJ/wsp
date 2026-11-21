@@ -124,9 +124,9 @@ const ALL_SECTIONS: [&str; 9] = ["Brief", "Requirements", CRIT_SEC, INC_SEC, "De
 
 /// One step of an initiative's plan (`wsp-731`): the criteria it delivers and
 /// the worklists it owns, one JSON line each in `## Increments`, in plan
-/// order. The order between increments is not kept here a second time: each
-/// list of increment n+1 is put `after` the last list of increment n (the
-/// worklist `after` relation, [`sync_after`]), which is what the queue reads.
+/// order. The order is not kept here a second time: the plan's lists are one
+/// chain of the worklist `after` relation ([`sync_after`]), which is what the
+/// queue reads.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Increment {
     pub id: String,
@@ -813,21 +813,22 @@ fn increment(store: &Store, args: &Args) -> i32 {
     finish(store, &i, &what, args)
 }
 
-/// Each list of increment n+1 waits on increment n: it is put `after` the
-/// last list of the nearest increment before it that has one. A list the plan
+/// The plan's lists as one chain of `after`, in plan order: an increment's
+/// first list waits on the previous increment's last, and each next list on
+/// the one before it in its own increment. `after` names one list (wsp-734
+/// would let it name several), so increment n+1 can wait on increment n only
+/// through its last list, and that holds only if the lists before it are
+/// chained to it — so the chain inside an increment is wsp's to keep, not a
+/// planner's, and an edit of one increment never undoes it. A list the plan
 /// let go of is let go by its `after` too, where that named a list of the
 /// plan. A chain that would come back round is refused before anything is
 /// written.
 fn sync_after(store: &Store, before: &[Increment], after: &[Increment]) -> Result<(), String> {
     let mut want: Vec<(String, Option<String>)> = Vec::new();
     let mut prev: Option<String> = None;
-    for inc in after {
-        for l in &inc.lists {
-            want.push((l.clone(), prev.clone()));
-        }
-        if let Some(last) = inc.lists.last() {
-            prev = Some(last.clone());
-        }
+    for l in after.iter().flat_map(|inc| &inc.lists) {
+        want.push((l.clone(), prev.clone()));
+        prev = Some(l.clone());
     }
     let planned: Vec<&String> = before.iter().chain(after).flat_map(|r| &r.lists).collect();
     for l in before.iter().flat_map(|r| &r.lists) {
@@ -1355,5 +1356,21 @@ mod tests {
             assert!(text.contains(want), "text lacks `{want}`:\n{text}");
         }
         assert!(i.json()["increments"][1]["lists"] == json!(["pb"]));
+
+        // Two lists in one increment, then another increment: the chain inside
+        // the first is kept, and the next waits on its last (cpd-6489's repro).
+        assert_eq!(run(&store, &["add", "Chain"], &[("product", "compound")]), 0);
+        for id in ["qa", "qb", "qc"] {
+            store.save_worklist(&Worklist::new(id, id)).unwrap();
+        }
+        let after = |id: &str| store.worklist(id).unwrap().after;
+        assert_eq!(run(&store, &["increment", "add", "init-2", "one"], &[("list", "qa"), ("list", "qb")]), 0);
+        assert_eq!((after("qa"), after("qb").as_deref()), (None, Some("qa")), "an increment's lists are chained");
+        assert_eq!(wl(&["after", "qb", "qa"], &[]), 0);
+        assert_eq!(run(&store, &["increment", "add", "init-2", "two"], &[("list", "qc")]), 0);
+        assert_eq!(after("qb").as_deref(), Some("qa"), "the next increment's add keeps the chain inside the first");
+        assert_eq!(after("qc").as_deref(), Some("qb"), "and waits on the first increment's last list");
+        assert_eq!(run(&store, &["increment", "edit", "init-2", "I1"], &[("list", "qb,qa")]), 0);
+        assert_eq!((after("qb"), after("qa").as_deref(), after("qc").as_deref()), (None, Some("qb"), Some("qa")), "reordered, the chain follows");
     }
 }
