@@ -4135,7 +4135,9 @@ impl Wip {
     /// `seats` to each host in the machine records, in parallel, each heard or
     /// silent within a second. The seats' state, rss and shells and the
     /// host's disks come from those replies; this runs no `ps`, `lsof`,
-    /// render or `df`. A seat the manager does not run (one started
+    /// render or `df`. The tree-less burners (wsp-691) are the line the
+    /// daemon's tick last stamped ([`crate::cmd_role::burners_stamped`],
+    /// wsp-716), not a process table read here. A seat the manager does not run (one started
     /// in-process) is not here until adoption (wsp-029).
     pub(crate) fn from_managers(store: &Store) -> Wip {
         let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
@@ -4173,7 +4175,7 @@ impl Wip {
                 memory,
                 daemon: daemon_by_stamp(store.daemon_tick(), heard, util::epoch_secs()),
                 disk: crate::disk::loud_of(store, &disks),
-                load: load_with_burners(crate::throttle::loud(store), crate::cmd_role::burners_now(store)),
+                load: load_with_burners(crate::throttle::loud(store), crate::cmd_role::burners_stamped(store, util::epoch_secs())),
                 throttle: Some(crate::throttle::status_line(store)),
             }
         });

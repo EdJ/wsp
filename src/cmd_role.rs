@@ -487,6 +487,47 @@ pub(crate) fn burners_now(store: &Store) -> Option<String> {
     burners_line(&procs, &cwd_of, &roots)
 }
 
+/// The state file the daemon's tick writes [`burners_now`] into: its epoch
+/// second, then the line (empty for none). `wsp wip` reads it here rather
+/// than reading the process table itself, because under the manager `wip`
+/// runs no `ps` (wsp-030, `docs/agent-manager.md` 4.3; wsp-716).
+const BURNERS_FILE: &str = "burners";
+
+/// How often the tick reads the process table for burners: they are named
+/// only past [`BURNER_AGE`], so a minute late is no burner missed.
+const BURNERS_EVERY: i64 = 60;
+
+/// How old a stamped burner line may be and still be said: past this the
+/// daemon is not ticking (which `wip` says on its own), and a pid named from
+/// that long ago may be gone.
+const BURNERS_FRESH: i64 = 5 * 60;
+
+/// `<at>\n<line>` out of [`BURNERS_FILE`].
+fn parse_burners(text: &str) -> Option<(i64, String)> {
+    let (at, line) = text.split_once('\n')?;
+    Some((at.trim().parse().ok()?, line.trim().to_string()))
+}
+
+/// On the daemon's tick: [`burners_now`] into [`BURNERS_FILE`], at most once
+/// per [`BURNERS_EVERY`]. Best effort, as the tick stamp is.
+pub(crate) fn stamp_burners(store: &Store, now: i64) {
+    let path = store.state_file(BURNERS_FILE);
+    let last = std::fs::read_to_string(&path).ok().and_then(|t| parse_burners(&t));
+    if last.is_some_and(|(at, _)| (0..BURNERS_EVERY).contains(&(now - at))) {
+        return;
+    }
+    let line = burners_now(store).unwrap_or_default();
+    let _ = std::fs::write(&path, format!("{now}\n{line}\n"));
+}
+
+/// The burners line the daemon last stamped, for `wsp wip`'s load warning:
+/// none where nothing was stamped, the stamp names none, or it is older than
+/// [`BURNERS_FRESH`]. Reads one file and runs nothing.
+pub(crate) fn burners_stamped(store: &Store, now: i64) -> Option<String> {
+    let (at, line) = parse_burners(&std::fs::read_to_string(store.state_file(BURNERS_FILE)).ok()?)?;
+    (now - at <= BURNERS_FRESH && !line.is_empty()).then_some(line)
+}
+
 /// What the guards ask of the store, so the rule is testable without one.
 pub(crate) struct Facts<'a> {
     /// A row's status, by its tree's name.
@@ -1169,6 +1210,25 @@ mod tests {
         assert_eq!(*read.borrow(), vec![10, 11, 12, 13, 17]);
         assert!(burners_line(&procs[..1], &|_| BTreeMap::new(), &[]).is_none());
         assert!(burners_line(&procs[4..], &cwd_of, &[]).is_none());
+    }
+
+    #[test]
+    fn wip_reads_the_burners_the_tick_stamped_and_runs_nothing() {
+        let env = crate::util::isolated("role-burners-stamped");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let now = 1_000_000;
+        assert_eq!(burners_stamped(&store, now), None, "nothing stamped is nothing said");
+        let line = "1 CPU burner in no tree, orphaned for over 10 minutes: 10 /usr/bin/yes";
+        std::fs::write(store.state_file(BURNERS_FILE), format!("{now}\n{line}\n")).unwrap();
+        assert_eq!(burners_stamped(&store, now + 20).as_deref(), Some(line));
+        assert_eq!(burners_stamped(&store, now + BURNERS_FRESH + 1), None, "a stamp the daemon left long ago is not said");
+        // Within the interval the tick reads no process table: the stamp stands.
+        stamp_burners(&store, now + BURNERS_EVERY - 1);
+        assert_eq!(burners_stamped(&store, now + BURNERS_EVERY - 1).as_deref(), Some(line));
+        std::fs::write(store.state_file(BURNERS_FILE), format!("{now}\n\n")).unwrap();
+        assert_eq!(burners_stamped(&store, now), None, "a stamp naming none says none");
+        assert_eq!(parse_burners("garbage"), None);
     }
 
     #[test]

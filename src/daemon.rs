@@ -785,6 +785,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             sample_seat_memory(store, now);
         }
 
+        // The CPU burners standing in no tree, for `wsp wip`'s load warning
+        // (wsp-691), read here so `wip` itself runs no `ps` (wsp-716).
+        wsp_base::calls::phase("burners");
+        crate::cmd_role::stamp_burners(store, now);
+
         crate::place_compound::tick_deliver_budget(false);
         wsp_base::calls::tick_end();
     }
