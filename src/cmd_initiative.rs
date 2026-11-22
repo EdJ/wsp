@@ -957,10 +957,132 @@ pub fn plan_graph(store: &Store, i: &Initiative) -> serde_json::Value {
     })
 }
 
-/// `wsp initiative plan show <id> [--json]`
+/// The planner's work order lives in docs (`wsp-733`), compiled in: its
+/// `## The order` section, to the end of the file, is what the seat reads.
+const PLAN_DOC: &str = include_str!("../docs/initiative-plan.md");
+/// The model a planner sits on when `--model` names none.
+pub const PLANNER_MODEL: &str = "opus";
+
+/// The body of `doc`'s `## The order` section: every line after that heading
+/// up to the next `## ` heading (its `###` subheads stay in).
+pub fn order_section(doc: &str) -> String {
+    let mut out = Vec::new();
+    let mut on = false;
+    for l in doc.lines() {
+        if l.starts_with("## ") {
+            if on {
+                break;
+            }
+            on = l.trim_end() == "## The order";
+            continue;
+        }
+        if on {
+            out.push(l);
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
+/// The planner's work order for `i`: the doc's order, then the brief, then a
+/// pending change request, which makes it a replan of the plan that exists.
+pub fn plan_order(store: &Store, i: &Initiative, changes: Option<&str>) -> String {
+    let mut o = format!("# Plan · {} · {}\n\n", i.id, i.title);
+    let replan = changes.is_some_and(|c| !c.trim().is_empty());
+    if replan {
+        o.push_str(&format!("This is a replan of {}: the person asked for changes (below). Edit the lists, rows and increments that exist; file nothing that duplicates them.\n\n", i.id));
+    } else {
+        o.push_str(&format!("You plan {}. Nothing here is a task to implement.\n\n", i.id));
+    }
+    o.push_str(&order_section(PLAN_DOC));
+    o.push_str("\n\n---\n\n## The brief (wsp initiative brief ");
+    o.push_str(&i.id);
+    o.push_str(")\n\n");
+    o.push_str(brief_text(store, i).trim_end());
+    o.push('\n');
+    if replan {
+        o.push_str(&format!("\n## The plan now (wsp initiative plan show {})\n\n", i.id));
+        o.push_str(plan_text(&plan_graph(store, i)).trim_end());
+        o.push_str("\n\n## Change request\n\n");
+        o.push_str(changes.unwrap_or("").trim());
+        o.push('\n');
+    }
+    o
+}
+
+/// `wsp initiative plan <id> [--changes "…"|-] [--model M] [--dry-run]`: file
+/// a planning row carrying the order, link it, and seat a planner on it.
+fn plan_seat(store: &Store, args: &Args, needle: &str) -> i32 {
+    let Some(mut i) = find(store, needle) else {
+        eprintln!("wsp: no initiative `{needle}`");
+        return 1;
+    };
+    let changes = match args.get("changes") {
+        None => None,
+        Some(c) if c == "true" => {
+            eprintln!("wsp: --changes takes the request: --changes \"…\" or --changes - (stdin)");
+            return 2;
+        }
+        Some(c) if c == "-" => match util::read_source("-") {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("wsp: cannot read stdin: {e}");
+                return 1;
+            }
+        },
+        Some(c) => Some(c),
+    };
+    if matches!(i.state.as_str(), "building" | "closed") {
+        eprintln!("wsp: {} is {} — a plan is made before the build, not during it", i.id, i.state);
+        return 1;
+    }
+    let model = args.get("model").filter(|m| !m.is_empty() && m != "true").unwrap_or_else(|| PLANNER_MODEL.to_string());
+    let order = plan_order(store, &i, changes.as_deref());
+    if args.has("dry-run") {
+        print!("{order}");
+        println!("\n(dry run: would file a planning row in {} and seat claude {model} on it; nothing filed, nothing seated)", i.projects.first().map(String::as_str).unwrap_or("the inbox"));
+        return 0;
+    }
+    let project = i.projects.first().cloned();
+    let id = match store.alloc_task_id(project.as_deref()) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("wsp: cannot allocate id: {e}");
+            return 1;
+        }
+    };
+    let verb = if changes.is_some() { "Replan" } else { "Plan" };
+    let mut t = crate::model::Task::new(&format!("{verb} {}: {}", i.id, i.title), &id);
+    t.project = project.clone();
+    t.tags = vec!["plan".into()];
+    if project.is_none() {
+        t.status_raw = "inbox".into();
+    }
+    crate::model::set_section_in(&mut t.body, "Overview", order.trim());
+    if let Err(e) = store.save_task(&t) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title }));
+    if !i.tasks.contains(&t.id) {
+        i.tasks.push(t.id.clone());
+    }
+    if let Err(e) = save(store, &i) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("initiative-plan", json!({ "id": i.id, "row": t.id, "replan": changes.is_some(), "model": model }));
+    store.git_commit(&format!("wsp: {} {} — planner row {}", verb.to_lowercase(), i.id, t.id));
+    println!("◇ {}  planner row {} · seating claude {model}", i.id, t.id);
+    crate::cmd_spawn::spawn(store, &Args::synth("spawn", &[t.id.as_str()], &[("agent", "true"), ("model", model.as_str())]))
+}
+
+/// `wsp initiative plan show <id> [--json]` · `wsp initiative plan <id> …`
 fn plan(store: &Store, args: &Args) -> i32 {
-    const USAGE: &str = "wsp initiative plan show <id> [--json]";
+    const USAGE: &str = "wsp initiative plan show <id> [--json] | plan <id> [--changes \"…\"|-] [--model M] [--dry-run]";
     let (Some("show"), Some(needle)) = (args.rest.get(1).map(|s| s.as_str()), args.rest.get(2)) else {
+        if let Some(needle) = args.rest.get(1).filter(|s| s.as_str() != "show") {
+            return plan_seat(store, args, needle);
+        }
         eprintln!("usage: {USAGE}");
         return 2;
     };
@@ -1121,6 +1243,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
                                     | increment add <id> ["caption"] [--criteria C1,C2] [--list L]…
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
+                                    | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
+                                    planner (opus) on the order in docs/initiative-plan.md
                                     | brief <id>  a record below a product: artefacts and
                                     decisions (wsp decide init-N "…"), ids init-N"##,
     }],
@@ -1247,6 +1371,54 @@ mod tests {
         assert!(b.contains("C1 [confirmed") && b.contains("A1 [accepted effect 1"), "{b}");
         run(&store, &["assume", "add", "init-1", "again"], &[]);
         assert_eq!(find(&store, "init-1").unwrap().assumptions()[1].id, "A2");
+    }
+
+    /// `wsp-733`: the planner's order is the doc's `## The order` plus the
+    /// brief, a change request makes it a replan with the plan in it, and
+    /// `--dry-run` prints it, filing and seating nothing.
+    #[test]
+    fn plan_assembles_the_order_from_the_doc_and_a_dry_run_seats_nothing() {
+        let store = crate::testkit::store("initiative-planner");
+        let mut prod = Project::new("compound");
+        prod.kind = "product".into();
+        store.save_project(&prod).unwrap();
+        let mut ui = Project::new("ui");
+        ui.parent = Some("compound".into());
+        store.save_project(&ui).unwrap();
+        assert_eq!(run(&store, &["add", "Fixture"], &[("product", "compound"), ("project", "ui")]), 0);
+        assert_eq!(run(&store, &["criterion", "add", "init-1", "a board shows the plan"], &[]), 0);
+
+        let doc = order_section(PLAN_DOC);
+        for want in ["### 1. Read", "### 5. Finish", "state=planned", "--initiative", "wsp after", "### Replanning"] {
+            assert!(doc.contains(want), "the order lacks {want}");
+        }
+        assert!(!doc.contains("## The order") && !doc.contains("Plan `wsp-733`"), "only the section, not the preamble");
+
+        let i = find(&store, "init-1").unwrap();
+        let o = plan_order(&store, &i, None);
+        assert!(o.starts_with("# Plan · init-1 · Fixture"), "{o}");
+        assert!(o.contains("### 2. Criteria") && o.contains("C1 [draft") && o.contains("wsp project show ui --handbook"), "{o}");
+        assert!(!o.contains("## Change request"), "{o}");
+        let r = plan_order(&store, &i, Some("split the board into two lists"));
+        assert!(r.contains("This is a replan") && r.contains("## The plan now") && r.contains("split the board into two lists"), "{r}");
+        assert_eq!(plan_order(&store, &i, Some("  ")), o, "an empty request is no replan");
+
+        let cases: &[(&[&str], &[(&str, &str)], i32)] = &[
+            (&["plan", "init-1"], &[("dry-run", "true")], 0),
+            (&["plan", "init-1"], &[("dry-run", "true"), ("changes", "fewer rows"), ("model", "sonnet")], 0),
+            (&["plan", "init-1"], &[("changes", "true")], 2),
+            (&["plan", "init-9"], &[("dry-run", "true")], 1),
+            (&["plan"], &[], 2),
+            (&["plan", "show"], &[], 2),
+        ];
+        for (rest, flags, want) in cases {
+            assert_eq!(run(&store, rest, flags), *want, "{rest:?} {flags:?}");
+        }
+        assert!(store.tasks().is_empty(), "a dry run files no row");
+        assert!(find(&store, "init-1").unwrap().tasks.is_empty(), "a dry run links nothing");
+
+        run(&store, &["set", "init-1", "state=building"], &[]);
+        assert_eq!(run(&store, &["plan", "init-1"], &[("dry-run", "true")]), 1, "no plan during the build");
     }
 
     /// `wsp-731`: increments over 2 lists, 5 groups, 2 increments — the verbs'

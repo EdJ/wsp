@@ -183,7 +183,7 @@ fn die_on_broken_pipe() {
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
 const LOOKS_FIRST: &str =
-    "archive, checkout, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
+    "archive, checkout, initiative plan, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -291,6 +291,9 @@ fn dry_run(args: &Args) -> (bool, String) {
         // and on `wsp add --rm` (which is not a verify) that is a word going
         // silently nowhere.
         "verify" => (args.given("rm"), args.cmd.clone()),
+        // `initiative plan <id> -n` prints the planner's order and seats
+        // nobody (wsp-733); `plan show` is a read and has nothing to preview.
+        "initiative" => named(sub == "plan" && args.rest.get(1).map(String::as_str) != Some("show")),
         "machine" | "machines" => named(false),
         "agent" => named(true),
         _ => (false, args.cmd.clone()),
