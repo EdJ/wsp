@@ -1073,7 +1073,31 @@ fn plan_seat(store: &Store, args: &Args, needle: &str) -> i32 {
     store.log_event("initiative-plan", json!({ "id": i.id, "row": t.id, "replan": changes.is_some(), "model": model }));
     store.git_commit(&format!("wsp: {} {} — planner row {}", verb.to_lowercase(), i.id, t.id));
     println!("◇ {}  planner row {} · seating claude {model}", i.id, t.id);
-    crate::cmd_spawn::spawn(store, &Args::synth("spawn", &[t.id.as_str()], &[("agent", "true"), ("model", model.as_str())]))
+    seat_planner(&t.id, &model)
+}
+
+/// `wsp spawn <row> --agent --model M` as a child of this binary, the way the
+/// run starts a seat ([`crate::cycle`]'s `start`): the engine does not call up
+/// into `cmd_spawn` (tests/layering.rs), and the child's output is the caller's.
+fn seat_planner(row: &str, model: &str) -> i32 {
+    // A test's binary is the harness: running it would run the suite again.
+    if cfg!(test) {
+        return 0;
+    }
+    let exe = match wsp_base::util::self_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("wsp: no path to this binary: {e}");
+            return 1;
+        }
+    };
+    match std::process::Command::new(exe).args(["spawn", row, "--agent", "--model", model]).status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("wsp: could not start `wsp spawn {row}`: {e}");
+            1
+        }
+    }
 }
 
 /// `wsp initiative plan show <id> [--json]` · `wsp initiative plan <id> …`
