@@ -11,6 +11,7 @@ PROJECTS
                                     | increment add <id> ["caption"] [--criteria C1,C2] [--list L]…
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
+                                    | approve <id> "verdict"  | changes <id> "what to change"
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md
                                     | brief <id>  a record below a product: artefacts and

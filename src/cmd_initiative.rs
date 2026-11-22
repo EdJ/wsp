@@ -297,8 +297,10 @@ pub fn initiative(store: &Store, args: &Args) -> i32 {
         "assume" | "assumption" => records(store, args, false),
         "increment" | "inc" => increment(store, args),
         "plan" => plan(store, args),
+        "approve" => approve(store, args),
+        "changes" => changes(store, args),
         other => {
-            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan)");
+            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan|approve|changes)");
             2
         }
     }
@@ -1016,8 +1018,15 @@ fn plan_seat(store: &Store, args: &Args, needle: &str) -> i32 {
         eprintln!("wsp: no initiative `{needle}`");
         return 1;
     };
+    let mut stored: Option<usize> = None;
     let changes = match args.get("changes") {
-        None => None,
+        None => match newest_change(&i) {
+            Some((n, text)) => {
+                stored = Some(n);
+                Some(text)
+            }
+            None => None,
+        },
         Some(c) if c == "true" => {
             eprintln!("wsp: --changes takes the request: --changes \"…\" or --changes - (stdin)");
             return 2;
@@ -1070,10 +1079,165 @@ fn plan_seat(store: &Store, args: &Args, needle: &str) -> i32 {
         eprintln!("wsp: write failed: {e}");
         return 1;
     }
+    if let Some(n) = stored {
+        let mut j = find(store, &i.id).unwrap_or_else(|| i.clone());
+        mark_change_answered(&mut j, n, &t.id);
+        if let Err(e) = save(store, &j) {
+            eprintln!("wsp: write failed: {e}");
+            return 1;
+        }
+    }
     store.log_event("initiative-plan", json!({ "id": i.id, "row": t.id, "replan": changes.is_some(), "model": model }));
     store.git_commit(&format!("wsp: {} {} — planner row {}", verb.to_lowercase(), i.id, t.id));
     println!("◇ {}  planner row {} · seating claude {model}", i.id, t.id);
     seat_planner(&t.id, &model)
+}
+
+const CHANGE_MARK: &str = "- change ";
+
+/// The change requests `changes` stored in `## Questions`: `(n, answered, text)`.
+/// One line each: `- change N: text`, or `- change N ✓ <row>: text` once a plan
+/// row has taken it up.
+fn change_requests(i: &Initiative) -> Vec<(usize, bool, String)> {
+    let Some(q) = i.section("Questions") else { return vec![] };
+    q.lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix(CHANGE_MARK)?;
+            let (head, text) = rest.split_once(": ")?;
+            let n = head.split_whitespace().next()?.parse().ok()?;
+            Some((n, head.contains('✓'), text.to_string()))
+        })
+        .collect()
+}
+
+/// The newest change request no plan row has taken up yet.
+fn newest_change(i: &Initiative) -> Option<(usize, String)> {
+    change_requests(i).into_iter().filter(|(_, done, _)| !done).max_by_key(|(n, _, _)| *n).map(|(n, _, t)| (n, t))
+}
+
+fn mark_change_answered(i: &mut Initiative, n: usize, row: &str) {
+    let q = i.section("Questions").unwrap_or_default();
+    let from = format!("{CHANGE_MARK}{n}: ");
+    let to = format!("{CHANGE_MARK}{n} ✓ {row}: ");
+    let text = q.lines().map(|l| if l.trim().starts_with(&from) { l.replacen(&from, &to, 1) } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+    crate::model::set_section_in_order(&mut i.body, "Questions", &text, &ALL_SECTIONS);
+}
+
+/// `wsp initiative changes <id> "what to change"`: Ask for changes. Stores the
+/// request as a question, leaves the state `planned`, starts nothing.
+fn changes(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "wsp initiative changes <id> \"what to change\"";
+    let mut i = match need(store, args, USAGE) {
+        Ok(i) => i,
+        Err(c) => return c,
+    };
+    let text = args.rest[2..].join(" ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    }
+    if i.state != "planned" {
+        eprintln!("wsp: {} is {} — changes are asked of a plan, and only a planned initiative has one waiting", i.id, i.state);
+        return 1;
+    }
+    let n = change_requests(&i).into_iter().map(|(n, _, _)| n).max().unwrap_or(0) + 1;
+    let mut q = i.section("Questions").unwrap_or_default().trim().to_string();
+    if !q.is_empty() {
+        q.push('\n');
+    }
+    q.push_str(&format!("{CHANGE_MARK}{n}: {text}"));
+    crate::model::set_section_in_order(&mut i.body, "Questions", &q, &ALL_SECTIONS);
+    if let Err(e) = save(store, &i) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("initiative-changes", json!({ "id": i.id, "n": n }));
+    store.git_commit(&format!("wsp: changes asked of {} — {}", i.id, util::truncate(&text, 60)));
+    if args.json() {
+        println!("{}", json!({ "initiative": i.id, "change": n, "state": i.state }));
+    } else {
+        println!("◇ {}  changes asked (#{n}) — `wsp initiative plan {}` replans from it", i.id, i.id);
+    }
+    0
+}
+
+/// `wsp initiative approve <id> "verdict"`: approve for build. Records the
+/// verdict, accepts the assumptions and confirms the criteria, moves the state
+/// planned → building and marks the plan's lists `planned` for the pickup.
+/// Nothing starts here: a list is `planned`, never `executing`, after it.
+fn approve(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "wsp initiative approve <id> \"verdict\"";
+    let mut i = match need(store, args, USAGE) {
+        Ok(i) => i,
+        Err(c) => return c,
+    };
+    let verdict = args.rest[2..].join(" ");
+    let verdict = verdict.trim();
+    if verdict.is_empty() {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    }
+    if i.state != "planned" {
+        eprintln!("wsp: {} is {} — only a planned initiative is approved for build", i.id, i.state);
+        return 1;
+    }
+    // The lists in plan order (increment 1's first), then any linked but unplanned.
+    let mut lists: Vec<String> = Vec::new();
+    for l in i.increments().iter().flat_map(|r| r.lists.iter()).chain(i.worklists.iter()) {
+        if !lists.contains(l) {
+            lists.push(l.clone());
+        }
+    }
+    for l in &lists {
+        if let Some(w) = store.worklist(l) {
+            if w.status() != crate::model::WorklistStatus::Draft {
+                eprintln!("wsp: {} has a list that already started ({l}) — approve a plan before its build begins", i.id);
+                return 1;
+            }
+        }
+    }
+    let crit: Vec<Rec> = i.criteria().into_iter().map(|mut r| { if r.status == "draft" { r.status = "confirmed".into(); } r }).collect();
+    let asm: Vec<Rec> = i.assumptions().into_iter().map(|mut r| { if r.status == "assumed" { r.status = "accepted".into(); } r }).collect();
+    if !crit.is_empty() {
+        i.put_recs(CRIT_SEC, &crit);
+    }
+    if !asm.is_empty() {
+        i.put_recs(ASSUME_SEC, &asm);
+    }
+    crate::model::append_decision(&mut i.body, &format!("approved for build: {verdict}"), &[]);
+    i.state = "building".into();
+    let mut marked: Vec<String> = Vec::new();
+    let res = store.locked(|| -> Result<(), String> {
+        for l in &lists {
+            let Some(mut w) = store.worklist(l) else { continue };
+            if w.is_planned() {
+                continue;
+            }
+            w.set_planned();
+            w.log(&format!("status draft → planned — {} approved for build", i.id));
+            store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+            store.log_event("worklist-edited", json!({ "id": w.id, "what": "status", "status": "planned" }));
+            marked.push(l.clone());
+        }
+        Ok(())
+    });
+    if let Err(e) = res {
+        eprintln!("{e}");
+        return 1;
+    }
+    if let Err(e) = save(store, &i) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("initiative-approved", json!({ "id": i.id, "lists": marked }));
+    store.git_commit(&format!("wsp: approve {} — {}", i.id, util::truncate(verdict, 60)));
+    if args.json() {
+        println!("{}", json!({ "initiative": i.id, "state": i.state, "planned": marked }));
+    } else {
+        println!("◆ {}  approved for build — {} list(s) planned", i.id, marked.len());
+    }
+    0
 }
 
 /// `wsp spawn <row> --agent --model M` as a child of this binary, the way the
@@ -1267,6 +1431,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
                                     | increment add <id> ["caption"] [--criteria C1,C2] [--list L]…
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
+                                    | approve <id> "verdict"  | changes <id> "what to change"
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md
                                     | brief <id>  a record below a product: artefacts and
@@ -1568,5 +1733,73 @@ mod tests {
         assert_eq!(after("qc").as_deref(), Some("qb"), "and waits on the first increment's last list");
         assert_eq!(run(&store, &["increment", "edit", "init-2", "I1"], &[("list", "qb,qa")]), 0);
         assert_eq!((after("qb"), after("qa").as_deref(), after("qc").as_deref()), (None, Some("qb"), Some("qa")), "reordered, the chain follows");
+    }
+
+    /// `wsp-732`: approve for build and ask for changes, table-driven.
+    #[test]
+    fn approve_plans_the_lists_changes_are_stored_and_plan_reads_them() {
+        use crate::model::{Group, Task, Worklist};
+        let store = crate::testkit::store("initiative-approve");
+        let mut prod = Project::new("compound");
+        prod.kind = "product".into();
+        store.save_project(&prod).unwrap();
+        assert_eq!(run(&store, &["add", "Appr"], &[("product", "compound")]), 0);
+        assert_eq!(run(&store, &["criterion", "add", "init-1", "one"], &[]), 0);
+        assert_eq!(run(&store, &["assume", "add", "init-1", "users have git"], &[]), 0);
+        store.save_task(&Task::new("T1", "p-1")).unwrap();
+        for (id, m) in [("pa", "p-1"), ("pb", "p-1")] {
+            let mut w = Worklist::new(id, id);
+            w.set_groups(&[Group { members: vec![m.to_string()], ..Group::default() }]);
+            store.save_worklist(&w).unwrap();
+        }
+        assert_eq!(run(&store, &["increment", "add", "init-1", "first"], &[("list", "pa")]), 0);
+        assert_eq!(run(&store, &["increment", "add", "init-1", "second"], &[("list", "pb")]), 0);
+        let state = |s: &Store| find(s, "init-1").unwrap().state;
+
+        // Not planned: refused, nothing changes.
+        assert_eq!(run(&store, &["approve", "init-1", "go"], &[]), 1);
+        assert_eq!(run(&store, &["changes", "init-1", "x"], &[]), 1);
+        assert_eq!(run(&store, &["set", "init-1", "state=planned"], &[]), 0);
+        let cases: &[(&[&str], i32)] = &[
+            (&["approve"], 2),
+            (&["approve", "init-1"], 2),
+            (&["approve", "init-9", "ok"], 1),
+            (&["changes", "init-1"], 2),
+            (&["changes", "init-1", "split", "the", "first list"], 0),
+            (&["changes", "init-1", "and fewer rows"], 0),
+        ];
+        for (rest, want) in cases {
+            assert_eq!(run(&store, rest, &[]), *want, "{rest:?}");
+        }
+        assert_eq!(state(&store), "planned", "changes leave the state");
+        assert!(store.worklist("pa").unwrap().status() == crate::model::WorklistStatus::Draft && !store.worklist("pa").unwrap().is_planned(), "changes start nothing");
+        let i = find(&store, "init-1").unwrap();
+        assert_eq!(newest_change(&i), Some((2, "and fewer rows".into())));
+        // plan with no --changes reads the newest unanswered request.
+        assert_eq!(run(&store, &["plan", "init-1"], &[("dry-run", "true")]), 0);
+
+        // A list already started refuses approve, whole.
+        let mut w = store.worklist("pb").unwrap();
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(run(&store, &["approve", "init-1", "ok"], &[]), 1);
+        assert_eq!(state(&store), "planned");
+        assert!(!store.worklist("pa").unwrap().is_planned(), "a refusal marks nothing");
+        let mut w = store.worklist("pb").unwrap();
+        w.set_status(crate::model::WorklistStatus::Draft);
+        store.save_worklist(&w).unwrap();
+
+        assert_eq!(run(&store, &["approve", "init-1", "looks right"], &[]), 0);
+        let i = find(&store, "init-1").unwrap();
+        assert_eq!(i.state, "building");
+        assert_eq!(i.criteria()[0].status, "confirmed");
+        assert_eq!(i.assumptions()[0].status, "accepted");
+        assert!(crate::model::decisions_of(&i.body).iter().any(|d| d.text == "approved for build: looks right"));
+        for l in ["pa", "pb"] {
+            let w = store.worklist(l).unwrap();
+            assert!(w.is_planned() && w.status() != crate::model::WorklistStatus::Running, "{l} planned, not executing");
+        }
+        assert_eq!(store.worklist("pb").unwrap().after.as_deref(), Some("pa"), "later lists wait on earlier ones");
+        assert_eq!(run(&store, &["approve", "init-1", "again"], &[]), 1, "approved once");
     }
 }
