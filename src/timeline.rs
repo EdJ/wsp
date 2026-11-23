@@ -1477,25 +1477,33 @@ const TOOL_KINDS: [&str; 4] = ["Bash", "Read", "Edit", "Write"];
 
 /// The model calls and tool times in one transcript. A call is a requestId:
 /// one transcript line per content block repeats its usage, so the figures are
-/// kept once (the largest seen). A call's model seconds run from the line
-/// before it to its last line; a tool's from its call to its result.
+/// kept once (the largest seen). A call's model seconds run from the
+/// `api-request` line that sent it to its last line; a tool's from its call to
+/// its result. A transcript that writes no `api-request` lines times a call
+/// from the line before it: there an `attachment` or `file-history-delta` line
+/// stamped when the reply came back would make a long call read as 0 s
+/// (`wsp-313`), which is why the request's own line is taken where it is.
 fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
     let mut calls: Vec<Call> = Vec::new();
     let mut index: std::collections::HashMap<String, usize> = Default::default();
     let mut pending: std::collections::HashMap<String, (i64, String)> = Default::default();
     let mut tools: Vec<(i64, String, i64)> = Vec::new();
     let mut prev: Option<i64> = None;
+    // The last request sent since the last user line, not yet answered.
+    let mut sent: Option<i64> = None;
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         let Some(t) = v["timestamp"].as_str().map(util::epoch_of).filter(|t| *t > 0) else { continue };
         match v["type"].as_str() {
+            Some("api-request") => sent = Some(t),
             Some("assistant") => {
                 let m = &v["message"];
                 let key = v["requestId"].as_str().or_else(|| m["id"].as_str()).map(String::from);
                 let n = match key.as_ref().and_then(|k| index.get(k)) {
                     Some(n) => *n,
                     None => {
-                        calls.push(Call { at: t, start: prev.unwrap_or(t), end: t, ..Default::default() });
+                        let start = sent.take().map(|s| s.min(t)).or(prev).unwrap_or(t);
+                        calls.push(Call { at: t, start, end: t, ..Default::default() });
                         if let Some(k) = key {
                             index.insert(k, calls.len() - 1);
                         }
@@ -1520,6 +1528,7 @@ fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
                 }
             }
             Some("user") => {
+                sent = None;
                 for b in v["message"]["content"].as_array().into_iter().flatten() {
                     if b["type"] == "tool_result" {
                         if let Some((at, name)) = b["tool_use_id"].as_str().and_then(|id| pending.remove(id)) {
@@ -3253,6 +3262,39 @@ mod tests {
         assert_eq!((f.untimed, f.model_secs, f.calls), (1, 0, 0));
         assert!(render_seat(&r).contains("transcript of session s has no timestamps"), "{}", render_seat(&r));
         assert_eq!(seat_json(&r)["untimed"], json!(["s"]));
+    }
+
+    #[test]
+    fn a_call_runs_from_its_api_request_line_and_not_from_an_attachment_stamped_at_the_reply() {
+        // wsp-154's transcript: the reply's attachment line, or a
+        // file-history-delta stamped later still, came just before the
+        // assistant line and the call read about 0 s.
+        let line = |kind: &str, at: &str, extra: Value| {
+            let mut v = json!({"type": kind, "timestamp": at});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v.to_string()
+        };
+        let reply = |req: &str| json!({"requestId": req, "message": {"content": [], "usage": {"input_tokens": 1, "output_tokens": 10}}});
+        let text = [
+            line("user", "2026-11-19T22:02:50.546Z", json!({"message": {"content": "go"}})),
+            line("attachment", "2026-11-19T22:02:50.550Z", json!({})),
+            line("api-request", "2026-11-19T22:02:50.565Z", json!({"querySource": "repl_main_thread"})),
+            line("attachment", "2026-11-19T22:06:41.034Z", json!({})),
+            line("assistant", "2026-11-19T22:06:41.033Z", reply("r1")),
+            line("user", "2026-11-19T22:06:42.483Z", json!({"message": {"content": "next"}})),
+            line("api-request", "2026-11-19T22:06:42.528Z", json!({"querySource": "repl_main_thread"})),
+            line("file-history-delta", "2026-11-19T22:09:09.178Z", json!({})),
+            line("assistant", "2026-11-19T22:06:49.741Z", reply("r2")),
+            line("assistant", "2026-11-19T22:09:09.143Z", reply("r2")),
+        ]
+        .join("\n");
+        let (calls, _) = read_transcript(&text);
+        let secs: Vec<i64> = calls.iter().map(|c| c.end - c.start).collect();
+        assert_eq!(secs, vec![231, 147]);
+        // Without api-request lines a call still runs from the line before it.
+        let old: String = text.lines().filter(|l| !l.contains("\"api-request\"")).collect::<Vec<_>>().join("\n");
+        let (calls, _) = read_transcript(&old);
+        assert_eq!(calls.iter().map(|c| c.end - c.start).collect::<Vec<_>>(), vec![0, 0]);
     }
 
     #[test]
