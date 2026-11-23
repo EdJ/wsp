@@ -1142,7 +1142,15 @@ pub(crate) fn api_health(state: &std::path::Path, running: Option<&[u32]>, probl
         return;
     }
     match wsp_client::Client::dial(state, wsp_store_contract::Principal::Wsp("doctor".into()), std::time::Duration::from_secs(2)) {
-        Ok(c) => notes.push(format!("API answers (head event {})", c.head().0)),
+        Ok(c) => {
+            // Where it listens is what api.json says, not a guess at the machine's addresses.
+            let at = std::fs::read_to_string(state.join(wsp_api::LISTEN_FILE))
+                .ok()
+                .and_then(|t| serde_json::from_str::<wsp_api::Listen>(&t).ok())
+                .map(|l| l.addrs.join(", "))
+                .unwrap_or_default();
+            notes.push(format!("API answers at {at} (head event {})", c.head().0));
+        }
         Err(why) => problems.push(format!("api.json names an address that does not answer: {why}")),
     }
 }

@@ -630,3 +630,20 @@ fn ann_offline_past_the_ttl_with_the_row_re_leased_by_bob_lands_her_journal_as_a
     // Ann's code is still on her branch.
     assert_eq!(git(&["rev-parse", &id]), work, "the branch still holds Ann's commits");
 }
+
+/// wsp-194: `wsp doctor` on a logged-in spoke names the hub, its user, the
+/// last sync and the journal; both are read from hubs.json and the worker's
+/// status file, so nothing in the line is a literal.
+#[test]
+fn doctor_on_a_logged_in_spoke_names_the_hub_the_user_the_last_sync_and_the_journal() {
+    let mut rig = Rig::up("d");
+    rig.a.start_daemon();
+    rig.a.wait("A's first good turn", Duration::from_secs(60), |s| s.status()["last_ok"].as_i64().is_some());
+    let out = rig.a.ok(&["doctor"]);
+    let url = format!("tcp://{}", rig.a.proxy.addr);
+    assert!(out.contains(&format!("hub {url} as ann")), "{out}");
+    assert!(out.contains("hub last synced"), "{out}");
+    assert!(out.contains("hub journal:") && out.contains("entries"), "{out}");
+    assert!(out.contains("hub leases held: none"), "{out}");
+    assert!(!out.contains("standalone"), "{out}");
+}

@@ -158,7 +158,7 @@ fn token_of(rec: &Value) -> Option<Token> {
     rec.get(TOKEN).and_then(|t| t.as_u64()).map(Token)
 }
 
-fn seat_of(rec: &Value) -> Option<&str> {
+pub(crate) fn seat_of(rec: &Value) -> Option<&str> {
     ["workspace_id", "workspace", "workspace_label"]
         .iter()
         .find_map(|k| rec.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))

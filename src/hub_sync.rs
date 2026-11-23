@@ -339,6 +339,108 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// The status file under `$WSP_STATE/hub/`, which `wsp doctor` reads.
+pub(crate) const STATUS_FILE: &str = "sync.json";
+
+/// What `wsp doctor` says of the hub, from `hubs.json` under `home`, the
+/// status file the worker keeps, the journal, the claims' leases and the drive
+/// book (wsp-194). A wsp that is not logged in says one line and nothing more.
+/// A lease within a day of its expiry whose seat `alive` does not know is a
+/// warning: nothing is renewing it. `now` is epoch seconds.
+pub(crate) fn health(
+    store: &Store,
+    home: Option<&std::path::Path>,
+    now: i64,
+    alive: &mut dyn FnMut(&str) -> bool,
+    problems: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let home = home.unwrap_or_else(|| std::path::Path::new(""));
+    let url = match wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home) {
+        Ok(u) => u,
+        Err(wsp_client::Silent::BadHubsFile(why)) => {
+            problems.push(format!("the hub login cannot be read: {why}"));
+            return;
+        }
+        Err(_) => {
+            notes.push("not logged in to a hub (standalone)".into());
+            return;
+        }
+    };
+    let user = env(wsp_client::HUB_USER_ENV)
+        .or_else(|| wsp_client::hub_login_in(home).ok().flatten().map(|l| l.user).filter(|u| !u.is_empty()))
+        .unwrap_or_else(|| "(unnamed)".into());
+    notes.push(format!("hub {url} as {user}"));
+
+    // The certificate the hub presents now.
+    let ca = wsp_client::hub_ca_in(env(wsp_client::HUB_CA_ENV), home).ok().flatten();
+    match wsp_client::hub_cert_expiry(&url, ca.as_deref(), Duration::from_secs(2)) {
+        Ok(None) => notes.push("hub certificate: none (the hub is dialled in the clear)".into()),
+        Ok(Some(at)) => {
+            let days = (at - now).div_euclid(86_400);
+            let line = format!("hub certificate expires {} (in {days} days)", crate::util::iso_at(at));
+            if at - now < 7 * 86_400 {
+                warnings.push(line);
+            } else {
+                notes.push(line);
+            }
+        }
+        Err(why) => warnings.push(format!("hub certificate not read: {why}")),
+    }
+
+    // The worker's last word.
+    let status: serde_json::Value = std::fs::read_to_string(store.state.join("hub").join(STATUS_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    match status["last_ok"].as_i64() {
+        Some(at) => notes.push(format!("hub last synced {} ({} ago)", crate::util::iso_at(at), crate::util::duration_human((now - at).max(0)))),
+        None => notes.push("hub never synced".into()),
+    }
+    if let Some(at) = status["last_failure"]["at"].as_i64() {
+        let why = status["last_failure"]["why"].as_str().unwrap_or("no reason given");
+        let line = format!("hub last failure {}: {why}", crate::util::iso_at(at));
+        if status["last_ok"].as_i64().is_none_or(|ok| ok < at) {
+            warnings.push(line);
+        } else {
+            notes.push(line);
+        }
+    }
+    notes.push(format!("hub journal: {} entries waiting", Journal::of(store).len()));
+
+    // The row leases the claims here hold, and the drive leases.
+    let claims = store.claims();
+    let mut held: Vec<(String, i64)> = claims
+        .iter()
+        .filter(|(_, rec)| rec.get(crate::hub_lease::TOKEN).is_some())
+        .filter_map(|(row, rec)| Some((row.clone(), wsp_store::store::record_expires(rec)?)))
+        .collect();
+    held.sort_by_key(|(_, at)| *at);
+    match held.first() {
+        None => notes.push("hub leases held: none".into()),
+        Some((row, at)) => notes.push(format!("hub leases held: {}, soonest {row} expires {}", held.len(), crate::util::iso_at(*at))),
+    }
+    for (row, at) in &held {
+        if at - now >= 86_400 {
+            continue;
+        }
+        let seat = claims.get(row).and_then(crate::hub_lease::seat_of).unwrap_or("");
+        if seat.is_empty() || !alive(seat) {
+            warnings.push(format!(
+                "hub lease on {row} expires {} and its seat is not alive: nothing renews it",
+                crate::util::iso_at(*at)
+            ));
+        }
+    }
+    let drives = crate::hub_lease::Book::read(store).drives;
+    match drives.iter().min_by_key(|(_, d)| d.expires) {
+        None => notes.push("hub drive leases held: none".into()),
+        Some((list, d)) => notes.push(format!("hub drive leases held: {}, soonest {list} expires {}", drives.len(), crate::util::iso_at(d.expires))),
+    }
+}
+
 /// A request that failed because the hub is not there, as against one it refused.
 fn unreachable(e: &wsp_client::Error) -> bool {
     matches!(e, wsp_client::Error::Timeout | wsp_client::Error::Lost(_) | wsp_client::Error::Silent(_))
@@ -503,7 +605,19 @@ impl Worker {
     /// `$WSP_STATE/hub/sync.json`: turns run, the link, and the last turn's tally.
     fn write_status(&self, store: &Store, last: Option<&Turned>) {
         let dir = store.state.join("hub");
+        // The last good turn and the last failure outlive the turn that wrote
+        // them: what `wsp doctor` says of a hub that answered an hour ago.
+        let before: serde_json::Value =
+            std::fs::read_to_string(dir.join(STATUS_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let now = crate::util::epoch_secs();
+        let last_ok = if matches!(self.link, Link::Up) { Some(serde_json::json!(now)) } else { before.get("last_ok").cloned() };
+        let last_failure = match &self.link {
+            Link::Down(w) => Some(serde_json::json!({ "at": now, "why": w })),
+            _ => before.get("last_failure").cloned(),
+        };
         let v = serde_json::json!({
+            "last_ok": last_ok,
+            "last_failure": last_failure,
             "turns": self.turns,
             "link": self.link.word(),
             "why": match &self.link { Link::Down(w) => Some(w.clone()), _ => None },
@@ -513,7 +627,7 @@ impl Worker {
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(format!(".sync.json.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, v.to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, dir.join("sync.json"));
+            let _ = std::fs::rename(&tmp, dir.join(STATUS_FILE));
         }
     }
 
@@ -1568,6 +1682,80 @@ mod tests {
         assert_eq!(w.0, 1, "one connection");
         assert!(String::from_utf8_lossy(&w.1).contains("\"type\":\"hello\""), "a hello frame: {}", String::from_utf8_lossy(&w.1));
         drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-194: what `health` says, as (problems, warnings, notes).
+    fn said(store: &Store, home: &std::path::Path, now: i64, alive: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let (mut p, mut w, mut n) = (Vec::new(), Vec::new(), Vec::new());
+        health(store, Some(home), now, &mut |_| alive, &mut p, &mut w, &mut n);
+        (p, w, n)
+    }
+
+    /// A wsp with no login says the one line and nothing about a hub.
+    #[test]
+    fn doctor_says_one_line_for_a_standalone_wsp() {
+        let env = crate::util::isolated("hub-doctor-standalone");
+        let dir = env.home().parent().unwrap().join("doc-standalone");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = spoke_with_seat(&dir.join("s"), "s-1", "cpd-s1");
+        let (p, w, n) = said(&store, &dir.join("nohome"), 1_800_000_000, true);
+        assert!(p.is_empty() && w.is_empty(), "{p:?} {w:?}");
+        assert_eq!(n, vec!["not logged in to a hub (standalone)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Logged in: the URL and user, the last sync and the journal's length;
+    /// and a lease a day from its end with no seat is a warning (a live seat
+    /// or a far-off expiry is not).
+    #[test]
+    fn doctor_names_the_hub_the_last_sync_the_journal_and_a_lease_nothing_renews() {
+        let env = crate::util::isolated("hub-doctor-in");
+        let dir = env.home().parent().unwrap().join("doc-in");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = spoke_with_seat(&dir.join("s"), "s-1", "cpd-s1");
+        let home = dir.join("s/home");
+        log_in(&home, "127.0.0.1:9".parse().unwrap(), "secret", "ann");
+        let now = crate::util::epoch_secs();
+        std::fs::create_dir_all(store.state.join("hub")).unwrap();
+        std::fs::write(
+            store.state.join("hub").join(STATUS_FILE),
+            serde_json::json!({
+                "last_ok": now - 120,
+                "last_failure": { "at": now - 600, "why": "the hub is gone" },
+                "journal": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        store.set_claim(
+            "s-1",
+            serde_json::json!({ "workspace_id": "w1", "hub_token": 7, "expires": crate::util::iso_at(now + 3600), "ttl_s": 86400 }),
+        );
+
+        let (p, w, n) = said(&store, &home, now, false);
+        let text = n.join("\n");
+        assert!(p.is_empty(), "{p:?}");
+        assert!(text.contains("hub tcp://127.0.0.1:9 as ann"), "{text}");
+        assert!(text.contains("hub last synced") && text.contains("2m"), "{text}");
+        assert!(text.contains("hub journal: 0 entries"), "{text}");
+        assert!(text.contains("hub leases held: 1, soonest s-1 expires"), "{text}");
+        assert!(text.contains("hub drive leases held: none"), "{text}");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("hub lease on s-1") && w[0].contains("not alive"), "{w:?}");
+
+        // The same lease with its seat alive, or more than a day from its end, warns of nothing.
+        assert!(said(&store, &home, now, true).1.is_empty());
+        assert!(said(&store, &home, now - 100_000, false).1.is_empty());
+
+        // A failure after the last good turn is a warning naming the reason.
+        std::fs::write(
+            store.state.join("hub").join(STATUS_FILE),
+            serde_json::json!({ "last_ok": now - 600, "last_failure": { "at": now - 60, "why": "the hub is gone" } }).to_string(),
+        )
+        .unwrap();
+        let (_, w, _) = said(&store, &home, now, true);
+        assert!(w.iter().any(|l| l.contains("the hub is gone")), "{w:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

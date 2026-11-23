@@ -7122,6 +7122,19 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    // And the hub: one line for a standalone wsp, the login's state for a spoke.
+    {
+        let mut seen = None;
+        crate::hub_sync::health(
+            store,
+            std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref(),
+            util::epoch_secs(),
+            &mut |seat| crate::daemon::seat_alive(store, seat, &mut seen),
+            &mut problems,
+            &mut warnings,
+            &mut notes,
+        );
+    }
     // And whether far machines have gone silent: their seats are held, not
     // gone, and say so in the daemon's own manner (`wsp-145`).
     notes.extend(crate::far::Silence::read(store).line);

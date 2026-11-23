@@ -135,6 +135,41 @@ fn open_at(addrs: &[String], token: ApiToken, by: &Principal, wait: Duration, tl
     Err(Silent::Unreachable(tried))
 }
 
+/// When the certificate the hub at `url` presents runs out, in epoch seconds:
+/// `Ok(None)` for a hub dialled in the clear (`tcp://`, a bare `host:port`).
+/// The handshake is the one a dial does, so a certificate the roots (or the
+/// pinned `ca`) do not vouch for is [`Silent::Tls`] naming the fault.
+pub fn hub_cert_expiry(url: &str, ca: Option<&Path>, wait: Duration) -> Result<Option<i64>, Silent> {
+    let (addr, secure) = crate::credential::hub_addr(url)?;
+    if !secure {
+        return Ok(None);
+    }
+    let tls = Tls::new(&addr, ca)?;
+    let deadline = Instant::now() + wait;
+    let mut tried = Vec::new();
+    let found = addr.to_socket_addrs().map_err(|e| Silent::Unreachable(vec![format!("{addr}: {e}")]))?;
+    for a in found {
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+        let stream = match std::net::TcpStream::connect_timeout(&a, left) {
+            Ok(s) => s,
+            Err(e) => {
+                tried.push(format!("{a}: {e}"));
+                continue;
+            }
+        };
+        return match handshake(stream, &tls, deadline) {
+            Ok(s) => Ok(s
+                .conn
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .and_then(|c| crate::tls::not_after(c.as_ref()))),
+            Err(Dialled::Tls(why)) => Err(Silent::Tls(format!("{addr}: {why}"))),
+            Err(Dialled::Net(e)) => Err(Silent::Unreachable(vec![format!("{addr}: {e}")])),
+        };
+    }
+    Err(Silent::Unreachable(tried))
+}
+
 fn hello(mut conn: Tcp, at: &str, token: ApiToken, by: &Principal, deadline: Instant) -> Result<Open, Silent> {
     let frame = Frame::Hello(Hello { token, by: by.clone(), client: client_name(), protocol: PROTOCOL });
     conn.send(&frame).map_err(|e| Silent::NoWelcome(format!("{at}: {e}")))?;
