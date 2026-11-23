@@ -5378,8 +5378,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// `compounding-220`: the packet generated for the second seat of a
-    /// reopened row starts with the reopen's reason, before the original
     /// wsp-303's done-when rested on `wsp mv`. Its review says so in one line,
     /// however many items or verbs; the overview before a done-when, and a
     /// done-when that needs no refused verb, say nothing (`wsp-312`).
@@ -5416,6 +5414,8 @@ pub(crate) mod tests {
         assert!(overview_names_refused("task", "wsp-154", Some("Overview"), "## Overview\nMake a.\n").is_empty());
     }
 
+    /// `compounding-220`: the packet generated for the second seat of a
+    /// reopened row starts with the reopen's reason, before the original
     /// overview. compounding-189's second seat re-reported a landed commit
     /// because its packet carried only the first brief.
     #[test]
