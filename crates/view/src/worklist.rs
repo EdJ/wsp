@@ -7,7 +7,46 @@
 
 use serde_json::{json, Value};
 
+use wsp_store_contract::{List, State};
+
 use crate::common::iso_at;
+
+/// The keys `mirror::lists` writes into [`List::fields`] beside `title`,
+/// `caption`, `status`, `prio`, `after`, `created` and `planned` (wsp-308).
+pub mod key {
+    /// `caption::of_worklist`'s `from`.
+    pub const CAPTION_FROM: &str = "caption_from";
+    /// The status word `ls` prints (`executing`, `planned`, ...).
+    pub const PHASE: &str = "phase";
+    pub const HELD: &str = "held";
+    pub const WAITING_ON_ED: &str = "waiting_on_ed";
+    pub const PARKED: &str = "parked";
+    /// The record's own word, trimmed.
+    pub const STORED: &str = "stored";
+    /// How many groups there are.
+    pub const GROUPS: &str = "group_count";
+    /// The group the run is at, `""` for none.
+    pub const AT: &str = "at";
+    /// JSON array of `{name, kind, file, present}`.
+    pub const OUTPUTS: &str = "outputs";
+    pub const OUTPUTS_DIR: &str = "outputs_dir";
+    pub const SEGMENT: &str = "segment";
+    /// The place `ls` draws it at (segment, then newest activity, then id).
+    pub const ORDER: &str = "order";
+    pub const OPEN: &str = "open";
+    /// JSON array of member ids.
+    pub const GONE: &str = "gone";
+    /// JSON array of group ordinals.
+    pub const UNWRITTEN: &str = "unwritten";
+    /// Epoch seconds.
+    pub const ACTIVITY: &str = "activity";
+    /// `waits::Prio::word`.
+    pub const PRIO_WORD: &str = "prio_word";
+    /// One-based queue place, present for a planned list only.
+    pub const QUEUE: &str = "queue";
+    /// What it waits on, `""` where it may start; with `queue`.
+    pub const WAITS: &str = "waits";
+}
 
 /// One declared output of a worklist and whether its file is there.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +149,76 @@ pub fn listed_json(l: &Listing) -> Value {
 /// `worklist ls --json`: every list, no collapse and no `--all`.
 pub fn list_json(listed: &[Listing]) -> Value {
     Value::Array(listed.iter().map(listed_json).collect())
+}
+
+fn f<'a>(l: &'a List, k: &str) -> &'a str {
+    l.fields.get(k).map(String::as_str).unwrap_or("")
+}
+
+fn flag(l: &List, k: &str) -> bool {
+    f(l, k) == "true"
+}
+
+fn json_of(l: &List, k: &str) -> Vec<Value> {
+    serde_json::from_str(f(l, k)).unwrap_or_default()
+}
+
+/// The [`Head`] a list's fields say.
+pub fn head_of_list(l: &List) -> Head {
+    let outputs = json_of(l, key::OUTPUTS);
+    let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_string();
+    Head {
+        id: l.id.0.clone(),
+        title: f(l, "title").into(),
+        caption_text: f(l, "caption").into(),
+        caption_from: f(l, key::CAPTION_FROM).into(),
+        status: f(l, key::PHASE).into(),
+        held: flag(l, key::HELD),
+        waiting_on_ed: flag(l, key::WAITING_ON_ED),
+        parked: flag(l, key::PARKED),
+        stored: f(l, key::STORED).into(),
+        planned: Some(f(l, "planned")).filter(|s| !s.is_empty()).map(str::to_string),
+        created: f(l, "created").into(),
+        groups: f(l, key::GROUPS).parse().unwrap_or(0),
+        at: f(l, key::AT).parse().ok(),
+        outputs: outputs
+            .iter()
+            .map(|o| Output { name: s(o, "name"), kind: s(o, "kind"), file: s(o, "file"), present: o["present"].as_bool().unwrap_or(false) })
+            .collect(),
+        outputs_dir: f(l, key::OUTPUTS_DIR).into(),
+    }
+}
+
+/// The [`Listing`] a list's fields say.
+pub fn listing_of_list(l: &List) -> Listing {
+    Listing {
+        head: head_of_list(l),
+        segment: f(l, key::SEGMENT).into(),
+        open: f(l, key::OPEN).parse().unwrap_or(0),
+        gone: json_of(l, key::GONE).iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        unwritten: json_of(l, key::UNWRITTEN).iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect(),
+        activity: f(l, key::ACTIVITY).parse().unwrap_or(0),
+        prio: f(l, key::PRIO_WORD).into(),
+        after: Some(f(l, "after")).filter(|s| !s.is_empty()).map(str::to_string),
+        queue: f(l, key::QUEUE).parse().ok().map(|n| Queue {
+            n,
+            waits: Some(f(l, key::WAITS)).filter(|s| !s.is_empty()).map(str::to_string),
+        }),
+    }
+}
+
+/// `worklist ls --json` over the State: every list in the order `ls` draws.
+pub fn ls_of_state(state: &State, _now: i64) -> Value {
+    let mut lists: Vec<&List> = state.lists.values().collect();
+    lists.sort_by_key(|l| (f(l, key::ORDER).parse::<usize>().unwrap_or(usize::MAX), l.id.0.clone()));
+    let listed: Vec<Listing> = lists.into_iter().map(listing_of_list).collect();
+    list_json(&listed)
+}
+
+/// The object `worklist show <id> --json` carries under `"worklist"`, less
+/// `project`: the head alone, from the State.
+pub fn head_of_state(state: &State, id: &str) -> Option<Value> {
+    state.lists.values().find(|l| l.id.0 == id).map(|l| head_json(&head_of_list(l)))
 }
 
 #[cfg(test)]

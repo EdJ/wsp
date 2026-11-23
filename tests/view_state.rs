@@ -25,6 +25,7 @@ type Projection = (&'static str, &'static [&'static str], fn(&State, i64) -> Str
 const PROJECTIONS: &[Projection] = &[
     ("ls-all", &["ls", "--all", "--json"], wsp_view::task::ls_all),
     ("wip", &["wip", "--json"], wip),
+    ("worklist-ls", &["worklist", "ls", "--json"], worklist_ls),
 ];
 
 /// Recordings `view_golden` already fails at HEAD (the fake manager gives an agent no
@@ -33,6 +34,10 @@ const STALE_RECORDING: &[&str] = &["wip"];
 
 fn wip(state: &State, now: i64) -> String {
     serde_json::to_string_pretty(&wsp_view::wip::of_state(state, now)).unwrap()
+}
+
+fn worklist_ls(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::worklist::ls_of_state(state, now)).unwrap()
 }
 
 #[test]

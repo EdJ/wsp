@@ -2604,8 +2604,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if args.json() {
         // No collapse and no `--all` here: an abridgement is a thing done for
         // a reader, and a parser is not one.
-        let waits = crate::waits::read(store, &listed);
-        let out = wsp_view::worklist::list_json(&listing_of(store, &listed, &waits));
+        let out = wsp_view::worklist::ls_of_state(&crate::mirror::state_of(store, crate::mirror::LOCAL), wsp_base::util::epoch_secs());
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -2735,28 +2734,6 @@ fn count(n: usize) -> String {
         0 => "·".to_string(),
         n => n.to_string(),
     }
-}
-
-/// The rows of `worklist ls --json`, read: each list's head, the facts the
-/// listing adds, and the queue place of a planned one. `wsp-view` draws them.
-fn listing_of(store: &Store, listed: &[worklist::Listed], waits: &[(String, Option<crate::waits::Wait>)]) -> Vec<wsp_view::worklist::Listing> {
-    listed
-        .iter()
-        .map(|l| wsp_view::worklist::Listing {
-            head: head_of(&l.list, &l.at, l.phase(store)),
-            segment: l.segment.word().to_string(),
-            open: l.open,
-            gone: l.gone.clone(),
-            unwritten: l.at.unwritten.clone(),
-            activity: l.activity,
-            prio: crate::waits::Prio::of(&l.list).word().to_string(),
-            after: l.list.after.clone(),
-            queue: waits.iter().position(|(id, _)| *id == l.list.id).map(|n| wsp_view::worklist::Queue {
-                n: n + 1,
-                waits: waits[n].1.as_ref().map(|w| w.text()),
-            }),
-        })
-        .collect()
 }
 
 // ---- what a passed group left behind ----------------------------------
@@ -11626,8 +11603,7 @@ mod tests {
         assert_eq!(v["worklist"]["status"], "executing");
         assert_eq!(v["worklist"]["flags"], json!({ "held": false, "waiting_on_ed": false, "parked": false }));
         assert_eq!(v["worklist"]["stored"], "running");
-        let listed = worklist::listing(&store, store.worklists());
-        let l = wsp_view::worklist::listed_json(&listing_of(&store, &listed, &[]).remove(0));
+        let l = wsp_view::worklist::ls_of_state(&crate::mirror::state_of(&store, crate::mirror::LOCAL), 0)[0].clone();
         assert_eq!(l["status"], "executing");
         assert!(l["flags"].is_object());
     }

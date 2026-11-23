@@ -131,6 +131,17 @@ fn encode(outs: &[Output], none: bool) -> Option<String> {
     (!items.is_empty()).then(|| items.join(","))
 }
 
+/// What the mirror writes a list's `outputs` and `outputs_dir` from: each
+/// declared output with whether its file is on disk, and the directory.
+pub fn list_outputs(w: &Worklist) -> (Vec<serde_json::Value>, String) {
+    let d = dir(&w.id);
+    let outs = declared(w)
+        .iter()
+        .map(|o| serde_json::json!({ "name": o.name, "kind": o.kind, "file": o.file(), "present": d.join(o.file()).is_file() }))
+        .collect();
+    (outs, d.display().to_string())
+}
+
 /// The files a declared output is still missing, by name.
 pub fn missing(w: &Worklist) -> Vec<String> {
     let d = dir(&w.id);

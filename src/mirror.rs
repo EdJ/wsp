@@ -781,9 +781,56 @@ pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let texts = texts_of(store, &tasks);
     let mut out = rows(&tasks, &claims_file, &worklists, &texts, &crate::stage::sayings(store));
     out.extend(claims(&claims_file));
-    out.extend(lists(&worklists, &tasks, &list_texts_of(store, &worklists)));
+    let mut ls = lists(&worklists, &tasks, &list_texts_of(store, &worklists));
+    list_facts(store, worklists.clone(), &mut ls);
+    out.extend(ls);
     out.extend(machines(&store.machines(), &store.machines_live(), local));
     out
+}
+
+/// What `worklist ls --json` reads that the files alone do not say, written
+/// into each list's `fields` (wsp-308; keys in [`wsp_view::worklist::key`]):
+/// phase word and flags, the group it stands at, which declared outputs are on
+/// disk, members gone, unwritten barriers, the segment and its place in `ls`'s
+/// order, activity, the priority word, and a planned list's queue place and
+/// what it waits on. One `worklist::listing` and one `waits::read`, as the CLI does.
+/// A list's declared outputs as `{name, kind, file, present}` and the
+/// directory they are in, read from disk. Installed by `main` (`cmd_report`
+/// is above the mirror); unset, a list says no outputs.
+pub static LIST_OUTPUTS: std::sync::OnceLock<fn(&Worklist) -> (Vec<serde_json::Value>, String)> = std::sync::OnceLock::new();
+
+pub fn list_facts(store: &Store, lists: Vec<Worklist>, out: &mut [Entity]) {
+    use wsp_view::worklist::key as k;
+    let listed = crate::worklist::listing(store, lists);
+    let waits = crate::waits::read(store, &listed);
+    for (order, l) in listed.iter().enumerate() {
+        let Some(Entity::List(e)) = out.iter_mut().find(|e| matches!(e, Entity::List(x) if x.id.0 == l.list.id)) else { continue };
+        let phase = l.phase(store);
+        let caption = caption::of_worklist(&l.list);
+        let (outputs, dir) = LIST_OUTPUTS.get().map(|f| f(&l.list)).unwrap_or_default();
+        let f = &mut e.fields;
+        put(f, k::CAPTION_FROM, caption.from);
+        put(f, k::PHASE, phase.status.word());
+        for (key, on) in [(k::HELD, phase.flags.held), (k::WAITING_ON_ED, phase.flags.waiting_on_ed), (k::PARKED, phase.flags.parked)] {
+            put(f, key, if on { "true" } else { "" });
+        }
+        put(f, k::STORED, l.list.status_raw.trim());
+        put(f, k::GROUPS, &l.at.of.to_string());
+        put(f, k::AT, &l.at.at.map(|n| n.to_string()).unwrap_or_default());
+        put(f, k::OUTPUTS, &serde_json::Value::Array(outputs).to_string());
+        put(f, k::OUTPUTS_DIR, &dir);
+        put(f, k::SEGMENT, l.segment.word());
+        put(f, k::ORDER, &order.to_string());
+        put(f, k::OPEN, &l.open.to_string());
+        put(f, k::GONE, &serde_json::json!(l.gone).to_string());
+        put(f, k::UNWRITTEN, &serde_json::json!(l.at.unwritten).to_string());
+        put(f, k::ACTIVITY, &l.activity.to_string());
+        put(f, k::PRIO_WORD, crate::waits::Prio::of(&l.list).word());
+        if let Some(n) = waits.iter().position(|(id, _)| *id == l.list.id) {
+            put(f, k::QUEUE, &(n + 1).to_string());
+            put(f, k::WAITS, &waits[n].1.as_ref().map(|w| w.text()).unwrap_or_default());
+        }
+    }
 }
 
 /// The whole [`c::State`] the files say, by the projections the mirror and

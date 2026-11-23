@@ -534,6 +534,7 @@ fn needs_store(args: &Args) -> bool {
 fn main() {
     die_on_broken_pipe();
     let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
+    let _ = mirror::LIST_OUTPUTS.set(cmd_report::list_outputs);
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,
