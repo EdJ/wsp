@@ -158,3 +158,10 @@ Writer: `src/readings.rs`, a daemon thread beside the mirror. Throttle, machines
 10 s, tasks every 30 s, spend every 60 s. `WSP_READINGS=off` turns it off.
 CLI `--json` sizes measured read-only on the live store (pretty; the readings are compact): wip 299,616; worklist ls
 194,848; machine ls 1,124; throttle 546; spend 47,072; ls --all 3,343,254. All well under MAX_LINE.
+
+Governor, 2026-11-23: wsp-view taking `serde` is accepted. It still reads no file, socket, env or clock, and
+`tests/layering.rs`'s IO check holds unchanged. wire-and-measure does not reinstall the live daemon. It measures
+each reply by building it in-process over a read-only open of the live store, as wsp-695 did; for the readings that
+is `crate::readings::take(&store, name)` for each name in `wsp_view::reading::ALL`, plus their sum for one
+`readings` reply. It states that the live API serves the readings only after the land's reinstall.
+compounding-851 waits on that.
