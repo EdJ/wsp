@@ -171,7 +171,7 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
 /// Resolve a typed slug: exact, then unique prefix. No fuzzy title match — a
 /// worklist is named by whoever made it and a guess here ends up editing the
 /// wrong plan.
-fn find(store: &Store, needle: &str) -> Option<Worklist> {
+pub(crate) fn find(store: &Store, needle: &str) -> Option<Worklist> {
     if let Some(w) = store.worklist(needle) {
         return Some(w);
     }
@@ -3543,7 +3543,11 @@ pub fn show(store: &Store, args: &Args) -> i32 {
 
     if args.json() {
         let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
-        let out = wsp_view::worklist::show_of_state(&state, &w.id, util::epoch_secs()).unwrap_or_default();
+        let mut out = wsp_view::worklist::show_of_state(&state, &w.id, util::epoch_secs()).unwrap_or_default();
+        // Only where allocated (`wsp allocate`), as the file carries it.
+        if let (Some(u), Some(head)) = (&w.for_user, out.get_mut("worklist")) {
+            head["for"] = serde_json::Value::String(u.clone());
+        }
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -3570,6 +3574,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // know it was never stated.
     println!("{}  {}", p.dim(&util::pad("under", 8)), home_line(&p, &w.id, worklist::home(store, &w).as_ref()));
     println!("{}  {}", p.dim(&util::pad("outputs", 8)), crate::cmd_report::line(&w));
+    if let Some(u) = &w.for_user {
+        println!("{}  for {u}", p.dim(&util::pad("for", 8)));
+    }
     // Where it is up to, and — on a list nobody has started — the fact that
     // this is where it *would* start. A plan has no barriers behind its groups
     // and its position says where the run would begin, which is a different

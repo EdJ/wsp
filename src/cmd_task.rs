@@ -755,7 +755,12 @@ pub(crate) fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
         pieces: crate::pieces::view(&t),
         stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
     };
-    Ok(wsp_view::task::show_json(&row_of(&t, &claims), &shown))
+    let mut v = wsp_view::task::show_json(&row_of(&t, &claims), &shown);
+    // Only where allocated (`wsp allocate`), as the file carries it.
+    if let Some(u) = &t.for_user {
+        v["for"] = Value::String(u.clone());
+    }
+    Ok(v)
 }
 
 /// `wsp show <piece-id>`: the parent's header line, then the entry whole
@@ -826,6 +831,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     println!("{} {}", p.dim(&util::pad("status", 9)), t.status().as_str());
     println!("{} {}", p.dim(&util::pad("priority", 9)), t.priority().as_str());
     println!("{} {}", p.dim(&util::pad("tags", 9)), tags.join(" "));
+    if let Some(u) = &t.for_user {
+        println!("{} {}", p.dim(&util::pad("for", 9)), u);
+    }
     if !t.refs.is_empty() {
         println!("{} {}", p.dim(&util::pad("refs", 9)), t.refs.join("  "));
     }

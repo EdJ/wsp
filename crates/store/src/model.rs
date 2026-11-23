@@ -173,6 +173,19 @@ fn set_workspace(d: &mut Doc, w: &WorkspaceId) {
     }
 }
 
+/// The user a record's `for:` names, absent or blank being nobody.
+fn for_of_doc(doc: &Doc) -> Option<String> {
+    doc.opt("for").map(|u| u.trim().to_string()).filter(|u| !u.is_empty())
+}
+
+/// Writes `for:` only where a record is allocated, so one that is not renders
+/// as it always has.
+fn set_for(d: &mut Doc, u: &Option<String>) {
+    if let Some(u) = u {
+        d.set_str("for", u);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Project {
     pub id: String,
@@ -975,6 +988,9 @@ pub struct Task {
     /// workspace (wsp-169); absent is private, and a private record is written
     /// without the key, so nothing stored before workspaces changes a byte.
     pub workspace: WorkspaceId,
+    /// `for:` — the user this record is allocated to (`wsp allocate`), where
+    /// it is shared; absent is nobody, and nothing is written for it.
+    pub for_user: Option<String>,
     pub body: String,
 }
 
@@ -1004,6 +1020,8 @@ pub struct TaskHead {
     pub caption: Option<String>,
     /// As [`Task::workspace`].
     pub workspace: WorkspaceId,
+    /// As [`Task::for_user`].
+    pub for_user: Option<String>,
     /// The body's `## ` headings, in order, so a reader can tell which tasks
     /// carry a `## Verification` or a `## Legs` without opening any of them.
     pub sections: Vec<String>,
@@ -1025,6 +1043,7 @@ impl TaskHead {
             refs: t.refs.clone(),
             caption: t.caption.clone(),
             workspace: t.workspace.clone(),
+            for_user: t.for_user.clone(),
             sections: t
                 .body
                 .lines()
@@ -1069,6 +1088,7 @@ impl TaskHead {
             refs: self.refs.clone(),
             caption: self.caption.clone(),
             workspace: self.workspace.clone(),
+            for_user: self.for_user.clone(),
             body: String::new(),
         }
     }
@@ -1085,6 +1105,9 @@ impl TaskHead {
         // workspaces reads the same as one written after for a private row.
         if !self.workspace.is_private() {
             v["workspace"] = serde_json::Value::String(self.workspace.to_string());
+        }
+        if let Some(u) = &self.for_user {
+            v["for"] = serde_json::Value::String(u.clone());
         }
         v
     }
@@ -1117,6 +1140,7 @@ impl TaskHead {
             refs: list("refs")?,
             caption: opt("caption")?,
             workspace: s("workspace").and_then(|w| w.parse().ok()).unwrap_or_default(),
+            for_user: s("for"),
             sections: list("sections")?,
         })
     }
@@ -1297,6 +1321,7 @@ impl Task {
             refs: doc.list("refs"),
             caption: doc.opt("caption"),
             workspace: workspace_of_doc(doc),
+            for_user: for_of_doc(doc),
             body: doc.body.clone(),
         }
     }
@@ -1324,6 +1349,7 @@ impl Task {
             d.set_str("caption", c);
         }
         set_workspace(&mut d, &self.workspace);
+        set_for(&mut d, &self.for_user);
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -2560,6 +2586,9 @@ pub struct Worklist {
     /// workspace (wsp-169); absent is private, and a private record is written
     /// without the key, so nothing stored before workspaces changes a byte.
     pub workspace: WorkspaceId,
+    /// `for:` — the user this record is allocated to (`wsp allocate`), where
+    /// it is shared; absent is nobody, and nothing is written for it.
+    pub for_user: Option<String>,
     pub body: String,
 }
 
@@ -2573,6 +2602,7 @@ impl Worklist {
             created: util::now_iso(),
             groups_made: 0,
             workspace: WorkspaceId::Private,
+            for_user: None,
             project: None,
             made_in: None,
             outputs: None,
@@ -2667,6 +2697,7 @@ impl Worklist {
             held_on: doc.list("held_on"),
             held_for: doc.opt("held_for").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
             workspace: workspace_of_doc(doc),
+            for_user: for_of_doc(doc),
             body: doc.body.clone(),
         }
     }
@@ -2721,6 +2752,7 @@ impl Worklist {
             d.set_str("held_for", f);
         }
         set_workspace(&mut d, &self.workspace);
+        set_for(&mut d, &self.for_user);
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -2856,6 +2888,26 @@ mod tests {
         assert_eq!(back.caption.as_deref(), Some("Move the chrome"));
         assert_eq!(back.groups(), groups);
         assert!(back.section("Groups").unwrap().contains("  caption: Three spikes\n"));
+    }
+
+    /// `for:` is written only where a row or a list is allocated, read back as
+    /// the user, and rides the head the index keeps; a record without it renders
+    /// as it always has.
+    #[test]
+    fn for_round_trips_and_is_written_only_when_set() {
+        let mut t = Task::new("A title", "f-1");
+        assert!(!t.render().contains("for:"));
+        t.for_user = Some("ed".into());
+        let back = Task::from_doc(&fm::parse(&t.render()), "f-1");
+        assert_eq!(back.for_user.as_deref(), Some("ed"));
+        let head = TaskHead::of(&t);
+        assert_eq!(TaskHead::from_json(&head.to_json()), Some(head.clone()));
+        assert_eq!(head.bodiless().for_user.as_deref(), Some("ed"));
+
+        let mut w = Worklist::new("wl", "A list");
+        assert!(!w.render().contains("for:"));
+        w.for_user = Some("jesper".into());
+        assert_eq!(Worklist::from_doc(&fm::parse(&w.render()), "wl").for_user.as_deref(), Some("jesper"));
     }
 
     /// The distinction the vocabulary went without: `blocked` and `parked` are

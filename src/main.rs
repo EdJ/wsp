@@ -45,6 +45,7 @@ mod disk;
 mod arrange;
 mod attention;
 mod cmd_agent;
+mod cmd_allocate;
 mod cmd_attempts;
 mod cmd_brief;
 mod cmd_burn;
