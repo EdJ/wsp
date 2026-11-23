@@ -200,7 +200,7 @@ fn a_snapshot_equals_the_files() {
     let client = sb.client(BUDGET);
     let state = snapshot_with(&client, |v| {
         let n = |k: &str| v[k].as_object().map_or(0, |o| o.len());
-        n("rows") == 2 && n("claims") == 1 && n("lists") == 1 && n("asks") == 2 && v["machines"].get("far").is_some()
+        n("rows") == 2 && n("claims") == 1 && n("lists") == 1 && n("asks") == 2 && v["machines"].get("far").is_some() && v["machines"].get("local").is_some()
     });
 
     // Rows: the files' `--json` and the task files, key by key.
@@ -258,9 +258,12 @@ fn a_snapshot_equals_the_files() {
     let fl = &asks[&format!("flag:{}", ids[1])];
     assert_eq!((fl["kind"].as_str(), fl["fields"]["reason"].as_str(), fl["fields"]["pane"].as_str()), (Some("flag"), Some("stuck"), Some("cpd-4")));
 
-    // Machines: the record, and not one more.
+    // Machines: the record, and the seat's own machine (wsp-308's
+    // `seat_machine`), named for the `local` host the sandbox's daemon runs
+    // under, and not one more.
     let machines = state["machines"].as_object().unwrap();
-    assert_eq!(machines.keys().collect::<Vec<_>>(), vec!["far"]);
+    assert_eq!(machines.keys().collect::<Vec<_>>(), vec!["far", "local"]);
+    assert_eq!(machines["local"]["transport"], serde_json::json!("local"));
     assert_eq!(machines["far"]["transport"], serde_json::json!({ "tcp": { "addr": "far-alias" } }));
     assert_eq!((machines["far"]["facts"]["os"].as_str(), machines["far"]["facts"]["status"].as_str()), (Some("linux"), Some("active")));
 
