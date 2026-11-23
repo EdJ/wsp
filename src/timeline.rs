@@ -1775,17 +1775,9 @@ fn found_transcripts(store: &Store, i: &Inputs) -> Vec<(i64, String)> {
             }
         }
     }
-    let tail = crate::host::mangle(&format!("/{}/{}", crate::cmd_checkout::WORKTREES, i.id));
-    let projects = util::home().join(".claude").join("projects");
-    for dir in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
-        if !dir.file_name().to_string_lossy().ends_with(&tail) {
-            continue;
-        }
-        for f in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
-            if f.path().extension().is_some_and(|x| x == "jsonl") {
-                add(f.path().to_string_lossy().to_string());
-            }
-        }
+    let tree = format!("/{}/{}", crate::cmd_checkout::WORKTREES, i.id);
+    for f in crate::host::LOCAL.transcripts_of_tree(&tree) {
+        add(f.to_string_lossy().to_string());
     }
     refs.into_iter().filter_map(|r| first_act(&r).map(|t| (t, r))).collect()
 }
