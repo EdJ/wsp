@@ -456,7 +456,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
                 match c.kind() {
                     "set" => println!(
                         "  {}",
-                        p.dim(&format!("set · {}  · answered per question with `wsp answer {} --question H --choice L`, ended by the last or `--finish`", answered_of(c), q.id))
+                        p.dim(&format!("set · {}  · answered per question with `wsp answer {} --question H --choice L`, ended by the last answer", answered_of(c), q.id))
                     ),
                     _ => println!("  {}", p.dim(&format!("{} · answered with `wsp answer {} --choice …`: {}", c.kind(), q.id, c.options_line()))),
                 }
@@ -615,7 +615,7 @@ fn whole(store: &Store, needle: &str, args: &Args, clock: &dyn Clock) -> i32 {
     }
     if q.is_open() && q.choices.as_ref().is_some_and(|c| c.kind() == "set") {
         println!();
-        println!("{}", p.dim(&format!("wsp answer {} --question H --choice L saves one · --finish ends it with some left", q.id)));
+        println!("{}", p.dim(&format!("wsp answer {} --question H --choice L saves one · the last one ends it", q.id)));
     } else if q.is_open() {
         println!();
         println!("{}", p.dim(&format!("wsp answer {} \"…\" closes it and reaches whoever asked", q.id)));
@@ -1051,7 +1051,7 @@ enum SetStep {
 /// `wsp answer <mid> --question H --choice L [--other W] [--note W]` and
 /// `wsp answer <mid> --finish ["words"]` on a set. A save keeps the answer on
 /// the ask and records a decision on the row; the ask ends when every question
-/// has an answer, or at `--finish`.
+/// has an answer; `--finish` is refused while one is open.
 fn set_answer(store: &Store, args: &Args, q: &Message, _me: &Party, _routed: bool) -> SetStep {
     let finish = args.has("finish");
     let words = match args.get("finish").as_deref() {
@@ -1060,14 +1060,23 @@ fn set_answer(store: &Store, args: &Args, q: &Message, _me: &Party, _routed: boo
     };
     let key = args.get("question");
     if key.is_none() && !finish {
-        eprintln!("wsp: {} is a set — answer a question with `--question 'Header' --choice 'Label'`, or end it with `--finish`", q.id);
+        eprintln!("wsp: {} is a set — answer a question with `--question 'Header' --choice 'Label'`, every question needs one", q.id);
         if let Some(c) = &q.choices {
             eprintln!("     {}", c.options_line());
         }
         return SetStep::Saved(2);
     }
     let Some(key) = key else {
-        return SetStep::Close(true, words.trim().to_string());
+        return match q.choices.as_ref() {
+            Some(c) => match open_questions(c) {
+                Some(why) => {
+                    eprintln!("wsp: {} stays open — {why}", q.id);
+                    SetStep::Saved(1)
+                }
+                None => SetStep::Close(true, words.trim().to_string()),
+            },
+            None => SetStep::Saved(1),
+        };
     };
     let picks = args.each("choice");
     let other = args.get("other");
@@ -1090,15 +1099,31 @@ fn set_answer(store: &Store, args: &Args, q: &Message, _me: &Party, _routed: boo
                 println!("  {}", p.dim(&format!("{} of {} answered · decision {}{}", saved.answered, saved.total, saved.decision,
                     saved.superseded.as_ref().map(|s| format!(" (supersedes {s})")).unwrap_or_default())));
             }
-            if finish {
-                return SetStep::Close(true, words.trim().to_string());
-            }
             if saved.answered == saved.total {
-                return SetStep::Close(false, String::new());
+                return SetStep::Close(finish, if finish { words.trim().to_string() } else { String::new() });
+            }
+            if finish {
+                if let Some(c) = store.message(&q.id).and_then(|m| m.choices) {
+                    if let Some(why) = open_questions(&c) {
+                        eprintln!("wsp: {} stays open — {why}", q.id);
+                    }
+                }
+                return SetStep::Saved(1);
             }
             SetStep::Saved(0)
         }
     }
+}
+
+/// Why `--finish` is refused: how many of the set are answered and the headers
+/// still open. `None` when every question has an answer.
+fn open_questions(c: &Choices) -> Option<String> {
+    let (done, total) = c.set_progress();
+    if done == total {
+        return None;
+    }
+    let open = c.open_headers();
+    Some(format!("{done} of {total} answered, every question needs one; open: {}", open.join(", ")))
 }
 
 /// The set ends: the log first (the ask closes onto its row), then whoever
@@ -2498,9 +2523,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     multi, options (2-4), recommended?, why?}]});
                                     `wsp answer <mid> --question H|N --choice L
                                     [--other W] [--note W]` saves one (a decision
-                                    on the row each), `--finish ["words"]` ends it
-                                    with some left; the asker is told once, at the
-                                    end; `wsp ask <mid>` reads it so far"##,
+                                    on the row each), the last answer ends it
+                                    (`--finish` is refused while any is open); the
+                                    asker is told once, at the end; `wsp ask <mid>` reads it so far"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
@@ -4362,7 +4387,7 @@ mod tests {
     }
 
     #[test]
-    fn a_set_finished_early_names_what_is_left_and_guesses_nothing() {
+    fn finish_is_refused_while_a_set_question_is_open_and_the_last_answer_ends_it() {
         let env = util::isolated("set-finish");
         let store = scratch("set-finish");
         task(&store, "lone-1");
@@ -4371,12 +4396,18 @@ mod tests {
         assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
         let id = message::all(&store).pop().unwrap().id;
         assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("choice", "C")], &[])), 0);
-        assert_eq!(answer(&store, &answer_args(&id, &[("finish", "true")], &["enough for today"])), 0);
+        assert_eq!(answer(&store, &answer_args(&id, &[("finish", "true")], &["enough for today"])), 1);
+        assert!(store.message(&id).unwrap().is_open(), "refused: the set stays open");
+        assert_eq!(store.message(&id).unwrap().choices.as_ref().unwrap().set_progress(), (1, 3));
+        // `--finish` with a save still saves, and still stays open.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "A"), ("finish", "true")], &[])), 1);
+        let q = store.message(&id).unwrap();
+        assert!(q.is_open());
+        assert_eq!(q.choices.as_ref().unwrap().set_progress(), (2, 3));
+        // The last save ends it, with or without `--finish`.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Three"), ("choice", "C")], &[])), 0);
         let done = store.message(&id).unwrap();
         assert!(!done.is_open());
-        let told = told(&done);
-        assert!(told.contains("1 of 3 answered, finished early") && told.contains("Unanswered (nothing guessed): One, Three"), "{told}");
-        assert!(told.contains("enough for today") && !told.contains("One: A"), "{told}");
-        assert_eq!(done.answer_choice().unwrap()["unanswered"], serde_json::json!(["One", "Three"]));
+        assert!(told(&done).contains("3 of 3 answered"));
     }
 }

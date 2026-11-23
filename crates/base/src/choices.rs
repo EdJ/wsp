@@ -358,7 +358,13 @@ impl Choices {
         self.0.get("answers").and_then(Value::as_object).cloned().unwrap_or_default()
     }
 
-    /// How many of a set's questions have an answer saved, and how many it has.
+    /// The headers of a set's questions that have no answer yet.
+    pub fn open_headers(&self) -> Vec<String> {
+        let given = self.answers();
+        self.questions().iter().filter(|q| !given.contains_key(q.header)).map(|q| q.header.to_string()).collect()
+    }
+
+    /// How many of a set's questions have an answer, and how many there are.
     pub fn set_progress(&self) -> (usize, usize) {
         let given = self.answers();
         let qs = self.questions();
