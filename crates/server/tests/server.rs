@@ -183,6 +183,7 @@ impl Client {
 
 fn row(id: &str, title: &str) -> Row {
     Row {
+        workspace: Default::default(),
         id: RowId(id.into()),
         project: ProjectId("wsp".into()),
         title: title.into(),
@@ -218,6 +219,7 @@ fn everything() -> Vec<Entity> {
         Entity::Row(row("wsp-1", "one")),
         Entity::Row(parked),
         Entity::List(List {
+            workspace: Default::default(),
             id: ListId("s1".into()),
             state: ListState::Running,
             groups: vec![],
@@ -227,6 +229,7 @@ fn everything() -> Vec<Entity> {
         Entity::Seat(seat("cpd-2", "pi")),
         Entity::Claim(Claim { row: RowId("wsp-1".into()), seat: SeatId("cpd-1".into()), token: Token(1), expires: At(9) }),
         Entity::Order(Order {
+            workspace: Default::default(),
             id: OrderId("o-1".into()),
             from: ed(),
             to: SeatId("cpd-1".into()),
@@ -237,6 +240,7 @@ fn everything() -> Vec<Entity> {
             why: None,
         }),
         Entity::Ask(Ask {
+            workspace: Default::default(),
             id: AskId("a-1".into()),
             kind: AskKind::Flag,
             from: ed(),
@@ -441,9 +445,10 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     let mut list_fields = std::collections::BTreeMap::new();
     list_fields.insert("body".to_string(), "list prose".to_string());
     list_fields.insert("name".to_string(), "the list".to_string());
-    put.push(Entity::List(List { id: ListId("s2".into()), state: ListState::Running, groups: vec![], fields: list_fields.clone() }));
-    put.push(Entity::List(List { id: ListId("s3".into()), state: ListState::Finished, groups: vec![], fields: list_fields }));
+    put.push(Entity::List(List { workspace: Default::default(), id: ListId("s2".into()), state: ListState::Running, groups: vec![], fields: list_fields.clone() }));
+    put.push(Entity::List(List { workspace: Default::default(), id: ListId("s3".into()), state: ListState::Finished, groups: vec![], fields: list_fields }));
     put.push(Entity::Ask(Ask {
+        workspace: Default::default(),
         id: AskId("a-2".into()),
         kind: AskKind::Ask,
         from: ed(),
@@ -1018,6 +1023,7 @@ fn under_owned_a_seats_answer_is_unauthorised_and_a_mirror_putting_an_order_is_i
 
     // A mirror that puts an order is refused, naming it; over the API it stays unsupported.
     let mirrored = Order {
+        workspace: Default::default(),
         id: OrderId("cpd-1-first-1".into()),
         from: ed(),
         to: SeatId("cpd-1".into()),

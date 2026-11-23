@@ -69,7 +69,7 @@ fn ed() -> Principal {
     Principal::Person("ed".into())
 }
 
-const COMMANDS: usize = 29;
+const COMMANDS: usize = 31;
 
 fn command(c: &Command) -> (usize, &'static str) {
     match c {
@@ -102,6 +102,8 @@ fn command(c: &Command) -> (usize, &'static str) {
         Command::HubUserRevoke { .. } => (26, "hub.user.revoke"),
         Command::HubTokenIssue { .. } => (27, "hub.token.issue"),
         Command::HubTokenRevoke { .. } => (28, "hub.token.revoke"),
+        Command::HubWorkspaceAdd { .. } => (29, "hub.workspace.add"),
+        Command::HubMemberSet { .. } => (30, "hub.member.set"),
     }
 }
 
@@ -236,6 +238,14 @@ fn commands() -> Vec<Command> {
         Command::HubTokenRevoke {
             id: TokenId("t-1".into()),
         },
+        Command::HubWorkspaceAdd {
+            name: SharedName("acme".into()),
+        },
+        Command::HubMemberSet {
+            workspace: SharedName("acme".into()),
+            user: UserName("ann".into()),
+            member: true,
+        },
     ]
 }
 
@@ -279,7 +289,7 @@ fn every_command_round_trips_under_its_verb() {
     });
 }
 
-const EVENT_KINDS: usize = 52;
+const EVENT_KINDS: usize = 54;
 
 fn event_kind(k: &EventKind) -> (usize, &'static str) {
     use EventKind::*;
@@ -336,6 +346,8 @@ fn event_kind(k: &EventKind) -> (usize, &'static str) {
         HubUserRevoked => (49, "hub.user.revoked"),
         HubTokenIssued => (50, "hub.token.issued"),
         HubTokenRevoked => (51, "hub.token.revoked"),
+        HubWorkspaceAdded => (52, "hub.workspace.added"),
+        HubMemberSet => (53, "hub.member.set"),
     }
 }
 
@@ -395,6 +407,8 @@ fn every_event_kind_round_trips_under_its_name() {
         HubUserRevoked,
         HubTokenIssued,
         HubTokenRevoked,
+        HubWorkspaceAdded,
+        HubMemberSet,
     ];
     table(&kinds, EVENT_KINDS, event_kind, as_str);
     // A newer writer's kind reads as Unknown.
@@ -634,6 +648,7 @@ fn state() -> State {
     s.rows.insert(
         row(),
         Row {
+            workspace: Default::default(),
             id: row(),
             project: ProjectId("wsp".into()),
             title: "S0".into(),
@@ -648,6 +663,7 @@ fn state() -> State {
     s.lists.insert(
         list(),
         List {
+            workspace: Default::default(),
             id: list(),
             state: ListState::Running,
             groups: vec![Group {
@@ -690,6 +706,7 @@ fn state() -> State {
     s.orders.insert(
         OrderId("ord-1".into()),
         Order {
+            workspace: Default::default(),
             id: OrderId("ord-1".into()),
             from: ed(),
             to: seat(),
@@ -703,6 +720,7 @@ fn state() -> State {
     s.asks.insert(
         AskId("m-1".into()),
         Ask {
+            workspace: Default::default(),
             id: AskId("m-1".into()),
             kind: AskKind::Ask,
             from: Principal::Seat(seat()),
@@ -790,12 +808,14 @@ fn every_entity_round_trips_under_its_tag() {
     assert_eq!(none, Command::Mirror { put: vec![], gone: vec![] });
     // A mirror event: the entity under its subject, and `null` for a gone one.
     let put = trip(&Draft {
+        workspace: Default::default(),
         kind: EventKind::MirrorPut,
         subject: Subject::Seat(seat()),
         payload: serde_json::to_value(&entities()[2]).unwrap(),
     });
     assert_eq!(put["payload"]["seat"]["fields"]["role"], "governor");
     trip(&Draft {
+        workspace: Default::default(),
         kind: EventKind::MirrorGone,
         subject: Subject::Seat(seat()),
         payload: Value::Null,
@@ -884,13 +904,21 @@ fn the_whole_state_events_and_feed_round_trip() {
         Subject::Lease(LeaseName("tick".into())),
         Subject::User(UserName("ann".into())),
         Subject::Credential(TokenId("t-1".into())),
+        Subject::Workspace(SharedName("acme".into())),
+        Subject::Member {
+            workspace: SharedName("acme".into()),
+            user: UserName("ann".into()),
+        },
     ];
     for sub in &subjects {
         trip(sub);
     }
     assert_eq!(trip(&subjects[11]), json!({"user": "ann"}));
     assert_eq!(trip(&subjects[12]), json!({"credential": "t-1"}));
+    assert_eq!(trip(&subjects[13]), json!({"workspace": "acme"}));
+    assert_eq!(trip(&subjects[14]), json!({"member": {"workspace": "acme", "user": "ann"}}));
     let e = Event {
+        workspace: Default::default(),
         id: EventId(12),
         at: At(5),
         principal: Principal::Executor(MachineName("mac".into())),
@@ -901,6 +929,7 @@ fn the_whole_state_events_and_feed_round_trip() {
     let v = trip(&e);
     assert_eq!(v["kind"], "order.acknowledged");
     trip(&Draft {
+        workspace: Default::default(),
         kind: EventKind::SeatStarted,
         subject: Subject::Seat(seat()),
         payload: Value::Null,
@@ -1084,6 +1113,7 @@ fn a_trivial_type_implements_the_family_and_as_dyn() {
         domain.evolve(
             State::default(),
             &Event {
+                workspace: Default::default(),
                 id: EventId(1),
                 at: At(1),
                 principal: ed(),
@@ -1198,4 +1228,104 @@ fn the_text_forms_of_user_names_and_token_ids_are_total() {
             TokenId(text.into())
         );
     }
+}
+
+// ------------------------------------------------------------ workspaces (wsp-168)
+
+fn acme() -> WorkspaceId {
+    WorkspaceId::Shared(SharedName("acme".into()))
+}
+
+/// `private` and `shared:<name>` are the text forms, on the wire as a bare string.
+#[test]
+fn a_workspace_id_is_private_or_shared_by_its_text() {
+    assert_eq!(trip(&WorkspaceId::Private), json!("private"));
+    assert_eq!(trip(&acme()), json!("shared:acme"));
+    assert_eq!(WorkspaceId::default(), WorkspaceId::Private);
+    assert_eq!("shared:acme".parse(), Ok(acme()));
+    assert_eq!(acme().to_string(), "shared:acme");
+    assert_eq!(trip(&SharedName("acme".into())), json!("acme"));
+    // A name may hold a colon: only the first `shared:` is the prefix.
+    assert_eq!(trip(&WorkspaceId::Shared(SharedName("a:b".into()))), json!("shared:a:b"));
+    for bad in ["", "shared", "group:acme", "Private"] {
+        assert!(serde_json::from_value::<WorkspaceId>(json!(bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn the_new_entities_round_trip() {
+    assert_eq!(trip(&SharedWorkspace { name: SharedName("acme".into()) }), json!({"name": "acme"}));
+    assert_eq!(
+        trip(&Member { workspace: SharedName("acme".into()), user: UserName("ann".into()) }),
+        json!({"workspace": "acme", "user": "ann"})
+    );
+}
+
+/// Each stamped entity and event: with the field it reads back as written, and
+/// without it reads `Private` (and a private one is written without it, so what
+/// is stored today is unchanged).
+#[test]
+fn a_record_or_event_with_a_workspace_round_trips_and_without_one_reads_private() {
+    let st = state();
+    let mut row = st.rows[&row()].clone();
+    let mut list = st.lists[&list()].clone();
+    let mut order = st.orders[&OrderId("ord-1".into())].clone();
+    let mut ask = st.asks[&AskId("m-1".into())].clone();
+    let mut event = Event {
+        id: EventId(1),
+        at: At(1),
+        principal: ed(),
+        kind: EventKind::RowAdded,
+        subject: Subject::Row(RowId("r-1".into())),
+        workspace: WorkspaceId::Private,
+        payload: Value::Null,
+    };
+    let mut draft = Draft {
+        kind: EventKind::RowAdded,
+        subject: Subject::Row(RowId("r-1".into())),
+        workspace: WorkspaceId::Private,
+        payload: Value::Null,
+    };
+
+    // Private: no field written, and the frame reads back private.
+    for v in [trip(&row), trip(&list), trip(&order), trip(&ask), trip(&event), trip(&draft)] {
+        assert!(v.get("workspace").is_none(), "{v}");
+    }
+    // Shared: the field is the text form, and it reads back.
+    row.workspace = acme();
+    list.workspace = acme();
+    order.workspace = acme();
+    ask.workspace = acme();
+    event.workspace = acme();
+    draft.workspace = acme();
+    for v in [trip(&row), trip(&list), trip(&order), trip(&ask), trip(&event), trip(&draft)] {
+        assert_eq!(v["workspace"], "shared:acme", "{v}");
+    }
+    // Without the field, and with an explicit `private`, they read private.
+    let strip = |mut v: Value| {
+        v.as_object_mut().unwrap().remove("workspace");
+        v
+    };
+    let explicit = |mut v: Value| {
+        v["workspace"] = json!("private");
+        v
+    };
+    for make in [strip, explicit] {
+        let r: Row = serde_json::from_value(make(serde_json::to_value(&row).unwrap())).unwrap();
+        let l: List = serde_json::from_value(make(serde_json::to_value(&list).unwrap())).unwrap();
+        let o: Order = serde_json::from_value(make(serde_json::to_value(&order).unwrap())).unwrap();
+        let a: Ask = serde_json::from_value(make(serde_json::to_value(&ask).unwrap())).unwrap();
+        let e: Event = serde_json::from_value(make(serde_json::to_value(&event).unwrap())).unwrap();
+        let d: Draft = serde_json::from_value(make(serde_json::to_value(&draft).unwrap())).unwrap();
+        assert_eq!(
+            [r.workspace, l.workspace, o.workspace, a.workspace, e.workspace, d.workspace],
+            std::array::from_fn::<_, 6, _>(|_| WorkspaceId::Private)
+        );
+    }
+    // A frame written before workspaces existed, whole.
+    let old: Row = serde_json::from_value(json!({
+        "id": "wsp-1", "project": "wsp", "title": "t", "state": "todo"
+    }))
+    .unwrap();
+    assert_eq!(old.workspace, WorkspaceId::Private);
 }

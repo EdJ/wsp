@@ -253,6 +253,7 @@ pub fn rows(
                 None => drop(f.insert(key::PROSE.into(), t.body.clone())),
             }
             Entity::Row(c::Row {
+                workspace: Default::default(),
                 id: RowId(t.id.clone()),
                 project: ProjectId(model::project_of(t).unwrap_or_default()),
                 title: t.title.clone(),
@@ -513,7 +514,7 @@ fn lists_with(
             if status == WorklistStatus::Done && seated(w, governed) {
                 f.insert(c::WIP_SEATED.into(), "true".into());
             }
-            Entity::List(c::List { id: ListId(w.id.clone()), state: list_state(status), groups, fields: f })
+            Entity::List(c::List { workspace: Default::default(), id: ListId(w.id.clone()), state: list_state(status), groups, fields: f })
         })
         .collect()
 }
@@ -573,6 +574,7 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
             };
             let answer = m.closing().filter(|h| h.act == wsp_store::message::Act::Answered).map(|h| h.note.clone());
             let mut ask = c::Ask {
+                workspace: Default::default(),
                 id: AskId(m.id.clone()),
                 kind,
                 from: principal(&m.from),
@@ -604,6 +606,7 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
             .unwrap_or("")
             .to_string();
         Entity::Ask(c::Ask {
+            workspace: Default::default(),
             id: AskId(format!("{FLAG_PREFIX}{task}")),
             kind: AskKind::Flag,
             from: Principal::Seat(SeatId(

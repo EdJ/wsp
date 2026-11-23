@@ -112,7 +112,9 @@ fn entity_at(state: &State, subject: &Subject) -> Option<Entity> {
         | Subject::Run(_)
         | Subject::Lease(_)
         | Subject::User(_)
-        | Subject::Credential(_) => None,
+        | Subject::Credential(_)
+        | Subject::Workspace(_)
+        | Subject::Member { .. } => None,
     }
 }
 
@@ -178,7 +180,13 @@ fn remove(state: &mut State, subject: &Subject) {
         Subject::Lease(name) => {
             state.leases.remove(name);
         }
-        Subject::Project(_) | Subject::Group(_) | Subject::Run(_) | Subject::User(_) | Subject::Credential(_) => {}
+        Subject::Project(_)
+        | Subject::Group(_)
+        | Subject::Run(_)
+        | Subject::User(_)
+        | Subject::Credential(_)
+        | Subject::Workspace(_)
+        | Subject::Member { .. } => {}
     }
 }
 
@@ -218,6 +226,10 @@ fn about(cmd: &Command) -> Subject {
         Command::MachineSet { name, .. } => Subject::Machine(name.clone()),
         Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } => Subject::User(name.clone()),
         Command::HubTokenIssue { id, .. } | Command::HubTokenRevoke { id } => Subject::Credential(id.clone()),
+        Command::HubWorkspaceAdd { name } => Subject::Workspace(name.clone()),
+        Command::HubMemberSet { workspace, user, .. } => {
+            Subject::Member { workspace: workspace.clone(), user: user.clone() }
+        }
         Command::SeatSpawn { row: None, .. } | Command::AskRaise { about: None, .. } | Command::Mirror { .. } => {
             Subject::Project(ProjectId(String::new()))
         }
@@ -250,7 +262,14 @@ impl Domain for Mirror {
             };
             let payload =
                 payload.map_err(|e| Refusal::Invalid { reason: format!("an entity that does not serialize: {e}") })?;
-            drafts.push(Draft { kind, subject: subject.clone(), payload });
+            let workspace = match entity {
+                Entity::Row(r) => r.workspace.clone(),
+                Entity::List(l) => l.workspace.clone(),
+                Entity::Order(o) => o.workspace.clone(),
+                Entity::Ask(a) => a.workspace.clone(),
+                _ => Default::default(),
+            };
+            drafts.push(Draft { kind, subject: subject.clone(), workspace, payload });
             touched.insert(subject, Some(entity.clone()));
         }
         for subject in gone {
@@ -261,7 +280,7 @@ impl Domain for Mirror {
             if !here {
                 continue;
             }
-            drafts.push(Draft { kind: EventKind::MirrorGone, subject: subject.clone(), payload: Value::Null });
+            drafts.push(Draft { kind: EventKind::MirrorGone, subject: subject.clone(), workspace: Default::default(), payload: Value::Null });
             touched.insert(subject.clone(), None);
         }
         Ok(drafts)
@@ -318,6 +337,7 @@ mod tests {
 
     fn row(id: &str, title: &str) -> Row {
         Row {
+            workspace: Default::default(),
             id: RowId(id.into()),
             project: ProjectId("wsp".into()),
             title: title.into(),
@@ -334,6 +354,7 @@ mod tests {
     fn fold(state: State, drafts: Vec<Draft>) -> State {
         drafts.into_iter().enumerate().fold(state, |s, (i, d)| {
             let e = Event {
+                workspace: Default::default(),
                 id: EventId(i as u64 + 1),
                 at: At(0),
                 principal: ed(),
@@ -384,6 +405,30 @@ mod tests {
                 Subject::Credential(t.clone()),
             ),
             (Command::HubTokenRevoke { id: t.clone() }, Subject::Credential(t.clone())),
+        ] {
+            assert_eq!(
+                Mirror.decide(&State::default(), &cmd, &ed()),
+                Err(Refusal::Illegal { subject, state: MIRRORED.into(), verb: verb(&cmd) })
+            );
+        }
+    }
+
+    /// The hub's workspace verbs (wsp-168) are refused `illegal`, state
+    /// `mirrored`, naming the workspace or the membership.
+    #[test]
+    fn the_hub_workspace_verbs_are_refused_mirrored() {
+        use wsp_store_contract::{SharedName, UserName};
+        let (w, u) = (SharedName("acme".into()), UserName("ann".into()));
+        for (cmd, subject) in [
+            (Command::HubWorkspaceAdd { name: w.clone() }, Subject::Workspace(w.clone())),
+            (
+                Command::HubMemberSet { workspace: w.clone(), user: u.clone(), member: true },
+                Subject::Member { workspace: w.clone(), user: u.clone() },
+            ),
+            (
+                Command::HubMemberSet { workspace: w.clone(), user: u.clone(), member: false },
+                Subject::Member { workspace: w.clone(), user: u.clone() },
+            ),
         ] {
             assert_eq!(
                 Mirror.decide(&State::default(), &cmd, &ed()),
@@ -464,7 +509,7 @@ mod tests {
 
     #[test]
     fn evolve_folds_the_stores_own_events_and_ignores_the_rest() {
-        let ev = |kind, subject, payload| Event { id: EventId(1), at: At(0), principal: ed(), kind, subject, payload };
+        let ev = |kind, subject, payload| Event { workspace: Default::default(), id: EventId(1), at: At(0), principal: ed(), kind, subject, payload };
         let name = LeaseName("tick".into());
         let lease = Lease { name: name.clone(), holder: ed(), token: Token(1), expires: At(5) };
         let s = Mirror.evolve(

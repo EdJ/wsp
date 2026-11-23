@@ -85,6 +85,7 @@ impl Log {
 
     fn fold(&mut self, by: &Principal, d: Draft) -> EventId {
         let e = Event {
+            workspace: Default::default(),
             id: EventId(self.events.len() as u64 + 1),
             at: At(1_000 + self.events.len() as u64),
             principal: by.clone(),
@@ -102,6 +103,7 @@ impl Log {
         let name = LeaseName::deliver(seat);
         let lease = Lease { name: name.clone(), holder: holder.clone(), token, expires: At(u64::MAX) };
         let d = Draft {
+            workspace: Default::default(),
             kind: EventKind::LeaseTaken,
             subject: Subject::Lease(name),
             payload: serde_json::to_value(&lease).unwrap(),
@@ -221,6 +223,7 @@ fn send_queues_an_order_for_a_seat_the_state_holds() {
     let id = OrderId(format!("{SEAT}-o1"));
     assert_eq!(e.subject, Subject::Order(id.clone()));
     let want = Order {
+        workspace: Default::default(),
         id: id.clone(),
         from: ed(),
         to: seat_id(SEAT),
@@ -650,7 +653,7 @@ fn evolve_folds_the_lease_events_and_leaves_the_rest() {
     let mut log = Log::new();
     let name = LeaseName::deliver(&seat_id(SEAT));
     assert_eq!(log.state.leases[&name].token, Token(7));
-    log.fold(&worker(), Draft { kind: EventKind::LeaseReleased, subject: Subject::Lease(name.clone()), payload: Value::Null });
+    log.fold(&worker(), Draft { workspace: Default::default(), kind: EventKind::LeaseReleased, subject: Subject::Lease(name.clone()), payload: Value::Null });
     assert!(!log.state.leases.contains_key(&name));
     let before = log.state.clone();
     for (kind, subject) in [
@@ -660,7 +663,7 @@ fn evolve_folds_the_lease_events_and_leaves_the_rest() {
         (EventKind::TextSet, Subject::Row(RowId("wsp-1".into()))),
         (EventKind::Unknown, Subject::Seat(seat_id(SEAT))),
     ] {
-        log.fold(&worker(), Draft { kind, subject, payload: Value::Null });
+        log.fold(&worker(), Draft { workspace: Default::default(), kind, subject, payload: Value::Null });
     }
     assert_eq!(log.state, before);
 }

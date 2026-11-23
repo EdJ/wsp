@@ -145,6 +145,7 @@ mod tests {
             let id = RowId(format!("wsp-{i:04}"));
             let fields = BTreeMap::from([("body".to_string(), "x".repeat(each))]);
             let row = Row {
+                workspace: Default::default(),
                 id: id.clone(),
                 project: ProjectId("wsp".into()),
                 title: "t".into(),

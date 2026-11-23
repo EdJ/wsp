@@ -71,6 +71,7 @@ fn feed(c: &Client, from: Option<EventId>) -> Feed {
 
 fn row(id: &str, title: &str) -> Row {
     Row {
+        workspace: Default::default(),
         id: RowId(id.into()),
         project: ProjectId("wsp".into()),
         title: title.into(),
@@ -106,6 +107,7 @@ fn everything() -> Vec<Entity> {
         Entity::Row(row("wsp-1", "one")),
         Entity::Row(parked),
         Entity::List(List {
+            workspace: Default::default(),
             id: ListId("s1".into()),
             state: ListState::Running,
             groups: vec![],
@@ -115,6 +117,7 @@ fn everything() -> Vec<Entity> {
         Entity::Seat(seat("cpd-2", "pi")),
         Entity::Claim(Claim { row: RowId("wsp-1".into()), seat: SeatId("cpd-1".into()), token: Token(1), expires: At(9) }),
         Entity::Order(Order {
+            workspace: Default::default(),
             id: OrderId("o-1".into()),
             from: ed(),
             to: SeatId("cpd-1".into()),
@@ -125,6 +128,7 @@ fn everything() -> Vec<Entity> {
             why: None,
         }),
         Entity::Ask(Ask {
+            workspace: Default::default(),
             id: AskId("a-1".into()),
             kind: AskKind::Flag,
             from: ed(),
@@ -413,7 +417,7 @@ fn the_census_reads_come_back_typed() {
     };
     let mut r = row("wsp-1", "one");
     text(&mut r.fields);
-    let mut l = List { id: ListId("s1".into()), state: ListState::Running, groups: vec![], fields: Default::default() };
+    let mut l = List { workspace: Default::default(), id: ListId("s1".into()), state: ListState::Running, groups: vec![], fields: Default::default() };
     text(&mut l.fields);
     let mut put = everything();
     put.retain(|e| !matches!(e, Entity::Row(x) if x.id.0 == "wsp-1") && !matches!(e, Entity::List(_)));
@@ -885,6 +889,7 @@ fn a_refusal_is_the_servers_refusal_and_is_never_retried() {
 
 fn order(id: &str, state: OrderState) -> Order {
     Order {
+        workspace: Default::default(),
         id: OrderId(id.into()),
         from: ed(),
         to: SeatId("cpd-1".into()),
@@ -898,7 +903,7 @@ fn order(id: &str, state: OrderState) -> Order {
 
 fn order_event(id: u64, order: &str, kind: EventKind) -> Say {
     let subject = Subject::Order(OrderId(order.into()));
-    let e = Event { id: EventId(id), at: At(id), principal: ed(), kind, subject, payload: Value::Null };
+    let e = Event { workspace: Default::default(), id: EventId(id), at: At(id), principal: ed(), kind, subject, payload: Value::Null };
     Say::Frame(wsp_api::Frame::Feed(wsp_api::Feed::Event(e)))
 }
 

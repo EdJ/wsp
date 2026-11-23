@@ -114,6 +114,7 @@ mod tests {
 
     fn order(id: &str) -> Order {
         Order {
+            workspace: Default::default(),
             id: OrderId(id.into()),
             from: ed(),
             to: SeatId("cpd-1".into()),
@@ -128,6 +129,7 @@ mod tests {
     fn fold(d: &Composed, state: State, drafts: Vec<Draft>) -> State {
         drafts.into_iter().enumerate().fold(state, |s, (i, dr)| {
             let e = Event {
+                workspace: Default::default(),
                 id: EventId(i as u64 + 1),
                 at: At(0),
                 principal: ed(),

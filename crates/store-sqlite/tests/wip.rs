@@ -37,7 +37,7 @@ impl Domain for Mirror {
         let Command::Mirror { put, .. } = cmd else { return Ok(vec![]) };
         Ok(put
             .iter()
-            .map(|e| Draft { kind: EventKind::MirrorPut, subject: subject(e), payload: serde_json::to_value(e).unwrap() })
+            .map(|e| Draft { workspace: Default::default(), kind: EventKind::MirrorPut, subject: subject(e), payload: serde_json::to_value(e).unwrap() })
             .collect())
     }
 
@@ -64,6 +64,7 @@ fn fields(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn row(id: &str, state: RowState, kv: &[(&str, &str)]) -> Entity {
     Entity::Row(Row {
+        workspace: Default::default(),
         id: RowId(id.into()),
         project: ProjectId("wsp".into()),
         title: format!("{id}'s title"),
@@ -78,6 +79,7 @@ fn row(id: &str, state: RowState, kv: &[(&str, &str)]) -> Entity {
 
 fn ask(id: &str, state: AskState) -> Entity {
     Entity::Ask(Ask {
+        workspace: Default::default(),
         id: AskId(id.into()),
         kind: AskKind::Ask,
         from: Principal::Seat(SeatId("cpd-1".into())),
@@ -109,6 +111,7 @@ fn world() -> Vec<Entity> {
     es.push(row("done-body", RowState::Done, &[("body", "a long finished body"), ("tags", "verify"), ("caption", "landed")]));
     es.push(row("done-head", RowState::Done, &[("head", "{\"id\":\"done-head\"}"), ("prose", "the prose"), ("updated", "2026-11-20")]));
     es.push(Entity::List(List {
+        workspace: Default::default(),
         id: ListId("wsp-read-api".into()),
         state: ListState::Running,
         groups: vec![Group {
@@ -121,6 +124,7 @@ fn world() -> Vec<Entity> {
         fields: fields(&[("body", "# the list's file"), ("title", "read api"), ("status", "running")]),
     }));
     es.push(Entity::List(List {
+        workspace: Default::default(),
         id: ListId("old-list".into()),
         state: ListState::Finished,
         groups: vec![Group {
@@ -133,6 +137,7 @@ fn world() -> Vec<Entity> {
         fields: fields(&[("body", "# a finished list's file"), ("title", "old"), ("status", "done")]),
     }));
     es.push(Entity::List(List {
+        workspace: Default::default(),
         id: ListId("seated-list".into()),
         state: ListState::Finished,
         groups: vec![],
@@ -155,6 +160,7 @@ fn world() -> Vec<Entity> {
     }));
     es.push(Entity::Claim(Claim { row: RowId("open".into()), seat: SeatId("cpd-1".into()), token: Token(3), expires: At(9_000) }));
     es.push(Entity::Order(Order {
+        workspace: Default::default(),
         id: OrderId("o-1".into()),
         from: Principal::Wsp("wsp".into()),
         to: SeatId("cpd-1".into()),

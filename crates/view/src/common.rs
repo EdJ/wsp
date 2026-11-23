@@ -324,6 +324,7 @@ mod tests {
 
     fn row(fields: &[(&str, &str)]) -> Row {
         Row {
+            workspace: Default::default(),
             id: RowId("inbox-001".into()),
             project: ProjectId("inbox".into()),
             title: "A row".into(),

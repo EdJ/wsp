@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use wsp_api::*;
 use wsp_store_contract::{
     At, Block, Claim, Entity, EventKind, Fence, GroupId, LeaseName, ListState, MachineName,
-    ProjectId, ReleaseTo, RowState, SeatState, Subject, Token, TokenId, Transport, UserName, Verdict,
+    ProjectId, ReleaseTo, RowState, SeatState, SharedName, Subject, Token, TokenId, Transport, UserName, Verdict,
 };
 
 // ---------------------------------------------------------------- fixtures
@@ -41,6 +41,7 @@ fn fence() -> Fence {
 }
 fn a_row() -> Row {
     Row {
+        workspace: Default::default(),
         id: row_id(),
         project: ProjectId("wsp".into()),
         title: "wsp-api".into(),
@@ -71,6 +72,7 @@ fn a_seat() -> Seat {
 }
 fn a_list() -> List {
     List {
+        workspace: Default::default(),
         id: list_id(),
         state: ListState::Running,
         groups: vec![wsp_store_contract::Group {
@@ -88,6 +90,7 @@ fn a_list() -> List {
 }
 fn an_order() -> Order {
     Order {
+        workspace: Default::default(),
         id: wsp_store_contract::OrderId("ord-1".into()),
         from: ed(),
         to: seat_id(),
@@ -100,6 +103,7 @@ fn an_order() -> Order {
 }
 fn an_ask() -> Ask {
     Ask {
+        workspace: Default::default(),
         id: wsp_store_contract::AskId("m-1".into()),
         kind: AskKind::Ask,
         from: Principal::Seat(seat_id()),
@@ -123,6 +127,7 @@ fn a_machine() -> Machine {
 }
 fn an_event(id: u64) -> Event {
     Event {
+        workspace: Default::default(),
         id: EventId(id),
         at: At(1_763_400_000_000 + id),
         principal: Principal::Wsp("main".into()),
@@ -275,7 +280,7 @@ fn every_frame_type_round_trips() {
 
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 17;
-const COMMANDS: usize = 29;
+const COMMANDS: usize = 31;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
@@ -331,6 +336,8 @@ fn command_ordinal(c: &Command) -> (usize, &'static str) {
         Command::HubUserRevoke { .. } => (26, "hub.user.revoke"),
         Command::HubTokenIssue { .. } => (27, "hub.token.issue"),
         Command::HubTokenRevoke { .. } => (28, "hub.token.revoke"),
+        Command::HubWorkspaceAdd { .. } => (29, "hub.workspace.add"),
+        Command::HubMemberSet { .. } => (30, "hub.member.set"),
     }
 }
 
@@ -522,6 +529,14 @@ fn requests() -> Vec<Frame> {
         },
         Command::HubTokenRevoke {
             id: TokenId("t-1".into()),
+        },
+        Command::HubWorkspaceAdd {
+            name: SharedName("acme".into()),
+        },
+        Command::HubMemberSet {
+            workspace: SharedName("acme".into()),
+            user: UserName("ann".into()),
+            member: true,
         },
     ];
     let mut out: Vec<Call> = vec![];

@@ -243,6 +243,7 @@ impl MemStore {
                     principal: by.clone(),
                     kind: d.kind,
                     subject: d.subject,
+                    workspace: d.workspace,
                     payload: d.payload,
                 }
             })
@@ -274,7 +275,7 @@ impl MemStore {
 
     /// Writes one event the store causes itself (a lease's, a claim's, a text's).
     fn write(&self, inner: &mut Inner, kind: EventKind, subject: Subject, payload: Value, by: &Principal) {
-        let events = Self::stamp(inner, vec![Draft { kind, subject, payload }], by);
+        let events = Self::stamp(inner, vec![Draft { kind, subject, workspace: Default::default(), payload }], by);
         self.publish(inner, events);
     }
 

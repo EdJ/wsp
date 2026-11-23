@@ -16,6 +16,7 @@ fn ws() -> WorkspaceId {
 
 fn row(id: &str) -> Row {
     Row {
+        workspace: Default::default(),
         id: RowId(id.into()),
         project: ProjectId("wsp".into()),
         title: "Hashed object format for the hub".into(),

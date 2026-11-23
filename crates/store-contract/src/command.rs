@@ -247,6 +247,16 @@ pub enum Command {
     /// Revoke a token record; revoking a revoked one is an empty decision.
     #[serde(rename = "hub.token.revoke")]
     HubTokenRevoke { id: TokenId },
+    /// Add a shared workspace; a second of one name is `invalid`.
+    #[serde(rename = "hub.workspace.add")]
+    HubWorkspaceAdd { name: SharedName },
+    /// Make a user a member of a shared workspace (`member: true`) or not.
+    #[serde(rename = "hub.member.set")]
+    HubMemberSet {
+        workspace: SharedName,
+        user: UserName,
+        member: bool,
+    },
     /// Step 1's projection (the module docs): each of `put` is now this, and
     /// each of `gone` is no more. Not fenced; only the mirror domain decides it.
     #[serde(rename = "mirror")]

@@ -14,6 +14,9 @@ pub struct Event {
     pub principal: Principal,
     pub kind: EventKind,
     pub subject: Subject,
+    /// The workspace it belongs to; none reads as private.
+    #[serde(default, skip_serializing_if = "WorkspaceId::is_private")]
+    pub workspace: WorkspaceId,
     /// What the kind carries beyond its subject; `null` when nothing.
     #[serde(default)]
     pub payload: serde_json::Value,
@@ -26,6 +29,9 @@ pub struct Event {
 pub struct Draft {
     pub kind: EventKind,
     pub subject: Subject,
+    /// The workspace it belongs to; none reads as private.
+    #[serde(default, skip_serializing_if = "WorkspaceId::is_private")]
+    pub workspace: WorkspaceId,
     #[serde(default)]
     pub payload: serde_json::Value,
 }
@@ -48,6 +54,8 @@ pub enum Subject {
     Lease(LeaseName),
     User(UserName),
     Credential(TokenId),
+    Workspace(SharedName),
+    Member { workspace: SharedName, user: UserName },
 }
 
 /// The kinds of event the machines write (section 3), by their wire names.
@@ -159,6 +167,10 @@ pub enum EventKind {
     HubTokenIssued,
     #[serde(rename = "hub.token.revoked")]
     HubTokenRevoked,
+    #[serde(rename = "hub.workspace.added")]
+    HubWorkspaceAdded,
+    #[serde(rename = "hub.member.set")]
+    HubMemberSet,
     // Text (2.5).
     #[serde(rename = "text.set")]
     TextSet,

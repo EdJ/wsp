@@ -11,7 +11,7 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
   unchanged; the modules below, re-exported at the root
 - `src/id.rs` — 2.1's keys and 2.2's values: `EventId` (monotonic), `IdempotencyKey`, `Token` (per lease name),
   `Rev`, `At` (Unix ms), the ids (`RowId`, `ListId`, `GroupId`, `SeatId`, `OrderId`, `AskId`, `MachineName`,
-  `LeaseName`, with `LeaseName::deliver(&SeatId)` naming `deliver:<seat>`, `ProjectId`, `RunKey`, and the hub's `UserName` and `TokenId`: any string, text form the string itself), and `Principal` (person, seat, manager, executor, `wsp:<instance>`)
+  `LeaseName`, with `LeaseName::deliver(&SeatId)` naming `deliver:<seat>`, `ProjectId`, `RunKey`, and the hub's `UserName`, `TokenId` and `SharedName`: any string, text form the string itself; `WorkspaceId`, wsp-168), and `Principal` (person, seat, manager, executor, `wsp:<instance>`)
 - `src/entity.rs` — 2.1's entities with section 3's states as enums: `Row`/`RowState` (3.3), `List`, `Group` and
   their shared `ListState` (3.4), `Seat`/`SeatState` (3.2), `Order`/`OrderState` (3.1), `Claim`, `Ask` (kind
   ask/note/flag), `Run`, `Machine`/`Transport`, `Lease`, and the hub's `User` and `Credential` with `IdentityState` (wsp-158); `State`, the whole domain as `snapshot()` returns it;
@@ -114,6 +114,20 @@ names them yet. Groups, roles and stewards are Later.
   both are wsp-159's to decide.
 - **Who refuses them today**: `TestDomain` (`illegal`, naming the user or the token record, state `""`) and the
   server's `mirror::Mirror` (`illegal`, state `mirrored`).
+
+## Workspaces (wsp-168)
+
+Multiplayer v1's sync scopes, as types only (R2); wsp-159's domain decides the commands.
+
+- **`WorkspaceId`**: `Private` (text `private`, the default) or `Shared(SharedName)` (text `shared:<name>`), on the wire
+  as that string. A spoke has one private workspace, which needs no name because it never leaves the spoke.
+- **Stamped**: `workspace` on `Row`, `List`, `Order`, `Ask`, `Event` and `Draft`. Absent reads `Private` (serde
+  default) and a private one is written without the field, so what is stored today keeps its bytes. There is no
+  `Project` record in the contract (a project is only `Subject::Project`), so none is stamped.
+- **Commands and events**: `hub.workspace.add { name }`, `hub.member.set { workspace, user, member }`; events
+  `hub.workspace.added`, `hub.member.set`. Subjects `Workspace(SharedName)` and `Member { workspace, user }`.
+- **Entities**: `SharedWorkspace { name }` and `Member { workspace, user }`; not in `Entity` or `State` yet.
+- **Who refuses them today**: `TestDomain` (`illegal`, state `""`) and `mirror::Mirror` (`illegal`, state `mirrored`).
 
 ## What a backend and a domain must agree on (wsp-065)
 

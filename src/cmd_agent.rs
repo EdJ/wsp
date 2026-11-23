@@ -9425,6 +9425,7 @@ mod tests {
     fn delivery_columns_follow_the_orders_states() {
         use wsp_store_contract::{Order, OrderId, OrderState as S, Principal, SeatId};
         let o = |id: &str, state: S, attempts: u32, first: bool, why: Option<&str>| Order {
+            workspace: Default::default(),
             id: OrderId(id.into()),
             from: Principal::Person("ed".into()),
             to: SeatId(id.rsplit_once("-o").unwrap().0.into()),

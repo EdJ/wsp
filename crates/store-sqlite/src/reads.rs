@@ -206,6 +206,7 @@ impl Events for SqliteStore {
                     principal: from_json!(&principal)?,
                     kind: from_json!(&kind)?,
                     subject: from_json!(&subject)?,
+                    workspace: Default::default(),
                     payload: from_json!(&payload)?,
                 });
             }

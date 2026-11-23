@@ -98,6 +98,71 @@ pub struct UserName(pub String);
 #[serde(transparent)]
 pub struct TokenId(pub String);
 
+/// A shared workspace's name (`acme`). Any string is a name here: nothing
+/// parses or checks one, and the text form is the string itself.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SharedName(pub String);
+
+/// The workspace a record or an event belongs to: the scope it syncs in.
+/// A spoke has one private workspace, which needs no name because it never
+/// leaves the spoke; a shared one is bound to the hub and syncs to its members.
+///
+/// The text form, which serde writes, is `private` or `shared:<name>`. A record
+/// or event with no workspace reads as [`Private`](WorkspaceId::Private), so
+/// nothing stored before workspaces existed changes meaning; a private one is
+/// written without the field, so it stays as it was stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkspaceId {
+    /// The spoke's own workspace (`private`).
+    #[default]
+    Private,
+    /// A workspace on the hub (`shared:<name>`).
+    Shared(SharedName),
+}
+
+impl WorkspaceId {
+    /// Whether this is the private workspace (what a record's `skip_serializing_if` asks).
+    pub fn is_private(&self) -> bool {
+        matches!(self, WorkspaceId::Private)
+    }
+}
+
+impl std::fmt::Display for WorkspaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkspaceId::Private => f.write_str("private"),
+            WorkspaceId::Shared(n) => write!(f, "shared:{}", n.0),
+        }
+    }
+}
+
+impl std::str::FromStr for WorkspaceId {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        if s == "private" {
+            Ok(WorkspaceId::Private)
+        } else if let Some(n) = s.strip_prefix("shared:") {
+            Ok(WorkspaceId::Shared(SharedName(n.to_string())))
+        } else {
+            Err(format!("not a workspace: `{s}` (`private` or `shared:<name>`)"))
+        }
+    }
+}
+
+impl Serialize for WorkspaceId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let t = String::deserialize(d)?;
+        t.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// A lease's name: `tick`, `barrier:<list>/<g>`, `sweep:<kind>`,
 /// `deliver:<seat>`, `claim:<row>`, `verify:<row>` (2.1). A claim is the lease
 /// `claim:<row>`.

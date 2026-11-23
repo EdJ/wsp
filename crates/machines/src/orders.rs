@@ -95,7 +95,7 @@ macro_rules! wire {
 }
 
 fn draft(kind: EventKind, order: &OrderId, payload: Value) -> Draft {
-    Draft { kind, subject: Subject::Order(order.clone()), payload }
+    Draft { kind, subject: Subject::Order(order.clone()), workspace: Default::default(), payload }
 }
 
 fn order<'s>(state: &'s State, id: &OrderId) -> Result<&'s Order, Refusal> {
@@ -182,6 +182,7 @@ impl Domain for Orders {
                     attempts: 0,
                     first: *first,
                     why: None,
+                    workspace: Default::default(),
                 };
                 vec![draft(EventKind::OrderQueued, &id, serde_json::to_value(&o).unwrap_or(Value::Null))]
             }

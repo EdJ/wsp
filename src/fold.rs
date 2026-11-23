@@ -587,6 +587,7 @@ fn mirror_of(store: &Store, db: &SharedStore, host: &str, msg: &Message) -> Opti
 fn order_entity(db: &SharedStore, host: &str, order: &str, seat: &str, state: OrderState) -> Entity {
     let held = db.snapshot().ok().and_then(|(s, _)| s.orders.get(&c::OrderId(order.to_string())).cloned());
     Entity::Order(c::Order {
+        workspace: Default::default(),
         id: c::OrderId(order.to_string()),
         from: held.as_ref().map(|h| h.from.clone()).unwrap_or(Principal::Manager(MachineName(host.to_string()))),
         to: SeatId(seat.to_string()),

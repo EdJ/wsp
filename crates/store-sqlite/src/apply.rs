@@ -75,7 +75,7 @@ pub(crate) fn insert_drafts(c: &Connection, drafts: Vec<Draft>, by: &Principal, 
     let mut out = Vec::with_capacity(drafts.len());
     for d in drafts {
         next += 1;
-        let e = Event { id: EventId(next), at, principal: by.clone(), kind: d.kind, subject: d.subject, payload: d.payload };
+        let e = Event { id: EventId(next), at, principal: by.clone(), kind: d.kind, subject: d.subject, workspace: d.workspace, payload: d.payload };
         stmt.execute(params![next as i64, at.0 as i64, to_json!(&e.principal)?, to_json!(&e.kind)?, to_json!(&e.subject)?, to_json!(&e.payload)?])
             .map_err(be)?;
         out.push(e);
@@ -104,7 +104,7 @@ pub(crate) fn write_event(
     payload: serde_json::Value,
     by: &Principal,
 ) -> Result<()> {
-    let events = insert_drafts(c, vec![Draft { kind, subject, payload }], by, now())?;
+    let events = insert_drafts(c, vec![Draft { kind, subject, workspace: Default::default(), payload }], by, now())?;
     fold(c, domain, &events)
 }
 

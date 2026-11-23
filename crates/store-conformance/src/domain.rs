@@ -30,6 +30,7 @@
 //! | `order.cancel` | `queued`, `typed` | `illegal` |
 //! | `order.deliver`, `order.delivered`, `order.acked`, `order.refused`, `order.done` | never: this domain stops an order at `queued` (wsp-117) | `illegal` |
 //! | `hub.user.add`, `hub.user.revoke`, `hub.token.issue`, `hub.token.revoke` | never: the hub's identity is wsp-159's domain (wsp-158) | `illegal` |
+//! | `hub.workspace.add`, `hub.member.set` | never: the hub's workspaces are wsp-159's domain (wsp-168) | `illegal` |
 //! | `mirror` | never: it is step 1's, and only the server's mirror domain decides it | `illegal` |
 //!
 //! `row.add` and `seat.spawn` are always legal (a second `seat.spawn` with the
@@ -97,7 +98,7 @@ fn invalid(reason: impl Into<String>) -> Refusal {
 }
 
 fn draft(kind: EventKind, subject: Subject, payload: Value) -> Draft {
-    Draft { kind, subject, payload }
+    Draft { kind, subject, workspace: Default::default(), payload }
 }
 
 /// The refusal of a verb the subject's state does not allow.
@@ -165,6 +166,7 @@ impl Domain for TestDomain {
                     group: None,
                     commit: None,
                     fields: fields.clone(),
+                    workspace: Default::default(),
                 };
                 vec![draft(EventKind::RowAdded, Subject::Row(id), to_value!(&row))]
             }
@@ -292,6 +294,7 @@ impl Domain for TestDomain {
                     attempts: 0,
                     first: *first,
                     why: None,
+                    workspace: Default::default(),
                 };
                 vec![draft(EventKind::OrderQueued, Subject::Order(id), to_value!(&order))]
             }
@@ -331,6 +334,20 @@ impl Domain for TestDomain {
             Command::HubTokenIssue { id, .. } | Command::HubTokenRevoke { id } => {
                 return Err(Refusal::Illegal {
                     subject: Subject::Credential(id.clone()),
+                    state: String::new(),
+                    verb: verb(cmd),
+                });
+            }
+            Command::HubWorkspaceAdd { name } => {
+                return Err(Refusal::Illegal {
+                    subject: Subject::Workspace(name.clone()),
+                    state: String::new(),
+                    verb: verb(cmd),
+                });
+            }
+            Command::HubMemberSet { workspace, user, .. } => {
+                return Err(Refusal::Illegal {
+                    subject: Subject::Member { workspace: workspace.clone(), user: user.clone() },
                     state: String::new(),
                     verb: verb(cmd),
                 });
@@ -498,6 +515,7 @@ mod tests {
                 attempts: 0,
                 first: false,
                 why: None,
+                workspace: Default::default(),
             },
         );
         for cmd in &verbs {
@@ -538,6 +556,31 @@ mod tests {
                     subject: Subject::Credential(token.clone()),
                     state: "".into(),
                     verb: verb(cmd)
+                })
+            );
+        }
+    }
+
+    /// The hub's two workspace verbs (wsp-168) are refused `illegal`, naming the
+    /// workspace or the membership: only the hub's domain decides them.
+    #[test]
+    fn the_hub_workspace_verbs_are_refused_as_illegal() {
+        let ed = Principal::Person("ed".into());
+        let ws = SharedName("acme".into());
+        let user = UserName("ann".into());
+        let add = Command::HubWorkspaceAdd { name: ws.clone() };
+        assert_eq!(
+            TestDomain.decide(&State::default(), &add, &ed),
+            Err(Refusal::Illegal { subject: Subject::Workspace(ws.clone()), state: "".into(), verb: "hub.workspace.add".into() })
+        );
+        for member in [true, false] {
+            let set = Command::HubMemberSet { workspace: ws.clone(), user: user.clone(), member };
+            assert_eq!(
+                TestDomain.decide(&State::default(), &set, &ed),
+                Err(Refusal::Illegal {
+                    subject: Subject::Member { workspace: ws.clone(), user: user.clone() },
+                    state: "".into(),
+                    verb: "hub.member.set".into()
                 })
             );
         }

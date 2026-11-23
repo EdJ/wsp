@@ -180,6 +180,7 @@ mod tests {
             fields.insert(key::STAGE_LIVE.into(), l.into());
         }
         Row {
+            workspace: Default::default(),
             id: RowId("beta-003".into()),
             project: ProjectId("beta".into()),
             title: "Doing row".into(),

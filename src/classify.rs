@@ -449,6 +449,7 @@ mod tests {
 
     fn ask(kind: AskKind, to: Option<Principal>, state: AskState) -> Ask {
         Ask {
+            workspace: Default::default(),
             id: AskId("m-1".into()),
             kind,
             from: Principal::Seat(SeatId("w1:p1".into())),

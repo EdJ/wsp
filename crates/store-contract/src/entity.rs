@@ -132,6 +132,9 @@ pub enum Transport {
 pub struct Row {
     pub id: RowId,
     pub project: ProjectId,
+    /// The workspace it belongs to; none reads as private.
+    #[serde(default, skip_serializing_if = "WorkspaceId::is_private")]
+    pub workspace: WorkspaceId,
     pub title: String,
     pub state: RowState,
     /// The state `unblock` returns to; set while `blocked`.
@@ -170,6 +173,9 @@ pub struct Group {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct List {
     pub id: ListId,
+    /// The workspace it belongs to; none reads as private.
+    #[serde(default, skip_serializing_if = "WorkspaceId::is_private")]
+    pub workspace: WorkspaceId,
     pub state: ListState,
     pub groups: Vec<Group>,
     /// Its other fields, by name, as today's files say them (its caption, ...);
@@ -219,6 +225,9 @@ pub struct Claim {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
+    /// The workspace it belongs to; none reads as private.
+    #[serde(default, skip_serializing_if = "WorkspaceId::is_private")]
+    pub workspace: WorkspaceId,
     pub from: Principal,
     pub to: SeatId,
     /// The text, or a reference to where it is kept.
@@ -239,6 +248,9 @@ pub struct Order {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ask {
     pub id: AskId,
+    /// The workspace it belongs to; none reads as private.
+    #[serde(default, skip_serializing_if = "WorkspaceId::is_private")]
+    pub workspace: WorkspaceId,
     pub kind: AskKind,
     pub from: Principal,
     /// Whom it is for; none is everybody who reads asks.
@@ -311,6 +323,19 @@ pub struct Credential {
     pub issued: At,
     #[serde(default)]
     pub revoked: Option<At>,
+}
+
+/// A shared workspace on the hub: a sync scope its members read and write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedWorkspace {
+    pub name: SharedName,
+}
+
+/// A user's membership of a shared workspace: the user may read and write it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    pub workspace: SharedName,
+    pub user: UserName,
 }
 
 /// One entity of 2.1, whole, as [`Command::Mirror`](crate::Command::Mirror)
