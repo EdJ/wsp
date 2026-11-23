@@ -59,7 +59,7 @@ fn forbidden(by: &Principal) -> Refusal {
 }
 
 fn draft(kind: EventKind, subject: Subject, payload: Value) -> Draft {
-    Draft { kind, subject, payload }
+    Draft { kind, subject, workspace: Default::default(), payload }
 }
 
 fn is_hash(s: &str) -> bool {

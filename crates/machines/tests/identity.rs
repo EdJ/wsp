@@ -26,6 +26,7 @@ impl Log {
                 principal: by.clone(),
                 kind: d.kind,
                 subject: d.subject,
+                workspace: d.workspace,
                 payload: d.payload,
             };
             self.state = Identity.evolve(std::mem::take(&mut self.state), &e);
