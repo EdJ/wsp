@@ -26,7 +26,7 @@ use wsp_api::{
 };
 
 use crate::dial::{self, Tcp};
-use crate::Target;
+use crate::Dial;
 
 /// What a [`Feed`] hands out.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +43,7 @@ pub enum Item {
 
 /// An iterator over a subscription. See the module docs.
 pub struct Feed {
-    target: Target,
+    target: Dial,
     timeout: Duration,
     beat: Duration,
     conn: Option<Tcp>,
@@ -76,7 +76,7 @@ const BACKOFF_FIRST: Duration = Duration::from_millis(25);
 const BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 impl Feed {
-    pub(crate) fn new(target: Target, from: Option<EventId>, timeout: Duration) -> Feed {
+    pub(crate) fn new(target: Dial, from: Option<EventId>, timeout: Duration) -> Feed {
         Feed {
             target,
             timeout,

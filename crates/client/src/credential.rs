@@ -1,0 +1,228 @@
+//! What a client dials with, and whom it dials (wsp-160): [`Target`] is the
+//! server, [`Credential`] the token that server takes. A spoke has two servers:
+//! its own daemon, which takes the instance's `api.token` ([`Target::Local`],
+//! [`crate::Client::dial`], unchanged), and a hub, which takes the user's token
+//! and never the instance's ([`crate::Client::dial_hub`]).
+//!
+//! The user's token is `$WSP_HUB_TOKEN` (tests), else the `token` of
+//! `~/.config/wsp/hubs.json`, a file only its owner may read (0600: a wider one
+//! is refused, naming it). The hub's URL is `$WSP_HUB_URL`, else the file's
+//! `url`. No host is a literal here: both come from the environment or the file.
+//! The file is one login, `{"url": "...", "token": "..."}`; its `user`, if any, is not read (the hello's hint is `$WSP_HUB_USER`, else `$USER`).
+
+use std::path::{Path, PathBuf};
+
+use wsp_store_contract::Principal;
+
+use crate::Silent;
+
+/// The environment variable that holds the user's hub token (tests).
+pub const HUB_TOKEN_ENV: &str = "WSP_HUB_TOKEN";
+/// The environment variable that holds the hub's URL.
+pub const HUB_URL_ENV: &str = "WSP_HUB_URL";
+/// The environment variable that holds the user's name, the hello's hint.
+pub const HUB_USER_ENV: &str = "WSP_HUB_USER";
+/// The file of the login, under the home directory.
+pub const HUBS_FILE: &str = ".config/wsp/hubs.json";
+
+/// Which server a client dials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// This instance's own daemon: its state dir's `api.json`, with [`Credential::Instance`].
+    Local,
+    /// A hub at `url`, with [`Credential::User`].
+    Hub { url: String },
+}
+
+/// The token a client says `hello` with.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// The instance's `api.token`: for [`Target::Local`] only, never sent to a hub.
+    Instance,
+    /// A user's token, for a hub.
+    User(String),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::Instance => f.write_str("Credential::Instance"),
+            Credential::User(_) => f.write_str("Credential::User(..)"),
+        }
+    }
+}
+
+impl Credential {
+    /// The credential for a hub: `$WSP_HUB_TOKEN`, else `~/.config/wsp/hubs.json`.
+    /// [`Silent::NotLoggedIn`] when neither names one; [`Silent::BadHubsFile`]
+    /// for a file wider than 0600 (named), unreadable or malformed. It never
+    /// reads `api.token`.
+    pub fn for_hub() -> Result<Credential, Silent> {
+        Credential::for_hub_in(std::env::var(HUB_TOKEN_ENV).ok(), &home())
+    }
+
+    /// [`Credential::for_hub`] with the environment's token and the home
+    /// directory given, so a test need not set process-wide variables.
+    pub fn for_hub_in(env_token: Option<String>, home: &Path) -> Result<Credential, Silent> {
+        if let Some(t) = env_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+            return Ok(Credential::User(t));
+        }
+        match read_login(home)? {
+            Some(Login { token: Some(t), .. }) if !t.is_empty() => Ok(Credential::User(t)),
+            Some(_) => Err(Silent::NotLoggedIn(format!("{} holds no token", home.join(HUBS_FILE).display()))),
+            None => Err(Silent::NotLoggedIn(format!("{HUB_TOKEN_ENV} is unset and there is no {}", home.join(HUBS_FILE).display()))),
+        }
+    }
+}
+
+/// The hub's URL: `$WSP_HUB_URL`, else `hubs.json`'s `url`.
+pub fn hub_url() -> Result<String, Silent> {
+    hub_url_in(std::env::var(HUB_URL_ENV).ok(), &home())
+}
+
+/// [`hub_url`] with the environment's URL and the home directory given.
+pub fn hub_url_in(env_url: Option<String>, home: &Path) -> Result<String, Silent> {
+    if let Some(u) = env_url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) {
+        return Ok(u);
+    }
+    match read_login(home)? {
+        Some(Login { url: Some(u), .. }) if !u.is_empty() => Ok(u),
+        _ => Err(Silent::NotLoggedIn(format!("{HUB_URL_ENV} is unset and {} names no url", home.join(HUBS_FILE).display()))),
+    }
+}
+
+struct Login {
+    url: Option<String>,
+    token: Option<String>,
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+}
+
+/// The login `hubs.json` holds; None when there is no such file.
+fn read_login(home: &Path) -> Result<Option<Login>, Silent> {
+    let path = home.join(HUBS_FILE);
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Silent::BadHubsFile(format!("{}: {e}", path.display()))),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(Silent::BadHubsFile(format!(
+                "{} is mode {mode:03o}, wider than 0600: chmod 600 it",
+                path.display()
+            )));
+        }
+    }
+    let _ = meta;
+    let text = std::fs::read_to_string(&path).map_err(|e| Silent::BadHubsFile(format!("{}: {e}", path.display())))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Silent::BadHubsFile(format!("{} is not a login: {e}", path.display())))?;
+    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    if !v.is_object() {
+        return Err(Silent::BadHubsFile(format!("{} is not a login: not an object", path.display())));
+    }
+    Ok(Some(Login { url: field("url"), token: field("token") }))
+}
+
+/// The `host:port` a hub's URL names: `tcp://host:port` or bare `host:port`
+/// (plain TCP until wsp-461's TLS). Any other scheme is refused rather than
+/// dialled in the clear.
+pub(crate) fn hub_addr(url: &str) -> Result<String, Silent> {
+    let url = url.trim();
+    let addr = match url.split_once("://") {
+        Some(("tcp", rest)) => rest,
+        Some((scheme, _)) => return Err(Silent::BadListenFile(format!("hub url {url}: scheme {scheme} is not supported yet"))),
+        None => url,
+    };
+    let addr = addr.trim_end_matches('/');
+    if addr.is_empty() || !addr.contains(':') {
+        return Err(Silent::BadListenFile(format!("hub url {url} is not host:port")));
+    }
+    Ok(addr.to_string())
+}
+
+/// Who the hello says it is for, as a hint the hub ignores (wsp-161).
+pub(crate) fn hint() -> Principal {
+    let name = std::env::var(HUB_USER_ENV).or_else(|_| std::env::var("USER")).unwrap_or_default();
+    Principal::Person(if name.is_empty() { "unknown".into() } else { name })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home(name: &str, mode: u32, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let h = std::env::temp_dir().join(format!("wsp-cred-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(h.join(".config/wsp")).unwrap();
+        let f = h.join(HUBS_FILE);
+        std::fs::write(&f, body).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+        h
+    }
+
+    const LOGIN: &str = r#"{"url":"tcp://hub.invalid:7000","user":"ed","token":"from-file"}"#;
+
+    #[test]
+    fn the_environment_comes_before_the_file() {
+        let h = home("order", 0o600, LOGIN);
+        assert_eq!(Credential::for_hub_in(Some("from-env".into()), &h), Ok(Credential::User("from-env".into())));
+        assert_eq!(Credential::for_hub_in(None, &h), Ok(Credential::User("from-file".into())));
+        assert_eq!(Credential::for_hub_in(Some("  ".into()), &h), Ok(Credential::User("from-file".into())));
+        // An environment token needs no file, and is not checked against one.
+        let wide = home("order-wide", 0o644, LOGIN);
+        assert_eq!(Credential::for_hub_in(Some("from-env".into()), &wide), Ok(Credential::User("from-env".into())));
+    }
+
+    #[test]
+    fn a_hubs_file_wider_than_0600_is_refused_naming_it() {
+        for mode in [0o644, 0o640, 0o604] {
+            let h = home("wide", mode, LOGIN);
+            match Credential::for_hub_in(None, &h) {
+                Err(Silent::BadHubsFile(why)) => {
+                    assert!(why.contains(&h.join(HUBS_FILE).display().to_string()), "does not name the file: {why}");
+                    assert!(why.contains("0600"), "{why}");
+                    assert!(!why.contains("from-file"), "{why}");
+                }
+                other => panic!("mode {mode:o}: {other:?}"),
+            }
+            assert!(matches!(hub_url_in(None, &h), Err(Silent::BadHubsFile(_))));
+        }
+        let h = home("narrow", 0o400, LOGIN);
+        assert_eq!(Credential::for_hub_in(None, &h), Ok(Credential::User("from-file".into())));
+    }
+
+    #[test]
+    fn no_token_anywhere_is_not_logged_in() {
+        let none = std::env::temp_dir().join(format!("wsp-cred-none-{}", std::process::id()));
+        let e = Credential::for_hub_in(None, &none).unwrap_err();
+        assert!(matches!(e, Silent::NotLoggedIn(_)));
+        assert!(e.to_string().starts_with("not logged in"), "{e}");
+        let h = home("no-token", 0o600, r#"{"url":"tcp://hub.invalid:7000"}"#);
+        assert!(matches!(Credential::for_hub_in(None, &h), Err(Silent::NotLoggedIn(_))));
+        let h = home("junk", 0o600, "not json");
+        assert!(matches!(Credential::for_hub_in(None, &h), Err(Silent::BadHubsFile(_))));
+    }
+
+    #[test]
+    fn the_url_is_the_environments_then_the_files() {
+        let h = home("url", 0o600, LOGIN);
+        assert_eq!(hub_url_in(Some("tcp://other.invalid:1".into()), &h).unwrap(), "tcp://other.invalid:1");
+        assert_eq!(hub_url_in(None, &h).unwrap(), "tcp://hub.invalid:7000");
+    }
+
+    #[test]
+    fn a_url_is_host_port_over_tcp_only() {
+        assert_eq!(hub_addr("tcp://hub.invalid:7000/").unwrap(), "hub.invalid:7000");
+        assert_eq!(hub_addr("hub.invalid:7000").unwrap(), "hub.invalid:7000");
+        assert!(hub_addr("https://hub.invalid:7000").is_err());
+        assert!(hub_addr("hub.invalid").is_err());
+    }
+}

@@ -31,6 +31,13 @@ dependencies to hold this.
   the dial's `wait`. An `order.refused` is followed by a re-read (it does not say `queued` or `failed`). Window: an
   event between the head read and the `orders` read is replayed, so a refused-and-requeued order can show an older
   state for a moment.
+- `src/credential.rs` (wsp-160): `Target` (`Local`, `Hub { url }`) and `Credential` (`Instance`, `User(token)`).
+  `Client::dial_hub(url, credential, wait)` dials a hub (`host:port` or `tcp://host:port`, plain TCP until wsp-461)
+  with the user's token; `Credential::Instance` is `Silent::NotLoggedIn` and `api.token` is never read for a hub.
+  `Credential::for_hub()` is `$WSP_HUB_TOKEN`, else `token` in `~/.config/wsp/hubs.json` (a file wider than 0600 is
+  `Silent::BadHubsFile`, naming it; none is `NotLoggedIn`); `hub_url()` is `$WSP_HUB_URL`, else its `url`. The
+  `_in` forms take the env value and home as arguments. The hello's `by` is a hint (`$WSP_HUB_USER`, else `$USER`).
+  The file's shape is this crate's reading of wsp-462's: `{"url", "token"}`.
 - `src/dial.rs`: `Silent` and `open`. `open` reads `api.json` and `api.token`, gives each address an even share of
   what is left of `wait`, and says `hello`. `Silent` is `NoListenFile`, `BadListenFile`, `NoToken`, `Unreachable`
   (each address, with why), `NoWelcome`, `Refused` (the server's code, `unauthorised` for a wrong token) or

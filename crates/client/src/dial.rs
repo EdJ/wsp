@@ -20,7 +20,7 @@ use wsp_api::{
 };
 use wsp_store_contract::Principal;
 
-use crate::{Target, Where};
+use crate::{Dial, Where};
 
 /// Why nothing answered. Never a panic or a hang: the CLI falls back and
 /// web-chrome reconnects.
@@ -40,6 +40,10 @@ pub enum Silent {
     Refused(Refused),
     /// The server answered with something that is not a welcome.
     NotAServer(String),
+    /// No user token for a hub: `$WSP_HUB_TOKEN` is unset and `hubs.json` names none.
+    NotLoggedIn(String),
+    /// `hubs.json` is unusable: wider than 0600, unreadable or not a login.
+    BadHubsFile(String),
 }
 
 impl fmt::Display for Silent {
@@ -52,6 +56,8 @@ impl fmt::Display for Silent {
             Silent::NoWelcome(at) => write!(f, "{at} accepted the connection but sent no welcome in time"),
             Silent::Refused(r) => write!(f, "the server refused the hello: {:?}: {}", r.code, r.text),
             Silent::NotAServer(what) => write!(f, "not a wsp server: {what}"),
+            Silent::NotLoggedIn(why) => write!(f, "not logged in: {why}"),
+            Silent::BadHubsFile(why) => write!(f, "hubs.json is not usable: {why}"),
         }
     }
 }
@@ -65,12 +71,13 @@ pub(crate) struct Open {
 }
 
 /// Dial the server `target` names and say hello as its `by`, in its `wait` at most.
-pub(crate) fn open(target: &Target) -> Result<Open, Silent> {
+pub(crate) fn open(target: &Dial) -> Result<Open, Silent> {
     match &target.at {
         Where::StateDir(dir) => {
             let (addrs, token) = read_state_dir(dir)?;
             open_at(&addrs, token, &target.by, target.wait)
         }
+        Where::Hub { addr, token } => open_at(std::slice::from_ref(addr), token.clone(), &target.by, target.wait),
         Where::Addrs { addrs, token } => {
             if addrs.is_empty() {
                 return Err(Silent::BadListenFile("no address was given".into()));

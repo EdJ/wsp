@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, to_value, Value};
 use wsp_api::{Answer, ApiToken, Code, Listen, Outcome, Reply, LISTEN_FILE, MISSED_BEATS, TOKEN_FILE};
-use wsp_client::{Client, Feed, Item, Silent, ViewError};
+use wsp_client::{Client, Credential, Feed, Item, Silent, ViewError};
 use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
@@ -1230,4 +1230,70 @@ impl Texts for Retained {
     fn set_text(&self, row: &RowId, section: &str, text: String, expect: Rev) -> Result<Rev> {
         self.inner.set_text(row, section, text, expect)
     }
+}
+
+// ------------------------------------------------------------ the hub (wsp-160)
+
+#[test]
+fn dial_hub_sends_the_users_token_and_never_reads_api_token() {
+    let d = dir("hub");
+    let store = mirror_store();
+    let server = start(Arc::new(store.handle()), &d);
+    // A loopback server stands in for the hub: it takes one token, here the one
+    // the test holds as the "user's". Neither state-dir file is there to read.
+    let listen: Listen = serde_json::from_str(&fs::read_to_string(d.join(LISTEN_FILE)).unwrap()).unwrap();
+    let token = fs::read_to_string(d.join(TOKEN_FILE)).unwrap().trim().to_string();
+    let url = format!("tcp://{}", listen.addrs[0]);
+    fs::remove_file(d.join(LISTEN_FILE)).unwrap();
+    fs::remove_file(d.join(TOKEN_FILE)).unwrap();
+    let wait = Duration::from_millis(800);
+
+    let mut c = Client::dial_hub(&url, Credential::User(token.clone()), WAIT).unwrap_or_else(|s| panic!("silent: {s}"));
+    assert_eq!(c.server(), "wsp");
+    assert!(c.wip().is_ok());
+    // The same address bare is the same hub.
+    assert!(Client::dial_hub(&listen.addrs[0], Credential::User(token), WAIT).is_ok());
+
+    // A wrong user token is refused unauthorised.
+    match Client::dial_hub(&url, Credential::User("not-the-token".into()), wait) {
+        Err(Silent::Refused(r)) => assert_eq!(r.code, Code::Unauthorised),
+        other => panic!("expected Refused, got {:?}", other.map(|_| ())),
+    }
+    // The instance credential is never sent to a hub, and nothing is dialled.
+    let e = Client::dial_hub(&url, Credential::Instance, wait).err().expect("Instance dialled a hub");
+    assert!(matches!(e, Silent::NotLoggedIn(_)), "{e:?}");
+    // Not a host and port, or not over TCP, is said and not dialled.
+    assert!(matches!(Client::dial_hub("https://hub.invalid", Credential::User("t".into()), wait), Err(Silent::BadListenFile(_))));
+    drop(c);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn with_an_api_token_and_no_hub_token_a_hub_dial_is_not_logged_in() {
+    let d = dir("hub-nologin");
+    let store = mirror_store();
+    let server = start(Arc::new(store.handle()), &d);
+    assert!(d.join(TOKEN_FILE).is_file(), "the instance token is there to be (not) read");
+    let home = dir("hub-nologin-home");
+    fs::create_dir_all(&home).unwrap();
+    let e = Credential::for_hub_in(None, &home).expect_err("a credential from nothing");
+    assert!(matches!(e, Silent::NotLoggedIn(_)), "{e:?}");
+    assert!(e.to_string().contains("not logged in"), "{e}");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn local_still_dials_with_the_instance_token() {
+    // `Client::dial` is the `Local` path and takes no credential: the state dir's own.
+    let d = dir("local");
+    let store = mirror_store();
+    let server = start(Arc::new(store.handle()), &d);
+    let c = dial(&d);
+    assert_eq!(c.server(), "wsp");
+    drop(c);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
 }

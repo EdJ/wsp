@@ -6,6 +6,9 @@
 //!   nothing answering is [`Silent`], never a panic or a hang.
 //! - [`Client::dial_at`] does the same against addresses and a token the
 //!   caller holds (another machine's API, its token fetched over ssh).
+//! - [`Client::dial_hub`] dials a hub with a [`Credential`] (the user's token,
+//!   from `$WSP_HUB_TOKEN` or `~/.config/wsp/hubs.json`); the instance token
+//!   goes to a [`Target::Local`] server only.
 //! - [`Client::request`] sends one verb and returns the reply with its id.
 //! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
 //! - [`Client::apply`] sends a command under one idempotency key, again under
@@ -34,10 +37,12 @@ use wsp_api::{
 };
 use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Refusal, Row, RowFilter, State};
 
+mod credential;
 mod dial;
 mod orders;
 mod subscribe;
 
+pub use credential::{hub_url, hub_url_in, Credential, Target, HUBS_FILE, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV};
 pub use dial::Silent;
 pub use orders::APPLY_ATTEMPTS;
 pub use subscribe::{Feed, Item};
@@ -111,7 +116,7 @@ impl std::error::Error for ViewError {}
 
 /// What it takes to dial again: where the server is, who for, and how long to wait.
 #[derive(Debug, Clone)]
-pub(crate) struct Target {
+pub(crate) struct Dial {
     pub(crate) at: Where,
     pub(crate) by: Principal,
     pub(crate) wait: Duration,
@@ -124,11 +129,13 @@ pub(crate) struct Target {
 pub(crate) enum Where {
     StateDir(PathBuf),
     Addrs { addrs: Vec<String>, token: ApiToken },
+    /// A hub, by the address its URL names, and the user's token (never the instance's).
+    Hub { addr: String, token: ApiToken },
 }
 
 /// A welcomed connection to the server, for requests.
 pub struct Client {
-    target: Target,
+    target: Dial,
     conn: Option<dial::Tcp>,
     next: u64,
     timeout: Duration,
@@ -140,7 +147,7 @@ impl Client {
     /// Dial the server `state_dir` names (its `api.json` and `api.token`) and
     /// say `hello` as `by`, within `wait` in all. [`Silent`] says why not.
     pub fn dial(state_dir: &Path, by: Principal, wait: Duration) -> Result<Client, Silent> {
-        Client::dial_target(Target { at: Where::StateDir(state_dir.to_path_buf()), by, wait })
+        Client::dial_target(Dial { at: Where::StateDir(state_dir.to_path_buf()), by, wait })
     }
 
     /// Dial the server at `addrs` (`host:port`, tried in order, as `api.json`
@@ -150,10 +157,28 @@ impl Client {
     /// [`Silent::Refused`]. A lost connection, here or in a [`Feed`], dials the
     /// same addresses again.
     pub fn dial_at(addrs: Vec<String>, token: ApiToken, by: Principal, wait: Duration) -> Result<Client, Silent> {
-        Client::dial_target(Target { at: Where::Addrs { addrs, token }, by, wait })
+        Client::dial_target(Dial { at: Where::Addrs { addrs, token }, by, wait })
     }
 
-    fn dial_target(target: Target) -> Result<Client, Silent> {
+    /// Dial the hub at `url` (`host:port`, or `tcp://host:port`: plain TCP until
+    /// TLS, wsp-461) and say `hello` with the user's token from `credential`,
+    /// within `wait` in all. The hub ignores the hello's `by` (wsp-161), so the
+    /// client sends the user's name (`$WSP_HUB_USER`, else `$USER`) as a hint
+    /// only. The instance token is never sent to a hub: [`Credential::Instance`]
+    /// is [`Silent::NotLoggedIn`], and `api.token` is never read. A lost
+    /// connection dials the same hub again.
+    pub fn dial_hub(url: &str, credential: Credential, wait: Duration) -> Result<Client, Silent> {
+        let token = match credential {
+            Credential::User(token) => ApiToken(token),
+            Credential::Instance => {
+                return Err(Silent::NotLoggedIn("the instance token is never sent to a hub".into()))
+            }
+        };
+        let addr = credential::hub_addr(url)?;
+        Client::dial_target(Dial { at: Where::Hub { addr, token }, by: credential::hint(), wait })
+    }
+
+    fn dial_target(target: Dial) -> Result<Client, Silent> {
         let wait = target.wait;
         let open = dial::open(&target)?;
         Ok(Client {
