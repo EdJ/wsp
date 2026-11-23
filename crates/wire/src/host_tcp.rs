@@ -1062,6 +1062,9 @@ impl Host for Tcp {
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.local.transcript_of(session, cwd)
     }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.local.transcripts_of_tree(tree)
+    }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.local.pi_session_of(session, cwd)
     }

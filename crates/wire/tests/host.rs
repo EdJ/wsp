@@ -481,6 +481,9 @@ impl Host for Counting<'_> {
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.inner.transcript_of(session, cwd)
     }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.inner.transcripts_of_tree(tree)
+    }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.inner.pi_session_of(session, cwd)
     }

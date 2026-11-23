@@ -240,6 +240,14 @@ pub fn isolated(name: &str) -> Isolated {
     // run from inside an agent's seat (as `wsp verify` is) would answer every
     // "who am I" with the outer seat. A test that wants a seat sets its own.
     std::env::remove_var(crate::base::seat::SEAT_ENV);
+    // wsp-390: the rest of what a spawn gives its seat goes the same way. A
+    // check seat's `WSP_SEAT_KIND=check` sends every `worklist hold` a test
+    // runs through the check's validator, and its `WSP_EXIT`/`WSP_VERDICT`
+    // name a file in the real state rather than this store's; a test that is
+    // a seat of some kind sets them itself.
+    for key in ["WSP_SEAT_KIND", "WSP_EXIT", "WSP_VERDICT"] {
+        std::env::remove_var(key);
+    }
     // wsp-029: `WSP_HOST` unset is the manager, which a test reaches only
     // when it says so (and stands one up); otherwise the host runs here.
     std::env::set_var("WSP_HOST", "inproc");
