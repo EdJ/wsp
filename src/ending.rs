@@ -2435,7 +2435,8 @@ mod tests {
     // ---- `wsp-691`: what a member leaves running in its tree is stopped -------
 
     /// A `yes` started in `tree` in the background by a shell that then exits:
-    /// orphaned, its parent pid 1, as wsp-693's eight burners were.
+    /// orphaned, its parent pid 1 as wsp-693's eight burners were (or, on
+    /// Linux, the subreaper that adopted it: `check_tree::orphaned`).
     fn orphaned_yes(tree: &std::path::Path) -> u32 {
         let out = wsp_base::calls::Command::new("sh")
             .args(["-c", "yes >/dev/null 2>&1 </dev/null & echo $!"])
@@ -2445,8 +2446,9 @@ mod tests {
             .unwrap();
         let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
         for _ in 0..100 {
-            let ppid = crate::check_tree::exes().into_iter().find(|(p, _, _)| *p == pid).map(|r| r.1);
-            if ppid == Some(1) {
+            let table = crate::check_tree::exes();
+            let ppid = table.iter().find(|(p, _, _)| *p == pid).map(|r| r.1);
+            if ppid.is_some_and(|pp| crate::check_tree::orphaned(pp, &table)) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));

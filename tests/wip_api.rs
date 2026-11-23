@@ -418,12 +418,17 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     // An open ask, from the seat below, which waits on it.
     store.save_message(&ask_message("m-1", "may I?", SEAT, &doing)).unwrap();
 
-    // A live build holder in a slot, as every shimmed cargo build leaves one:
-    // this test's own pid. No `since`, so its line does not tick between reads.
+    // A live build holder in a slot, as every shimmed cargo build leaves one.
+    // A hold is live by its job (wsp-052, wsp-057), not a pid: this job is in
+    // no job table, so the hold is its holder's while its file is younger than
+    // the start grace, and it is written again before each read below. No
+    // `since`, so its line does not tick between reads.
     let builds = sb.state.join("builds");
     std::fs::create_dir_all(&builds).unwrap();
-    let holder = serde_json::json!({ "pid": std::process::id(), "task": doing, "cmd": "cargo build", "tree": sb.dir.display().to_string() });
-    std::fs::write(builds.join("slot-0"), holder.to_string()).unwrap();
+    let job = wsp_host_api::JobKey { row: wsp_host_api::RowId(doing.clone()), attempt: 0, job: "throttle:build@wip-api".into() };
+    let holder = serde_json::json!({ "pid": std::process::id(), "task": doing, "cmd": "cargo build", "tree": sb.dir.display().to_string(), "job": job });
+    let hold_build = || std::fs::write(builds.join("slot-0"), holder.to_string()).unwrap();
+    hold_build();
 
     // The loopback manager, on record in the sandbox's state.
     let sup = sb.dir.join("sup");
@@ -484,6 +489,7 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     // on its default auto (both do, from ioreg and from the beat).
     for mode in ["on", "auto"] {
         std::fs::write(sb.state.join("throttle.json"), serde_json::json!({ "mode": mode }).to_string()).unwrap();
+        hold_build();
         same_both_ways(&sb, mode);
     }
     // The seat as wip draws it under api.
@@ -513,16 +519,24 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     // The fallback is the files path: what it runs is the files path's.
     let _ = children;
 
-    // 4. WSP_READ=files never dials.
+    // 4. WSP_READ=files never dials for what it reads from the files. Under
+    // WSP_ORDERS=store, the default since wsp-358, the orders live only in the
+    // store, so there the files path's one dial is the orders read (wsp-127):
+    // the files read is counted with the orders on files, then the orders' dial.
     let (addr, accepted) = counting_listener();
     std::fs::write(sb.state.join("api.json"), serde_json::json!({ "addrs": [addr] }).to_string()).unwrap();
-    sb.wip("files");
+    let files_only = sb.cmd(&["wip", "--json"]).env("WSP_READ", "files").env("WSP_ORDERS", "files").output().expect("wsp runs");
+    assert!(files_only.status.success(), "wsp wip under files: {}", String::from_utf8_lossy(&files_only.stderr));
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(accepted.load(Ordering::SeqCst), 0, "WSP_READ=files dialled");
+    sb.wip("files");
+    std::thread::sleep(Duration::from_millis(200));
+    let orders_dials = accepted.load(Ordering::SeqCst);
+    assert!(orders_dials >= 1, "under WSP_ORDERS=store the files path reads the orders through the API");
     // And the listener counts: under api the same call dials it.
     sb.wip("api");
     std::thread::sleep(Duration::from_millis(200));
-    assert!(accepted.load(Ordering::SeqCst) >= 1, "the counting listener counted nothing under api");
+    assert!(accepted.load(Ordering::SeqCst) > orders_dials, "the counting listener counted nothing under api");
 
     // End what this test started.
     sb.wsp(&["despawn", SEAT]);

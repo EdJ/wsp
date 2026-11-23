@@ -3989,20 +3989,28 @@ fn silent_lines(store: &Store) -> Vec<String> {
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
     // The files unless `WSP_READ=api`; a silent or failed dial reads the files
-    // and says why, once (wsp-076).
+    // and says why, once (wsp-076). The orders, which under `WSP_ORDERS=store`
+    // are read through the API on the files path too (wsp-127), are not dialled
+    // for a second time after it failed: that is said on the same line.
+    let mut fell = false;
     let api = match wip_reads_api() {
         false => None,
         true => match api_state(store) {
             Ok(state) => Some(state),
             Err(why) => {
-                eprintln!("wsp: wip reads the files: {why}");
+                let orders = match crate::orders::mode() {
+                    crate::orders::Mode::Store => "; no orders drawn, as they are read through it too",
+                    _ => "",
+                };
+                eprintln!("wsp: wip reads the files: {why}{orders}");
+                fell = true;
                 None
             }
         },
     };
     let w = match &api {
         Some(state) => Wip::from_api(store, state),
-        None => Wip::from_managers(store),
+        None => Wip::from_managers(store, !fell),
     };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
@@ -4203,8 +4211,24 @@ struct Gathering {
 impl Gathering {
     /// The files' half, read as `wip` always has.
     fn files(store: &Store, agents: Vec<(crate::place::Seated, Option<i64>)>, since: BTreeMap<String, String>) -> Gathering {
+        Gathering::files_dialling(store, agents, since, true)
+    }
+
+    /// [`Gathering::files`], the orders read through the API only where
+    /// `dial` is set: not after `wip`'s own dial of it failed, whose line said
+    /// so. Not dialled, the delivery columns are drawn empty, as a failed read
+    /// draws them.
+    fn files_dialling(
+        store: &Store,
+        agents: Vec<(crate::place::Seated, Option<i64>)>,
+        since: BTreeMap<String, String>,
+        dial: bool,
+    ) -> Gathering {
         Gathering {
-            delivery: OrderReads::of(store).map(|r| DeliveryColumns::read(&r, None, now_ms())),
+            delivery: OrderReads::of(store).map(|r| match dial {
+                true => DeliveryColumns::read(&r, None, now_ms()),
+                false => DeliveryColumns::default(),
+            }),
             tasks: wip_tasks(store),
             bindings: store.bindings(),
             claims: store.claims(),
@@ -4435,7 +4459,8 @@ impl Wip {
     /// daemon's tick last stamped ([`crate::cmd_role::burners_stamped`],
     /// wsp-716), not a process table read here. A seat the manager does not run (one started
     /// in-process) is not here until adoption (wsp-029).
-    pub(crate) fn from_managers(store: &Store) -> Wip {
+    /// `dial_orders` unset leaves the orders unread ([`Gathering::files_dialling`]).
+    pub(crate) fn from_managers(store: &Store, dial_orders: bool) -> Wip {
         let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
         let census = &reading.census;
         let seen: Vec<crate::place::Seated> = census.seats().filter(|s| s.state != State::Empty).cloned().collect();
@@ -4459,7 +4484,7 @@ impl Wip {
                 })
             })
             .collect();
-        let read = Gathering::files(store, seen.into_iter().map(|s| (s, None)).collect(), since);
+        let read = Gathering::files_dialling(store, seen.into_iter().map(|s| (s, None)).collect(), since, dial_orders);
         let mut w = Wip::gathered(store, read, |agents, bindings| {
             let shells = crate::waiting::Shells::counted(
                 agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),

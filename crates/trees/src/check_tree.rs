@@ -410,9 +410,21 @@ pub fn verdict(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, Strin
     judge(pid, tree, in_tree, table, false)
 }
 
-/// [`verdict`], and where `orphans` is set an orphan (`ppid` 1, its starter
-/// gone) that no rule above spares is the tree's to stop (`wsp-691`: eight
-/// `yes` burners stood in a member's tree at review, orphaned to launchd). Set
+/// The executables that adopt an orphan: pid 1 on a Mac (`launchd`), and on
+/// Linux the nearest child subreaper, most often the person's `systemd --user`,
+/// whose pid is not 1.
+const REAPERS: &[&str] = &["launchd", "systemd", "init"];
+
+/// Is a process whose parent is `ppid` an orphan: its parent pid 1, or a
+/// [`REAPERS`] name that adopted it once its starter was gone.
+pub fn orphaned(ppid: u32, table: &[(u32, u32, String)]) -> bool {
+    ppid <= 1 || table.iter().find(|(p, _, _)| *p == ppid).is_some_and(|(_, _, exe)| REAPERS.contains(&base_of(exe)))
+}
+
+/// [`verdict`], and where `orphans` is set an orphan ([`orphaned`]: its starter
+/// gone, adopted by pid 1 or a subreaper) that no rule above spares is the
+/// tree's to stop (`wsp-691`: eight `yes` burners stood in a member's tree at
+/// review, orphaned to launchd). Set
 /// for the trees a seat has just left or is waiting in at review, and at a
 /// submit: there the tree is the row's alone, so what nobody holds is its
 /// leftovers. Hosts, servers, apps and a wsp's check are spared as ever.
@@ -448,7 +460,7 @@ pub fn judge(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)
     if DEV_TOOLS.contains(&base_of(exe)) {
         return Verdict::Stop;
     }
-    if orphans && ppid <= 1 {
+    if orphans && orphaned(ppid, table) {
         return Verdict::Stop;
     }
     // Up through its parents, to the first that decides it: a host makes it
@@ -1309,6 +1321,11 @@ mod tests {
         let tree = Path::new("/r/.worktrees/c-1");
         assert!(matches!(judge(40, tree, &in_tree, &table, false), Verdict::Spare(_)), "today's rule, unchanged");
         assert_eq!(judge(40, tree, &in_tree, &table, true), Verdict::Stop);
+        // On Linux the orphan's parent is the person's `systemd --user`, a
+        // subreaper, not pid 1; a child of a plain shell is no orphan.
+        let linux = [proc(1361, 1, "systemd"), proc(45, 1361, "yes"), proc(46, 1, "bash"), proc(47, 46, "yes")];
+        assert_eq!(judge(45, tree, &[45], &linux, true), Verdict::Stop, "adopted by systemd --user");
+        assert!(matches!(judge(47, tree, &[47], &linux, true), Verdict::Spare(_)), "a shell's child is not an orphan");
         assert_eq!(judge(41, tree, &in_tree, &table, true), Verdict::Stop);
         for pid in [42, 43, 44] {
             assert!(matches!(judge(pid, tree, &in_tree, &table, true), Verdict::Spare(_)), "{pid}");
