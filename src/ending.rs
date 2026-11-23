@@ -2280,6 +2280,11 @@ mod tests {
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let root = std::env::temp_dir().join(format!("wsp-453-{}-{}", std::process::id(), util::epoch_nanos()));
+        // `wsp-369`: the scan finds a row's tree by its name anywhere on the
+        // machine, so a suite run beside this one (two seats verifying at once)
+        // would stop this run's `f-1` for it. The rows carry this run's pid.
+        let tag = std::process::id();
+        let row = |id: &str| format!("{id}-{tag}");
         let mut rows = Vec::new();
         for (id, status) in [
             ("f-1", crate::model::Status::Review),
@@ -2287,10 +2292,10 @@ mod tests {
             ("f-3", crate::model::Status::Review),
             ("f-4", crate::model::Status::Review),
         ] {
-            let mut t = crate::model::Task::new(id, id);
+            let mut t = crate::model::Task::new(id, &row(id));
             t.set_status(status);
             store.save_task(&t).unwrap();
-            let tree = root.join(crate::cmd_checkout::WORKTREES).join(id);
+            let tree = root.join(crate::cmd_checkout::WORKTREES).join(row(id));
             std::fs::create_dir_all(&tree).unwrap();
             let mut cmd = if id == "f-4" {
                 let mut c = wsp_base::calls::Command::new("sleep");
@@ -2309,7 +2314,22 @@ mod tests {
                 .unwrap();
             rows.push((id, child));
         }
-        let seated = Quiet(vec![("cpd-9".into(), "f-3 · working".into())]);
+        // `wsp-369`: the shell's `sleep` is the server, the one the tree started;
+        // the shell itself stands there by working directory alone and is
+        // spared. A shell that has not forked it yet when the scan reads `ps`
+        // leaves nothing in f-1 to stop (red under a loaded full suite), so the
+        // tick waits for each shell's `sleep`.
+        let started = std::time::Instant::now();
+        for (id, child) in &rows {
+            if *id == "f-4" {
+                continue;
+            }
+            while crate::place_super::tree_of(child.id()).len() < 2 {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10), "{id}'s shell never started its sleep");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let seated = Quiet(vec![("cpd-9".into(), format!("{} · working", row("f-3")))]);
         let said = stop_finished(&store, &seated, &Default::default());
         let mut ended = Vec::new();
         for (id, child) in rows.iter_mut() {
@@ -2323,10 +2343,10 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(ended, vec![("f-1", true), ("f-2", false), ("f-3", true), ("f-4", false)], "said: {said:?}");
-        assert!(said.iter().any(|l| l.starts_with("stopped in finished row f-1")), "{said:?}");
-        assert!(said.iter().any(|l| l.starts_with("stopped in finished row f-3")), "{said:?}");
-        assert!(said.iter().any(|l| l.starts_with("spared") && l.contains("row f-4")), "{said:?}");
-        assert!(!said.iter().any(|l| l.contains("f-2")), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with(&format!("stopped in finished row {} ", row("f-1")))), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with(&format!("stopped in finished row {} ", row("f-3")))), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with("spared") && l.contains(&format!("row {} ", row("f-4")))), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains(&row("f-2"))), "{said:?}");
         assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2], spared: vec![] }, 2048).contains("2 processes (2 MB)"));
     }
 
