@@ -1470,7 +1470,7 @@ fn tree_missing(dir: &Path, step: &Step, start: Instant) -> Option<Ran> {
     }
     let path = util::contract(dir);
     let tail = format!("tree missing: {path} — the step could not run there; nothing it did failed");
-    Some(Ran { step: step.clone(), done: Done::TreeMissing(path), took: start.elapsed(), tail, first: None, reused: None })
+    Some(Ran { step: step.clone(), done: Done::TreeMissing(path), took: start.elapsed(), tail, first: None, reused: None, build: None })
 }
 
 /// How long a step may sit with no output and no CPU before it is called hung:
@@ -1501,6 +1501,56 @@ pub(crate) struct Ran {
     pub first: Option<(String, String)>,
     /// The green this step was answered by, when it did not run.
     pub reused: Option<Green>,
+    /// The share of `took` spent in a cold build (`wsp-364`), when the step's
+    /// first run was stopped by its limit while cargo was still building: that
+    /// first run, and the second's build as cargo reports it. What is left,
+    /// [`run_took`], is the step's own run, and that is what its limit judges.
+    pub build: Option<Duration>,
+}
+
+/// A step's own run: its time less any cold build ([`Ran::build`]).
+pub(crate) fn run_took(r: &Ran) -> Duration {
+    r.took.saturating_sub(r.build.unwrap_or_default())
+}
+
+/// The most a cold build may add to a step's limit on its second run: a check
+/// tree that starts with no `target/` compiles the workspace inside the first
+/// step, and a limit of 1-5 s declared for the run was judged against that
+/// compile (`wsp-364`, three m3 rows sent back for nothing they did). The
+/// manager's hang bound still ends a build that stops making progress.
+const COLD_BUILD_LIMIT: Duration = Duration::from_secs(20 * 60);
+
+/// Whether a step's log ends with cargo still building: a line of its build
+/// (`Compiling`, `Blocking waiting for file lock`, …) and no `Finished` line,
+/// so a stop at the limit stopped the build, not the step's run.
+fn still_building(log: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(log) else { return false };
+    let words = |l: &str| l.trim_start().split_whitespace().next().map(str::to_string).unwrap_or_default();
+    let building = text.lines().any(|l| {
+        let w = words(l);
+        matches!(w.as_str(), "Compiling" | "Checking" | "Blocking" | "Downloading" | "Downloaded" | "Updating" | "Locking" | "Building")
+    });
+    building && !text.lines().any(|l| words(l) == "Finished")
+}
+
+/// What cargo's `Finished … in 9.03s` (or `in 1m 05s`) line in a step's log
+/// says its build took.
+fn built_in(log: &Path) -> Option<Duration> {
+    let text = std::fs::read_to_string(log).ok()?;
+    let line = text.lines().find(|l| l.trim_start().starts_with("Finished "))?;
+    let (_, after) = line.rsplit_once(" in ")?;
+    let mut total = 0.0;
+    for part in after.split_whitespace() {
+        let (n, unit) = part.split_at(part.find(|c: char| !(c.is_ascii_digit() || c == '.'))?);
+        let n: f64 = n.parse().ok()?;
+        total += match unit {
+            "s" => n,
+            "m" => n * 60.0,
+            "h" => n * 3600.0,
+            _ => return None,
+        };
+    }
+    Some(Duration::from_secs_f64(total))
 }
 
 /// `$WSP_SCRATCH` for a step run in `dir` (`compound-react-045`): the seat's
@@ -1579,6 +1629,7 @@ fn run_as_job(dir: &Path, step: &Step, log: &Path, jobs: &Jobs<'_>) -> Ran {
         tail: why,
         first: None,
         reused: None,
+        build: None,
     };
     if let Some(why) = unparsable(&step.command) {
         return Ran { done: Done::Malformed(why.clone()), tail: why, ..failed(String::new()) };
@@ -1609,7 +1660,7 @@ fn run_as_job(dir: &Path, step: &Step, log: &Path, jobs: &Jobs<'_>) -> Ran {
 /// What a step's `job.ended` reads as: the same pass, fail, timeout and hang
 /// a step run here reads as.
 fn ran_of_job(dir: &Path, step: &Step, log: &Path, end: &JobEnded, start: Instant) -> Ran {
-    let ran = |done: Done, tail: String| Ran { step: step.clone(), done, took: start.elapsed(), tail, first: None, reused: None };
+    let ran = |done: Done, tail: String| Ran { step: step.clone(), done, took: start.elapsed(), tail, first: None, reused: None, build: None };
     if end.exit != Some(0) {
         if let Some(missing) = tree_missing(dir, step, start) {
             return missing;
@@ -1671,7 +1722,7 @@ pub(crate) fn run_all(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reu
     for s in steps {
         let stop = out.last().is_some_and(|r| r.done.stops());
         let ran = if stop {
-            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None }
+            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None, build: None }
         } else {
             run_again(dir, s, log, reuse, runner)
         };
@@ -1704,7 +1755,10 @@ pub(crate) fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&R
 /// A step that timed out is run once more with its limit doubled: a measured
 /// time at its declared limit is a budget set too tight, not a failure of the
 /// code. A pass there is "limit too tight", and the row is not sent back; a
-/// step that also takes twice its limit really hangs and fails.
+/// step that also takes twice its limit really hangs and fails. One stopped
+/// while cargo was still building (a cold check tree, `wsp-364`) is run once
+/// more with room for the build, and its limit judges the run after cargo's
+/// `Finished` line: a cold compile is the tree's, not the step's.
 ///
 /// With a `reuse`, a step already green at that commit is not run (it costs 0s
 /// and is not written again), and a pass is recorded when the tree was clean at
@@ -1713,7 +1767,7 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
     let inputs = reuse.and_then(|r| crate::affected::key(dir, r.sha, &step.command));
     if let Some(r) = reuse {
         if let Some(green) = r.greens.lookup_by(r.sha, inputs.as_deref(), &step.command, r.env) {
-            return Ran { step: step.clone(), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: Some(green) };
+            return Ran { step: step.clone(), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: Some(green), build: None };
         }
     }
     let clean = reuse.is_some_and(|r| greens::clean_at(dir, r.sha));
@@ -1734,6 +1788,18 @@ pub(crate) fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reus
     let ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
         let second = run_step(dir, step, log, runner);
         Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
+    } else if matches!(first.done, Done::Failed { timed_out: true, .. }) && still_building(log) {
+        // `wsp-364`: stopped in a cold build. The second run has room for the
+        // build, and what is judged is its run once cargo said it had built.
+        let why = format!("stopped at its {}s limit while cargo was still building (a cold `target/`)", step.limit.as_secs());
+        let wide = Step { limit: step.limit * 2 + COLD_BUILD_LIMIT, ..step.clone() };
+        let second = run_step(dir, &wide, log, runner);
+        let build = built_in(log).map(|b| first.took + b.min(second.took));
+        let mut ran = Ran { step: step.clone(), took: first.took + second.took, first: Some((why, first.tail.clone())), build, ..second };
+        if ran.done == Done::Passed && ran.build.is_some() && run_took(&ran) > step.limit * 2 {
+            ran.done = Done::Failed { exit: None, timed_out: true };
+        }
+        ran
     } else if matches!(first.done, Done::Failed { timed_out: true, .. }) {
         let wide = Step { limit: step.limit * 2, ..step.clone() };
         let second = run_step(dir, &wide, log, runner);
@@ -1770,6 +1836,12 @@ pub(crate) fn secs(d: Duration) -> u64 {
 
 pub(crate) fn why_failed(r: &Ran) -> String {
     match &r.done {
+        Done::Failed { timed_out: true, .. } if r.build.is_some() => format!(
+            "ran {}s past twice its declared budget of {}s, after a cold build of {}s",
+            secs(run_took(r)),
+            r.step.limit.as_secs(),
+            secs(r.build.unwrap_or_default())
+        ),
         Done::Failed { timed_out: true, .. } => format!(
             "timed out after {}s (declared budget {}s, measured {}s)",
             r.step.limit.as_secs(),
@@ -1797,6 +1869,15 @@ pub(crate) fn account(ran: &[Ran]) -> String {
                 ("✓", format!("reused (green at {at}, {}s, by {}, {}{flake})", g.took, g.who, g.when))
             }
             (Done::Passed, None) => ("✓", format!("{}s", secs(r.took))),
+            (Done::Passed, Some((why, _))) if r.build.is_some() => {
+                let (run, build, limit) = (secs(run_took(r)), secs(r.build.unwrap_or_default()), r.step.limit.as_secs());
+                let judged = if run_took(r) <= r.step.limit {
+                    format!("within its {limit}s limit")
+                } else {
+                    format!("limit too tight: past its {limit}s limit and within twice it; raise the step's limit")
+                };
+                ("✓", format!("{run}s · {judged} — the first run was {why}; built in {build}s, then ran {run}s"))
+            }
             (Done::Passed, Some((why, _))) if why.starts_with("timed out") => {
                 ("✓", format!("{}s · limit too tight: passed on a second run at twice the limit, the first was {why}; raise the step's limit", secs(r.took)))
             }
@@ -2004,10 +2085,11 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
             }
             if let Some(r) = ran.iter().find(|r| matches!(r.done, Done::Failed { timed_out: true, .. })) {
                 owes = format!(
-                    "`{}` took its whole budget: declared {}s, measured {}s. Raise its limit past its run time (`wsp check <id> --set --why … -`) or make it faster; it is not queued to rerun.\n\n{owes}",
+                    "`{}` took its whole budget: declared {}s, measured {}s{}. Raise its limit past its run time (`wsp check <id> --set --why … -`) or make it faster; it is not queued to rerun.\n\n{owes}",
                     r.step.name,
                     r.step.limit.as_secs(),
-                    secs(r.took)
+                    secs(run_took(r)),
+                    r.build.map(|b| format!(" after a cold build of {}s, which is not counted", secs(b))).unwrap_or_default()
                 );
             }
             v::send_back(&mut t, util::now_iso(), "wsp check failed", read.as_deref(), &owes, Some(CHECK_HEAD));
@@ -2019,7 +2101,7 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
         out
     });
     let word = state.as_str();
-    let steps: Vec<_> = ran.iter().map(|r| serde_json::json!({ "name": r.step.name, "secs": secs(r.took), "reused": r.reused.is_some() })).collect();
+    let steps: Vec<_> = ran.iter().map(|r| serde_json::json!({ "name": r.step.name, "secs": secs(r.took), "reused": r.reused.is_some(), "build": r.build.map(secs) })).collect();
     let mut event = serde_json::json!({ "id": id, "state": word, "steps": ran.len(), "took": took.as_secs(), "step_secs": steps });
     if let Some(start) = start {
         event["start"] = start.json();
@@ -2771,7 +2853,33 @@ pub(crate) fn set_as(store: &Store, args: &Args, needle: &str, usage: &str, role
     };
     store.git_commit(&format!("wsp: {what} declares {} check(s)", steps.len()));
     println!("{what}: {} check(s) — {}", steps.len(), steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
+    for line in store.find_task(&what).map(|t| under_measured(&t, &steps)).unwrap_or_default() {
+        println!("  warning: {line}");
+    }
     0
+}
+
+/// `wsp-364`: each of `steps` declared under what the row's last check
+/// measured for it (its own run, a cold build left out), named with both, so
+/// a `--set` that will time out says so when it is written, not at the gate.
+pub(crate) fn under_measured(t: &Task, steps: &[Step]) -> Vec<String> {
+    let runs = v::runs(t);
+    steps
+        .iter()
+        .filter_map(|s| {
+            let (took, at) = runs.iter().rev().find_map(|r| {
+                r.text.lines().find_map(|l| {
+                    let mut parts = l.get(l.find(' ')? + 1..)?.split(" · ");
+                    (parts.next()? == s.name).then_some(())?;
+                    let took: u64 = parts.nth(1)?.strip_suffix('s')?.parse().ok()?;
+                    Some((took, r.read.clone().unwrap_or_default()))
+                })
+            })?;
+            (s.limit < Duration::from_secs(took)).then(|| {
+                format!("`{}` is declared {}s and its last check at {at} measured {took}s — it will time out; raise it past its run", s.name, s.limit.as_secs())
+            })
+        })
+        .collect()
 }
 
 fn refuse_set(store: &Store, role: &Setter, id: &str, why: &str) -> i32 {
@@ -3477,6 +3585,65 @@ mod tests {
         }
     }
 
+    /// A fake `cargo test` in `dir`: on a tree with no `built` mark it prints
+    /// `Compiling`, builds for `build`s and says `Finished … in {build}s`;
+    /// then it runs for `run`s. A first run stopped in the build leaves no mark.
+    fn cold_cargo(dir: &Path, build: u64, run: &str) -> String {
+        let _ = std::fs::remove_file(dir.join("built"));
+        format!(
+            "cd '{}' && if [ ! -f built ]; then echo '   Compiling wsp v0.1.0'; sleep {build}; touch built; \
+             echo '    Finished `test` profile [unoptimized + debuginfo] target(s) in {build}.00s'; fi; \
+             echo '     Running unittests'; sleep {run}",
+            dir.display()
+        )
+    }
+
+    /// `wsp-364`: a step declared at 3s on a cold check tree whose build takes
+    /// 9s, then runs 2.8s, is judged on its run and the row is not sent back.
+    #[test]
+    fn a_step_stopped_in_a_cold_build_is_judged_on_its_run_and_the_row_is_not_sent_back() {
+        let (_env, store, sha) = world("cold-fits", "- s: true", "exit 0\n");
+        let (dir, log) = scratch_log("cold-fits");
+        let ran = run_again(&dir, &sh(&cold_cargo(&dir, 9, "2.8"), 3), &log, None, &Runner::Inproc);
+        assert_eq!(ran.done, Done::Passed, "{}", ran.tail);
+        let build = ran.build.expect("the cold build was read off cargo's Finished line");
+        assert!(build >= Duration::from_secs(12) && run_took(&ran) < Duration::from_secs(4), "{build:?} {:?}", run_took(&ran));
+        let text = account(std::slice::from_ref(&ran));
+        assert!(text.contains("built in 12s") && text.contains("while cargo was still building"), "{text}");
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        assert_eq!(settle(&store, "pj-001", &at, &[ran], Duration::from_secs(15)), Settled::Passed);
+        assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Review, "not sent back");
+    }
+
+    /// The same step declared at 1s, with a run of 3s after the build, is past
+    /// twice its limit: the row is sent back, and the build is not counted.
+    #[test]
+    fn a_run_past_twice_its_limit_after_a_cold_build_still_sends_the_row_back() {
+        let (_env, store, sha) = world("cold-over", "- s: true", "exit 0\n");
+        let (dir, log) = scratch_log("cold-over");
+        let ran = run_again(&dir, &sh(&cold_cargo(&dir, 9, "3"), 1), &log, None, &Runner::Inproc);
+        assert_eq!(ran.done, Done::Failed { exit: None, timed_out: true }, "{}", ran.tail);
+        assert!(why_failed(&ran).contains("ran 3s past twice its declared budget of 1s"), "{}", why_failed(&ran));
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        assert_eq!(settle(&store, "pj-001", &at, &[ran], Duration::from_secs(13)), Settled::SentBack);
+        let t = store.find_task("pj-001").unwrap();
+        let log = t.section("Log").unwrap();
+        assert!(log.contains("declared 1s, measured 3s after a cold build of 10s, which is not counted"), "{log}");
+    }
+
+    #[test]
+    fn cargos_finished_line_reads_as_its_build_time() {
+        let (dir, log) = scratch_log("finished");
+        let _ = dir;
+        std::fs::write(&log, "   Compiling a v0.1.0\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 05s\n").unwrap();
+        assert_eq!(built_in(&log), Some(Duration::from_secs(65)));
+        assert!(!still_building(&log), "it finished");
+        std::fs::write(&log, "   Compiling a v0.1.0\nwarning: unused doc comment\n").unwrap();
+        assert!(still_building(&log));
+        std::fs::write(&log, "running 3 tests\n").unwrap();
+        assert!(!still_building(&log), "a test run, not a build");
+    }
+
     /// Under `manager` the hang is the manager's to see and end (its
     /// `job.ended` says `hung`); it reads as the same red.
     #[test]
@@ -3826,7 +3993,7 @@ mod tests {
         let t = store.find_task("pj-001").unwrap();
         let tg = target(&store, &t, None).unwrap();
         let at = begin(&store, "pj-001", &tg.sha, 3600, false).unwrap();
-        let ran = vec![Ran { step: sh("sh check.sh", 10), done: Done::Passed, took: Duration::from_secs(4), tail: String::new(), first: None, reused: None }];
+        let ran = vec![Ran { step: sh("sh check.sh", 10), done: Done::Passed, took: Duration::from_secs(4), tail: String::new(), first: None, reused: None, build: None }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(4)), Settled::Passed);
 
         let t = store.find_task("pj-001").unwrap();
@@ -3849,7 +4016,7 @@ mod tests {
         let (_env, store, sha) = world("once", "- ok: true", "exit 0\n");
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a second trigger found the first one running");
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None, build: None }];
         settle(&store, "pj-001", &at, &ran, Duration::ZERO);
         assert!(begin(&store, "pj-001", &sha, 3600, false).is_none(), "a landing already checked is not checked again");
         assert!(begin(&store, "pj-001", &sha, 3600, true).is_some(), "but a person can ask");
@@ -3868,7 +4035,7 @@ mod tests {
         assert!(!running_at(&store, &t, other), "another tip has no run");
         let mut t2 = t.clone();
         assert!(!carry_pass(&mut t2, &sha, other), "a run still going carries nothing");
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None, build: None }];
         settle(&store, "pj-001", &at, &ran, Duration::ZERO);
         let mut t = store.find_task("pj-001").unwrap();
         assert!(!running_at(&store, &t, &sha));
@@ -3905,6 +4072,7 @@ mod tests {
             tail: "boom".into(),
             first: None,
             reused: None,
+            build: None,
         }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(2)), Settled::SentBack);
         let t = store.find_task("pj-001").unwrap();
@@ -3924,6 +4092,7 @@ mod tests {
             tail: String::new(),
             first: None,
             reused: None,
+            build: None,
         }]
     }
 
@@ -4036,6 +4205,7 @@ mod tests {
             tail: "syntax error: unexpected end of file".into(),
             first: None,
             reused: None,
+            build: None,
         }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::from_secs(1)), Settled::Malformed);
         let t = store.find_task("pj-001").unwrap();
@@ -4101,7 +4271,7 @@ mod tests {
         t.set_status(Status::Doing);
         store.save_task(&t).unwrap();
         let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
-        let ran = vec![Ran { step: sh("false", 10), done: Done::Failed { exit: Some(1), timed_out: false }, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
+        let ran = vec![Ran { step: sh("false", 10), done: Done::Failed { exit: Some(1), timed_out: false }, took: Duration::ZERO, tail: String::new(), first: None, reused: None, build: None }];
         assert_eq!(settle(&store, "pj-001", &at, &ran, Duration::ZERO), Settled::Failed);
         assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
     }
@@ -4118,7 +4288,7 @@ mod tests {
         assert_eq!(gate(&store, &t), Gate::Wait, "and it is still running");
         assert_eq!(v::runs(&store.find_task("pj-001").unwrap()).len(), 1);
 
-        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None }];
+        let ran = vec![Ran { step: sh("true", 10), done: Done::Passed, took: Duration::ZERO, tail: String::new(), first: None, reused: None, build: None }];
         settle(&store, "pj-001", &runs[0].at, &ran, Duration::ZERO);
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(gate(&store, &t), Gate::Clear, "passed for {sha}");
@@ -4889,6 +5059,31 @@ mod tests {
 
     fn declared(store: &Store) -> String {
         store.find_task("pj-001").unwrap().section(SECTION).unwrap_or_default()
+    }
+
+    /// `wsp-364`: a `--set` with a limit under the step's last measured run is
+    /// written, and its answer names the step with both figures.
+    #[test]
+    fn a_set_under_the_steps_last_measured_run_names_it_in_its_answer() {
+        let (env, store, sha) = world("set-under", "", "exit 0\n");
+        assert_eq!(set_by(&store, &env, &Setter::Person, "pj-001", "- tests (60s): sh check.sh\n- build (5m): true\n", None), 0);
+        let at = begin(&store, "pj-001", &sha, 3600, false).unwrap();
+        let ran = vec![Ran {
+            step: Step { name: "tests".into(), command: "sh check.sh".into(), limit: Duration::from_secs(60), of: Of::Project, on: Vec::new(), barrier: false, end: false },
+            done: Done::Passed,
+            took: Duration::from_secs(4),
+            tail: String::new(),
+            first: None,
+            reused: None,
+            build: None,
+        }];
+        settle(&store, "pj-001", &at, &ran, Duration::from_secs(4));
+        let after = "- tests (2s): sh check.sh\n- build (5m): true\n";
+        assert_eq!(set_by(&store, &env, &Setter::Person, "pj-001", after, Some("tighter")), 0, "written all the same");
+        let said = under_measured(&store.find_task("pj-001").unwrap(), &parse_steps(after, Of::Project));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("`tests` is declared 2s") && said[0].contains("measured 4s"), "{}", said[0]);
+        assert!(under_measured(&store.find_task("pj-001").unwrap(), &parse_steps("- tests (5s): sh check.sh", Of::Project)).is_empty(), "a limit past the run says nothing");
     }
 
     #[test]
