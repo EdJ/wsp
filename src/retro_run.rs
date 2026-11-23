@@ -302,39 +302,6 @@ pub fn wrong_seat(store: &Store, w: &Worklist, s: &Value, pane: Option<&str>) ->
     Some(format!("{who}; this is {}'s, whose retro is {} — a retro seat writes only its own list's retro", w.id, record.unwrap_or("not on a row")))
 }
 
-/// Carry a renumbering into every list's `retro.json` (`wsp-351`).
-///
-/// [`Store::rename_tasks`] rewrites the records and the state files, but
-/// `retro.json` lives under the artefacts root, which the store does not know:
-/// a retro row filed out of the inbox kept its old id in `s["row"]` while the
-/// list's `retro:` line said the new one, and [`wrong_seat`] reads `s["row"]`
-/// first, so every retro verb refused the seat. The filed rows and notes in it
-/// name rows by id too and follow the same way. Written through [`save`], so
-/// the artefact keeps its versions and `retro.html` is redrawn with the new
-/// ids. Answers the lists rewritten, or the first write that failed.
-pub fn follow_renames(store: &Store, map: &std::collections::BTreeMap<String, String>) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    if map.is_empty() {
-        return Ok(out);
-    }
-    for w in store.worklists() {
-        let s = state(&w.id);
-        if s.is_null() {
-            continue;
-        }
-        let text = serde_json::to_string(&s).unwrap_or_default();
-        let (text, n) = crate::store::substitute_tokens(&text, map);
-        if n == 0 {
-            continue;
-        }
-        let s: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", w.id))?;
-        let moved: Vec<String> = map.iter().map(|(a, b)| format!("{a} → {b}")).collect();
-        save(store, &w, &s, &format!("renumbered: {}", moved.join(", ")))?;
-        out.push(w.id.clone());
-    }
-    Ok(out)
-}
-
 /// Who is running the verb: its pane, when it is in one.
 fn caller_pane() -> Option<String> {
     crate::place::my_pane()
@@ -963,6 +930,7 @@ mod renumbered {
 
         let s = state("l");
         assert_eq!(s["row"].as_str(), Some(new.as_str()), "retro.json names the new id");
+        assert!(!std::fs::read_to_string(dir("l").join("retro.html")).unwrap().contains(&old), "retro.html names the old id nowhere");
         assert_eq!(store.worklist("l").unwrap().retro.map(|(_, r)| r), Some(new.clone()));
         assert!(store.worklist(&on).unwrap().groups().iter().any(|g| g.members.contains(&new)), "list membership follows");
         assert_eq!(store.task("cr-9").unwrap().after, vec![new.clone()], "after links follow");

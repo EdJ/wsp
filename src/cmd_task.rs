@@ -2517,7 +2517,7 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
             // What names the row outside the store: a list's retro record and
             // the row's own outputs, both under the artefacts root (`wsp-351`).
             let mut code = 0;
-            match crate::retro_run::follow_renames(store, &renumber) {
+            match crate::retro_yours::follow_renames(store, &renumber) {
                 Ok(lists) => {
                     for l in lists {
                         println!("  {}", p.dim(&format!("{l}'s retro record follows")));

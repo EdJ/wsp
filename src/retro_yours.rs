@@ -17,6 +17,47 @@ pub fn state(slug: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Carry a renumbering into every list's retro record (`wsp-351`).
+///
+/// [`Store::rename_tasks`] rewrites the records and the state files, but
+/// `retro.json` lives under the artefacts root, which the store does not know:
+/// a retro row filed out of the inbox kept its old id in `s["row"]` while the
+/// list's `retro:` line said the new one, and `retro_run::wrong_seat` reads
+/// `s["row"]` first, so every retro verb refused the seat. The filed rows and
+/// notes name rows by id too and follow the same way, as do the links in
+/// `retro.html`. Both are rewritten whole-token and written through
+/// [`crate::artefact::put_bytes`], so each keeps its versions. Here, in the
+/// engine, rather than in `retro_run` (timeline) because `wsp mv` calls it.
+/// Answers the lists rewritten, or the first write that failed.
+pub fn follow_renames(store: &Store, map: &std::collections::BTreeMap<String, String>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if map.is_empty() {
+        return Ok(out);
+    }
+    let root = crate::artefact::root();
+    let note = format!("renumbered: {}", map.iter().map(|(a, b)| format!("{a} → {b}")).collect::<Vec<_>>().join(", "));
+    for w in store.worklists() {
+        let mut touched = false;
+        for file in [FILE, "retro.html"] {
+            let Ok(text) = std::fs::read_to_string(root.join(&w.id).join(file)) else { continue };
+            let (text, n) = crate::store::substitute_tokens(&text, map);
+            if n == 0 {
+                continue;
+            }
+            if file == FILE {
+                serde_json::from_str::<Value>(&text).map_err(|e| format!("{}'s {file}: {e}", w.id))?;
+            }
+            let who = crate::artefact::Who { row: Some(w.id.clone()), seat: Some("wsp".to_string()) };
+            crate::artefact::put_bytes(&root, &w.id, file, text.as_bytes(), &note, &who, false)?;
+            touched = true;
+        }
+        if touched {
+            out.push(w.id.clone());
+        }
+    }
+    Ok(out)
+}
+
 pub fn arr<'a>(s: &'a Value, k: &str) -> &'a [Value] {
     s[k].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
