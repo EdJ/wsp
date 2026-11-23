@@ -4398,6 +4398,8 @@ mod tests {
         assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("choice", "C")], &[])), 0);
         assert_eq!(answer(&store, &answer_args(&id, &[("finish", "true")], &["enough for today"])), 1);
         assert!(store.message(&id).unwrap().is_open(), "refused: the set stays open");
+        let why = open_questions(store.message(&id).unwrap().choices.as_ref().unwrap()).unwrap();
+        assert!(why.contains("1 of 3 answered") && why.contains("One, Three"), "{why}");
         assert_eq!(store.message(&id).unwrap().choices.as_ref().unwrap().set_progress(), (1, 3));
         // `--finish` with a save still saves, and still stays open.
         assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "A"), ("finish", "true")], &[])), 1);

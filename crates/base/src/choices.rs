@@ -244,7 +244,7 @@ impl Choices {
     pub fn accept_words(&self, words: &str) -> Result<(Value, String), String> {
         let qs = self.questions();
         if self.kind() == "set" {
-            return Err("a set is answered one question at a time: `--question 'Header' --choice 'Label'`, or ended with `--finish`".into());
+            return Err("a set is answered one question at a time: `--question 'Header' --choice 'Label'` for each; the last one ends the set".into());
         }
         match (self.kind(), qs.as_slice()) {
             ("ask", [q]) => self.accept(&json!({ "answers": { q.question: words.trim() } }), ""),
@@ -499,8 +499,8 @@ impl Choices {
     fn accept_set(&self, o: &Map<String, Value>, typed: &str) -> Result<(Value, String), String> {
         let finish = o.get("finish").and_then(Value::as_bool).unwrap_or(false);
         let (done, total) = self.set_progress();
-        if done < total && !finish {
-            return Err(format!("{done} of {total} answered — a set ends when every question is, or with `--finish`"));
+        if done < total {
+            return Err(format!("{done} of {total} answered — a set ends when every question is answered"));
         }
         let answers = self.answers();
         let unanswered: Vec<String> = self.set_headers().into_iter().filter(|h| !answers.contains_key(h)).collect();
