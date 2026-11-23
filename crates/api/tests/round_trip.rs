@@ -890,7 +890,7 @@ fn wire_spelling_is_pinned() {
     );
 
     assert_eq!(
-        serde_json::to_value(&answers()[12]).unwrap(),
+        serde_json::to_value(&answers()[13]).unwrap(),
         json!({"type": "reply", "id": 13, "ok": "applied", "events": [412, 413]})
     );
     assert_eq!(
