@@ -973,6 +973,14 @@ pub(crate) const EXIT_ENDED: &str = "ended: its exit was accepted at";
 /// The line on the row saying that seat is left running, and why.
 const EXIT_LEFT: &str = "wsp: the exit is accepted and its seat is left running —";
 
+/// How long after its exit was accepted a check's seat a turn began at is
+/// kept for whoever is using it, before it is ended all the same
+/// (`compound-react-044`). A check's seat is the run's: nothing is owed at it
+/// after its verdict, and cpd-102 stood 44 min past its own because "left
+/// running" had no end. Under the tick (20 s), so the seat is gone within
+/// 120 s of its verdict.
+pub(crate) const CHECK_KEPT_SECS: i64 = 90;
+
 /// The line on the row saying ending that seat was tried and failed.
 const EXIT_NOT_ENDED: &str = "wsp: could not end the seat of an accepted exit";
 
@@ -1030,12 +1038,16 @@ pub(crate) fn forget_exit(store: &Store, seat: &str) {
 }
 
 /// A verifier's or a check's seat left running by its exit: kept on the
-/// record, so no older ending takes it after all, but counted again.
-fn mark_left(store: &Store, seat: &str) {
+/// record, so no older ending takes it after all, but counted again. `until`
+/// is when a check's seat kept for its user is ended all the same.
+fn mark_left(store: &Store, seat: &str, until: Option<i64>) {
     store.locked(|| {
         let mut all = read_exits(store);
         let Some(e) = all.get_mut(seat).and_then(|e| e.as_object_mut()) else { return false };
         e.insert("left".into(), serde_json::Value::Bool(true));
+        if let Some(u) = until {
+            e.insert("until".into(), serde_json::json!(u));
+        }
         write_exits(store, &all)
     });
 }
@@ -1081,16 +1093,26 @@ fn exits(store: &Store, seats: &dyn Seats) -> std::collections::BTreeSet<String>
 /// doing; a verifier's or a check's left seat stays on the record, out of the
 /// older endings' reach, until it is gone. `None` is not yet; `Some` is the
 /// line said.
+///
+/// **A check's seat is never left without an end** (`compound-react-044`):
+/// nobody types to a check after its verdict, so a backend that cannot say
+/// whether anybody did ([`Left::Untold`]) does not hold it, and one a turn
+/// began at is kept [`CHECK_KEPT_SECS`] past its exit — the line says until
+/// when — and then ended by the tick, by the same guards less that one: never
+/// mid-turn, never behind its own ask, never a governor seat.
 pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<String> {
     let e = read_exits(store).get(seat).cloned()?;
     let row = e["row"].as_str().unwrap_or_default().to_string();
     let kind = e["kind"].as_str().unwrap_or("member").to_string();
     let at = e["at"].as_i64().unwrap_or(0);
+    let check = kind == "check";
+    let due = e["until"].as_i64().filter(|u| check && util::epoch_secs() >= *u);
     if e["left"].as_bool() == Some(true) {
         if seats.state(seat).is_none() && seats.absent(seat) {
             forget_exit(store, seat);
+            return None;
         }
-        return None;
+        due?;
     }
     let state = seats.state(seat);
     if state.is_none() && seats.absent(seat) {
@@ -1103,11 +1125,24 @@ pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<S
         state,
         wait: None,
         governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
-        typed: seats.turn_began_since(store, seat, at),
+        typed: match (check, due) {
+            (true, Some(_)) => Some(false),
+            (true, None) => seats.turn_began_since(store, seat, at).or(Some(false)),
+            (false, _) => seats.turn_began_since(store, seat, at),
+        },
         pids: seats.pids(seat),
     };
     let line = match left(&reading) {
         Some(why) if why.passes() => return None,
+        Some(Left::Typed) if check => {
+            let until = at + CHECK_KEPT_SECS;
+            let line = format!(
+                "{EXIT_LEFT} {seat} ({kind}): a turn began at it after the exit was accepted, so it is kept for whoever is using it until {}, and ended then",
+                util::iso_at(until)
+            );
+            mark_left(store, seat, Some(until));
+            return Some(said_exit(store, seat, &row, &kind, &line));
+        }
         Some(why) => {
             let sentence = match why {
                 Left::Typed => "a turn began at it after the exit was accepted, so somebody is using it and it is theirs to end".into(),
@@ -1137,7 +1172,14 @@ pub(crate) fn end_exit(store: &Store, seats: &dyn Seats, seat: &str) -> Option<S
                 }
             };
             match ending {
-                Ok(()) => format!("{EXIT_ENDED} {} ({kind}, {seat}), no pid of it running and its tree kept", util::iso_at(at)),
+                Ok(()) => match due {
+                    Some(u) => format!(
+                        "{EXIT_ENDED} {} ({kind}, {seat}), kept until {} for whoever was using it and ended then, no pid of it running and its tree kept",
+                        util::iso_at(at),
+                        util::iso_at(u)
+                    ),
+                    None => format!("{EXIT_ENDED} {} ({kind}, {seat}), no pid of it running and its tree kept", util::iso_at(at)),
+                },
                 Err(why) => format!("{EXIT_NOT_ENDED} ({kind}, {seat}) — {}", util::truncate(&why_not_ended(&why), 200)),
             }
         }
@@ -1195,7 +1237,7 @@ fn check_ended(store: &Store, seats: &dyn Seats, seat: &str, gone: bool, pids: &
 /// endings still step aside for it.
 fn said_exit(store: &Store, seat: &str, row: &str, kind: &str, line: &str) -> String {
     match line.starts_with(EXIT_LEFT) && kind != "member" {
-        true => mark_left(store, seat),
+        true => mark_left(store, seat, None),
         false => forget_exit(store, seat),
     }
     once(store, row, line);
@@ -2237,6 +2279,66 @@ mod tests {
         f.absent.push("cpd-2".into());
         exits(&store, &f);
         assert!(exit_owns(&store).is_empty(), "and its record goes once the seat has gone");
+    }
+
+    /// How many times the check's seat `cpd-3` was ended since last asked —
+    /// the fixture's member is the tick's to end too, and not what is asked.
+    fn checks_ended() -> usize {
+        drain(&DESPAWNED).iter().filter(|e| *e == "cpd-3").count()
+    }
+
+    /// `compound-react-044`: cpd-102's exit was accepted at the cap, its seat
+    /// was "left running", and nothing ended it for 44 min. A check's seat whose
+    /// backend cannot say whether anybody typed to it is ended by the next
+    /// tick, and `cycle.log` says so.
+    #[test]
+    fn a_check_seat_accepted_at_the_cap_that_cannot_say_who_typed_is_ended_by_the_next_tick() {
+        let (_env, store, mut f) = three_exits("exit-check-untold");
+        f.typed.remove("cpd-3");
+        assert!(exited(&store, "cpd-3", "run barrier 1", "check"));
+        assert!(exited_seats(&store).contains("cpd-3"), "no place under the cap from its submit");
+        tick(&store, &f);
+        assert_eq!(checks_ended(), 1, "ended by the tick");
+        assert_eq!(check_ending(&store), crate::barrier::Ending::Ended);
+        assert!(exit_owns(&store).is_empty(), "nothing left on the record to stand behind");
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert!(log.lines().any(|l| l.contains(EXIT_ENDED) && l.contains("(check, cpd-3)")), "{log}");
+        assert!(!log.contains("left running"), "{log}");
+    }
+
+    /// A check's seat a turn began at after its exit is kept for whoever is
+    /// using it until a set time, said in the line, and the first tick past it
+    /// ends it — not left until the list closes, as cpd-102 was.
+    #[test]
+    fn a_check_seat_typed_to_after_its_exit_is_kept_until_a_set_time_and_then_ended_by_the_tick() {
+        let (_env, store, mut f) = three_exits("exit-check-typed");
+        f.typed.insert("cpd-3".into(), true);
+        exited(&store, "cpd-3", "run barrier 1", "check");
+        tick(&store, &f);
+        assert_eq!(checks_ended(), 0, "kept for whoever is using it");
+        let log = || std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        assert_eq!(log().matches("so it is kept for whoever is using it until").count(), 1, "{}", log());
+        crate::cycle::checks_finished(&store, &f);
+        assert!(crate::cycle::end_checks_when_idle(&store, "run", 1).is_empty());
+        tick(&store, &f);
+        assert_eq!(checks_ended(), 0, "not before its time, by its exit's ending or the older ones");
+        assert_eq!(log().matches("so it is kept for whoever is using it until").count(), 1, "said once");
+
+        // Its time comes: the exit was accepted CHECK_KEPT_SECS ago and more.
+        let mut all = read_exits(&store);
+        let e = all.get_mut("cpd-3").unwrap();
+        e["at"] = serde_json::json!(util::epoch_secs() - CHECK_KEPT_SECS - 1);
+        e["until"] = serde_json::json!(util::epoch_secs() - 1);
+        write_exits(&store, &all);
+        let f = f.with("cpd-3", State::Working);
+        tick(&store, &f);
+        assert_eq!(checks_ended(), 0, "never mid-turn, even past its time");
+        let f = f.with("cpd-3", State::Idle);
+        tick(&store, &f);
+        assert_eq!(checks_ended(), 1, "ended by the first tick past its time");
+        assert_eq!(check_ending(&store), crate::barrier::Ending::Ended);
+        assert!(exit_owns(&store).is_empty());
+        assert!(log().lines().any(|l| l.contains(EXIT_ENDED) && l.contains("(check, cpd-3), kept until")), "{}", log());
     }
 
     #[test]

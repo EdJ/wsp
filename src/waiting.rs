@@ -623,13 +623,21 @@ impl Asks {
 ///   (`wsp-530` sat on one with no process in its tree at all). One
 ///   [`crate::stuck`] names as waiting on itself — an `until … pgrep -f` loop
 ///   that matches its own line — never ends by itself and never counts.
-/// - **Not quiet for [`QUIET`].** Work that has used no CPU for a minute
-///   (blocked on a lock, a hung test) stops holding the seat, and the wait
-///   shows `quiet` from [`SHOWN`] on. CPU is read as the tree's total cputime
-///   against the last reading, kept in `shell-cpu.json` in the state dir.
+/// - **Held until it ends, once it has been seen working** (`compound-react-041`).
+///   A shell read with work under it is remembered by its pid and start, and
+///   holds the seat on every later pass while that process lives: when only a
+///   watcher is under it for a moment (a poll loop between its calls), and
+///   when its work uses no CPU (blocked on cargo's build lock, on a server, on
+///   a sandbox). The rule this replaced released the hold after a minute with
+///   no CPU, and `compound-react-024` lost a 32-minute attempt to it: held at
+///   21:56:42, told at 21:57:42 with its `sh` still running, ended ten minutes
+///   later with seven uncommitted paths. A hung test now holds the seat until
+///   [`LEFT_RUNNING`]; the wait shows `quiet` from [`SHOWN`] on, so a person
+///   sees it. CPU is read as the tree's total cputime against the last
+///   reading, kept with the held shells in `shell-cpu.json` in the state dir.
 ///
-/// The seat that stops counting reads idle on that tick, and the normal path
-/// applies: told to finish, then ended and reseated.
+/// The seat whose shells have all ended reads idle on that pass, and the normal
+/// path applies: told to finish, then ended and reseated.
 ///
 /// A backend that cannot name a root, and a far machine whose process table
 /// is not this one, read as no shells: the seat is idle as before.
@@ -658,10 +666,6 @@ const SETTLED: i64 = 5;
 /// How long a shell may run and still be waited on, in seconds. See [`Shells`].
 const LEFT_RUNNING: i64 = 60 * 60;
 
-/// How long the work under a shell may use no CPU and still hold the seat, in
-/// seconds. See [`Shells`].
-pub(crate) const QUIET: i64 = 60;
-
 /// From how quiet the wait says so, in seconds.
 const SHOWN: i64 = 10;
 
@@ -684,7 +688,14 @@ const WATCHERS: [&str; 20] = [
 pub(crate) struct Memory {
     /// seat → (cpu ms, when it last changed, when it was last read).
     by_seat: BTreeMap<String, (i64, i64, i64)>,
+    /// seat → the shells it was last held on: (pid, when it started, the work
+    /// seen under it). A shell here holds until it ends (`compound-react-041`).
+    held: BTreeMap<String, Vec<(u32, i64, String)>>,
 }
+
+/// How far two readings of one shell's start may differ, in seconds: `etime`
+/// and the clock are each whole seconds.
+const SAME_START: i64 = 2;
 
 impl Memory {
     fn path() -> std::path::PathBuf {
@@ -698,20 +709,48 @@ impl Memory {
     fn load() -> Memory {
         let read = std::fs::read_to_string(Memory::path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
         let Some(serde_json::Value::Object(map)) = read else { return Memory::default() };
-        let by_seat = map
-            .into_iter()
-            .filter_map(|(seat, v)| {
-                let a = v.as_array()?;
-                Some((seat, (a.first()?.as_i64()?, a.get(1)?.as_i64()?, a.get(2)?.as_i64()?)))
-            })
-            .collect();
-        Memory { by_seat }
+        let mut memory = Memory::default();
+        for (seat, v) in map {
+            let Some(a) = v.as_array() else { continue };
+            let (Some(c), Some(ch), Some(seen)) =
+                (a.first().and_then(|v| v.as_i64()), a.get(1).and_then(|v| v.as_i64()), a.get(2).and_then(|v| v.as_i64()))
+            else {
+                continue;
+            };
+            // The fourth field is the held shells; a file from before it has none.
+            let held: Vec<(u32, i64, String)> = a
+                .get(3)
+                .and_then(|v| v.as_array())
+                .map(|hs| {
+                    hs.iter()
+                        .filter_map(|h| {
+                            let h = h.as_array()?;
+                            Some((h.first()?.as_u64()? as u32, h.get(1)?.as_i64()?, h.get(2)?.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !held.is_empty() {
+                memory.held.insert(seat.clone(), held);
+            }
+            memory.by_seat.insert(seat, (c, ch, seen));
+        }
+        memory
     }
 
     fn save(&mut self, now: i64) {
         self.by_seat.retain(|_, (_, _, seen)| now - *seen < 600);
-        let map: serde_json::Map<String, serde_json::Value> =
-            self.by_seat.iter().map(|(k, (c, ch, seen))| (k.clone(), serde_json::json!([c, ch, seen]))).collect();
+        let by_seat = &self.by_seat;
+        self.held.retain(|seat, _| by_seat.contains_key(seat));
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .by_seat
+            .iter()
+            .map(|(k, (c, ch, seen))| {
+                let held: Vec<serde_json::Value> =
+                    self.held.get(k).into_iter().flatten().map(|(pid, start, work)| serde_json::json!([pid, start, work])).collect();
+                (k.clone(), serde_json::json!([c, ch, seen, held]))
+            })
+            .collect();
         let path = Memory::path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -730,6 +769,16 @@ impl Memory {
         };
         self.by_seat.insert(seat.to_string(), (cpu, since, now));
         now - since
+    }
+
+    /// The work this seat was held on under the shell `pid` that started at
+    /// `start`, when it was held on that shell at the last reading.
+    fn was_held(&self, seat: &str, pid: u32, start: i64) -> Option<&str> {
+        self.held
+            .get(seat)?
+            .iter()
+            .find(|(p, s, _)| *p == pid && (s - start).abs() <= SAME_START)
+            .map(|(_, _, work)| work.as_str())
     }
 }
 
@@ -809,6 +858,7 @@ impl Shells {
             let tree = below(*root);
             let mine: Vec<&Row> = rows.iter().filter(|r| r.pid != *root && tree.contains(&r.pid)).collect();
             let (mut n, mut age, mut cpu, mut work) = (0, 0, 0, String::new());
+            let mut holding: Vec<(u32, i64, String)> = Vec::new();
             for sh in mine.iter().filter(|r| r.shell && !shell.contains(&r.ppid)).filter(|r| (SETTLED..LEFT_RUNNING).contains(&r.age)) {
                 // A pgrep guard that matches itself ends only when the tool's
                 // limit ends it: it holds nothing (`stuck::waits_on_itself_line`, passed in: `waiting` sits below `stuck`).
@@ -818,24 +868,31 @@ impl Shells {
                 let under = below(sh.pid);
                 let doing: Vec<&&Row> = mine.iter().filter(|r| r.pid != sh.pid && under.contains(&r.pid) && !r.shell).collect();
                 let works: Vec<&&&Row> = doing.iter().filter(|r| !is_watcher(&r.command)).collect();
-                if works.is_empty() {
-                    continue;
-                }
+                // Seen working once, it holds until it ends (`compound-react-041`):
+                // a watcher alone under it now is a poll between its calls.
+                let start = now - sh.age;
+                let named = match (works.first(), memory.was_held(seat, sh.pid, start)) {
+                    (Some(w), _) => name_of_work(&w.command),
+                    (None, Some(before)) => before.to_string(),
+                    (None, None) => continue,
+                };
                 n += 1;
                 age = age.max(sh.age);
                 cpu += doing.iter().map(|r| r.cpu).sum::<i64>();
                 if work.is_empty() {
-                    work = name_of_work(&works[0].command);
+                    work = named.clone();
                 }
+                holding.push((sh.pid, start, named));
             }
             if n == 0 {
                 memory.by_seat.remove(seat);
+                memory.held.remove(seat);
                 continue;
             }
+            // Quiet is said, and holds as long as busy (`compound-react-041`).
             let quiet = memory.quiet(seat, cpu, now);
-            if quiet < QUIET {
-                by_seat.insert(seat.clone(), Own { n, work, age, quiet });
-            }
+            memory.held.insert(seat.clone(), holding);
+            by_seat.insert(seat.clone(), Own { n, work, age, quiet });
         }
         Shells { by_seat }
     }
@@ -1481,8 +1538,12 @@ mod tests {
         assert!(held(&seat_with("cargo nextest run", ""), 1040, &mut memory).is_none());
     }
 
+    /// `compound-react-041`: the hold on `compound-react-024`'s seat lapsed a
+    /// minute after it was written, with its `sh` still running, and the seat
+    /// was told and then ended. **Work with no CPU is said as quiet and holds
+    /// until the shell ends**, on a fake clock, however long it is quiet.
     #[test]
-    fn work_that_has_used_no_cpu_for_a_minute_reads_idle_and_says_quiet_before_it() {
+    fn work_that_has_used_no_cpu_says_quiet_and_holds_until_its_shell_ends() {
         let mut memory = Memory::default();
         let table = seat_with("cargo test", "  202   201    05:00  2:00.00 cargo test\n");
         let first = held(&table, 1000, &mut memory).expect("just seen");
@@ -1491,12 +1552,49 @@ mod tests {
         assert_eq!(w.word(), "waiting · itself · quiet 45s");
         assert_eq!(w.reason(), "waiting on itself: cargo test (2m, quiet 45s)");
         assert!(w.owed() == false);
-        assert!(held(&table, 1060, &mut memory).is_none(), "a minute with no CPU");
-        assert!(held(&table, 1080, &mut memory).is_none(), "and it stays idle while quiet");
-        // It wakes up: held again, and the clock starts over.
+        for now in (1060..=1000 + 30 * 60).step_by(60) {
+            let w = held(&table, now, &mut memory).unwrap_or_else(|| panic!("the shell still runs at +{}s: held", now - 1000));
+            assert_eq!(w.own.map(|o| o.quiet), Some(now - 1000), "and says how long it has been quiet");
+        }
+        // It wakes up: still held, and the quiet clock starts over.
         let woke = table.replace("2:00.00", "2:00.40");
-        let w = held(&woke, 1100, &mut memory).expect("CPU used");
+        let w = held(&woke, 1000 + 31 * 60, &mut memory).expect("CPU used");
         assert_eq!(w.own.map(|o| o.quiet), Some(0));
+        // The shell ends: the next pass reads idle.
+        let gone = "  100     1    01:00:00  0:01.00 compound-sup\n  200   100    59:00     0:30.00 claude\n";
+        assert!(held(gone, 1000 + 32 * 60, &mut memory).is_none(), "no shell, no hold");
+    }
+
+    /// `compound-react-041`: a shell seen working holds while only a watcher is
+    /// under it — the `sleep` between a poll loop's calls — and a new shell of
+    /// the same command, or the same pid started again, has to be seen working
+    /// first.
+    #[test]
+    fn a_shell_seen_working_holds_while_only_a_watcher_is_under_it_until_it_ends() {
+        let mut memory = Memory::default();
+        let loop_ = "while ! cargo build; do sleep 5; done";
+        let building = seat_with(loop_, "  202   201    01:00  0:40.00 cargo build\n");
+        assert!(held(&building, 1000, &mut memory).is_some());
+        let sleeping = seat_with(loop_, "  203   201    00:02  0:00.00 sleep 5\n").replace("02:00  0:00.10 /bin/zsh", "02:30  0:00.10 /bin/zsh");
+        let w = held(&sleeping, 1030, &mut memory).expect("seen working: a sleep between its calls holds");
+        assert_eq!(w.own.map(|o| o.work), Some("cargo build".to_string()), "named by the work it was seen doing");
+        // Never seen working: a fresh memory, the same sleeping table.
+        assert!(held(&sleeping, 1030, &mut Memory::default()).is_none(), "a dead wait, as before");
+        // The pid came back as another shell (started later): not the one held.
+        let reused = sleeping.replace("02:30  0:00.10 /bin/zsh", "00:20  0:00.10 /bin/zsh");
+        assert!(held(&reused, 1060, &mut memory).is_none(), "another shell under the same pid");
+    }
+
+    #[test]
+    fn the_held_shells_survive_the_file_they_are_kept_in() {
+        let _env = util::isolated("waiting-held-file");
+        let mut memory = Memory::default();
+        let building = seat_with("make", "  202   201    01:00  0:40.00 make\n");
+        assert!(held(&building, 1000, &mut memory).is_some());
+        memory.save(1000);
+        let mut loaded = Memory::load();
+        let sleeping = seat_with("make", "  203   201    00:02  0:00.00 sleep 5\n").replace("02:00  0:00.10", "02:10  0:00.10");
+        assert!(held(&sleeping, 1010, &mut loaded).is_some(), "the daemon's next pass is another process");
     }
 
     #[test]

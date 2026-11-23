@@ -1279,6 +1279,23 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         // the seat is ended, because ending it throws the verdict away.
         let ended = state == State::Gone;
         let second = already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs());
+        // **Uncommitted work in its tree is asked about, not ended**
+        // (`compound-react-041`): `compound-react-024`'s first seat was ended
+        // here with seven uncommitted paths, 32 minutes of an attempt, and
+        // nobody was asked. Ending throws away the context the paths were made
+        // in, and a review cannot be typed over them; the run holds the seat
+        // and asks once per spell (the one ask: the close below would flag the
+        // same tree a second time). Asked of the person, the ask is a question
+        // the seat waits on, held above like any other until it is answered;
+        // asked of a governor, it is a line, and the seat is ended on the
+        // first tick its tree is clean. A seat that is `Gone` has no context
+        // left to keep.
+        if second && !ended {
+            if let Some((n, tree)) = uncommitted_tree(store, &t.id) {
+                ask_before_ending(store, w, at, &t.id, &seat, n, &tree);
+                continue;
+            }
+        }
         if ended || second {
             let idle = already.map(|since| (util::epoch_secs() - since + STALLED_AFTER) / 60).unwrap_or(0);
             let why = if ended { crate::closing::Why::Ended } else { crate::closing::Why::Idle(idle) };
@@ -1349,6 +1366,73 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
              has been told to finish, land and review, or say what is left. `wsp show {}` has its row.",
             id, w.id, id
         ));
+    }
+}
+
+/// The marker in a member's `## Log` for an idle member past its window that
+/// was not ended because its tree has uncommitted work (`compound-react-041`).
+const DIRTY_HELD: &str = "wsp: idle past its window with uncommitted work in its tree — not ended";
+
+/// The uncommitted paths in a member's own tree, and the tree, contracted —
+/// `None` when it is clean or not the member's own (`.worktrees/<id>`, as
+/// [`crate::cycle::despawn`] reads it: a tree named otherwise is somebody
+/// else's to answer for).
+fn uncommitted_tree(store: &Store, id: &str) -> Option<(usize, String)> {
+    let cwd = store.claims().get(id)?.get("cwd")?.as_str().map(util::expand)?;
+    let dir = std::path::Path::new(&cwd);
+    if dir.file_name().and_then(|n| n.to_str()) != Some(id) {
+        return None;
+    }
+    let n = crate::cmd_checkout::uncommitted(dir);
+    (n > 0).then(|| (n, util::contract(dir)))
+}
+
+/// An idle member past its window, its tree holding `n` uncommitted paths: not
+/// ended, and asked about once per spell (since its last start, wait or tell) —
+/// to the list's governor when one is seated, else to the person.
+fn ask_before_ending(store: &Store, w: &Worklist, at: usize, id: &str, seat: &str, n: usize, tree: &str) {
+    use crate::message::{self, About, Kind, Message, Party, Waiting};
+    let wrote = store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        let mut asked = false;
+        for l in t.section("Log").unwrap_or_default().lines() {
+            if fresh_start(l) || l.contains(WAITING) || l.contains(NOTICED) {
+                asked = false;
+            } else if l.contains(DIRTY_HELD) {
+                asked = true;
+            }
+        }
+        if asked {
+            return false;
+        }
+        t.log(&format!("{DIRTY_HELD} ({n} path(s) in {tree}); asked first"));
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
+    if !wrote {
+        return;
+    }
+    let governor = crate::cycle::governor_seated(store, w);
+    let to = if governor { "the governor" } else { "the person" };
+    stamp(store, &format!(
+        "{} group {at}: {id} ({seat}) was told to finish and still reads idle, with {n} uncommitted path(s) in {tree} — not ending it; asked {to} first",
+        w.id
+    ));
+    let text = format!(
+        "{id} ({seat}) in the {} run was told to finish and still reads idle, and its tree {tree} has {n} uncommitted path(s). \
+         The run does not end it while they stand. `wsp despawn {id}` ends it (the tree is kept for the next start), \
+         `wsp tell {id} \"…\"` reaches it, `wsp peek {id}` shows its screen.",
+        w.id
+    );
+    if governor {
+        crate::cycle::tell(store, w, &text);
+        return;
+    }
+    let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new(seat, id))
+        .about(About::Task(id.to_string()))
+        .for_the_person();
+    if let Err(e) = message::raise(store, &q) {
+        stamp(store, &format!("{} group {at}: {id}'s uncommitted work could not be raised to the person: {e}", w.id));
     }
 }
 
@@ -4128,6 +4212,97 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
         assert_eq!(member_told().len(), 1, "now it is told, and not ended on any earlier mark");
         assert!(ended().is_empty());
+    }
+
+    /// Every stamp in a member's `## Log` set to long ago: the fake clock that
+    /// puts every window the repair reads behind it.
+    fn age_the_log(store: &Store, id: &str) {
+        let mut t = store.find_task(id).unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let aged: Vec<String> =
+            log.lines()
+                .map(|l| match l.strip_prefix("- ").and_then(|r| r.split_once(' ')) {
+                    Some((_, rest)) => format!("- 2026-01-01T00:00:00Z {rest}"),
+                    None => l.to_string(),
+                })
+                .collect();
+        crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+        store.save_task(&t).unwrap();
+    }
+
+    /// `compound-react-041`, as a test: `compound-react-024`'s seat was held on
+    /// its own shell at 21:56:42 and told "finish, land and review" at 21:57:42
+    /// with the shell still running. **While the seat has a shell of its own,
+    /// no tick tells it or ends it, however far the clock moves**, and the
+    /// hold's `cycle.log` line is never followed by "telling it" for the seat.
+    #[test]
+    fn a_member_waiting_on_its_own_shell_is_not_told_or_ended_on_any_later_tick() {
+        let (_env, store) = in_flight("shell-held-long");
+        let waiting = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1", "⏺ The test run wakes me when it ends.");
+        for _ in 0..6 {
+            tick(&store, &waiting, &mut Pass::new());
+            age_the_log(&store, "m-1");
+        }
+        assert!(member_told().is_empty(), "never told while its shell runs");
+        assert!(ended().is_empty(), "never ended while its shell runs");
+        let said = stamped();
+        let hold = said.iter().position(|l| l.contains("not told and not ended")).expect("the hold is said");
+        assert!(!said[hold..].iter().any(|l| l.contains("telling it") || l.contains("ending it")), "{said:?}");
+        assert!(!row_log(&store, "m-1").contains(NOTICED), "{}", row_log(&store, "m-1"));
+    }
+
+    /// `compound-react-041`: the shell has ended and the seat is idle. **It is
+    /// told, ended only a window ([`STALLED_AFTER`]) after the tell — and a tree
+    /// with uncommitted paths blocks the end and asks first**, once, until the
+    /// tree is clean.
+    #[test]
+    fn a_member_whose_shell_ended_is_told_then_ended_after_the_window_unless_its_tree_is_uncommitted() {
+        let (env, store) = in_flight("shell-ended");
+        let tree = env.path("m-1");
+        std::fs::create_dir_all(&tree).unwrap();
+        git_in(&tree, &["init", "--quiet", "-b", "m-1"]);
+        git_in(&tree, &["commit", "--quiet", "--allow-empty", "-m", "start"]);
+        store.set_claim("m-1", serde_json::json!({ "workspace": "cpd-1", "cwd": tree.display().to_string() }));
+        let waiting = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1", "");
+        tick(&store, &waiting, &mut Pass::new());
+        age_the_log(&store, "m-1");
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+
+        // The shell ends: told, and not ended inside the window.
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "told once its shell has ended");
+        tick(&store, &idle, &mut Pass::new());
+        assert!(ended().is_empty(), "not ended inside the window");
+
+        // Past the window, with seven uncommitted paths: asked, not ended.
+        for i in 0..7 {
+            std::fs::write(tree.join(format!("probe-{i}.rs")), "fn probe() {}\n").unwrap();
+        }
+        age_the_notice(&store, "m-1");
+        for _ in 0..3 {
+            tick(&store, &idle, &mut Pass::new());
+        }
+        assert!(ended().is_empty(), "uncommitted work blocks the end");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "and the row is not put back");
+        let raised = raised_texts(&store);
+        assert_eq!(raised.len(), 1, "asked once, of the person (no governor is seated): {raised:?}");
+        assert!(raised[0].contains("7 uncommitted path(s)") && raised[0].contains("does not end it"), "{}", raised[0]);
+        assert!(stamped().iter().any(|l| l.contains("not ending it; asked the person first")), "{:?}", stamped());
+
+        // The ask is a question the seat waits on: held, with no ceiling, until
+        // it is answered — then told afresh, and ended a window later once its
+        // tree is clean, as before.
+        let q = crate::message::raised(&store).into_iter().find(|m| m.text.contains("does not end it")).unwrap();
+        assert_eq!(crate::cmd_message::answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "commit them, then end it"], &[])), 0);
+        git_in(&tree, &["add", "."]);
+        git_in(&tree, &["commit", "--quiet", "-m", "the probes"]);
+        let _ = member_told();
+        tick(&store, &idle, &mut Pass::new());
+        assert!(ended().is_empty(), "the wait clears the told-mark: told again first");
+        age_the_notice(&store, "m-1");
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(ended(), vec!["m-1".to_string()], "a clean tree past the window is ended: {:?}", stamped());
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
     }
 
     /// `wsp-581`: agent-029 started its release verify, ended its turn on "What
