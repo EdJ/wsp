@@ -848,6 +848,15 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             eprintln!("wsp daemon: renewed {renewed} claim(s)");
         }
 
+        // A claim whose lease has run out is released as `despawn --lost`
+        // releases one, and its row goes back to todo (wsp-411). After the
+        // renewal above, so a holder that is alive has been moved past it.
+        wsp_base::calls::phase("claims-expire");
+        let released = release_lapsed_claims(store, now);
+        if verbose && released > 0 {
+            eprintln!("wsp daemon: released {released} expired claim(s)");
+        }
+
         // The CPU burners standing in no tree, for `wsp wip`'s load warning
         // (wsp-691), read here so `wip` itself runs no `ps` (wsp-716).
         wsp_base::calls::phase("burners");
@@ -917,6 +926,50 @@ fn renew_claims(store: &Store, now: i64, census: impl FnOnce() -> Option<crate::
         }
     }
     renewed
+}
+
+/// The expiry pass (wsp-411): every claim whose `expires` is before `now` is
+/// let go of through [`crate::cmd_spawn::release_lost`], the way `wsp despawn
+/// <row> --lost` lets go of one: the row goes back to todo with one line in its
+/// `## Log` saying why, what its seat asked is closed, and its worktree stays as
+/// the next holder's start. The row's governor is told once; the claim is gone
+/// afterwards, so the next tick finds nothing to say it about.
+///
+/// A record with no `expires`, and every claim under `WSP_CLAIM_TTL=off`, never
+/// lapses. Returns how many claims were released.
+fn release_lapsed_claims(store: &Store, now: i64) -> usize {
+    let Some(ttl) = wsp_store::store::claim_ttl() else { return 0 };
+    let lapsed: Vec<(String, i64, i64, String)> = store
+        .claims()
+        .iter()
+        .filter_map(|(task, rec)| {
+            let at = wsp_store::store::record_expires(rec).filter(|at| *at < now)?;
+            let lease = rec.get("ttl_s").and_then(|t| t.as_i64()).filter(|t| *t > 0).unwrap_or(ttl);
+            Some((task.clone(), at, lease, claim_seat_id(rec).unwrap_or("").to_string()))
+        })
+        .collect();
+    let mut released = 0;
+    for (task, at, lease, seat) in lapsed {
+        let seat = match seat.is_empty() {
+            true => store.panes_for_task(&task).first().cloned().unwrap_or_else(|| "no seat".into()),
+            false => seat,
+        };
+        let machine = crate::place_compound::seat_machine(store, &seat);
+        let on = if machine.is_empty() { "this machine" } else { machine.as_str() };
+        let why = format!("claim expired: held by {seat} on {on}, last renewed {}", crate::util::iso_at(at - lease));
+        match crate::cmd_spawn::release_lost(store, &task, &why) {
+            Ok(_) => {
+                released += 1;
+                crate::verification::tell_governor(
+                    store,
+                    &task,
+                    &format!("{task}: {why}. It is released and back to todo; the last checkpoint is in the seat's worktree."),
+                );
+            }
+            Err(e) => wsp_store::store::log_line(store, &format!("claim expiry: {task}: {e}")),
+        }
+    }
+    released
 }
 
 /// One sample of every seated agent's resident memory into
@@ -1073,6 +1126,72 @@ mod tests {
         store.set_claim("t-local", serde_json::json!({ "workspace_id": "cpd-here", "expires": iso(about_to_end) }));
         assert_eq!(renew_claims(&store, now, || None), 0, "the far seat was renewed above, the local one cannot be seen");
         assert_eq!(expires("t-local"), about_to_end);
+    }
+
+    /// wsp-411: a far seat's claim whose `expires` is past is released on the next
+    /// pass: the row is todo with one line saying why, `claims.json` no longer holds
+    /// it, the machine's notes name the far copy, and the governor is told once and
+    /// not again on the ticks after. Under `WSP_CLAIM_TTL=off` nothing is released.
+    #[test]
+    fn a_claim_whose_lease_ran_out_is_released_and_its_row_goes_back_to_todo() {
+        use wsp_store::model::{Group, Machine, Task, Worklist, WorklistStatus};
+
+        let _env = crate::util::isolated("claim-expire");
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let now = crate::util::epoch_secs();
+        let iso = |s: i64| crate::util::iso_at(s);
+
+        let mut m = Machine::new("mb3", "mb3");
+        m.exec_dir = "/far/exec".into();
+        store.save_machine(&m).unwrap();
+        let dir = store.state.join("compound-seats").join("cpd-far");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seat.json"), serde_json::json!({ "machine": "mb3" }).to_string()).unwrap();
+
+        // Two rows on one running list: `t-lapsed` expired an hour ago, `t-live` has a day left.
+        for id in ["t-lapsed", "t-live"] {
+            let mut t = Task::new(id, id);
+            t.status_raw = "doing".into();
+            store.save_task(&t).unwrap();
+        }
+        let mut w = Worklist::new("run", "run");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[Group { members: vec!["t-lapsed".into(), "t-live".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        store.set_binding("cpd-far", serde_json::json!({ "task_id": "t-lapsed", "pane_id": "cpd-far" }));
+        store.set_claim("t-lapsed", serde_json::json!({ "workspace_id": "cpd-far", "expires": iso(now - 3600), "ttl_s": 7 * 86_400 }));
+        store.set_claim("t-live", serde_json::json!({ "workspace_id": "cpd-far", "expires": iso(now + 86_400) }));
+        store.set_claim("t-old", serde_json::json!({ "workspace_id": "cpd-far" }));
+
+        // Off: nothing is released, however late.
+        std::env::set_var("WSP_CLAIM_TTL", "off");
+        crate::cycle::tests::TOLD.with(|t| t.borrow_mut().clear());
+        assert_eq!(release_lapsed_claims(&store, now), 0);
+        std::env::remove_var("WSP_CLAIM_TTL");
+        assert!(store.claims().contains_key("t-lapsed"), "WSP_CLAIM_TTL=off releases nothing");
+        assert!(crate::cycle::tests::TOLD.with(|t| t.borrow().is_empty()));
+
+        assert_eq!(release_lapsed_claims(&store, now), 1);
+        assert!(!store.claims().contains_key("t-lapsed"), "the claim is gone from claims.json");
+        assert!(store.claims().contains_key("t-live") && store.claims().contains_key("t-old"), "the others stand");
+        assert!(store.bindings().get("cpd-far").is_none(), "the binding went with it");
+        let row = store.task("t-lapsed").unwrap();
+        assert_eq!(row.status(), crate::model::Status::Todo);
+        let log = row.section("Log").unwrap_or_default();
+        let lines: Vec<&str> = log.lines().filter(|l| l.contains("claim expired")).collect();
+        assert_eq!(lines.len(), 1, "one line in the log: {log}");
+        assert!(lines[0].contains("held by cpd-far on mb3, last renewed "), "{}", lines[0]);
+        assert!(store.machine("mb3").unwrap().body.contains("/far/exec/trees/t-lapsed"), "the far copy is named");
+
+        let told = crate::cycle::tests::TOLD.with(|t| t.borrow().clone());
+        assert_eq!(told.len(), 1, "the governor is told once: {told:?}");
+        assert!(told[0].contains("t-lapsed") && told[0].contains("claim expired"), "{told:?}");
+        for tick in 1..5 {
+            assert_eq!(release_lapsed_claims(&store, now + tick * 30), 0);
+        }
+        assert_eq!(crate::cycle::tests::TOLD.with(|t| t.borrow().len()), 1, "not once per tick");
     }
 
     /// The marker a crash leaves behind must never be the reason a machine has

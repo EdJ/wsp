@@ -1143,7 +1143,7 @@ fn set_owed(store: &Store, member: &str, owed: Option<&str>, by: &str) {
 }
 
 /// Tell whoever governs the list a row is on; nothing for a row on no list.
-fn tell_governor(store: &Store, member: &str, text: &str) {
+pub(crate) fn tell_governor(store: &Store, member: &str, text: &str) {
     if let Some(w) = store.find_task(member).and_then(|t| crate::cycle::list_of(store, &t)) {
         crate::cycle::tell(store, &w, text);
     }

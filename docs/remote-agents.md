@@ -185,8 +185,13 @@ applies.
    hash changed) while connected, so the loss is at most one turn's work.
 2. The agent's conversation. Its transcript is on the far machine. A replacement
    agent starts from the brief, the task log and the last checkpoint on the seat.
-3. Time: the claim sits held and `unreachable` until a person acts. Nothing is
-   released automatically, by design. The person's two verbs, both new:
+3. Time: the claim sits held and `unreachable` until its lease runs out. A claim
+   carries an expiry (`WSP_CLAIM_TTL`, 7 days by default), a live holder's daemon
+   renews it, and a silent one's is not: once it has passed, the daemon releases
+   the claim after its TTL (v1, mp-v1) exactly as `wsp despawn <row> --lost` does
+   — the row goes back to todo, one line in its `## Log` says why, and the row's
+   governor is told once. `WSP_CLAIM_TTL=off` turns that off and leaves the claim
+   held until a person acts. The person's two verbs are kept for doing it sooner:
    `wsp machine retire <m>`, which says the machine is not coming back and lists
    every row held on it, and `wsp despawn <row> --lost`, which releases the
    claim, returns the row to todo, and leaves the last checkpoint in the seat's

@@ -3565,7 +3565,7 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
     // nothing behind that says where it had been.
     let where_held = store.claims().get(&t.id).map(|c| claim_where(c));
     if where_held.is_some() {
-        end_claim(store, &t.id);
+        end_claim(store, &t.id, "release");
     }
     if !panes.is_empty() || where_held.is_some() {
         // The legs a row staged start now, as `leg done` and `review` start
@@ -3620,12 +3620,12 @@ pub(crate) fn claim_where(claim: &serde_json::Value) -> String {
 /// Shared by both forms of `release`, which differ only in how they find the
 /// task: a released claim has to leave the same record whichever end it was
 /// asked for.
-fn end_claim(store: &Store, task_id: &str) {
+fn end_claim(store: &Store, task_id: &str, reason: &str) {
     // Releasing is a decision, so it clears the durable claim too — unlike a
     // pane exiting, which is only ever an accident of process lifetime and must
     // leave the intent standing. It ends the same way a migration does, and
     // leaves the same record behind.
-    hand_off(store, task_id, None, "release");
+    hand_off(store, task_id, None, reason);
     // `hand_off` writes the release into the task's log, and until commits were
     // scoped to what a command wrote, that line waited for some later command
     // to sweep it up — under that command's message. It belongs to this one.
@@ -3652,6 +3652,13 @@ pub(crate) fn claim_elsewhere(store: &Store, row: &str, pane: &str) -> Option<(S
 /// rather than a second copy of it. Returns whether there was a binding, and the
 /// task whose claim was ended.
 pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) {
+    release_pane_because(store, pane, "release")
+}
+
+/// [`release_pane`] with the reason the row's `## Log` line carries: `release`
+/// says nothing more than "released", anything else is the line's ` · why`
+/// (`wsp-411`'s lapsed claim and `despawn --lost` give theirs).
+pub(crate) fn release_pane_because(store: &Store, pane: &str, reason: &str) -> (bool, Option<String>) {
     let had = store.bindings().get(pane).cloned();
     let mut released: Option<String> = None;
     // **A seat that does not hold the row's claim never releases it**
@@ -3671,7 +3678,7 @@ pub(crate) fn release_pane(store: &Store, pane: &str) -> (bool, Option<String>) 
     if removed {
         if let Some(task_id) = had.as_ref().and_then(|b| b.get("task_id")).and_then(|t| t.as_str()) {
             released = Some(task_id.to_string());
-            end_claim(store, task_id);
+            end_claim(store, task_id, reason);
         }
     }
     (removed, released)

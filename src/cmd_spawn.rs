@@ -5014,18 +5014,119 @@ pub fn despawn(store: &Store, args: &Args) -> i32 {
 /// `wsp despawn` that does it; "lost" is a claim about a machine, and a verb
 /// that let it be made of one that is answering would release live work.
 fn despawn_lost(store: &Store, args: &Args) -> i32 {
+    let p = Paint::new();
     let index = Index::new(store.projects());
-    let seat = match seat_of(store, args, &index, None) {
-        Ok((seat, _)) => seat,
+    let (seat, task) = match seat_of(store, args, &index, None) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("wsp: {e}");
             return 2;
         }
     };
-    // A far seat was told by its `@machine` suffix, which only backend wrote; no
-    // seat carries one now, so every seat is this one's.
-    eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
-    2
+    // A far seat is the one whose record names a machine (`place_compound`).
+    let machine = crate::place_compound::seat_machine(store, seat.as_str());
+    if machine.is_empty() {
+        eprintln!("wsp: {seat} is on this seat, not on a machine that is gone — `wsp despawn` ends it; --lost is for a far seat");
+        return 2;
+    }
+    let why = format!("lost with {machine} (seat {seat}) — the last checkpoint is in the seat's worktree");
+    let lost = match &task {
+        Some(row) => match release_lost(store, row, &why) {
+            Ok(lost) => Some(lost),
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                return 1;
+            }
+        },
+        // A seat bound to no row: its record and what it asked go, and nothing else.
+        None => {
+            let _ = cmd_agent::release_pane(store, seat.as_str());
+            crate::lapse::seat_ended(store, seat.as_str());
+            store.git_commit(&format!("wsp: despawn --lost {seat}"));
+            None
+        }
+    };
+    let far = lost.as_ref().and_then(|l| l.far.clone());
+    if args.json() {
+        println!("{}", json!({ "seat": seat.as_str(), "machine": machine, "task": task, "far_copy": far, "tree": "kept" }));
+    } else {
+        match &task {
+            Some(t) => println!("  {}", p.dim(&format!("released {t} — back to todo; its worktree on the seat is kept as it was"))),
+            None => println!("  {}", p.dim("it was holding nothing")),
+        }
+        if let Some(at) = far {
+            println!("  {}", p.dim(&format!("{machine}'s copy ({at}) is named in its notes, and is not read")));
+        }
+    }
+    0
+}
+
+/// What [`release_lost`] let go of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Lost {
+    /// The seat that held the row's claim.
+    pub seat: String,
+    /// The machine that seat is on; empty for a seat on this one.
+    pub machine: String,
+    /// Where the far copy of the row's tree is, when the machine's notes now name it.
+    pub far: Option<String>,
+}
+
+/// Let go of the claim on `row` without asking its seat anything: the claim and
+/// the seat's binding go, the row returns to todo with `why` as the line in its
+/// `## Log`, what the seat asked is closed, and the seat's worktree is left
+/// exactly as it is, the starting point of whoever takes the row next. If the
+/// seat is on a machine, that machine's notes name the far copy, which is never
+/// read.
+///
+/// The one body of `wsp despawn <row> --lost` and of the daemon's lapsed-claim
+/// pass (`wsp-411`). It takes no `Args` and does not judge whether the seat
+/// is lost: the verb refuses a local seat and the pass only reaches a claim
+/// whose lease has run out.
+pub(crate) fn release_lost(store: &Store, row: &str, why: &str) -> Result<Lost, String> {
+    let claim = store.claims().get(row).cloned();
+    let seat = store
+        .panes_for_task(row)
+        .first()
+        .cloned()
+        .or_else(|| claim.as_ref().and_then(|c| ["workspace_id", "workspace", "workspace_label"].iter().find_map(|k| c.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from))))
+        .ok_or_else(|| format!("nothing holds {row}"))?;
+    let machine = crate::place_compound::seat_machine(store, &seat);
+    cmd_agent::release_pane_because(store, &seat, why);
+    // A claim no binding stood for — what a backend restart leaves — is still a claim.
+    if store.claims().contains_key(row) {
+        cmd_agent::hand_off(store, row, None, why);
+    }
+    crate::lapse::seat_ended(store, &seat);
+    let _ = std::fs::remove_file(brief_path(store, row));
+    if let Some(mut t) = store.task(row) {
+        if t.status() == crate::model::Status::Doing {
+            t.set_status(crate::model::Status::Todo);
+            t.touch();
+            let _ = store.save_task(&t);
+        }
+    }
+    let mut far = None;
+    if !machine.is_empty() {
+        if let Some(mut m) = store.machine(&machine) {
+            let at = match m.exec_dir.trim_end_matches('/') {
+                "" => "its exec_dir".to_string(),
+                d => format!("{d}/trees/{row}"),
+            };
+            if !m.body.is_empty() && !m.body.ends_with('\n') {
+                m.body.push('\n');
+            }
+            m.body.push_str(&format!(
+                "- {} lost {row} (seat {seat}): its copy, if it returns, is at {at} — never read automatically\n",
+                util::now_iso()
+            ));
+            let _ = store.save_machine(&m);
+            far = Some(at);
+        }
+    }
+    store.log_event("task-lost", json!({ "id": row, "seat": seat, "machine": machine, "why": why }));
+    store.git_commit(&format!("wsp: release {row} (lost)"));
+    Ok(Lost { seat, machine, far })
 }
 
 /// Which pane is running this despawn, and what it holds the seat of.
@@ -10029,6 +10130,42 @@ mod tests {
         assert_eq!(local, 2, "a local seat is refused");
         assert!(store.claims().contains_key("t-260816-096"), "and its claim stays");
         assert!(store.bindings().contains_key("w1:p2"));
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-411`: the body `--lost` shares with the daemon's expiry pass lets go of a
+    /// far seat's row — claim and binding gone, row todo with the reason as its one
+    /// log line, worktree untouched, the far copy in the machine's notes — and the
+    /// verb, which refuses a local seat, releases a far one through it.
+    #[test]
+    fn despawn_lost_releases_a_far_seat_through_release_lost() {
+        let _env = no_backend();
+        let store = seat("despawn-lost-far");
+        let mut m = crate::model::Machine::new("mb2", "mb2");
+        m.exec_dir = "/far/exec".into();
+        store.save_machine(&m).unwrap();
+        let dir = store.state.join("compound-seats").join("cpd-far");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seat.json"), json!({ "machine": "mb2" }).to_string()).unwrap();
+        working(&store, "t-260816-095", "cpd-far");
+        let tree = store.root.join("tree-095");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("checkpoint"), "x").unwrap();
+
+        let far = despawn_lost(&store, &Args::synth("despawn", &["095"], &[("lost", "true")]));
+        assert_eq!(far, 0);
+        assert!(!store.claims().contains_key("t-260816-095"), "the claim is released");
+        assert!(store.panes_for_task("t-260816-095").is_empty());
+        let row = store.task("t-260816-095").unwrap();
+        assert_eq!(row.status(), crate::model::Status::Todo);
+        let log = row.section("Log").unwrap_or_default();
+        assert_eq!(log.lines().filter(|l| l.contains("lost with mb2")).count(), 1, "{log}");
+        assert!(tree.join("checkpoint").exists(), "the worktree is kept");
+        let body = store.machine("mb2").unwrap().body;
+        assert!(body.contains("/far/exec/trees/t-260816-095") && body.contains("never read"), "{body}");
+
+        assert!(release_lost(&store, "t-260816-095", "again").is_err(), "nothing holds it now");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
