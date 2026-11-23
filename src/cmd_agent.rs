@@ -5597,6 +5597,7 @@ fn wip_parts(w: &Wip) -> (Vec<wsp_view::wip::Agent>, wsp_view::wip::Head) {
     (agents, head)
 }
 
+#[cfg(test)]
 fn wip_json(w: &Wip) -> serde_json::Value {
     let (agents, head) = wip_parts(w);
     wsp_view::wip::wip_json(&agents, &head)
