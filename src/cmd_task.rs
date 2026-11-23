@@ -3283,6 +3283,8 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         crate::log::append_to_body(&mut body, "decisions edited by hand");
     }
 
+    let refused = overview_names_refused(item.what, &item.id, one, &body);
+
     let saved = match item.what {
         "project" => store.project(&item.id).map(|mut p| {
             p.body = body;
@@ -3321,6 +3323,10 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     );
     store.git_commit(&format!("wsp: edit {} {}", item.what, item.id));
 
+    // Said, not refused: the author may be writing it for a person to run.
+    for why in &refused {
+        eprintln!("wsp: {why}");
+    }
     if args.json() {
         println!(
             "{}",
@@ -3338,6 +3344,19 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         }
     }
     0
+}
+
+/// What an edit that wrote `body` says about the verbs its overview tells a
+/// seat to run that the seat is refused (`wsp-312`): an overview is the order a
+/// seat reads, so it is said while its author is here. Only when the edit could
+/// reach `## Overview`. A worklist's overview is read by no one row's seat, and
+/// a project's is no order.
+fn overview_names_refused(what: &str, id: &str, one: Option<&str>, body: &str) -> Vec<String> {
+    if what == "project" || one.is_some_and(|sec| sec != "Overview") {
+        return Vec::new();
+    }
+    let own = (what != "worklist").then_some(id);
+    crate::split::warn_order(&crate::model::section_of(body, "Overview").unwrap_or_default(), own)
 }
 
 fn launch_editor(path: &std::path::Path) -> i32 {
@@ -5339,6 +5358,25 @@ pub(crate) mod tests {
 
     /// `compounding-220`: the packet generated for the second seat of a
     /// reopened row starts with the reopen's reason, before the original
+    /// wsp-154's overview told its own seat to `wsp add --parent`, and wsp-303's
+    /// barrier order told its seat to `wsp mv`. An edit that writes an overview
+    /// like that says which verb, and what the seat does instead; one that writes
+    /// another section, a project, or an overview with nothing refused says
+    /// nothing (`wsp-312`).
+    #[test]
+    fn an_overview_that_tells_its_seat_a_refused_verb_is_said_when_it_is_written() {
+        let body = "## Overview\n2. Sub-tasks of this row (`wsp add --parent`).\n- `wsp mv <id> --parent none` for each of the 86.\n\n## Details\nx\n";
+        let said = overview_names_refused("task", "wsp-154", Some("Overview"), body);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("`wsp add --parent`") && said[0].contains("wsp leg add wsp-154"), "{}", said[0]);
+        assert!(said[1].contains("`wsp mv`") && said[1].contains("`wsp ask wsp-154 --person`"), "{}", said[1]);
+        assert_eq!(overview_names_refused("task", "wsp-154", None, body).len(), 2, "the whole body reaches Overview");
+        assert!(overview_names_refused("task", "wsp-154", Some("Details"), body).is_empty());
+        assert!(overview_names_refused("project", "wsp", None, body).is_empty());
+        assert_eq!(overview_names_refused("worklist", "spec-breakdown", None, body).len(), 2);
+        assert!(overview_names_refused("task", "wsp-154", Some("Overview"), "## Overview\nMake a.\n").is_empty());
+    }
+
     /// overview. compounding-189's second seat re-reported a landed commit
     /// because its packet carried only the first brief.
     #[test]

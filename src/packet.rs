@@ -435,7 +435,7 @@ pub fn build_leg(task: &str, leg: &str, path: &str, root: &Path, last: bool) -> 
     let p = parse(&text);
     let kind = if last { crate::exit::Kind::Member } else { crate::exit::Kind::Leg };
     let exit = crate::closing::exit_template(kind, task, &[]);
-    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), &exit)
+    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), task, &exit)
 }
 
 /// A leg spawn's decision: the size of its packet when it starts short, `None`
@@ -488,7 +488,7 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
         None => format!("# Packet · {} · {}\n", t.id, t.title),
     };
     let exit = crate::closing::exit_template(crate::exit::Kind::Member, &t.id, &crate::cmd_submit::packet_items(t));
-    render(&head, &p, root, &t.id, &exit)
+    render(&head, &p, root, &t.id, &t.id, &exit)
 }
 
 /// Bytes of the owed block: the newest reason is always in (cut to this if it
@@ -567,9 +567,10 @@ pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrow
 /// found its own shell.
 pub const WAIT_RULE: &str = "Waiting: never wait on `pgrep -f \"<string>\"` — the pattern is on the loop's own line, so it finds its own shell and never ends; wait on a pid (`wait <pid>`, or `while kill -0 <pid>; do sleep 5; done`) or on a `run_in_background` command's notification.";
 
-/// The print: a heading, the author's words, the seat's exit template
-/// (`wsp-617`), then each named file inline, refused over [`CAP`].
-fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<String, String> {
+/// The print: a heading, the author's words, the verbs the seat working `row`
+/// is refused (`wsp-312`), the seat's exit template (`wsp-617`), then each
+/// named file inline, refused over [`CAP`].
+fn render(head: &str, p: &Packet, root: &Path, who: &str, row: &str, exit: &str) -> Result<String, String> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for f in &p.files {
         if !inside(f) {
@@ -587,6 +588,15 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<
         out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
     out.push_str(&format!("\n{WAIT_RULE}\n"));
+    out.push_str(&format!("\n{}\n", crate::split::seat_rule(row)));
+    let named = crate::split::named_in(&p.text, Some(row));
+    if !named.is_empty() {
+        let verbs: Vec<String> = named.iter().map(|r| format!("`{}`", r.verb())).collect();
+        out.push_str(&format!(
+            "\nThis packet's words name {}. Where they ask you to run one, do its instead from the list above, and where that leaves part of the work undone, mark that item not held in your exit and ask about it.\n",
+            verbs.join(", ")
+        ));
+    }
     if !exit.is_empty() {
         out.push_str(&format!("\n{exit}"));
     }
@@ -830,6 +840,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// spec-breakdown's orders named verbs their seats were refused, and each
+    /// became an ask and an unfinished done-when (`wsp-312`). Every packet lists
+    /// the three with what to do instead, and one whose words name a verb says
+    /// so.
+    #[test]
+    fn every_packet_lists_the_verbs_its_seat_is_refused_and_says_when_its_words_name_one() {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-refused-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let plain = build(&row("file: src/a.rs\nSave prints ok."), &dir).unwrap();
+        assert_eq!(plain.matches(&crate::split::seat_rule("t-1")).count(), 1, "{plain}");
+        assert!(!plain.contains("This packet's words name"), "{plain}");
+        let ordered = build(&row("file: src/a.rs\n- `wsp mv <id> --parent none` for each of the 86.\n- Sub-tasks of this row (`wsp add --parent`)."), &dir).unwrap();
+        assert!(ordered.contains("This packet's words name `wsp add --parent`, `wsp mv`."), "{ordered}");
+        // Before the exit and the files, where the brief is read.
+        assert!(ordered.find("Refused to this seat").unwrap() < ordered.find("## src/a.rs").unwrap());
+        let leg = dir.join("leg.md");
+        std::fs::write(&leg, "Make a return 1.\n").unwrap();
+        let text = build_leg("t-1", "a", leg.to_str().unwrap(), &dir, false).unwrap();
+        assert!(text.contains(&crate::split::seat_rule("t-1")), "a leg's seat is its row's: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_packet_says_never_to_wait_on_a_pgrep_and_to_wait_on_a_pid() {
         let dir = std::env::temp_dir().join(format!("wsp-packet-wait-{}", std::process::id()));
@@ -902,7 +935,8 @@ mod tests {
         let dir = std::env::temp_dir();
         let plain = build(&row("Add the flag."), &dir).unwrap();
         let exit = crate::closing::exit_template(crate::exit::Kind::Member, "t-1", &[]);
-        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{exit}"));
+        let refused = crate::split::seat_rule("t-1");
+        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{refused}\n\n{exit}"));
         let mut t = row("Add the flag.");
         t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n");
         t.set_status(crate::model::Status::Review);
