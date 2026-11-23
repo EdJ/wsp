@@ -851,9 +851,9 @@ PLUMBING
                                     multi, options (2-4), recommended?, why?}]});
                                     `wsp answer <mid> --question H|N --choice L
                                     [--other W] [--note W]` saves one (a decision
-                                    on the row each), `--finish ["words"]` ends it
-                                    with some left; the asker is told once, at the
-                                    end; `wsp ask <mid>` reads it so far
+                                    on the row each), the last answer ends it
+                                    (`--finish` is refused while any is open); the
+                                    asker is told once, at the end; `wsp ask <mid>` reads it so far
   wsp answer <mid> --choice 'Q=Label' [--choice …] [--other 'Q=words']
                                     answer one that has options: a label or an
                                     Other, refused with the options named
