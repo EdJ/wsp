@@ -1379,3 +1379,35 @@ fn a_tls_url_is_dialled_over_tls_against_the_pinned_ca_and_a_feed_follows_it() {
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
+
+// ---------------------------------------------------------------- a revoked token (wsp-162)
+
+#[test]
+fn a_feed_refused_unauthorised_after_the_welcome_ends_and_does_not_dial_again() {
+    let subscribed = Arc::new(AtomicUsize::new(0));
+    let heard = subscribed.clone();
+    let server = Scripted::start("revoked-feed", 0, move |_, req| match req["verb"].as_str().unwrap() {
+        "subscribe" => {
+            heard.fetch_add(1, Ordering::SeqCst);
+            let mut says = says_ok(req, Answer::Subscribed);
+            says.push(order_event(1, "o-1", EventKind::OrderTyped));
+            says.push(Say::Frame(wsp_api::Frame::Refused(wsp_api::Refused {
+                code: Code::Unauthorised,
+                text: "the token is revoked".into(),
+            })));
+            says.push(Say::Close);
+            says
+        }
+        _ => vec![],
+    });
+    let c = dial(&server.dir);
+    let mut f = feed(&c, Some(EventId(0)));
+    assert!(matches!(f.next_within(WAIT), Some(Item::Event(e)) if e.id == EventId(1)), "what came first is handed out");
+    assert_eq!(f.next_within(Duration::from_millis(100)), None);
+    assert_eq!(f.refused(), Some("the token is revoked"));
+    // A redial would come within the backoff (25 ms, doubling to a second): give it several.
+    assert_eq!(f.next_within(Duration::from_secs(2)), None);
+    assert_eq!(subscribed.load(Ordering::SeqCst), 1, "no second subscribe");
+    assert_eq!(f.reconnects(), 0, "no redial");
+    assert_eq!(f.by_ref().next(), None, "the iterator ends");
+}

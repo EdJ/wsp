@@ -433,6 +433,10 @@ itself.
   Q7) the client takes `state` afresh. Ids are the de-duplication key, so delivery is at-least-once and the client
   drops an id it has seen.
 - A plain heartbeat `{ "beat": <head id>, "at": … }` every 10 s. A client that misses three reconnects.
+- **A revoked token's connections are dropped (the hub, wsp-162).** A server with a gate follows the head and, on
+  `hub.token.revoked` (or `hub.user.revoked`), closes every open connection whose hello resolved to that credential
+  (or user). A subscriber gets a last `refused { code: unauthorised }` first, and its client treats that, after a
+  welcome, as final: it dials no more and its feed ends.
 - **Not in v1** (named only as later options): per-view or filtered subscriptions, patches or diffs, server-side
   projections, fan-out to browsers. Each one would make the server aware of a client's shape, which Ed ruled out
   for v1.

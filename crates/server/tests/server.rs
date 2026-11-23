@@ -1104,3 +1104,153 @@ fn tls_leaves_the_daemons_peer_rule_as_it_was_and_a_public_peer_is_still_refused
     assert!(matches!(Server::start(store, cfg), Err(StartError::Address(_))));
     let _ = fs::remove_dir_all(&d);
 }
+
+// ------------------------------------------------- a revoked token's connections (wsp-162)
+
+/// A gate of the hub's shape over a store with the identity machine: a token is the active
+/// credential whose hash it has, of its user, and names `person:<user>`.
+struct Tokens(SharedStore);
+
+impl wsp_server::Gate for Tokens {
+    fn hello(&self, hello: &Hello, _: &ApiToken) -> std::result::Result<wsp_server::Welcomed, String> {
+        let (state, _) = self.0.snapshot().map_err(|e| format!("{e:?}"))?;
+        let hash = wsp_machines::token::hash(&hello.token.0);
+        state
+            .credentials
+            .values()
+            .find(|c| c.hash == hash && c.state == IdentityState::Active)
+            .map(|c| wsp_server::Welcomed { by: Principal::Person(c.user.0.clone()), credential: Some(c.id.0.clone()) })
+            .ok_or_else(|| "the token is none this hub has issued, or it is revoked".to_string())
+    }
+    fn admits(&self, _: &Principal, _: &Call) -> std::result::Result<(), wsp_api::Failure> {
+        Ok(())
+    }
+    fn owns(&self, cmd: &Command) -> bool {
+        wsp_machines::Identity::owns(cmd)
+    }
+}
+
+fn identity_store() -> Arc<MemStore> {
+    Arc::new(MemStore::with_domain(Arc::new(wsp_machines::Identity)))
+}
+
+fn apply_as(store: &MemStore, by: &str, key: &str, cmd: Command) {
+    let by = if by == "wsp" { Principal::Wsp("wsp".into()) } else { Principal::Person(by.into()) };
+    store.apply(cmd, IdempotencyKey(key.into()), by).unwrap();
+}
+
+/// `root` the admin, and each of `users` with a token `<user>-token` whose record is `<user>-1`.
+fn seed_users(store: &MemStore, users: &[&str]) {
+    apply_as(store, "wsp", "k-root", Command::HubUserAdd { name: UserName("root".into()), admin: true });
+    for u in users {
+        apply_as(store, "root", &format!("k-{u}"), Command::HubUserAdd { name: UserName((*u).into()), admin: false });
+        apply_as(
+            store,
+            "root",
+            &format!("k-{u}-t"),
+            Command::HubTokenIssue {
+                id: TokenId(format!("{u}-1")),
+                user: UserName((*u).into()),
+                hash: wsp_machines::token::hash(&format!("{u}-token")),
+            },
+        );
+    }
+}
+
+fn start_gated(store: SharedStore, dir: &Path, beat: Duration) -> Server {
+    let mut cfg = Config::new(dir);
+    cfg.port = 0;
+    cfg.beat = beat;
+    cfg.gate = Some(Arc::new(Tokens(store.clone())));
+    Server::start(store, cfg).unwrap()
+}
+
+/// A connection welcomed on `token`; its first frame after the hello is the welcome.
+fn dial_token(dir: &Path, token: &str, user: &str) -> std::result::Result<Client, Refused> {
+    let by = Principal::Person(user.into());
+    let mut conn = Tcp::dial(addr(dir), WAIT).unwrap();
+    let hello = Frame::Hello(Hello { token: ApiToken(token.into()), by: by.clone(), client: "wsp-server tests".into(), protocol: PROTOCOL });
+    conn.send(&hello).unwrap();
+    match conn.recv(WAIT).unwrap() {
+        Some(Frame::Welcome(_)) => Ok(Client { conn, by, next: 1, feed: vec![] }),
+        Some(Frame::Refused(r)) => Err(r),
+        other => panic!("expected welcome or refused, got {other:?}"),
+    }
+}
+
+/// Frames until the connection ends, the last `refused` seen among them; it must end within `within`.
+fn until_closed(c: &mut Client, within: Duration) -> Option<Refused> {
+    let deadline = Instant::now() + within;
+    let mut refused = None;
+    loop {
+        assert!(Instant::now() < deadline, "the connection was not closed within {within:?}");
+        match c.conn.recv(Duration::from_millis(50)) {
+            Ok(Some(Frame::Refused(r))) => refused = Some(r),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => return refused,
+        }
+    }
+}
+
+#[test]
+fn a_revoked_tokens_open_connections_are_closed_within_a_beat_and_another_engineers_stay_up() {
+    let d = dir("revoke");
+    let store = identity_store();
+    seed_users(&store, &["ann", "bob"]);
+    let beat = Duration::from_millis(1500);
+    let server = start_gated(store.clone(), &d, beat);
+
+    let mut ann_reader = dial_token(&d, "ann-token", "ann").unwrap();
+    let mut ann_feed = dial_token(&d, "ann-token", "ann").unwrap();
+    ann_feed.subscribe(None);
+    let mut bob_reader = dial_token(&d, "bob-token", "bob").unwrap();
+    let mut bob_feed = dial_token(&d, "bob-token", "bob").unwrap();
+    bob_feed.subscribe(None);
+    assert!(matches!(ann_reader.read(Verb::Events { from: EventId(0), limit: Some(0) }), Answer::Events { .. }));
+    while server.clients() < 4 {
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let began = Instant::now();
+    apply_as(&store, "root", "k-revoke", Command::HubTokenRevoke { id: TokenId("ann-1".into()) });
+
+    let refused = until_closed(&mut ann_feed, beat).expect("the subscriber was told before the close");
+    assert_eq!(refused.code, Code::Unauthorised, "{refused:?}");
+    assert!(until_closed(&mut ann_reader, beat).is_none(), "the reader is closed, with no frame of its own");
+    assert!(began.elapsed() < beat, "both closed within one beat: {:?}", began.elapsed());
+
+    let refused = dial_token(&d, "ann-token", "ann").err().expect("a fresh hello with the token is refused");
+    assert_eq!(refused.code, Code::Unauthorised);
+
+    // Bob's connections never noticed: his reader answers, his feed still beats.
+    assert!(matches!(bob_reader.read(Verb::Events { from: EventId(0), limit: Some(0) }), Answer::Events { .. }));
+    assert!(matches!(bob_feed.next_feed(), Feed::State { .. } | Feed::Event(_)));
+    // The cut connections' threads end and log a moment after the close.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let log = fs::read_to_string(server.log_path()).unwrap();
+        if server.clients() == 2 && log.matches("dropped, its token was revoked").count() == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bob's two remain and ann's two are logged: {} clients, {log}", server.clients());
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_revoked_user_loses_every_connection_it_held() {
+    let d = dir("revoke-user");
+    let store = identity_store();
+    seed_users(&store, &["ann", "bob"]);
+    let server = start_gated(store.clone(), &d, Duration::from_millis(1500));
+    let mut ann = dial_token(&d, "ann-token", "ann").unwrap();
+    let mut bob = dial_token(&d, "bob-token", "bob").unwrap();
+    apply_as(&store, "root", "k-revoke", Command::HubUserRevoke { name: UserName("ann".into()) });
+    assert!(until_closed(&mut ann, Duration::from_millis(1500)).is_none());
+    assert!(matches!(bob.read(Verb::Events { from: EventId(0), limit: Some(0) }), Answer::Events { .. }));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}

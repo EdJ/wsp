@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use wsp_api::{ApiToken, Call, Code, Failure, Hello};
 use wsp_machines::{token, Identity};
-use wsp_server::Gate;
+use wsp_server::{Gate, Welcomed};
 use wsp_store_contract::{Command, IdentityState, Principal, Refusal, State};
 
 use crate::Hub;
@@ -73,6 +73,17 @@ pub fn resolve(state: &State, instance: &str, bootstrap: &ApiToken, token: &str)
     Err(UNKNOWN.into())
 }
 
+/// The id of the active token record `token` is, from the same state a hello
+/// was resolved against; none for the bootstrap token.
+pub fn credential(state: &State, token: &str) -> Option<String> {
+    let hash = token::hash(token);
+    state
+        .credentials
+        .values()
+        .find(|c| token::same(&c.hash, &hash) && c.state == IdentityState::Active)
+        .map(|c| c.id.0.clone())
+}
+
 /// Whether `by` may make `call` on the hub `instance`: the hub itself (the
 /// bootstrap token) only `hub.user.add { admin: true }`; a person anything,
 /// the identity machine deciding its identity commands.
@@ -96,9 +107,10 @@ fn forbidden(by: &Principal, why: &str) -> Failure {
 }
 
 impl Gate for Auth {
-    fn hello(&self, hello: &Hello, bootstrap: &ApiToken) -> Result<Principal, String> {
+    fn hello(&self, hello: &Hello, bootstrap: &ApiToken) -> Result<Welcomed, String> {
         let state = self.hub.state().map_err(|e| format!("the hub's store did not answer: {e:?}"))?;
-        resolve(&state, &self.instance, bootstrap, &hello.token.0)
+        let by = resolve(&state, &self.instance, bootstrap, &hello.token.0)?;
+        Ok(Welcomed { by, credential: credential(&state, &hello.token.0) })
     }
 
     fn admits(&self, by: &Principal, call: &Call) -> Result<(), Failure> {

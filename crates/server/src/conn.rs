@@ -52,6 +52,7 @@ use wsp_api::{
 use wsp_machines::Orders;
 use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal};
 
+use crate::revoke::{Entry, DROPPED};
 use crate::tcp::Tcp;
 use crate::{subscribe, Shared};
 
@@ -110,15 +111,15 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
             return conn.shutdown();
         }
     };
-    let by = match &shared.cfg.gate {
+    let (by, credential) = match &shared.cfg.gate {
         Some(gate) => match gate.hello(&hello, &shared.token) {
-            Ok(by) => by,
+            Ok(w) => (w.by, w.credential),
             Err(why) => {
                 shared.log.line(&format!("{peer}: refused, {why} ({})", hello.client));
                 return refuse(&mut conn, Code::Unauthorised, &why);
             }
         },
-        None if same(&hello.token.0, &shared.token.0) => hello.by.clone(),
+        None if same(&hello.token.0, &shared.token.0) => (hello.by.clone(), None),
         None => {
             shared.log.line(&format!("{peer}: refused, a wrong token ({})", hello.client));
             return refuse(&mut conn, Code::Unauthorised, "the token is not this instance's");
@@ -143,18 +144,26 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
     let (Ok(writer), Ok(handle)) = (conn.try_clone(), conn.stream_clone()) else {
         return conn.shutdown();
     };
-    shared.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(n, handle);
-    let mut c = Client {
-        shared: &shared,
-        by,
-        writer: Arc::new(Mutex::new(writer)),
-        closed: Arc::new(AtomicBool::new(false)),
-        feed: None,
+    let writer: Writer = Arc::new(Mutex::new(writer));
+    let (subscribed, revoked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let entry = Entry {
+        stream: handle,
+        writer: writer.clone(),
+        credential,
+        by: by.clone(),
+        subscribed: subscribed.clone(),
+        revoked: revoked.clone(),
     };
+    // A token revoked between its hello and here is found by the registry.
+    if shared.clients.lock().unwrap_or_else(|e| e.into_inner()).add(n, entry).is_err() {
+        shared.log.line(&format!("{peer} ({}): {DROPPED}", hello.client));
+        return refuse(&mut conn, Code::Unauthorised, "the token is revoked");
+    }
+    let mut c = Client { shared: &shared, by, writer, closed: Arc::new(AtomicBool::new(false)), subscribed, revoked, feed: None };
     let why = if shared.stopping() { "closed, the server stops".to_string() } else { c.follow(&mut conn) };
     c.closed.store(true, Ordering::SeqCst);
     conn.shutdown();
-    shared.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&n);
+    shared.clients.lock().unwrap_or_else(|e| e.into_inner()).open.remove(&n);
     if let Some(feed) = c.feed.take() {
         let _ = feed.join();
     }
@@ -171,6 +180,10 @@ struct Client<'a> {
     writer: crate::conn::Writer,
     /// Set by either half when the connection is done.
     closed: Arc<AtomicBool>,
+    /// Set when `subscribe` is answered, so a revocation tells the feed.
+    subscribed: Arc<AtomicBool>,
+    /// Set by the revocation thread when it cut this connection.
+    revoked: Arc<AtomicBool>,
     /// The subscription's thread, once `subscribe` was answered.
     feed: Option<JoinHandle<()>>,
 }
@@ -185,6 +198,9 @@ impl Client<'_> {
         loop {
             if self.shared.stopping() {
                 return "closed, the server stops".into();
+            }
+            if self.revoked.load(Ordering::SeqCst) {
+                return DROPPED.into();
             }
             if self.closed.load(Ordering::SeqCst) {
                 return "closed, its feed could not be written".into();
@@ -201,6 +217,7 @@ impl Client<'_> {
                     }
                 }
                 Ok(None) => {}
+                Err(_) if self.revoked.load(Ordering::SeqCst) => return DROPPED.into(),
                 Err(ConnError::Closed) => return String::new(),
                 Err(e) => return format!("closed: {e}"),
             }
@@ -319,6 +336,7 @@ impl Client<'_> {
             Ok(o) => o,
             Err(f) => return send(&self.writer, &reply(id, Err(f))),
         };
+        self.subscribed.store(true, Ordering::SeqCst);
         if !send(&self.writer, &reply(id, Ok(Answer::Subscribed))) {
             return false;
         }

@@ -32,7 +32,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,6 +52,7 @@ mod conn;
 pub mod domain;
 pub mod mirror;
 pub mod ranges;
+mod revoke;
 mod subscribe;
 pub mod tcp;
 pub mod tls;
@@ -113,6 +114,15 @@ impl std::fmt::Debug for dyn SyncVerbs {
     }
 }
 
+/// What a [`Gate`] says a hello is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Welcomed {
+    pub by: Principal,
+    /// The id of the credential the hello's token is, when it is one: the
+    /// server drops the connection when a `hub.token.revoked` event names it.
+    pub credential: Option<String>,
+}
+
 /// Who a connection is, where the hello's token decides it rather than its
 /// `by` (the hub, wsp-161). Without one a server keeps the state core's rule:
 /// the hello's token must be the instance's, and its `by` is trusted. Like
@@ -120,10 +130,11 @@ impl std::fmt::Debug for dyn SyncVerbs {
 /// decides from.
 pub trait Gate: Send + Sync {
     /// The principal `hello`'s token names, which replaces the hello's `by` for
-    /// the connection's life (and is what `welcome` names); `Err` is refused
+    /// the connection's life (and is what `welcome` names), and the credential
+    /// it is (wsp-162: what a revocation of it drops); `Err` is refused
     /// `unauthorised` with its text. `token` is the instance's own
     /// (`api.token`), for a gate that gives it a meaning.
-    fn hello(&self, hello: &Hello, token: &ApiToken) -> Result<Principal, String>;
+    fn hello(&self, hello: &Hello, token: &ApiToken) -> Result<Welcomed, String>;
     /// Whether the connection's principal `by` may make `call`, asked after
     /// the request's `by` was found to be `by`; `Err` is the reply's `err`.
     fn admits(&self, by: &Principal, call: &Call) -> Result<(), Failure>;
@@ -295,8 +306,9 @@ pub(crate) struct Shared {
     pub(crate) token: ApiToken,
     pub(crate) log: Log,
     pub(crate) stopping: AtomicBool,
-    /// The welcomed connections, by number, with a handle that closes each.
-    pub(crate) clients: Mutex<std::collections::BTreeMap<u64, TcpStream>>,
+    /// The welcomed connections, by number, with a handle that closes each, and
+    /// the credentials revoked (`revoke`).
+    pub(crate) clients: Mutex<revoke::Clients>,
     next_client: AtomicU64,
 }
 
@@ -384,13 +396,17 @@ impl Server {
             clients: Mutex::new(Default::default()),
             next_client: AtomicU64::new(1),
         });
-        let threads = listeners
+        let mut threads: Vec<JoinHandle<()>> = listeners
             .into_iter()
             .map(|l| {
                 let s = shared.clone();
                 std::thread::spawn(move || accept(s, l))
             })
             .collect();
+        if shared.cfg.gate.is_some() {
+            let s = shared.clone();
+            threads.push(std::thread::spawn(move || revoke::follow(s)));
+        }
         Ok(Server { shared, addrs, threads })
     }
 
@@ -406,7 +422,7 @@ impl Server {
 
     /// How many clients have been welcomed and are still connected.
     pub fn clients(&self) -> usize {
-        self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()).open.len()
     }
 
     /// The log's path.
@@ -422,8 +438,8 @@ impl Server {
             let _ = t.join();
         }
         let clients = std::mem::take(&mut *self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()));
-        for s in clients.values() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        for e in clients.open.values() {
+            let _ = e.stream.shutdown(std::net::Shutdown::Both);
         }
         self.shared.log.line("stopped");
     }

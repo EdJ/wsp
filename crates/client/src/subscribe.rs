@@ -16,6 +16,11 @@
 //! before it delivered anything (no item, no beat) is dialled again after a
 //! backoff that doubles each time, as a failed dial is, so that a snapshot the
 //! client cannot read does not cost the server one every 25 ms.
+//!
+//! A `refused { unauthorised }` after a welcome is final (wsp-162): the hub
+//! sends it to a subscriber whose token was revoked, then closes. The feed
+//! hands out what it held, dials no more, and [`Feed::refused`] says why; its
+//! iterator ends. A redial whose hello is refused `unauthorised` ends it too.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -25,7 +30,7 @@ use wsp_api::{
     Subscribe, Verb, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
 
-use crate::dial::{self, Tcp};
+use crate::dial::{self, Silent, Tcp};
 use crate::Dial;
 
 /// What a [`Feed`] hands out.
@@ -68,6 +73,8 @@ pub struct Feed {
     /// The pieces of a split snapshot so far, and the id they are at.
     parts: Option<(State, EventId)>,
     silent: Option<String>,
+    /// Why the feed is over for good: the server refused its token.
+    refused: Option<String>,
     backoff: Duration,
     retry_at: Instant,
 }
@@ -96,6 +103,7 @@ impl Feed {
             delivered: false,
             parts: None,
             silent: None,
+            refused: None,
             backoff: BACKOFF_FIRST,
             retry_at: Instant::now(),
         }
@@ -137,6 +145,12 @@ impl Feed {
         self.silent.as_deref()
     }
 
+    /// Why the feed ended for good, once the server refused its token
+    /// `unauthorised` after welcoming it: it does not dial again.
+    pub fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
+    }
+
     /// The next item, waiting up to `wait` for it; `None` when none came (the
     /// feed keeps trying to connect in the meantime and again on the next call).
     pub fn next_within(&mut self, wait: Duration) -> Option<Item> {
@@ -144,6 +158,9 @@ impl Feed {
         loop {
             if let Some(item) = self.pending.pop_front() {
                 return Some(item);
+            }
+            if self.refused.is_some() {
+                return None;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if self.conn.is_none() {
@@ -176,6 +193,7 @@ impl Feed {
             let got = self.conn.as_mut().expect("connected").recv(step);
             match got {
                 Ok(Some(Frame::Feed(frame))) => self.take(frame),
+                Ok(Some(Frame::Refused(r))) if r.code == Code::Unauthorised => self.end(r.text),
                 Ok(Some(_)) => {}
                 Ok(None) => self.quiet_wake(),
                 Err(e) => self.lose(format!("the connection failed: {e}")),
@@ -263,6 +281,16 @@ impl Feed {
         }
     }
 
+    /// The server refused the token after welcoming it: no more dials.
+    fn end(&mut self, why: String) {
+        if let Some(c) = self.conn.take() {
+            c.shutdown();
+        }
+        self.parts = None;
+        self.silent = Some(format!("refused unauthorised: {why}"));
+        self.refused = Some(why);
+    }
+
     fn failed(&mut self, why: String) {
         self.silent = Some(why);
         self.retry_at = Instant::now() + self.backoff;
@@ -274,6 +302,9 @@ impl Feed {
     fn connect(&mut self) {
         let mut open = match dial::open(&self.target) {
             Ok(o) => o,
+            Err(Silent::Refused(r)) if r.code == Code::Unauthorised && self.connected_before => {
+                return self.end(r.text);
+            }
             Err(s) => return self.failed(s.to_string()),
         };
         let resumed = self.connected_before.then_some(self.last).flatten();
@@ -290,6 +321,10 @@ impl Feed {
                 }
                 Err(Refusal::TooOld) => return self.reject(open.conn, "subscribe {} was refused too_old".into()),
                 Err(Refusal::Other(why)) => return self.reject(open.conn, why),
+                Err(Refusal::Revoked(why)) => {
+                    open.conn.shutdown();
+                    return self.end(why);
+                }
             }
         }
         let reconnect = self.connected_before;
@@ -332,6 +367,7 @@ impl Feed {
                         Outcome::Err(f) => Err(Refusal::Other(format!("subscribe was refused {:?}: {}", f.code, f.text))),
                     }
                 }
+                Ok(Some(Frame::Refused(r))) if r.code == Code::Unauthorised => return Err(Refusal::Revoked(r.text)),
                 // Frames of an earlier subscription cannot be on a new connection.
                 Ok(Some(_)) => {}
                 Ok(None) => return Err(Refusal::Other("no reply to subscribe in time".into())),
@@ -344,17 +380,24 @@ impl Feed {
 
 enum Refusal {
     TooOld,
+    /// `refused { unauthorised }` after the welcome.
+    Revoked(String),
     Other(String),
 }
 
 impl Iterator for Feed {
     type Item = Item;
 
-    /// Blocks until the next item: it never ends while the server may come back.
+    /// Blocks until the next item: it never ends while the server may come
+    /// back, but once it refused the token (`unauthorised`, after a welcome)
+    /// it ends.
     fn next(&mut self) -> Option<Item> {
         loop {
             if let Some(item) = self.next_within(Duration::from_secs(1)) {
                 return Some(item);
+            }
+            if self.refused.is_some() {
+                return None;
             }
         }
     }
