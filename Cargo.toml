@@ -43,6 +43,8 @@ wsp-host = { path = "crates/host" }
 wsp-hub = { path = "crates/hub" }
 wsp-machines = { path = "crates/machines" }
 wsp-server = { path = "crates/server", features = ["test-support"] }
+# identity.rs (wsp-167) speaks raw frames to a hub over TLS, as a client that says another `by`.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 
 [profile.release]
 opt-level = 2
