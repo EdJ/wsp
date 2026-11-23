@@ -211,6 +211,19 @@ fn seeded() -> Sandbox {
     store.set_claim("beta-003", json!({ "workspace": SEAT }));
     store.set_binding(SEAT, json!({ "pane": SEAT, "task_id": "beta-003" }));
 
+    // The seat's clock: what the fold leaves when the manager's `turn` (ended,
+    // at NOW) reaches it, the one source of `wip`'s `agents[].since` since
+    // wsp-030 (`fold::state_since`; seat-since.json's sampling is gone). The
+    // fake manager streams no events, so the sandbox stages the folded record.
+    {
+        use wsp_wire::host::Host as _;
+        let seats = wsp_wire::place_compound::Compound::at(sb.state.join(wsp_wire::place_compound::SEATS));
+        let dir = seats.dir_of(&wsp_wire::place::Seat::new(SEAT)).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = wsp_base::util::iso_at(NOW.parse().unwrap());
+        wsp_wire::host::LOCAL.say(&dir, &json!({ "state": "idle", "at": at, "epoch": 1, "from": "manager" }));
+    }
+
     // The stop ledger: seats on the claimed and the landed rows' days, in the
     // window and out of it.
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(sb.state.join("spent.jsonl")).unwrap();
