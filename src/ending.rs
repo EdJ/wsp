@@ -2876,4 +2876,94 @@ mod tests {
         assert_eq!(ran_alive, want, "the check's cargo survives the sweep: {log}");
         assert!(check_alive, "and the check itself");
     }
+
+    /// `wsp-444`: under `WSP_JOBS=inproc` the daemon runs a ready row's check
+    /// in its own process, each step a job on `wsp-host`'s runner: no `wsp
+    /// check` and no manager job above the step's `npm`, which stands in the
+    /// row's tree. The review tick fires while the step runs: the `npm`
+    /// survives (compound-react-036's was TERMed, exit 143), and an orphaned
+    /// `yes` in the same tree is still stopped.
+    #[test]
+    fn a_check_step_run_in_process_under_wsp_jobs_inproc_keeps_its_npm_through_the_review_sweep() {
+        let env = util::isolated("ending-444-inproc");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-444-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // The npm is a `sleep` under that name, outside the tree, so `ps`
+        // names it `npm`: what descends from a process standing in the tree.
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let npm = bin.join("npm");
+        std::fs::copy(sleep, &npm).unwrap();
+        std::env::set_var(crate::host_tcp::JOBS_ENV, "inproc");
+        let runner = crate::check::Runner::chosen(&store, crate::check::Whose::Row(&row), crate::check::TreeKind::Check, &tree, None);
+        std::env::remove_var(crate::host_tcp::JOBS_ENV);
+        let runner = runner.unwrap();
+        assert!(matches!(runner, crate::check::Runner::Inproc), "WSP_JOBS=inproc runs the check in this process");
+        let step = crate::check::Step {
+            name: "web-chrome check".into(),
+            command: format!("{} 30", npm.display()),
+            limit: std::time::Duration::from_secs(60),
+            of: crate::check::Of::Project,
+            on: Vec::new(),
+            barrier: false,
+            end: false,
+        };
+        let log = root.join("step.log");
+        let ran = {
+            let (tree, log) = (tree.clone(), log.clone());
+            std::thread::spawn(move || crate::check::run_step(&tree, &step, &log, &crate::check::Runner::Inproc))
+        };
+        // The step's npm, started in the tree under this process, before the tick.
+        let me = std::process::id();
+        let npms = || -> Vec<u32> {
+            let table = crate::check_tree::exes();
+            let under_me = |mut p: u32| {
+                for _ in 0..table.len() {
+                    match table.iter().find(|(q, _, _)| *q == p) {
+                        Some(&(_, up, _)) if up == me => return true,
+                        Some(&(_, up, _)) => p = up,
+                        None => return false,
+                    }
+                }
+                false
+            };
+            table.iter().filter(|(p, _, exe)| exe.ends_with("/npm") && under_me(*p)).map(|r| r.0).collect()
+        };
+        let mut found = Vec::new();
+        for _ in 0..250 {
+            found = npms();
+            if found.len() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(found.len(), 1, "the in-process step never started its npm: {found:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), Vec::new());
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, npm_alive) = (alive(&[yes]), alive(&found));
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &found, "KILL");
+        let done = ran.join().unwrap().done;
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert_eq!(npm_alive, found, "the in-process check's npm survives the sweep: {log}");
+        assert!(!log.contains("npm"), "and is not named as stopped: {log}");
+        assert_ne!(done, crate::check::Done::Passed, "the step ended by this test's KILL");
+    }
 }

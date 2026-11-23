@@ -445,13 +445,86 @@ pub fn runners(table: &[(u32, u32, String)], ask: &Ask, jobs: &[wsp_host_api::Jo
 
 /// The running jobs of this machine's manager, for [`runners`]: none where
 /// there is no manager or it did not answer, and then a check's own `wsp`
-/// still spares what it runs.
+/// still spares what it runs. The jobs `wsp-host`'s runner runs in a process
+/// (`WSP_JOBS=inproc`, [`inproc_jobs`]) are added (`wsp-444`).
 fn manager_jobs() -> Vec<wsp_host_api::JobRow> {
     let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(Store::default_state);
-    match crate::throttle::manager_jobs(&state) {
+    let mut jobs = match crate::throttle::manager_jobs(&state) {
         Ok(Some(host)) => host.jobs().unwrap_or_default(),
         _ => Vec::new(),
+    };
+    let mut execs: Vec<PathBuf> = INPROC_EXECS.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+    execs.push(state.join("inproc"));
+    execs.sort();
+    execs.dedup();
+    jobs.extend(inproc_jobs(&execs));
+    jobs
+}
+
+/// The exec dirs this process has run in-process jobs in ([`runs_inproc_at`]).
+static INPROC_EXECS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Say that this process runs jobs on `wsp-host`'s runner with their files
+/// under `exec` (`WSP_JOBS=inproc`): the daemon's own check of a ready row
+/// runs so, its steps descending from `wsp daemon`, no `wsp check` and no
+/// manager job, and [`manager_jobs`] reads them from there too (`wsp-444`:
+/// compound-react-036's `npm run check` was TERMed with exit 143).
+pub fn runs_inproc_at(exec: &Path) {
+    INPROC_EXECS.lock().unwrap_or_else(|e| e.into_inner()).insert(exec.to_path_buf());
+}
+
+/// The jobs running on `wsp-host`'s runner in a process, out of each exec
+/// dir's `jobs/<key>.job` with no `<key>.exit` beside it yet: its record's pid
+/// leads the job's group, and its key's row is the file name's first part
+/// ([`wsp_host::jobs::file_key`]). A job whose process is gone is never above
+/// anything in the process table, so it spares nothing.
+pub fn inproc_jobs(execs: &[PathBuf]) -> Vec<wsp_host_api::JobRow> {
+    use wsp_host::jobs as runner;
+    let mut out = Vec::new();
+    for exec in execs {
+        let Ok(dir) = std::fs::read_dir(runner::jobs_dir(exec)) else { continue };
+        let mut keys: Vec<String> = dir
+            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".job").map(str::to_string))
+            .collect();
+        keys.sort();
+        for key in keys {
+            if runner::exit_path(exec, &key).exists() {
+                continue;
+            }
+            let Some(record) = runner::recorded(exec, &key) else { continue };
+            let mut parts = key.splitn(3, '+').map(unescape);
+            let (Some(row), Some(attempt), Some(job)) = (parts.next(), parts.next(), parts.next()) else { continue };
+            out.push(wsp_host_api::JobRow {
+                key: crate::host::job_key(&row, attempt.parse().unwrap_or(0), &job),
+                class: wsp_host_api::JobClass::Check,
+                pgid: record.pid,
+                started: wsp_host_api::At(record.started_ms),
+                state: wsp_host_api::JobState::Running,
+            });
+        }
     }
+    out
+}
+
+/// A part of a job's file name with its `%XX` bytes read back.
+fn unescape(part: &str) -> String {
+    let b = part.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%').then(|| part.get(i + 1..i + 3)).flatten().and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The nearest of `runners` at or above `at`, climbing until a host that is
@@ -1608,6 +1681,27 @@ mod tests {
         assert!(checked_rows("/bin/sh -c wsp check wsp-307").is_empty());
         assert!(checked_rows("wsp land wsp-307").is_empty());
         assert!(checked_rows("wspx check a").is_empty());
+    }
+
+    /// `wsp-444`: a job `wsp-host`'s runner runs in a process (`WSP_JOBS=inproc`)
+    /// is read from its exec dir while it has no exit file, by its row and its
+    /// group's leader; one that ended, or a file that is no job, is not.
+    #[test]
+    fn a_running_in_process_job_is_read_by_its_row_and_pgid() {
+        let exec = std::env::temp_dir().join(format!("wsp-444-{}-{}", std::process::id(), util::epoch_nanos()));
+        let jobs = exec.join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        let record = |pid: u32| format!("pid {pid}\nstarted Mon_Nov_23_09:33:42_2026\nstarted_ms 7\ntimeout_secs 120\n");
+        std::fs::write(jobs.join("c%2B1+0+check%3Aweb-chrome_check@1.2.0.job"), record(41)).unwrap();
+        std::fs::write(jobs.join("c-2+0+check%3Aunit@1.3.0.job"), record(42)).unwrap();
+        std::fs::write(jobs.join("c-2+0+check%3Aunit@1.3.0.exit"), "exit 0\n").unwrap();
+        std::fs::write(jobs.join("c-3+0+check%3Aunit@1.4.0.log"), "").unwrap();
+        let read = inproc_jobs(&[exec.clone(), exec.join("none")]);
+        let _ = std::fs::remove_dir_all(&exec);
+        let got: Vec<(String, u32, String, u32)> =
+            read.iter().map(|j| (j.key.row.0.clone(), j.key.attempt, j.key.job.clone(), j.pgid)).collect();
+        assert_eq!(got, vec![("c+1".to_string(), 0, "check:web-chrome_check@1.2.0".to_string(), 41)]);
+        assert!(read.iter().all(|j| j.state == wsp_host_api::JobState::Running));
     }
 
     #[test]
