@@ -63,8 +63,20 @@ fn world() -> Log {
     l
 }
 
+fn ws(n: &str) -> SharedName {
+    SharedName(n.into())
+}
+fn add_ws(n: &str) -> Command {
+    Command::HubWorkspaceAdd { name: ws(n) }
+}
+fn set_member(w: &str, user: &str, member: bool) -> Command {
+    Command::HubMemberSet { workspace: ws(w), user: u(user), member }
+}
+
 fn all() -> Vec<Command> {
     vec![
+        add_ws("x"),
+        set_member("x", "sam", true),
         add("x", false),
         Command::HubUserRevoke { name: u("sam") },
         issue("t9", "sam", &token::hash("x")),
@@ -236,4 +248,66 @@ fn same_is_false_on_any_differing_byte() {
     assert!(!token::same(&t, &t[..63]));
     assert!(!token::same("", "a"));
     assert!(token::same("", ""));
+}
+
+#[test]
+fn an_admin_adds_a_shared_workspace_once() {
+    let mut l = world();
+    let ev = l.run(add_ws("team"), &person("ed")).unwrap();
+    assert_eq!(ev.len(), 1);
+    assert_eq!((ev[0].kind, ev[0].subject.clone()), (EventKind::HubWorkspaceAdded, Subject::Workspace(ws("team"))));
+    assert_eq!(l.state.workspaces[&ws("team")], SharedWorkspace { name: ws("team") });
+    let n = l.n;
+    assert!(matches!(l.run(add_ws("team"), &person("ed")), Err(Refusal::Invalid { .. })));
+    assert!(matches!(l.run(add_ws(" "), &person("ed")), Err(Refusal::Invalid { .. })));
+    assert_eq!(l.n, n);
+}
+
+#[test]
+fn an_admin_sets_a_member_and_setting_it_again_decides_nothing() {
+    let mut l = world();
+    l.run(add_ws("team"), &person("ed")).unwrap();
+    let ev = l.run(set_member("team", "sam", true), &person("ed")).unwrap();
+    assert_eq!(
+        (ev[0].kind, ev[0].subject.clone()),
+        (EventKind::HubMemberSet, Subject::Member { workspace: ws("team"), user: u("sam") })
+    );
+    assert!(l.state.members[&ws("team")].contains(&u("sam")));
+    let before = (l.state.clone(), l.n);
+    assert_eq!(l.run(set_member("team", "sam", true), &person("ed")), Ok(vec![]));
+    assert_eq!((l.state.clone(), l.n), before);
+    assert_eq!(l.run(set_member("team", "ed", false), &person("ed")), Ok(vec![]), "not a member, not set");
+    l.run(set_member("team", "sam", false), &person("ed")).unwrap();
+    assert!(!l.state.members[&ws("team")].contains(&u("sam")));
+    assert_eq!(l.run(set_member("team", "sam", false), &person("ed")), Ok(vec![]));
+}
+
+#[test]
+fn a_member_is_an_active_user_of_an_existing_workspace() {
+    let mut l = world();
+    l.run(add_ws("team"), &person("ed")).unwrap();
+    l.run(add("kim", false), &person("ed")).unwrap();
+    l.run(Command::HubUserRevoke { name: u("kim") }, &person("ed")).unwrap();
+    let before = (l.state.clone(), l.n);
+    assert_eq!(
+        l.run(set_member("nope", "sam", true), &person("ed")),
+        Err(Refusal::NotFound { subject: Subject::Workspace(ws("nope")) })
+    );
+    assert_eq!(
+        l.run(set_member("team", "ghost", true), &person("ed")),
+        Err(Refusal::NotFound { subject: Subject::User(u("ghost")) })
+    );
+    for member in [true, false] {
+        assert_eq!(
+            l.run(set_member("team", "kim", member), &person("ed")),
+            Err(Refusal::Illegal { subject: Subject::User(u("kim")), state: "revoked".into(), verb: "hub.member.set".into() })
+        );
+    }
+    assert_eq!((l.state.clone(), l.n), before);
+}
+
+#[test]
+fn the_workspace_verbs_are_its_own() {
+    assert!(Identity::owns(&add_ws("x")));
+    assert!(Identity::owns(&set_member("x", "sam", true)));
 }

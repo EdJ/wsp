@@ -3,7 +3,7 @@
 //! it. Records only: which transition is legal is the domain's (section 3,
 //! [`Domain`](crate::Domain)), never this crate's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -384,4 +384,10 @@ pub struct State {
     /// The hub's token records, by id.
     #[serde(default)]
     pub credentials: BTreeMap<TokenId, Credential>,
+    /// The hub's shared workspaces, by name (wsp-478's identity domain folds them).
+    #[serde(default)]
+    pub workspaces: BTreeMap<SharedName, SharedWorkspace>,
+    /// Each shared workspace's members: the users `hub.member.set` made so.
+    #[serde(default)]
+    pub members: BTreeMap<SharedName, BTreeSet<UserName>>,
 }

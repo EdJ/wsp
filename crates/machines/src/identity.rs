@@ -8,6 +8,8 @@
 //! | `hub.user.revoke` | an active admin user | `hub.user.revoked`, then `hub.token.revoked` for each of the user's active tokens, in one decision; a revoked user is an empty decision | `forbidden`, `not_found` (user) |
 //! | `hub.token.issue` | an active admin user | `hub.token.issued` | `forbidden`, `not_found` (user), `illegal` (user, `revoked`), `invalid` (id taken, or a hash that is not 64 hex characters) |
 //! | `hub.token.revoke` | an active admin user | `hub.token.revoked`; a revoked token is an empty decision | `forbidden`, `not_found` (token) |
+//! | `hub.workspace.add` | an active admin user | `hub.workspace.added` | `forbidden`, `invalid` (empty name, or a name taken) |
+//! | `hub.member.set` | an active admin user | `hub.member.set`; setting a member to what it is is an empty decision | `forbidden`, `not_found` (workspace, or user), `illegal` (user, `revoked`) |
 //!
 //! Who may is checked first, so a principal that may not learns nothing of
 //! the state. An admin user is a [`Principal::Person`] whose name is an active
@@ -16,8 +18,9 @@
 //! **The events.** `hub.user.added` carries `{"admin"}`, `hub.user.revoked`
 //! `null`, `hub.token.issued` `{"user", "hash"}` and `hub.token.revoked`
 //! `null`; subjects `User(name)` and `Credential(id)`. A token's `issued` and
-//! `revoked` moments are the event's own `at`. Membership of shared workspaces
-//! (`hub.workspace.*`) comes with wsp-168's contract.
+//! `revoked` moments are the event's own `at`. `hub.workspace.added` carries
+//! `null` under `Workspace(name)`; `hub.member.set` carries `{"member"}` under
+//! `Member { workspace, user }` (wsp-478).
 
 use serde_json::{json, Value};
 use std::result::Result;
@@ -28,7 +31,7 @@ use wsp_store_contract::*;
 pub struct Identity;
 
 impl Identity {
-    /// Whether `cmd` is one of this machine's: the four `hub.user.*` and `hub.token.*` verbs.
+    /// Whether `cmd` is one of this machine's: the `hub.user.*`, `hub.token.*`, `hub.workspace.add` and `hub.member.set` verbs.
     pub fn owns(cmd: &Command) -> bool {
         matches!(
             cmd,
@@ -36,6 +39,8 @@ impl Identity {
                 | Command::HubUserRevoke { .. }
                 | Command::HubTokenIssue { .. }
                 | Command::HubTokenRevoke { .. }
+                | Command::HubWorkspaceAdd { .. }
+                | Command::HubMemberSet { .. }
         )
     }
 }
@@ -139,6 +144,43 @@ impl Domain for Identity {
                 }
                 Ok(vec![draft(EventKind::HubTokenRevoked, Subject::Credential(id.clone()), Value::Null)])
             }
+            Command::HubWorkspaceAdd { name } => {
+                if !is_admin(state, by) {
+                    return Err(forbidden(by));
+                }
+                if name.0.trim().is_empty() {
+                    return Err(Refusal::Invalid { reason: "a shared workspace needs a name".into() });
+                }
+                if state.workspaces.contains_key(name) {
+                    return Err(Refusal::Invalid { reason: format!("shared workspace {} exists", name.0) });
+                }
+                Ok(vec![draft(EventKind::HubWorkspaceAdded, Subject::Workspace(name.clone()), Value::Null)])
+            }
+            Command::HubMemberSet { workspace, user, member } => {
+                if !is_admin(state, by) {
+                    return Err(forbidden(by));
+                }
+                if !state.workspaces.contains_key(workspace) {
+                    return Err(Refusal::NotFound { subject: Subject::Workspace(workspace.clone()) });
+                }
+                let u = state.users.get(user).ok_or_else(|| Refusal::NotFound { subject: Subject::User(user.clone()) })?;
+                if u.state == IdentityState::Revoked {
+                    return Err(Refusal::Illegal {
+                        subject: Subject::User(user.clone()),
+                        state: "revoked".into(),
+                        verb: "hub.member.set".into(),
+                    });
+                }
+                let is = state.members.get(workspace).is_some_and(|m| m.contains(user));
+                if is == *member {
+                    return Ok(vec![]);
+                }
+                Ok(vec![draft(
+                    EventKind::HubMemberSet,
+                    Subject::Member { workspace: workspace.clone(), user: user.clone() },
+                    json!({ "member": member }),
+                )])
+            }
             _ => Err(Refusal::Invalid { reason: "not an identity command".into() }),
         }
     }
@@ -177,6 +219,16 @@ impl Domain for Identity {
                 if let Some(c) = state.credentials.get_mut(id) {
                     c.state = IdentityState::Revoked;
                     c.revoked = Some(event.at);
+                }
+            }
+            (EventKind::HubWorkspaceAdded, Subject::Workspace(name)) => {
+                state.workspaces.insert(name.clone(), SharedWorkspace { name: name.clone() });
+            }
+            (EventKind::HubMemberSet, Subject::Member { workspace, user }) => {
+                if event.payload.get("member").and_then(Value::as_bool).unwrap_or(false) {
+                    state.members.entry(workspace.clone()).or_default().insert(user.clone());
+                } else if let Some(m) = state.members.get_mut(workspace) {
+                    m.remove(user);
                 }
             }
             _ => {}

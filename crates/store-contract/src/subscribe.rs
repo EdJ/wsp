@@ -51,7 +51,7 @@ impl State {
     /// snapshot are put back together. Runs are appended, so pieces taken in
     /// the order they were sent keep the runs' order.
     pub fn absorb(&mut self, other: State) {
-        let State { rows, lists, seats, claims, orders, asks, mut runs, machines, leases, users, credentials } = other;
+        let State { rows, lists, seats, claims, orders, asks, mut runs, machines, leases, users, credentials, workspaces, members } = other;
         self.rows.extend(rows);
         self.lists.extend(lists);
         self.seats.extend(seats);
@@ -63,6 +63,8 @@ impl State {
         self.leases.extend(leases);
         self.users.extend(users);
         self.credentials.extend(credentials);
+        self.workspaces.extend(workspaces);
+        self.members.extend(members);
     }
 
     /// The length of this state's JSON, counted without writing it out.
@@ -107,6 +109,8 @@ impl State {
         take!(leases);
         take!(users);
         take!(credentials);
+        take!(workspaces);
+        take!(members);
         pieces.push(cur);
         pieces
     }
