@@ -260,6 +260,17 @@ pub fn room_of(governors: &BTreeMap<String, Value>, scope: &str) -> String {
     }
 }
 
+/// A seat as a receipt names it: *the `x` governor · room* for a project's or a
+/// list's, and *`ed`'s primary* for `primary:ed` (`wsp-485`) — a user's primary
+/// is filed under no room here, and a receipt that said "the primary:ed governor
+/// · " ended on nothing.
+pub fn seat_words(governors: &BTreeMap<String, Value>, seat: &Seat) -> String {
+    match crate::governors::user_of_primary(&seat.scope) {
+        Some(user) => format!("{user}'s primary"),
+        None => format!("the {} governor · {}", seat.scope, whereabouts(governors, seat)),
+    }
+}
+
 /// Where a seat [`seat_for`] reached is, for a receipt: its room, or that wsp
 /// is filling it and what is said to it waits there ([`Seat::vacant`]).
 pub fn whereabouts(governors: &BTreeMap<String, Value>, seat: &Seat) -> String {
@@ -373,7 +384,26 @@ pub fn seat_for_task(
     project: Option<&str>,
     allocated_to: Option<&str>,
 ) -> Option<Seat> {
-    if governors.is_empty() {
+    // The login is read only for an allocated row: an unallocated one walks as
+    // it always did and touches no file.
+    let login = allocated_to.and_then(|_| crate::address::logged_in_user());
+    seat_for_task_as(governors, index, list, task, project, allocated_to, login.as_deref())
+}
+
+/// [`seat_for_task`] told who is logged in here (`wsp-485`): an allocation to
+/// another user ends at that user's `primary:<user>` whether or not a primary
+/// is seated on this spoke. The pure form, for a caller that has the login in
+/// hand and for tests.
+pub fn seat_for_task_as(
+    governors: &BTreeMap<String, Value>,
+    index: &Index,
+    list: Option<&str>,
+    task: &crate::model::Task,
+    project: Option<&str>,
+    allocated_to: Option<&str>,
+    login: Option<&str>,
+) -> Option<Seat> {
+    if governors.is_empty() && allocated_to.is_none() {
         return None;
     }
     if let Some(seat) = list.and_then(|l| seat_for(governors, index, Some(l), None, None)) {
@@ -382,7 +412,7 @@ pub fn seat_for_task(
     if let Some(seat) = started_by(task).and_then(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec))) {
         return Some(seat);
     }
-    seat_for(governors, index, None, project, allocated_to)
+    crate::governors::seat_for_as(governors, index, None, project, allocated_to, login)
 }
 
 /// The seat that answers for one task, asked once.
@@ -1964,6 +1994,28 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
 pub(crate) mod tests {
     use super::*;
     use crate::model::Project;
+
+    /// `wsp-485`: the receipt for an ask to `primary:ed` names ed's primary and
+    /// ends there — it used to read "asked of the primary:ed governor · " with
+    /// an empty room. A project's seat keeps its wording.
+    #[test]
+    fn a_receipt_for_a_users_primary_names_it_and_has_no_empty_room() {
+        let g = seated(&[("wsp", "w1")]);
+        let ed = Seat {
+            scope: "primary:ed".into(),
+            pane: String::new(),
+            since: String::new(),
+            session: String::new(),
+            cwd: String::new(),
+            kind: String::new(),
+            vacant: false,
+        };
+        let said = format!("asked of {}", seat_words(&g, &ed));
+        assert_eq!(said, "asked of ed's primary");
+        assert!(!said.contains('·') && !said.contains("governor"), "{said}");
+        let s = seat_for(&g, &tree(), None, Some("wsp"), None).unwrap();
+        assert_eq!(seat_words(&g, &s), "the wsp governor · w1");
+    }
 
     fn tree() -> Index {
         let mut wsp = Project::new("wsp");

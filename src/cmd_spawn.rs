@@ -11149,7 +11149,7 @@ mod tests {
         store.clear_claim("t-1");
         let index = crate::resolve::Index::new(store.projects());
         let lists = crate::worklist::Running::read(&store);
-        let to = |store: &Store| crate::cmd_watch::addressed_to(&index, &store.governors(), &lists, &store.task("t-1").unwrap());
+        let to = |store: &Store| crate::cmd_watch::addressed_to(&index, &store.governors(), &lists, &store.task("t-1").unwrap(), None);
         assert_eq!(to(&store), "proc", "the review notice goes to the seat that started it, not core's");
         assert_eq!(cmd_govern::answering_seat(&store, &store.task("t-1").unwrap()).map(|s| s.scope).as_deref(), Some("proc"));
 

@@ -2108,13 +2108,34 @@ impl Scope {
 /// names a task is one that has genuinely gone. A caller with only an id can
 /// therefore look it up plainly, and a miss means nobody rather than *ask
 /// again*.
+///
+/// **The row's allocation is part of the walk** (`wsp-485`). `allocated_to` is
+/// the user the row is allocated to ([`Store::allocated_to`]), the same reading
+/// the ask's own routing is handed, so the Unanswered level of an allocated
+/// row's ask is addressed where the ask went — `primary:<user>` — and not to
+/// the project's seat or to everyone, where this keyboard's Needs you would
+/// show it. `None` for an unallocated row, which walks as it always did.
 pub(crate) fn addressed_to(
     index: &Index,
     governors: &BTreeMap<String, Value>,
     lists: &worklist::Running,
     task: &Task,
+    allocated_to: Option<&str>,
 ) -> String {
-    cmd_govern::seat_for_task(governors, index, lists.list_for(task), task, task.project.as_deref(), None)
+    let login = allocated_to.and_then(|_| crate::address::logged_in_user());
+    addressed_to_as(index, governors, lists, task, allocated_to, login.as_deref())
+}
+
+/// [`addressed_to`] with the user logged in here in hand — the pure form.
+pub(crate) fn addressed_to_as(
+    index: &Index,
+    governors: &BTreeMap<String, Value>,
+    lists: &worklist::Running,
+    task: &Task,
+    allocated_to: Option<&str>,
+    login: Option<&str>,
+) -> String {
+    cmd_govern::seat_for_task_as(governors, index, lists.list_for(task), task, task.project.as_deref(), allocated_to, login)
         .map(|s| s.scope)
         .unwrap_or_else(|| EVERYONE.to_string())
 }
@@ -2126,12 +2147,13 @@ pub(crate) fn in_scope(
     governors: &BTreeMap<String, Value>,
     lists: &worklist::Running,
     task: &Task,
+    allocated_to: Option<&str>,
 ) -> bool {
     if scope.all {
         return true;
     }
     if scope.seated {
-        return addressed_to(index, governors, lists, task) == scope.name;
+        return addressed_to(index, governors, lists, task, allocated_to) == scope.name;
     }
     if lists.list_for(task) == Some(scope.name.as_str()) {
         return true;
@@ -2563,7 +2585,7 @@ impl<'a> Poll<'a> {
         let lists = worklist::Running::read(self.store);
         if self.store.tasks().iter().any(|t| {
             outstanding(t, &lists).is_some()
-                && addressed_to(&index, &governors, &lists, t) == self.scope.name
+                && addressed_to(&index, &governors, &lists, t, self.store.allocated_to(&t.id).as_deref()) == self.scope.name
         }) {
             return true;
         }
@@ -2576,7 +2598,7 @@ impl<'a> Poll<'a> {
             p.at_barrier()
                 && p.members.iter().any(|m| {
                     self.store.task_now(&renamed, &m.id).is_some_and(|t| {
-                        addressed_to(&index, &governors, &lists, &t) == self.scope.name
+                        addressed_to(&index, &governors, &lists, &t, self.store.allocated_to(&t.id).as_deref()) == self.scope.name
                     })
                 })
         })
@@ -2658,9 +2680,9 @@ impl Source for Poll<'_> {
         let to: BTreeMap<String, String> = wip
             .tasks
             .iter()
-            .map(|t| (t.id.clone(), addressed_to(&wip.index, &wip.governors, &lists, t)))
+            .map(|t| (t.id.clone(), addressed_to(&wip.index, &wip.governors, &lists, t, self.store.allocated_to(&t.id).as_deref())))
             .collect();
-        let mine = |t: &Task| in_scope(&self.scope, &wip.index, &wip.governors, &lists, t);
+        let mine = |t: &Task| in_scope(&self.scope, &wip.index, &wip.governors, &lists, t, self.store.allocated_to(&t.id).as_deref());
         let task_of = |id: &str| wip.tasks.iter().find(|t| t.id == id);
 
         // Read once and above everything, because (b) and (c) both want it: (c)
@@ -4045,7 +4067,7 @@ fn is_out(store: &Store, scope: &Scope, needle: &str) -> bool {
         Scope { name, seated: false, workspace: scope.workspace.clone(), pane: scope.pane.clone(), all: false };
     let members: Vec<&Task> = tasks
         .iter()
-        .filter(|t| in_scope(&asked, &index, &store.governors(), &lists, t))
+        .filter(|t| in_scope(&asked, &index, &store.governors(), &lists, t, store.allocated_to(&t.id).as_deref()))
         .collect();
     if members.iter().any(|t| t.status().is_open()) {
         return false;
@@ -4811,6 +4833,48 @@ mod tests {
 
     fn sig(kind: Kind, subject: &str) -> Signal {
         Signal::new(kind, subject, "because")
+    }
+
+    // ---- an allocated row's level goes where its ask went (wsp-485) ---------
+
+    /// The derived level of an ask on an ed-allocated row is addressed to
+    /// `primary:ed` — where the ask itself was routed — and not to everyone,
+    /// which is where it showed in this keyboard's Needs you. With a local
+    /// primary seated the answer is the same; an unallocated row stays what it
+    /// was, and ed's own spoke keeps its own primary's bare walk.
+    #[test]
+    fn an_allocated_rows_level_is_addressed_to_its_users_primary() {
+        let env = util::isolated("addressed-allocated");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_project(&crate::model::Project::new("core")).unwrap();
+        let mut a = Task::new("ed's row", "t-1");
+        a.project = Some("core".into());
+        a.for_user = Some("ed".into());
+        store.save_task(&a).unwrap();
+        let mut b = Task::new("nobody's row", "t-2");
+        b.project = Some("core".into());
+        store.save_task(&b).unwrap();
+        // core's seat is empty and the list holds neither.
+        store.set_governor("core", json!({ "workspace": "", "pane": "" }));
+        store.set_governor("other", json!({ "workspace": "w1", "pane": "w1:p1", "host": util::hostname() }));
+        let index = Index::new(store.projects());
+        let lists = worklist::Running::read(&store);
+        let to = |id: &str, login: Option<&str>| {
+            let t = store.task(id).unwrap();
+            addressed_to_as(&index, &store.governors(), &lists, &t, store.allocated_to(id).as_deref(), login)
+        };
+        assert_eq!(to("t-1", Some("jesper")), "primary:ed", "no local primary seated, and still ed's");
+        assert_eq!(to("t-2", Some("jesper")), EVERYONE, "unallocated: as today");
+        assert_eq!(to("t-1", None), EVERYONE, "standalone: as today");
+
+        store.set_governor(crate::governors::PRIMARY, json!({ "workspace": "p", "pane": "p:1", "host": util::hostname() }));
+        assert_eq!(to("t-1", Some("jesper")), "primary:ed", "a local primary seated: the same");
+        assert_eq!(to("t-1", Some("ed")), "primary:ed", "ed's own spoke: its primary, under his name");
+
+        // The project's seat, seated, still answers first, as it does for the ask.
+        store.set_governor("core", json!({ "workspace": "w2", "pane": "w2:p1", "host": util::hostname() }));
+        assert_eq!(to("t-1", Some("jesper")), "core");
     }
 
     // ---- what a seat is told about itself ----------------------------------
@@ -6014,7 +6078,7 @@ mod tests {
             let lists = worklist::Running::read(&self.store);
             let to: BTreeMap<String, String> = tasks
                 .iter()
-                .map(|t| (t.id.clone(), addressed_to(&self.index, &self.governors, &lists, t)))
+                .map(|t| (t.id.clone(), addressed_to(&self.index, &self.governors, &lists, t, self.store.allocated_to(&t.id).as_deref())))
                 .collect();
             stalled_seats(
                 &tasks,

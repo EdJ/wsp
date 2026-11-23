@@ -1062,11 +1062,7 @@ fn addressed(store: &Store, task: &Task) -> String {
     // reason. It used to be spelled here as well, and this receipt and
     // `cmd_message`'s were already two of them.
     match cmd_govern::answering_seat(store, task) {
-        Some(s) => format!(
-            "raised to the {} governor · {} · x there lowers it",
-            s.scope,
-            cmd_govern::whereabouts(&governors, &s)
-        ),
+        Some(s) => format!("raised to {} · x there lowers it", cmd_govern::seat_words(&governors, &s)),
         None => "raised on every panel · x there lowers it".into(),
     }
 }

@@ -667,7 +667,7 @@ mod tests {
             self.1
                 .iter()
                 .map(|s| match self.0.task(&s.subject) {
-                    Some(t) => s.clone().to(&crate::cmd_watch::addressed_to(&index, &governors, &lists, &t)),
+                    Some(t) => s.clone().to(&crate::cmd_watch::addressed_to(&index, &governors, &lists, &t, self.0.allocated_to(&t.id).as_deref())),
                     None => s.clone(),
                 })
                 .collect()

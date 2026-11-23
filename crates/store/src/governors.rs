@@ -150,7 +150,24 @@ pub fn seat_for(
     project: Option<&str>,
     allocated_to: Option<&str>,
 ) -> Option<Seat> {
-    if governors.is_empty() {
+    seat_for_as(governors, index, list, project, allocated_to, None)
+}
+
+/// [`seat_for`] with the user logged in on this spoke, which the store does not
+/// hold (`wsp-485`). `login` is `None` for a standalone wsp or a caller that
+/// does not know, and the walk is then [`seat_for`]'s. With a login, an
+/// allocated row whose user is *another's* ends at `primary:<user>` whether or
+/// not a primary is seated here — the seat is theirs, on their wsp, and
+/// delivery routes it through the hub ([`user_primary_seat_as`]).
+pub fn seat_for_as(
+    governors: &BTreeMap<String, Value>,
+    index: &Index,
+    list: Option<&str>,
+    project: Option<&str>,
+    allocated_to: Option<&str>,
+    login: Option<&str>,
+) -> Option<Seat> {
+    if governors.is_empty() && !is_elsewhere(allocated_to, login) {
         return None;
     }
     if let Some(list) = list {
@@ -175,16 +192,48 @@ pub fn seat_for(
         .into_iter()
         .flat_map(|p| std::iter::once(p.to_string()).chain(index.ancestors(p)))
         .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
-        .or_else(|| user_primary_seat(governors, allocated_to?))
+        .or_else(|| user_primary_seat_as(governors, allocated_to?, login))
+}
+
+/// Whether an allocation names a user other than the one logged in here.
+fn is_elsewhere(allocated_to: Option<&str>, login: Option<&str>) -> bool {
+    match (allocated_to.map(str::trim), login.map(str::trim)) {
+        (Some(u), Some(me)) => !u.is_empty() && !me.is_empty() && u != me,
+        _ => false,
+    }
 }
 
 /// The seat `primary:<user>` names, if seated: a record under that key, else
 /// the local [`PRIMARY`]'s occupant under the user's name — the step
 /// [`seat_for`] takes past the project levels for an allocated row.
 pub fn user_primary_seat(governors: &BTreeMap<String, Value>, user: &str) -> Option<Seat> {
+    user_primary_seat_as(governors, user, None)
+}
+
+/// [`user_primary_seat`] knowing who is logged in here. For a user who is not
+/// the login, the seat is `primary:<user>` whether or not a local primary is
+/// seated — the local one is *this* user's, never theirs — with no pane, so
+/// that what is said to it goes through the hub. For the login's own user, or
+/// with no login, it is [`user_primary_seat`]'s answer.
+pub fn user_primary_seat_as(governors: &BTreeMap<String, Value>, user: &str, login: Option<&str>) -> Option<Seat> {
     let user = user.trim();
     if user.is_empty() {
         return None;
+    }
+    if is_elsewhere(Some(user), login) {
+        let key = primary_of(user);
+        if let Some(seat) = governors.get(&key).and_then(|rec| seat_of(&key, rec)) {
+            return Some(seat);
+        }
+        return Some(Seat {
+            scope: key,
+            pane: String::new(),
+            since: String::new(),
+            session: String::new(),
+            cwd: String::new(),
+            kind: String::new(),
+            vacant: false,
+        });
     }
     let key = primary_of(user);
     if let Some(seat) = governors.get(&key).and_then(|rec| seat_of(&key, rec)) {
@@ -460,5 +509,39 @@ mod user_primary_tests {
         assert!(!is_primary("primary:ed"), "its 18 readers meant the bare primary");
         assert!(is_primary_key("primary") && is_primary_key("primary:ed"));
         assert!(!is_primary_key("primaryx") && !is_primary_key("wsp"));
+    }
+
+    /// `wsp-485`: on jesper's spoke an ed-allocated row's walk ends at
+    /// `primary:ed` with no primary seated here, and with one seated — which is
+    /// jesper's, never ed's, so it lends the seat nothing. An unallocated row,
+    /// ed's own spoke and a standalone one walk as they did.
+    #[test]
+    fn another_users_primary_is_reached_with_no_local_primary_seated() {
+        let index = crate::resolve::Index::new(vec![crate::model::Project::new("core")]);
+        let seated = |pane: &str| serde_json::json!({ "workspace": "w1", "pane": pane });
+        let mut g: BTreeMap<String, Value> = BTreeMap::new();
+        g.insert("core".into(), serde_json::json!({ "workspace": "", "pane": "" }));
+        let walk = |g: &BTreeMap<String, Value>, to: Option<&str>, login: Option<&str>| {
+            seat_for_as(g, &index, None, Some("core"), to, login)
+        };
+
+        let s = walk(&g, Some("ed"), Some("jesper")).expect("ed's, with nobody seated here");
+        assert_eq!((s.scope.as_str(), s.pane.as_str(), s.vacant), ("primary:ed", "", false));
+        assert_eq!(walk(&g, Some("ed"), None), None, "standalone: today's walk");
+        assert_eq!(walk(&g, Some("ed"), Some("ed")), None, "ed's own spoke with no primary: today's");
+        assert_eq!(walk(&g, None, Some("jesper")), None, "unallocated: the person");
+        assert_eq!(walk(&BTreeMap::new(), Some("ed"), Some("jesper")).map(|s| s.scope), Some("primary:ed".into()));
+
+        g.insert(PRIMARY.into(), seated("pr:1"));
+        let s = walk(&g, Some("ed"), Some("jesper")).unwrap();
+        assert_eq!((s.scope.as_str(), s.pane.as_str()), ("primary:ed", ""), "jesper's primary is not ed's");
+        let own = walk(&g, Some("jesper"), Some("jesper")).unwrap();
+        assert_eq!((own.scope.as_str(), own.pane.as_str()), ("primary:jesper", "pr:1"), "its own user: today's");
+        assert_eq!(walk(&g, Some("ed"), None).unwrap().pane, "pr:1", "standalone: today's");
+        assert_eq!(walk(&g, None, Some("jesper")), None);
+
+        // A record under the user's own key is theirs, seated.
+        g.insert("primary:ed".into(), seated("ed:1"));
+        assert_eq!(walk(&g, Some("ed"), Some("jesper")).unwrap().pane, "ed:1");
     }
 }
