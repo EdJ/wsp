@@ -3505,22 +3505,43 @@ fn archive_month(t: &Task) -> String {
 const ARCHIVE_MAX: usize = 20;
 
 /// `ls --json`'s rows: each task's record and its stage.
-fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
-    // `wsp-242`: each row's stage, every source read once for all of them.
-    let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
+pub(crate) fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
+    let r = ls_reading(store, tasks);
     tasks
         .iter()
-        .map(|t| {
-            let mut v = t.json();
-            // `wsp-274`: and since when, off the same timeline `show` gives.
-            v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
-            // The objects `show --json` has, and absent on an unstaged row.
-            if t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty() {
-                v["legs"] = crate::legs::json(t);
-            }
-            v
-        })
+        .map(|t| wsp_view::task::ls_json_row(t.json(), r.stages.get(&t.id), r.legs.get(&t.id).map(Vec::as_slice)))
         .collect()
+}
+
+/// What `ls --json` prints of `tasks` beside each record, as `wsp-view` takes
+/// it (wsp-743: the daemon's `tasks` reading is this over `ls --all`'s tasks).
+fn ls_reading(store: &Store, tasks: &[Task]) -> wsp_view::reading::Tasks {
+    // `wsp-242`: each row's stage, every source read once for all of them.
+    let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
+    wsp_view::reading::Tasks {
+        order: tasks.iter().map(|t| t.id.clone()).collect(),
+        // `wsp-274`: and since when, off the same timeline `show` gives.
+        stages: stages.iter().map(|(id, (s, h))| (id.clone(), crate::stage::view(s, h))).collect(),
+        // The objects `show --json` has, and absent on an unstaged row.
+        legs: tasks
+            .iter()
+            .filter(|t| t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty())
+            .map(|t| (t.id.clone(), crate::legs::view(t)))
+            .collect(),
+    }
+}
+
+/// The `tasks` reading (wsp-743): `ls --json --all`'s order, stages and legs,
+/// over the tasks it lists (every live task, by status, priority and id).
+pub(crate) fn tasks_reading(store: &Store) -> wsp_view::reading::Tasks {
+    ls_reading(store, &ls_all(store))
+}
+
+/// The tasks `ls --json --all` lists, in its order, with no project in scope.
+pub(crate) fn ls_all(store: &Store) -> Vec<Task> {
+    let index = Index::new(store.projects());
+    let args = Args::synth("ls", &[], &[("all", ""), ("json", "")]);
+    filtered(store, &args, &index, None)
 }
 
 /// The contract row a task is, as the mirror projects it, for `wsp-view`.

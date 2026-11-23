@@ -344,6 +344,8 @@ pub(crate) struct Api {
     pub(crate) db: wsp_server::SharedStore,
     _server: Option<wsp_server::Server>,
     _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// wsp-743: the census reads' inputs, beside the mirror's entities.
+    _readings: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 /// Open `state.db`, serve it, and start the mirror thread. Each failure is one
@@ -372,7 +374,8 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         }
     };
     let mirror = Some(crate::mirror::start(store, db.clone()));
-    Some(Api { db, _server: server, _mirror: mirror })
+    let readings = crate::readings::start(store, db.clone());
+    Some(Api { db, _server: server, _mirror: mirror, _readings: readings })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,

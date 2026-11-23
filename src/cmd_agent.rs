@@ -3880,17 +3880,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     picked_up.extend(silent_lines(store));
     match args.json() {
         true => {
-            let mut v = wip_json(&w);
-            if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
-                o.insert("waiting_at_cap".into(), serde_json::json!(cap_waits));
-            }
-            if let (Some(o), false) = (v.as_object_mut(), picked_up.is_empty()) {
-                let started: Vec<serde_json::Value> = crate::pickup::started_lately(store)
-                    .into_iter()
-                    .map(|(at, id, why)| serde_json::json!({ "at": at, "worklist": id, "why": why }))
-                    .collect();
-                o.insert("planned_started".into(), serde_json::json!(started));
-            }
+            let v = wsp_view::wip::census_json(&census_of(store, &w, cap_waits.clone(), !picked_up.is_empty()));
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
         }
         false => {
@@ -5237,7 +5227,37 @@ fn wip_attention(w: &Wip, rows: &[WipRow]) -> serde_json::Value {
     json!({ "needs_you": needs_you, "follow_up": follow_up })
 }
 
+/// `wip --json` whole as `wsp-view` takes it: the seats and head of `w`, the
+/// rows waiting at the cap, and the lists started lately where `picked_up`
+/// (there are pickup or silent lines to say).
+fn census_of(store: &Store, w: &Wip, cap_waits: Vec<String>, picked_up: bool) -> wsp_view::wip::Census {
+    let (agents, head) = wip_view(w);
+    let planned_started = picked_up.then(|| {
+        crate::pickup::started_lately(store)
+            .into_iter()
+            .map(|(at, id, why)| serde_json::json!({ "at": at, "worklist": id, "why": why }))
+            .collect()
+    });
+    wsp_view::wip::Census { agents, head, waiting_at_cap: cap_waits, planned_started }
+}
+
+/// The `wip` reading (wsp-743): `wip --json`'s input as the CLI reads it on
+/// the files path (`WSP_READ` unset), so a reader of the reading prints what
+/// `wip --json` prints.
+pub(crate) fn wip_reading(store: &Store) -> wsp_view::wip::Census {
+    let w = Wip::from_managers(store);
+    let cap_waits = crate::room::waiting_lines(store, &w.agents);
+    let picked_up = !crate::pickup::wip_lines(store).is_empty() || !silent_lines(store).is_empty();
+    census_of(store, &w, cap_waits, picked_up)
+}
+
+#[cfg(test)]
 fn wip_json(w: &Wip) -> serde_json::Value {
+    let (agents, head) = wip_view(w);
+    wsp_view::wip::wip_json(&agents, &head)
+}
+
+fn wip_view(w: &Wip) -> (Vec<wsp_view::wip::Agent>, wsp_view::wip::Head) {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
     let agents: Vec<wsp_view::wip::Agent> = rows
@@ -5291,7 +5311,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         review: in_review.iter().map(|t| t.json()).collect(),
         inbox,
     };
-    wsp_view::wip::wip_json(&agents, &head)
+    (agents, head)
 }
 
 /// What the `REVIEW` line says to do about a row at `review` (`wsp-323`).

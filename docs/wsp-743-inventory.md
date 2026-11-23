@@ -124,3 +124,37 @@ reply nearest the limit and should be watched, but it is not changed here.
 `wip --json` (agents and attention) shapes from a gathering that is src/-only (`Wip::from_api`). Option (a) puts
 a written `Agent` record on each seat; the mirror's daemon pass then runs `wip_rows` (it already does, for attention
 items, each pass). Confirm (a) before contract-store, as it decides the largest change.
+
+## What contract-store did (880b465 and the commit after it)
+
+Option (a) taken, and widened: d1 says "each becomes a field the mirror writes or a served value". So each
+census read's src-only inputs became one **reading** each: the JSON of the wsp-view input struct, which the
+daemon takes with the CLI's own builder. They are not fields on entities, because:
+- seats are the fold's, and the mirror never writes one, so `role` rides in the `wip` reading's `Agent.role`;
+- `worklist ls` and `ls` order and select in src (`worklist::listing`, `keep`'s sort), and a field per entity loses that;
+- stages, the throttle and wip move on things no fingerprint covers (said.json, the census, load), so a mirror field would go stale.
+
+So `state`, `rows {}`, `lists {}` and `wip` are byte for byte what they were; no entity gained a field.
+
+Correction to the table above: `ls --json --all` is `Task::json` + `stage` + `legs` (when it has legs; `cmd_task::rows_json`),
+not `ls_row`. `ls_row` and `archived` belong to `find --json`. `ls` lists live tasks only, and the archive is not read.
+
+| read | API call | wsp-view | reading (`wsp_view::reading`) | CLI builder it shares |
+|---|---|---|---|---|
+| tasks | `rows {heads: true}` + `readings {names:["tasks"]}` | `task::ls_json_row(task_json(row), stages[id], legs[id])` over `order` | `Tasks{order, stages, legs}` | `cmd_task::ls_reading` / `tasks_reading` |
+| flags | `asks {kinds:[flag]}` | none | none | |
+| agents, wip | `readings ["wip"]` | `wip::census_json` | `wip::Census{agents, head, waiting_at_cap, planned_started}` | `cmd_agent::census_of` / `wip_reading` (files path) |
+| worklists, lists | `readings ["worklists"]` | `worklist::list_json` | `[Listing]` | `cmd_worklist::listings` |
+| machines | `readings ["machines"]` | `machine::list_json` | `machine::Fleet` | `cmd_machine::view(&Fleet::live)` |
+| throttle | `readings ["throttle"]` | `throttle::json` | `throttle::Throttle` | `throttle::view` |
+| spend | `readings ["spend"]` | `spend::report(lines, &places(), landed, now)` | `Spend{lines, places, landed}` | `spend::reading` |
+
+Contract: `RowFilter.heads`, `ListFilter{heads}` (null or absent `args` still read), `Reads::lists`, and
+`Readings{readings, set_reading}` in the `Store` family (default impls: read empty, write refused). `Reading{json, at}`
+lives in a `reading` table beside the state: no event, never in `snapshot()`. API: `lists` takes the filter, and
+`readings {names}` is answered by `Answer::Readings`. The server's two arms are in. Client methods and the
+equality tests against the CLI are wire-and-measure's.
+Writer: `src/readings.rs`, a daemon thread beside the mirror. Throttle, machines, wip and worklists are taken every
+10 s, tasks every 30 s, spend every 60 s. `WSP_READINGS=off` turns it off.
+CLI `--json` sizes measured read-only on the live store (pretty; the readings are compact): wip 299,616; worklist ls
+194,848; machine ls 1,124; throttle 546; spend 47,072; ls --all 3,343,254. All well under MAX_LINE.

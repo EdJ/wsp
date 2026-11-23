@@ -2627,8 +2627,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if args.json() {
         // No collapse and no `--all` here: an abridgement is a thing done for
         // a reader, and a parser is not one.
-        let waits = crate::waits::read(store, &listed);
-        let out = wsp_view::worklist::list_json(&listing_of(store, &listed, &waits));
+        let out = wsp_view::worklist::list_json(&listings_of(store, &listed));
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -2762,6 +2761,16 @@ fn count(n: usize) -> String {
 
 /// The rows of `worklist ls --json`, read: each list's head, the facts the
 /// listing adds, and the queue place of a planned one. `wsp-view` draws them.
+/// `worklist ls --json`'s input, as `wsp-view` takes it (wsp-743: the daemon's
+/// `worklists` reading).
+pub(crate) fn listings(store: &Store) -> Vec<wsp_view::worklist::Listing> {
+    listings_of(store, &worklist::listing(store, store.worklists()))
+}
+
+fn listings_of(store: &Store, listed: &[worklist::Listed]) -> Vec<wsp_view::worklist::Listing> {
+    listing_of(store, listed, &crate::waits::read(store, listed))
+}
+
 fn listing_of(store: &Store, listed: &[worklist::Listed], waits: &[(String, Option<crate::waits::Wait>)]) -> Vec<wsp_view::worklist::Listing> {
     listed
         .iter()

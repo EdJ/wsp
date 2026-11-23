@@ -307,7 +307,13 @@ fn agents_on<'a>(here: &'a [Standing], name: &str) -> Vec<&'a Standing> {
 
 /// `machine ls --json`: the fleet's reads handed to `wsp-view` as plain values.
 fn list_json(f: &Fleet) -> Value {
-    wsp_view::machine::list_json(&wsp_view::machine::Fleet {
+    wsp_view::machine::list_json(&view(f))
+}
+
+/// The fleet as `wsp-view` takes it (wsp-743: the daemon's `machines` reading
+/// is this over `Fleet::live`).
+pub(crate) fn view(f: &Fleet) -> wsp_view::machine::Fleet {
+    wsp_view::machine::Fleet {
         machines: f.machines.iter().map(|m| (record_of(m), f.live.get(&m.name).map(live_of))).collect(),
         agents: standing(f)
             .into_iter()
@@ -316,7 +322,7 @@ fn list_json(f: &Fleet) -> Value {
         seat: f.seat.clone(),
         seat_cap: f.seat_cap,
         seat_working: f.seat_working.clone(),
-    })
+    }
 }
 
 /// The list as text, one line per element and nothing printed.
