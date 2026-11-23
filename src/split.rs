@@ -26,8 +26,9 @@
 //! - [`unrun`]: the sub-tasks no run will start. `wsp worklist show`, the
 //!   governor and the member's verifier are each told about them.
 //! - [`Refused`]: the verbs a working seat is refused, with what it does
-//!   instead, as every packet lists them and `wsp edit --overview` checks an
-//!   order for them (`wsp-312`).
+//!   instead. A packet whose row names one lists it, `wsp review` warns once
+//!   about a done-when that needs one, and `wsp edit --overview` says when an
+//!   overview names one (`wsp-312`).
 
 use crate::model::{Status, Task, Worklist};
 use crate::worklist::Running;
@@ -96,8 +97,8 @@ pub(crate) fn filed_anyway(parent: &str, child: &str) -> String {
 /// (`legs::another_rows_seat`). wsp-303's barrier order told its seat to
 /// `wsp mv` 86 rows, and `wsp mv` is on the person's deny list, so every agent
 /// seat is refused it. Each one became an ask and a done-when nobody could
-/// finish. A packet lists all three with what to do instead ([`seat_rule`]), and
-/// an overview that names one is warned about when it is written
+/// finish. A packet whose row names one lists it with what to do instead
+/// ([`seat_rule`]), and a done-when or overview that names one is warned about
 /// ([`named_in`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
@@ -139,14 +140,35 @@ impl Refused {
     }
 }
 
-/// What every packet says about the verbs [`Refused`] names, for the seat
-/// working `id`.
-pub(crate) fn seat_rule(id: &str) -> String {
-    let mut out = String::from("Refused to this seat: an order that names one of these is asking for the instead, not the verb.");
-    for r in Refused::ALL {
+/// The packet section for the verbs in `named`, for the seat working `id`:
+/// each with what to do instead. `None` when the row names none, so a packet
+/// says nothing of verbs nobody asked for.
+pub(crate) fn seat_rule(id: &str, named: &[Refused]) -> Option<String> {
+    if named.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "## Verbs this seat is refused\nThis row's words name verbs this seat is refused. Where they ask you to run one, do its instead, and where that leaves part of the work undone, mark that item not held in your exit and ask about it.",
+    );
+    for r in named {
         out.push_str(&format!("\n- {}", r.line(id)));
     }
-    out
+    Some(out)
+}
+
+/// What `wsp review` says, once, when the done-when of `id` needs a verb its
+/// seat is refused: one line naming every such verb, or `None`.
+pub(crate) fn warn_done_when(done_when: &str, id: &str) -> Option<String> {
+    let named = named_in(done_when, Some(id));
+    (!named.is_empty()).then(|| {
+        let verbs: Vec<String> = named.iter().map(|r| format!("`{}`", r.verb())).collect();
+        let instead: Vec<String> = named.iter().map(|r| r.line(id)).collect();
+        format!(
+            "{id}'s done-when needs {}, which its seat is refused: an item that rests on it is not held until someone else runs it — {}",
+            verbs.join(", "),
+            instead.join(" · ")
+        )
+    })
 }
 
 /// The verbs in [`Refused`] that `text` tells the seat working `own` to run.
@@ -155,9 +177,10 @@ pub(crate) fn seat_rule(id: &str) -> String {
 ///
 /// `wsp mv` is refused every agent seat, so it counts wherever it is named.
 /// `wsp add --parent` counts unless it names a parent other than `own`, because
-/// [`refusal`] refuses only the seat's own row. `wsp leg add` counts only when
-/// it names a row other than `own`: legs on its own row are the seat's to give.
-/// A placeholder such as `<id>` names no row.
+/// [`refusal`] refuses only the seat's own row. `wsp leg add` counts unless it
+/// names `own`: legs on its own row are the seat's to give, and a bare one, or
+/// one with a placeholder such as `<id>`, is a planner's step the seat cannot
+/// take. With no `own`, a row's legs are anyone's call, so it does not count.
 pub(crate) fn named_in(text: &str, own: Option<&str>) -> Vec<Refused> {
     let after = |line: &str, at: &str| -> Option<String> {
         let rest = &line[line.find(at)? + at.len()..];
@@ -177,7 +200,7 @@ pub(crate) fn named_in(text: &str, own: Option<&str>) -> Vec<Refused> {
         {
             found.push(Refused::AddParent);
         }
-        if line.contains("wsp leg add") && own.is_some() && other(after(line, "wsp leg add")) {
+        if line.contains("wsp leg add") && own.is_some() && after(line, "wsp leg add").as_deref() != own {
             found.push(Refused::LegAdd);
         }
         if line.split("wsp mv").skip(1).any(|rest| rest.is_empty() || rest.starts_with([' ', '`', ':', ','])) {
@@ -377,25 +400,42 @@ mod tests {
         // row or a placeholder, and words that only look like the verb.
         assert!(named_in("file a follow-up with `wsp add \"y\" --parent wsp-200`", own).is_empty());
         assert!(named_in("commit, then `wsp leg add wsp-154 <name> --order FILE`", own).is_empty());
-        assert!(named_in("`wsp leg add <id> <name> --order FILE` per leg", own).is_empty());
+        // A planner's step, bare or with a placeholder, is not this seat's.
+        assert_eq!(named_in("split it with `wsp leg add` per phase", own), vec![Refused::LegAdd]);
+        assert_eq!(named_in("`wsp leg add <id> <name> --order FILE` per leg", own), vec![Refused::LegAdd]);
         assert!(named_in("wsp mvp is not a verb", own).is_empty());
         // A worklist's overview: no row reads it, so a leg is anyone's call.
         assert!(named_in("`wsp leg add wsp-9 a`", None).is_empty());
         assert_eq!(named_in("wsp mv it\nwsp add --parent", None), vec![Refused::AddParent, Refused::Mv]);
     }
 
-    /// Every packet's rule names the three verbs and what to do instead of
-    /// each, in the refusals' own words.
+    /// The packet section names the verbs the row named, each with what to do
+    /// instead in the refusals' own words, and is absent when it named none.
     #[test]
     fn the_seat_rule_names_each_refused_verb_with_its_instead() {
-        let rule = seat_rule("m-1");
+        let rule = seat_rule("m-1", &Refused::ALL).unwrap();
         for r in Refused::ALL {
             assert!(rule.contains(&format!("`{}", r.verb())), "{r:?}: {rule}");
         }
         assert_eq!(rule.matches("Instead:").count(), 3, "{rule}");
         assert!(rule.contains(&steps("m-1")) && rule.contains(crate::legs::GIVEN_BY) && rule.contains("`wsp ask m-1 --person`"), "{rule}");
+        let one = seat_rule("m-1", &[Refused::Mv]).unwrap();
+        assert!(one.contains("`wsp mv`") && !one.contains("`wsp add --parent"), "{one}");
+        assert_eq!(seat_rule("m-1", &[]), None);
         assert_eq!(warn_order("wsp mv x", Some("m-1")).len(), 1);
         assert!(warn_order("nothing refused here", Some("m-1")).is_empty());
+    }
+
+    /// wsp-303's done-when rested on `wsp mv`. Naming two verbs over several
+    /// lines is still one warning, and a done-when that needs none has none.
+    #[test]
+    fn a_done_when_needing_refused_verbs_is_one_warning() {
+        let dw = "- only wsp-302 keeps parent wsp-155, after `wsp mv <id> --parent none`\n- the 86 rows are detached with wsp mv\n- sub-tasks filed with `wsp add --parent`";
+        let said = warn_done_when(dw, "wsp-303").unwrap();
+        assert!(!said.contains('\n'), "{said}");
+        assert_eq!(said.matches("`wsp mv`").count(), 2, "named once, and once in its instead: {said}");
+        assert!(said.contains("`wsp add --parent`, `wsp mv`") && said.contains("`wsp ask wsp-303 --person`"), "{said}");
+        assert_eq!(warn_done_when("- `cargo test packet::` passes", "wsp-303"), None);
     }
 
     #[test]

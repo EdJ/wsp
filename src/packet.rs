@@ -435,7 +435,8 @@ pub fn build_leg(task: &str, leg: &str, path: &str, root: &Path, last: bool) -> 
     let p = parse(&text);
     let kind = if last { crate::exit::Kind::Member } else { crate::exit::Kind::Leg };
     let exit = crate::closing::exit_template(kind, task, &[]);
-    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), task, &exit)
+    let refused = crate::split::seat_rule(task, &crate::split::named_in(&p.text, Some(task)));
+    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), refused.as_deref(), &exit)
 }
 
 /// A leg spawn's decision: the size of its packet when it starts short, `None`
@@ -488,7 +489,9 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
         None => format!("# Packet · {} · {}\n", t.id, t.title),
     };
     let exit = crate::closing::exit_template(crate::exit::Kind::Member, &t.id, &crate::cmd_submit::packet_items(t));
-    render(&head, &p, root, &t.id, &t.id, &exit)
+    let words = format!("{}\n{}", t.section("Overview").unwrap_or_default(), p.text);
+    let refused = crate::split::seat_rule(&t.id, &crate::split::named_in(&words, Some(&t.id)));
+    render(&head, &p, root, &t.id, refused.as_deref(), &exit)
 }
 
 /// Bytes of the owed block: the newest reason is always in (cut to this if it
@@ -567,10 +570,10 @@ pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrow
 /// found its own shell.
 pub const WAIT_RULE: &str = "Waiting: never wait on `pgrep -f \"<string>\"` — the pattern is on the loop's own line, so it finds its own shell and never ends; wait on a pid (`wait <pid>`, or `while kill -0 <pid>; do sleep 5; done`) or on a `run_in_background` command's notification.";
 
-/// The print: a heading, the author's words, the verbs the seat working `row`
-/// is refused (`wsp-312`), the seat's exit template (`wsp-617`), then each
-/// named file inline, refused over [`CAP`].
-fn render(head: &str, p: &Packet, root: &Path, who: &str, row: &str, exit: &str) -> Result<String, String> {
+/// The print: a heading, the author's words, the verbs the row names that its
+/// seat is refused (`refused`, `wsp-312`), the seat's exit template
+/// (`wsp-617`), then each named file inline, refused over [`CAP`].
+fn render(head: &str, p: &Packet, root: &Path, who: &str, refused: Option<&str>, exit: &str) -> Result<String, String> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for f in &p.files {
         if !inside(f) {
@@ -588,14 +591,8 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, row: &str, exit: &str)
         out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
     out.push_str(&format!("\n{WAIT_RULE}\n"));
-    out.push_str(&format!("\n{}\n", crate::split::seat_rule(row)));
-    let named = crate::split::named_in(&p.text, Some(row));
-    if !named.is_empty() {
-        let verbs: Vec<String> = named.iter().map(|r| format!("`{}`", r.verb())).collect();
-        out.push_str(&format!(
-            "\nThis packet's words name {}. Where they ask you to run one, do its instead from the list above, and where that leaves part of the work undone, mark that item not held in your exit and ask about it.\n",
-            verbs.join(", ")
-        ));
+    if let Some(section) = refused {
+        out.push_str(&format!("\n{section}\n"));
     }
     if !exit.is_empty() {
         out.push_str(&format!("\n{exit}"));
@@ -841,25 +838,39 @@ mod tests {
     }
 
     /// spec-breakdown's orders named verbs their seats were refused, and each
-    /// became an ask and an unfinished done-when (`wsp-312`). Every packet lists
-    /// the three with what to do instead, and one whose words name a verb says
-    /// so.
+    /// became an ask and an unfinished done-when (`wsp-312`). A planning row
+    /// whose overview says `wsp add --parent` or `wsp leg add`, and a row naming
+    /// `wsp mv`, get a section naming the refused verb and what to do instead; a
+    /// row naming none does not.
     #[test]
-    fn every_packet_lists_the_verbs_its_seat_is_refused_and_says_when_its_words_name_one() {
+    fn a_row_naming_a_verb_its_seat_is_refused_gets_a_section_and_one_naming_none_does_not() {
         let dir = std::env::temp_dir().join(format!("wsp-packet-refused-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
-        let plain = build(&row("file: src/a.rs\nSave prints ok."), &dir).unwrap();
-        assert_eq!(plain.matches(&crate::split::seat_rule("t-1")).count(), 1, "{plain}");
-        assert!(!plain.contains("This packet's words name"), "{plain}");
-        let ordered = build(&row("file: src/a.rs\n- `wsp mv <id> --parent none` for each of the 86.\n- Sub-tasks of this row (`wsp add --parent`)."), &dir).unwrap();
-        assert!(ordered.contains("This packet's words name `wsp add --parent`, `wsp mv`."), "{ordered}");
-        // Before the exit and the files, where the brief is read.
-        assert!(ordered.find("Refused to this seat").unwrap() < ordered.find("## src/a.rs").unwrap());
+        let planning = |overview: &str| {
+            let mut t = row("file: src/a.rs\nBreak the spec down.");
+            crate::model::set_section_in(&mut t.body, "Overview", overview);
+            build(&t, &dir).unwrap()
+        };
+        let cases = [
+            (planning("2. Sub-tasks of this row (`wsp add --parent`), each small enough for one seat."), "`wsp add --parent t-1`", "Instead: commit, then `wsp leg add t-1"),
+            (planning("3. Split each phase with `wsp leg add` per piece."), "`wsp leg add <other row>`", "Instead: `wsp ask` a planner"),
+            (build(&row("file: src/a.rs\n- `wsp mv <id> --parent none` for each of the 86."), &dir).unwrap(), "`wsp mv`:", "Instead: `wsp ask t-1 --person`"),
+        ];
+        for (text, verb, instead) in &cases {
+            assert_eq!(text.matches("## Verbs this seat is refused").count(), 1, "{text}");
+            assert!(text.contains(verb) && text.contains(instead), "{verb}: {text}");
+            // Before the exit and the files, where the brief is read.
+            assert!(text.find("## Verbs this seat is refused").unwrap() < text.find("## Your exit").unwrap(), "{text}");
+        }
+        assert!(!cases[2].0.contains("`wsp add --parent"), "only the verbs the row names: {}", cases[2].0);
+        let plain = planning("Make a return 1.");
+        assert!(!plain.contains("## Verbs this seat is refused") && !plain.contains("wsp mv"), "{plain}");
+        // A leg's seat is its row's, and its packet is read the same way.
         let leg = dir.join("leg.md");
-        std::fs::write(&leg, "Make a return 1.\n").unwrap();
+        std::fs::write(&leg, "Detach them with `wsp mv`.\n").unwrap();
         let text = build_leg("t-1", "a", leg.to_str().unwrap(), &dir, false).unwrap();
-        assert!(text.contains(&crate::split::seat_rule("t-1")), "a leg's seat is its row's: {text}");
+        assert!(text.contains("## Verbs this seat is refused") && text.contains("`wsp ask t-1 --person`"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -935,8 +946,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let plain = build(&row("Add the flag."), &dir).unwrap();
         let exit = crate::closing::exit_template(crate::exit::Kind::Member, "t-1", &[]);
-        let refused = crate::split::seat_rule("t-1");
-        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{refused}\n\n{exit}"));
+        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{exit}"));
         let mut t = row("Add the flag.");
         t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n");
         t.set_status(crate::model::Status::Review);
