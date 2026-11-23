@@ -1,0 +1,58 @@
+[
+  {
+    "about": {
+      "task": "alpha-001"
+    },
+    "ask": "",
+    "at": "2026-11-18T11:06:40Z",
+    "caption": {
+      "from": "derived",
+      "text": "Which scope do we ship first?"
+    },
+    "choices": null,
+    "for": "person",
+    "from": {
+      "pane": "cpd-7",
+      "workspace": "w1"
+    },
+    "id": "m-seed-q1",
+    "kind": "note",
+    "reply_to": null,
+    "seen": false,
+    "shape": "question",
+    "source": "agent",
+    "state": "open",
+    "text": "Which scope do we ship first?",
+    "via": [],
+    "waiting": {
+      "pane": "cpd-7",
+      "task": "beta-003"
+    }
+  },
+  {
+    "about": {
+      "task": "beta-001"
+    },
+    "ask": "",
+    "at": "2026-11-18T11:06:40Z",
+    "caption": {
+      "from": "derived",
+      "text": "The vendor has not answered"
+    },
+    "choices": null,
+    "for": null,
+    "from": {
+      "human": true
+    },
+    "id": "m-seed-flag",
+    "kind": "note",
+    "reply_to": null,
+    "seen": false,
+    "shape": "notification",
+    "source": "human",
+    "state": "open",
+    "text": "The vendor has not answered",
+    "via": [],
+    "waiting": null
+  }
+]

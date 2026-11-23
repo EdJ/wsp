@@ -1,0 +1,66 @@
+{
+  "closed": [
+    {
+      "about": {
+        "task": "alpha-002"
+      },
+      "asked": "Is the second row still wanted?",
+      "at": "2026-11-18T11:06:40Z",
+      "caption": {
+        "from": "derived",
+        "text": "Is the second row still wanted?"
+      },
+      "choices": null,
+      "closed": {
+        "answer": {
+          "text": "yes, keep it"
+        },
+        "at": "2026-11-18T11:06:40Z",
+        "by": "person",
+        "how": "answered",
+        "kind": "answered",
+        "reason": null
+      },
+      "for": "person",
+      "from": "cpd-7",
+      "id": "m-seed-q2",
+      "project": "alpha",
+      "text": "Is the second row still wanted?",
+      "unblocks": "list-a group 2",
+      "unrouted": null,
+      "waiting": {
+        "pane": "cpd-7",
+        "task": "beta-003"
+      }
+    }
+  ],
+  "closed_by_the_run": 0,
+  "items": [
+    {
+      "about": {
+        "task": "alpha-001"
+      },
+      "asked": "Which scope do we ship first?",
+      "at": "2026-11-18T11:06:40Z",
+      "caption": {
+        "from": "derived",
+        "text": "Which scope do we ship first?"
+      },
+      "choices": null,
+      "for": "person",
+      "from": "cpd-7",
+      "id": "m-seed-q1",
+      "project": "alpha",
+      "text": "Which scope do we ship first?",
+      "unblocks": "alpha-001",
+      "unrouted": null,
+      "waiting": {
+        "pane": "cpd-7",
+        "task": "beta-003"
+      }
+    }
+  ],
+  "project": "alpha",
+  "retro": [],
+  "review": 0
+}

@@ -30,3 +30,5 @@ pub mod machine;
 pub mod throttle;
 /// `spend --json`.
 pub mod spend;
+/// `flag --person --json` and `yours --json`.
+pub mod asks;

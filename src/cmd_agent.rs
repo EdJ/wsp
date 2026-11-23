@@ -1105,6 +1105,11 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     // because both read [`message::raised_to_the_person`] (`wsp-275`). Not `--for person` after the JSON
     // field, because the spell check would then offer `--for` for `--form`,
     // which is the slip `--from` is there to catch.
+    if args.json() && args.has("person") {
+        let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+        println!("{}", serde_json::to_string_pretty(&wsp_view::asks::flags_person(&state, util::epoch_secs())).unwrap_or_default());
+        return 0;
+    }
     let rows: Vec<Message> = match args.has("person") {
         true => message::raised_to_the_person(store),
         false => message::raised(store).into_iter().filter(|m| !m.is_reply()).collect(),

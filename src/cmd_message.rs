@@ -1134,31 +1134,15 @@ pub(crate) fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
 /// What answering this unblocks, derived from what it is about. Never stored:
 /// a member moved between groups would leave a stored one lying.
 pub(crate) fn unblocks(store: &Store, q: &Message) -> Option<String> {
-    match &q.about {
-        About::Group { scope, group } => Some(format!("{scope} group {group}")),
-        About::Scope(s) => Some(s.clone()),
-        About::Task(t) => match crate::worklist::Running::read(store).of(t) {
-            Some(at) => Some(format!("{} group {}", at.list, at.group)),
-            None => Some(t.clone()),
-        },
-        About::Nothing => None,
-    }
+    crate::mirror::unblocks(store, q)
 }
 
-/// The project an item belongs to: its task's, or for a list its first
-/// member's that still exists — a list has no project of its own.
 fn project_of(store: &Store, about: &About) -> Option<String> {
-    let task = match about {
-        About::Task(t) => store.task(t),
-        About::Scope(l) | About::Group { scope: l, .. } => store
-            .worklist(l)
-            .and_then(|w| w.groups().iter().flat_map(|g| g.members.clone()).find_map(|m| store.task(&m))),
-        About::Nothing => None,
-    }?;
-    task.project.clone().filter(|p| !p.is_empty())
+    crate::mirror::project_of(store, about)
 }
 
 /// An item, as `wsp yours --json` gives it.
+#[cfg(test)]
 fn item_json(store: &Store, q: &Message) -> serde_json::Value {
     let whole = q.to_json();
     json!({
@@ -1181,6 +1165,7 @@ fn item_json(store: &Store, q: &Message) -> serde_json::Value {
 
 /// A closed question of the person's, as `yours --json` lists it for ten
 /// minutes after (compound's §26.8 D7): the item, and how it ended.
+#[cfg(test)]
 fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
     let mut v = item_json(store, q);
     v["closed"] = closed;
@@ -1188,10 +1173,12 @@ fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_j
 }
 
 /// How long a closed question stays in `yours --json`'s `closed`.
+#[cfg(test)]
 const CLOSED_FOR: i64 = 600;
 
 /// The person's questions closed in the last [`CLOSED_FOR`] seconds, newest
 /// first, each with `closed: {how, by, at, answer}`.
+#[cfg(test)]
 pub(crate) fn recently_closed(store: &Store) -> Vec<(Message, serde_json::Value)> {
     let mut out: Vec<(Message, serde_json::Value)> = store
         .messages()
@@ -1365,23 +1352,10 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
         .count();
 
     if args.json() {
+        let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "project": project,
-                "items": items.iter().map(|q| item_json(store, q)).collect::<Vec<_>>(),
-                "review": review,
-                "closed_by_the_run": crate::auto_close::unseen(store).len(),
-                "retro": crate::retro_yours::yours_lines(store),
-                // The person's questions closed in the last ten minutes, so a
-                // reader can tell *answered in the pane* from *gone*.
-                "closed": recently_closed(store)
-                    .into_iter()
-                    .filter(|(m, _)| project.is_none() || yours_scope(store, m, project.as_deref(), &index))
-                    .map(|(m, c)| closed_json(store, &m, c))
-                    .collect::<Vec<_>>(),
-            }))
-            .unwrap_or_default()
+            serde_json::to_string_pretty(&wsp_view::asks::yours(&state, util::epoch_secs(), project.as_deref())).unwrap_or_default()
         );
         return 0;
     }

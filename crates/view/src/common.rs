@@ -42,6 +42,12 @@
 //! | `census`       | the census state word (`place::State::as_str`)         | [`crate::stage::census_word`] |
 //! | `governs`      | the scope the seat governs (`place::governs`), absent for none | [`crate::stage::agent_of`] |
 //!
+//! And on an [`wsp_store_contract::Ask`] (`mirror::ask_facts`), read by [`crate::asks`]:
+//! `raised`, `person`, `wants`, `person_q` (`"true"` or absent), `item_project`,
+//! `project_chain` (the project and its ancestors, joined by `,`; a review row
+//! carries its own too), `unblocks`; and on the machine named `local`
+//! `yours_unseen` (a count) and `yours_retro` (a JSON array).
+//!
 //! `Row::project` is not the file's project: it is `model::project_of`, which
 //! names an inbox row's project after its id. [`project`] reads the file's.
 //! A comma inside a tag, an `after` id or a ref is split by [`list`]; none is

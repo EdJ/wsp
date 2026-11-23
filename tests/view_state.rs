@@ -27,6 +27,10 @@ const PROJECTIONS: &[Projection] = &[
     ("wip", &["wip", "--json"], wip),
     ("worklist-ls", &["worklist", "ls", "--json"], worklist_ls),
     ("machine-ls", &["machine", "ls", "--json"], machine_ls),
+    ("flag-person", &["flag", "--person", "--json"], flag_person),
+    ("yours", &["yours", "--json"], yours),
+    ("yours-alpha", &["yours", "-p", "alpha", "--json"], yours_alpha),
+    ("yours-beta", &["yours", "-p", "beta", "--json"], yours_beta),
 ];
 
 /// Recordings `view_golden` already fails at HEAD (the fake manager gives an agent no
@@ -43,6 +47,22 @@ fn worklist_ls(state: &State, now: i64) -> String {
 
 fn machine_ls(state: &State, now: i64) -> String {
     wsp_view::machine::ls_of_state(state, now).to_string()
+}
+
+fn flag_person(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::asks::flags_person(state, now)).unwrap()
+}
+
+fn yours(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::asks::yours(state, now, None)).unwrap()
+}
+
+fn yours_alpha(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::asks::yours(state, now, Some("alpha"))).unwrap()
+}
+
+fn yours_beta(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::asks::yours(state, now, Some("beta"))).unwrap()
 }
 
 #[test]

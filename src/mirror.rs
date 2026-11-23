@@ -803,6 +803,18 @@ pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let worklists = store.worklists();
     let texts = texts_of(store, &tasks);
     let mut out = rows(&tasks, &claims_file, &worklists, &texts, &crate::stage::sayings(store));
+    {
+        // A review row's project chain, for `yours --json -p`'s count.
+        let index = crate::resolve::Index::new(store.projects());
+        for e in out.iter_mut() {
+            if let Entity::Row(r) = e {
+                let project = r.fields.get(key::PROJECT).cloned().unwrap_or_default();
+                if r.fields.get(key::STATUS).map(String::as_str) == Some("review") && !project.is_empty() {
+                    r.fields.insert(wsp_view::asks::key::CHAIN.to_string(), chain_of(&index, &project));
+                }
+            }
+        }
+    }
     out.extend(claims(&claims_file));
     let mut ls = lists(&worklists, &tasks, &list_texts_of(store, &worklists));
     list_facts(store, worklists.clone(), &mut ls);
@@ -824,6 +836,10 @@ fn seat_machine(store: &Store, out: &mut Vec<Entity>, local: &str) {
     use wsp_view::machine::key as k;
     let cap = store.seat_cap();
     let mut f = BTreeMap::new();
+    // `yours --json`'s two readings that belong to no ask: the rows the run
+    // closed that nobody has looked at, and the retro lines.
+    f.insert(wsp_view::asks::key::UNSEEN.to_string(), crate::auto_close::unseen(store).len().to_string());
+    f.insert(wsp_view::asks::key::RETRO.to_string(), serde_json::json!(crate::retro_yours::yours_lines(store)).to_string());
     f.insert(k::SEAT.to_string(), wsp_base::util::hostname());
     if let Some(n) = cap {
         f.insert(k::SEAT_CAP.to_string(), n.to_string());
@@ -922,7 +938,65 @@ pub fn state_of(store: &Store, local: &str) -> c::State {
 
 /// Reads the attention half: messages and flags.
 pub fn read_attention(store: &Store) -> Vec<Entity> {
-    asks(&store.messages(), &store.flags())
+    let mut out = asks(&store.messages(), &store.flags());
+    ask_facts(store, &mut out);
+    out
+}
+
+/// The project an item belongs to: its task's, or for a list its first
+/// member's that still exists — a list has no project of its own.
+pub fn project_of(store: &Store, about: &About) -> Option<String> {
+    let task = match about {
+        About::Task(t) => store.task(t),
+        About::Scope(l) | About::Group { scope: l, .. } => store
+            .worklist(l)
+            .and_then(|w| w.groups().iter().flat_map(|g| g.members.clone()).find_map(|m| store.task(&m))),
+        About::Nothing => None,
+    }?;
+    task.project.clone().filter(|p| !p.is_empty())
+}
+
+/// What an item holds: the list and group it unblocks, or the row.
+pub fn unblocks(store: &Store, q: &Message) -> Option<String> {
+    match &q.about {
+        About::Group { scope, group } => Some(format!("{scope} group {group}")),
+        About::Scope(s) => Some(s.clone()),
+        About::Task(t) => match crate::worklist::Running::read(store).of(t) {
+            Some(at) => Some(format!("{} group {}", at.list, at.group)),
+            None => Some(t.clone()),
+        },
+        About::Nothing => None,
+    }
+}
+
+/// A project and its ancestors, nearest first, joined by `,`.
+fn chain_of(index: &crate::resolve::Index, project: &str) -> String {
+    let mut all = vec![project.to_string()];
+    all.extend(index.ancestors(project));
+    all.join(",")
+}
+
+/// What `flag --person --json` and `yours --json` read off each message that
+/// the record does not say (wsp-308; keys in [`wsp_view::asks::key`]): whether
+/// it is raised, the person's, wanting an answer, a question for the person;
+/// its project and that project's chain, and what it unblocks.
+fn ask_facts(store: &Store, out: &mut [Entity]) {
+    use wsp_view::asks::key as k;
+    let index = crate::resolve::Index::new(store.projects());
+    for e in out.iter_mut() {
+        let Entity::Ask(a) = e else { continue };
+        let Some(m) = message_of(a) else { continue };
+        let raised = m.needs_attention();
+        let flag = |b: bool| if b { "true" } else { "" };
+        put(&mut a.fields, k::RAISED, flag(raised));
+        put(&mut a.fields, k::PERSON, flag(raised && !m.is_reply() && m.is_the_persons()));
+        put(&mut a.fields, k::WANTS, flag(m.wants_answering()));
+        put(&mut a.fields, k::PERSON_Q, flag(m.shape() == Some(Shape::Question) && m.for_person));
+        let project = project_of(store, &m.about);
+        put(&mut a.fields, k::PROJECT, project.as_deref().unwrap_or(""));
+        put(&mut a.fields, k::CHAIN, &project.as_deref().map(|p| chain_of(&index, p)).unwrap_or_default());
+        put(&mut a.fields, k::UNBLOCKS, unblocks(store, &m).as_deref().unwrap_or(""));
+    }
 }
 
 /// Both halves.

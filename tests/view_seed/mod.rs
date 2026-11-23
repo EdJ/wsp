@@ -184,6 +184,31 @@ pub fn seeded() -> Sandbox {
     store.set_claim("beta-003", json!({ "workspace": SEAT }));
     store.set_binding(SEAT, json!({ "pane": SEAT, "task_id": "beta-003" }));
 
+    // What waits on the person: a raised hand, an open question, and one the
+    // person answered at the pinned instant (`yours --json` keeps it ten minutes).
+    {
+        use wsp_store::message::{self, About, Kind, Party};
+        let mut m = message::Message::new(Party::Human, Kind::Note, "The vendor has not answered");
+        m.id = "m-seed-flag".into();
+        m.about = About::Task("beta-001".into());
+        message::raise(&store, &m).unwrap();
+    }
+    for (n, (task, text)) in [("alpha-001", "Which scope do we ship first?"), ("alpha-002", "Is the second row still wanted?")].into_iter().enumerate() {
+        use wsp_store::message::{self, About, Kind, Party, Waiting};
+        let mut q = message::Message::question(Party::pane(SEAT, "w1"), Kind::Note, text, Waiting::new(SEAT, "beta-003"))
+            .about(About::Task(task.into()))
+            .for_the_person();
+        q.id = format!("m-seed-q{}", n + 1);
+        message::raise(&store, &q).unwrap();
+    }
+    let id = store
+        .messages()
+        .into_values()
+        .find(|m| m.text.starts_with("Is the second row"))
+        .expect("the question was raised")
+        .id;
+    sb.ok(&["answer", &id, "yes, keep it"]);
+
     // The stop ledger: seats on the claimed and the landed rows' days, in the
     // window and out of it.
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(sb.state.join("spent.jsonl")).unwrap();
