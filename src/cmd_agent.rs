@@ -7124,12 +7124,12 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     );
     // And the hub: one line for a standalone wsp, the login's state for a spoke.
     {
-        let mut seen = None;
+        // A seat is alive when the fleet census the seat checks above read lists it.
         crate::hub_sync::health(
             store,
             std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref(),
             util::epoch_secs(),
-            &mut |seat| crate::daemon::seat_alive(store, seat, &mut seen),
+            &mut |seat| seats.iter().any(|s| s.seat.as_str() == seat),
             &mut problems,
             &mut warnings,
             &mut notes,
