@@ -298,7 +298,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
             let index = crate::resolve::Index::new(store.projects());
             let seat = crate::governors::seat_for(&governors, &index, Some(&w.id), None, None);
             let to = match &seat {
-                Some(s) => format!("asked of {}", crate::cmd_govern::seat_words(&governors, s)),
+                Some(s) => asked_of(&governors, s),
                 None => "asked of every panel — no governor above it".into(),
             };
             (about, w.id.clone(), seat, to)
@@ -2301,6 +2301,17 @@ fn asker(closed: &message::Closed) -> String {
     closed.question.from.byline()
 }
 
+/// The receipt's words for the seat an ask reached: *asked of the `x` governor ·
+/// room*, and *asked of ed's primary* for `primary:ed` (`wsp-485`), which is
+/// filed under no room here. Kept beside the ask rather than taken from
+/// `cmd_govern::seat_words`, so this module takes no new upward edge.
+fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s: &crate::governors::Seat) -> String {
+    match crate::governors::user_of_primary(&s.scope) {
+        Some(user) => format!("asked of {user}'s primary"),
+        None => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(governors, s)),
+    }
+}
+
 /// Who a question is addressed to, in one line of receipt.
 ///
 /// The same walk `wsp flag` prints and deliberately **not** the same sentence.
@@ -2313,7 +2324,7 @@ fn asker(closed: &message::Closed) -> String {
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
     let governors = store.governors();
     match crate::cmd_govern::answering_seat(store, task) {
-        Some(s) => format!("asked of {}", crate::cmd_govern::seat_words(&governors, &s)),
+        Some(s) => asked_of(&governors, &s),
         None => "asked of every panel — no governor above it".into(),
     }
 }
@@ -2840,6 +2851,23 @@ pub(crate) fn tests_govern(store: &Store, scope: &str, pane: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wsp-485`: the receipt for an ask reaching `primary:ed` names ed's primary
+    /// and has no empty room after it.
+    #[test]
+    fn the_receipt_for_an_ask_to_a_users_primary_has_no_empty_room() {
+        let seat = crate::governors::Seat {
+            scope: "primary:ed".into(),
+            pane: String::new(),
+            since: String::new(),
+            session: String::new(),
+            cwd: String::new(),
+            kind: String::new(),
+            vacant: false,
+        };
+        let said = asked_of(&Default::default(), &seat);
+        assert_eq!(said, "asked of ed's primary");
+    }
     use crate::model::Task;
 
     /// An item as `yours --json` prints it, through the builder and wsp-view's projection.
