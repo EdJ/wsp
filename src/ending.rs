@@ -431,8 +431,24 @@ fn left_in_finished_by(store: &Store, seats: &dyn Seats, ended: &std::collection
     // One `ps` for the whole scan, not one per seat (`wsp-480`); each scan takes
     // its own, so the look after a signal is a fresh one.
     crate::place_super::one_ps(|| {
-        crate::check_tree::left_in_finished(store, seats.census()?, &|seat| seats.pids(seat), &crate::legs::staged, &|row| seat_of(store, row), ended)
+        crate::check_tree::left_in_finished(
+            store,
+            seats.census()?,
+            &|seat| seats.pids(seat),
+            &crate::legs::staged,
+            &|row| seat_of(store, row),
+            &|row| verifier_seats(store, row),
+            ended,
+        )
     })
+}
+
+/// The seats spawned with `--verify` on `row` that still stand: each standing
+/// pass's pane (`wsp-453`). What they run in the row's tree is the
+/// verifier's, never a leftover of the member's.
+fn verifier_seats(store: &Store, row: &str) -> Vec<String> {
+    let Some(t) = store.find_task(row) else { return Vec::new() };
+    crate::verification::passes(&t).into_iter().filter(|p| p.standing()).filter_map(|p| p.pane).collect()
 }
 
 /// How long [`stop_finished`] gives a `TERM` before it looks again and sends
@@ -2875,6 +2891,80 @@ mod tests {
         want.sort();
         assert_eq!(ran_alive, want, "the check's cargo survives the sweep: {log}");
         assert!(check_alive, "and the check itself");
+    }
+
+    /// `wsp-453` where it happened: compound-react-061's member seat had
+    /// ended and its verifier, spawned with `--verify` on the row, drove the
+    /// app live from its tree; the review tick TERMed `npm exec vite` and all
+    /// under it. Here the member's seat is gone (no binding, no claim), the
+    /// verifier's is known by its standing pass, its record lists only its
+    /// agent (a shell standing in the tree), and the agent's tool shell runs
+    /// an `npm` (a
+    /// `sleep` under that name, a dev tool the sweep stops by name). The tick
+    /// fires: the npm and its shell survive, and an orphaned `yes` in the same
+    /// tree is stopped.
+    #[test]
+    fn a_verifiers_own_live_drive_survives_the_review_sweep_and_an_orphan_beside_it_does_not() {
+        let env = util::isolated("ending-453-verify");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-453-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.at = "2026-11-23T11:48:53Z".into();
+        p.pane = Some("cpd-2".into());
+        p.state = crate::verification::State::Running;
+        crate::verification::write(&mut t, &[p]);
+        store.save_task(&t).unwrap();
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let npm = bin.join("npm");
+        std::fs::copy(sleep, &npm).unwrap();
+        // The verifier's agent, its tool shell, and the npm that shell runs.
+        let mut agent = wsp_base::calls::Command::new("sh")
+            .args(["-c", "sh -c \"$0 60; true\"; true", &npm.display().to_string()])
+            .current_dir(&tree)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let is_npm = |p: u32| crate::check_tree::exes().iter().any(|(q, _, exe)| *q == p && exe.ends_with("npm"));
+        let (mut shell, mut drive) = (Vec::new(), Vec::new());
+        for _ in 0..250 {
+            shell = children_of(agent.id());
+            drive = shell.iter().flat_map(|s| children_of(*s)).collect();
+            if drive.len() == 1 && is_npm(drive[0]) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(drive.len() == 1 && is_npm(drive[0]), "the verifier never started its npm: {shell:?} {drive:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-2".into(), State::Idle);
+        f.typed.insert("cpd-2".into(), false);
+        f.pids.insert("cpd-2".into(), vec![agent.id()]);
+        f.census = Some(vec![("cpd-2".into(), format!("{row} · verifying"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, drive_alive, shell_alive) = (alive(&[yes]), alive(&drive), alive(&shell));
+        let agent_alive = agent.try_wait().unwrap().is_none();
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &drive, "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &shell, "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert_eq!(drive_alive, drive, "the verifier's npm survives the sweep: {log}");
+        assert_eq!(shell_alive.len(), shell.len(), "and the shell it runs under: {log}");
+        assert!(agent_alive, "and the verifier's agent");
+        assert!(log.contains(&format!("{yes} `")) && !log.contains(&format!("{} `", drive[0])), "{log}");
     }
 
     /// `wsp-444`: under `WSP_JOBS=inproc` the daemon runs a ready row's check

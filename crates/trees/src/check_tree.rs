@@ -736,6 +736,16 @@ pub fn finished_trees(lsof: &str, finished: &dyn Fn(&str) -> bool, keep: &[u32])
 /// tree; every other live seat's processes (a verifier working in the tree)
 /// are kept whole.
 ///
+/// **A verifier's seat is never the row's own (`wsp-453`).** `verifiers`
+/// names the live seats spawned with `--verify` on a row (its standing
+/// passes' panes): such a seat is kept whole even where `own` answers it (the
+/// member's seat ended, and the binding or claim it is read off is the
+/// verifier's), and so is every process that descends from it in the process
+/// table, a pid its seat record did not list too. compound-react-061's
+/// verifier drove the app live (`npm exec vite`, `watch.mjs`, the tauri
+/// binary) and the sweep TERMed all of it at 11:52:22Z, then the row was sent
+/// back for want of that drive. An orphan beside it is still stopped.
+///
 /// `None` when no backend answered: a census that failed says nothing about
 /// which rows have a seat, so the caller signals and names nothing.
 pub fn left_in_finished(
@@ -744,6 +754,7 @@ pub fn left_in_finished(
     pids: &dyn Fn(&str) -> Option<Vec<u32>>,
     staged: &dyn Fn(&crate::model::Task) -> bool,
     own: &dyn Fn(&str) -> Option<String>,
+    verifiers: &dyn Fn(&str) -> Vec<String>,
     ended: &BTreeSet<String>,
 ) -> Option<Vec<Left>> {
     let mut live = BTreeSet::new();
@@ -760,7 +771,9 @@ pub fn left_in_finished(
     let owners: BTreeMap<String, String> = live
         .iter()
         .filter(|row| at_review(row))
-        .filter_map(|row| own(row).filter(|seat| seats.contains_key(seat)).map(|seat| (seat, row.clone())))
+        .filter_map(|row| {
+            own(row).filter(|seat| seats.contains_key(seat) && !verifiers(row).contains(seat)).map(|seat| (seat, row.clone()))
+        })
         .collect();
     let mut table = None;
     // Each such row's seat whole: kept in every tree but its own row's.
@@ -800,6 +813,16 @@ pub fn left_in_finished(
         l.pids.retain(|p| !theirs.iter().any(|(row, ps)| row != &l.row && ps.contains(p)));
     }
     found.retain(|l| !l.pids.is_empty());
+    // What the row's verifier runs, by its seat's pids and all under them.
+    for l in &mut found {
+        let roots: Vec<u32> =
+            verifiers(&l.row).iter().flat_map(|v| seats.get(v).cloned().or_else(|| pids(v)).unwrap_or_default()).collect();
+        if !roots.is_empty() {
+            let under = descendants(&roots, table.get_or_insert_with(exes));
+            l.pids.retain(|p| !under.contains(p));
+        }
+    }
+    found.retain(|l| !l.pids.is_empty());
     // The executables are read only for processes there are to sort (`wsp-480`).
     if found.is_empty() {
         return Some(found);
@@ -834,6 +857,24 @@ pub fn agent_of(seat: &[u32], table: &[(u32, u32, String)]) -> Vec<u32> {
         layer = children(&carriers).into_iter().filter(|p| !keep.contains(p)).collect();
     }
     keep
+}
+
+/// Every process at or under one of `seat`'s pids in `table` ([`exes`]),
+/// a verifier seat's (`wsp-453`). Not down through a carrier of the seat (a
+/// host or `compound-sup`), whose other children may be other seats': only
+/// from the seat's own agent and what it runs.
+pub fn descendants(seat: &[u32], table: &[(u32, u32, String)]) -> Vec<u32> {
+    let carrier = |p: u32| {
+        table.iter().find(|(q, _, _)| *q == p).is_some_and(|(_, _, exe)| host_named(exe).is_some() || BUILT_SERVERS.contains(&base_of(exe)))
+    };
+    let mut out: Vec<u32> = seat.to_vec();
+    let mut layer: Vec<u32> = seat.iter().copied().filter(|p| *p > 1 && !carrier(*p)).collect();
+    while !layer.is_empty() {
+        let next: Vec<u32> = table.iter().filter(|(q, pp, _)| layer.contains(pp) && !out.contains(q)).map(|r| r.0).collect();
+        out.extend(&next);
+        layer = next;
+    }
+    out
 }
 
 /// A plain shell, the kind an agent runs a command in the background under.
@@ -1499,6 +1540,26 @@ mod tests {
     /// `wsp-691`: at submit the caller's own seat keeps its agent, its servers
     /// and the chain the submit runs on; a background shell it left goes, and
     /// another seat is kept whole.
+    /// `wsp-453`: what a verifier seat runs is all under its agent, however
+    /// deep, and never down through the carrier above it, whose other child
+    /// is another seat's.
+    #[test]
+    fn a_verifier_seats_descendants_are_all_under_its_agent_and_not_its_carriers_other_children() {
+        let table = vec![
+            proc(50, 1, "tmux"),
+            proc(60, 50, "claude"),
+            proc(61, 60, "bash"),
+            proc(62, 61, "npm"),
+            proc(63, 62, "node"),
+            proc(64, 63, "web-chrome"),
+            proc(70, 50, "claude"),
+            proc(71, 70, "bash"),
+        ];
+        let mut got = descendants(&[50, 60], &table);
+        got.sort();
+        assert_eq!(got, vec![50, 60, 61, 62, 63, 64]);
+    }
+
     #[test]
     fn the_submit_keeps_the_callers_chain_and_agent_and_drops_its_background_shells() {
         let table = [
