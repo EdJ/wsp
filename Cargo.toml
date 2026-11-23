@@ -25,6 +25,8 @@ wsp-store-sqlite = { path = "crates/store-sqlite" }
 wsp-api = { path = "crates/api" }
 wsp-client = { path = "crates/client" }
 wsp-view = { path = "crates/view" }
+# `token::mint`, the hash a hub token record keeps (wsp-163: `wsp hub`).
+wsp-machines = { path = "crates/machines" }
 
 [dev-dependencies]
 wsp-manager = { path = "crates/manager" }

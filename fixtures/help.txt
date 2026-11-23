@@ -562,6 +562,12 @@ MACHINES
                                     replaces the first. --ca pins a private CA
   wsp logout                        forget the hub's token; a sync worker stops
   wsp hub status [--json]           the hub you are logged in to, and as whom
+  wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
+  wsp hub user ls                      the hub's users and their live tokens
+  wsp hub user revoke <name>           revoke a user and every token of its
+  wsp hub token <name>                 a new token for a user, the old ones revoked
+  wsp hub workspace add <name>         a shared workspace
+  wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
 
 WORKLISTS
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,

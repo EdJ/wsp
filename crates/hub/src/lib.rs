@@ -31,6 +31,7 @@
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
 //! `ok` answer, not an `err`.
 
+pub mod admin;
 pub mod auth;
 mod config;
 mod objects;

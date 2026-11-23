@@ -324,11 +324,13 @@ pub(crate) fn status_text(login: &Option<HubLogin>) -> String {
     }
 }
 
-pub fn hub(_store: &Store, args: &Args) -> i32 {
+pub fn hub(store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(String::as_str) {
         Some("status") if args.rest.len() == 1 => {}
+        // The admin verbs (wsp-163): user, token, workspace, member.
+        Some("user" | "token" | "workspace" | "member") => return crate::cmd_hub::run(store, args),
         _ => {
-            eprintln!("usage: wsp hub status [--json]");
+            eprintln!("usage: wsp hub status [--json] | user … | token … | workspace … | member … (wsp help)");
             return 2;
         }
     }
@@ -379,11 +381,14 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     crate::verbs::Verb {
         names: &["hub"],
         run: hub,
-        help: &[crate::verbs::Help {
-            section: crate::verbs::Section::Machines,
-            order: 120,
-            text: r##"  wsp hub status [--json]           the hub you are logged in to, and as whom"##,
-        }],
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Machines,
+                order: 120,
+                text: r##"  wsp hub status [--json]           the hub you are logged in to, and as whom"##,
+            },
+            crate::verbs::Help { section: crate::verbs::Section::Machines, order: 121, text: crate::cmd_hub::HELP },
+        ],
     },
 ];
 

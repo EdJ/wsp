@@ -59,6 +59,7 @@ mod cmd_govern;
 mod cmd_install;
 mod cmd_login;
 mod cmd_machine;
+mod cmd_hub;
 mod cmd_mandate;
 mod cmd_message;
 mod cmd_migrate;
