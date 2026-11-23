@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn a_packet_naming_a_cargo_test_says_the_full_suite_is_the_barriers() {
-        let dir = std::env::temp_dir().join(format!("wsp-packet-scope-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wsp-packet-test-scope-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
         let with = build(&row("file: src/a.rs\nverify  cargo test a::"), &dir).unwrap();
