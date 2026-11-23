@@ -355,7 +355,16 @@ fn held_verdict(t: &crate::model::Task) -> Option<(String, String)> {
 /// spoke pushed (wsp-486): only for a member held elsewhere.
 pub(crate) fn verdict_held(store: &Store, row: &str) -> bool {
     let book = Book::read(store);
-    book.elsewhere.contains_key(row) && book.verdicts.contains_key(row)
+    if !book.elsewhere.contains_key(row) {
+        return false;
+    }
+    let Some(verdict) = book.verdicts.get(row) else { return false };
+    // A verdict is for the commit it names: a member whose current commit
+    // moved on since is not verified by it.
+    match store.task(row).and_then(|t| crate::repair::commit_of(&t)) {
+        Some(now) => now.starts_with(verdict.as_str()) || verdict.starts_with(now.as_str()),
+        None => true,
+    }
 }
 
 /// Takes in a `row.reviewed` object read from the hub's line for `row`: one
@@ -945,6 +954,73 @@ pub(crate) mod tests {
         assert_eq!(head(&mut bo), Some(left), "the row stays as its new holder left it");
         let again = push_verdict(&mut ann, "shared:team", "wsp-1", EventKind::RowLanded, &json!({ "commit": "ccccccc" }), held.token);
         assert!(matches!(again, Err(PushError::Fenced(_))), "{again:?}");
+
+        running.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-486: a verifier's hold on a member this spoke holds is pushed once as
+    /// a `row.reviewed` with `verdict: holds` and the commit; the pull puts it in
+    /// the book of the driver's spoke, where `verdict_held` is true for a member
+    /// held elsewhere at that commit, and false for one that is not held elsewhere.
+    #[test]
+    fn hub_verdict_a_held_verdict_is_pushed_once_and_pulled_into_the_book() {
+        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        let _env = crate::util::isolated("hub-verdict-held");
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let dir = std::env::temp_dir().join(format!("wsp-486-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (running, tokens) = serve(&dir);
+        let mut ann = dial(&running, &tokens, "ann");
+
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        shared_row(&store, "wsp-1");
+        let held = take(&mut ann, "shared:team", "wsp-1").unwrap();
+        let mut claim = json!({ "workspace_id": "cpd-a", "claimed_at": util::now_iso() });
+        stamp(&mut claim, &held);
+        store.set_claim("wsp-1", claim);
+        let mut t = store.task("wsp-1").unwrap();
+        t.log(&format!("{} abc1234 on m-1", crate::repair::READY));
+        store.save_task(&t).unwrap();
+        crate::verification::record(&store, "wsp-1", crate::verification::State::Holds, "checked", None, None).unwrap();
+
+        // Sent once as a verdict object, then the ready line's own event; a second pass sends nothing.
+        let first = push_all(&store, &mut ann).sent;
+        assert!(first >= 1, "the hold went to the hub");
+        assert_eq!(push_all(&store, &mut ann).sent, 0, "once");
+        let subject = wsp_api::fence_subject(&RowId("wsp-1".into()));
+        let head = ann.sync_heads(&HubWorkspace("shared:team".into())).unwrap().get(&subject).copied().expect("a head");
+        let mut at = Some(head);
+        let mut verdicts = Vec::new();
+        while let Some(id) = at {
+            let blob = ann.sync_get(vec![id]).unwrap().remove(0);
+            let obj = wsp_objects::decode(&blob.bytes).unwrap();
+            at = obj.parent().copied();
+            if let wsp_objects::Object::Event { kind, payload, .. } = obj {
+                if payload["verdict"] == "holds" {
+                    assert_eq!(kind, EventKind::RowReviewed);
+                    assert_eq!(payload["commit"], "abc1234");
+                    verdicts.push(payload);
+                }
+            }
+        }
+        assert_eq!(verdicts.len(), 1, "one holding verdict on the hub: {verdicts:?}");
+
+        // The pull's import (hub_sync): the book takes it; the barrier reads it for a member held elsewhere only.
+        let (dh, dst) = (dir.join("driver-home"), dir.join("driver-state"));
+        let ds = Store::at(dh, dst);
+        ds.ensure_dirs().unwrap();
+        take_verdict(&ds, "wsp-1", &verdicts[0]);
+        assert!(!verdict_held(&ds, "wsp-1"), "not held elsewhere: no");
+        Book::edit(&ds, |b| b.elsewhere.insert("wsp-1".into(), "ann".into()));
+        assert!(verdict_held(&ds, "wsp-1"), "held elsewhere, verdict pulled");
+        assert!(!verdict_held(&ds, "wsp-2"), "no verdict for another row");
+        let mut m = wsp_store::model::Task::new("wsp-1", "wsp-1");
+        m.log(&format!("{} deadbee on m-1", crate::repair::READY));
+        ds.save_task(&m).unwrap();
+        assert!(!verdict_held(&ds, "wsp-1"), "the member moved on to another commit");
 
         running.stop();
         let _ = std::fs::remove_dir_all(&dir);
