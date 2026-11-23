@@ -2966,4 +2966,108 @@ mod tests {
         assert!(!log.contains("npm"), "and is not named as stopped: {log}");
         assert_ne!(done, crate::check::Done::Passed, "the step ended by this test's KILL");
     }
+
+    /// `wsp-444` where it happened: compound-react-058's `wsp submit` started
+    /// a `wsp check`, whose `web-chrome check` step a manager ran as a job:
+    /// the step's `npm run check` stood in the row's tree under the job's
+    /// wrapper, under `wsp-manager`, not under the `wsp check`; and the daemon
+    /// (`WSP_JOBS=inproc`) asks no manager's job table, so the sweep at review
+    /// TERMed it (exit 143). Here the manager is a shell under that name
+    /// outside the tree, with no job table to ask: the step's `npm` survives
+    /// the review tick and is not named, while a plain `npm` the same manager
+    /// runs in the tree with no job's wrapper, and an orphaned `yes`, are
+    /// still stopped.
+    #[test]
+    fn a_check_step_a_manager_runs_keeps_its_npm_through_the_review_sweep_with_no_job_table() {
+        let env = util::isolated("ending-444-manager");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-444m-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let find = |names: &[&str]| names.iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string()).unwrap();
+        // `ps` names each by the file it runs: an `npm` that is a `sleep`, a
+        // `wsp-manager` that is a shell, both outside the tree.
+        let npm = bin.join("npm");
+        std::fs::copy(find(&["/bin/sleep", "/usr/bin/sleep"]), &npm).unwrap();
+        let manager = bin.join("wsp-manager");
+        std::fs::copy(find(&["/bin/sh", "/usr/bin/sh"]), &manager).unwrap();
+        let exit = root.join("exec").join("jobs").join(format!("{row}+0+check%3Aweb-chrome_check@1.2.3.exit"));
+        // `wsp-host`'s wrapper, word for word, as the manager starts it.
+        let wrapper = "e=$1; shift\n\"$@\"\ns=$?\n{ echo \"exit $s\"; times; } > \"$e.tmp\" 2>/dev/null && mv -f \"$e.tmp\" \"$e\"\nkill -KILL 0";
+        let script = format!(
+            "cd '{tree}' && {{ sh -c \"$W\" sh '{exit}' '{npm}' 30 & '{npm}' 31 & }} ; wait",
+            tree = tree.display(),
+            exit = exit.display(),
+            npm = npm.display()
+        );
+        // In a group of its own, as `wsp-host` starts a job: the wrapper ends
+        // its group with `kill -KILL 0`, which must not be this test's.
+        use std::os::unix::process::CommandExt as _;
+        // A test beside this one that forks while the copy is open makes the
+        // exec "text file busy" for a moment.
+        let spawn = || {
+            std::process::Command::new(&manager)
+                .args(["-c", &script])
+                .process_group(0)
+                .env("W", wrapper)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        let mut started = spawn();
+        for _ in 0..50 {
+            match &started {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    started = spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut run = started.unwrap();
+        let held = run.id();
+        // (the step's npm, the plain one): told apart by their parents.
+        let mut step = Vec::new();
+        let mut plain = Vec::new();
+        for _ in 0..250 {
+            let table = crate::check_tree::exes();
+            let npms: Vec<(u32, u32)> = table.iter().filter(|(_, _, e)| e.ends_with("/npm")).map(|r| (r.0, r.1)).collect();
+            step = npms.iter().filter(|(_, pp)| table.iter().any(|(q, up, _)| q == pp && *up == held)).map(|r| r.0).collect();
+            plain = npms.iter().filter(|(_, pp)| *pp == held).map(|r| r.0).collect();
+            if step.len() == 1 && plain.len() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!((step.len(), plain.len()), (1, 1), "the manager never started both npms: {step:?} {plain:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), Vec::new());
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, step_alive, plain_alive) = (alive(&[yes]), alive(&step), alive(&plain));
+        let all: Vec<u32> = [yes].into_iter().chain(step.iter().copied()).chain(plain.iter().copied()).collect();
+        crate::host::Host::signal(&crate::host::LOCAL, &all, "KILL");
+        let _ = run.kill();
+        let _ = run.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert!(plain_alive.is_empty(), "the plain npm {plain:?}, no job's, was stopped: {log}");
+        assert_eq!(step_alive, step, "the manager's check step's npm survives the sweep: {log}");
+        assert!(!log.contains(&format!("{} `", step[0])), "and is not named as stopped: {log}");
+    }
 }

@@ -424,86 +424,56 @@ pub type Ask = dyn Fn(&[u32]) -> Vec<(u32, String)>;
 /// What runs a check (`wsp-426`), as `(its pid, the row it is for)`: a `wsp`
 /// in `table` ([`exes`]) whose command line ([`commands`], asked through `ask`)
 /// runs a row's checks ([`checked_rows`]), wherever it stands (a `wsp` script
-/// under its shell too); and each running job of `jobs` (the manager's job
-/// table), by its group's leader, the job's `pgid`, under its key's row: the
-/// check's own steps and the builds they send through the throttle. What
+/// under its shell too); each running job of `jobs` (the manager's job table),
+/// by its group's leader, the job's `pgid`, under its key's row; and every
+/// job's leader whose own command line names its job ([`job_row`], `wsp-444`):
+/// the check's own steps and the builds they send through the throttle. What
 /// descends from one is that row's check's, never a leftover in its tree: the
 /// verifier's `wsp check` runs from outside the tree, and its cargo was TERMed
 /// with exit 143.
+///
+/// The leader's command line is what decides, whoever runs the job: a step a
+/// manager runs descends from `wsp-manager`, not from the `wsp check` that
+/// asked for it, and the daemon (`WSP_JOBS=inproc`) never asks the manager's
+/// table, nor does a caller the manager does not answer within its second
+/// (`wsp-444`: compound-react-058's `npm run check`, a manager job of the
+/// `wsp check` its `wsp submit` started, was TERMed, exit 143). A step run in
+/// a process (the daemon's, a `wsp review`'s or `wsp submit`'s, a check
+/// seat's `wsp check`) has the same leader.
 pub fn runners(table: &[(u32, u32, String)], ask: &Ask, jobs: &[wsp_host_api::JobRow]) -> Vec<(u32, String)> {
     let running = jobs.iter().filter(|j| j.state == wsp_host_api::JobState::Running);
     let mut out: Vec<(u32, String)> = running.map(|j| (j.pgid, j.key.row.0.clone())).collect();
-    // A `wsp` script's executable is its shell where `ps` names the interpreter.
+    // A `wsp` script's executable is its shell where `ps` names the
+    // interpreter, and a job's leader is the `sh` of its wrapper.
     let wsps: Vec<u32> = table.iter().filter(|(_, _, e)| base_of(e) == "wsp" || shell_named(e)).map(|r| r.0).collect();
     if !wsps.is_empty() {
         for (pid, command) in ask(&wsps) {
             out.extend(checked_rows(&command).into_iter().map(|row| (pid, row)));
+            out.extend(job_row(&command).map(|row| (pid, row)));
         }
     }
     out
+}
+
+/// The row of the job whose leader `command` is ([`wsp_host::jobs::wrapped_key`]):
+/// its file key's first part, its `%XX` bytes read back
+/// ([`wsp_host::jobs::file_key`]).
+fn job_row(command: &str) -> Option<String> {
+    let key = wsp_host::jobs::wrapped_key(command)?;
+    let row = unescape(key.split('+').next()?);
+    (!row.is_empty()).then_some(row)
 }
 
 /// The running jobs of this machine's manager, for [`runners`]: none where
-/// there is no manager or it did not answer, and then a check's own `wsp`
-/// still spares what it runs. The jobs `wsp-host`'s runner runs in a process
-/// (`WSP_JOBS=inproc`, [`inproc_jobs`]) are added (`wsp-444`).
+/// there is no manager, it did not answer, or this process runs its jobs
+/// itself (`WSP_JOBS=inproc`); then a job's own leader ([`job_row`]) and a
+/// check's own `wsp` still spare what it runs.
 fn manager_jobs() -> Vec<wsp_host_api::JobRow> {
     let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(Store::default_state);
-    let mut jobs = match crate::throttle::manager_jobs(&state) {
+    match crate::throttle::manager_jobs(&state) {
         Ok(Some(host)) => host.jobs().unwrap_or_default(),
         _ => Vec::new(),
-    };
-    let mut execs: Vec<PathBuf> = INPROC_EXECS.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
-    execs.push(state.join("inproc"));
-    execs.sort();
-    execs.dedup();
-    jobs.extend(inproc_jobs(&execs));
-    jobs
-}
-
-/// The exec dirs this process has run in-process jobs in ([`runs_inproc_at`]).
-static INPROC_EXECS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-
-/// Say that this process runs jobs on `wsp-host`'s runner with their files
-/// under `exec` (`WSP_JOBS=inproc`): the daemon's own check of a ready row
-/// runs so, its steps descending from `wsp daemon`, no `wsp check` and no
-/// manager job, and [`manager_jobs`] reads them from there too (`wsp-444`:
-/// compound-react-036's `npm run check` was TERMed with exit 143).
-pub fn runs_inproc_at(exec: &Path) {
-    INPROC_EXECS.lock().unwrap_or_else(|e| e.into_inner()).insert(exec.to_path_buf());
-}
-
-/// The jobs running on `wsp-host`'s runner in a process, out of each exec
-/// dir's `jobs/<key>.job` with no `<key>.exit` beside it yet: its record's pid
-/// leads the job's group, and its key's row is the file name's first part
-/// ([`wsp_host::jobs::file_key`]). A job whose process is gone is never above
-/// anything in the process table, so it spares nothing.
-pub fn inproc_jobs(execs: &[PathBuf]) -> Vec<wsp_host_api::JobRow> {
-    use wsp_host::jobs as runner;
-    let mut out = Vec::new();
-    for exec in execs {
-        let Ok(dir) = std::fs::read_dir(runner::jobs_dir(exec)) else { continue };
-        let mut keys: Vec<String> = dir
-            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".job").map(str::to_string))
-            .collect();
-        keys.sort();
-        for key in keys {
-            if runner::exit_path(exec, &key).exists() {
-                continue;
-            }
-            let Some(record) = runner::recorded(exec, &key) else { continue };
-            let mut parts = key.splitn(3, '+').map(unescape);
-            let (Some(row), Some(attempt), Some(job)) = (parts.next(), parts.next(), parts.next()) else { continue };
-            out.push(wsp_host_api::JobRow {
-                key: crate::host::job_key(&row, attempt.parse().unwrap_or(0), &job),
-                class: wsp_host_api::JobClass::Check,
-                pgid: record.pid,
-                started: wsp_host_api::At(record.started_ms),
-                state: wsp_host_api::JobState::Running,
-            });
-        }
     }
-    out
 }
 
 /// A part of a job's file name with its `%XX` bytes read back.
@@ -1683,25 +1653,76 @@ mod tests {
         assert!(checked_rows("wspx check a").is_empty());
     }
 
-    /// `wsp-444`: a job `wsp-host`'s runner runs in a process (`WSP_JOBS=inproc`)
-    /// is read from its exec dir while it has no exit file, by its row and its
-    /// group's leader; one that ended, or a file that is no job, is not.
+    /// `wsp-444`: a job's leader names its row on its own command line, so
+    /// what a row's check step runs in its tree is spared whoever runs the
+    /// step and with no job table to ask: a manager (compound-react-058's
+    /// `npm run check`, under `wsp-manager`, for the `wsp check` its `wsp
+    /// submit` started), the daemon in its own process (`WSP_JOBS=inproc`), a
+    /// `wsp review` or `wsp submit` at its ready step, and a `wsp` whose verb
+    /// is no check verb (the run's barrier step under `wsp worklist advance`),
+    /// each from outside the tree. A job of another row, a plain `sh -c` in the
+    /// tree, and an orphan still go.
     #[test]
-    fn a_running_in_process_job_is_read_by_its_row_and_pgid() {
-        let exec = std::env::temp_dir().join(format!("wsp-444-{}-{}", std::process::id(), util::epoch_nanos()));
-        let jobs = exec.join("jobs");
-        std::fs::create_dir_all(&jobs).unwrap();
-        let record = |pid: u32| format!("pid {pid}\nstarted Mon_Nov_23_09:33:42_2026\nstarted_ms 7\ntimeout_secs 120\n");
-        std::fs::write(jobs.join("c%2B1+0+check%3Aweb-chrome_check@1.2.0.job"), record(41)).unwrap();
-        std::fs::write(jobs.join("c-2+0+check%3Aunit@1.3.0.job"), record(42)).unwrap();
-        std::fs::write(jobs.join("c-2+0+check%3Aunit@1.3.0.exit"), "exit 0\n").unwrap();
-        std::fs::write(jobs.join("c-3+0+check%3Aunit@1.4.0.log"), "").unwrap();
-        let read = inproc_jobs(&[exec.clone(), exec.join("none")]);
-        let _ = std::fs::remove_dir_all(&exec);
-        let got: Vec<(String, u32, String, u32)> =
-            read.iter().map(|j| (j.key.row.0.clone(), j.key.attempt, j.key.job.clone(), j.pgid)).collect();
-        assert_eq!(got, vec![("c+1".to_string(), 0, "check:web-chrome_check@1.2.0".to_string(), 41)]);
-        assert!(read.iter().all(|j| j.state == wsp_host_api::JobState::Running));
+    fn a_rows_check_step_is_spared_by_its_jobs_leader_whatever_runs_it() {
+        let tree = Path::new("/r/.worktrees/c-1");
+        let wrapper = |row: &str, n: u32| {
+            format!(
+                "sh -c e=$1; shift \"$@\" s=$? {{ echo \"exit $s\"; times; }} > \"$e.tmp\" 2>/dev/null && mv -f \"$e.tmp\" \"$e\" kill -KILL 0 sh /x/state/jobs/{row}+0+check%3Aweb-chrome_check@77.1.{n}.exit env -u WSP_EXIT -- sh -c cd spikes/web-chrome && npm run check"
+            )
+        };
+        // (the step's runner, its exe, the leader's pid): each leader has an
+        // `npm run check` under it, and a `node scripts/check.mjs` under that.
+        let runs: [(u32, &str); 5] = [
+            (100, "/home/e/.local/bin/wsp-manager"),
+            (110, "/home/e/.local/bin/wsp"),
+            (120, "/home/e/.local/bin/wsp"),
+            (130, "/home/e/.local/bin/wsp"),
+            (140, "/home/e/.local/bin/wsp"),
+        ];
+        let mut table = vec![proc(1361, 1, "systemd")];
+        for (run, exe) in runs {
+            table.extend([proc(run, 1361, exe), proc(run + 1, run, "sh"), proc(run + 2, run + 1, "npm"), proc(run + 3, run + 2, "node")]);
+        }
+        table.extend([
+            // Another row's job in this tree, a plain shell's npm, an orphan.
+            proc(150, 1361, "/home/e/.local/bin/wsp-manager"),
+            proc(151, 150, "sh"),
+            proc(152, 151, "npm"),
+            proc(160, 1361, "/home/e/.local/bin/wsp-manager"),
+            proc(161, 160, "sh"),
+            proc(162, 161, "npm"),
+            proc(170, 1361, "yes"),
+        ]);
+        let ask = move |pids: &[u32]| -> Vec<(u32, String)> {
+            let line = |p: u32| match p {
+                100 => "/home/e/.local/bin/wsp-manager --exec-dir /x/state --port 7487".to_string(),
+                110 => "/home/e/.local/bin/wsp daemon".to_string(),
+                120 => "/home/e/.local/bin/wsp review c-1 -".to_string(),
+                130 => "/home/e/.local/bin/wsp submit c-1".to_string(),
+                140 => "/home/e/.local/bin/wsp worklist advance verify-fix-2".to_string(),
+                101 | 111 | 121 | 131 | 141 => wrapper("c-1", p),
+                151 => wrapper("c-2", p),
+                161 => "sh -c npm run dev".to_string(),
+                _ => "(gone)".to_string(),
+            };
+            pids.iter().map(|p| (*p, line(*p))).collect()
+        };
+        let run = runners(&table, &ask, &[]);
+        let ours: Vec<u32> = run.iter().filter(|(_, r)| r == "c-1").map(|r| r.0).collect();
+        assert_eq!(ours, vec![101, 111, 121, 131, 141], "{run:?}");
+        assert!(run.contains(&(151, "c-2".into())), "{run:?}");
+        let in_tree: Vec<u32> = table.iter().map(|r| r.0).filter(|p| ![1361, 100, 110, 120, 130, 140, 150, 160].contains(p)).collect();
+        for leader in [101, 111, 121, 131, 141] {
+            for pid in [leader, leader + 1, leader + 2] {
+                let v = judge_among(pid, tree, &in_tree, &ours, &table, true);
+                assert!(matches!(&v, Verdict::Spare(why) if why.contains("running check's")), "{pid}: {v:?}");
+            }
+        }
+        for pid in [152, 162, 170] {
+            assert_eq!(judge_among(pid, tree, &in_tree, &ours, &table, true), Verdict::Stop, "{pid}");
+        }
+        assert_eq!(job_row(&wrapper("c%2B1", 1)).as_deref(), Some("c+1"), "the key's row, unescaped");
+        assert_eq!(job_row("sh -c cd spikes/web-chrome && npm run check"), None);
     }
 
     #[test]

@@ -1594,8 +1594,6 @@ fn in_process(dir: &Path) -> Jobs<'static> {
     static HOSTS: OnceLock<Mutex<BTreeMap<(PathBuf, PathBuf), &'static crate::host::InProcess>>> = OnceLock::new();
     let (root, place) = wsp_trees::job_place::own_root(dir);
     let exec = inproc_exec();
-    // The leftover sweep spares what this process's jobs run (wsp-444).
-    wsp_trees::check_tree::runs_inproc_at(&exec);
     let host = *HOSTS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
