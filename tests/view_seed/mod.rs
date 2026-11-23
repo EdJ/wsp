@@ -176,6 +176,7 @@ pub fn seeded(tag: &str) -> Sandbox {
     let g1 = model::Group { members: vec!["beta-003".into(), "beta-002".into()], ..model::Group::default() };
     let g2 = model::Group { members: vec!["alpha-002".into()], ..model::Group::default() };
     w.set_groups(&[g1, g2]);
+    model::set_section_in(&mut w.body, "Overview", "Two groups: the beta rows, then alpha-002.");
     store.save_worklist(&w).unwrap();
 
     // A second machine, on record and never seen.

@@ -41,6 +41,8 @@ const CAPTURES: &[(&str, &[&str])] = &[
     ("ls-all", &["ls", "--all", "--json"]),
     ("wip", &["wip", "--json"]),
     ("worklist-ls", &["worklist", "ls", "--json"]),
+    ("worklist-show", &["worklist", "show", "list-a", "--json"]),
+    ("worklist-show-all", &["worklist", "show", "--all", "--json"]),
     ("machine-ls", &["machine", "ls", "--json"]),
     ("flag-person", &["flag", "--person", "--json"]),
     ("yours", &["yours", "--json"]),
