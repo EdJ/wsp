@@ -33,6 +33,7 @@ pub const READ_ONLY: &[&str] = &[
     "calls",    // this log
     "reap",     // `--list`: the manager's seats and jobs (wsp-057; `reap <pid>` is gone)
     "state",    // the contract `State` the files make (wsp-308)
+    "whoami",   // who the hub says this process is (wsp-165)
 ];
 
 /// Verbs that write, or that write for some of their forms.
