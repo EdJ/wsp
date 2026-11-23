@@ -19,9 +19,9 @@ use crate::util::{self, Paint};
 use crate::Args;
 
 /// The daemon's tick, which a step nobody poked waits for.
-const TICK: i64 = 20;
+pub(crate) const TICK: i64 = 20;
 /// Longest a poke takes to show as a start: a process, a lock, a pane.
-const HAND_OFF: i64 = 8;
+pub(crate) const HAND_OFF: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Phase {
