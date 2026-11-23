@@ -2313,7 +2313,7 @@ pub(crate) fn fixed_of(i: &Inputs, phases: &[Phase]) -> (Option<i64>, Option<i64
 /// Every seat left standing past a verdict that holds, and for how long
 /// (`compound-react-040`): the verifier, from the verdict to its `ended …,
 /// which verified` line; and the row's own seat, from the last holding verdict
-/// it was left running at to its release or its `ended` line. `(seat, seconds)`,
+/// it was left running at to its first release or `ended` line after it. `(seat, seconds)`,
 /// the verifier first. The verdict-to-despawn figure is the longest of these:
 /// compound-react-040's verifier was ended 14 s after its verdict while its own
 /// seat, cpd-115, stood 396 min more, and the figure read the 14 s alone.
@@ -2334,6 +2334,11 @@ pub(crate) fn holds_after_verdict(i: &Inputs, phases: &[Phase]) -> Vec<(String, 
         let e = format!("ended {pane}");
         ends.extend(i.cycle.iter().filter(|(_, l)| *l == e || l.starts_with(&format!("{e},")) || l.starts_with(&format!("{e} "))).map(|(t, _)| (*t, Some(pane.to_string()))));
     }
+    // The first end after a verdict is where that seat stopped standing: a second
+    // release with no claim between (compound-react-012's, days after its seat
+    // went) ends nothing, so each verdict is read to its first end alone.
+    ends.sort_by_key(|(t, _)| *t);
+    let mut ended_at: Vec<i64> = Vec::new();
     let mut own: Option<(String, i64)> = None;
     for (end, pane) in ends {
         // The last verdict before the end, in the same seating, and only if it held:
@@ -2346,6 +2351,10 @@ pub(crate) fn holds_after_verdict(i: &Inputs, phases: &[Phase]) -> Vec<(String, 
         if pane.is_some() && pane != seat {
             continue;
         }
+        if ended_at.contains(&v) {
+            continue;
+        }
+        ended_at.push(v);
         let secs = end - v;
         if own.as_ref().is_none_or(|(_, s)| secs > *s) {
             own = Some((seat.unwrap_or_else(|| "the row's own seat".to_string()), secs));
@@ -2735,6 +2744,25 @@ mod tests {
         // The run's own `ended <pane>` line ends the seat as a release does.
         i.events.retain(|(_, k, _)| k != "task-released");
         i.cycle.push((380 + 3600, "ended cpd-115, its verdict held".into()));
+        assert_eq!(fixed_of(&i, &build(&i)).3, Some(3600));
+    }
+
+    /// compound-react-012: the seat was released an hour after its holding
+    /// verdict, and the row released again days later with no claim between.
+    /// The seat's figure is the hour; the later release ends nothing.
+    #[test]
+    fn a_second_release_after_the_seat_went_is_not_the_seat_standing() {
+        let mut i = row();
+        i.events[0] = ev(110, "task-claimed", json!({"id": "r-1", "pane": "cpd-9"}));
+        i.events.retain(|(_, k, _)| k != "task-released");
+        i.events.push(ev(380 + 4 * 86400, "task-released", json!({"id": "r-1"})));
+        i.events.push(ev(380 + 3600, "task-released", json!({"id": "r-1"})));
+        let ph = build(&i);
+        let own: Vec<_> = holds_after_verdict(&i, &ph).into_iter().filter(|(s, _)| s == "cpd-9").collect();
+        assert_eq!(own, vec![("cpd-9".to_string(), 3600)]);
+
+        // An `ended <pane>` line after the release is no later end of that seat either.
+        i.cycle.push((380 + 2 * 86400, "ended cpd-9".into()));
         assert_eq!(fixed_of(&i, &build(&i)).3, Some(3600));
     }
 
