@@ -4745,15 +4745,35 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         }
     }
 
-    /// `wsp-338`'s fourth item: compound-react-040's eight minutes, replayed —
-    /// released, waiting past the land grace, the run's land refused on a
-    /// conflict in `deps`. Its 07:00-07:08 had sixteen status lines, two tells
-    /// and a refusal naming no file and no verb; this is two lines.
+    /// `wsp-338`'s fourth item: retro-8's cycle.log is already written and
+    /// cannot be rebuilt, so this replays compound-react-040's 07:00-07:08 through
+    /// the new code. The conditions are its own: at `done`, ten commits not on
+    /// master, its seat (cpd-115) released, so nothing holds it; a tick a minute
+    /// (07:00:46 … 07:06:54, eight with the next); and at 07:05:53, past the land
+    /// grace, the run's `wsp land` refused on a conflict in `deps` behind the
+    /// hook's "deps: compound -> …" line. The live window had twenty lines for
+    /// the row: two contradicting status lines each tick, two tells, two
+    /// not-delivered tells, and a refusal naming no file and no verb. The test
+    /// asserts two at most: the status once, and the refusal with its fix.
     #[test]
     fn a_released_member_whose_land_fails_on_deps_is_two_lines_in_eight_ticks_and_the_refusal_names_the_path_and_the_verb() {
         let (env, store) = scratch("releaseddeps");
         landed_member(&env, &store, true);
+        let repo = env.path("repo");
+        git_in(&repo, &["checkout", "--quiet", "m-1"]);
+        for n in 2..=10 {
+            git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", &format!("work {n}")]);
+        }
+        git_in(&repo, &["checkout", "--quiet", "master"]);
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Done);
+        store.save_task(&t).unwrap();
+        // Its seat held it, then was released: no binding is left.
+        claim(&store, "m-1", "cpd-115");
+        store.clear_binding("cpd-115");
+        assert!(store.panes_for_task("m-1").is_empty(), "nothing holds m-1");
         let _ = (stamped(), governed(), member_told(), landed_for());
+        // The refusal `wsp land --for-run` gives now for retro-8's conflict.
         LAND_FAILS.with(|f| *f.borrow_mut() = Some(
             "wsp: the rebase onto master does not apply cleanly: conflict in deps\n\
              wsp: the rebase was aborted and ~/src/compound-react/.worktrees/m-1 is as it was. To clear it, in ~/src/compound-react/.worktrees/m-1: \
@@ -4778,8 +4798,15 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         }
         LAND_FAILS.with(|f| *f.borrow_mut() = None);
         assert_eq!(landed_for(), vec!["m-1".to_string()], "the land is tried once, not each minute");
-        assert!(member_told().is_empty());
+        assert!(member_told().is_empty(), "nothing holds m-1: no tell, so no not-delivered line");
         assert!(lines.len() <= 2, "no more than two lines for the row in eight ticks: {lines:#?}");
+        let status: Vec<&String> = lines.iter().filter(|l| l.contains("so it has no verifier yet")).collect();
+        assert_eq!(status.len(), 1, "the status once: {lines:#?}");
+        assert!(status[0].contains("m-1 is at done with 10 commits not on master"), "the one state it has: {}", status[0]);
+        assert!(!lines.iter().any(|l| l.contains("is at review")), "never a second, contradicting state: {lines:#?}");
+        assert!(lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count() <= 1, "the order at most once");
+        let gov = governed();
+        assert_eq!(gov.len(), 2, "the seat told twice in all, no seat and the refusal: {gov:#?}");
         let refused = lines.iter().find(|l| l.contains("could not land it")).expect("the refusal is logged");
         assert!(refused.contains("conflict in deps"), "the path: {refused}");
         assert!(refused.contains("resolve deps") && refused.contains("`wsp land m-1`") && refused.contains("`wsp reopen m-1"), "the verbs: {refused}");
