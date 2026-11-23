@@ -2514,7 +2514,25 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
             if refs > 0 {
                 println!("  {}", p.dim(&format!("{refs} reference(s) rewritten across {files} file(s)")));
             }
-            0
+            // What names the row outside the store: a list's retro record and
+            // the row's own outputs, both under the artefacts root (`wsp-351`).
+            let mut code = 0;
+            match crate::retro_run::follow_renames(store, &renumber) {
+                Ok(lists) => {
+                    for l in lists {
+                        println!("  {}", p.dim(&format!("{l}'s retro record follows")));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("wsp: a retro record still names the old id: {e}");
+                    code = 1;
+                }
+            }
+            if let Err(e) = crate::artefact::follow_renames(&crate::artefact::root(), &renumber) {
+                eprintln!("wsp: {e}");
+                code = 1;
+            }
+            code
         }
         Err(e) => {
             eprintln!("wsp: the move landed but the renumbering did not: {e}");

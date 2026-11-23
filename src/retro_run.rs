@@ -302,6 +302,39 @@ pub fn wrong_seat(store: &Store, w: &Worklist, s: &Value, pane: Option<&str>) ->
     Some(format!("{who}; this is {}'s, whose retro is {} — a retro seat writes only its own list's retro", w.id, record.unwrap_or("not on a row")))
 }
 
+/// Carry a renumbering into every list's `retro.json` (`wsp-351`).
+///
+/// [`Store::rename_tasks`] rewrites the records and the state files, but
+/// `retro.json` lives under the artefacts root, which the store does not know:
+/// a retro row filed out of the inbox kept its old id in `s["row"]` while the
+/// list's `retro:` line said the new one, and [`wrong_seat`] reads `s["row"]`
+/// first, so every retro verb refused the seat. The filed rows and notes in it
+/// name rows by id too and follow the same way. Written through [`save`], so
+/// the artefact keeps its versions and `retro.html` is redrawn with the new
+/// ids. Answers the lists rewritten, or the first write that failed.
+pub fn follow_renames(store: &Store, map: &std::collections::BTreeMap<String, String>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if map.is_empty() {
+        return Ok(out);
+    }
+    for w in store.worklists() {
+        let s = state(&w.id);
+        if s.is_null() {
+            continue;
+        }
+        let text = serde_json::to_string(&s).unwrap_or_default();
+        let (text, n) = crate::store::substitute_tokens(&text, map);
+        if n == 0 {
+            continue;
+        }
+        let s: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", w.id))?;
+        let moved: Vec<String> = map.iter().map(|(a, b)| format!("{a} → {b}")).collect();
+        save(store, &w, &s, &format!("renumbered: {}", moved.join(", ")))?;
+        out.push(w.id.clone());
+    }
+    Ok(out)
+}
+
 /// Who is running the verb: its pane, when it is in one.
 fn caller_pane() -> Option<String> {
     crate::place::my_pane()
@@ -896,5 +929,57 @@ mod tests {
         std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(done(&store, &args(&["done", "b", &ok], &[])), 0);
         assert!(show_text(&store, &store.worklist("b").unwrap()).contains("by a hand outside any seat"));
+    }
+}
+
+#[cfg(test)]
+mod renumbered {
+    use super::*;
+    use crate::cmd_report::dir;
+
+    /// wsp-351: a retro row filed out of the inbox by `wsp mv` is the retro of
+    /// record under its new id — the verbs accept its seat, and the list it sits
+    /// on, the rows waiting on it and its outputs all follow.
+    #[test]
+    fn a_retro_row_moved_into_a_project_keeps_its_retro_under_the_new_id() {
+        let (env, store) = crate::testkit::isolated_store("retro-mv");
+        store.save_project(&crate::model::Project::new("cr")).unwrap();
+        let mut w = Worklist::new("l", "A list");
+        w.body = "## Groups\n\n1. x-1\n".into();
+        store.save_worklist(&w).unwrap();
+        let old = start(&store, &w, true).unwrap();
+        assert!(old.starts_with(&format!("{}-", crate::store::INBOX_CODE)), "a list with no project seats its retro in the inbox: {old}");
+        let on = state("l")["retros"].as_str().unwrap().to_string();
+        let mut waiting = Task::new("waits on the retro", "cr-9");
+        waiting.project = Some("cr".into());
+        waiting.after = vec![old.clone()];
+        store.save_task(&waiting).unwrap();
+        std::fs::create_dir_all(dir(&old)).unwrap();
+        std::fs::write(dir(&old).join("notes.md"), "an output").unwrap();
+
+        assert_eq!(crate::cmd_task::mv(&store, &Args::synth("mv", &[&old], &[("project", "cr")])), 0);
+        let new = store.tasks().into_iter().find(|t| t.title == "Timing retro of l").unwrap().id;
+        assert!(new.starts_with("cr-"), "{new}");
+
+        let s = state("l");
+        assert_eq!(s["row"].as_str(), Some(new.as_str()), "retro.json names the new id");
+        assert_eq!(store.worklist("l").unwrap().retro.map(|(_, r)| r), Some(new.clone()));
+        assert!(store.worklist(&on).unwrap().groups().iter().any(|g| g.members.contains(&new)), "list membership follows");
+        assert_eq!(store.task("cr-9").unwrap().after, vec![new.clone()], "after links follow");
+        assert!(dir(&new).join("notes.md").is_file() && !dir(&old).exists(), "the row's outputs follow");
+
+        store.set_binding("pane-r", json!({ "task_id": new }));
+        assert_eq!(wrong_seat(&store, &store.worklist("l").unwrap(), &s, Some("pane-r")), None);
+        let tmp = env.home().join("scratch");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ok = tmp.join("ok");
+        std::fs::write(&ok, "nothing to file").unwrap();
+        let ok = ok.to_string_lossy().into_owned();
+        std::env::set_var(crate::base::seat::SEAT_ENV, "pane-r");
+        let noted = note(&store, &Args::synth("retro", &["note", "l", &new, &ok], &[]));
+        let done_ = done(&store, &Args::synth("retro", &["done", "l", &ok], &[]));
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert_eq!((noted, done_), (0, 0), "the retro verbs accept the seat under its new id");
+        assert!(show_text(&store, &store.worklist("l").unwrap()).contains(&new));
     }
 }
