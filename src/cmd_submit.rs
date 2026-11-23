@@ -137,6 +137,14 @@ pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Op
             return 1;
         }
     };
+    // A seat whose claim expired does not land over the row's next holder
+    // (`wsp-412`): refused before anything is read or written.
+    if kind == Kind::Member {
+        if let Some(why) = expired_claim_refusal(store, &t, me.as_deref()) {
+            eprintln!("{why}");
+            return 1;
+        }
+    }
     // The seat of a running leg submits its leg whatever kind its environment
     // says (`wsp-011`): a leg seat taken for a member closed the row and left
     // its leg `running` with no seat, and nothing reseated it.
@@ -192,6 +200,38 @@ pub(crate) fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Op
         return 0;
     }
     take(store, args, &t, &checked, exit, &text, &from, me.as_deref())
+}
+
+/// The refusal for a seat whose claim on `t` expired (`wsp-412`): `me` is not
+/// the seat the row's claim names now, and the row's `## Log` carries the
+/// `claim expired: held by <me> on …` line `wsp-411`'s pass writes. A row that
+/// went on to another seat, or to nobody, is not this seat's to land over.
+/// `None` for a seat that holds the row, a seat whose claim never expired, and
+/// a caller outside any seat.
+pub(crate) fn expired_claim_refusal(store: &Store, t: &Task, me: Option<&str>) -> Option<String> {
+    let me = me.filter(|m| !m.is_empty())?;
+    if holds_claim(store, &t.id, me) {
+        return None;
+    }
+    let needle = format!("claim expired: held by {me} on ");
+    let log = t.section("Log").unwrap_or_default();
+    let line = log.lines().rev().find(|l| l.contains(&needle))?;
+    let at = line.trim_start().trim_start_matches("- ").split_whitespace().next().unwrap_or("");
+    let list = crate::cycle::list_of(store, t).map(|w| w.id).unwrap_or_else(|| "<list>".into());
+    Some(format!(
+        "wsp: your claim on {} expired at {at} and the row went back to todo; tell your governor (wsp tell governor:{list})",
+        t.id
+    ))
+}
+
+/// Whether `me` is the seat the claim on `row` names: bound to the row, or the
+/// workspace the claim record carries.
+fn holds_claim(store: &Store, row: &str, me: &str) -> bool {
+    let Some(claim) = store.claims().get(row).cloned() else { return false };
+    store.panes_for_task(row).iter().any(|p| p == me)
+        || ["workspace_id", "workspace", "workspace_label", "pane_id"]
+            .iter()
+            .any(|k| claim.get(k).and_then(|x| x.as_str()) == Some(me))
 }
 
 /// The exit's text and where it came from: `--from FILE|-`, `$WSP_EXIT`, or
@@ -1740,6 +1780,44 @@ mod tests {
         let log = t.section("Log").unwrap();
         assert!(log.contains(&format!("review: {}", fold(&text))), "the file whole is the account: {log}");
         assert!(log.contains("note: the next row can start"), "{log}");
+    }
+
+    /// `wsp-412`: seat A's claim expires and is released; seat B takes the row.
+    /// A's submit is refused in the words the packet gives and the row is as it
+    /// was; B's is accepted. A seat that never held it is not told it expired.
+    #[test]
+    fn a_seat_whose_claim_expired_cannot_submit_over_the_next_holder() {
+        std::env::set_var("WSP_BACKEND_SOCKET_PATH", "/nonexistent/wsp-submit-tests.sock");
+        let (env, store, _tree) = member("submit-expired", ARTEFACTS);
+        let hold = |seat: &str| {
+            store.set_binding(seat, serde_json::json!({ "task_id": "wsp-101", "pane_id": seat, "workspace_id": seat }));
+            store.set_claim("wsp-101", serde_json::json!({ "workspace_id": seat, "cwd": "/tmp" }));
+        };
+        hold("seat-a");
+        let why = "claim expired: held by seat-a on this machine, last renewed 2026-11-10T10:00:00Z";
+        crate::cmd_spawn::release_lost(&store, "wsp-101", why).unwrap();
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "todo");
+        hold("seat-b");
+        let mut t = store.task("wsp-101").unwrap();
+        t.status_raw = "doing".into();
+        store.save_task(&t).unwrap();
+
+        let text = exit_with("- unit (2m): true\n", "- note: none\n");
+        let before = store.task("wsp-101").unwrap().render();
+        assert_eq!(submit_in(&env, &store, &text, "member", "seat-a"), 1);
+        let after = store.task("wsp-101").unwrap().render();
+        assert_eq!(before, after, "the row is unchanged");
+        let said = expired_claim_refusal(&store, &store.task("wsp-101").unwrap(), Some("seat-a")).unwrap();
+        assert!(
+            said.starts_with("wsp: your claim on wsp-101 expired at ")
+                && said.ends_with(" and the row went back to todo; tell your governor (wsp tell governor:run)"),
+            "{said}"
+        );
+        assert!(expired_claim_refusal(&store, &store.task("wsp-101").unwrap(), Some("seat-c")).is_none());
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing");
+
+        assert_eq!(submit_in(&env, &store, &text, "member", "seat-b"), 0);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "review");
     }
 
     #[test]

@@ -1714,6 +1714,14 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             }
         };
     }
+    // A seat whose claim expired does not review the row over its next holder
+    // (`wsp-412`): refused before anything is read or written.
+    if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        if let Some(why) = crate::cmd_submit::expired_claim_refusal(store, &t, crate::place::my_pane().as_deref()) {
+            eprintln!("{why}");
+            return 1;
+        }
+    }
     // Given no account: the one written at the place wsp keeps for it (`wsp-374`,
     // `$WSP_VERDICT`), when it was written in this run of the row.
     if let Some((from_file, written)) = crate::closing::member_args(store, args) {
