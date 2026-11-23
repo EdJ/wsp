@@ -28,6 +28,19 @@
 //! | `body`         | the whole task file, for a row `wip` reads in full     | [`prose`]          |
 //! | `head`         | `TaskHead::to_json`, for the rest                      | (wip's reading)    |
 //! | `prose`        | the body after the front matter, beside `head`         | [`prose`]          |
+//! | `stage`        | `stage::of_member`'s caption with no agent looked at, `Told::json` text | [`crate::stage::stage_of`] |
+//! | `stage_steps`  | `stage::history`'s steps before the live word settles them, JSON array | [`crate::stage::stage_of`] |
+//! | `legs`         | on a staged row, `legs::json`: the legs `show --json` gives, JSON text | [`crate::task::ls_entry`] |
+//! | `stage_live`   | on a `doing` row whose word its seat decides: `{"said": …}`, what its agent last said | [`crate::stage::stage_of`] |
+//!
+//! And on a [`wsp_store_contract::Seat`], what `src/mirror.rs`'s
+//! `seat_records` writes (wsp-076) and the stage overlay reads:
+//!
+//! | key            | holds                                                  | read by            |
+//! |----------------|--------------------------------------------------------|--------------------|
+//! | `binding`      | the seat's `bindings.json` record, JSON text           | [`crate::stage::bound_row`] |
+//! | `census`       | the census state word (`place::State::as_str`)         | [`crate::stage::census_word`] |
+//! | `governs`      | the scope the seat governs (`place::governs`), absent for none | [`crate::stage::agent_of`] |
 //!
 //! `Row::project` is not the file's project: it is `model::project_of`, which
 //! names an inbox row's project after its id. [`project`] reads the file's.
@@ -54,6 +67,14 @@ pub mod key {
     pub const BODY: &str = "body";
     pub const HEAD: &str = "head";
     pub const PROSE: &str = "prose";
+    pub const STAGE: &str = "stage";
+    pub const STAGE_STEPS: &str = "stage_steps";
+    pub const STAGE_LIVE: &str = "stage_live";
+    pub const LEGS: &str = "legs";
+    /// Seat keys.
+    pub const BINDING: &str = "binding";
+    pub const CENSUS: &str = "census";
+    pub const GOVERNS: &str = "governs";
 }
 
 /// A field's text, `""` when the row has none.

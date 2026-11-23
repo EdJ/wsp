@@ -40,19 +40,10 @@ use crate::verification::{Pass, State as Verdict};
 use crate::worklist::Position;
 use crate::util;
 
-/// What the seat holding a `doing` task is doing, as far as anyone looked.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Agent {
-    /// Nobody asked, or no backend answered. Not "idle": not knowing whether a
-    /// seat stopped is not knowing it stopped (`wip`'s rule).
-    #[default]
-    Unknown,
-    /// A turn is in flight, or the agent is running and not stopped.
-    Working,
-    /// Stopped while holding `doing` work, in a seat that governs nothing —
-    /// `cmd_govern::needs_a_person`, the one definition `wip` publishes.
-    WantsYou,
-}
+/// What the seat holding a `doing` task is doing, as far as anyone looked:
+/// `wsp-view`'s, so the overlay web-chrome runs over `State` and this one are
+/// one type (wsp-308).
+pub(crate) use wsp_view::stage::Agent;
 
 /// Everything a member's stage is read from.
 pub(crate) struct Member<'a> {
@@ -79,12 +70,29 @@ pub(crate) struct Member<'a> {
 /// answered falls through to what the member is now — at review, or being
 /// verified again — rather than reading `sent back` until a verifier comes.
 pub(crate) fn of_member(m: &Member) -> Told {
+    match read_member(m) {
+        Read::Told(t) => t,
+        Read::Live { said, at } => live(said.as_deref(), &at, m.agent),
+    }
+}
+
+/// What the files alone say of a member's stage (wsp-308): the stage, or, for
+/// a `doing` row past every record, what its agent last said and the instant
+/// — the word is its seat's ([`live`]). The mirror writes the first half on
+/// the row and `wsp-view` overlays the second from `State`'s seats.
+pub(crate) enum Read {
+    Told(Told),
+    Live { said: Option<String>, at: String },
+}
+
+/// [`of_member`] without the agent: everything it reads off a record.
+pub(crate) fn read_member(m: &Member) -> Read {
     let t = m.task;
     let log = heads(t);
     match t.status() {
-        Status::Done => return bare("done", &t.updated, "status"),
-        Status::Parked => return reason("parked", &log, "parked:", t),
-        Status::Blocked => return reason("blocked", &log, "blocked:", t),
+        Status::Done => return Read::Told(bare("done", &t.updated, "status")),
+        Status::Parked => return Read::Told(reason("parked", &log, "parked:", t)),
+        Status::Blocked => return Read::Told(reason("blocked", &log, "blocked:", t)),
         _ => {}
     }
 
@@ -97,32 +105,32 @@ pub(crate) fn of_member(m: &Member) -> Told {
         // that mark is a `wsp reopen`, whose reason is the tail.
         if !head.contains("the verifier blocked") {
             let why = head[crate::cycle::SENT_BACK.len()..].trim();
-            return told("sent back", Some(caption::say(why, Some(&t.id))), date, "reason");
+            return Read::Told(told("sent back", Some(caption::say(why, Some(&t.id))), date, "reason"));
         }
         if let Some(p) = latest.filter(|p| p.state == Verdict::Blocks) {
-            return verdict("sent back", p);
+            return Read::Told(verdict("sent back", p));
         }
-        return told("sent back", None, date, "stage");
+        return Read::Told(told("sent back", None, date, "stage"));
     }
     if let Some(p) = latest {
         match p.state {
             // A block with no `sent back:` line under it is one migrated off a
             // Verify row, from before the verdict wrote one: still owed.
-            Verdict::Blocks if back.is_none() => return verdict("sent back", p),
-            Verdict::Holds => return verdict("holds", p),
+            Verdict::Blocks if back.is_none() => return Read::Told(verdict("sent back", p)),
+            Verdict::Holds => return Read::Told(verdict("holds", p)),
             Verdict::Running => {
                 let again = m.passes.iter().any(|q| matches!(q.state, Verdict::Holds | Verdict::Blocks));
-                return told("verifying", again.then(|| "again".to_string()), &p.at, "stage");
+                return Read::Told(told("verifying", again.then(|| "again".to_string()), &p.at, "stage"));
             }
             _ => {}
         }
     }
     if t.status() == Status::Review {
-        return bare("at review", &t.updated, "status");
+        return Read::Told(bare("at review", &t.updated, "status"));
     }
     if let Some(l) = m.landed.filter(|l| l.commit.is_some()) {
         let n = l.files.len();
-        return told("landed", Some(format!("{n} file{}", if n == 1 { "" } else { "s" })), &t.updated, "stage");
+        return Read::Told(told("landed", Some(format!("{n} file{}", if n == 1 { "" } else { "s" })), &t.updated, "stage"));
     }
     // A staged row's tail is the newest leg caption written (`docs/legs.md`,
     // *Seen*), or the newest piece's (`docs/pieces.md`, *Seen and told*): `scout: three layers, plan next`. Written by the leg's seat at
@@ -132,14 +140,20 @@ pub(crate) fn of_member(m: &Member) -> Told {
         .or_else(|| crate::pieces::newest_caption(t))
         .or_else(|| m.said.map(|s| caption::say(s, Some(&t.id))))
         .filter(|s| !s.is_empty());
-    match (t.status(), m.agent) {
-        (Status::Doing, Agent::WantsYou) => told("wants you", said, &t.updated, "say"),
-        (Status::Doing, Agent::Working) => told("working", said, &t.updated, "say"),
-        (Status::Doing, Agent::Unknown) if said.is_some() => told("working", said, &t.updated, "say"),
-        (Status::Doing, _) => bare("started", &t.updated, "status"),
-        _ if m.claimed => bare("started", &t.updated, "status"),
-        _ => bare("not started", &t.created, "status"),
+    match t.status() {
+        Status::Doing => Read::Live { said, at: t.updated.clone() },
+        _ if m.claimed => Read::Told(bare("started", &t.updated, "status")),
+        _ => Read::Told(bare("not started", &t.created, "status")),
     }
+}
+
+/// A `doing` row's stage once its agent is known: `wsp-view`'s [`live`]
+/// rule, at the instant the files gave.
+///
+/// [`live`]: wsp_view::stage::live
+pub(crate) fn live(said: Option<&str>, at: &str, agent: Agent) -> Told {
+    let l = wsp_view::stage::live(said, agent);
+    Told { word: l.word, tail: l.tail, text: l.text, from: l.from, at: at.to_string() }
 }
 
 /// Everything a group's stage is read from, off the walk `worklist show`
@@ -394,12 +408,10 @@ pub(crate) fn history(t: &Task, passes: &[Pass], now: Option<&Told>) -> Vec<Step
         out.push(Step { word, at, tail });
     }
     if let (Some(now), Some(last)) = (now, out.last_mut()) {
-        let on_it = |w: &str| matches!(w, "started" | "working");
-        if on_it(last.word) && on_it(now.word) {
-            last.word = now.word;
-        } else if on_it(last.word) && now.word == "wants you" {
-            let at = now.at.clone().max(last.at.clone());
-            out.push(Step { word: "wants you", at, tail: None });
+        match wsp_view::stage::settle(last.word, &last.at, now.word, &now.at) {
+            wsp_view::stage::Settle::Keep => {}
+            wsp_view::stage::Settle::Rename => last.word = now.word,
+            wsp_view::stage::Settle::Append(at) => out.push(Step { word: "wants you", at, tail: None }),
         }
     }
     out
@@ -595,6 +607,58 @@ fn read(store: &Store, asked: &[&Task]) -> BTreeMap<String, (Told, Vec<Step>)> {
             let now = of_member(&m);
             let steps = history(t, &passes, Some(&now));
             (t.id.clone(), (now, steps))
+        })
+        .collect()
+}
+
+/// What the mirror writes of a row's stage (wsp-308): the half the files
+/// decide. `wsp_view::stage::stage_of` reads it back over `State` and puts the
+/// seat's half on it.
+pub(crate) struct Filed {
+    /// The caption as if nobody looked at the agent ([`Agent::Unknown`]).
+    pub told: Told,
+    /// [`history`] before the live word settles its last step.
+    pub steps: Vec<Step>,
+    /// For a `doing` row past every record ([`Read::Live`]): what its agent
+    /// last said, whose word its seat decides.
+    pub live: Option<Option<String>>,
+}
+
+/// [`Filed`] for every task in `tasks`, off the same records [`read`] takes —
+/// the passes among `tasks`, the lists' landing records, the claims and the
+/// sayings — and no census.
+pub(crate) fn filed(
+    tasks: &[Task],
+    lists: &[crate::model::Worklist],
+    claims: &BTreeMap<String, serde_json::Value>,
+    said: &BTreeMap<String, String>,
+) -> BTreeMap<String, Filed> {
+    let mut landed: BTreeMap<String, Landed> = BTreeMap::new();
+    for w in lists {
+        for g in w.groups() {
+            for l in g.landed {
+                landed.insert(l.member.clone(), l);
+            }
+        }
+    }
+    tasks
+        .iter()
+        .map(|t| {
+            let passes = crate::verification::all(tasks, t);
+            let m = Member {
+                task: t,
+                passes: &passes,
+                landed: landed.get(&t.id),
+                said: said.get(&t.id).map(String::as_str),
+                claimed: claims.contains_key(&t.id),
+                agent: Agent::Unknown,
+            };
+            let (told, live) = match read_member(&m) {
+                Read::Told(told) => (told, None),
+                Read::Live { said, at } => (live(said.as_deref(), &at, Agent::Unknown), Some(said)),
+            };
+            let steps = history(t, &passes, None);
+            (t.id.clone(), Filed { told, steps, live })
         })
         .collect()
 }

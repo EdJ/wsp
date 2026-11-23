@@ -32,6 +32,7 @@ pub const READ_ONLY: &[&str] = &[
     "spend",    // tokens and cost by day, model, project and list
     "calls",    // this log
     "reap",     // `--list`: the manager's seats and jobs (wsp-057; `reap <pid>` is gone)
+    "state",    // the contract `State` the files make (wsp-308)
 ];
 
 /// Verbs that write, or that write for some of their forms.

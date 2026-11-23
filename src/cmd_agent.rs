@@ -10283,7 +10283,7 @@ mod tests {
         let item = needs_you.iter().find(|e| e["kind"] == "finished").expect("the finished rows are one item");
         assert_eq!(item["rows"], json!(["r-1", "r-2"]));
         assert_eq!(item["text"], "2 finished rows to close");
-        let mirrored = crate::mirror::rows(&w.tasks, &BTreeMap::new(), &w.lists, &BTreeMap::new());
+        let mirrored = crate::mirror::rows(&w.tasks, &BTreeMap::new(), &w.lists, &BTreeMap::new(), &BTreeMap::new());
         let first = mirrored
             .iter()
             .find_map(|e| match e {

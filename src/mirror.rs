@@ -175,6 +175,13 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 /// `head`, `prose` is the task's body after its front matter (wsp-305), so `ls
 /// --all` and `show` read every row's legs, log and passes.
 ///
+/// **And its stage's file half** (wsp-308): `stage`, the caption
+/// `stage::of_member` reads with no agent looked at; `stage_steps`, its
+/// `history` before the live word settles it; and on a `doing` row whose word
+/// its seat decides, `stage_live`, what its agent last said (`said`, from
+/// `stage::sayings`). `wsp_view::stage::stage_of` overlays the seat's half.
+/// And on a staged row `legs`, `legs::json`'s text, which `ls --json` prints.
+///
 /// A row at review that is finished (`wsp-105`: verified, not reverted, no
 /// held barrier still judging it) carries `attention` = `needs-you`,
 /// `attention_text`, and `action` (`wsp done <id>`, Mark done), as groups and
@@ -186,8 +193,10 @@ pub fn rows(
     claims: &BTreeMap<String, serde_json::Value>,
     lists: &[Worklist],
     texts: &BTreeMap<String, String>,
+    said: &BTreeMap<String, String>,
 ) -> Vec<Entity> {
     let place = placements(lists);
+    let mut staged = crate::stage::filed(tasks, lists, claims, said);
     let finished = finished_rows(tasks, lists);
     let group = (finished.len() > 1).then(|| finished_item(&finished)).flatten();
     tasks
@@ -223,6 +232,17 @@ pub fn rows(
                         }
                     }
                 }
+            }
+            if let Some(st) = staged.remove(&t.id) {
+                f.insert(key::STAGE.into(), crate::stage::told_view(&st.told).json().to_string());
+                f.insert(key::STAGE_STEPS.into(), serde_json::Value::Array(st.steps.iter().map(|s| s.json()).collect()).to_string());
+                if let Some(said) = st.live {
+                    f.insert(key::STAGE_LIVE.into(), serde_json::json!({ "said": said }).to_string());
+                }
+            }
+            // The objects `show --json` has, and absent on an unstaged row.
+            if t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty() {
+                f.insert(key::LEGS.into(), crate::legs::json(t).to_string());
             }
             match texts.get(&t.id) {
                 Some(text) => {
@@ -639,7 +659,7 @@ pub fn machines(files: &[MachineFile], live: &BTreeMap<String, MachineLive>, loc
 // ---------------------------------------------------------------- seats
 
 /// A seat's `fields` key holding its `bindings.json` record (JSON text).
-pub const BINDING: &str = "binding";
+pub const BINDING: &str = key::BINDING;
 /// A seat's `fields` key holding its `spawned.json` record (JSON text).
 pub const SPAWNED: &str = "spawned";
 /// A seat's `fields` keys for what builds a `place::Seated`: the label, the
@@ -648,7 +668,7 @@ pub const SPAWNED: &str = "spawned";
 pub const LABEL: &str = "label";
 pub const CWD: &str = "cwd";
 pub const AGENT: &str = "agent";
-pub const CENSUS: &str = "census";
+pub const CENSUS: &str = key::CENSUS;
 pub const SESSION: &str = "session";
 
 fn set(m: &mut BTreeMap<String, String>, k: &str, v: &str) {
@@ -665,12 +685,15 @@ fn set(m: &mut BTreeMap<String, String>, k: &str, v: &str) {
 /// Writes a seat's records onto its `fields`, each replacing what was there
 /// and removed where there is none: the whole binding and spawned records,
 /// and `seated`'s label, cwd, agent, state word and session — the census row
-/// the files path builds (`Compound::seated_as`).
+/// the files path builds (`Compound::seated_as`); and `governs`, the scope the
+/// seat governs (`place::governs`), which `wsp_view::stage::agent_of` reads as
+/// `needs_a_person`'s third input (wsp-308).
 pub fn seat_records(
     fields: &mut BTreeMap<String, String>,
     binding: Option<&serde_json::Value>,
     spawned: Option<&serde_json::Value>,
     seated: &crate::place::Seated,
+    governs: Option<&str>,
 ) {
     set(fields, BINDING, &binding.map(|v| v.to_string()).unwrap_or_default());
     set(fields, SPAWNED, &spawned.map(|v| v.to_string()).unwrap_or_default());
@@ -684,6 +707,14 @@ pub fn seat_records(
     set(fields, AGENT, &agent);
     set(fields, CENSUS, seated.state.as_str());
     set(fields, SESSION, &seated.session);
+    set(fields, key::GOVERNS, governs.unwrap_or_default());
+}
+
+/// The scope a seat governs, as `stage::census` asks it: by its pane, within
+/// its workspace.
+pub fn governs_of(governors: &BTreeMap<String, serde_json::Value>, seat: &str) -> Option<String> {
+    let workspace = seat.split(':').next().unwrap_or(seat);
+    crate::place::governs(governors, &crate::place::seat_query(workspace, Some(seat)))
 }
 
 fn json_field(seat: &c::Seat, k: &str) -> Option<serde_json::Value> {
@@ -711,19 +742,16 @@ pub fn seated_of(seat: &c::Seat) -> crate::place::Seated {
     // The seat's own state first where it has ended: a `gone` the fold wrote
     // stands over any word the census row carried before it. A seat with no
     // census word (one mirrored before wsp-076 carried it) reads its own
-    // state, never Unknown (wsp-094).
-    let state = match (seat.state, f(CENSUS).as_str()) {
-        (c::SeatState::Gone | c::SeatState::Ending | c::SeatState::Lost, _) => State::Gone,
-        (_, "empty") => State::Empty,
-        (_, "starting") => State::Starting,
-        (_, "idle") => State::Idle,
-        (_, "working") => State::Working,
-        (_, "blocked") => State::Blocked,
-        (_, "gone") => State::Gone,
-        (_, "unreachable") => State::Unreachable,
-        (c::SeatState::Idle, "") => State::Idle,
-        (c::SeatState::Working, "") => State::Working,
-        (c::SeatState::Requested | c::SeatState::Spawning | c::SeatState::Started, "") => State::Starting,
+    // state, never Unknown (wsp-094). `wsp-view`'s reading, so the stage
+    // overlay over `State` and this one agree (wsp-308).
+    let state = match wsp_view::stage::census_word(seat) {
+        "empty" => State::Empty,
+        "starting" => State::Starting,
+        "idle" => State::Idle,
+        "working" => State::Working,
+        "blocked" => State::Blocked,
+        "gone" => State::Gone,
+        "unreachable" => State::Unreachable,
         _ => State::Unknown,
     };
     Seated {
@@ -751,11 +779,46 @@ pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let claims_file = store.claims();
     let worklists = store.worklists();
     let texts = texts_of(store, &tasks);
-    let mut out = rows(&tasks, &claims_file, &worklists, &texts);
+    let mut out = rows(&tasks, &claims_file, &worklists, &texts, &crate::stage::sayings(store));
     out.extend(claims(&claims_file));
     out.extend(lists(&worklists, &tasks, &list_texts_of(store, &worklists)));
     out.extend(machines(&store.machines(), &store.machines_live(), local));
     out
+}
+
+/// The whole [`c::State`] the files say, by the projections the mirror and
+/// the fold apply (wsp-308): rows, claims, lists and machines
+/// ([`read_rows_etc`]), asks ([`read_attention`]), and seats as the fold
+/// builds them (`fold::seat_of`), one per seat this machine's backend's census
+/// names, at its census word. What the CLI's `--json` paths hand `wsp-view`,
+/// so they print what web-chrome draws from the daemon's fold.
+pub fn state_of(store: &Store, local: &str) -> c::State {
+    let mut s = c::State::default();
+    let seats = crate::fold::seats_of(store, local).into_iter().map(Entity::Seat);
+    for e in read_rows_etc(store, local).into_iter().chain(read_attention(store)).chain(seats) {
+        match e {
+            Entity::Row(r) => {
+                s.rows.insert(r.id.clone(), r);
+            }
+            Entity::List(l) => {
+                s.lists.insert(l.id.clone(), l);
+            }
+            Entity::Seat(x) => {
+                s.seats.insert(x.id.clone(), x);
+            }
+            Entity::Claim(x) => {
+                s.claims.insert(x.row.clone(), x);
+            }
+            Entity::Ask(x) => {
+                s.asks.insert(x.id.clone(), x);
+            }
+            Entity::Machine(x) => {
+                s.machines.insert(x.name.clone(), x);
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 /// Reads the attention half: messages and flags.
@@ -1320,14 +1383,14 @@ mod tests {
             pid: None,
             fields: BTreeMap::from([("task_id".to_string(), "wsp-2".to_string())]),
         };
-        seat_records(&mut seat.fields, Some(&binding), Some(&spawned), &seated);
+        seat_records(&mut seat.fields, Some(&binding), Some(&spawned), &seated, None);
         assert_eq!(binding_of(&seat), Some(binding));
         assert_eq!(spawned_of(&seat), Some(spawned));
         assert_eq!(seat.fields["task_id"], "wsp-2", "what was there stands");
         let back = seated_of(&seat);
         assert_eq!(format!("{back:?}"), format!("{seated:?}"));
         // A binding that ends goes from the fields.
-        seat_records(&mut seat.fields, None, None, &Seated { seat: Seat::new("cpd-2"), state: State::Gone, ..Default::default() });
+        seat_records(&mut seat.fields, None, None, &Seated { seat: Seat::new("cpd-2"), state: State::Gone, ..Default::default() }, None);
         assert_eq!((binding_of(&seat), spawned_of(&seat)), (None, None));
         assert_eq!(seated_of(&seat).state, State::Gone);
         assert!(!seat.fields.contains_key(LABEL) && !seat.fields.contains_key(AGENT));
@@ -1391,7 +1454,7 @@ mod tests {
 
         let read = |s: &Store| {
             let tasks = s.tasks();
-            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks))
+            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks), &BTreeMap::new())
         };
         let es = read(&s);
         let f = |id: &str| row_of(&es, id).fields;

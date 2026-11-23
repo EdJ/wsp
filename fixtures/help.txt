@@ -21,6 +21,8 @@ TASKS
   wsp add "title" --caption "…"     …with the line a glance reads, under 60
   wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`
   wsp ls [-p proj] [-t tag] [-s status] [--all]
+  wsp state --json                  the contract State the files make, as the
+                                    mirror projects it: what the --json views read
   wsp find <text> [-p proj] [--all] [--full]
                                     every task the words are in — the title or
                                     the prose; the project you are in and open

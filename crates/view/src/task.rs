@@ -7,9 +7,9 @@
 //! file or the clock. The key order is the order the CLI always printed.
 
 use serde_json::{json, Value};
-use wsp_store_contract::Row;
+use wsp_store_contract::{Row, State};
 
-use crate::common::task_json;
+use crate::common::{key, priority, priority_rank, status, status_rank, task_json};
 
 /// A stage's caption (`wsp-242`): the word wsp derives and the tail, as the
 /// `stage` key prints them. A pass's `caption` is the same shape.
@@ -35,6 +35,12 @@ impl Told {
         }
         v
     }
+
+    /// [`Told::json`] read back: `None` without a word.
+    pub fn of_json(v: &Value) -> Option<Told> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Some(Told { word: s("word")?, tail: s("tail"), text: s("text").unwrap_or_default(), from: s("from").unwrap_or_default(), at: s("at").unwrap_or_default() })
+    }
 }
 
 /// One step of a task's timeline: the stage word it entered, and when.
@@ -56,6 +62,12 @@ impl Step {
             v["tail"] = json!(t);
         }
         v
+    }
+
+    /// [`Step::json`] read back: `None` without a word.
+    pub fn of_json(v: &Value) -> Option<Step> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Some(Step { word: s("word")?, at: s("at").unwrap_or_default(), tail: s("tail") })
     }
 }
 
@@ -261,7 +273,7 @@ pub struct Running {
     pub of: usize,
 }
 
-/// One `ls --json` row: the record, whether it is filed away, and its stage.
+/// One `find --json` row: the record, whether it is filed away, and its stage.
 pub fn ls_row(row: &Row, archived: bool, stage: Option<&Stage>) -> Value {
     let mut v = task_json(row);
     v["archived"] = json!(archived);
@@ -273,6 +285,39 @@ pub fn ls_row(row: &Row, archived: bool, stage: Option<&Stage>) -> Value {
 /// `ls --json`: the rows, pretty.
 pub fn ls(rows: &[Value]) -> String {
     serde_json::to_string_pretty(rows).unwrap_or_default()
+}
+
+/// One `ls --json` row over [`State`] (wsp-308): the record, its stage read
+/// by [`crate::stage::stage_of`] (the mirror's half and its seats'), and on a
+/// staged row the legs the mirror wrote (`legs`), absent on an unstaged one.
+pub fn ls_entry(row: &Row, state: &State) -> Value {
+    let mut v = task_json(row);
+    // `wsp-274`: and since when, off the same timeline `show` gives.
+    v["stage"] = json!(crate::stage::stage_of(row, state).as_ref().map(stage_json));
+    if let Some(legs) = row.fields.get(key::LEGS).and_then(|l| serde_json::from_str::<Value>(l).ok()) {
+        v["legs"] = legs;
+    }
+    v
+}
+
+/// `ls --json` over [`State`]: each picked row as [`ls_entry`], in the order
+/// given, pretty. `now` is the clock every projection is handed; nothing `ls`
+/// prints reads it yet.
+pub fn ls_rows(state: &State, picked: &[&Row], _now: i64) -> String {
+    ls(&picked.iter().map(|r| ls_entry(r, state)).collect::<Vec<_>>())
+}
+
+/// `ls --all --json` over [`State`]: every row, in `ls`'s order — status
+/// (`Status::rank`), then priority, then id.
+pub fn ls_all(state: &State, now: i64) -> String {
+    let mut rows: Vec<&Row> = state.rows.values().collect();
+    rows.sort_by(|a, b| {
+        status_rank(status(a))
+            .cmp(&status_rank(status(b)))
+            .then(priority_rank(priority(a)).cmp(&priority_rank(priority(b))))
+            .then(a.id.0.cmp(&b.id.0))
+    });
+    ls_rows(state, &rows, now)
 }
 
 /// What `show --json` adds to the record, all of it read by the caller.

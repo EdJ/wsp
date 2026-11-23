@@ -287,7 +287,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
 
     if args.json() {
         let tasks = filtered(store, args, &index, scope.clone());
-        println!("{}", serde_json::to_string_pretty(&rows_json(store, &tasks)).unwrap_or_default());
+        println!("{}", rows_json(store, &tasks));
         return 0;
     }
     // **The rows are front matter, so they are read from the index**
@@ -3526,28 +3526,31 @@ fn archive_month(t: &Task) -> String {
 /// you to look at the count instead.
 const ARCHIVE_MAX: usize = 20;
 
-/// `ls --json`'s rows: each task's record and its stage.
-fn rows_json(store: &Store, tasks: &[Task]) -> Vec<serde_json::Value> {
-    // `wsp-242`: each row's stage, every source read once for all of them.
-    let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
-    tasks
-        .iter()
-        .map(|t| {
-            let mut v = t.json();
-            // `wsp-274`: and since when, off the same timeline `show` gives.
-            v["stage"] = json!(stages.get(&t.id).map(|(s, h)| crate::stage::json(s, h)));
-            // The objects `show --json` has, and absent on an unstaged row.
-            if t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty() {
-                v["legs"] = crate::legs::json(t);
-            }
-            v
-        })
-        .collect()
+/// `ls --json`'s rows: each task's record, its stage and a staged row's legs,
+/// printed by `wsp-view` over the `State` the files make (wsp-308) — the
+/// mirror's own projections, so web-chrome's fold of the daemon's `State`
+/// prints these bytes too (`wsp_view::task::ls_all`). Each row's stage is the
+/// mirror's half (`stage`, `stage_steps`, `stage_live`) with its seats' over it.
+fn rows_json(store: &Store, tasks: &[Task]) -> String {
+    let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    let picked: Vec<&wsp_store_contract::Row> =
+        tasks.iter().filter_map(|t| state.rows.get(&wsp_store_contract::RowId(t.id.clone()))).collect();
+    wsp_view::task::ls_rows(&state, &picked, util::epoch_secs())
+}
+
+/// `wsp state --json` (wsp-308): the contract `State` the files make, by the
+/// mirror's own projections (`mirror::state_of`), pretty. What the `--json`
+/// paths hand `wsp-view`, printed so `tests/view_state.rs` can hand the same
+/// `State` to `wsp-view` itself and compare.
+fn state(store: &Store, _args: &Args) -> i32 {
+    let s = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
+    0
 }
 
 /// The contract row a task is, as the mirror projects it, for `wsp-view`.
 fn row_of(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> wsp_store_contract::Row {
-    crate::mirror::rows(std::slice::from_ref(t), claims, &[], &Default::default())
+    crate::mirror::rows(std::slice::from_ref(t), claims, &[], &Default::default(), &Default::default())
         .into_iter()
         .find_map(|e| match e {
             wsp_store_contract::Entity::Row(r) => Some(r),
@@ -3595,6 +3598,18 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Tasks,
                 order: 50,
                 text: r##"  wsp ls [-p proj] [-t tag] [-s status] [--all]"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["state"],
+        run: state,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 55,
+                text: r##"  wsp state --json                  the contract State the files make, as the
+                                    mirror projects it: what the --json views read"##,
             },
         ],
     },
@@ -3929,7 +3944,7 @@ pub(crate) mod tests {
         t.updated = "2026-10-08T09:20:00Z".into();
         crate::model::set_section_in(&mut t.body, "Log", "- 2026-10-08T08:00:00Z claimed by pane w1:p1\n- 2026-10-08T08:00:00Z → doing\n");
         store.save_task(&t).unwrap();
-        let rows = rows_json(&store, &store.tasks());
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rows_json(&store, &store.tasks())).unwrap();
         let stage = &rows[0]["stage"];
         assert_eq!((&stage["word"], &stage["since"]), (&json!("started"), &json!("2026-10-08T08:00:00Z")), "{rows:?}");
         assert_ne!(stage["at"], stage["since"], "at stays the record's time");
@@ -3947,7 +3962,7 @@ pub(crate) mod tests {
         let mut plain = Task::new("An unstaged row", "s-2");
         plain.status_raw = "doing".into();
         store.save_task(&plain).unwrap();
-        let rows = rows_json(&store, &store.tasks());
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rows_json(&store, &store.tasks())).unwrap();
         let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
         assert_eq!(row("s-1")["legs"], crate::legs::json(&store.find_task("s-1").unwrap()));
         assert_eq!(row("s-1")["legs"][1]["after"], json!(["scout"]));

@@ -428,8 +428,11 @@ pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> 
 /// `done`. Every one of them was stopped on live work and reported as busy.
 /// [`crate::place::State::turn_in_flight`] is the reading that answers this
 /// without enumerating any runner's spelling.
+///
+/// The rule itself is `wsp-view`'s (wsp-308), so the stage web-chrome draws
+/// over `State`'s seats reads it with this code.
 pub fn needs_a_person(stopped: bool, doing: bool, seat: bool) -> bool {
-    stopped && doing && !seat
+    wsp_view::stage::needs_a_person(stopped, doing, seat)
 }
 
 /// Put a workspace in a project's slot, and say whom it displaced.

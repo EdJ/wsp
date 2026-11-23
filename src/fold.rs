@@ -414,6 +414,42 @@ fn scalars(m: &serde_json::Map<String, Value>, keys: &[&str], into: &mut BTreeMa
 /// The seat as the files now say it, over what the database held of it.
 fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: SeatState) -> c::Seat {
     let held = db.snapshot().ok().and_then(|(s, _)| s.seats.get(&SeatId(seat.to_string())).cloned());
+    // The state word is the event's.
+    let census = match state {
+        SeatState::Working => crate::place::State::Working,
+        SeatState::Idle => crate::place::State::Idle,
+        SeatState::Gone | SeatState::Ending | SeatState::Lost => crate::place::State::Gone,
+        _ => crate::place::State::Starting,
+    };
+    seat_of(store, held.as_ref(), host, seat, state, census)
+}
+
+/// Every seat this machine's backend's census names, each as [`seat_entity`]
+/// builds it, at the census's own word and with nothing held before it: the
+/// seats `mirror::state_of` hands `wsp-view` (wsp-308). The census reads the
+/// store's own seat records, as `stage::census`'s backend does.
+pub(crate) fn seats_of(store: &Store, host: &str) -> Vec<c::Seat> {
+    use crate::place::{Place as _, State};
+    let place = Compound::at(store.state.join(crate::place_compound::SEATS));
+    let Ok(census) = place.census() else { return Vec::new() };
+    census
+        .seats()
+        .map(|s| {
+            let state = match s.state {
+                State::Working => SeatState::Working,
+                State::Idle | State::Blocked => SeatState::Idle,
+                State::Starting => SeatState::Started,
+                State::Gone | State::Empty => SeatState::Gone,
+                State::Unreachable | State::Unknown => SeatState::Lost,
+            };
+            seat_of(store, None, host, s.seat.as_str(), state, s.state)
+        })
+        .collect()
+}
+
+/// [`seat_entity`]'s build, over what was `held` of the seat and at the given
+/// census word.
+fn seat_of(store: &Store, held: Option<&c::Seat>, host: &str, seat: &str, state: SeatState, census: crate::place::State) -> c::Seat {
     let rec = match store.spawned().remove(seat) {
         Some(Value::Object(m)) => m,
         _ => serde_json::Map::new(),
@@ -429,16 +465,10 @@ fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: S
     // (wsp-076). No event and no `seats` reply carries the label, cwd, agent
     // or session: the census reads them off the seat's own record and
     // `said.json` (`Compound::seated_as`), and so does this, by the same fn.
-    // The state word is the event's.
-    let census = match state {
-        SeatState::Working => crate::place::State::Working,
-        SeatState::Idle => crate::place::State::Idle,
-        SeatState::Gone | SeatState::Ending | SeatState::Lost => crate::place::State::Gone,
-        _ => crate::place::State::Starting,
-    };
     let seated = Compound::at(store.state.join(crate::place_compound::SEATS)).seated_as(&Seat::new(seat), census);
     let spawned = (!rec.is_empty()).then(|| Value::Object(rec.clone()));
-    crate::mirror::seat_records(&mut fields, store.bindings().get(seat), spawned.as_ref(), &seated);
+    let governs = crate::mirror::governs_of(&store.governors(), seat);
+    crate::mirror::seat_records(&mut fields, store.bindings().get(seat), spawned.as_ref(), &seated, governs.as_deref());
     let started = rec.get("started").and_then(Value::as_object);
     let row = started
         .and_then(|s| s.get("row"))

@@ -18,6 +18,8 @@
 pub mod common;
 /// `ls --json` and `show --json`.
 pub mod task;
+/// A row's stage over `State`: the mirror's half and its seats'.
+pub mod stage;
 /// `wip --json`.
 pub mod wip;
 /// `worklist ls --json`.
