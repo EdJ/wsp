@@ -49,7 +49,8 @@ pub mod key {
 }
 
 /// One declared output of a worklist and whether its file is there.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Output {
     pub name: String,
     pub kind: String,
@@ -58,7 +59,8 @@ pub struct Output {
 }
 
 /// The object every worklist verb emits, before `project` is added.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Head {
     pub id: String,
     pub title: String,
@@ -82,7 +84,8 @@ pub struct Head {
 }
 
 /// Where a planned list queues and what it waits on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Queue {
     /// One-based place in the queue.
     pub n: usize,
@@ -91,7 +94,8 @@ pub struct Queue {
 }
 
 /// One row of `worklist ls --json`: the head and the facts the listing adds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Listing {
     pub head: Head,
     pub segment: String,

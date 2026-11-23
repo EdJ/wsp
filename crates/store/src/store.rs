@@ -242,6 +242,11 @@ pub struct Store {
     /// The last parse of each state JSON file, by name, and the stamp it was
     /// parsed at. See [`Store::read_json`].
     json_cache: RefCell<BTreeMap<String, (Stamp, std::rc::Rc<Value>)>>,
+    /// `messages.json` as built into [`Message`]s, and the stamp it was built at
+    /// (`wsp-741`): 2 MB, and `worklist ls` asked for it once per list.
+    messages_memo: RefCell<Option<(Stamp, std::rc::Rc<BTreeMap<String, Message>>)>>,
+    /// `ids.json`, parsed, at its stamp (`wsp-741`).
+    renamed_memo: RefCell<Option<(Option<Stamp>, std::rc::Rc<BTreeMap<String, String>>)>>,
 }
 
 /// What a file looked like when we last parsed it: modified time in
@@ -444,6 +449,8 @@ impl Store {
             memos: RefCell::new(BTreeMap::new()),
             running_memo: RefCell::new(None),
             json_cache: RefCell::new(BTreeMap::new()),
+            messages_memo: RefCell::new(None),
+            renamed_memo: RefCell::new(None),
         }
     }
 
@@ -1425,7 +1432,10 @@ impl Store {
                 return Found::One(Box::new(t));
             }
         }
-        let all = self.tasks();
+        // Shared, not copied (wsp-741): a miss used to clone all ~3200 parsed
+        // tasks (~90 ms) to read their ids and titles, and the daemon missed
+        // once per pane that was no task's.
+        let all = self.tasks_shared();
         let open: Vec<&Task> = all.iter().filter(|t| t.status().is_open()).collect();
 
         // A suffix must land on a `-` boundary. Without that `022` also
@@ -1590,16 +1600,26 @@ impl Store {
     /// Retired id -> the id it became. Never has an entry whose value is itself
     /// a key: see [`Store::rename_tasks`] for why chains are collapsed.
     pub fn renamed_ids(&self) -> BTreeMap<String, String> {
+        // Memoised on the file's stamp: a caller per member of every list read it
+        // again each time (wsp-741). A missing file is a stamp of `None`.
+        let stamp = fs::metadata(self.ids_path()).ok().as_ref().and_then(stamp_of);
+        if let Some((was, m)) = &*self.renamed_memo.borrow() {
+            if *was == stamp && stamp.is_some() {
+                return (**m).clone();
+            }
+        }
         let Ok(text) = fs::read_to_string(self.ids_path()) else {
             return BTreeMap::new();
         };
-        match serde_json::from_str::<Value>(&text) {
+        let map: BTreeMap<String, String> = match serde_json::from_str::<Value>(&text) {
             Ok(Value::Object(m)) => m
                 .into_iter()
                 .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
                 .collect(),
             _ => BTreeMap::new(),
-        }
+        };
+        *self.renamed_memo.borrow_mut() = Some((stamp, std::rc::Rc::new(map.clone())));
+        map
     }
 
     /// Rename tasks wholesale, rewriting every reference to them in one pass.
@@ -2822,12 +2842,24 @@ impl Store {
     /// message id -> the record.
     #[allow(dead_code)]
     pub fn messages(&self) -> BTreeMap<String, Message> {
-        match self.read_json("messages.json") {
-            Value::Object(m) => {
-                m.into_iter().map(|(id, v)| (id.clone(), Message::from_json(&id, &v))).collect()
+        (*self.messages_shared()).clone()
+    }
+
+    /// [`Store::messages`], shared and rebuilt only when the file's stamp moves,
+    /// for the readers that filter it and keep a few (`wsp-741`).
+    pub fn messages_shared(&self) -> std::rc::Rc<BTreeMap<String, Message>> {
+        let stamp = fs::metadata(self.state_file("messages.json")).ok().as_ref().and_then(stamp_of);
+        if let (Some(stamp), Some((was, built))) = (stamp, &*self.messages_memo.borrow()) {
+            if *was == stamp {
+                return built.clone();
             }
-            _ => BTreeMap::new(),
         }
+        let built = std::rc::Rc::new(match &*self.read_json_shared("messages.json") {
+            Value::Object(m) => m.iter().map(|(id, v)| (id.clone(), Message::from_json(id, v))).collect(),
+            _ => BTreeMap::new(),
+        });
+        *self.messages_memo.borrow_mut() = stamp.map(|s| (s, built.clone()));
+        built
     }
 
     #[allow(dead_code)]

@@ -274,7 +274,7 @@ fn every_frame_type_round_trips() {
 // ---------------------------------------------------------------- verbs
 
 /// Read verbs, then the contract's commands, then the unknown verb.
-const VERBS: usize = 12;
+const VERBS: usize = 17;
 const COMMANDS: usize = 25;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
@@ -292,6 +292,11 @@ fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
         Verb::Machines(_) => (9, "machines"),
         Verb::Events { .. } => (10, "events"),
         Verb::Subscribe(_) => (11, "subscribe"),
+        Verb::Wip(_) => (12, "wip"),
+        Verb::Throttle(_) => (13, "throttle"),
+        Verb::Spend(_) => (14, "spend"),
+        Verb::Show { .. } => (15, "show"),
+        Verb::Readings { .. } => (16, "readings"),
     }
 }
 
@@ -352,9 +357,10 @@ fn requests() -> Vec<Frame> {
             states: vec![RowState::Doing, RowState::Review],
             list: Some(list_id()),
             seat: None,
+            heads: false,
         }),
         Verb::List { list: list_id() },
-        Verb::Lists(NoArgs {}),
+        Verb::Lists(ListFilter { heads: true }),
         Verb::Seat { seat: seat_id() },
         Verb::Seats(SeatFilter {
             machine: Some(MachineName("mac".into())),
@@ -377,6 +383,15 @@ fn requests() -> Vec<Frame> {
         Verb::Subscribe(Subscribe {
             from: Some(EventId(400)),
         }),
+        Verb::Wip(NoArgs {}),
+        Verb::Throttle(NoArgs {}),
+        Verb::Spend(NoArgs {}),
+        Verb::Show {
+            id: "wsp-307".into(),
+        },
+        Verb::Readings {
+            names: vec!["throttle".into()],
+        },
     ];
     let commands = vec![
         Command::RowAdd {
@@ -532,7 +547,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 13;
+const ANSWERS: usize = 18;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -556,6 +571,11 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Events { .. } => (10, "events"),
         Answer::Subscribed => (11, "subscribed"),
         Answer::Applied => (12, "applied"),
+        Answer::Wip { .. } => (13, "wip"),
+        Answer::Throttle(_) => (14, "throttle"),
+        Answer::Spend(_) => (15, "spend"),
+        Answer::Show(_) => (16, "show"),
+        Answer::Readings(_) => (17, "readings"),
     }
 }
 
@@ -596,7 +616,29 @@ fn answers() -> Vec<Frame> {
             vec![],
         ),
         ok(12, Answer::Subscribed, vec![]),
+        ok(
+            14,
+            Answer::Wip {
+                state: a_state(),
+                at: EventId(411),
+            },
+            vec![],
+        ),
         ok(13, Answer::Applied, vec![412, 413]),
+        ok(15, Answer::Throttle(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "agents": null })), vec![]),
+        ok(16, Answer::Spend(json!({ "currency": "USD", "rows": { "landed_30d": 0 } })), vec![]),
+        ok(17, Answer::Show(json!({ "id": "wsp-307", "tags": ["api"] })), vec![]),
+        ok(
+            18,
+            Answer::Readings(BTreeMap::from([(
+                "throttle".into(),
+                Reading {
+                    json: r#"{"mode":"auto"}"#.into(),
+                    at: At(1_763_400_010_000),
+                },
+            )])),
+            vec![],
+        ),
     ]
 }
 
@@ -765,7 +807,7 @@ fn the_contract_codes_are_its_refusals_codes() {
 
 // ---------------------------------------------------------------- feed
 
-const FEEDS: usize = 3;
+const FEEDS: usize = 4;
 
 fn feed_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Feed(feed) = f else {
@@ -775,6 +817,7 @@ fn feed_ordinal(f: &Frame) -> (usize, &'static str) {
         Feed::State { .. } => (0, "state"),
         Feed::Event(_) => (1, "event"),
         Feed::Beat { .. } => (2, "beat"),
+        Feed::Part { .. } => (3, "part"),
     }
 }
 
@@ -788,6 +831,10 @@ fn feeds() -> Vec<Frame> {
         Frame::Feed(Feed::Beat {
             beat: EventId(412),
             at: At(1_763_400_010_000),
+        }),
+        Frame::Feed(Feed::Part {
+            part: a_state(),
+            at: EventId(411),
         }),
     ]
 }
@@ -826,8 +873,8 @@ fn wire_spelling_is_pinned() {
         json!({
             "type": "request",
             "v": 1,
-            "id": 15,
-            "key": "k-15",
+            "id": 20,
+            "key": "k-20",
             "by": "seat:cpd-3698",
             "verb": "row.claim",
             "args": {
@@ -838,10 +885,26 @@ fn wire_spelling_is_pinned() {
         })
     );
 
+    // wsp-307's view verbs: `show` names its id; a view's `ok` is the CLI's
+    // document under the verb's name.
+    let show = requests().into_iter().find(|f| matches!(call_of(f), Call::Verb(Verb::Show { .. }))).unwrap();
+    let show = serde_json::to_value(&show).unwrap();
+    assert_eq!((&show["verb"], &show["args"]), (&json!("show"), &json!({"id": "wsp-307"})));
+    assert_eq!(
+        serde_json::to_value(ok(4, Answer::Throttle(json!({"mode": "auto"})), vec![])).unwrap(),
+        json!({"type": "reply", "id": 4, "ok": {"throttle": {"mode": "auto"}}, "events": []})
+    );
+
     let rows = serde_json::to_value(&requests()[2]).unwrap();
     assert_eq!(rows["verb"], "rows");
     assert!(rows.get("key").is_none(), "a read carries no key");
     assert_eq!(rows["args"]["states"], json!(["doing", "review"]));
+    assert!(rows["args"].get("heads").is_none(), "heads false is left out: the frame a filter always sent");
+    assert_eq!(serde_json::to_value(&requests()[4]).unwrap()["args"], json!({"heads": true}));
+    assert_eq!(
+        serde_json::to_value(&requests()[16]).unwrap()["args"],
+        json!({"names": ["throttle"]})
+    );
 
     assert_eq!(
         serde_json::to_value(&requests()[0]).unwrap()["args"],
@@ -850,7 +913,7 @@ fn wire_spelling_is_pinned() {
     );
 
     assert_eq!(
-        serde_json::to_value(answers().last().unwrap()).unwrap(),
+        serde_json::to_value(&answers()[13]).unwrap(),
         json!({"type": "reply", "id": 13, "ok": "applied", "events": [412, 413]})
     );
     assert_eq!(
@@ -924,8 +987,10 @@ fn a_verb_without_arguments_decodes_either_way() {
     ] {
         for (verb, want) in [
             ("state", Verb::State(NoArgs {})),
-            ("lists", Verb::Lists(NoArgs {})),
+            ("lists", Verb::Lists(ListFilter::default())),
             ("machines", Verb::Machines(NoArgs {})),
+            ("throttle", Verb::Throttle(NoArgs {})),
+            ("spend", Verb::Spend(NoArgs {})),
         ] {
             let l = line(verb, args);
             assert_eq!(call_of(&decode(&l)), &Call::Verb(want), "{l}");

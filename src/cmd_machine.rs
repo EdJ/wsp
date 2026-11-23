@@ -304,6 +304,21 @@ fn agents_on<'a>(here: &'a [Standing], name: &str) -> Vec<&'a Standing> {
     here.iter().filter(|s| s.machine == name).collect()
 }
 
+/// The fleet as `wsp-view` takes it (wsp-743: the daemon's `machines` reading
+/// is this over `Fleet::live`).
+pub(crate) fn view(f: &Fleet) -> wsp_view::machine::Fleet {
+    wsp_view::machine::Fleet {
+        machines: f.machines.iter().map(|m| (record_of(m), f.live.get(&m.name).map(live_of))).collect(),
+        agents: standing(f)
+            .into_iter()
+            .map(|s| wsp_view::machine::Standing { machine: s.machine, pane: s.pane, agent: s.agent, state: s.state, holding: s.holding })
+            .collect(),
+        seat: f.seat.clone(),
+        seat_cap: f.seat_cap,
+        seat_working: f.seat_working.clone(),
+    }
+}
+
 /// The list as text, one line per element and nothing printed.
 ///
 /// Returned rather than written so the three states this view exists to tell

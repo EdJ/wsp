@@ -969,6 +969,9 @@ impl Host for Tcp {
     fn signal_group(&self, group: u32, sig: &str) {
         self.local.signal_group(group, sig)
     }
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        self.local.cwds(pids)
+    }
 
     // ---- seat.read
     fn read_screen(&self, render: &Path) -> Result<String> {
@@ -1058,6 +1061,9 @@ impl Host for Tcp {
     // ---- seat.did
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.local.transcript_of(session, cwd)
+    }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.local.transcripts_of_tree(tree)
     }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.local.pi_session_of(session, cwd)

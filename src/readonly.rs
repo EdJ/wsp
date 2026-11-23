@@ -43,7 +43,7 @@ pub const ACTIONS: &[&str] = &[
     "attend", "claim", "release", "pin", "unpin", "agent", "doctor", "say", "tell", "flag", "reconcile",
     "attempts", "leg", "install", "daemon", "brief", "commit-help", "machine", "migrate", "code", "retro", "packet", "sandbox",
     "mandate", "cold", "after", "scratch", "artefact", "done", "stuck", "verifications", "panel", "init",
-    "project", "resume", "govern", "view", "kanban", "checkout", "land", "verify", "report", "throttle", "submit",
+    "project", "product", "initiative", "resume", "govern", "view", "kanban", "checkout", "land", "verify", "report", "throttle", "submit",
 ];
 
 /// Verbs that write except for the listed sub-verbs.

@@ -13,7 +13,10 @@ dependencies to hold this.
 ## Holds
 
 - `src/lib.rs`: `Client::dial(state_dir, by, wait)`, `Client::{request, request_keyed, set_timeout, server, head,
-  subscribe}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`, `Refused`, `Failed`, `Unexpected`), `REQUEST_TIMEOUT`. `request(verb, args)` builds the
+  subscribe, wip, throttle, spend, show}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`, `Refused`, `Failed`, `Unexpected`),
+  `ViewError` (`Request`, `Refused`, `Answer`), `REQUEST_TIMEOUT`. `throttle()`, `spend()` and `show(id)` return the
+  documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id> --json` print, as the `Value` (wsp-307); a
+  refusal (`not_found`, `unsupported` from a server without them) is `ViewError::Refused`. `request(verb, args)` builds the
   envelope from a verb name and JSON `args` (so a verb this build does not know still goes out, and the server
   answers `unsupported`), and returns the `Reply` whose id matches; a refusal is a `Reply` with `err`. One timeout
   covers send to reply; on a timeout or a lost connection the connection is dropped, and the next request dials
@@ -38,9 +41,14 @@ dependencies to hold this.
   `Item::Resumed { from }`; `Iterator::next` blocks until the next one. An event id at or before the last handed
   out is dropped (`duplicates()`). A beat resets the quiet count; each beat period of silence counts a missed beat
   (`missed_beats()`), and `MISSED_BEATS` in a row, or a closed or malformed connection, drops it. It then dials
-  again with a backoff (25 ms doubling to 1 s; `why_silent()` says why it cannot) and subscribes `from` its last
+  again and subscribes `from` its last
   id, and announces that as one `Resumed { from }`, but only when something had been handed out. A `too_old` reply
   leads to `subscribe {}` on the same connection and a fresh `State`, after which events count from its id.
+  A loss after the connection delivered an item or a beat dials again at once. A loss before it did (a snapshot
+  line it cannot read, say) waits a backoff first, as a failed dial does: 25 ms doubling to 1 s, reset by a
+  delivery. `why_silent()` says why it cannot connect (wsp-702). A
+  snapshot sent as `Feed::Part`s and a closing `Feed::State` is held until the `State` comes and handed out as one
+  `Item::State`; the parts of a lost connection are dropped.
   The server drops a connection it hears nothing on for `MISSED_BEATS` beats, so once a beat the feed sends the cheap
   read `events { from: <its last>, limit: 0 }` and reads its reply past. `set_beat` tells the feed the server's beat period (`BEAT_SECS` unless a test sets it).
 
@@ -50,8 +58,10 @@ dependencies to hold this.
 for no `api.json`, a wrong token, no token file, a bad file, a stopped server, and a listener that never welcomes;
 `request` for each read verb, and a request after the server was away; `subscribe` for the snapshot then each event
 once, a restart mid-stream (`Resumed`, then every later event once, ids contiguous), a feed that never connected
-(no `Resumed`), `too_old` (a fresh `State`), and, against a fake server, a repeated id dropped and a silent
-connection dialled again.
+(no `Resumed`), `too_old` (a fresh `State`), `throttle`, `spend` and `show` against a server with fake views (and
+`unsupported` without them), and, against a fake server, a repeated id dropped and a silent
+connection dialled again; a connection lost before it delivered anything backed off, each wait longer than the
+last, and a snapshot in parts handed out as one `State` with the event after it following.
 
 wsp-119's tests run against a scripted server of the test file's own (it welcomes, then asks a closure what to say):
 a reply dropped by hanging up, and one never sent, each retried under one key and answered with the first result; a

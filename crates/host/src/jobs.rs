@@ -190,6 +190,23 @@ pub fn exit_path(exec_dir: &Path, key: &str) -> PathBuf {
     jobs_dir(exec_dir).join(format!("{key}.exit"))
 }
 
+/// The file key of the job whose wrapper `command` is, read off the command
+/// line alone as `ps` prints it (`wsp-444`): `sh -c WRAPPER sh <exit> argv…`,
+/// where [`WRAPPER`] ends `kill -KILL 0`, the next word is the wrapper's `$0`
+/// and the one after it the job's `<exec_dir>/jobs/<key>.exit`. Whoever runs
+/// the job (a manager, a `wsp` verb's in-process runner, the daemon's) and
+/// whichever exec dir it uses, its group's leader says which job it is. `None`
+/// for any other command line.
+pub fn wrapped_key(command: &str) -> Option<&str> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let at = words.windows(4).position(|w| w[..3] == ["-KILL", "0", "sh"] && w[3].ends_with(".exit"))?;
+    let exit = Path::new(words[at + 3]);
+    if exit.parent()?.file_name()? != "jobs" {
+        return None;
+    }
+    exit.file_name()?.to_str()?.strip_suffix(".exit").filter(|k| !k.is_empty())
+}
+
 /// `<exec_dir>/jobs/<key>.job`.
 pub fn record_path(exec_dir: &Path, key: &str) -> PathBuf {
     jobs_dir(exec_dir).join(format!("{key}.job"))
@@ -556,6 +573,32 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         f()
+    }
+
+    /// `wsp-444`: a running job's leader names its job on its command line, as
+    /// `ps` prints it, so the leftover sweep can tell a job's group from a
+    /// stray without asking whoever runs it; no other command line does.
+    #[test]
+    fn a_running_jobs_leader_names_its_key_on_its_command_line() {
+        let (host, dir) = (InProcess::default(), scratch("wrapped"));
+        let key = "c%2B1+0+check%3Aweb-chrome_check@9.1.3";
+        let argv = sh("sleep 30");
+        let mut job = start(&host, &dir, &spec(key, &argv, &dir, 60, None)).unwrap();
+        let out = std::process::Command::new("ps").args(["-o", "command=", "-p", &job.pgid().to_string()]).output().unwrap();
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let _ = job.stop(&host);
+        assert_eq!(wrapped_key(&line), Some(key), "{line}");
+        let printed = format!("sh -c {} sh {} sleep 30", WRAPPER.replace('\n', " "), exit_path(&dir, key).display());
+        assert_eq!(wrapped_key(&printed), Some(key));
+        for other in [
+            "sh -c npm run check",
+            "/bin/zsh -c tail -f /x/jobs/a+0+b.exit",
+            "sh -c kill -KILL 0 sh /x/elsewhere/a+0+b.exit",
+            "sh -c kill -KILL 0 sh /x/jobs/a+0+b.log",
+            "",
+        ] {
+            assert_eq!(wrapped_key(other), None, "{other}");
+        }
     }
 
     #[test]

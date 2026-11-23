@@ -150,6 +150,28 @@ pub fn root() -> PathBuf {
     }
 }
 
+/// Move each renumbered row's outputs, `<root>/<old>/`, to `<root>/<new>/`
+/// (`wsp-351`): compound's tab and `wsp artefact` find a row's assets by its
+/// id, so a row filed out of the inbox otherwise loses them. A destination
+/// already holding files is not merged into; it is answered as an error naming
+/// both, and the old directory is left where it is.
+pub fn follow_renames(root: &Path, map: &std::collections::BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
+    let mut moved = Vec::new();
+    for (from, to) in map {
+        let (a, b) = (root.join(from), root.join(to));
+        if !a.is_dir() {
+            continue;
+        }
+        if b.exists() && fs::read_dir(&b).map(|mut d| d.next().is_some()).unwrap_or(true) {
+            return Err(format!("{from}'s outputs stay in {}: {} already holds files", a.display(), b.display()));
+        }
+        let _ = fs::remove_dir(&b);
+        fs::rename(&a, &b).map_err(|e| format!("{from}'s outputs could not move to {}: {e}", b.display()))?;
+        moved.push((from.clone(), to.clone()));
+    }
+    Ok(moved)
+}
+
 fn plain(what: &str, s: &str) -> Result<(), String> {
     if s.is_empty() || s.contains(['/', '\0']) || s.starts_with('.') {
         return Err(format!("`{s}` is not a usable {what}: it must be one plain word, with no `/` and no leading `.`"));

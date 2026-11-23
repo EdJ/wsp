@@ -49,7 +49,8 @@ pub mod key {
 pub use wsp_store_contract::LINK_REQUIRED as LINK;
 
 /// A machine's durable record, as the file says it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Record {
     pub name: String,
     pub ssh: String,
@@ -67,7 +68,8 @@ pub struct Record {
 }
 
 /// What the daemon last saw of a machine.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Live {
     pub reachable: bool,
     pub last_seen: String,
@@ -109,7 +111,8 @@ impl Live {
 }
 
 /// One agent as the list draws it: which pane, what it is, what it holds.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Standing {
     /// The machine it is on; `""` is this seat.
     pub machine: String,
@@ -120,7 +123,8 @@ pub struct Standing {
 }
 
 /// Everything `machine ls --json` draws.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Fleet {
     pub machines: Vec<(Record, Option<Live>)>,
     pub agents: Vec<Standing>,

@@ -570,6 +570,12 @@ pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrow
 /// found its own shell.
 pub const WAIT_RULE: &str = "Waiting: never wait on `pgrep -f \"<string>\"` — the pattern is on the loop's own line, so it finds its own shell and never ends; wait on a pid (`wait <pid>`, or `while kill -0 <pid>; do sleep 5; done`) or on a `run_in_background` command's notification.";
 
+/// The one rule every packet carries on killing (`wsp-691`): on 2026-11-19 a
+/// verifier's `pkill -f "scripts/check.mjs" -P 0` read `-P` and `0` as two more
+/// patterns (BSD getopt stops at the first one) and ended every Claude session
+/// on the machine. The Bash hook refuses that form; this says what to do instead.
+pub const KILL_RULE: &str = "Killing: kill by pid, never by a broad pattern — `kill $(cat <pidfile>)` for what you started (`echo $! > <pidfile>`), or the pids `lsof -t -i :<port>` or `lsof -t +D <dir>` gives. `pkill`/`killall` read every word after the first pattern as another pattern on macOS, so `pkill -f \"x\" -P 0` matches nearly every process; the Bash hook refuses that, `killall node` (or claude, wsp, cargo) and a `pkill` pattern under 4 characters. What you leave running in your tree is stopped when you submit.";
+
 /// The print: a heading, the author's words, the verbs the row names that its
 /// seat is refused (`refused`, `wsp-312`), the seat's exit template
 /// (`wsp-617`), then each named file inline, refused over [`CAP`].
@@ -590,7 +596,7 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, refused: Option<&str>,
     if p.text.contains("cargo test") {
         out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
-    out.push_str(&format!("\n{WAIT_RULE}\n"));
+    out.push_str(&format!("\n{WAIT_RULE}\n\n{KILL_RULE}\n"));
     if let Some(section) = refused {
         out.push_str(&format!("\n{section}\n"));
     }
@@ -884,6 +890,10 @@ mod tests {
             assert_eq!(text.matches(WAIT_RULE).count(), 1, "{text}");
         }
         assert!(WAIT_RULE.contains("never wait on `pgrep -f \"<string>\"`") && WAIT_RULE.contains("wait on a pid"));
+        for body in ["file: src/a.rs\nverify  cargo test a::", "file: src/a.rs\nSave prints ok."] {
+            assert_eq!(build(&row(body), &dir).unwrap().matches(KILL_RULE).count(), 1);
+        }
+        assert!(KILL_RULE.contains("kill by pid, never by a broad pattern"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -946,7 +956,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let plain = build(&row("Add the flag."), &dir).unwrap();
         let exit = crate::closing::exit_template(crate::exit::Kind::Member, "t-1", &[]);
-        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{exit}"));
+        assert_eq!(plain, format!("# Packet · t-1 · Add a flag\n\nAdd the flag.\n\n{WAIT_RULE}\n\n{KILL_RULE}\n\n{exit}"));
         let mut t = row("Add the flag.");
         t.body.push_str("\n## Log\n- 2026-11-08 sent back: the first gap\n");
         t.set_status(crate::model::Status::Review);

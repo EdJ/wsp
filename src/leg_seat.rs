@@ -151,6 +151,28 @@ pub(crate) fn attach(store: &Store, id: &str, name: &str, seat: &str, stand: &St
     wrote
 }
 
+/// Whether `seat` is a leg's or a piece's on `t`: an entry names it, or the
+/// binding its spawn wrote says `leg` (`wsp-334`). Such a seat holds no claim
+/// and is no member's. The leg's own paths end it (`cycle::legs_finished`,
+/// `closing::tick`), never the member's idle tell or close. wsp-030's legs
+/// were each told "finish, land and review", and the person was flagged
+/// "needs a person" for a row only its finish leg submits.
+pub(crate) fn a_parts_seat(store: &Store, t: &Task, seat: &str) -> bool {
+    legs::legs(t).iter().any(|l| l.pane.as_deref() == Some(seat))
+        || crate::pieces::record(t).pieces.iter().any(|p| p.pane.as_deref() == Some(seat))
+        || store
+            .bindings()
+            .get(seat)
+            .is_some_and(|b| b.get("task_id").and_then(|v| v.as_str()) == Some(t.id.as_str()) && b.get("leg").is_some())
+}
+
+/// Whether the row has handed itself to its legs: staged, with a leg begun
+/// (running, done or skipped). From then on nothing on the row is a member's
+/// seat to tell to finish, and its legs are what is read (`wsp-334`).
+pub(crate) fn handed_to_legs(t: &Task) -> bool {
+    legs::staged(t) && legs::legs(t).iter().any(|l| l.state != State::Pending)
+}
+
 /// The tier a leg spawns at: its policy's kind, model and effort.
 pub(crate) fn tier_of(leg: &Leg) -> (String, Option<String>, Option<String>) {
     let Policy { kind, model, effort } = leg.policy.clone();
@@ -271,7 +293,14 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         return 2;
     };
     match done(store, args, task, pane) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // `wsp-691`: what the leg left running in the row's tree goes with
+            // it, all but this seat's agent and the chain this runs on.
+            if let Some(t) = store.find_task(task) {
+                crate::ending::stop_in_tree(store, &t.id, true, &format!("{} leg done", t.id));
+            }
+            0
+        }
         Err(why) => {
             let why = why.trim_start_matches("wsp: ").to_string();
             crate::store::log_line(

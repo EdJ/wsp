@@ -641,6 +641,10 @@ fn run_unit_locked(
             return (Ranged::Could(why), narrowed, Some(start));
         }
     };
+    // A `node_modules/` the tree lacks is installed before the steps that need
+    // it (`compound-react-045`), and said on the start's seed lines.
+    let mut start = start;
+    start.install(&tree, &dir.join("barrier.log"), &runner);
     let ran = check::run_every(&tree, &steps, &dir.join("barrier.log"), Some(&reuse), &runner, |_| {});
     drop(lock);
     (Ranged::Ran(ran), narrowed, Some(start))
@@ -827,7 +831,7 @@ mod tests {
             assert_eq!(at.host.0, wsp_trees::job_place::host_of(barrier), "the list's barrier host");
             assert_eq!(jobs.place, check::place_of(barrier, check::TreeKind::Barrier, &dir.join("tree")).unwrap(), "from place_of");
             assert!(!at.escapes() && !at.path.starts_with('/') && at.path.ends_with("/tree"), "{}", at.path);
-            let run = jobs.run_of(&u.items[0].step);
+            let run = jobs.run_of(&u.items[0].step, &dir.join("tree"));
             assert_eq!((run.key.row.0.as_str(), run.at.clone()), ("run#1", jobs.place.at.clone()));
             drop(runner);
 
@@ -904,6 +908,7 @@ mod tests {
             tail: tail.into(),
             first: None,
             reused: None,
+            build: None,
         }
     }
 

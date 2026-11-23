@@ -424,6 +424,9 @@ impl Host for Counting<'_> {
     fn signal_group(&self, group: u32, sig: &str) {
         self.inner.signal_group(group, sig)
     }
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        self.inner.cwds(pids)
+    }
     fn answers(&self, socket: &Path) -> bool {
         self.inner.answers(socket)
     }
@@ -477,6 +480,9 @@ impl Host for Counting<'_> {
     }
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.inner.transcript_of(session, cwd)
+    }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.inner.transcripts_of_tree(tree)
     }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.inner.pi_session_of(session, cwd)

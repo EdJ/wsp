@@ -120,11 +120,17 @@ fn places(store: &Store, since: i64) -> (HashMap<String, Place>, usize) {
 
 /// The report as of `now`, in the shape compound draws.
 pub fn report(store: &Store, now: i64) -> Value {
+    let r = reading(store, now);
+    wsp_view::spend::report(&r.lines, &r.places(), r.landed, now)
+}
+
+/// `spend --json`'s inputs as of `now` (wsp-743: the daemon's `spend` reading).
+pub fn reading(store: &Store, now: i64) -> wsp_view::reading::Spend {
     let today = now - now.rem_euclid(DAY);
     let since = today - (WINDOW - 1) * DAY;
     let lines: Vec<Line> = ledger(&store.state).into_iter().filter(|l| l.ended >= since && l.ended < today + DAY).collect();
     let (places, landed) = places(store, since);
-    wsp_view::spend::report(&lines, &places, landed, now)
+    wsp_view::reading::Spend { lines, places: places.into_iter().collect(), landed }
 }
 
 pub fn spend(store: &Store, args: &Args) -> i32 {

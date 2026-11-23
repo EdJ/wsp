@@ -747,7 +747,36 @@ pub(crate) struct Spooled {
     /// confirmation covers all of them together. `wsp-146` d2, and its own
     /// cost is one integer per held line.
     pub(crate) typed: i64,
+    /// Epoch seconds of when this entry was folded into a count rather than
+    /// typed, or zero if it never has been (`wsp-694`).
+    ///
+    /// **Kept, not settled, and withheld from the seat from then on.** A
+    /// delivery past [`DELIVERY_CAP`] types a summary and folds what it did not
+    /// print, and a seat ended for refusing folds what it was typed (see
+    /// [`crate::wake::fold_what_was_typed`]). Either way the entry is still in
+    /// the record for `wsp watch --drain`, which is what the summary points
+    /// at, and it is no longer owed — so the next wake is not the same text
+    /// again.
+    pub(crate) folded: i64,
 }
+
+/// The most one delivery to a seat may carry, in bytes, before it is a summary
+/// rather than the spool (`wsp-694`).
+///
+/// **Measured against the one that wedged a seat.** On 2026-11-19 the
+/// `compounding` spool held 515 entries going back two days, and wsp typed
+/// them at the custodian as one 81,814-byte message. It sat in Claude Code's
+/// input box unsubmitted, the pane read `no composer` from then on, and every
+/// tell to it was refused for fifteen hours. Four kilobytes is a screenful: a
+/// wake that has more to say than that says how much there is and where it is.
+pub(crate) const DELIVERY_CAP: usize = 4 * 1024;
+
+/// How many of the newest lines a summary prints.
+const SUMMARY_NEWEST: usize = 5;
+
+/// The longest one line in a summary may be, in characters — a seat's last
+/// words drawn as box rules are one line, and must not be the whole budget.
+const SUMMARY_LINE: usize = 400;
 
 /// What is being held for the next wake.
 ///
@@ -782,6 +811,7 @@ impl Spooled {
             class: line.class().word().to_string(),
             line: Some(line),
             typed: 0,
+            folded: 0,
         }
     }
 
@@ -839,6 +869,58 @@ impl Spooled {
             // stored line is already whole, so it is printed as it was.
             None if self.class == Class::News.word() => self.text.clone(),
             None => column(&self.class, self.at, &self.text, &util::Paint::new()),
+        }
+    }
+}
+
+impl Spooled {
+    /// The list or row this entry is about, where it names one, as
+    /// `("list" | "row", name)` — what [`Spool::stale`] asks `closed` of.
+    ///
+    /// News names its subject. A message is read for the two shapes wsp
+    /// writes itself: a done list's sentence handed on (`Meant for the <list>
+    /// list's own seat`, `crate::cycle`'s `tell_now`) and a hand raised to a
+    /// governor (`… raised a hand on <row> (<id>)`, `cmd_agent`'s
+    /// `for_a_governor`). Anything else names nothing and is kept.
+    fn about(&self) -> Option<(&'static str, String)> {
+        if let Some(Line::News(e)) = &self.line {
+            return Some(("row", e.signal.subject.clone()));
+        }
+        let text = self.message()?;
+        if let Some(rest) = text.strip_prefix("Meant for the ") {
+            return rest.split_once(" list's own seat").map(|(list, _)| ("list", list.to_string()));
+        }
+        let (_, rest) = text.split_once(" raised a hand on ")?;
+        let row = rest.split([' ', ':', '\n']).next().filter(|r| !r.is_empty())?;
+        Some(("row", row.to_string()))
+    }
+
+    /// What two flags share when the newer one says everything the older one
+    /// did. `None` for anything that is not a flag — see [`Spool::stale`].
+    fn repeat_key(&self) -> Option<String> {
+        if let Some(Line::News(e)) = &self.line {
+            return (e.signal.kind == Kind::Flag)
+                .then(|| format!("flag {} {}", e.signal.subject, e.edge.word()));
+        }
+        // A hand carries its own message id, so two raises of the same words
+        // differ only in it: the row and the words are the repeat.
+        let (_, rest) = self.message()?.split_once(" raised a hand on ")?;
+        let row = rest.split([' ', ':', '\n']).next().unwrap_or_default();
+        let body = rest.split("\n\n").nth(1).unwrap_or_default();
+        Some(format!("hand {row} {body}"))
+    }
+
+    /// The start of what this said, for a line in `cycle.log`.
+    fn head(&self) -> String {
+        util::truncate(&self.text.split_whitespace().collect::<Vec<_>>().join(" "), 80)
+    }
+
+    /// The word a summary counts this under: the signal's kind for news, the
+    /// class for everything else.
+    fn kind_word(&self) -> &str {
+        match &self.line {
+            Some(Line::News(e)) => e.signal.kind.word(),
+            _ => &self.class,
         }
     }
 }
@@ -947,8 +1029,9 @@ impl Spool {
             true => crate::worklist::Running::read(store),
             false => Default::default(),
         };
+        // A folded entry has been said, as a count, and is the drain's now.
         let (typed, withheld): (Vec<Spooled>, Vec<Spooled>) =
-            self.held.drain(..).partition(|h| h.is_a_decision(&running));
+            self.held.drain(..).partition(|h| h.folded == 0 && h.is_a_decision(&running));
         self.held = typed;
         withheld
     }
@@ -1008,6 +1091,76 @@ impl Spool {
         }
     }
 
+    /// Say that these entries were folded into a count, and are withheld from
+    /// the seat from now on. Inside the caller's lock, writing back only this
+    /// field — see [`Spool::stamp_typed`].
+    pub(crate) fn fold(rec: &mut Value, at: i64, seqs: &[u64]) {
+        if seqs.is_empty() {
+            return;
+        }
+        if !rec.is_object() {
+            *rec = json!({});
+        }
+        let mut spool = Spool::of_json(rec.get("spool").unwrap_or(&Value::Null));
+        for h in spool.held.iter_mut().filter(|h| seqs.contains(&h.seq)) {
+            h.folded = at;
+        }
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("spool".into(), spool.json());
+        }
+    }
+
+    /// How many entries here have been folded and wait for `--drain`.
+    pub(crate) fn folded(&self) -> usize {
+        self.held.iter().filter(|h| h.folded > 0).count()
+    }
+
+    /// What here is no longer worth anybody's read, and why — `(seq, words)`
+    /// for each, newest kept (`wsp-694`).
+    ///
+    /// **Two rules, and both are relevance rather than age.**
+    ///
+    /// - *About something closed.* An entry whose subject is a row or a list
+    ///   that `closed` says is finished: news of a row that has since landed, a
+    ///   hand raised on a row that is done, a sentence meant for a list's own
+    ///   seat whose list is over. On 2026-11-19 those were most of the 515.
+    ///   **One exception, and it is `wsp-216`'s:** a done list's sentences are
+    ///   handed on to the seat above *because* the list is over, so that notice
+    ///   is kept for [`DEFER_MAX`] — the time the seat above is promised to
+    ///   hear it in — and dropped after.
+    /// - *A repeat of a flag.* The `flag` level on the same row going the same
+    ///   way, or the same hand raised on the same row with the same words: only
+    ///   the newest says anything the older ones did not. **Flags only**, and
+    ///   on purpose — any other level re-raising is owed again
+    ///   (`the_same_wake_twice_is_owed_twice_where_a_person_would_be_refused`),
+    ///   and a flag is the one thing `hooks/on-attention-raised` has already
+    ///   put in front of a person.
+    ///
+    /// An entry written before seqs existed carries seq zero beside others
+    /// that do, and is never named: removal is by identity, and a shared seq
+    /// is not one. (A record's very first entry is seq zero too, and alone.)
+    pub(crate) fn stale(&self, at: i64, closed: &dyn Fn(&str) -> bool) -> Vec<(u64, String)> {
+        let mut gone = Vec::new();
+        let mut seen = BTreeSet::new();
+        let zero_is_one = self.held.iter().filter(|h| h.seq == 0).count() == 1;
+        for h in self.held.iter().rev().filter(|h| h.seq > 0 || zero_is_one) {
+            if let Some(key) = h.repeat_key() {
+                if !seen.insert(key) {
+                    gone.push((h.seq, format!("a repeat of a newer entry: {}", h.head())));
+                    continue;
+                }
+            }
+            if let Some((what, name)) = h.about() {
+                let handed_on = what == "list" && at - h.at <= DEFER_MAX;
+                if !handed_on && closed(&name) {
+                    gone.push((h.seq, format!("about the {what} {name}, which is closed: {}", h.head())));
+                }
+            }
+        }
+        gone.reverse();
+        gone
+    }
+
     /// Everything held, in the order it happened — **taken, not copied**.
     ///
     /// The caller is expected to fail to deliver it and put it back. See
@@ -1036,6 +1189,12 @@ impl Spool {
                     if h.typed > 0 {
                         if let Some(o) = v.as_object_mut() {
                             o.insert("typed".into(), json!(h.typed));
+                        }
+                    }
+                    // Omitted at zero for the same reason as `typed`.
+                    if h.folded > 0 {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("folded".into(), json!(h.folded));
                         }
                     }
                     if let (Some(Line::News(e)), Some(o)) = (&h.line, v.as_object_mut()) {
@@ -1076,7 +1235,8 @@ impl Spool {
                 Some(c) => Some(Line::Note(c, text.clone())),
                 None => None,
             };
-            held.push(Spooled { seq, at, line, text, class, typed });
+            let folded = rec.get("folded").and_then(Value::as_i64).unwrap_or(0);
+            held.push(Spooled { seq, at, line, text, class, typed, folded });
         }
         Spool { held }
     }
@@ -2528,6 +2688,18 @@ impl Source for Poll<'_> {
                     &t.id,
                     "stopped on a question — wsp show <id> has it",
                 )),
+                // Sent back at the leg (or piece) cap: no rework could be
+                // added, so the run starts nothing and seats nobody — a level
+                // until it moves (`wsp-690`).
+                Status::Doing => {
+                    if let Some(cap) = crate::verification::stalled_at_cap(t) {
+                        out.push(Signal::new(
+                            Kind::Blocked,
+                            &t.id,
+                            &format!("sent back at the {cap}: no rework was added and nothing will start — the governor decides · wsp show <id>"),
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
@@ -3240,6 +3412,10 @@ pub(crate) struct Stream<'a, S: Sink = Stdout> {
     /// Judged not worth one *on its own*, this tick. Merged into the durable
     /// spool by [`Stream::tick`].
     cold: Vec<Spooled>,
+    /// What the last [`Stream::tick`] said only as a count, by seq — empty
+    /// unless that delivery was past [`Spec::cap`] and arrived. The caller
+    /// stamps these with [`Spool::fold`] rather than settling them.
+    pub(crate) folded: Vec<u64>,
 }
 
 impl<'a, S: Sink> Stream<'a, S> {
@@ -3247,7 +3423,7 @@ impl<'a, S: Sink> Stream<'a, S> {
         // Asked of the sink, because painting is a fact about where the words
         // are going and not about where they come from — see [`Sink::paint`].
         let p = sink.paint();
-        Stream { spec, p, sink, hot: Vec::new(), cold: Vec::new() }
+        Stream { spec, p, sink, hot: Vec::new(), cold: Vec::new(), folded: Vec::new() }
     }
 
     /// Offer a line. Print now, or hold — there is no third outcome, and no
@@ -3357,6 +3533,16 @@ impl<'a, S: Sink> Stream<'a, S> {
         out.extend(ending);
 
         let said: Vec<String> = out.iter().map(|h| h.say(self.spec, &self.p)).collect();
+        // **`wsp-694`: never the whole spool at a seat.** Past the cap the seat
+        // is typed a summary, and what it does not print is folded rather than
+        // put back, so the next tick is not the same text again.
+        let (said, shown) = match self.spec.cap {
+            Some(cap) if size(&said) > cap => summary(&out, &said, at, self.spec.defer_max, cap),
+            _ => {
+                let all = (0..out.len()).collect();
+                (said, all)
+            }
+        };
         if !self.sink.deliver(&said) {
             // Nothing arrived, so **nothing** clears — not the half of it that
             // happened to be cloned. `Spool::take` says the caller is expected
@@ -3374,8 +3560,82 @@ impl<'a, S: Sink> Stream<'a, S> {
             spool.put_back(out);
             return Vec::new();
         }
+        if shown.len() < out.len() {
+            let (typed, folded): (Vec<(usize, Spooled)>, Vec<(usize, Spooled)>) =
+                out.into_iter().enumerate().partition(|(i, _)| shown.contains(i));
+            self.folded = folded.into_iter().map(|(_, h)| h.seq).collect();
+            return typed.into_iter().map(|(_, h)| h).collect();
+        }
         out
     }
+}
+
+/// How many bytes these lines are as one message.
+fn size(said: &[String]) -> usize {
+    said.iter().map(|l| l.len() + 1).sum()
+}
+
+/// A delivery too big to type, said in [`DELIVERY_CAP`] or less (`wsp-694`):
+/// the lines to type, and which of `out` they print.
+///
+/// **What a seat needs to act, and where the rest is.** How much is held and
+/// how much of it is old; counts by kind, so a seat sees *312 flags* and not
+/// 312 lines; the newest few, each cut to [`SUMMARY_LINE`]; and `wsp watch
+/// --drain`, which prints the whole spool and takes it off the seat. Nothing
+/// past `defer_max` is printed: it has waited past the bound on holding and is
+/// a count, never a line.
+fn summary(out: &[Spooled], said: &[String], at: i64, defer_max: i64, cap: usize) -> (Vec<String>, Vec<usize>) {
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    for h in out {
+        *kinds.entry(h.kind_word()).or_default() += 1;
+    }
+    let mut kinds: Vec<(&str, usize)> = kinds.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let old = out.iter().filter(|h| at - h.at > defer_max).count();
+    let fresh = |i: &usize| at - out[*i].at <= defer_max;
+
+    let head = |shown: usize| {
+        vec![
+            format!(
+                "{} entries are held for this seat ({} KB) — more than one delivery carries ({} KB), so this is a summary and not the spool.",
+                out.len(),
+                size(said).div_ceil(1024),
+                cap / 1024
+            ),
+            format!("by kind: {}", kinds.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(" · ")),
+            format!(
+                "folded, not typed: {} ({old} held past the {} bound on holding){}",
+                out.len() - shown,
+                util::duration_human(defer_max),
+                match shown {
+                    0 => String::new(),
+                    n => format!(" · the newest {n}:"),
+                }
+            ),
+        ]
+    };
+    let foot = "`wsp watch --drain` prints every one of them and takes them off this seat.".to_string();
+
+    // Newest first, within the bound, while they fit.
+    let mut idx: Vec<usize> = (0..out.len()).filter(fresh).collect();
+    idx.sort_by_key(|i| std::cmp::Reverse((out[*i].at, *i)));
+    let room = cap.saturating_sub(size(&head(SUMMARY_NEWEST)) + foot.len() + 1);
+    let mut shown = Vec::new();
+    let mut used = 0;
+    for i in idx.into_iter().take(SUMMARY_NEWEST) {
+        let line = util::truncate(&said[i], SUMMARY_LINE);
+        if used + line.len() + 1 > room {
+            break;
+        }
+        used += line.len() + 1;
+        shown.push(i);
+    }
+    // Printed in the order the delivery had them, so `over` stays last.
+    shown.sort_unstable();
+    let mut lines = head(shown.len());
+    lines.extend(shown.iter().map(|i| util::truncate(&said[*i], SUMMARY_LINE)));
+    lines.push(foot);
+    (lines, shown)
 }
 
 /// Where a line goes when it leaves this verb.
@@ -3559,6 +3819,10 @@ pub(crate) struct Spec {
     /// How old a spooled fact may get before it is a wake on its own. See
     /// [`DEFER_MAX`].
     defer_max: i64,
+    /// The most one delivery may carry before it is a summary, or `None` for a
+    /// reader that wants every line — a person at a stream, a governor's own
+    /// pipe. Only the daemon's path to a seat sets it: see [`DELIVERY_CAP`].
+    cap: Option<usize>,
 }
 
 impl Spec {
@@ -3625,6 +3889,7 @@ impl Spec {
             json: false,
             wake: true,
             defer_max: DEFER_MAX,
+            cap: Some(DELIVERY_CAP),
         }
     }
 }
@@ -3745,6 +4010,7 @@ fn spec(store: &Store, args: &Args) -> Result<Spec, String> {
         json: args.json(),
         wake: args.has("wake"),
         defer_max: dur("defer-max", DEFER_MAX)?,
+        cap: None,
     })
 }
 
@@ -6136,6 +6402,7 @@ mod tests {
             json,
             wake: false,
             defer_max: DEFER_MAX,
+            cap: None,
         }
     }
 
@@ -6491,6 +6758,86 @@ mod tests {
             self.said.extend(said.iter().cloned());
             true
         }
+    }
+
+    /// **`wsp-694`: 515 entries over two days were typed at a custodian as one
+    /// 81,814-byte message, and it wedged the seat for fifteen hours.** The same
+    /// shape, 500 entries over two days: what is about a closed list goes, a
+    /// flag raised again and again on one row is one flag, and what is left is
+    /// one delivery under the cap whose summary counts what it folded, and
+    /// never prints what has waited past the bound.
+    #[test]
+    fn a_two_day_backlog_is_one_delivery_under_the_cap_that_counts_what_it_folded() {
+        let now = 2_000_000_000;
+        let two_days = 2 * 24 * 60 * 60;
+        let at = |i: i64| now - two_days + i * two_days / 500;
+        // The closed list's sentences inside the bound are handed on, not stale.
+        let old_for_the_list = (0..500).filter(|i| i % 5 == 0 && now - at(*i) > DEFER_MAX).count();
+        let fresh_for_the_list = 100 - old_for_the_list;
+        assert!(old_for_the_list > 80 && fresh_for_the_list > 0);
+        let lines: Vec<Spooled> = (0..500)
+            .map(|i| {
+                let at = at(i);
+                let line = match i % 5 {
+                    // A done list's sentences, handed on and never read.
+                    0 => Line::Note(
+                        Class::Message,
+                        format!("Meant for the governance-ui list's own seat, and nobody is coming to it: the list is done.\n\nbarrier {i} passed"),
+                    ),
+                    // The same hand, raised again and again on one row.
+                    1 => Line::Note(
+                        Class::Message,
+                        format!("cpd-700 raised a hand on compounding-756 (m-{i}):\n\nthe fixture is red\n\nnothing is owed back"),
+                    ),
+                    // The same level on the same row, each tick it re-raised.
+                    2 => news(Kind::Flag, Edge::Up, "compounding-756"),
+                    // A seat's last words, drawn as rules.
+                    3 => Line::Note(Class::Message, format!("cpd-{i} said last: {}", "─".repeat(300))),
+                    _ => Line::Note(Class::Message, format!("verdict {i}: wsp-{i} holds")),
+                };
+                Spooled::of(at, line)
+            })
+            .collect();
+        let mut rec = Value::Null;
+        Spool::append(&mut rec, lines);
+        // One sentence handed on from the closed list within the bound — the
+        // seat above is still owed that one (`wsp-216`).
+        Spool::append(&mut rec, vec![Spooled::of(now - 60, Line::Note(
+            Class::Message,
+            "Meant for the governance-ui list's own seat, and nobody is coming to it: the list is done.\n\nthe last verdict".into(),
+        ))]);
+
+        let closed = |name: &str| name == "governance-ui";
+        let gone = Spool::of_json(&rec["spool"]).stale(now, &closed);
+        let why = |w: &str| gone.iter().filter(|(_, g)| g.starts_with(w)).count();
+        assert_eq!(why("about the list governance-ui, which is closed"), old_for_the_list, "the closed list's messages are dropped");
+        assert_eq!(why("a repeat of a newer entry"), 99 + 99, "a hand and a level on one row, each kept once");
+        let seqs: Vec<u64> = gone.iter().map(|(q, _)| *q).collect();
+        Spool::settle_these(&mut rec, &seqs);
+        let mut spool = Spool::of_json(&rec["spool"]);
+        let left = 501 - old_for_the_list - 198;
+        assert_eq!(spool.depth(), left);
+        assert!(
+            spool.held.iter().all(|h| !h.text.contains("governance-ui") || now - h.at <= DEFER_MAX),
+            "no sentence for the closed list older than the bound is left"
+        );
+        assert!(spool.held.iter().any(|h| h.text.contains("the last verdict")), "but one handed on within it is");
+
+        let spec = Spec { cap: Some(DELIVERY_CAP), ..waking(DEFER_MAX) };
+        let mut sink = Recorded::default();
+        let mut stream = Stream::new(&spec, &mut sink);
+        let typed = stream.tick(now, &mut spool);
+        let folded = std::mem::take(&mut stream.folded);
+        let said = sink.said.join("\n");
+
+        assert!(said.len() <= DELIVERY_CAP, "one delivery under the cap: {} bytes", said.len());
+        assert!(typed.len() <= SUMMARY_NEWEST && !typed.is_empty(), "the newest few are typed: {}", typed.len());
+        assert_eq!(typed.len() + folded.len(), left, "and everything else is folded, none of it lost");
+        assert!(said.contains(&format!("folded, not typed: {} (", folded.len())), "the summary counts the folded: {said}");
+        assert!(said.contains("by kind: ") && said.contains(" message") && said.contains("1 flag"), "{said}");
+        assert!(said.contains("`wsp watch --drain`"), "and says where the rest is");
+        assert!(typed.iter().all(|h| now - h.at <= DEFER_MAX), "nothing past the bound is printed, only counted");
+        assert!(spool.held.is_empty(), "taken: the caller settles what was typed and folds the rest");
     }
 
     /// **A stream is painted for where its words are going, not for the

@@ -641,7 +641,14 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                         }
                         Some(_) => {}
                     }
-                    if !store.claims().contains_key(row) {
+                    // **Never for a leg's or a piece's seat** (`wsp-334`): a part
+                    // claims nothing. The claim this wrote for each of wsp-030's
+                    // legs kept the next leg from opening (a row someone holds
+                    // whole opens no leg). It also made the run read the leg's seat
+                    // as the member's, so the seat was told to finish, the
+                    // person was flagged, and each boundary cost two ticks.
+                    let part = store.find_task(row).is_some_and(|t| crate::leg_seat::a_parts_seat(store, &t, seat));
+                    if !part && !store.claims().contains_key(row) {
                         store.set_claim(row, json!({ "workspace_id": seat, "host": host, "epoch": s.epoch.0, "claimed_at": util::now_iso() }));
                     }
                 });
@@ -917,16 +924,21 @@ mod tests {
         msgs.into_iter().map(|msg| m.emit(msg).unwrap().0).collect()
     }
 
-    /// Ask until `want` frames were folded or ten seconds passed.
-    fn pump(store: &Store, sub: &mut Subscription, want: usize) -> usize {
-        let mut n = 0;
-        let start = Instant::now();
-        while n < want && start.elapsed() < Duration::from_secs(10) {
-            if step(store, None, HOST, sub, Duration::from_millis(500)).unwrap() {
-                n += 1;
-            }
+    /// The upper bound on every wait here for a frame to come and be folded:
+    /// generous, so a machine under load is slow and not failed. Each wait
+    /// ends as soon as what it waits for is seen (as wsp-114's do).
+    const WAIT: Duration = Duration::from_secs(120);
+
+    /// Ask until the fold has reached event `id`, and fail if `WAIT` runs out.
+    /// What it waits on is the folded id, not a count of frames: a manager
+    /// that comes back beats first, and under load that beat can be the frame
+    /// a count would stop at, before the event the test emitted.
+    fn fold_to(store: &Store, sub: &mut Subscription, id: u64) {
+        let deadline = Instant::now() + WAIT;
+        while read_folded(&store.state, HOST).is_none_or(|EventId(n)| n < id) {
+            assert!(Instant::now() < deadline, "event {id} not folded within {WAIT:?}: at {:?}", read_folded(&store.state, HOST));
+            step(store, None, HOST, sub, Duration::from_millis(500)).unwrap();
         }
-        n
     }
 
     fn lines(path: &Path) -> usize {
@@ -950,9 +962,9 @@ mod tests {
         // manager runs in this test's process and reads its facts with its
         // own probes; those are its, so the tick below starts after them.
         let mut sub = Subscription::new(addr, token(&exec), HOST, &store.state, "test");
-        let start = Instant::now();
+        let deadline = Instant::now() + WAIT;
         while !beat_path(&store.state, HOST).exists() {
-            assert!(start.elapsed() < Duration::from_secs(10), "no beat with host facts within 10s");
+            assert!(Instant::now() < deadline, "no beat with host facts within {WAIT:?}");
             step(&store, None, HOST, &mut sub, Duration::from_millis(500)).unwrap();
         }
         assert!(read(&beat_path(&store.state, HOST))["beat"]["host"]["cpus"].as_u64().is_some_and(|n| n > 0));
@@ -961,7 +973,7 @@ mod tests {
         wsp_base::calls::tick_begin();
         wsp_base::calls::phase("fold");
         let ids = script(&m);
-        assert_eq!(pump(&store, &mut sub, ids.len()), ids.len(), "every event folded");
+        fold_to(&store, &mut sub, *ids.last().unwrap());
         wsp_base::calls::tick_end();
         let ticks: Vec<Value> =
             wsp_base::calls::read_all(&store.state).into_iter().filter(|l| l["k"] == "tick" && l["phases"].get("fold").is_some()).collect();
@@ -1004,7 +1016,7 @@ mod tests {
         let later = m
             .emit(Message::SeatSaid(SeatSaid { seat: seat(), epoch: Epoch(1), at: At(1_700_000_009_000), text: "again".into() }))
             .unwrap();
-        assert_eq!(pump(&store, &mut sub, 1), 1);
+        fold_to(&store, &mut sub, later.0);
         assert!(sub.subscribed >= 2, "it resubscribed: {}", sub.subscribed);
         assert_eq!(LOCAL.said(&dir)["said"], "again");
         sub.close();
@@ -1014,9 +1026,9 @@ mod tests {
         // fold skips every one of them.
         let _ = std::fs::remove_file(wsp_wire::host_tcp::last_path(&store.state, HOST));
         let mut again = Subscription::new(addr, token(&exec), HOST, &store.state, "test");
-        let start = Instant::now();
+        let deadline = Instant::now() + WAIT;
         let mut heard = 0;
-        while heard < ids.len() + 1 && start.elapsed() < Duration::from_secs(10) {
+        while heard < ids.len() + 1 && Instant::now() < deadline {
             if let Some(f) = again.next(Duration::from_millis(500)).unwrap() {
                 if f.id.is_some() {
                     heard += 1;
@@ -1074,6 +1086,40 @@ mod tests {
         assert_eq!((&s["epoch"], &s["pid"]), (&json!(2), &json!(4343)), "the new start is recorded: {s}");
         assert_eq!(spawned["cpd-a2"]["started"]["row"], "", "{spawned:?}");
         assert_eq!(spawned["cpd-a3"]["started"]["row"], "", "{spawned:?}");
+    }
+
+    /// `wsp-334`: a leg's seat starting claims nothing, found by the entry the
+    /// spawn seated or by the binding it wrote with `leg`. A member's seat on
+    /// another row is still claimed as before.
+    #[test]
+    fn a_legs_seat_start_claims_no_row() {
+        let _env = util::isolated("fold-leg");
+        let store = Store::open();
+        let mut t = crate::model::Task::new("legged", "wsp-200");
+        t.status_raw = "doing".into();
+        let mut leg = crate::legs::Leg::pending("build", "do it");
+        leg.state = crate::legs::State::Running;
+        leg.pane = Some("cpd-l1".into());
+        crate::legs::write(&mut t, &[leg]);
+        store.save_task(&t).unwrap();
+        let mut plain = crate::model::Task::new("plain", "wsp-201");
+        plain.status_raw = "doing".into();
+        store.save_task(&plain).unwrap();
+        store.set_binding("cpd-l2", json!({ "task_id": "wsp-202", "pane_id": "cpd-l2", "leg": "verbs" }));
+        let mut bound = crate::model::Task::new("bound", "wsp-202");
+        bound.status_raw = "doing".into();
+        store.save_task(&bound).unwrap();
+        let started = |id: u64, seat: &str, row: &str| Frame {
+            id: Some(EventId(id)),
+            req: None,
+            msg: Message::SeatStarted(SeatStarted { key: Key { row: RowId(row.into()), attempt: 1 }, seat: SeatId(seat.into()), epoch: Epoch(1), pid: 1, sockets: vec![] }),
+        };
+        assert!(fold(&store, HOST, &started(1, "cpd-l1", "wsp-200")));
+        assert!(fold(&store, HOST, &started(2, "cpd-l2", "wsp-202")));
+        assert!(fold(&store, HOST, &started(3, "cpd-m1", "wsp-201")));
+        let claims = store.claims();
+        assert!(!claims.contains_key("wsp-200") && !claims.contains_key("wsp-202"), "{claims:?}");
+        assert_eq!(claims["wsp-201"]["workspace_id"], "cpd-m1", "a member's seat is claimed as before");
     }
 
     /// A seat's start makes its entry, a `turn` edge and an `order.acked` date

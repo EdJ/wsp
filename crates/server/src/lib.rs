@@ -36,8 +36,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
 use wsp_api::{
-    ApiToken, Code, Connection, Frame, Hello, Listen, Principal, LISTEN_FILE, PROTOCOL, TOKEN_FILE, TOKEN_MODE,
+    ApiToken, Code, Connection, Failure, Frame, Hello, Listen, Principal, LISTEN_FILE, PROTOCOL, TOKEN_FILE,
+    TOKEN_MODE,
 };
 use wsp_store_contract::{At, Store};
 
@@ -61,6 +63,30 @@ pub const DEFAULT_PORT: u16 = 7488;
 /// connection that ends other than by its client.
 pub const LOG_FILE: &str = "api.log";
 
+/// The CLI's documents the view verbs answer (`throttle`, `spend`, `show`;
+/// wsp-307): what `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+/// --json` print, as the value they print. Their inputs are this machine's
+/// readings, the stop ledger and the store's files, none of which a `dyn
+/// Store` holds, so whatever starts the server (the daemon) hands in the one
+/// code the CLI prints from, and the server, linking nothing of the CLI,
+/// passes its answer through whole.
+///
+/// Each is called on the asking connection's thread, after its hello and the
+/// request's `by` were checked as every read's are. An `Err` is the reply's
+/// `err` as it stands (`not_found` for a `show` the CLI would say has none).
+pub trait Views: Send + Sync {
+    fn throttle(&self) -> Result<Value, Failure>;
+    fn spend(&self) -> Result<Value, Failure>;
+    /// `id` as `wsp show` takes it: a row's id or prefix, or a piece's id.
+    fn show(&self, id: &str) -> Result<Value, Failure>;
+}
+
+impl std::fmt::Debug for dyn Views {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Views(..)")
+    }
+}
+
 /// What a server is started with.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -75,10 +101,13 @@ pub struct Config {
     /// The beat's period, [`wsp_api::BEAT_SECS`] outside tests. A client
     /// silent for [`wsp_api::MISSED_BEATS`] of them is dropped.
     pub beat: Duration,
+    /// What answers the view verbs; none answers each `unsupported`.
+    pub views: Option<Arc<dyn Views>>,
 }
 
 impl Config {
-    /// Loopback alone, on [`DEFAULT_PORT`], instance `wsp`, a 10 s beat.
+    /// Loopback alone, on [`DEFAULT_PORT`], instance `wsp`, a 10 s beat, no
+    /// [`Views`].
     pub fn new(state_dir: &Path) -> Config {
         Config {
             addrs: Vec::new(),
@@ -86,6 +115,7 @@ impl Config {
             port: DEFAULT_PORT,
             instance: "wsp".into(),
             beat: Duration::from_secs(wsp_api::BEAT_SECS),
+            views: None,
         }
     }
 }
@@ -487,6 +517,7 @@ mod tests {
         fn lease(&self, _: &LeaseName) -> Result<Option<Lease>> { never!() }
         fn machine(&self, _: &MachineName) -> Result<Option<Machine>> { never!() }
         fn snapshot(&self) -> Result<(State, EventId)> { never!() }
+        fn wip_snapshot(&self) -> Result<(State, EventId)> { never!() }
     }
     impl Events for NoStore {
         fn events_after(&self, _: EventId, _: usize) -> Result<Vec<Event>> { never!() }
@@ -505,6 +536,7 @@ mod tests {
         fn claim(&self, _: &RowId, _: &SeatId, _: Duration, _: Option<&Fence>) -> Result<Token> { never!() }
         fn release(&self, _: &RowId, _: Token) -> Result<()> { never!() }
     }
+    impl Readings for NoStore {}
     impl Texts for NoStore {
         fn text(&self, _: &RowId, _: &str) -> Result<(String, Rev)> { never!() }
         fn set_text(&self, _: &RowId, _: &str, _: String, _: Rev) -> Result<Rev> { never!() }

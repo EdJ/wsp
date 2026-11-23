@@ -5,6 +5,9 @@
 //! - A read verb is one call on the store's `Reads` or `Events` (`lists`,
 //!   `asks`, `machines`, and `orders` of no seat, which `Reads` has no verb
 //!   for, read the one `snapshot`).
+//! - `throttle`, `spend` and `show` are the CLI's documents, from the
+//!   [`crate::Views`] the server was started with (wsp-307), `unsupported`
+//!   without one.
 //! - `subscribe` is answered `subscribed`, or `too_old`; then the
 //!   `subscribe` module's thread writes its feed beside the replies.
 //! - A command [`Orders::owns`] is applied through the store's `apply`, under
@@ -346,10 +349,12 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
     let s = &shared.store;
     let r = match verb {
         Verb::State(_) => s.snapshot().map(|(state, at)| Answer::State { state, at }),
+        Verb::Wip(_) => s.wip_snapshot().map(|(state, at)| Answer::Wip { state, at }),
         Verb::Row { row } => s.row(&row).map(Answer::Row),
         Verb::Rows(filter) => s.rows(&filter).map(Answer::Rows),
         Verb::List { list } => s.list(&list).map(Answer::List),
-        Verb::Lists(_) => s.snapshot().map(|(st, _)| Answer::Lists(st.lists.into_values().collect())),
+        Verb::Lists(filter) => s.lists(&filter).map(Answer::Lists),
+        Verb::Readings { names } => s.readings(&names).map(Answer::Readings),
         Verb::Seat { seat } => s.seat(&seat).map(Answer::Seat),
         Verb::Seats(filter) => s.seats(&filter).map(Answer::Seats),
         Verb::Orders { seat: Some(seat), states } => s.orders_for(&seat, &states).map(Answer::Orders),
@@ -373,8 +378,23 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
             s.events_after(from, limit).and_then(|events| Ok(Answer::Events { events, head: s.head()? }))
         }
         Verb::Subscribe(_) => unreachable!("subscribe is answered by its own path"),
+        Verb::Throttle(_) | Verb::Spend(_) | Verb::Show { .. } => return view(shared, verb),
     };
     r.map_err(store_failure)
+}
+
+/// A view verb, answered by the [`crate::Views`] the server was started with,
+/// whole; `unsupported` without one.
+fn view(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
+    let Some(views) = &shared.cfg.views else {
+        return Err(failure(Code::Unsupported, "this server was started with nothing that answers the view verbs".into()));
+    };
+    match verb {
+        Verb::Throttle(_) => views.throttle().map(Answer::Throttle),
+        Verb::Spend(_) => views.spend().map(Answer::Spend),
+        Verb::Show { id } => views.show(&id).map(Answer::Show),
+        _ => unreachable!("only the view verbs come here"),
+    }
 }
 
 #[cfg(test)]

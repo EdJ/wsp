@@ -1,6 +1,6 @@
 //! Task commands.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::cmd_agent::{claim_line, current_project, worked_line};
 use crate::message::{self, Ask, Message, Shape};
@@ -710,21 +710,57 @@ fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Ve
     out
 }
 
-/// `wsp show <piece-id>`: the parent's header line, then the entry whole.
-fn show_piece(a: &crate::pieces::Addressed, args: &Args) -> i32 {
-    if args.json() {
-        let v = match &a.piece {
-            Some(p) => crate::pieces::piece_json(&a.task.id, p),
-            None => json!({ "n": a.n, "id": a.id(), "folded": a.folded }),
-        };
-        let mut v = v;
-        v["row"] = json!(a.task.id);
-        if let Some(path) = &a.archived {
-            v["archived"] = json!(util::contract(path));
-        }
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-        return 0;
+/// `wsp show <piece-id> --json`'s document.
+fn addressed_json(a: &crate::pieces::Addressed) -> Value {
+    let mut v = match &a.piece {
+        Some(p) => crate::pieces::piece_json(&a.task.id, p),
+        None => json!({ "n": a.n, "id": a.id(), "folded": a.folded }),
+    };
+    v["row"] = json!(a.task.id);
+    if let Some(path) = &a.archived {
+        v["archived"] = json!(util::contract(path));
     }
+    v
+}
+
+/// `wsp show <id> --json`'s document: a piece's entry when `needle` names
+/// one, else the row it resolves to, live or archived. `Err` is what the
+/// verb says on stderr instead. The CLI prints this, and the API's `show`
+/// answers it (wsp-307), so the two cannot drift.
+pub(crate) fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
+    match crate::pieces::addressed(store, needle) {
+        Ok(Some(a)) => return Ok(addressed_json(&a)),
+        Ok(None) => {}
+        Err(why) => return Err(format!("wsp: {why}")),
+    }
+    let (t, archived) = match store.resolve_task(needle) {
+        crate::store::Found::One(t) => (*t, None),
+        crate::store::Found::Archived(t, path) => (*t, Some(path)),
+        other => return Err(other.why(needle).unwrap_or_default()),
+    };
+    // Each key's rule is `wsp_view::task::show_json`'s: this reads what it
+    // prints and hands it over.
+    let claims = store.claims();
+    let staged = crate::stage::with_history(store, &[&t]);
+    let running = crate::worklist::Running::read(store);
+    let shown = wsp_view::task::Show {
+        body: &t.body,
+        archived: archived.as_ref().map(|path| util::contract(path)),
+        claim: claims.get(&t.id).cloned(),
+        worked: store.worked().get(&t.id).cloned(),
+        list: running.of(&t.id).map(|l| wsp_view::task::Running { list: l.list.clone(), group: l.group, of: l.of }),
+        raised: raised_about(store, &t.id).iter().map(|m| m.to_json()).collect(),
+        verification: crate::verification::view(&t),
+        legs: crate::legs::view(&t),
+        pieces: crate::pieces::view(&t),
+        stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
+    };
+    Ok(wsp_view::task::show_json(&row_of(&t, &claims), &shown))
+}
+
+/// `wsp show <piece-id>`: the parent's header line, then the entry whole
+/// (under `--json`, [`show_json`] answers instead).
+fn show_piece(a: &crate::pieces::Addressed) -> i32 {
     let p = Paint::new();
     println!("{}  {}", p.bold(&a.task.id), a.task.title);
     match (&a.piece, &a.folded) {
@@ -747,10 +783,22 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // has left the live store. `show` does: displaying the record *is* the
     // verb, and a reader who followed `render-026`'s citation of `render-018`
     // wants the prose it points at, not the path it is filed under.
+    if args.json() {
+        return match show_json(store, &needle) {
+            Ok(v) => {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                0
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        };
+    }
     // A piece id (`docs/pieces.md`, *Seen and told*): the row's header line and
     // the entry whole, or the line it folded into once the row has landed.
     match crate::pieces::addressed(store, &needle) {
-        Ok(Some(a)) => return show_piece(&a, args),
+        Ok(Some(a)) => return show_piece(&a),
         Ok(None) => {}
         Err(why) => {
             eprintln!("wsp: {why}");
@@ -765,27 +813,6 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    if args.json() {
-        // Each key's rule is `wsp_view::task::show`'s: this reads what it
-        // prints and hands it over.
-        let claims = store.claims();
-        let staged = crate::stage::with_history(store, &[&t]);
-        let running = crate::worklist::Running::read(store);
-        let shown = wsp_view::task::Show {
-            body: &t.body,
-            archived: archived.as_ref().map(|path| util::contract(path)),
-            claim: claims.get(&t.id).cloned(),
-            worked: store.worked().get(&t.id).cloned(),
-            list: running.of(&t.id).map(|l| wsp_view::task::Running { list: l.list.clone(), group: l.group, of: l.of }),
-            raised: raised_about(store, &t.id).iter().map(|m| m.to_json()).collect(),
-            verification: crate::verification::view(&t),
-            legs: crate::legs::view(&t),
-            pieces: crate::pieces::view(&t),
-            stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
-        };
-        println!("{}", wsp_view::task::show(&row_of(&t, &claims), &shown));
-        return 0;
-    }
 
     let p = Paint::new();
     let index = Index::new(store.projects());
@@ -1782,6 +1809,19 @@ pub(crate) fn review_payload(args: &Args, usage: &str) -> Result<(String, String
 /// the row to `review` with `account` as its `review:` line. `args` names the
 /// row as its first word and may carry `--anyway` and `--hold-review`.
 pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
+    let code = accept_now(store, args, account, said);
+    // `wsp-691`: what the row left running in its tree goes with its submit,
+    // all but this seat's agent and the chain this command runs on.
+    if code == 0 {
+        if let Some(id) = args.rest.first().and_then(|n| store.find_task(n)).map(|t| t.id) {
+            crate::ending::stop_in_tree(store, &id, true, &format!("{id} submitted"));
+        }
+    }
+    code
+}
+
+/// [`accept`] before its sweep.
+fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
     // A row copied to an executor is reviewed only at the tree `verify` ran on.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
         if let Some(tree) = crate::cmd_checkout::member_tree(store, &t.id) {
@@ -2219,6 +2259,12 @@ pub fn decide(store: &Store, args: &Args) -> i32 {
         }
     }
 
+    if needle.starts_with("init-") {
+        if let Some(code) = crate::cmd_initiative::decide(store, &needle, &text, &supersedes, args.json()) {
+            return code;
+        }
+    }
+
     if let Some(t) = store.find_task(&needle) {
         if let Err(code) = check_supersedes(&t.body, &supersedes, &t.id) {
             return code;
@@ -2495,7 +2541,25 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
             if refs > 0 {
                 println!("  {}", p.dim(&format!("{refs} reference(s) rewritten across {files} file(s)")));
             }
-            0
+            // What names the row outside the store: a list's retro record and
+            // the row's own outputs, both under the artefacts root (`wsp-351`).
+            let mut code = 0;
+            match crate::retro_yours::follow_renames(store, &renumber) {
+                Ok(lists) => {
+                    for l in lists {
+                        println!("  {}", p.dim(&format!("{l}'s retro record follows")));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("wsp: a retro record still names the old id: {e}");
+                    code = 1;
+                }
+            }
+            if let Err(e) = crate::artefact::follow_renames(&crate::artefact::root(), &renumber) {
+                eprintln!("wsp: {e}");
+                code = 1;
+            }
+            code
         }
         Err(e) => {
             eprintln!("wsp: the move landed but the renumbering did not: {e}");
@@ -3531,11 +3595,42 @@ const ARCHIVE_MAX: usize = 20;
 /// mirror's own projections, so web-chrome's fold of the daemon's `State`
 /// prints these bytes too (`wsp_view::task::ls_all`). Each row's stage is the
 /// mirror's half (`stage`, `stage_steps`, `stage_live`) with its seats' over it.
-fn rows_json(store: &Store, tasks: &[Task]) -> String {
+pub(crate) fn rows_json(store: &Store, tasks: &[Task]) -> String {
     let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
     let picked: Vec<&wsp_store_contract::Row> =
         tasks.iter().filter_map(|t| state.rows.get(&wsp_store_contract::RowId(t.id.clone()))).collect();
     wsp_view::task::ls_rows(&state, &picked, util::epoch_secs())
+}
+
+/// What `ls --json` prints of `tasks` beside each record, as `wsp-view` takes
+/// it (wsp-743: the daemon's `tasks` reading is this over `ls --all`'s tasks).
+fn ls_reading(store: &Store, tasks: &[Task]) -> wsp_view::reading::Tasks {
+    // `wsp-242`: each row's stage, every source read once for all of them.
+    let stages = crate::stage::with_history(store, &tasks.iter().collect::<Vec<_>>());
+    wsp_view::reading::Tasks {
+        order: tasks.iter().map(|t| t.id.clone()).collect(),
+        // `wsp-274`: and since when, off the same timeline `show` gives.
+        stages: stages.iter().map(|(id, (s, h))| (id.clone(), crate::stage::view(s, h))).collect(),
+        // The objects `show --json` has, and absent on an unstaged row.
+        legs: tasks
+            .iter()
+            .filter(|t| t.body.contains(&format!("## {}", crate::legs::SECTION)) && !crate::legs::legs(t).is_empty())
+            .map(|t| (t.id.clone(), crate::legs::view(t)))
+            .collect(),
+    }
+}
+
+/// The `tasks` reading (wsp-743): `ls --json --all`'s order, stages and legs,
+/// over the tasks it lists (every live task, by status, priority and id).
+pub(crate) fn tasks_reading(store: &Store) -> wsp_view::reading::Tasks {
+    ls_reading(store, &ls_all(store))
+}
+
+/// The tasks `ls --json --all` lists, in its order, with no project in scope.
+pub(crate) fn ls_all(store: &Store) -> Vec<Task> {
+    let index = Index::new(store.projects());
+    let args = Args::synth("ls", &[], &[("all", ""), ("json", "")]);
+    filtered(store, &args, &index, None)
 }
 
 /// The contract row a task is, as the mirror projects it, for `wsp-view`.

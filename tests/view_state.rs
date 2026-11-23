@@ -33,10 +33,6 @@ const PROJECTIONS: &[Projection] = &[
     ("yours-beta", &["yours", "-p", "beta", "--json"], yours_beta),
 ];
 
-/// Recordings `view_golden` already fails at HEAD (the fake manager gives an agent no
-/// `since` and no cpu clock: wsp-322): the CLI comparison holds for them, the recording's does not yet.
-const STALE_RECORDING: &[&str] = &["wip"];
-
 fn wip(state: &State, now: i64) -> String {
     serde_json::to_string_pretty(&wsp_view::wip::of_state(state, now)).unwrap()
 }
@@ -69,7 +65,7 @@ fn yours_beta(state: &State, now: i64) -> String {
 fn each_projection_over_state_prints_the_clis_bytes_and_the_recording() {
     std::env::set_var("WSP_TEST_NOW", NOW);
     std::env::set_var("HOSTNAME", HOST);
-    let sb = seeded();
+    let sb = seeded("s");
     let out = sb.cmd(&["state", "--json"]).output().unwrap();
     assert!(out.status.success(), "wsp state --json: {}", String::from_utf8_lossy(&out.stderr));
     let state: State = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("wsp state --json is a State: {e}"));
@@ -84,7 +80,7 @@ fn each_projection_over_state_prints_the_clis_bytes_and_the_recording() {
         let was = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e} (view_golden records it)", path.display()));
         if drawn != cli {
             moved.push(format!("── {name}: wsp-view over State ≠ wsp {} ──\nview:\n{drawn}\ncli:\n{cli}", args.join(" ")));
-        } else if drawn != was && !STALE_RECORDING.contains(name) {
+        } else if drawn != was {
             moved.push(format!("── {name}: wsp-view over State ≠ tests/fixtures/view/{name}.json ──\n{drawn}"));
         }
     }

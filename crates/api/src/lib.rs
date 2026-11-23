@@ -47,9 +47,9 @@ pub use conn::{pair, Memory};
 pub use conn::{ConnError, Connection, MAX_LINE};
 
 pub use wsp_store_contract::{
-    Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListId,
-    Machine, Order, OrderState, Principal, Refusal, Row, RowFilter, RowId, Seat, SeatFilter,
-    SeatId, State, Subscribe, BEAT_SECS, MISSED_BEATS,
+    Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListFilter,
+    ListId, Machine, Order, OrderState, Principal, Reading, Refusal, Row, RowFilter, RowId, Seat,
+    SeatFilter, SeatId, State, Subscribe, BEAT_SECS, MISSED_BEATS,
 };
 
 /// The protocol's version: the envelope's `v` and both sides' `protocol` in
@@ -86,6 +86,11 @@ pub const READ_VERBS: &[&str] = &[
     "machines",
     "events",
     "subscribe",
+    "wip",
+    "throttle",
+    "spend",
+    "show",
+    "readings",
 ];
 
 /// The command verbs, as the contract's [`Command`] names them on the wire: the
@@ -259,11 +264,15 @@ pub enum Verb {
     Row {
         row: RowId,
     },
+    /// Rows the filter keeps; each as its head, without its text, where
+    /// `heads` (wsp-743).
     Rows(#[serde(default)] RowFilter),
     List {
         list: ListId,
     },
-    Lists(#[serde(default)] NoArgs),
+    /// Every list; each without its text where `heads` (wsp-743). `args` may
+    /// be left out, `null` or `{}`, as before the filter.
+    Lists(#[serde(default)] ListFilter),
     Seat {
         seat: SeatId,
     },
@@ -296,6 +305,31 @@ pub enum Verb {
     /// `subscribe { from? }` (4.3): from an id, every event after it; absent,
     /// a snapshot first. Answered [`Answer::Subscribed`], then the feed.
     Subscribe(#[serde(default)] Subscribe),
+    /// What `wip` draws of `state` (wsp-695), as the store's
+    /// `Reads::wip_snapshot` says: open rows whole, the rest as heads, lists
+    /// whole but finished ones no seat still sits on without their text, only
+    /// raised asks, the seats and claims; small enough
+    /// for one line under [`MAX_LINE`] where `state`'s whole domain is not.
+    Wip(#[serde(default)] NoArgs),
+    /// `wsp throttle --json`'s document: this machine's build throttle and
+    /// the readings it acts on (wsp-307). Answered [`Answer::Throttle`].
+    Throttle(#[serde(default)] NoArgs),
+    /// `wsp spend --json`'s document: the last 30 days' tokens and cost
+    /// (wsp-307). Answered [`Answer::Spend`].
+    Spend(#[serde(default)] NoArgs),
+    /// `wsp show <id> --json`'s document: a row's record, or a piece's entry
+    /// when `id` names one, as the CLI resolves it (wsp-307). Answered
+    /// [`Answer::Show`], or `not_found` when the CLI would say there is none.
+    Show {
+        id: String,
+    },
+    /// The readings named, every one when `names` is empty (wsp-743): what
+    /// the daemon works out and no entity carries, by name, as the store's
+    /// `Readings` keeps them. Answered [`Answer::Readings`].
+    Readings {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        names: Vec<String>,
+    },
 }
 
 /// The `args` of a verb that takes none: written `{}`, and read from `{}`,
@@ -388,6 +422,21 @@ pub enum Answer {
     Subscribed,
     /// A command: it was applied, and its events are the reply's `events`.
     Applied,
+    /// `wip`: the part of the snapshot `wip` draws, and the id it is
+    /// consistent at.
+    Wip {
+        state: State,
+        at: EventId,
+    },
+    /// `throttle`: the document `wsp throttle --json` prints, the same value,
+    /// so that printed pretty it is the same bytes.
+    Throttle(Value),
+    /// `spend`: the document `wsp spend --json` prints.
+    Spend(Value),
+    /// `show`: the document `wsp show <id> --json` prints.
+    Show(Value),
+    /// `readings`: each reading asked for that there is, by name.
+    Readings(std::collections::BTreeMap<String, Reading>),
 }
 
 /// What `err` carries: `{ code, text }` (4.1), and the contract's refusal

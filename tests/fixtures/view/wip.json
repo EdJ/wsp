@@ -13,7 +13,7 @@
       "leg": null,
       "members_waiting": null,
       "model": null,
-      "needs_you": false,
+      "needs_you": true,
       "pane": "cpd-7",
       "project": "beta",
       "queued": 0,
@@ -34,22 +34,18 @@
       "turning": false,
       "unsent": false,
       "wait": {
-        "kind": "itself",
-        "line": "waiting on itself: a shell (0s, busy)",
-        "quiet_secs": 0,
+        "kind": "person",
+        "line": "waiting on a person: its question m-seed-q1",
+        "quiet_secs": null,
         "since": "2026-11-18T11:06:40Z",
-        "target": null
+        "target": "m-seed-q1"
       },
       "waiting": {
-        "age": 0,
-        "on": "itself",
-        "question": null,
-        "quiet": 0,
-        "reason": "waiting on itself: a shell (0s, busy)",
-        "shells": 1,
-        "why": "shell",
-        "word": "waiting · itself",
-        "work": ""
+        "on": "person",
+        "question": "m-seed-q1",
+        "reason": "waiting on a person to answer its question m-seed-q1",
+        "why": "answer",
+        "word": "waiting · person"
       },
       "was_governor": null,
       "workspace": "cpd-7"
@@ -57,7 +53,15 @@
   ],
   "attention": {
     "follow_up": [],
-    "needs_you": []
+    "needs_you": [
+      {
+        "attention": "needs-you",
+        "kind": "seat",
+        "pane": "cpd-7",
+        "task": "beta-003",
+        "text": "waiting on a person to answer its question m-seed-q1"
+      }
+    ]
   },
   "blocked": [
     {
@@ -97,10 +101,10 @@
   },
   "inbox": 1,
   "load": null,
-  "needs_you": 0,
+  "needs_you": 1,
   "review": [],
-  "throttle": "throttle: auto — in force, idle time unreadable so assuming the person is here · cpu clock 100% · check slots 0/4",
+  "throttle": "throttle: auto — in force, idle time unreadable so assuming the person is here · check slots 0/4",
   "turning": 0,
   "unreachable": null,
-  "waiting": 0
+  "waiting": 1
 }

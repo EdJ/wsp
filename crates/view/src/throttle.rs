@@ -4,7 +4,8 @@
 use serde_json::{json, Value};
 
 /// The memory readings, and the text of the memory hold if one is up.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Memory {
     pub free_percent: Option<u32>,
     /// Swap used and total, in MB.
@@ -29,7 +30,8 @@ pub fn memory_json(m: &Memory) -> Value {
 }
 
 /// Everything the throttle's JSON reports, already worked out.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Throttle {
     pub mode: String,
     pub in_force: bool,

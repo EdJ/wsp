@@ -2,7 +2,7 @@
   "agents": null,
   "builds": [],
   "cores": 8,
-  "cpu_speed_limit": 100,
+  "cpu_speed_limit": null,
   "hot_jobs": 2,
   "hot_slots": 4,
   "idle_secs": null,

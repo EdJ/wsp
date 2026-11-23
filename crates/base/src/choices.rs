@@ -36,7 +36,7 @@
 use serde_json::{json, Map, Value};
 
 /// The kinds, and the one word each answer is said in.
-pub const KINDS: [&str; 3] = ["ask", "plan", "permission"];
+pub const KINDS: [&str; 4] = ["ask", "plan", "permission", "set"];
 
 /// The structured part of a question for the person.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +86,11 @@ impl Choices {
                     norm.push(n);
                 }
                 out.insert("questions".into(), Value::Array(norm));
+            }
+            "set" => {
+                out.remove("answers");
+                out.insert("questions".into(), Value::Array(set_questions(o)?));
+                out.insert("title".into(), o["title"].as_str().unwrap_or_default().trim().into());
             }
             "plan" => {
                 if o.get("plan").and_then(Value::as_str).is_none_or(|p| p.trim().is_empty()) {
@@ -145,6 +150,11 @@ impl Choices {
     pub fn sentence(&self) -> String {
         match self.kind() {
             "ask" => self.questions().iter().map(|q| q.question).collect::<Vec<_>>().join(" "),
+            "set" => {
+                let title = self.0.get("title").and_then(Value::as_str).unwrap_or_default();
+                let heads: Vec<&str> = self.questions().iter().map(|q| q.header).collect();
+                format!("{title}: {}", heads.join(", "))
+            }
             "plan" => "Approve this plan?".into(),
             _ => {
                 let tool = self.0.get("tool").and_then(Value::as_str).unwrap_or_default();
@@ -176,6 +186,11 @@ impl Choices {
     /// the person speaking instead of choosing; a plan or permission is
     /// `allow` or `deny`, each with its sentence after a colon when it has one.
     pub fn told(&self, stored: &Value) -> String {
+        if self.kind() == "set" {
+            let finished = stored.get("finished").and_then(Value::as_bool).unwrap_or(false);
+            let words = stored.get("words").and_then(Value::as_str).unwrap_or_default();
+            return self.set_report(stored.get("answers").and_then(Value::as_object).unwrap_or(&Map::new()), finished, words);
+        }
         if let Some(b) = stored.get("behavior").and_then(Value::as_str) {
             let said = stored.get("message").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty());
             return match (self.kind(), b, said) {
@@ -213,6 +228,12 @@ impl Choices {
                 .map(|q| format!("“{}” — {}", q.question, q.labels.join(" | ")))
                 .collect::<Vec<_>>()
                 .join("; "),
+            "set" => self
+                .questions()
+                .iter()
+                .map(|q| format!("“{}” — {}", q.header, q.labels.join(" | ")))
+                .collect::<Vec<_>>()
+                .join("; "),
             _ => "allow | deny".into(),
         }
     }
@@ -222,6 +243,9 @@ impl Choices {
     /// nothing of which question they answer.
     pub fn accept_words(&self, words: &str) -> Result<(Value, String), String> {
         let qs = self.questions();
+        if self.kind() == "set" {
+            return Err("a set is answered one question at a time: `--question 'Header' --choice 'Label'`, or ended with `--finish`".into());
+        }
         match (self.kind(), qs.as_slice()) {
             ("ask", [q]) => self.accept(&json!({ "answers": { q.question: words.trim() } }), ""),
             _ => Err(format!(
@@ -244,6 +268,7 @@ impl Choices {
         };
         match self.kind() {
             "ask" => self.accept_ask(o, typed),
+            "set" => self.accept_set(o, typed),
             _ => self.accept_decision(o, typed),
         }
     }
@@ -310,6 +335,238 @@ impl Choices {
         }
         Ok((v, text))
     }
+}
+
+/// What saving one question of a set did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub header: String,
+    /// The decision id this save recorded on the row, and the one it replaced.
+    pub decision: String,
+    pub superseded: Option<String>,
+    pub answered: usize,
+    pub total: usize,
+}
+
+impl Choices {
+    /// The set's headers, in its order.
+    pub fn set_headers(&self) -> Vec<String> {
+        self.questions().iter().map(|q| q.header.to_string()).collect()
+    }
+
+    fn answers(&self) -> Map<String, Value> {
+        self.0.get("answers").and_then(Value::as_object).cloned().unwrap_or_default()
+    }
+
+    /// How many of a set's questions have an answer saved, and how many it has.
+    pub fn set_progress(&self) -> (usize, usize) {
+        let given = self.answers();
+        let qs = self.questions();
+        (qs.iter().filter(|q| given.contains_key(q.header)).count(), qs.len())
+    }
+
+    /// Which question `key` names: its header (any case), its text, or its
+    /// place in the set from 1.
+    fn set_index(&self, key: &str) -> Result<usize, String> {
+        let key = key.trim();
+        let qs = self.questions();
+        if let Ok(n) = key.parse::<usize>() {
+            return match n {
+                1.. if n <= qs.len() => Ok(n - 1),
+                _ => Err(format!("there is no question {n} — the set has {}", qs.len())),
+            };
+        }
+        qs.iter()
+            .position(|q| q.header.eq_ignore_ascii_case(key) || q.question == key)
+            .ok_or_else(|| format!("“{key}” is not a question of this set — {}", self.set_headers().join(" | ")))
+    }
+
+    /// Save one question's answer into the set. `decide` records the decision
+    /// on the row — given its text and the ids it supersedes — and returns the
+    /// id; it is called once the answer is checked, so a refusal writes none.
+    /// Saving a question again replaces it, superseding its earlier decision.
+    pub fn save_answer(
+        &self,
+        mid: &str,
+        key: &str,
+        picks: &[String],
+        other: Option<&str>,
+        note: &str,
+        at: &str,
+        decide: &mut dyn FnMut(&str, &[String]) -> String,
+    ) -> Result<(Choices, Saved), String> {
+        if self.kind() != "set" {
+            return Err("that question is not a set".into());
+        }
+        let i = self.set_index(key)?;
+        let qs = self.questions();
+        let q = &qs[i];
+        let other = other.map(str::trim).filter(|o| !o.is_empty());
+        let mut labels: Vec<String> = Vec::new();
+        for p in picks {
+            let p = p.trim();
+            if !q.labels.contains(&p) {
+                return Err(format!("“{p}” is not an option of “{}” — one of: {}", q.header, q.labels.join(" | ")));
+            }
+            if !labels.iter().any(|l| l == p) {
+                labels.push(p.to_string());
+            }
+        }
+        match (labels.is_empty(), other) {
+            (true, None) => return Err(format!("“{}” needs a `--choice` or an `--other` — one of: {}", q.header, q.labels.join(" | "))),
+            (false, Some(_)) => return Err(format!("“{}” is answered by a label or an Other, not both", q.header)),
+            _ => {}
+        }
+        if labels.len() > 1 && !q.multi {
+            return Err(format!("“{}” takes one answer, not {}", q.header, labels.len()));
+        }
+        let recommended = self.0["questions"][i].get("recommended").and_then(Value::as_str).map(str::to_string);
+        let mut text = match other {
+            Some(w) => format!("{}: Other — {w}", q.header),
+            None => format!("{}: {}", q.header, labels.join(", ")),
+        };
+        if !note.trim().is_empty() {
+            text.push_str(&format!(" · note: {}", note.trim()));
+        }
+        match &recommended {
+            Some(r) => text.push_str(&format!(" (set {mid}; recommended: {r})")),
+            None => text.push_str(&format!(" (set {mid})")),
+        }
+        let mut answers = self.answers();
+        let superseded = answers.get(q.header).and_then(|a| a.get("decision")).and_then(Value::as_str).map(str::to_string);
+        let decision = decide(&text, &superseded.iter().cloned().collect::<Vec<_>>());
+        answers.insert(
+            q.header.into(),
+            json!({ "pick": labels, "other": other, "note": note.trim(), "at": at, "decision": decision }),
+        );
+        let total = qs.len();
+        let header = q.header.to_string();
+        let answered = qs.iter().filter(|q| answers.contains_key(q.header)).count();
+        let mut v = self.0.clone();
+        v["answers"] = Value::Object(answers);
+        Ok((Choices(v), Saved { header, decision, superseded, answered, total }))
+    }
+
+    /// The set as the asker is told it: every question with its answer, note
+    /// and whether it differs from the recommended one, then the unanswered.
+    fn set_report(&self, answers: &Map<String, Value>, finished: bool, words: &str) -> String {
+        let title = self.0.get("title").and_then(Value::as_str).unwrap_or_default();
+        let qs = self.questions();
+        let done = qs.iter().filter(|q| answers.contains_key(q.header)).count();
+        let mut out = vec![format!("{title}: {done} of {} answered{}", qs.len(), if finished && done < qs.len() { ", finished early" } else { "" })];
+        if !words.trim().is_empty() {
+            out.push(format!("finished with: {}", words.trim()));
+        }
+        let mut open = Vec::new();
+        for (i, q) in qs.iter().enumerate() {
+            let Some(a) = answers.get(q.header) else {
+                open.push(q.header);
+                continue;
+            };
+            let picks: Vec<&str> = a.get("pick").and_then(Value::as_array).map(|p| p.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            let other = a.get("other").and_then(Value::as_str).filter(|o| !o.is_empty());
+            let mut line = match other {
+                Some(w) => format!("{}: Other — {w}", q.header),
+                None => format!("{}: {}", q.header, picks.join(", ")),
+            };
+            if let Some(n) = a.get("note").and_then(Value::as_str).filter(|n| !n.is_empty()) {
+                line.push_str(&format!(" · note: {n}"));
+            }
+            if let Some(r) = self.0["questions"][i].get("recommended").and_then(Value::as_str) {
+                if other.is_some() || picks != [r] {
+                    line.push_str(&format!(" · differs from recommended ({r})"));
+                } else {
+                    line.push_str(" · as recommended");
+                }
+            }
+            out.push(line);
+        }
+        if !open.is_empty() {
+            out.push(format!("Unanswered (nothing guessed): {}", open.join(", ")));
+        }
+        out.join("\n")
+    }
+
+    /// The close of a set: every question answered, or `{finish: true}`. The
+    /// answers are the ones saved on it; what is stored is them and what was
+    /// left, and what is read is the asker's one message.
+    fn accept_set(&self, o: &Map<String, Value>, typed: &str) -> Result<(Value, String), String> {
+        let finish = o.get("finish").and_then(Value::as_bool).unwrap_or(false);
+        let (done, total) = self.set_progress();
+        if done < total && !finish {
+            return Err(format!("{done} of {total} answered — a set ends when every question is, or with `--finish`"));
+        }
+        let answers = self.answers();
+        let unanswered: Vec<String> = self.set_headers().into_iter().filter(|h| !answers.contains_key(h)).collect();
+        let report = self.set_report(&answers, finish, typed);
+        let mut stored = json!({ "answers": answers, "finished": finish, "unanswered": unanswered });
+        if !typed.trim().is_empty() {
+            stored["words"] = typed.trim().into();
+        }
+        Ok((stored, report))
+    }
+}
+
+/// A set's questions, checked: 2 to 30 of them, each with 2 to 4 options, a
+/// header of its own (40 characters at most, the key of its answer), a
+/// `recommended` that is one of its labels, and a `why` only beside one.
+fn set_questions(o: &Map<String, Value>) -> Result<Vec<Value>, String> {
+    if o.get("title").and_then(Value::as_str).is_none_or(|t| t.trim().is_empty()) {
+        return Err("a set needs a `title`".into());
+    }
+    if o.get("intro").is_some_and(|i| !i.is_string() && !i.is_null()) {
+        return Err("a set's `intro` is a line of Markdown".into());
+    }
+    let qs = o.get("questions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    if !(2..=30).contains(&qs.len()) {
+        return Err(format!("a set has 2 to 30 questions, not {}", qs.len()));
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for q in qs {
+        let (mut n, text) = question(q)?;
+        let header = n.get("header").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+        if header.is_empty() {
+            return Err(format!("“{text}” has no `header` — it is the question's key in a set"));
+        }
+        if header.chars().count() > 40 {
+            return Err(format!("the header “{header}” is over 40 characters"));
+        }
+        if seen.iter().any(|h| h.eq_ignore_ascii_case(&header)) {
+            return Err(format!("two questions have the header “{header}” — it is the key of an answer"));
+        }
+        seen.push(header.clone());
+        n["header"] = header.clone().into();
+        let labels: Vec<&str> = n["options"].as_array().map(|a| a.iter().filter_map(|o| o["label"].as_str()).collect()).unwrap_or_default();
+        if !(2..=4).contains(&labels.len()) {
+            return Err(format!("“{header}” has {} options — 2 to 4", labels.len()));
+        }
+        let rec = match n.get("recommended") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(r)) => Some(r.trim().to_string()),
+            Some(_) => return Err(format!("the `recommended` of “{header}” is one of its labels")),
+        };
+        if let Some(r) = &rec {
+            if !labels.contains(&r.as_str()) {
+                return Err(format!("the `recommended` of “{header}” is “{r}”, which is not one of its labels — {}", labels.join(" | ")));
+            }
+            n["recommended"] = r.clone().into();
+        }
+        match n.get("why") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(w)) => {
+                if rec.is_none() {
+                    return Err(format!("“{header}” gives a `why` with no `recommended` to be the reason for"));
+                }
+                if w.chars().count() > 140 {
+                    return Err(format!("the `why` of “{header}” is over 140 characters"));
+                }
+            }
+            Some(_) => return Err(format!("the `why` of “{header}” is one line of text")),
+        }
+        out.push(n);
+    }
+    Ok(out)
 }
 
 /// One question of an ask, with its defaults filled; and its text.

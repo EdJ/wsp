@@ -13,7 +13,8 @@ use crate::common::{key, priority, priority_rank, status, status_rank, task_json
 
 /// A stage's caption (`wsp-242`): the word wsp derives and the tail, as the
 /// `stage` key prints them. A pass's `caption` is the same shape.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Told {
     pub word: String,
     pub tail: Option<String>,
@@ -44,7 +45,8 @@ impl Told {
 }
 
 /// One step of a task's timeline: the stage word it entered, and when.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Step {
     pub word: String,
     /// Empty where nothing dated it.
@@ -72,7 +74,8 @@ impl Step {
 }
 
 /// Where a task is and how it got there: the stage now and the steps before.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Stage {
     pub now: Told,
     pub steps: Vec<Step>,
@@ -178,7 +181,8 @@ pub fn verification_json(passes: &[Pass]) -> Value {
 }
 
 /// What a done leg cost (compound-561 A5).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Spent {
     /// Null where the record kept nothing to price.
     pub usd: Option<f64>,
@@ -188,7 +192,8 @@ pub struct Spent {
 }
 
 /// One leg of a task's plan.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Leg {
     pub spent: Option<Spent>,
     pub name: String,
@@ -282,6 +287,19 @@ pub fn ls_row(row: &Row, archived: bool, stage: Option<&Stage>) -> Value {
     v
 }
 
+/// One `ls --json` row (wsp-743): the task's record (`Task::json`, which is
+/// [`task_json`] of its row), its stage, and its legs where it has any (the
+/// key absent where it has none). The CLI hands in the record it read; a
+/// reader of the `tasks` reading hands in `task_json` of the row's head.
+pub fn ls_json_row(record: Value, stage: Option<&Stage>, legs: Option<&[Leg]>) -> Value {
+    let mut v = record;
+    v["stage"] = json!(stage.map(stage_json));
+    if let Some(l) = legs {
+        v["legs"] = legs_json(l);
+    }
+    v
+}
+
 /// `ls --json`: the rows, pretty.
 pub fn ls(rows: &[Value]) -> String {
     serde_json::to_string_pretty(rows).unwrap_or_default()
@@ -336,8 +354,13 @@ pub struct Show<'a> {
     pub stage: Option<Stage>,
 }
 
-/// `show --json`, pretty.
+/// `show --json`, pretty: [`show_json`] as the CLI prints it.
 pub fn show(row: &Row, s: &Show) -> String {
+    serde_json::to_string_pretty(&show_json(row, s)).unwrap_or_default()
+}
+
+/// `show --json`'s document, the value the API's `show` answers (wsp-307).
+pub fn show_json(row: &Row, s: &Show) -> Value {
     let mut v = task_json(row);
     v["body"] = json!(s.body);
     if let Some(path) = &s.archived {
@@ -354,5 +377,5 @@ pub fn show(row: &Row, s: &Show) -> String {
     v["pieces"] = pieces_json(&s.pieces);
     v["stage"] = json!(s.stage.as_ref().map(stage_json));
     v["stages"] = json!(s.stage.as_ref().map(|g| g.steps.iter().map(Step::json).collect::<Vec<_>>()));
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+    v
 }

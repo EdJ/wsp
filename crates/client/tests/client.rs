@@ -4,7 +4,8 @@
 //! with the right token, subscribing, and refused with a wrong one; `request` for each read verb; `subscribe` handing
 //! out the snapshot and then each event once, across a server restart (a
 //! `Resumed`, and no id twice) and through a `too_old` (a fresh `State`); and a
-//! duplicate id dropped.
+//! duplicate id dropped; `throttle`, `spend` and `show` handing back the
+//! server's documents, and their refusals (wsp-307).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, to_value, Value};
 use wsp_api::{Answer, ApiToken, Code, Listen, Outcome, Reply, LISTEN_FILE, MISSED_BEATS, TOKEN_FILE};
-use wsp_client::{Client, Feed, Item, Silent};
+use wsp_client::{Client, Feed, Item, Silent, ViewError};
 use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
+use wsp_store_contract::Feed as Feed2;
 
 /// The upper bound on every wait for an item, a reply or a state the feed comes
 /// to: generous, so a machine under load is slow and not failed. Each wait ends
@@ -316,6 +318,134 @@ fn request_gets_each_read_verbs_answer_matched_by_id() {
         Outcome::Err(f) => assert_eq!(f.code, Code::Unsupported),
         other => panic!("{other:?}"),
     }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The daemon's documents, faked, for the view calls (wsp-307).
+struct Docs;
+
+impl wsp_server::Views for Docs {
+    fn throttle(&self) -> std::result::Result<Value, wsp_api::Failure> {
+        Ok(json!({ "mode": "on", "in_force": true, "load": [2.5, 2.0, 1.75] }))
+    }
+    fn spend(&self) -> std::result::Result<Value, wsp_api::Failure> {
+        Ok(json!({ "today": "2026-11-20", "currency": "USD" }))
+    }
+    fn show(&self, id: &str) -> std::result::Result<Value, wsp_api::Failure> {
+        match id {
+            "wsp-1" => Ok(json!({ "id": "wsp-1", "title": "one" })),
+            _ => Err(wsp_api::Failure { code: Code::NotFound, text: format!("no task matches '{id}'"), refusal: None }),
+        }
+    }
+}
+
+#[test]
+fn throttle_spend_and_show_return_the_documents_and_a_refusal_says_why() {
+    let d = dir("views");
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.beat = BEAT;
+    cfg.views = Some(Arc::new(Docs));
+    let server = Server::start(Arc::new(mirror_store()), cfg).unwrap();
+    let mut c = dial(&d);
+    assert_eq!(c.throttle().unwrap(), json!({ "mode": "on", "in_force": true, "load": [2.5, 2.0, 1.75] }));
+    assert_eq!(c.spend().unwrap(), json!({ "today": "2026-11-20", "currency": "USD" }));
+    assert_eq!(c.show("wsp-1").unwrap(), json!({ "id": "wsp-1", "title": "one" }));
+    match c.show("wsp-9") {
+        Err(ViewError::Refused(f)) => assert_eq!((f.code, f.text.as_str()), (Code::NotFound, "no task matches 'wsp-9'")),
+        other => panic!("a show of nothing gave {other:?}"),
+    }
+    server.stop();
+    assert!(matches!(c.spend(), Err(ViewError::Request(_))), "the server is gone");
+    let _ = fs::remove_dir_all(&d);
+
+    // A server with no views refuses them `unsupported`, as one from before them would.
+    let d = dir("no-views");
+    let server = start(Arc::new(mirror_store()), &d);
+    let mut c = dial(&d);
+    assert!(matches!(c.throttle(), Err(ViewError::Refused(f)) if f.code == Code::Unsupported));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn wip_reads_the_cut_typed_bodies_only_on_open_rows() {
+    let d = dir("wip");
+    let store = mirror_store();
+    let body = |r: &mut Row| drop(r.fields.insert("body".into(), "long prose".into()));
+    let mut open = row("wsp-1", "open");
+    body(&mut open);
+    let mut done = row("wsp-2", "done");
+    done.state = RowState::Done;
+    body(&mut done);
+    done.fields.insert("head".into(), "the head".into());
+    apply(&store, vec![Entity::Row(open), Entity::Row(done)], vec![], "rows");
+    let server = start(Arc::new(store.handle()), &d);
+    let mut c = dial(&d);
+
+    let (state, at) = c.wip().unwrap();
+    assert_eq!((state.clone(), at), store.wip_snapshot().unwrap());
+    let get = |id: &str| state.rows[&RowId(id.into())].fields.clone();
+    assert_eq!(get("wsp-1").get("body").map(String::as_str), Some("long prose"));
+    assert_eq!(get("wsp-2").get("body"), None);
+    assert_eq!(get("wsp-2").get("head").map(String::as_str), Some("the head"));
+    // `state` is unchanged beside it: the done row keeps its body there.
+    match ok(c.request("state", json!({})).unwrap()) {
+        Answer::State { state, .. } => assert!(state.rows[&RowId("wsp-2".into())].fields.contains_key("body")),
+        other => panic!("{other:?}"),
+    }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The census's reads, typed (wsp-743): `rows` and `lists` as heads keep
+/// every row and list less its text, `asks` filters by kind and state, and
+/// `readings` hands back what the store keeps by name, every one for none.
+#[test]
+fn the_census_reads_come_back_typed() {
+    let d = dir("census");
+    let store = mirror_store();
+    let text = |f: &mut std::collections::BTreeMap<String, String>| {
+        f.insert("body".into(), "long".into());
+        f.insert("prose".into(), "longer".into());
+        f.insert("status".into(), "todo".into());
+    };
+    let mut r = row("wsp-1", "one");
+    text(&mut r.fields);
+    let mut l = List { id: ListId("s1".into()), state: ListState::Running, groups: vec![], fields: Default::default() };
+    text(&mut l.fields);
+    let mut put = everything();
+    put.retain(|e| !matches!(e, Entity::Row(x) if x.id.0 == "wsp-1") && !matches!(e, Entity::List(_)));
+    put.push(Entity::Row(r));
+    put.push(Entity::List(l));
+    apply(&store, put, vec![], "census");
+    store.set_reading("throttle", r#"{"mode":"auto"}"#.into()).unwrap();
+    store.set_reading("spend", r#"{"landed":2}"#.into()).unwrap();
+    let server = start(Arc::new(store.handle()), &d);
+    let mut c = dial(&d);
+
+    let heads = c.rows(RowFilter { heads: true, ..Default::default() }).unwrap();
+    assert_eq!(heads, store.rows(&RowFilter { heads: true, ..Default::default() }).unwrap());
+    let one = heads.iter().find(|r| r.id.0 == "wsp-1").unwrap();
+    assert!(!one.fields.contains_key("body") && !one.fields.contains_key("prose"), "{one:?}");
+    assert_eq!(one.fields.get("status").map(String::as_str), Some("todo"));
+    assert_eq!(c.rows(RowFilter::default()).unwrap(), store.rows(&RowFilter::default()).unwrap(), "whole rows as before");
+
+    let lists = c.lists(ListFilter { heads: true }).unwrap();
+    assert_eq!(lists.len(), 1);
+    assert!(!lists[0].fields.contains_key("body") && lists[0].fields.contains_key("status"), "{lists:?}");
+    assert!(c.lists(ListFilter::default()).unwrap()[0].fields.contains_key("body"), "whole lists as before");
+
+    assert_eq!(c.asks(vec![AskKind::Flag], vec![AskState::Raised]).unwrap().len(), 1);
+    assert_eq!(c.asks(vec![AskKind::Ask], vec![]).unwrap(), vec![]);
+
+    let all = c.readings(&[]).unwrap();
+    assert_eq!(all.keys().collect::<Vec<_>>(), ["spend", "throttle"]);
+    let one = c.readings(&["throttle", "nothing"]).unwrap();
+    assert_eq!(one.keys().collect::<Vec<_>>(), ["throttle"]);
+    assert_eq!(one["throttle"].json, r#"{"mode":"auto"}"#);
+    assert_eq!(one["throttle"], all["throttle"]);
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
@@ -874,6 +1004,138 @@ fn await_order_is_silent_within_the_dials_bound_when_the_server_goes() {
     assert!(after < bound + Duration::from_secs(5), "within the bound, not the wait: {after:?}");
 }
 
+/// A server of our own at `d`, taking `conns` connections: each is welcomed, and
+/// each subscribe is answered `subscribed` and then given `then(n, stream)` (n
+/// counts subscribes from 0). Returns when each subscribe came, and the thread.
+#[allow(clippy::type_complexity)]
+fn fake_feed(
+    d: &Path,
+    conns: usize,
+    then: fn(usize, &mut std::net::TcpStream),
+) -> (Arc<std::sync::Mutex<Vec<Instant>>>, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::create_dir_all(d).unwrap();
+    let listen = Listen { addrs: vec![l.local_addr().unwrap().to_string()] };
+    fs::write(d.join(LISTEN_FILE), serde_json::to_string(&listen).unwrap()).unwrap();
+    fs::write(d.join(TOKEN_FILE), "t").unwrap();
+    let came = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let times = came.clone();
+    let accepts = std::thread::spawn(move || {
+        let mut threads = vec![];
+        for stream in l.incoming().take(conns) {
+            let (mut s, times) = (stream.unwrap(), times.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut text = String::new();
+                if r.read_line(&mut text).unwrap_or(0) == 0 {
+                    return;
+                }
+                writeln!(s, r#"{{"type":"welcome","server":"fake","protocol":1,"head":3}}"#).unwrap();
+                text.clear();
+                if r.read_line(&mut text).unwrap_or(0) == 0 {
+                    return;
+                }
+                let n = {
+                    let mut t = times.lock().unwrap();
+                    t.push(Instant::now());
+                    t.len() - 1
+                };
+                let id = serde_json::from_str::<Value>(&text).unwrap()["id"].clone();
+                writeln!(s, "{}", json!({"type":"reply","id":id,"ok":"subscribed","events":[]})).unwrap();
+                then(n, &mut s);
+                loop {
+                    text.clear();
+                    if r.read_line(&mut text).unwrap_or(0) == 0 {
+                        return;
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+    });
+    (came, accepts)
+}
+
+#[test]
+fn a_connection_lost_before_it_delivered_anything_backs_off_and_each_wait_is_longer() {
+    // wsp-702: the server answers `subscribed` and hangs up, as a client meets a
+    // snapshot line it cannot read. The feed must not ask again at once, forever.
+    let d = dir("backoff");
+    // The client's request connection, then five subscribes.
+    const SUBS: usize = 5;
+    let (came, accepts) = fake_feed(&d, 1 + SUBS, |_, s| {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    });
+    let c = Client::dial(&d, ed(), WAIT).unwrap();
+    let mut f = c.subscribe(None);
+    f.set_beat(BEAT);
+    let deadline = Instant::now() + WAIT;
+    while came.lock().unwrap().len() < SUBS {
+        assert!(Instant::now() < deadline, "the subscribes never came: {:?}", f.why_silent());
+        assert_eq!(f.next_within(Duration::from_millis(20)), None, "nothing is delivered");
+    }
+    drop(f);
+    drop(c);
+    let t = came.lock().unwrap().clone();
+    let gaps: Vec<Duration> = t.windows(2).map(|w| w[1] - w[0]).collect();
+    // The waits are 25, 50, 100, 200 ms: each a floor on its gap, so a machine
+    // under load is slower and never failed. Before the fix every gap was the
+    // dial's few ms.
+    for (i, gap) in gaps.iter().enumerate() {
+        let floor = Duration::from_millis(25 << i);
+        assert!(*gap >= floor, "reconnect {} came after {gap:?}, under its backoff of {floor:?}: {gaps:?}", i + 1);
+    }
+    assert!(gaps[1] >= Duration::from_millis(50), "the second reconnect waits longer than the first: {gaps:?}");
+    let _ = accepts.join();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_snapshot_in_parts_is_handed_out_as_one_state_and_the_events_after_it_follow() {
+    // wsp-702: Parts closed by a State, then an event; the caller sees one
+    // Item::State with every piece in it, as from a snapshot that came whole.
+    let d = dir("parts");
+    let (_, accepts) = fake_feed(&d, 2, |_, s| {
+        use std::io::Write;
+        let store = mirror_store();
+        apply(&store, everything(), vec![], "all");
+        rows(&store, 0, 40);
+        let (state, at) = store.snapshot().unwrap();
+        let mut pieces = state.split(600);
+        assert!(pieces.len() > 3, "the fixture splits: {}", pieces.len());
+        let last = pieces.pop().unwrap();
+        let line = |f: Feed2| format!("{}\n", serde_json::to_string(&wsp_api::Frame::Feed(f)).unwrap());
+        for part in pieces {
+            s.write_all(line(Feed2::Part { part, at }).as_bytes()).unwrap();
+        }
+        s.write_all(line(Feed2::State { state: last, at }).as_bytes()).unwrap();
+        rows(&store, 40, 1);
+        let e = store.events_after(at, 1).unwrap().remove(0);
+        s.write_all(line(Feed2::Event(e)).as_bytes()).unwrap();
+    });
+    let c = Client::dial(&d, ed(), WAIT).unwrap();
+    let mut f = c.subscribe(None);
+    f.set_beat(BEAT);
+    let want = {
+        let store = mirror_store();
+        apply(&store, everything(), vec![], "all");
+        rows(&store, 0, 40);
+        store.snapshot().unwrap()
+    };
+    assert_eq!(f.next_within(WAIT), Some(Item::State { state: want.0, at: want.1 }));
+    match f.next_within(WAIT) {
+        Some(Item::Event(e)) => assert_eq!(e.id, EventId(want.1 .0 + 1)),
+        other => panic!("expected the event after the snapshot, got {other:?}"),
+    }
+    drop(f);
+    drop(c);
+    let _ = accepts.join();
+    let _ = fs::remove_dir_all(&d);
+}
+
 // ---------------------------------------------------------------- a store with retention
 
 /// `MemStore` with retention: `events_after` refuses `too_old` before `oldest`.
@@ -912,6 +1174,9 @@ impl Reads for Retained {
     }
     fn snapshot(&self) -> Result<(State, EventId)> {
         self.inner.snapshot()
+    }
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        self.inner.wip_snapshot()
     }
 }
 
@@ -957,6 +1222,7 @@ impl Claims for Retained {
     }
 }
 
+impl Readings for Retained {}
 impl Texts for Retained {
     fn text(&self, row: &RowId, section: &str) -> Result<(String, Rev)> {
         self.inner.text(row, section)

@@ -226,12 +226,23 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     };
     // The structured part, if any (`wsp-299`): read and checked before anything
     // is raised, so a malformed file is a sentence and not a half-asked question.
-    let choices = match args.get("choices") {
-        None => None,
-        Some(src) => match json_source(&src).and_then(|v| Choices::parse(&v)) {
+    if args.has("set") && args.has("choices") {
+        eprintln!("wsp: --set is a set of questions and --choices one ask — send one");
+        return 2;
+    }
+    let choices = match (args.get("choices"), args.get("set")) {
+        (None, None) => None,
+        (Some(src), _) => match json_source(&src).and_then(|v| Choices::parse(&v)) {
             Ok(c) => Some(c),
             Err(why) => {
                 eprintln!("wsp: --choices: {why}");
+                return 2;
+            }
+        },
+        (None, Some(src)) => match json_source(&src).and_then(|v| set_choices(&v)) {
+            Ok(c) => Some(c),
+            Err(why) => {
+                eprintln!("wsp: --set: {why}");
                 return 2;
             }
         },
@@ -349,7 +360,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
         // words by a seat, and an answer that had to be one of a list would
         // be a rule nobody asked the seat to learn.
         if !q.for_person {
-            eprintln!("wsp: --choices is for a question to the person — add --person");
+            eprintln!("wsp: --choices and --set are for a question to the person — add --person");
             return 2;
         }
         // §26.8 D3: how long the question is held, and from when. Only with
@@ -442,7 +453,13 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
             }
             println!("  {}", p.dim("asked of the person · `wsp yours` lists it · only the person may answer it"));
             if let Some(c) = &q.choices {
-                println!("  {}", p.dim(&format!("{} · answered with `wsp answer {} --choice …`: {}", c.kind(), q.id, c.options_line())));
+                match c.kind() {
+                    "set" => println!(
+                        "  {}",
+                        p.dim(&format!("set · {}  · answered per question with `wsp answer {} --question H --choice L`, ended by the last or `--finish`", answered_of(c), q.id))
+                    ),
+                    _ => println!("  {}", p.dim(&format!("{} · answered with `wsp answer {} --choice …`: {}", c.kind(), q.id, c.options_line()))),
+                }
             }
             if let Some(holds) = unblocks(store, &q) {
                 println!("  {}", p.dim(&format!("holds {holds}")));
@@ -462,6 +479,25 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
         println!("  {}", r.said(&format!("the {} seat", r.scope), &p));
     }
     0
+}
+
+/// A set's filing: the file is the set, and its kind is `set`.
+fn set_choices(v: &serde_json::Value) -> Result<Choices, String> {
+    let Some(o) = v.as_object() else {
+        return Err("a set is a JSON object: {title, intro?, questions: […]}".into());
+    };
+    if o.get("kind").is_some_and(|k| k != "set") {
+        return Err("a set's kind is `set`, or left out".into());
+    }
+    let mut o = o.clone();
+    o.insert("kind".into(), "set".into());
+    Choices::parse(&serde_json::Value::Object(o))
+}
+
+/// "n of m answered", for a set.
+fn answered_of(c: &Choices) -> String {
+    let (n, m) = c.set_progress();
+    format!("{n} of {m} answered")
 }
 
 /// The question as it goes to the seat, and the return path with it.
@@ -574,7 +610,13 @@ fn whole(store: &Store, needle: &str, args: &Args, clock: &dyn Clock) -> i32 {
     println!("  {}", p.dim(&waiting_line(&q)));
     println!();
     println!("{}", q.text.trim());
-    if q.is_open() {
+    if let Some(c) = q.choices.as_ref().filter(|c| c.kind() == "set") {
+        print_set(&p, c);
+    }
+    if q.is_open() && q.choices.as_ref().is_some_and(|c| c.kind() == "set") {
+        println!();
+        println!("{}", p.dim(&format!("wsp answer {} --question H --choice L saves one · --finish ends it with some left", q.id)));
+    } else if q.is_open() {
         println!();
         println!("{}", p.dim(&format!("wsp answer {} \"…\" closes it and reaches whoever asked", q.id)));
     } else if let Some(h) = q.closing() {
@@ -586,6 +628,45 @@ fn whole(store: &Store, needle: &str, args: &Args, clock: &dyn Clock) -> i32 {
         }
     }
     0
+}
+
+/// A set, whole: its intro, each question with its options, the recommended
+/// one marked, and the answer saved so far.
+fn print_set(p: &Paint, c: &Choices) {
+    let j = c.json();
+    println!();
+    if let Some(i) = j["intro"].as_str().filter(|i| !i.trim().is_empty()) {
+        println!("{}\n", i.trim());
+    }
+    println!("{}", p.dim(&answered_of(c)));
+    let answers = j.get("answers").and_then(|a| a.as_object()).cloned().unwrap_or_default();
+    for (n, q) in j["questions"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
+        let header = q["header"].as_str().unwrap_or_default();
+        println!("\n{}. {} — {}", n + 1, p.bold(header), q["question"].as_str().unwrap_or_default());
+        let rec = q["recommended"].as_str();
+        for o in q["options"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            let label = o["label"].as_str().unwrap_or_default();
+            let mark = if rec == Some(label) { "  ← recommended" } else { "" };
+            println!("   · {label}{mark}  {}", o["description"].as_str().unwrap_or_default());
+        }
+        if let Some(w) = q["why"].as_str() {
+            println!("   {}", p.dim(&format!("why: {w}")));
+        }
+        match answers.get(header) {
+            Some(a) => {
+                let picks: Vec<&str> = a["pick"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                let mut said = match a["other"].as_str() {
+                    Some(w) => format!("Other — {w}"),
+                    None => picks.join(", "),
+                };
+                if let Some(nt) = a["note"].as_str().filter(|n| !n.is_empty()) {
+                    said.push_str(&format!(" · note: {nt}"));
+                }
+                println!("   answered: {said}  ({})", a["decision"].as_str().unwrap_or_default());
+            }
+            None => println!("   {}", p.dim("not answered")),
+        }
+    }
 }
 
 // ---- `wsp ask --wait`: the tool call that returns with the answer -----------
@@ -830,7 +911,10 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     // A structured answer (`wsp-299`) is `--choice` or `--other`; the sentence
     // beside it, if any, is a deny's message, and otherwise there is none.
     let chosen = args.has("choice") || args.has("other");
+    let a_set = q.choices.as_ref().is_some_and(|c| c.kind() == "set") && !giving_up;
     let (text, choice) = match chosen {
+        // A set is answered per question, below; its words are its own.
+        _ if a_set => (String::new(), None),
         false => match crate::cmd_agent::prose(args, 1) {
             Ok(t) => (t, None),
             Err(code) => return code,
@@ -895,6 +979,18 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     };
 
     let routed = q.for_person && me.scope().is_some();
+    if a_set {
+        match set_answer(store, args, &q, &me, routed) {
+            SetStep::Saved(code) => return code,
+            SetStep::Close(finish, words) => {
+                return close_set(store, args, &q, &me, routed, finish, &words);
+            }
+        }
+    }
+    if !a_set && (args.has("question") || args.has("finish")) {
+        eprintln!("wsp: {} is not a set — `--question` and `--finish` answer one", q.id);
+        return 2;
+    }
     let closed = match (giving_up, &choice) {
         (false, c) if routed => message::answer_routed(store, &q.id, &me, &text, c.as_ref()),
         (false, Some(c)) => message::answer_choice(store, &q.id, &me, &text, c),
@@ -942,6 +1038,91 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     if !giving_up {
         crate::cmd_submit::answered(store, &closed.question, &closed.reply.text);
     }
+    deliver(store, &closed, args)
+}
+
+/// What an answer to a set did: saved a question (and printed it, with the
+/// exit code), or is the close.
+enum SetStep {
+    Saved(i32),
+    Close(bool, String),
+}
+
+/// `wsp answer <mid> --question H --choice L [--other W] [--note W]` and
+/// `wsp answer <mid> --finish ["words"]` on a set. A save keeps the answer on
+/// the ask and records a decision on the row; the ask ends when every question
+/// has an answer, or at `--finish`.
+fn set_answer(store: &Store, args: &Args, q: &Message, _me: &Party, _routed: bool) -> SetStep {
+    let finish = args.has("finish");
+    let words = match args.get("finish").as_deref() {
+        Some("true") | None => args.text(1),
+        Some(w) => w.to_string(),
+    };
+    let key = args.get("question");
+    if key.is_none() && !finish {
+        eprintln!("wsp: {} is a set — answer a question with `--question 'Header' --choice 'Label'`, or end it with `--finish`", q.id);
+        if let Some(c) = &q.choices {
+            eprintln!("     {}", c.options_line());
+        }
+        return SetStep::Saved(2);
+    }
+    let Some(key) = key else {
+        return SetStep::Close(true, words.trim().to_string());
+    };
+    let picks = args.each("choice");
+    let other = args.get("other");
+    let note = args.get("note").filter(|n| n != "true").unwrap_or_default();
+    let p = Paint::new();
+    match message::save_set_answer(store, &q.id, &key, &picks, other.as_deref(), &note) {
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            SetStep::Saved(if matches!(e, message::Refused::BadChoice(_)) { 2 } else { 1 })
+        }
+        Ok(saved) => {
+            if args.json() {
+                println!(
+                    "{}",
+                    json!({ "id": q.id, "saved": saved.header, "decision": saved.decision, "superseded": saved.superseded,
+                            "answered": saved.answered, "of": saved.total })
+                );
+            } else {
+                println!("{} {}  {}", p.dim("·"), p.bold(&q.id), p.dim(&format!("{} saved", saved.header)));
+                println!("  {}", p.dim(&format!("{} of {} answered · decision {}{}", saved.answered, saved.total, saved.decision,
+                    saved.superseded.as_ref().map(|s| format!(" (supersedes {s})")).unwrap_or_default())));
+            }
+            if finish {
+                return SetStep::Close(true, words.trim().to_string());
+            }
+            if saved.answered == saved.total {
+                return SetStep::Close(false, String::new());
+            }
+            SetStep::Saved(0)
+        }
+    }
+}
+
+/// The set ends: the log first (the ask closes onto its row), then whoever
+/// asked, once, with every answer.
+fn close_set(store: &Store, args: &Args, q: &Message, me: &Party, routed: bool, finish: bool, words: &str) -> i32 {
+    let input = json!({ "finish": finish });
+    let closed = if routed {
+        message::answer_routed(store, &q.id, me, words, Some(&input))
+    } else {
+        message::answer_choice(store, &q.id, me, words, &input)
+    };
+    let closed = match closed {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+    let p = Paint::new();
+    if !args.json() {
+        println!("{} {}  {}", p.dim("·"), p.bold(&closed.question.id), p.dim("set answered"));
+        println!("  {}", p.dim(&format!("→ {}", closed.reply.text.trim().lines().next().unwrap_or_default())));
+    }
+    tell_the_list(store, &closed, args);
     deliver(store, &closed, args)
 }
 
@@ -1141,44 +1322,72 @@ fn project_of(store: &Store, about: &About) -> Option<String> {
     crate::mirror::project_of(store, about)
 }
 
-/// An item, as `wsp yours --json` gives it.
-#[cfg(test)]
-fn item_json(store: &Store, q: &Message) -> serde_json::Value {
-    let whole = q.to_json();
-    json!({
-        "id": q.id,
-        "asked": q.title(),
-        "caption": whole["caption"],
-        "text": q.text,
-        "about": whole["about"],
-        "project": project_of(store, &q.about),
-        "from": q.from.byline(),
-        "at": q.at,
-        "unblocks": unblocks(store, q),
-        "waiting": whole["waiting"],
-        "for": whole["for"],
-        "unrouted": whole["unrouted"],
-        // Null for a question with none, which is today's.
-        "choices": whole["choices"],
-    })
+/// An item's inputs, as `wsp yours --json` draws it ([`wsp_view::flag::item_json`]):
+/// the record, and what is worked out here beside it.
+fn item_of(store: &Store, q: &Message) -> wsp_view::flag::Item {
+    wsp_view::flag::Item {
+        record: q.to_json(),
+        asked: q.title().to_string(),
+        from: q.from.byline(),
+        project: project_of(store, &q.about),
+        unblocks: unblocks(store, q),
+    }
 }
 
-/// A closed question of the person's, as `yours --json` lists it for ten
-/// minutes after (compound's §26.8 D7): the item, and how it ended.
-#[cfg(test)]
-fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
-    let mut v = item_json(store, q);
-    v["closed"] = closed;
-    v
+/// `yours --json`'s inputs for `project` (none is every project), over the
+/// items and review count `yours` has already read. `person` is left empty:
+/// it is `flag --person`'s, which [`flags_reading`] adds.
+fn yours_reading(store: &Store, project: Option<&str>, index: &crate::resolve::Index, items: &[Message], review: usize) -> wsp_view::flag::Flags {
+    wsp_view::flag::Flags {
+        person: Vec::new(),
+        project: project.map(str::to_string),
+        items: items.iter().map(|q| item_of(store, q)).collect(),
+        review,
+        closed_by_the_run: crate::auto_close::unseen(store).len(),
+        retro: crate::retro_yours::yours_lines(store),
+        // The person's questions closed in the last ten minutes, so a
+        // reader can tell *answered in the pane* from *gone*.
+        closed: recently_closed(store)
+            .into_iter()
+            .filter(|(m, _)| project.is_none() || yours_scope(store, m, project, index))
+            .map(|(m, closed)| wsp_view::flag::Closed { item: item_of(store, &m), closed })
+            .collect(),
+    }
+}
+
+/// How many rows wait at `review` in `project` and every project under it,
+/// or in all.
+fn review_count(store: &Store, project: Option<&str>, index: &crate::resolve::Index) -> usize {
+    store
+        .tasks()
+        .iter()
+        .filter(|t| t.status() == crate::model::Status::Review)
+        .filter(|t| match project {
+            None => true,
+            Some(p) => t.project.as_deref().is_some_and(|tp| tp == p || index.ancestors(tp).iter().any(|a| a == p)),
+        })
+        .count()
+}
+
+/// The `flags` reading (wsp-745): `flag --person --json`'s hands and `yours
+/// --json`'s inputs for every project, taken with the builders the two verbs
+/// print through, so [`wsp_view::flag::person_json`] and
+/// [`wsp_view::flag::yours_json`] draw what each prints.
+pub(crate) fn flags_reading(store: &Store) -> wsp_view::flag::Flags {
+    let index = crate::resolve::Index::new(store.projects());
+    let items = yours_in(store, None);
+    let mut flags = yours_reading(store, None, &index, &items, review_count(store, None, &index));
+    // `flag --person`'s hands: each raised to the person, replies left out,
+    // oldest first, as its record (`cmd_agent::list_flags` prints the same).
+    flags.person = message::raised_to_the_person(store).iter().map(Message::to_json).collect();
+    flags
 }
 
 /// How long a closed question stays in `yours --json`'s `closed`.
-#[cfg(test)]
 const CLOSED_FOR: i64 = 600;
 
 /// The person's questions closed in the last [`CLOSED_FOR`] seconds, newest
 /// first, each with `closed: {how, by, at, answer}`.
-#[cfg(test)]
 pub(crate) fn recently_closed(store: &Store) -> Vec<(Message, serde_json::Value)> {
     let mut out: Vec<(Message, serde_json::Value)> = store
         .messages()
@@ -1341,15 +1550,7 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     let items = yours_in(store, project.as_deref());
-    let review = store
-        .tasks()
-        .iter()
-        .filter(|t| t.status() == crate::model::Status::Review)
-        .filter(|t| match &project {
-            None => true,
-            Some(p) => t.project.as_deref().is_some_and(|tp| tp == p || index.ancestors(tp).iter().any(|a| a == p)),
-        })
-        .count();
+    let review = review_count(store, project.as_deref(), &index);
 
     if args.json() {
         let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
@@ -1369,7 +1570,10 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
             println!("  {line}");
         }
         if let Some(c) = &q.choices {
-            println!("  {}", p.dim(&format!("{} · {}", c.kind(), c.options_line())));
+            match c.kind() {
+                "set" => println!("  {}", p.dim(&format!("set · {}", answered_of(c)))),
+                _ => println!("  {}", p.dim(&format!("{} · {}", c.kind(), c.options_line()))),
+            }
         }
         let mut parts = vec![format!("from {}", q.from.byline())];
         if let Some(u) = unblocks(store, q) {
@@ -1534,6 +1738,9 @@ fn open(store: &Store, args: &Args) -> i32 {
         // a list that hides the choice it asks (`wsp-170`).
         for line in m.body().lines() {
             println!("  {line}");
+        }
+        if let Some(c) = m.choices.as_ref().filter(|c| c.kind() == "set") {
+            println!("  {}", p.dim(&format!("set · {}", answered_of(c))));
         }
         println!("  {}", p.dim(&waiting_line(m)));
     }
@@ -2285,6 +2492,18 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,
+                order: 291,
+                text: r##"  wsp ask <id> --person --set F|-   a set of 2-30 questions, one ask (F: JSON
+                                    {title, intro?, questions:[{header, question,
+                                    multi, options (2-4), recommended?, why?}]});
+                                    `wsp answer <mid> --question H|N --choice L
+                                    [--other W] [--note W]` saves one (a decision
+                                    on the row each), `--finish ["words"]` ends it
+                                    with some left; the asker is told once, at the
+                                    end; `wsp ask <mid>` reads it so far"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
                 order: 320,
                 text: r##"  wsp ask <id> --person --wait [--timeout S] [--choices F|-] ["…"]
                                     ask inside the turn: blocks, prints the
@@ -2375,6 +2594,16 @@ pub(crate) fn say_to_governor(store: &Store, scope: &str, q: &Message) {
 mod tests {
     use super::*;
     use crate::model::Task;
+
+    /// An item as `yours --json` prints it, through the builder and wsp-view's projection.
+    fn item_json(store: &Store, q: &Message) -> serde_json::Value {
+        wsp_view::flag::item_json(&item_of(store, q))
+    }
+
+    /// A closed question as `yours --json`'s `closed` prints it.
+    fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
+        wsp_view::flag::closed_json(&wsp_view::flag::Closed { item: item_of(store, q), closed })
+    }
 
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(&format!("ans-{tag}"))
@@ -4008,5 +4237,146 @@ mod tests {
         assert_eq!(answer(&store, &crate::Args::synth("answer", &positional, &flags)), 0);
         assert!(store.message(&id).unwrap().step_done_at.is_some());
         assert_eq!(attention(&store), None, "neither once its step is done");
+    }
+
+    // ---- sets (wsp-682) ----------------------------------------------------
+
+    fn a_set() -> serde_json::Value {
+        let q = |h: &str, rec: Option<&str>| {
+            let mut v = serde_json::json!({ "header": h, "question": format!("About {h}?"),
+                "options": [{ "label": "A", "description": "first" }, { "label": "B" }, { "label": "C" }] });
+            if let Some(r) = rec {
+                v["recommended"] = r.into();
+                v["why"] = "because".into();
+            }
+            v
+        };
+        serde_json::json!({ "title": "Plan decisions", "intro": "settles it", "questions": [q("One", Some("A")), q("Two", None), q("Three", Some("B"))] })
+    }
+
+    fn file_set(env: &util::Isolated, name: &str, v: &serde_json::Value) -> String {
+        let f = env.path(name);
+        std::fs::write(&f, v.to_string()).unwrap();
+        f.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn a_set_is_checked_when_it_is_filed() {
+        let env = util::isolated("set-file");
+        let store = scratch("set-file");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut one = a_set();
+        one["questions"] = serde_json::json!([a_set()["questions"][0].clone()]);
+        cases.push(("one question", one));
+        let mut many = a_set();
+        let q0 = a_set()["questions"][0].clone();
+        many["questions"] = (0..31).map(|i| { let mut q = q0.clone(); q["header"] = format!("H{i}").into(); q }).collect();
+        cases.push(("31 questions", many));
+        let mut few = a_set();
+        few["questions"][0]["options"] = serde_json::json!([{ "label": "A" }]);
+        cases.push(("one option", few));
+        let mut lots = a_set();
+        lots["questions"][0]["options"] = serde_json::json!([{ "label": "A" }, { "label": "B" }, { "label": "C" }, { "label": "D" }, { "label": "E" }]);
+        cases.push(("five options", lots));
+        let mut dup = a_set();
+        dup["questions"][1]["header"] = "One".into();
+        cases.push(("a repeated header", dup));
+        let mut long = a_set();
+        long["questions"][0]["header"] = "x".repeat(41).into();
+        cases.push(("a header over 40", long));
+        let mut rec = a_set();
+        rec["questions"][0]["recommended"] = "Z".into();
+        cases.push(("recommended not a label", rec));
+        let mut why = a_set();
+        why["questions"][1]["why"] = "no mark to explain".into();
+        cases.push(("why without recommended", why));
+        let before = message::all(&store).len();
+        for (what, v) in &cases {
+            let f = file_set(&env, "bad.json", v);
+            let a = crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())]);
+            assert_eq!(ask(&store, &a), 2, "{what}");
+        }
+        assert_eq!(message::all(&store).len(), before, "nothing was raised");
+
+        let f = file_set(&env, "set.json", &a_set());
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        let q = message::all(&store).pop().unwrap();
+        assert_eq!(q.text, "Plan decisions: One, Two, Three", "the title and the headers");
+        let c = q.choices.as_ref().unwrap();
+        assert_eq!((c.kind(), c.set_progress()), ("set", (0, 3)));
+        // Not beside --choices.
+        let both = [("person", ""), ("set", f.as_str()), ("choices", f.as_str())];
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &both)), 2);
+    }
+
+    #[test]
+    fn a_set_is_answered_a_question_at_a_time_and_ends_on_the_last() {
+        let env = util::isolated("set-answer");
+        let store = scratch("set-answer");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let f = file_set(&env, "set.json", &a_set());
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        let decisions = |store: &Store| store.task("lone-1").unwrap().body.matches("(set ").count();
+
+        // A bare answer or words is refused: a set is per question.
+        assert_eq!(answer(&store, &answer_args(&id, &[], &["words"])), 2);
+        assert_eq!(answer(&store, &answer_args(&id, &[("choice", "A")], &[])), 2);
+        // A label that is not one, a pick and an Other together, a second pick.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "Z")], &[])), 2);
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "A"), ("other", "w")], &[])), 2);
+        assert_eq!(decisions(&store), 0, "a refusal records nothing");
+
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "B"), ("note", "n1")], &[])), 0);
+        let q = store.message(&id).unwrap();
+        assert!(q.is_open());
+        assert_eq!(q.choices.as_ref().unwrap().set_progress(), (1, 3));
+        let a = &q.choices.as_ref().unwrap().json()["answers"]["One"];
+        assert_eq!((a["pick"][0].as_str(), a["note"].as_str()), (Some("B"), Some("n1")));
+        let first = a["decision"].as_str().unwrap().to_string();
+        let body = store.task("lone-1").unwrap().body;
+        assert!(body.contains("One: B · note: n1 (set") && body.contains("recommended: A"), "{body}");
+        assert!(body.contains("1 of 3 answered"), "the row's log says how far");
+
+        // Saving it again replaces it, and the new decision supersedes the old.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "1"), ("choice", "A")], &[])), 0);
+        let q = store.message(&id).unwrap();
+        let again = q.choices.as_ref().unwrap().json()["answers"]["One"]["decision"].as_str().unwrap().to_string();
+        assert_ne!(first, again);
+        assert!(store.task("lone-1").unwrap().body.contains(&format!("supersedes {first}")) || store.task("lone-1").unwrap().body.contains(&first));
+        assert_eq!(q.choices.as_ref().unwrap().set_progress(), (1, 3));
+
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("other", "my own")], &[])), 0);
+        assert!(store.message(&id).unwrap().is_open(), "two of three");
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Three"), ("choice", "C")], &[])), 0);
+        let done = store.message(&id).unwrap();
+        assert!(!done.is_open(), "the last answer ends it");
+        let told = told(&done);
+        assert!(told.contains("3 of 3 answered") && told.contains("Two: Other — my own") && told.contains("Three: C · differs from recommended (B)") && told.contains("One: A · as recommended"), "{told}");
+        // Once: one reply to the asker.
+        assert_eq!(message::all(&store).iter().filter(|m| m.reply_to.as_deref() == Some(id.as_str())).count(), 1);
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "B")], &[])), 1, "a closed set takes no more");
+    }
+
+    #[test]
+    fn a_set_finished_early_names_what_is_left_and_guesses_nothing() {
+        let env = util::isolated("set-finish");
+        let store = scratch("set-finish");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let f = file_set(&env, "set.json", &a_set());
+        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("choice", "C")], &[])), 0);
+        assert_eq!(answer(&store, &answer_args(&id, &[("finish", "true")], &["enough for today"])), 0);
+        let done = store.message(&id).unwrap();
+        assert!(!done.is_open());
+        let told = told(&done);
+        assert!(told.contains("1 of 3 answered, finished early") && told.contains("Unanswered (nothing guessed): One, Three"), "{told}");
+        assert!(told.contains("enough for today") && !told.contains("One: A"), "{told}");
+        assert_eq!(done.answer_choice().unwrap()["unanswered"], serde_json::json!(["One", "Three"]));
     }
 }

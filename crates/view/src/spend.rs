@@ -12,7 +12,8 @@ const DAY: i64 = 86_400;
 const WINDOW: i64 = 30;
 
 /// One ledger line: an ended seat and what it spent.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Line {
     pub seat: String,
     pub ended: i64,
@@ -26,7 +27,8 @@ pub struct Line {
 }
 
 /// What a seat held.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Place {
     pub list: Option<String>,
     pub project: Option<String>,

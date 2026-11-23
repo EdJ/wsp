@@ -1264,6 +1264,12 @@ fn is_shim(p: &Path) -> bool {
     String::from_utf8_lossy(&head[..n]).starts_with("#!/bin/sh\n") && String::from_utf8_lossy(&head[..n]).contains(SHIM_MARK)
 }
 
+/// `path` with every directory whose `tool` is a wsp shim left out: what a
+/// child is given that must run the real tool, not send it to a manager again.
+pub fn without_shims(tool: &str, path: &str) -> String {
+    path.split(':').filter(|d| !is_shim(&Path::new(d).join(tool))).collect::<Vec<_>>().join(":")
+}
+
 /// The first `tool` on `path` that is not one of ours.
 pub fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -2171,6 +2177,34 @@ pub fn holding_back(store: &Store) -> Option<Pause> {
 
 /// The memory readings as `wsp throttle --json` carries them, and which, if
 /// any, is holding. Blank under test, like [`holding_back`].
+/// `throttle --json`'s input, as `wsp-view` takes it (wsp-743: the daemon's
+/// `throttle` reading is this, read afresh).
+pub fn view(store: &Store) -> wsp_view::throttle::Throttle {
+    view_of(store, &View::read(&store.state))
+}
+
+fn view_of(store: &Store, v: &View) -> wsp_view::throttle::Throttle {
+    wsp_view::throttle::Throttle {
+        mode: v.settings.mode.word().to_string(),
+        in_force: v.in_force,
+        idle_secs: v.idle,
+        cores: v.cores,
+        slots: v.settings.slot_count(v.cores),
+        jobs: v.settings.job_cap(v.cores),
+        load: v.load,
+        load_warning: v.load_warning(),
+        memory: memory_json(store),
+        cpu_speed_limit: v.thermal,
+        thermal_below: v.settings.thermal_below,
+        thermally_limited: v.hot(),
+        hot_slots: v.settings.slots_at(v.cores, true),
+        hot_jobs: v.settings.jobs_at(v.cores, true),
+        suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
+        agents: store.seat_cap(),
+        builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
+    }
+}
+
 pub fn memory_json(store: &Store) -> Value {
     if cfg!(test) {
         return Value::Null;
@@ -2384,32 +2418,10 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
         }
     }
     ensure_shims(&store.state, &s);
-    let v = View::read(&store.state);
     match args.json() {
-        true => println!(
-            "{}",
-            serde_json::to_string_pretty(&wsp_view::throttle::json(&wsp_view::throttle::Throttle {
-                mode: v.settings.mode.word().to_string(),
-                in_force: v.in_force,
-                idle_secs: v.idle,
-                cores: v.cores,
-                slots: v.settings.slot_count(v.cores),
-                jobs: v.settings.job_cap(v.cores),
-                load: v.load,
-                load_warning: v.load_warning(),
-                memory: memory_json(store),
-                cpu_speed_limit: v.thermal,
-                thermal_below: v.settings.thermal_below,
-                thermally_limited: v.hot(),
-                hot_slots: v.settings.slots_at(v.cores, true),
-                hot_jobs: v.settings.jobs_at(v.cores, true),
-                suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
-                agents: store.seat_cap(),
-                builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
-            }))
-            .unwrap_or_default()
-        ),
+        true => println!("{}", serde_json::to_string_pretty(&document(store)).unwrap_or_default()),
         false => {
+            let v = View::read(&store.state);
             println!("{}", v.render());
             match holding_back(store) {
                 Some(h) => println!("new work: held — {}", h.text().trim_start_matches("throttle: ")),
@@ -2426,6 +2438,31 @@ pub fn throttle(store: &Store, args: &Args) -> i32 {
         }
     }
     0
+}
+
+/// `wsp throttle --json`'s document, as of now: what the bare verb prints
+/// under `--json`, and what the API's `throttle` verb answers (wsp-307).
+pub fn document(store: &Store) -> Value {
+    let v = View::read(&store.state);
+    wsp_view::throttle::json(&wsp_view::throttle::Throttle {
+        mode: v.settings.mode.word().to_string(),
+        in_force: v.in_force,
+        idle_secs: v.idle,
+        cores: v.cores,
+        slots: v.settings.slot_count(v.cores),
+        jobs: v.settings.job_cap(v.cores),
+        load: v.load,
+        load_warning: v.load_warning(),
+        memory: memory_json(store),
+        cpu_speed_limit: v.thermal,
+        thermal_below: v.settings.thermal_below,
+        thermally_limited: v.hot(),
+        hot_slots: v.settings.slots_at(v.cores, true),
+        hot_jobs: v.settings.jobs_at(v.cores, true),
+        suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
+        agents: store.seat_cap(),
+        builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
+    })
 }
 
 fn bad(k: &str, v: &str) -> i32 {
@@ -3276,6 +3313,20 @@ mod tests {
         assert_eq!(real_tool("cargo", &path, &mine), Some(rig.bin.join("cargo")));
         let only = format!("{}:/usr/bin", foreign.display());
         assert_eq!(real_tool("cargo", &only, &mine).filter(|p| p.starts_with(&foreign)), None);
+    }
+
+    /// wsp-395: a child that must run the real cargo is given the PATH with
+    /// every shim directory out, whichever state dir wrote it, and the rest
+    /// kept in order.
+    #[test]
+    fn a_path_without_shims_keeps_every_other_directory_in_order() {
+        let rig = rig("throttle-without-shims");
+        let mine = ensure_shims(&rig.state, &Settings::load(&rig.state));
+        let other = rig.state.join("other-state");
+        let foreign = ensure_shims(&other, &Settings::load(&other));
+        let path = format!("{}:{}:{}:/usr/bin", mine.display(), rig.bin.display(), foreign.display());
+        assert_eq!(without_shims("cargo", &path), format!("{}:/usr/bin", rig.bin.display()));
+        assert_eq!(real_tool("cargo", &without_shims("cargo", &path), Path::new("")), Some(rig.bin.join("cargo")));
     }
 
     #[test]

@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use wsp_api::{Failure, Feed, Frame, Subscribe, MAX_EVENTS};
-use wsp_store_contract::{Error, EventId};
+use wsp_api::{Failure, Feed, Frame, State, Subscribe, MAX_EVENTS, MAX_LINE};
+use wsp_store_contract::{Error, EventId, SNAPSHOT_PART};
 
 use crate::conn::{send, store_failure, Writer};
 use crate::{now, Shared};
@@ -40,7 +40,7 @@ pub(crate) fn open(shared: &Shared, sub: &Subscribe) -> Result<Opened, Failure> 
     match sub.from {
         None => {
             let (state, at) = store.snapshot().map_err(store_failure)?;
-            Ok(Opened { first: vec![Feed::State { state, at }], cursor: at })
+            Ok(Opened { first: snapshot_frames(state, at), cursor: at })
         }
         Some(from) => {
             let events = store.events_after(from, MAX_EVENTS as usize).map_err(store_failure)?;
@@ -48,6 +48,24 @@ pub(crate) fn open(shared: &Shared, sub: &Subscribe) -> Result<Opened, Failure> 
             Ok(Opened { first: events.into_iter().map(Feed::Event).collect(), cursor })
         }
     }
+}
+
+/// Room left in a line for the frame around a snapshot (`{"feed":{"state":…,"at":N}}`).
+const ENVELOPE: usize = 1024;
+
+/// The frames that carry `state`: one [`Feed::State`] when it fits in a line,
+/// as every client reads; else [`Feed::Part`]s of [`SNAPSHOT_PART`] bytes and a
+/// closing [`Feed::State`] with the rest (wsp-702), so that no frame is past
+/// [`MAX_LINE`] however large the store grows.
+pub(crate) fn snapshot_frames(state: State, at: EventId) -> Vec<Feed> {
+    if state.json_len() + ENVELOPE <= MAX_LINE {
+        return vec![Feed::State { state, at }];
+    }
+    let mut pieces = state.split(SNAPSHOT_PART);
+    let last = pieces.pop().unwrap_or_default();
+    let mut frames: Vec<Feed> = pieces.into_iter().map(|part| Feed::Part { part, at }).collect();
+    frames.push(Feed::State { state: last, at });
+    frames
 }
 
 /// Write the subscription until it ends.
@@ -112,5 +130,63 @@ fn run(shared: &Shared, writer: &Writer, closed: &AtomicBool, opened: Opened) ->
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use wsp_store_contract::{ProjectId, Row, RowId, RowState};
+
+    fn state_of(rows: usize, each: usize) -> State {
+        let mut s = State::default();
+        for i in 0..rows {
+            let id = RowId(format!("wsp-{i:04}"));
+            let fields = BTreeMap::from([("body".to_string(), "x".repeat(each))]);
+            let row = Row {
+                id: id.clone(),
+                project: ProjectId("wsp".into()),
+                title: "t".into(),
+                state: RowState::Done,
+                before_block: None,
+                seat: None,
+                group: None,
+                commit: None,
+                fields,
+            };
+            s.rows.insert(id, row);
+        }
+        s
+    }
+
+    fn line_len(f: &Feed) -> usize {
+        serde_json::to_vec(&Frame::Feed(f.clone())).unwrap().len()
+    }
+
+    #[test]
+    fn a_snapshot_that_fits_a_line_is_one_state_and_one_past_it_is_parts_each_under_the_line() {
+        // Under the line: one State, as a client older than Part reads it.
+        let small = state_of(10, 1000);
+        assert_eq!(snapshot_frames(small.clone(), EventId(7)), vec![Feed::State { state: small, at: EventId(7) }]);
+
+        // wsp-702's store was 51 MB; 20 MB here, in rows of 100 kB.
+        let big = state_of(200, 100_000);
+        let frames = snapshot_frames(big.clone(), EventId(9));
+        assert!(frames.len() >= 5, "{} frames", frames.len());
+        let (last, parts) = frames.split_last().unwrap();
+        assert!(matches!(last, Feed::State { at: EventId(9), .. }), "it closes with the State");
+        assert!(parts.iter().all(|f| matches!(f, Feed::Part { at: EventId(9), .. })));
+        let largest = frames.iter().map(line_len).max().unwrap();
+        assert!(largest <= SNAPSHOT_PART + 200_000, "the largest frame is {largest} B");
+        assert!(largest < MAX_LINE);
+        let mut back = State::default();
+        for f in frames {
+            match f {
+                Feed::Part { part, .. } | Feed::State { state: part, .. } => back.absorb(part),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(back, big);
     }
 }

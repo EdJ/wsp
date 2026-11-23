@@ -1118,7 +1118,11 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     .rev()
     .collect();
     if args.json() {
-        let out: Vec<serde_json::Value> = rows.iter().map(Message::to_json).collect();
+        // `--person`'s is drawn by wsp-view (wsp-745), as the daemon's `flags` reading is.
+        let out = match args.has("person") {
+            true => wsp_view::flag::person_json(&rows.iter().rev().map(Message::to_json).collect::<Vec<_>>()),
+            false => serde_json::Value::Array(rows.iter().map(Message::to_json).collect()),
+        };
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
@@ -3994,20 +3998,28 @@ fn silent_lines(store: &Store) -> Vec<String> {
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
     // The files unless `WSP_READ=api`; a silent or failed dial reads the files
-    // and says why, once (wsp-076).
+    // and says why, once (wsp-076). The orders, which under `WSP_ORDERS=store`
+    // are read through the API on the files path too (wsp-127), are not dialled
+    // for a second time after it failed: that is said on the same line.
+    let mut fell = false;
     let api = match wip_reads_api() {
         false => None,
         true => match api_state(store) {
             Ok(state) => Some(state),
             Err(why) => {
-                eprintln!("wsp: wip reads the files: {why}");
+                let orders = match crate::orders::mode() {
+                    crate::orders::Mode::Store => "; no orders drawn, as they are read through it too",
+                    _ => "",
+                };
+                eprintln!("wsp: wip reads the files: {why}{orders}");
+                fell = true;
                 None
             }
         },
     };
     let w = match &api {
         Some(state) => Wip::from_api(store, state),
-        None => Wip::from_managers(store),
+        None => Wip::from_managers(store, !fell),
     };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
@@ -4208,8 +4220,24 @@ struct Gathering {
 impl Gathering {
     /// The files' half, read as `wip` always has.
     fn files(store: &Store, agents: Vec<(crate::place::Seated, Option<i64>)>, since: BTreeMap<String, String>) -> Gathering {
+        Gathering::files_dialling(store, agents, since, true)
+    }
+
+    /// [`Gathering::files`], the orders read through the API only where
+    /// `dial` is set: not after `wip`'s own dial of it failed, whose line said
+    /// so. Not dialled, the delivery columns are drawn empty, as a failed read
+    /// draws them.
+    fn files_dialling(
+        store: &Store,
+        agents: Vec<(crate::place::Seated, Option<i64>)>,
+        since: BTreeMap<String, String>,
+        dial: bool,
+    ) -> Gathering {
         Gathering {
-            delivery: OrderReads::of(store).map(|r| DeliveryColumns::read(&r, None, now_ms())),
+            delivery: OrderReads::of(store).map(|r| match dial {
+                true => DeliveryColumns::read(&r, None, now_ms()),
+                false => DeliveryColumns::default(),
+            }),
             tasks: wip_tasks(store),
             bindings: store.bindings(),
             claims: store.claims(),
@@ -4436,9 +4464,12 @@ impl Wip {
     /// `seats` to each host in the machine records, in parallel, each heard or
     /// silent within a second. The seats' state, rss and shells and the
     /// host's disks come from those replies; this runs no `ps`, `lsof`,
-    /// render or `df`. A seat the manager does not run (one started
+    /// render or `df`. The tree-less burners (wsp-691) are the line the
+    /// daemon's tick last stamped ([`crate::cmd_role::burners_stamped`],
+    /// wsp-716), not a process table read here. A seat the manager does not run (one started
     /// in-process) is not here until adoption (wsp-029).
-    pub(crate) fn from_managers(store: &Store) -> Wip {
+    /// `dial_orders` unset leaves the orders unread ([`Gathering::files_dialling`]).
+    pub(crate) fn from_managers(store: &Store, dial_orders: bool) -> Wip {
         let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
         let census = &reading.census;
         let seen: Vec<crate::place::Seated> = census.seats().filter(|s| s.state != State::Empty).cloned().collect();
@@ -4462,7 +4493,7 @@ impl Wip {
                 })
             })
             .collect();
-        let read = Gathering::files(store, seen.into_iter().map(|s| (s, None)).collect(), since);
+        let read = Gathering::files_dialling(store, seen.into_iter().map(|s| (s, None)).collect(), since, dial_orders);
         let mut w = Wip::gathered(store, read, |agents, bindings| {
             let shells = crate::waiting::Shells::counted(
                 agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
@@ -4474,7 +4505,7 @@ impl Wip {
                 memory,
                 daemon: daemon_by_stamp(store.daemon_tick(), heard, util::epoch_secs()),
                 disk: crate::disk::loud_of(store, &disks),
-                load: crate::throttle::loud(store),
+                load: load_with_burners(crate::throttle::loud(store), crate::cmd_role::burners_stamped(store, util::epoch_secs())),
                 throttle: Some(crate::throttle::status_line(store)),
             }
         });
@@ -4701,6 +4732,15 @@ fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> Strin
     };
     let idle = f.and_then(|f| f.hid_idle_secs);
     crate::throttle::View::of_beat(&store.state, given, idle).status_line()
+}
+
+/// The load warning with the tree-less CPU burners (wsp-691) under it: either
+/// alone is a line, both are two.
+fn load_with_burners(load: Option<String>, burners: Option<String>) -> Option<String> {
+    match (load, burners) {
+        (Some(l), Some(b)) => Some(format!("{l}\n{b}")),
+        (l, b) => l.or(b),
+    }
 }
 
 /// [`crate::throttle::loud`] from a manager's host facts rather than `sysctl`
@@ -5540,7 +5580,37 @@ fn wip_attention(w: &Wip, rows: &[WipRow]) -> serde_json::Value {
     json!({ "needs_you": needs_you, "follow_up": follow_up })
 }
 
-fn wip_parts(w: &Wip) -> (Vec<wsp_view::wip::Agent>, wsp_view::wip::Head) {
+/// `wip --json` whole as `wsp-view` takes it: the seats and head of `w`, the
+/// rows waiting at the cap, and the lists started lately where `picked_up`
+/// (there are pickup or silent lines to say).
+fn census_of(store: &Store, w: &Wip, cap_waits: Vec<String>, picked_up: bool) -> wsp_view::wip::Census {
+    let (agents, head) = wip_view(w);
+    let planned_started = picked_up.then(|| {
+        crate::pickup::started_lately(store)
+            .into_iter()
+            .map(|(at, id, why)| serde_json::json!({ "at": at, "worklist": id, "why": why }))
+            .collect()
+    });
+    wsp_view::wip::Census { agents, head, waiting_at_cap: cap_waits, planned_started }
+}
+
+/// The `wip` reading (wsp-743): `wip --json`'s input as the CLI reads it on
+/// the files path (`WSP_READ` unset), so a reader of the reading prints what
+/// `wip --json` prints.
+pub(crate) fn wip_reading(store: &Store) -> wsp_view::wip::Census {
+    let w = Wip::from_managers(store, true);
+    let cap_waits = crate::room::waiting_lines(store, &w.agents);
+    let picked_up = !crate::pickup::wip_lines(store).is_empty() || !silent_lines(store).is_empty();
+    census_of(store, &w, cap_waits, picked_up)
+}
+
+#[cfg(test)]
+fn wip_json(w: &Wip) -> serde_json::Value {
+    let (agents, head) = wip_view(w);
+    wsp_view::wip::wip_json(&agents, &head)
+}
+
+fn wip_view(w: &Wip) -> (Vec<wsp_view::wip::Agent>, wsp_view::wip::Head) {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
     let agents: Vec<wsp_view::wip::Agent> = rows
@@ -5597,12 +5667,6 @@ fn wip_parts(w: &Wip) -> (Vec<wsp_view::wip::Agent>, wsp_view::wip::Head) {
     (agents, head)
 }
 
-#[cfg(test)]
-fn wip_json(w: &Wip) -> serde_json::Value {
-    let (agents, head) = wip_parts(w);
-    wsp_view::wip::wip_json(&agents, &head)
-}
-
 /// The seat and machine fields `wip --json` needs and the contract `State` does
 /// not carry (wsp-308), written onto `state` from what `w` read: each seat's
 /// object under `wip_view::key::AGENT` (and `OWED`), and this host's machine
@@ -5610,7 +5674,7 @@ fn wip_json(w: &Wip) -> serde_json::Value {
 pub(crate) fn wip_overlay(w: &Wip, state: &mut wsp_store_contract::State) {
     use wsp_store_contract as c;
     use wsp_view::wip::key;
-    let (agents, head) = wip_parts(w);
+    let (agents, head) = wip_view(w);
     for a in &agents {
         let id = c::SeatId(a.pane.clone());
         let seat = state.seats.entry(id.clone()).or_insert_with(|| c::Seat {
@@ -5654,7 +5718,7 @@ pub(crate) fn state_with_wip(store: &Store, w: &Wip) -> wsp_store_contract::Stat
 /// paths hand `wsp-view`, printed so `tests/view_state.rs` can hand the same
 /// `State` to `wsp-view` itself and compare.
 fn state_verb(store: &Store, _args: &Args) -> i32 {
-    let s = state_with_wip(store, &Wip::from_managers(store));
+    let s = state_with_wip(store, &Wip::from_managers(store, true));
     println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
     0
 }
@@ -7483,6 +7547,16 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn burners_join_the_load_line() {
+        let l = || Some("load 12".to_string());
+        let b = || Some("1 CPU burner".to_string());
+        assert_eq!(load_with_burners(l(), b()).as_deref(), Some("load 12\n1 CPU burner"));
+        assert_eq!(load_with_burners(None, b()), b());
+        assert_eq!(load_with_burners(l(), None), l());
+        assert_eq!(load_with_burners(None, None), None);
+    }
+
     use super::*;
 
     /// A store of our own, with the state beside it — a raised hand lives in

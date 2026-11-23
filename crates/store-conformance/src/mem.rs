@@ -97,6 +97,8 @@ struct Inner {
     keys: HashMap<IdempotencyKey, Applied>,
     leases: BTreeMap<LeaseName, Slot>,
     texts: BTreeMap<(RowId, String), (String, u64)>,
+    /// `Readings`, beside the state and outside the log.
+    readings: BTreeMap<String, Reading>,
     /// A commit `gap_in_ids` is holding back.
     late: Vec<Event>,
     knobs: Knobs,
@@ -164,6 +166,7 @@ impl MemStore {
             keys: HashMap::new(),
             leases: BTreeMap::new(),
             texts: BTreeMap::new(),
+            readings: BTreeMap::new(),
             late: vec![],
             knobs: Knobs::default(),
         };
@@ -306,6 +309,12 @@ impl Reads for MemStore {
             .filter(|r| filter.list.as_ref().is_none_or(|l| r.group.as_ref().is_some_and(|g| g.list == *l)))
             .filter(|r| filter.seat.as_ref().is_none_or(|s| r.seat.as_ref() == Some(s)))
             .cloned()
+            .map(|mut r| {
+                if filter.heads {
+                    heads_only(&mut r.fields);
+                }
+                r
+            })
             .collect())
     }
 
@@ -363,6 +372,32 @@ impl Reads for MemStore {
         self.live()?;
         let g = self.lock();
         Ok((g.state.clone(), g.head))
+    }
+
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        let (s, at) = self.snapshot()?;
+        let bodiless = |mut f: std::collections::BTreeMap<String, String>| {
+            WIP_BODIES.iter().for_each(|k| drop(f.remove(*k)));
+            f
+        };
+        let rows = s
+            .rows
+            .into_iter()
+            .map(|(id, r)| match r.state {
+                RowState::Done => (id, Row { fields: bodiless(r.fields), ..r }),
+                _ => (id, r),
+            })
+            .collect();
+        let lists = s
+            .lists
+            .into_iter()
+            .map(|(id, l)| match l.state {
+                ListState::Finished if !l.fields.contains_key(WIP_SEATED) => (id, List { fields: bodiless(l.fields), ..l }),
+                _ => (id, l),
+            })
+            .collect();
+        let asks = s.asks.into_iter().filter(|(_, a)| a.state == AskState::Raised).collect();
+        Ok((State { rows, lists, seats: s.seats, claims: s.claims, asks, ..State::default() }, at))
     }
 }
 
@@ -510,6 +545,20 @@ impl Claims for MemStore {
         };
         let holder = slot.held.take().map(|l| l.holder).expect("held, as filtered");
         self.write(inner, EventKind::ClaimReleased, Subject::Claim(row.clone()), Value::Null, &holder);
+        Ok(())
+    }
+}
+
+impl Readings for MemStore {
+    fn readings(&self, names: &[String]) -> Result<BTreeMap<String, Reading>> {
+        self.live()?;
+        let g = self.lock();
+        Ok(g.readings.iter().filter(|(n, _)| names.is_empty() || names.contains(n)).map(|(n, r)| (n.clone(), r.clone())).collect())
+    }
+
+    fn set_reading(&self, name: &str, json: String) -> Result<()> {
+        self.live()?;
+        self.lock().readings.insert(name.to_string(), Reading { json, at: now() });
         Ok(())
     }
 }

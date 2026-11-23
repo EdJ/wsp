@@ -8,7 +8,21 @@
 
   "_comment_close": "PostToolUse is the other half of the held entry (wsp-302): Claude Code does not signal a held hook when the pane's dialog is answered first, so the tool running afterwards is what closes the question as answered in the pane. Stop, StopFailure, UserPromptSubmit and SessionEnd above close it as abandoned. It fires after every tool call, and costs one sh in a session that is not in a wsp seat.",
 
+  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command finds the script in the checkout or, on an executor, in ~/.claude/hooks; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
+
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$HOME/claude/wsp/claude-code/wsp-session.sh\"; [ -f \"$f\" ] || f=\"$HOME/.claude/hooks/wsp-session.sh\"; exec sh \"$f\" PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "*",

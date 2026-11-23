@@ -1,5 +1,5 @@
 //! `wsp-server` on an ephemeral loopback port over `MemStore` (wsp-073's done
-//! list): `hello` and its token, each read verb, commands `unsupported`,
+//! list): `hello` and its token, each read verb, `wip`'s cut (wsp-695), commands `unsupported`,
 //! malformed lines, `subscribe {}` and `subscribe {from}` (across a restart,
 //! and `too_old`), the silent client dropped, two subscribers in one order,
 //! the start refused while another server answers, and the mirror domain:
@@ -9,6 +9,8 @@
 //! `order.queued` reaches a subscriber, refuses a seat's `order.acked`
 //! `unauthorised` and a `mirror` putting an order `illegal`, state `owned`;
 //! under `Mirrored`, `order.send` is `illegal`, state `mirrored`.
+//! The view verbs (wsp-307): whatever the `Views` hand in, whole, and
+//! `unsupported` without them.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -345,7 +347,7 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
     }
     let s1 = ListId("s1".into());
     assert_eq!(c.read(Verb::List { list: s1.clone() }), Answer::List(store.list(&s1).unwrap()));
-    assert_eq!(c.read(Verb::Lists(NoArgs {})), Answer::Lists(state.lists.values().cloned().collect()));
+    assert_eq!(c.read(Verb::Lists(ListFilter::default())), Answer::Lists(state.lists.values().cloned().collect()));
     let cpd1 = SeatId("cpd-1".into());
     assert_eq!(c.read(Verb::Seat { seat: cpd1.clone() }), Answer::Seat(store.seat(&cpd1).unwrap()));
     let on_pi = SeatFilter { machine: Some(MachineName("pi".into())), ..Default::default() };
@@ -413,6 +415,146 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
     };
     c.conn.send(&Frame::Request(other)).unwrap();
     assert!(matches!(c.reply(id).outcome, Outcome::Err(f) if f.code == Code::Forbidden));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
+/// on rows not done and lists not finished, raised asks only, and `state` beside
+/// it unchanged.
+#[test]
+fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
+    let d = dir("wip");
+    let store = mirror_store();
+    let mut put = everything();
+    let with_body = |mut r: Row| {
+        r.fields.insert("body".into(), "the long prose".into());
+        r.fields.insert("prose".into(), "more of it".into());
+        r.fields.insert("head".into(), "a head".into());
+        Entity::Row(r)
+    };
+    let mut parked = row("wsp-3", "parked");
+    parked.state = RowState::Parked;
+    let mut done = row("wsp-4", "done");
+    done.state = RowState::Done;
+    put.extend([with_body(parked), with_body(done)]);
+    let mut list_fields = std::collections::BTreeMap::new();
+    list_fields.insert("body".to_string(), "list prose".to_string());
+    list_fields.insert("name".to_string(), "the list".to_string());
+    put.push(Entity::List(List { id: ListId("s2".into()), state: ListState::Running, groups: vec![], fields: list_fields.clone() }));
+    put.push(Entity::List(List { id: ListId("s3".into()), state: ListState::Finished, groups: vec![], fields: list_fields }));
+    put.push(Entity::Ask(Ask {
+        id: AskId("a-2".into()),
+        kind: AskKind::Ask,
+        from: ed(),
+        to: None,
+        about: None,
+        text: "settled".into(),
+        state: AskState::Answered,
+        answer: Some("yes".into()),
+        fields: Default::default(),
+    }));
+    apply(&store, put, vec![], "all");
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+    let (full, at) = store.snapshot().unwrap();
+
+    let Answer::Wip { state, at: wip_at } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    assert_eq!((state.clone(), wip_at), store.wip_snapshot().unwrap());
+    assert_eq!(wip_at, at);
+    assert_eq!(state.rows.len(), full.rows.len(), "every row is kept");
+    let fields = |id: &str| state.rows[&RowId(id.into())].fields.clone();
+    assert_eq!(fields("wsp-3").get("body").map(String::as_str), Some("the long prose"), "an open row is whole");
+    assert_eq!(fields("wsp-3").get("prose").map(String::as_str), Some("more of it"));
+    for body in WIP_BODIES {
+        assert_eq!(fields("wsp-4").get(body), None, "a done row loses {body}");
+        assert_eq!(state.lists[&ListId("s3".into())].fields.get(body), None, "a finished list loses {body}");
+    }
+    assert_eq!(state.lists[&ListId("s2".into())], full.lists[&ListId("s2".into())], "a running list is whole");
+    assert_eq!(fields("wsp-4").get("head").map(String::as_str), Some("a head"), "a done row keeps its head");
+    assert_eq!(state.lists[&ListId("s3".into())].fields.get("name").map(String::as_str), Some("the list"));
+    assert_eq!(state.asks.keys().cloned().collect::<Vec<_>>(), vec![AskId("a-1".into())], "raised asks only");
+    assert_eq!((state.seats.clone(), state.claims.clone()), (full.seats.clone(), full.claims.clone()));
+    assert!(state.orders.is_empty() && state.machines.is_empty());
+
+    // `state` is unchanged: the done row's body is there.
+    assert_eq!(c.read(Verb::State(NoArgs {})), Answer::State { state: full.clone(), at });
+    assert!(full.rows[&RowId("wsp-4".into())].fields.contains_key("body"));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// What a daemon hands in for the view verbs, faked: fixed documents, a `show`
+/// that knows one id, and a count of the calls (wsp-307).
+struct FakeViews {
+    calls: AtomicUsize,
+}
+
+impl wsp_server::Views for FakeViews {
+    fn throttle(&self) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "builds": [] }))
+    }
+    fn spend(&self) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "currency": "USD", "rows": { "landed_30d": 2, "cost_per_landed_row": 1.75 } }))
+    }
+    fn show(&self, id: &str) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match id {
+            "wsp-1" => Ok(json!({ "id": "wsp-1", "body": "the body\n" })),
+            _ => Err(wsp_api::Failure { code: Code::NotFound, text: format!("no task {id}"), refusal: None }),
+        }
+    }
+}
+
+#[test]
+fn the_view_verbs_answer_what_the_views_hand_in_whole_and_are_unsupported_without_them() {
+    let d = dir("views");
+    let views = Arc::new(FakeViews { calls: AtomicUsize::new(0) });
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.views = Some(views.clone());
+    let server = Server::start(Arc::new(mirror_store()), cfg).unwrap();
+    let mut c = connect(&d);
+    assert_eq!(
+        c.read(Verb::Throttle(NoArgs {})),
+        Answer::Throttle(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "builds": [] }))
+    );
+    assert_eq!(
+        c.read(Verb::Spend(NoArgs {})),
+        Answer::Spend(json!({ "currency": "USD", "rows": { "landed_30d": 2, "cost_per_landed_row": 1.75 } }))
+    );
+    assert_eq!(
+        c.read(Verb::Show { id: "wsp-1".into() }),
+        Answer::Show(json!({ "id": "wsp-1", "body": "the body\n" }))
+    );
+    match c.call(Call::Verb(Verb::Show { id: "wsp-404".into() })) {
+        Outcome::Err(f) => assert_eq!((f.code, f.text.as_str()), (Code::NotFound, "no task wsp-404")),
+        other => panic!("a show of no row was answered {other:?}"),
+    }
+    // `show` needs its id: without one it is malformed, and no view is asked.
+    let asked = views.calls.load(Ordering::SeqCst);
+    assert!(matches!(c.call(Call::Unknown { verb: "show".into(), args: json!({}) }), Outcome::Err(f) if f.code == Code::Malformed));
+    // A request by another principal than the hello's is forbidden, as any read's is.
+    let id = ReqId(600);
+    let other = Request { v: PROTOCOL, id, key: None, by: Principal::Seat(SeatId("cpd-9".into())), call: Call::Verb(Verb::Spend(NoArgs {})) };
+    c.conn.send(&Frame::Request(other)).unwrap();
+    assert!(matches!(c.reply(id).outcome, Outcome::Err(f) if f.code == Code::Forbidden));
+    assert_eq!(views.calls.load(Ordering::SeqCst), asked, "neither a malformed nor a forbidden request reaches the views");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+
+    // A server started with no views answers each one unsupported.
+    let d = dir("no-views");
+    let server = start(Arc::new(mirror_store()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+    for verb in [Verb::Throttle(NoArgs {}), Verb::Spend(NoArgs {}), Verb::Show { id: "wsp-1".into() }] {
+        match c.call(Call::Verb(verb)) {
+            Outcome::Err(f) => assert_eq!(f.code, Code::Unsupported, "{f:?}"),
+            other => panic!("a view verb with no views was answered {other:?}"),
+        }
+    }
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
@@ -733,6 +875,9 @@ impl Reads for Retained {
     fn snapshot(&self) -> Result<(State, EventId)> {
         self.inner.snapshot()
     }
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        self.inner.wip_snapshot()
+    }
 }
 
 impl Events for Retained {
@@ -777,6 +922,7 @@ impl Claims for Retained {
     }
 }
 
+impl Readings for Retained {}
 impl Texts for Retained {
     fn text(&self, row: &RowId, section: &str) -> Result<(String, Rev)> {
         self.inner.text(row, section)

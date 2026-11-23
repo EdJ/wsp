@@ -353,7 +353,7 @@ impl Window {
 
 pub fn new(store: &Store, args: &Args) -> i32 {
     let Some(raw) = args.rest.get(1).cloned() else {
-        eprintln!("usage: wsp worklist new <slug> \"title\"");
+        eprintln!("usage: wsp worklist new <slug> \"title\" [--initiative init-N]");
         return 2;
     };
     // Slugified on the way in, exactly as `project add` does it. The two share
@@ -398,6 +398,19 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         None => (None, maker(store)),
     };
 
+    // `--initiative`: linked as it is made (`wsp-731`), so the initiative is
+    // asked for before anything is written.
+    let initiative = match args.get("initiative").filter(|v| v != "true") {
+        Some(n) => match crate::cmd_initiative::find(store, &n) {
+            Some(i) => Some(i),
+            None => {
+                eprintln!("wsp: no initiative `{n}`");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
     let mut w = Worklist::new(&slug, &title);
     w.caption = caption;
     w.project = project;
@@ -410,6 +423,16 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         return 1;
     }
     store.log_event("worklist-added", json!({ "id": w.id }));
+    if let Some(mut i) = initiative {
+        if !i.worklists.contains(&w.id) {
+            i.worklists.push(w.id.clone());
+        }
+        if let Err(e) = crate::cmd_initiative::save(store, &i) {
+            eprintln!("wsp: write failed: {e}");
+            return 1;
+        }
+        store.log_event("initiative-changed", json!({ "id": i.id, "what": "linked" }));
+    }
     store.git_commit(&format!("wsp: add worklist {}", w.id));
 
     if args.json() {
@@ -2736,6 +2759,38 @@ fn count(n: usize) -> String {
     }
 }
 
+/// The rows of `worklist ls --json`, read: each list's head, the facts the
+/// listing adds, and the queue place of a planned one. `wsp-view` draws them.
+/// `worklist ls --json`'s input, as `wsp-view` takes it (wsp-743: the daemon's
+/// `worklists` reading).
+pub(crate) fn listings(store: &Store) -> Vec<wsp_view::worklist::Listing> {
+    listings_of(store, &worklist::listing(store, store.worklists()))
+}
+
+fn listings_of(store: &Store, listed: &[worklist::Listed]) -> Vec<wsp_view::worklist::Listing> {
+    listing_of(store, listed, &crate::waits::read(store, listed))
+}
+
+fn listing_of(store: &Store, listed: &[worklist::Listed], waits: &[(String, Option<crate::waits::Wait>)]) -> Vec<wsp_view::worklist::Listing> {
+    listed
+        .iter()
+        .map(|l| wsp_view::worklist::Listing {
+            head: head_of(&l.list, &l.at, l.phase(store)),
+            segment: l.segment.word().to_string(),
+            open: l.open,
+            gone: l.gone.clone(),
+            unwritten: l.at.unwritten.clone(),
+            activity: l.activity,
+            prio: crate::waits::Prio::of(&l.list).word().to_string(),
+            after: l.list.after.clone(),
+            queue: waits.iter().position(|(id, _)| *id == l.list.id).map(|n| wsp_view::worklist::Queue {
+                n: n + 1,
+                waits: waits[n].1.as_ref().map(|w| w.text()),
+            }),
+        })
+        .collect()
+}
+
 // ---- what a passed group left behind ----------------------------------
 //
 // `Position::slipped` is the verdict floor's receipt: a member of a group the
@@ -2875,7 +2930,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     --caption "…" is its line for a glance;
                                     -p <project> is where it stands, whose
                                     governor its seat answers to — unsaid,
-                                    the project its members share"##,
+                                    the project its members share;
+                                    --initiative init-N links it as it's made"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,

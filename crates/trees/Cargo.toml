@@ -14,6 +14,8 @@ wsp-store = { path = "../store" }
 wsp-wire = { path = "../wire" }
 # throttle run's jobs and the beat's facts it decides on (wsp-052).
 wsp-host-api = { path = "../host-api" }
+# a job's leader read off its command line (wsp-host's wrapper), which the leftover sweep spares (wsp-444).
+wsp-host = { path = "../host" }
 # throttle --json's projection (wsp-305).
 wsp-view = { path = "../view" }
 

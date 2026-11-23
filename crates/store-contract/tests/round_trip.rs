@@ -893,7 +893,18 @@ fn the_whole_state_events_and_feed_round_trip() {
         states: vec![RowState::Todo],
         list: Some(list()),
         seat: None,
+        heads: true,
     });
+    trip(&ListFilter { heads: true });
+    trip(&Reading {
+        json: "{}".into(),
+        at: At(7),
+    });
+    // `lists` read `NoArgs` before its filter: absent and `null` still read.
+    for v in [json!(null), json!({}), json!({"newer": 1})] {
+        assert_eq!(serde_json::from_value::<ListFilter>(v).unwrap(), ListFilter::default());
+    }
+    assert_eq!(serde_json::to_value(RowFilter::default()).unwrap(), json!({"project": null, "states": [], "list": null, "seat": null}));
     trip(&SeatFilter {
         machine: Some(MachineName("mac".into())),
         states: vec![SeatState::Idle],
@@ -944,6 +955,9 @@ impl Reads for Nothing {
     fn snapshot(&self) -> Result<(State, EventId)> {
         Ok((self.state.borrow().clone(), EventId(0)))
     }
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        self.snapshot()
+    }
 }
 
 impl Events for Nothing {
@@ -985,6 +999,7 @@ impl Claims for Nothing {
     }
 }
 
+impl Readings for Nothing {}
 impl Texts for Nothing {
     fn text(&self, _: &RowId, _: &str) -> Result<(String, Rev)> {
         Ok((String::new(), Rev("0".into())))
@@ -1048,4 +1063,39 @@ fn a_trivial_type_implements_the_family_and_as_dyn() {
         ),
         State::default()
     );
+}
+
+#[test]
+fn a_split_state_absorbs_back_to_itself_and_each_piece_keeps_to_its_budget() {
+    // wsp-702: the pieces of a snapshot too large for one line.
+    let mut big = state();
+    let base = big.rows[&row()].clone();
+    for i in 0..200 {
+        let id = RowId(format!("wsp-{i:03}"));
+        big.rows.insert(id.clone(), Row { id, ..base.clone() });
+    }
+    let run = big.runs[0].clone();
+    big.runs = (0..20).map(|_| run.clone()).collect();
+    let whole = serde_json::to_vec(&big).unwrap().len();
+    assert_eq!(big.json_len(), whole, "json_len counts what to_vec writes");
+    let one_row = serde_json::to_vec(&base).unwrap().len();
+    let budget = one_row * 10;
+    let pieces = big.clone().split(budget);
+    assert!(pieces.len() > 20, "{} pieces of {whole} B at {budget}", pieces.len());
+    for p in &pieces {
+        // A piece's JSON is its entities plus the empty collections around them.
+        let n = serde_json::to_vec(p).unwrap().len();
+        assert!(n <= budget + 200, "a piece of {n} B over a budget of {budget}");
+    }
+    let mut back = State::default();
+    for p in pieces {
+        back.absorb(p);
+    }
+    assert_eq!(back, big, "absorbed in order, the pieces are the state, runs in their order");
+    // Small enough, one piece and itself; empty, one empty piece.
+    assert_eq!(state().split(usize::MAX), vec![state()]);
+    assert_eq!(State::default().split(10), vec![State::default()]);
+    // An entity over the budget is a piece alone.
+    assert!(big.clone().split(1).iter().all(|p| p.rows.len() + p.runs.len() + p.lists.len() + p.seats.len()
+        + p.claims.len() + p.orders.len() + p.asks.len() + p.machines.len() + p.leases.len() == 1));
 }

@@ -19,7 +19,7 @@
 //! | the agent is gone | the seat reads [`State::Gone`], or `Idle` with the row still `doing` — at its `Stop` (told at once, `wsp-616`) or past [`STALLED_AFTER`] where no hook says | a marker line in the member's `## Log` |
 //! | the start never claimed | `doing`, unclaimed, wsp's own start its last word | the `started by wsp:` line `cycle` already takes on |
 //! | the landing was never recorded | settled, branch level with the trunk, no landing on the row | a landing line, which `wsp land` now writes too |
-//! | `advance` skipped a member | settled, and nothing was started for it | none, and it is stamped on every pass for that reason |
+//! | `advance` skipped a member | settled, and nothing was started for it | a marker holding the reason, so it is said once per reason (`wsp-338`) |
 //!
 //! **A log line and not a state file, and that is the load-bearing choice.** A
 //! separate `reconciled.json` would have to be kept in step with the task files
@@ -659,6 +659,9 @@ pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
         }
         // The successor starts its own count.
         crate::refusals::accepted(store, &scope);
+        // And not the payload this seat refused (`wsp-694`): what was typed at
+        // it is folded, so the successor is told it is there, not typed it.
+        seats.fold_typed(store, &scope);
         let line = format!(
             "{scope}: {} refused delivery {n} ticks running ({why}) — ended so a successor is seated",
             seat.pane
@@ -1152,6 +1155,15 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             ));
             continue;
         };
+        // **A leg's seat is no member's** (`wsp-334`), nor is any seat on a row
+        // that has handed itself to its legs. The leg's own paths end it:
+        // `cycle::legs_finished` once it is done, `closing::tick` once it
+        // stops without closing. Read here, wsp-030's legs were told "finish,
+        // land and review" (a member's rule), ended as members, and the person
+        // was flagged "needs a person" for a row whose finish leg submits.
+        if crate::leg_seat::handed_to_legs(&t) || crate::leg_seat::a_parts_seat(store, &t, &seat) {
+            continue;
+        }
         let state = match seats.state(&seat) {
             Some(s) => s,
             None => continue,
@@ -2058,53 +2070,65 @@ fn sha_after(line: &str, marker: &str) -> Option<String> {
 /// that something changed; a governor told the same sentence every minute has
 /// learned nothing and paid a context read for it.
 ///
-/// **Stamped every pass, told once per reason.** The two differ deliberately.
-/// `cycle.log` is how a governor reads what the run has been doing, and a
-/// member still waiting twenty minutes later has not become less waiting — but
-/// the seat's spool is a queue an agent reads with a whole context behind it,
-/// and the same sentence arriving every minute is a cost paid on every request
-/// of every session. So the sentence carries a marker on the member holding the
-/// reason, and a seat hears it when the reason changes, which is when the
-/// sentence has stopped being the same sentence.
+/// **Said once per reason, in the log and to the seat alike** (`wsp-338`).
+/// This was stamped every pass, on the reading that a member still waiting has
+/// not become less waiting. On retro-8 that was compound-react-040 written twice
+/// a minute for eight minutes, its seat long released, each line ordering a seat
+/// that did not exist to commit and review again — and the second line (here)
+/// said `done` where the first said `review`. `cycle::step` now writes its one
+/// line when the reason changes, this writes none, and a member nothing holds
+/// is not told at all: the seat hears what is owed instead.
 fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     let tasks = store.tasks_shared();
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
-        stamp(store, &format!(
-            "{} group {at}: {} is at {} and nothing was started for it — {why}. {}",
-            w.id,
+        let said = format!("{WHY_NOT} {} is at {} and not on the trunk: {why}.", s.id, s.settlement.word());
+        if !said_once_per_reason(store, &s.id, &format!("{WHY_NOT} {} is at ", s.id), &said) {
+            continue;
+        }
+        // `wsp-338`: a member whose seat was released, or is gone, has nobody
+        // to tell. `wsp tell` refuses it ("nothing holds"), and ordering it to
+        // commit and review again is an order to nobody. Said once to the seat,
+        // with what is owed instead.
+        if store.panes_for_task(&s.id).is_empty() {
+            crate::cycle::tell_logged(store, w, &format!(
+                "{} in the {} run is at {} with nothing started for it — {why} — and nothing holds it: its seat \
+                 was released or is gone, so nobody is told to land it. If nothing changes in {} min, wsp lands it \
+                 itself when the rebase is clean and flags the person when it is not; or `wsp reopen {} \"what is owed\"` \
+                 starts a seat on it now.",
+                s.id,
+                w.id,
+                s.settlement.word(),
+                LAND_GRACE / 60,
+                s.id
+            ));
+            continue;
+        }
+        crate::cycle::tell_logged(store, w, &format!(
+            "{} in the {} run is at {} with nothing started for it — {why}, so no verifier can run \
+             on it. {} wsp has told it so.",
             s.id,
+            w.id,
             s.settlement.word(),
             Flow::Verified.owes(&s.id)
         ));
-        let said = format!("{WHY_NOT} {} is at {} and not on the trunk: {why}.", s.id, s.settlement.word());
-        if told_once(store, &s.id, &said) {
-            crate::cycle::tell(store, w, &format!(
-                "{} in the {} run is at {} with nothing started for it — {why}, so no verifier can run \
-                 on it. {} wsp has told it so.",
-                s.id,
-                w.id,
-                s.settlement.word(),
-                Flow::Verified.owes(&s.id)
-            ));
-            // `wsp-226`: the seat alone was told, and by its order a governor
-            // does not relay — so a member that ran `wsp review` without
-            // `wsp land` sat at its prompt while the run stood behind it. The
-            // member is the one who can act, and it is still claimed; one
-            // marker keys both, so it hears this as often as the seat does.
-            tell_member(store, &s.id, &format!(
-                "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
-                 waits on you. {} Never `wsp land` it or land by hand; if `wsp review` is refused, `wsp ask` about it. \
-                 If nothing has been recorded {} min from now and this seat is idle or gone, wsp lands \
-                 it for you when the rebase is clean, and flags the person when it is not.",
-                s.id,
-                s.settlement.word(),
-                w.id,
-                Flow::Verified.owes(&s.id),
-                LAND_GRACE / 60
-            ));
-        }
+        // `wsp-226`: the seat alone was told, and by its order a governor
+        // does not relay — so a member that ran `wsp review` without
+        // `wsp land` sat at its prompt while the run stood behind it. The
+        // member is the one who can act, and it is still claimed; one
+        // marker keys both, so it hears this as often as the seat does.
+        tell_member(store, &s.id, &format!(
+            "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
+             waits on you. {} Never `wsp land` it or land by hand; if `wsp review` is refused, `wsp ask` about it. \
+             If nothing has been recorded {} min from now and this seat is idle or gone, wsp lands \
+             it for you when the rebase is clean, and flags the person when it is not.",
+            s.id,
+            s.settlement.word(),
+            w.id,
+            Flow::Verified.owes(&s.id),
+            LAND_GRACE / 60
+        ));
     }
     // The barrier's own no-op, one level up and the same silence: every member
     // settled, the run did not move, and nothing said which verdict was
@@ -2228,7 +2252,7 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
         match land_for_the_run(id) {
             Ok(()) => {
                 stamp(store, &format!("{} group {at}: {id} was not landed {} min after it was told — {cause} — so the run landed it", w.id, (now - told_at) / 60));
-                crate::cycle::tell(store, w, &format!(
+                crate::cycle::tell_logged(store, w, &format!(
                     "{id} sat at review without landing ({cause}), so wsp ran `wsp land {id}` for it: the commits are on the trunk \
                      and its verifier starts on the land."
                 ));
@@ -2238,22 +2262,52 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
             }
             Err(why) => {
                 let why = util::truncate(why.trim(), 400);
-                stamp(store, &format!("{} group {at}: {id} was not landed and the run could not land it ({cause}): {why}", w.id));
+                let fix = to_clear(id, &why);
+                stamp(store, &format!("{} group {at}: {id} was not landed and the run could not land it ({cause}): {} {fix}", w.id, first_line(&why)));
                 use crate::message::{self, About, Kind, Message, Party};
                 let text = format!(
                     "{id}: the run could not land it, and the {} run waits on it\n\n\
                      {id} is at review with commits not on the trunk, and {cause}. wsp tried `wsp land {id}`: {why}\n\n\
-                     Land it yourself from its tree once that is cleared, or `wsp reopen {id} \"what is owed\"`.",
+                     {fix}",
                     w.id
                 );
                 let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Task(id.clone()));
                 let _ = message::raise(store, &m);
-                crate::cycle::tell(store, w, &format!(
-                    "{id} sat at review without landing ({cause}) and `wsp land {id}` for it failed: {why}. The person is flagged."
+                crate::cycle::tell_logged(store, w, &format!(
+                    "{id} sat at review without landing ({cause}) and `wsp land {id}` for it failed: {why}. {fix} The person is flagged."
                 ));
             }
         }
     }
+}
+
+/// What clears a land the run could not make, with the verbs (`wsp-338`).
+///
+/// On retro-8 the whole of what a person read was "the rebase onto master does
+/// not apply cleanly: deps: compound -> /mnt/… (unchanged; a sibling of the main
+/// checkout …)" — a hook's chatter where the conflict should be, and no verb.
+/// [`crate::cmd_checkout`] now leads with the conflicting paths; this names the
+/// two ways out, by the paths when it has them.
+fn to_clear(id: &str, why: &str) -> String {
+    let paths = why
+        .lines()
+        .find_map(|l| l.split_once("conflict in ").map(|(_, p)| p.trim().trim_end_matches('.').to_string()))
+        .filter(|p| !p.is_empty());
+    match paths {
+        Some(p) => format!(
+            "To clear it: in {id}'s tree, `git rebase <trunk>`, resolve {p}, `git rebase --continue`, then `wsp land {id}`; \
+             or `wsp reopen {id} \"rebase onto the trunk: resolve {p}\"` to have a seat do it."
+        ),
+        None => format!(
+            "To clear it: fix what git names in {id}'s tree, then `wsp land {id}`; or `wsp reopen {id} \"what is owed\"` to have a seat do it."
+        ),
+    }
+}
+
+/// The first line of a refusal, which [`crate::cmd_checkout`] makes the one that
+/// says what failed and on what.
+fn first_line(why: &str) -> &str {
+    why.lines().next().unwrap_or(why).trim()
 }
 
 /// `wsp land <id> --for-run`, as a process, from nowhere in particular: the
@@ -2334,6 +2388,43 @@ fn told_of_verdict(store: &Store, id: &str, said: &str) -> bool {
         }
         crate::log::note(store, &mut t, said).is_ok()
     })
+}
+
+/// The marker on a member's `## Log` that `cycle.log` has said why the member
+/// waits at review with nothing started — [`crate::cycle::step`]'s line after it.
+pub(crate) const LOGGED_WHY: &str = "wsp: cycle.log has said:";
+
+/// Whether `said` is new for this member since the last time a sentence of its
+/// `kind` was recorded, and records it when it is (`wsp-338`).
+///
+/// **The newest line of its kind, not the last line of the log.** [`told_once`]
+/// asks about the last line, so any later line — the run's own [`LAND_TAKEN`]
+/// marker, a governor's note — bought the same sentence again: on retro-8,
+/// compound-react-040's seat had been released, and the run said "commit what
+/// is left … and end with `wsp review` again" every tick for eight minutes, to a
+/// seat that did not exist. A reason that changes is said again because the
+/// sentence changed; so is one after a new agent, a send-back, a ready or a
+/// landing, which make it a new wait. Not touched, for [`told_of_verdict`]'s
+/// reason: `updated` can be the re-verify key.
+pub(crate) fn said_once_per_reason(store: &Store, id: &str, kind: &str, said: &str) -> bool {
+    store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        let log = t.section("Log").unwrap_or_default();
+        let newest = log.lines().map(|l| undated(l.trim())).filter(|l| l.starts_with(kind) || a_new_wait(l)).last();
+        if newest == Some(said) {
+            return false;
+        }
+        crate::log::note(store, &mut t, said).is_ok()
+    })
+}
+
+/// A `## Log` line after which a member's wait at review is a new one.
+fn a_new_wait(line: &str) -> bool {
+    fresh_start(line)
+        || line.starts_with(crate::cycle::SENT_BACK)
+        || line.contains(crate::cycle::RESEAT_ASKED)
+        || line.starts_with(READY)
+        || line.starts_with(LANDED)
 }
 
 /// One `## Log` line with its date taken off, which is what a reader compares.
@@ -3036,8 +3127,19 @@ esac
         let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
         assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "the manager forked {seat}: {spawns:?}");
         assert!(m.seats().iter().any(|s| s.seat.0 == seat), "the manager runs {seat}: {:?}", m.seats());
-        // And `wip`'s census, which asks the manager, reads it.
-        let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+        // And `wip`'s census, which asks the manager, reads it. The census
+        // gives a manager `SILENT` (1 s) to answer and reads it silent past
+        // that, which a loaded machine overruns: asked again until the
+        // manager is heard (bounded generously, as wsp-114's waits are), and
+        // only a heard census is held to having the seat.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let reading = loop {
+            let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+            if reading.heard() {
+                break reading;
+            }
+            assert!(std::time::Instant::now() < deadline, "wip's census never heard the manager within 120s");
+        };
         assert!(reading.rows.contains_key(&seat), "wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
 
         // The seat ended through the manager, as `wsp despawn` would.
@@ -4558,6 +4660,9 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         t.set_status(Status::Review);
         store.save_task(&t).unwrap();
         list(&store, &["m-1"], "claude");
+        // A seat holds it, so it is the one told (`wsp-338`: a member nothing
+        // holds is not ordered to review again).
+        claim(&store, "m-1", "cpd-1");
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(key(&store, "m-1").is_none(), "there is no landing to record");
@@ -4579,8 +4684,10 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_settled_member_nothing_started_for_is_reported_and_the_seat_is_told_once() {
         let (env, store) = scratch("skipped");
         // A branch with the member's commit still on it: settled, and not
-        // finished, so the run owes it a `wsp land` and nothing else.
+        // finished, so the run owes it a `wsp land` and nothing else. Its seat
+        // still holds it, so there is somebody to tell (`wsp-338`).
         landed_member(&env, &store, true);
+        claim(&store, "m-1", "cpd-1");
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         // The line in `cycle.log` comes from `cycle::step`, which already said
@@ -4601,15 +4708,122 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert_eq!(told[0].0, "m-1", "on its own pane: {told:?}");
         assert!(told[0].1.contains("`wsp review m-1`") && !told[0].1.contains("`wsp land m-1`"), "with the line that moves it: {}", told[0].1);
 
-        // Every pass stamps it; the seat hears it once, because the spool is a
-        // queue an agent reads with a whole context behind it.
+        // `wsp-338`: said once per reason, in the log as to the seat — a line a
+        // minute for the same wait was the retro-8 noise.
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(
-            stamped().iter().any(|l| l.contains("m-1 is at review with 1 commit not on master")),
-            "the log says it on every pass: a member still waiting has not stopped waiting"
+            !stamped().iter().any(|l| l.contains("m-1 is at")),
+            "the log does not say the same wait again: {:?}",
+            stamped()
         );
         assert!(governed().is_empty(), "and the seat is not handed the same sentence twice");
         assert!(member_told().is_empty(), "nor the member: once per reason, like the seat");
+
+        // A changed reason is a new sentence, and said again.
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Done);
+        store.save_task(&t).unwrap();
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("m-1 is at")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("m-1 is at done with 1 commit not on master"), "the status it has: {said:?}");
+    }
+
+    /// `wsp-338`, compound-react-040 on retro-8: the seat was released, the row
+    /// sat with ten commits off master, and every tick the run (a) wrote two
+    /// lines for it, one "at review" and one "at done", each ordering it to
+    /// commit and end with `wsp review` again, and (b) told it so through a
+    /// `wsp tell` that came back "nothing holds". Nothing holds this one.
+    #[test]
+    fn a_released_member_at_review_off_the_trunk_is_ordered_once_and_never_told_through_a_seat_it_has_not() {
+        let (env, store) = scratch("released");
+        landed_member(&env, &store, true);
+        let _ = (stamped(), governed(), member_told());
+
+        for n in 0..8 {
+            tick(&store, &Fake::empty(), &mut Pass::new());
+            let lines: Vec<String> = stamped().into_iter().filter(|l| l.contains("m-1")).collect();
+            // One status line per tick at most, and never two that disagree.
+            assert!(lines.len() <= 1, "tick {n}: one line for the row, not two: {lines:?}");
+            assert!(!lines.iter().any(|l| l.contains("nothing was started for it")), "tick {n}: the repair's twin line is gone: {lines:?}");
+            let ordered = lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count();
+            assert_eq!(ordered, usize::from(n == 0), "tick {n}: the order is given once: {lines:?}");
+            assert!(member_told().is_empty(), "tick {n}: nothing holds m-1, so nothing is sent to it");
+            let gov = governed();
+            if n == 0 {
+                assert_eq!(gov.len(), 1, "{gov:?}");
+                assert!(gov[0].contains("nothing holds it") && gov[0].contains("`wsp reopen m-1"), "what is owed instead: {}", gov[0]);
+            } else {
+                assert!(gov.is_empty(), "tick {n}: told once: {gov:?}");
+            }
+        }
+    }
+
+    /// `wsp-338`'s fourth item: retro-8's cycle.log is already written and
+    /// cannot be rebuilt, so this replays compound-react-040's 07:00-07:08 through
+    /// the new code. The conditions are its own: at `done`, ten commits not on
+    /// master, its seat (cpd-115) released, so nothing holds it; a tick a minute
+    /// (07:00:46 … 07:06:54, eight with the next); and at 07:05:53, past the land
+    /// grace, the run's `wsp land` refused on a conflict in `deps` behind the
+    /// hook's "deps: compound -> …" line. The live window had twenty lines for
+    /// the row: two contradicting status lines each tick, two tells, two
+    /// not-delivered tells, and a refusal naming no file and no verb. The test
+    /// asserts two at most: the status once, and the refusal with its fix.
+    #[test]
+    fn a_released_member_whose_land_fails_on_deps_is_two_lines_in_eight_ticks_and_the_refusal_names_the_path_and_the_verb() {
+        let (env, store) = scratch("releaseddeps");
+        landed_member(&env, &store, true);
+        let repo = env.path("repo");
+        git_in(&repo, &["checkout", "--quiet", "m-1"]);
+        for n in 2..=10 {
+            git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", &format!("work {n}")]);
+        }
+        git_in(&repo, &["checkout", "--quiet", "master"]);
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Done);
+        store.save_task(&t).unwrap();
+        // Its seat held it, then was released: no binding is left.
+        claim(&store, "m-1", "cpd-115");
+        store.clear_binding("cpd-115");
+        assert!(store.panes_for_task("m-1").is_empty(), "nothing holds m-1");
+        let _ = (stamped(), governed(), member_told(), landed_for());
+        // The refusal `wsp land --for-run` gives now for retro-8's conflict.
+        LAND_FAILS.with(|f| *f.borrow_mut() = Some(
+            "wsp: the rebase onto master does not apply cleanly: conflict in deps\n\
+             wsp: the rebase was aborted and ~/src/compound-react/.worktrees/m-1 is as it was. To clear it, in ~/src/compound-react/.worktrees/m-1: \
+             `git rebase master`, resolve deps, `git rebase --continue`\n\
+             git said: CONFLICT (content): Merge conflict in deps".into()
+        ));
+        let mut lines = Vec::new();
+        for n in 0..8 {
+            if n == 5 {
+                // Five minutes on: the notice is past the grace.
+                let mut t = store.find_task("m-1").unwrap();
+                let log = t.section("Log").unwrap_or_default();
+                let aged: Vec<String> = log
+                    .lines()
+                    .map(|l| if l.contains(WHY_NOT) { format!("- {}{}", util::iso_at(util::epoch_secs() - LAND_GRACE - 60), &l[22..]) } else { l.to_string() })
+                    .collect();
+                crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+                store.save_task(&t).unwrap();
+            }
+            tick(&store, &Fake::empty(), &mut Pass::new());
+            lines.extend(stamped().into_iter().filter(|l| l.contains("m-1")));
+        }
+        LAND_FAILS.with(|f| *f.borrow_mut() = None);
+        assert_eq!(landed_for(), vec!["m-1".to_string()], "the land is tried once, not each minute");
+        assert!(member_told().is_empty(), "nothing holds m-1: no tell, so no not-delivered line");
+        assert!(lines.len() <= 2, "no more than two lines for the row in eight ticks: {lines:#?}");
+        let status: Vec<&String> = lines.iter().filter(|l| l.contains("so it has no verifier yet")).collect();
+        assert_eq!(status.len(), 1, "the status once: {lines:#?}");
+        assert!(status[0].contains("m-1 is at done with 10 commits not on master"), "the one state it has: {}", status[0]);
+        assert!(!lines.iter().any(|l| l.contains("is at review")), "never a second, contradicting state: {lines:#?}");
+        assert!(lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count() <= 1, "the order at most once");
+        let gov = governed();
+        assert_eq!(gov.len(), 2, "the seat told twice in all, no seat and the refusal: {gov:#?}");
+        let refused = lines.iter().find(|l| l.contains("could not land it")).expect("the refusal is logged");
+        assert!(refused.contains("conflict in deps"), "the path: {refused}");
+        assert!(refused.contains("resolve deps") && refused.contains("`wsp land m-1`") && refused.contains("`wsp reopen m-1"), "the verbs: {refused}");
     }
 
     /// A member told to land, its notice an hour old and its seat `cpd-1`.

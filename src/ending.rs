@@ -132,6 +132,10 @@ const NOT_ENDED: &str = "wsp: could not end";
 /// reason that will not pass by itself.
 const LEFT: &str = "wsp: verification holds and the agent is left running —";
 
+/// The line on a retro row saying its agent is kept, until a set time, for
+/// whoever typed to it after the verdict. Not [`LEFT`]: it has an end.
+const KEPT: &str = "wsp: verification holds and the agent is kept —";
+
 /// The line on a member's row saying its verifier's pane is left running.
 const VERIFIER_LEFT: &str = "wsp: the verifier is left running —";
 
@@ -157,6 +161,17 @@ pub(crate) const HANDED_OVER: &str = "ended: handed to its verifier at";
 /// How long a landed member with no verifier owed is left before its agent is
 /// ended: the person's chance to type to it first.
 const SETTLE_GRACE_SECS: i64 = if cfg!(test) { 0 } else { 300 };
+
+/// The tag of a retro row: its seat's one job is a `wsp retro done`, and the
+/// verifier's hold closes it, so nobody is owed anything at it afterwards.
+const RETRO_TAG: &str = "retro";
+
+/// How long after its verdict a retro row's seat that a turn began at is kept
+/// for whoever is using it, before it is ended all the same (`wsp-333`).
+/// compound-react-040's seat (cpd-115) stood 6h44m past its verdict, and
+/// wsp-309's (cpd-157) 2h21m, because "cannot say whether anybody has typed
+/// to it" held them with no end.
+pub(crate) const RETRO_KEPT_SECS: i64 = 60 * 60;
 
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
@@ -358,7 +373,9 @@ pub(crate) fn left(r: &Reading) -> Option<Left> {
 /// off the **open** lists alone — their groups that wsp runs — and the verdict
 /// off the member.
 pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
-    exits(store, seats);
+    // The rows whose seat ended on this tick, or was found gone: their trees
+    // are swept below whatever their status (`wsp-691`).
+    let mut ended = exits(store, seats);
     // A seat its exit is still to end (a turn in flight, or left running by it)
     // is that ending's alone: the `--end-seat` helper may be ending it now.
     let owned = exit_owns(store);
@@ -368,6 +385,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
     let mut seated = std::collections::BTreeSet::new();
     for id in seated_rows(store) {
         seated.insert(id.clone());
+        if seat_of(store, &id).is_some_and(|seat| seats.absent(&seat)) {
+            ended.insert(id.clone());
+        }
         let Some(m) = store.find_task(&id) else { continue };
         let Some(h) = due(store, &lists, &mut tasks, &m) else { continue };
         let Some(seat) = seat_of(store, &id) else {
@@ -382,10 +402,165 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats) {
         let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
         if end_one(store, seats, w, &m.id, &seat, &h, asks) {
             record_ended(store, &m.id, &h);
+            ended.insert(m.id.clone());
         }
     }
-    released_seats(store, seats, &lists, &seated, &mut tasks, &mut asks);
+    ended.extend(released_seats(store, seats, &lists, &seated, &mut tasks, &mut asks));
     original_seats(store, seats);
+    // `wsp-453`: what a finished row's tree still has running goes with its
+    // seat, or by the next tick where the seat went some other way. Not in a
+    // test, which would signal the machine's own processes, unless the test
+    // asked for it ([`tests::SCANS`]) over a tree of its own.
+    if scans_finished() {
+        stop_finished(store, seats, &ended);
+    }
+}
+
+/// Whether the tick scans finished trees: always, but in a test only where it
+/// asked to on its thread.
+fn scans_finished() -> bool {
+    #[cfg(test)]
+    return tests::SCANS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
+}
+
+/// [`crate::check_tree::left_in_finished`], asked of a fleet's seats, with
+/// each row's own seat read off its binding or claim ([`seat_of`]).
+fn left_in_finished_by(store: &Store, seats: &dyn Seats, ended: &std::collections::BTreeSet<String>) -> Option<Vec<crate::check_tree::Left>> {
+    // One `ps` for the whole scan, not one per seat (`wsp-480`); each scan takes
+    // its own, so the look after a signal is a fresh one.
+    crate::place_super::one_ps(|| {
+        crate::check_tree::left_in_finished(
+            store,
+            seats.census()?,
+            &|seat| seats.pids(seat),
+            &crate::legs::staged,
+            &|row| seat_of(store, row),
+            &|row| verifier_seats(store, row),
+            ended,
+        )
+    })
+}
+
+/// The seats spawned with `--verify` on `row` that still stand: each standing
+/// pass's pane (`wsp-453`). What they run in the row's tree is the
+/// verifier's, never a leftover of the member's.
+fn verifier_seats(store: &Store, row: &str) -> Vec<String> {
+    let Some(t) = store.find_task(row) else { return Vec::new() };
+    crate::verification::passes(&t).into_iter().filter(|p| p.standing()).filter_map(|p| p.pane).collect()
+}
+
+/// How long [`stop_finished`] gives a `TERM` before it looks again and sends
+/// `KILL`. Short in a test, whose one process exits on `TERM` at once.
+const TERM_GRACE_MS: u64 = if cfg!(test) { 100 } else { 1500 };
+
+/// Stop what the finished rows left running (`wsp-453`): `TERM`, a moment,
+/// then `KILL` for what is still there, and a `cycle.log` line for each tree,
+/// naming each pid with its command, and the same as a note on the row.
+/// Run by the tick, so a row that reaches review has nothing of its own
+/// running by the next one; a row at review whose seat is open, and a row in
+/// `ended` (its seat ended on this tick), are swept too (`wsp-691`,
+/// [`crate::check_tree::left_in_finished`]). Returns the lines said.
+pub(crate) fn stop_finished(store: &Store, seats: &dyn Seats, ended: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let Some(found) = left_in_finished_by(store, seats, ended) else { return Vec::new() };
+    let mut said = say_spared(store, &found);
+    let found: Vec<_> = found.into_iter().filter(|l| !l.pids.is_empty()).collect();
+    if found.is_empty() {
+        return said;
+    }
+    let all = |l: &[crate::check_tree::Left]| l.iter().flat_map(|t| t.pids.clone()).collect::<Vec<u32>>();
+    let named = crate::check_tree::commands(&all(&found));
+    crate::check_tree::signal("TERM", &all(&found));
+    std::thread::sleep(std::time::Duration::from_millis(TERM_GRACE_MS));
+    let still = left_in_finished_by(store, seats, ended).unwrap_or_default();
+    // Only what was sent `TERM`: a pid that came since is the next tick's.
+    let still: Vec<u32> = all(&still).into_iter().filter(|p| all(&found).contains(p)).collect();
+    crate::check_tree::signal("KILL", &still);
+    for t in &found {
+        let kill: Vec<u32> = t.pids.iter().copied().filter(|p| still.contains(p)).collect();
+        let line = stopped_line(&format!("stopped in finished row {} tree", t.row), t, &kill, &named);
+        crate::store::log_line(store, &line);
+        note_on(store, &t.row, &line);
+        said.push(line);
+    }
+    said
+}
+
+/// The line a stop says: `head` and the tree, then `TERM` and the pids, each
+/// with its command, then `KILL` and the pids that needed it.
+fn stopped_line(head: &str, t: &crate::check_tree::Left, kill: &[u32], named: &[(u32, String)]) -> String {
+    let path = util::contract(std::path::Path::new(&t.tree));
+    let list = |p: &[u32]| p.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+    let what = |p: &u32| {
+        let cmd = named.iter().find(|(q, _)| q == p).map(|(_, c)| c.as_str()).unwrap_or("(gone)");
+        format!("{p} `{}`", util::truncate(cmd, 120))
+    };
+    let mut line = format!("{head} {path}: TERM {}", list(&t.pids));
+    line.push_str(&format!(" ({})", t.pids.iter().map(what).collect::<Vec<_>>().join(", ")));
+    if !kill.is_empty() {
+        line.push_str(&format!(", KILL {}", list(kill)));
+    }
+    line
+}
+
+/// `line` as a note on row `id`, where there is such a row.
+fn note_on(store: &Store, id: &str, line: &str) {
+    if let Some(mut t) = store.find_task(id) {
+        let _ = crate::log::note(store, &mut t, &format!("wsp: {line}"));
+    }
+}
+
+/// Stop what row `row` has left standing in its tree (`wsp-691`): at its
+/// submit (`wsp review`, `wsp submit`, `wsp leg done`: `submit` set, which
+/// spares the caller's own seat's agent and its foreground chain and nothing
+/// else of it) or as its seat is despawned (every live seat kept whole). By
+/// working directory in the row's tree and by nothing else; `TERM`, a moment,
+/// `KILL`, each pid and its command said in `cycle.log` and on the row. `why`
+/// heads the line. Not in a test unless it asked ([`tests::SCANS`]).
+pub(crate) fn stop_in_tree(store: &Store, row: &str, submit: bool, why: &str) -> Vec<String> {
+    if !scans_finished() {
+        return Vec::new();
+    }
+    let Some(tree) = crate::cmd_checkout::member_tree(store, row) else { return Vec::new() };
+    stop_tree(store, why, &|| crate::check_tree::left_in_tree(row, &tree, submit))
+}
+
+/// [`stop_in_tree`] over what `look` finds, asked again after the `TERM`.
+fn stop_tree(store: &Store, why: &str, look: &dyn Fn() -> Option<crate::check_tree::Left>) -> Vec<String> {
+    let Some(found) = look() else { return Vec::new() };
+    let mut said = say_spared(store, std::slice::from_ref(&found));
+    if found.pids.is_empty() {
+        return said;
+    }
+    let named = crate::check_tree::commands(&found.pids);
+    crate::check_tree::signal("TERM", &found.pids);
+    std::thread::sleep(std::time::Duration::from_millis(TERM_GRACE_MS));
+    let still: Vec<u32> = look().map(|l| l.pids).unwrap_or_default().into_iter().filter(|p| found.pids.contains(p)).collect();
+    crate::check_tree::signal("KILL", &still);
+    let line = stopped_line(&format!("{why}: stopped what row {} left in its tree", found.row), &found, &still, &named);
+    crate::store::log_line(store, &line);
+    note_on(store, &found.row, &line);
+    said.push(line);
+    said
+}
+
+/// What the sweep let be, said in `cycle.log` once per pid for as long as this
+/// process lives (`wsp-478`). Returns the lines said.
+fn say_spared(store: &Store, found: &[crate::check_tree::Left]) -> Vec<String> {
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut said = Vec::new();
+    let mut seen = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    for l in found {
+        for (pid, why) in &l.spared {
+            if seen.insert(crate::check_tree::spared_key(l, *pid, why)) {
+                let line = crate::check_tree::spared_line(l, *pid, why);
+                crate::store::log_line(store, &line);
+                said.push(line);
+            }
+        }
+    }
+    said
 }
 
 fn open_lists(store: &Store) -> Vec<Worklist> {
@@ -439,15 +614,20 @@ fn released_seats(
     seated: &std::collections::BTreeSet<String>,
     tasks: &mut Option<Vec<Task>>,
     asks: &mut Option<crate::waiting::Asks>,
-) {
-    let Some(census) = seats.census() else { return };
+) -> Vec<String> {
+    let mut ended = Vec::new();
+    let Some(census) = seats.census() else { return ended };
     let held = store.held_seats();
+    // Read once for the census; a pane's label is an id wsp wrote, so it is found
+    // by `task_now`, which guesses nothing, and not by `find_task`, whose miss
+    // for a pane that is no row's reads every task (wsp-741).
+    let renamed = store.renamed_ids();
     for (seat, label) in census {
         let id = label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string();
         if held.contains(&seat) || seated.contains(&id) {
             continue;
         }
-        let Some(m) = store.find_task(&id) else { continue };
+        let Some(m) = store.task_now(&renamed, &id) else { continue };
         if !released_from(&m, &seat) {
             continue;
         }
@@ -456,8 +636,10 @@ fn released_seats(
         let asks = asks.get_or_insert_with(|| crate::waiting::Asks::read(store));
         if end_one(store, seats, w, &m.id, &seat, &h, asks) {
             record_ended(store, &m.id, &h);
+            ended.push(m.id.clone());
         }
     }
+    ended
 }
 
 /// Whether the member's last claim was made from `seat` and has been let go.
@@ -521,19 +703,40 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     // group signalled, and that kills the shell, which is the point. A question
     // it asked, a prompt, a turn and a person typing still hold it below.
     let shells = Default::default();
+    // **A retro row's seat is never left without an end** (`wsp-333`): nobody
+    // types to it after its verdict, so a backend that cannot say whether
+    // anybody did does not hold it, and one a turn began at is kept
+    // [`RETRO_KEPT_SECS`] past the verdict — the line says until when — and
+    // then ended, by the guards that still stand: never mid-turn, never behind
+    // a prompt or its own ask, never a governor seat.
+    let retro = store.find_task(member).is_some_and(|t| t.tags.iter().any(|g| g == RETRO_TAG));
+    let until = h.at + RETRO_KEPT_SECS;
+    let due = retro && util::epoch_secs() >= until;
+    let typed = match (retro, due) {
+        (true, true) => Some(false),
+        (true, false) => seats.turn_began_since(store, seat, h.at).or(Some(false)),
+        (false, _) => seats.turn_began_since(store, seat, h.at),
+    };
     let reading = Reading {
         state,
         wait: crate::waiting::reading(state, asks, &shells, seat, member),
         governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
-        typed: seats.turn_began_since(store, seat, h.at),
+        typed,
         pids: seats.pids(seat),
     };
     let by = w.map_or(member, |w| w.id.as_str());
-    if let Some(why) = left(&reading) {
-        if !why.passes() {
-            say_left(store, w, member, seat, &why, h);
+    match left(&reading) {
+        Some(Left::Typed) if retro => {
+            say_kept(store, w, member, seat, h, until);
+            return false;
         }
-        return false;
+        Some(why) => {
+            if !why.passes() {
+                say_left(store, w, member, seat, &why, h);
+            }
+            return false;
+        }
+        None => {}
     }
     let pids = reading.pids.unwrap_or_default();
     let claimed = store.claims().contains_key(member);
@@ -545,7 +748,12 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     };
     match ending.and_then(|()| confirm_gone(seats, &pids)) {
         Ok(()) => {
-            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}, and no pid of it is running", h.because()));
+            let kept = match (retro, due) {
+                (true, true) => format!(", a retro row's seat kept until {} for whoever was using it and ended then", util::iso_at(until)),
+                (true, false) => ", a retro row's seat, which nobody types to after its verdict".to_string(),
+                (false, _) => String::new(),
+            };
+            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}{kept}, and no pid of it is running", h.because()));
             true
         }
         Err(why) => {
@@ -799,6 +1007,28 @@ fn say_left(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, why: 
     }
 }
 
+/// A retro row's seat a turn began at since its verdict, kept for whoever is
+/// using it until `until` and ended then: said once per verdict, on the row, in
+/// `cycle.log` and to the run's governor, with the time.
+fn say_kept(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, until: i64) {
+    let line = format!(
+        "{KEPT} {member} ({seat}) at {}: a turn began at its seat after the verdict, so it is kept for whoever is using it until {}, and ended then",
+        h.commit,
+        util::iso_at(until)
+    );
+    if !once(store, member, &line) {
+        return;
+    }
+    crate::store::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
+    if let Some(w) = w {
+        crate::cycle::tell(store, w, &format!(
+            "{member}: {}, and its agent ({seat}) is kept until {}: a turn began at it after the verdict.",
+            h.because(),
+            util::iso_at(until)
+        ));
+    }
+}
+
 /// Write `line` on the row unless it is already there; whether it was written.
 fn once(store: &Store, id: &str, line: &str) -> bool {
     store.locked(|| {
@@ -905,11 +1135,20 @@ fn mark_left(store: &Store, seat: &str, until: Option<i64>) {
     });
 }
 
-/// Every accepted exit's seat, tried once each tick.
-fn exits(store: &Store, seats: &dyn Seats) {
+/// Every accepted exit's seat, tried once each tick. Returns the rows whose
+/// seat was ended, or found gone.
+fn exits(store: &Store, seats: &dyn Seats) -> std::collections::BTreeSet<String> {
+    let mut ended = std::collections::BTreeSet::new();
     for seat in exit_owns(store) {
-        end_exit(store, seats, &seat);
+        let row = read_exits(store).get(&seat).and_then(|e| e["row"].as_str().map(str::to_string));
+        let line = end_exit(store, seats, &seat);
+        if let (Some(row), Some(line)) = (row, line) {
+            if line.starts_with(EXIT_ENDED) || line.starts_with(EXIT_GONE) {
+                ended.insert(row);
+            }
+        }
     }
+    ended
 }
 
 /// End the seat of an accepted exit — member, verifier or check — by ending.rs's
@@ -1161,6 +1400,12 @@ mod tests {
         fn absent(&self, seat: &str) -> bool {
             self.absent.iter().any(|s| s == seat)
         }
+    }
+
+    thread_local! {
+        /// Set by a test that wants the tick's finished-tree scan
+        /// ([`super::scans_finished`]) over a tree of its own.
+        pub(super) static SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
@@ -1478,6 +1723,152 @@ mod tests {
         seats.typed.remove("cpd-1");
         tick(&store, &seats);
         assert!(!member_ended(), "holding costs a pane, guessing costs a conversation");
+    }
+
+    /// `m-1` made a retro row, its pass decided `ago` seconds before now.
+    fn retro(store: &Store, ago: i64) {
+        let mut m = store.find_task("m-1").unwrap();
+        m.tags.push(RETRO_TAG.into());
+        store.save_task(&m).unwrap();
+        retro_decided(store, ago);
+    }
+
+    /// `wsp-333`: compound-react-040's seat (cpd-115) stood 6h44m past its
+    /// verdict as "left running" because its backend could not say whether
+    /// anybody had typed to it. A retro row's seat is nobody's after its
+    /// verdict: the next tick after the hold ends it, and `cycle.log` says so.
+    #[test]
+    fn a_retro_row_whose_verifier_holds_has_its_seat_ended_on_the_next_tick() {
+        let (_env, store) = verified("retro-untold");
+        retro(&store, 30);
+        let mut seats = Fake::at_rest();
+        seats.typed.remove("cpd-1");
+        drain(&SAID);
+        pass(&store, &seats);
+        assert!(member_ended(), "a retro row's seat is not held by a doubt nobody will resolve");
+        let said = drain(&SAID);
+        assert!(
+            said.iter().any(|l| l.contains("m-1 (cpd-1) ended — verification holds at abc1234") && l.contains("retro row")),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|l| l.contains("left running")), "{said:?}");
+        let log = log_of(&store, "m-1");
+        assert!(log.contains("ended: verification holds at abc1234") && !log.contains("left running"), "{log}");
+    }
+
+    /// A retro row's seat somebody typed to after the verdict is theirs for
+    /// [`RETRO_KEPT_SECS`], said once with the time it ends — and ended then.
+    #[test]
+    fn a_retro_seat_typed_to_after_its_verdict_is_kept_until_a_time_it_names_and_ended_then() {
+        let (_env, store) = verified("retro-typed");
+        retro(&store, 60);
+        let mut seats = Fake::at_rest();
+        seats.typed.insert("cpd-1".into(), true);
+        drain(&SAID);
+        pass(&store, &seats);
+        drain(&DESPAWNED);
+        pass(&store, &seats);
+        assert!(!drain(&DESPAWNED).contains(&"m-1".to_string()), "kept for whoever is using it");
+        let decided = util::epoch_of(crate::verification::passes(&store.find_task("m-1").unwrap())[0].decided.as_deref().unwrap());
+        let until = util::iso_at(decided + RETRO_KEPT_SECS);
+        let said = drain(&SAID);
+        let kept: Vec<_> = said.iter().filter(|l| l.contains("is kept")).collect();
+        assert_eq!(kept.len(), 1, "said once: {said:?}");
+        assert!(kept[0].contains(&format!("until {until}")) && !kept[0].contains("left running"), "{}", kept[0]);
+        assert!(drain(&TOLD).iter().any(|t| t.contains(&until)));
+
+        // Past the time it named, the same typed-to seat is ended.
+        retro_decided(&store, RETRO_KEPT_SECS + 60);
+        pass(&store, &seats);
+        assert!(member_ended(), "kept until a set time, not never");
+        let said = drain(&SAID);
+        assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended") && l.contains("kept until")), "{said:?}");
+    }
+
+    /// A row that is no retro keeps the old rule: a seat that cannot say is left.
+    #[test]
+    fn a_member_that_is_no_retro_row_is_still_left_when_its_seat_cannot_say() {
+        let (_env, store) = verified("not-retro");
+        let mut seats = Fake::at_rest();
+        seats.typed.remove("cpd-1");
+        pass(&store, &seats);
+        assert!(!member_ended());
+        assert!(log_of(&store, "m-1").contains("left running"));
+    }
+
+    /// `wsp-333`'s third item: retro-8's cycle.log is already written and
+    /// cannot be rebuilt, so this replays its two cases through the new code.
+    /// compound-react-040 (seat cpd-115) stood 6h44m past its verdict and
+    /// wsp-309 (seat cpd-157) 2h21m, each "verification holds and the agent is
+    /// left running" because its backend could not say whether anybody had
+    /// typed to it. The conditions are theirs: a retro row whose verifier
+    /// holds, a seat at rest, and ticks every five minutes from a minute after
+    /// the verdict across the whole window each stood. With the seat unable to
+    /// say, it is ended on the first tick; with a turn begun at it after the
+    /// verdict, it is kept with the time named, once, and ended on the first
+    /// tick past that time. In neither is a "left running" line written.
+    #[test]
+    fn retro_8s_two_seats_replayed_across_their_windows_are_ended_or_kept_with_a_named_end_and_never_left_running() {
+        for (row, window) in [("compound-react-040", 6 * 3600 + 44 * 60), ("wsp-309", 2 * 3600 + 21 * 60)] {
+            for typed in [None, Some(true)] {
+                // The env lock `verified` holds is what makes the clock below
+                // this test's alone; the guard puts it back however it ends.
+                let (_env, store) = verified(&format!("replay-{row}-{typed:?}"));
+                retro(&store, 0);
+                let verdict = util::epoch_secs();
+                struct Clock;
+                impl Drop for Clock {
+                    fn drop(&mut self) {
+                        std::env::remove_var("WSP_TEST_NOW");
+                    }
+                }
+                let _clock = Clock;
+                let mut seats = Fake::at_rest();
+                match typed {
+                    None => drop(seats.typed.remove("cpd-1")),
+                    Some(t) => drop(seats.typed.insert("cpd-1".into(), t)),
+                }
+                drain(&SAID);
+                drain(&TOLD);
+                let mut said = Vec::new();
+                let mut ended_at = None;
+                for ago in std::iter::once(60).chain((300..=window).step_by(300)) {
+                    // The verdict stands where it was; the run's clock moves on.
+                    std::env::set_var("WSP_TEST_NOW", (verdict + ago).to_string());
+                    pass(&store, &seats);
+                    said.extend(drain(&SAID));
+                    if member_ended() {
+                        assert!(ended_at.is_none(), "{row}: ended once");
+                        ended_at = Some(ago);
+                    }
+                }
+                let case = format!("{row}, typed {typed:?}");
+                let ended_at = ended_at.unwrap_or_else(|| panic!("{case}: the seat is ended inside the window: {said:#?}"));
+                match typed {
+                    None => assert_eq!(ended_at, 60, "{case}: ended on the first tick after the hold"),
+                    Some(_) => {
+                        assert!(ended_at >= RETRO_KEPT_SECS && ended_at < RETRO_KEPT_SECS + 300, "{case}: kept until the time named, then ended: {ended_at}s");
+                        let kept: Vec<_> = said.iter().filter(|l| l.contains("is kept")).collect();
+                        assert_eq!(kept.len(), 1, "{case}: the keep said once: {said:#?}");
+                        let until = util::iso_at(verdict + RETRO_KEPT_SECS);
+                        assert!(kept[0].contains(&format!("kept for whoever is using it until {until}")), "{case}: names its end: {}", kept[0]);
+                    }
+                }
+                assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended") && l.contains("retro row")), "{case}: {said:#?}");
+                assert!(!said.iter().any(|l| l.contains("left running")), "{case}: no left-running line in cycle.log: {said:#?}");
+                assert!(!log_of(&store, "m-1").contains(LEFT), "{case}: none on the row");
+                assert!(!drain(&TOLD).iter().any(|t| t.contains("left running")), "{case}: none to the governor");
+            }
+        }
+    }
+
+    /// `m-1`'s pass decided `ago` seconds before now, its tags left alone.
+    fn retro_decided(store: &Store, ago: i64) {
+        let mut m = store.find_task("m-1").unwrap();
+        let mut ps = crate::verification::passes(&m);
+        ps[0].decided = Some(util::iso_at(util::epoch_secs() - ago));
+        crate::verification::write(&mut m, &ps);
+        store.save_task(&m).unwrap();
     }
 
     #[test]
@@ -1866,7 +2257,6 @@ mod tests {
     /// ending still names the survivor — which is now at `ppid=1`.
     #[test]
     fn a_child_that_outlives_its_root_is_still_named_and_still_running() {
-        use std::os::unix::process::CommandExt;
         let mut root = wsp_base::calls::Command::new("sh")
             .args(["-c", "sleep 30 & echo $!; wait"])
             .stdout(std::process::Stdio::piped())
@@ -1888,6 +2278,127 @@ mod tests {
         assert!(after.contains(&child), "still in the group with its parent gone: {after:?}");
         assert_eq!(running, vec![child], "the seat's root is gone and its agent is not");
     }
+    struct Quiet(Vec<(String, String)>);
+    impl Seats for Quiet {
+        fn state(&self, _seat: &str) -> Option<crate::place::State> {
+            None
+        }
+        fn census(&self) -> Option<Vec<(String, String)>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// `wsp-453` where it happened: a check left a server in a row's tree (here
+    /// a `sleep`, in a group of its own the way `vite` leaves one), and the row
+    /// reached review. The tick's stop ends it; a row still `doing` keeps its
+    /// own, and since `wsp-691` a row at review with a seat open does not. The server is a `sleep` under a shell
+    /// that stands in the tree; a plain `sleep` started from elsewhere with its
+    /// cwd in the tree is not the tree's (`wsp-478`), and `f-4` is that.
+    #[test]
+    fn a_server_a_check_left_in_a_finished_rows_tree_is_stopped_and_a_working_rows_is_not() {
+        let env = util::isolated("check-tree-finished");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let root = std::env::temp_dir().join(format!("wsp-453-{}-{}", std::process::id(), util::epoch_nanos()));
+        // `wsp-369`: the scan finds a row's tree by its name anywhere on the
+        // machine, so a suite run beside this one (two seats verifying at once)
+        // would stop this run's `f-1` for it. The rows carry this run's pid.
+        let tag = std::process::id();
+        let row = |id: &str| format!("{id}-{tag}");
+        let mut rows = Vec::new();
+        for (id, status) in [
+            ("f-1", crate::model::Status::Review),
+            ("f-2", crate::model::Status::Doing),
+            ("f-3", crate::model::Status::Review),
+            ("f-4", crate::model::Status::Review),
+        ] {
+            let mut t = crate::model::Task::new(id, &row(id));
+            t.set_status(status);
+            store.save_task(&t).unwrap();
+            let tree = root.join(crate::cmd_checkout::WORKTREES).join(row(id));
+            std::fs::create_dir_all(&tree).unwrap();
+            let mut cmd = if id == "f-4" {
+                let mut c = wsp_base::calls::Command::new("sleep");
+                c.arg("60");
+                c
+            } else {
+                let mut c = wsp_base::calls::Command::new("sh");
+                c.args(["-c", "sleep 60; true"]);
+                c
+            };
+            let child = cmd
+                .current_dir(&tree)
+                .stdin(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            rows.push((id, child));
+        }
+        // `wsp-369`: the shell's `sleep` is the server, the one the tree started;
+        // the shell itself stands there by working directory alone and is
+        // spared. A shell that has not forked it yet when the scan reads `ps`
+        // leaves nothing in f-1 to stop (red under a loaded full suite), so the
+        // tick waits for each shell's `sleep`.
+        let started = std::time::Instant::now();
+        for (id, child) in &rows {
+            if *id == "f-4" {
+                continue;
+            }
+            while crate::place_super::tree_of(child.id()).len() < 2 {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10), "{id}'s shell never started its sleep");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let seated = Quiet(vec![("cpd-9".into(), format!("{} · working", row("f-3")))]);
+        let said = stop_finished(&store, &seated, &Default::default());
+        let mut ended = Vec::new();
+        for (id, child) in rows.iter_mut() {
+            // A signalled child of ours is reaped at once; one alive is not.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            ended.push((*id, child.try_wait().unwrap().is_some()));
+            // The group, for the `sleep` under the shell.
+            crate::host::Host::signal_group(&crate::host::LOCAL, child.id(), "KILL");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(ended, vec![("f-1", true), ("f-2", false), ("f-3", true), ("f-4", false)], "said: {said:?}");
+        assert!(said.iter().any(|l| l.starts_with(&format!("stopped in finished row {} ", row("f-1")))), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with(&format!("stopped in finished row {} ", row("f-3")))), "{said:?}");
+        assert!(said.iter().any(|l| l.starts_with("spared") && l.contains(&format!("row {} ", row("f-4")))), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains(&row("f-2"))), "{said:?}");
+        assert!(crate::check_tree::left_line(&crate::check_tree::Left { row: "f-1".into(), tree: "/r/.worktrees/f-1".into(), pids: vec![1, 2], spared: vec![] }, 2048).contains("2 processes (2 MB)"));
+    }
+
+    /// `wsp-633`: the children of a person's app, a new pid each cycle, were
+    /// named and TERMed every cycle for a day. They are spared, and the one
+    /// lineage is named once, whatever pids it has by the next cycle.
+    #[test]
+    fn a_persons_apps_children_in_a_removed_tree_are_named_once_and_never_stopped() {
+        let env = util::isolated("check-tree-app-lineage");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let tree = "/r/.worktrees/app-633";
+        let app = "/Users/e/Applications/web-chrome.app/Contents/MacOS/web-chrome";
+        let mut said = Vec::new();
+        for cycle in 0..4u32 {
+            let (app_pid, child, grandchild) = (7000, 7100 + cycle, 7200 + cycle);
+            let table = vec![
+                (app_pid, 1, app.to_string()),
+                (child, app_pid, "/usr/local/bin/helper".to_string()),
+                (grandchild, child, "/usr/local/bin/node".to_string()),
+            ];
+            let lsof = format!("p{app_pid}\nn{tree}\np{child}\nn{tree}/web\np{grandchild}\nn{tree}/web\n");
+            let lefts = crate::check_tree::finished_trees(&lsof, &|n| n == "app-633", &[]);
+            let found = crate::check_tree::sorted(&lsof, lefts, &table);
+            assert!(found.iter().all(|l| l.pids.is_empty()), "cycle {cycle}: nothing is the row's to stop: {found:?}");
+            said.extend(say_spared(&store, &found));
+        }
+        let app_lines: Vec<_> = said.iter().filter(|l| l.contains("descends from an app")).collect();
+        assert_eq!(app_lines.len(), 1, "one lineage named once: {said:?}");
+        assert_eq!(said.len(), 2, "the app itself once more, by its own pid: {said:?}");
+    }
+
 
     // ---- `wsp-615`: an accepted exit ends its seat ----------------------------
 
@@ -2168,5 +2679,573 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ended despawn --pane cpd-10\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- `wsp-691`: what a member leaves running in its tree is stopped -------
+
+    /// A `yes` started in `tree` in the background by a shell that then exits:
+    /// orphaned, its parent pid 1 as wsp-693's eight burners were (or, on
+    /// Linux, the subreaper that adopted it: `check_tree::orphaned`).
+    fn orphaned_yes(tree: &std::path::Path) -> u32 {
+        let out = wsp_base::calls::Command::new("sh")
+            .args(["-c", "yes >/dev/null 2>&1 </dev/null & echo $!"])
+            .current_dir(tree)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        for _ in 0..100 {
+            let table = crate::check_tree::exes();
+            let ppid = table.iter().find(|(p, _, _)| *p == pid).map(|r| r.1);
+            if ppid.is_some_and(|pp| crate::check_tree::orphaned(pp, &table)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pid
+    }
+
+    /// The seat's agent: a shell standing in `tree` with a `sleep` under it,
+    /// its one direct child.
+    fn agent_in(tree: &std::path::Path) -> wsp_base::calls::Child {
+        wsp_base::calls::Command::new("sh")
+            .args(["-c", "sleep 60; true"])
+            .current_dir(tree)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// The pids under `parent`, read now.
+    fn children_of(parent: u32) -> Vec<u32> {
+        crate::check_tree::exes().into_iter().filter(|(_, pp, _)| *pp == parent).map(|r| r.0).collect()
+    }
+
+    fn alive(pids: &[u32]) -> Vec<u32> {
+        let mut a: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect();
+        a.sort();
+        a
+    }
+
+    /// A tree of the test's own, `.worktrees/<row>` under a fresh root.
+    fn own_tree(row: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("wsp-691-{}-{}", std::process::id(), util::epoch_nanos()));
+        let tree = root.join(crate::cmd_checkout::WORKTREES).join(row);
+        std::fs::create_dir_all(&tree).unwrap();
+        (root, tree)
+    }
+
+    /// `wsp-691` where it happened: a member at review with its seat still
+    /// open (waiting for its verifier) and an orphaned `yes` in its tree. The
+    /// tick stops the `yes`; the open seat's own running agent, and what it
+    /// started directly, are never stopped.
+    #[test]
+    fn a_member_at_review_with_an_open_seat_has_its_orphaned_yes_stopped_on_the_tick_and_its_agent_kept() {
+        let env = util::isolated("ending-691-tick");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = "y-691t";
+        let mut t = Task::new(row, row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(row);
+        let mut agent = agent_in(&tree);
+        let yes = orphaned_yes(&tree);
+        let mut kid = Vec::new();
+        for _ in 0..100 {
+            kid = children_of(agent.id());
+            if !kid.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), vec![agent.id()]);
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, agent_alive) = (alive(&[yes]), agent.try_wait().unwrap().is_none());
+        let kid_alive = alive(&kid);
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &kid, "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped");
+        assert!(agent_alive, "the open seat's agent is never stopped");
+        assert_eq!(kid_alive.len(), kid.len(), "nor what the agent started directly: {kid:?}");
+        let log = log_of(&store, row);
+        assert!(log.contains(&format!("{yes} `")) && log.contains("stopped in finished row y-691t"), "{log}");
+    }
+
+    /// `wsp-691` at submit: everything standing in the row's tree goes but the
+    /// caller's chain — the seat's agent and the command it runs, here the
+    /// shell and the `sleep` under it — and an orphan stood beside them goes.
+    #[test]
+    fn the_submit_sweep_stops_an_orphan_in_the_tree_and_spares_the_callers_chain() {
+        let env = util::isolated("ending-691-submit");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = "y-691s";
+        let mut t = Task::new(row, row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        let (root, tree) = own_tree(row);
+        let mut agent = agent_in(&tree);
+        let yes = orphaned_yes(&tree);
+        let mut chain = Vec::new();
+        for _ in 0..100 {
+            chain = children_of(agent.id());
+            if !chain.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        chain.push(agent.id());
+        let keep = crate::check_tree::kept_at_submit(&[agent.id()], &chain, &crate::check_tree::exes());
+        let said = stop_tree(&store, &format!("{row} submitted"), &|| crate::check_tree::left_kept(row, &tree, &keep));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, chain_alive) = (alive(&[yes]), alive(&chain));
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &chain, "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(yes_alive.is_empty(), "the orphan went: {said:?}");
+        let mut want = chain.clone();
+        want.sort();
+        assert_eq!(chain_alive, want, "the caller's chain stands: {said:?}");
+        assert!(said.iter().any(|l| l.starts_with("y-691s submitted: stopped what row y-691s left") && l.contains(&format!("TERM {yes}"))), "{said:?}");
+        assert!(log_of(&store, row).contains(&format!("{yes} `")), "the pid and its command, on the row");
+    }
+
+    /// `wsp-426`: a `wsp check` run from outside a member's tree (a stand-in,
+    /// a `wsp` script in a directory of the test's own) with its `cargo`
+    /// standing in the tree. The review tick fires while the member's seat
+    /// waits: the check's cargo survives, and an orphaned `yes` in the same
+    /// tree is still stopped.
+    #[test]
+    fn a_wsp_check_run_from_outside_the_tree_keeps_its_cargo_through_the_review_sweep() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let env = util::isolated("ending-426-check");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-426-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // The cargo is a `sleep` under that name, so `ps` names it `cargo` as it
+        // named wsp-307's, a dev tool the sweep stops by name.
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let cargo = bin.join("cargo");
+        std::fs::copy(sleep, &cargo).unwrap();
+        let wsp = script("wsp", "(cd \"$3\" && exec \"$4\" 60) &\nwait");
+        let mut check = wsp_base::calls::Command::new(&wsp)
+            .args(["check", &row, &tree.display().to_string(), &cargo.display().to_string()])
+            .current_dir(&bin)
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // The check's cargo, started in the tree, before the tick.
+        let is_cargo = |p: u32| crate::check_tree::exes().iter().any(|(q, _, exe)| *q == p && exe.ends_with("cargo"));
+        let mut ran = Vec::new();
+        for _ in 0..250 {
+            ran = children_of(check.id());
+            if ran.len() == 1 && is_cargo(ran[0]) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(ran.len() == 1 && is_cargo(ran[0]), "the stand-in check never started its cargo: {ran:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), Vec::new());
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, ran_alive, check_alive) = (alive(&[yes]), alive(&ran), check.try_wait().unwrap().is_none());
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal_group(&crate::host::LOCAL, check.id(), "KILL");
+        let _ = check.kill();
+        let _ = check.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        let mut want = ran.clone();
+        want.sort();
+        assert_eq!(ran_alive, want, "the check's cargo survives the sweep: {log}");
+        assert!(check_alive, "and the check itself");
+    }
+
+    /// `wsp-453` where it happened: compound-react-061's member seat had
+    /// ended and its verifier, spawned with `--verify` on the row, drove the
+    /// app live from its tree; the review tick TERMed `npm exec vite` and all
+    /// under it. Here the member's seat is gone (no binding, no claim), the
+    /// verifier's is known by its standing pass, its record lists only its
+    /// agent (a shell standing in the tree), and the agent's tool shell runs
+    /// an `npm` (a
+    /// `sleep` under that name, a dev tool the sweep stops by name). The tick
+    /// fires: the npm and its shell survive, and an orphaned `yes` in the same
+    /// tree is stopped.
+    #[test]
+    fn a_verifiers_own_live_drive_survives_the_review_sweep_and_an_orphan_beside_it_does_not() {
+        let env = util::isolated("ending-453-verify");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-453-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.at = "2026-11-23T11:48:53Z".into();
+        p.pane = Some("cpd-2".into());
+        p.state = crate::verification::State::Running;
+        crate::verification::write(&mut t, &[p]);
+        store.save_task(&t).unwrap();
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let npm = bin.join("npm");
+        std::fs::copy(sleep, &npm).unwrap();
+        // The verifier's agent, its tool shell, and the npm that shell runs.
+        let mut agent = wsp_base::calls::Command::new("sh")
+            .args(["-c", "sh -c \"$0 60; true\"; true", &npm.display().to_string()])
+            .current_dir(&tree)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let is_npm = |p: u32| crate::check_tree::exes().iter().any(|(q, _, exe)| *q == p && exe.ends_with("npm"));
+        let (mut shell, mut drive) = (Vec::new(), Vec::new());
+        for _ in 0..250 {
+            shell = children_of(agent.id());
+            drive = shell.iter().flat_map(|s| children_of(*s)).collect();
+            if drive.len() == 1 && is_npm(drive[0]) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(drive.len() == 1 && is_npm(drive[0]), "the verifier never started its npm: {shell:?} {drive:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-2".into(), State::Idle);
+        f.typed.insert("cpd-2".into(), false);
+        f.pids.insert("cpd-2".into(), vec![agent.id()]);
+        f.census = Some(vec![("cpd-2".into(), format!("{row} · verifying"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, drive_alive, shell_alive) = (alive(&[yes]), alive(&drive), alive(&shell));
+        let agent_alive = agent.try_wait().unwrap().is_none();
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &drive, "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &shell, "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert_eq!(drive_alive, drive, "the verifier's npm survives the sweep: {log}");
+        assert_eq!(shell_alive.len(), shell.len(), "and the shell it runs under: {log}");
+        assert!(agent_alive, "and the verifier's agent");
+        assert!(log.contains(&format!("{yes} `")) && !log.contains(&format!("{} `", drive[0])), "{log}");
+    }
+
+    /// `wsp-453` as 061 really ran: the verifier's drive was started by
+    /// `probe/dev.sh` as `nohup npx vite … &`, the shell exited at once, and
+    /// `npm exec vite` was adopted by `systemd --user`, so it descends from no
+    /// seat. What still says whose it is is the environment it kept:
+    /// `WSP_SEAT_ID` of the verifier's seat. Here the verifier (known by its
+    /// standing pass, its record listing only its agent) detaches an `npm` the
+    /// same way. The ended member's seat id is on another detached `npm`, and
+    /// a `yes` carries none. The tick fires: the verifier's npm survives, and
+    /// the other two are stopped.
+    #[test]
+    fn a_verifiers_detached_drive_survives_the_review_sweep_by_its_seat_id_and_the_members_does_not() {
+        let env = util::isolated("ending-453-detached");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-453d-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.at = "2026-11-23T11:48:53Z".into();
+        p.pane = Some("cpd-474".into());
+        p.state = crate::verification::State::Running;
+        crate::verification::write(&mut t, &[p]);
+        store.save_task(&t).unwrap();
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let npm = bin.join("npm");
+        std::fs::copy(sleep, &npm).unwrap();
+        let mut agent = agent_in(&tree);
+        // `nohup npm 60 &` from a shell that exits at once, as `probe/dev.sh`.
+        let detached = |seat: &str| -> u32 {
+            let out = wsp_base::calls::Command::new("sh")
+                .args(["-c", "nohup \"$0\" 60 >/dev/null 2>&1 </dev/null & echo $!", &npm.display().to_string()])
+                .env(crate::base::seat::SEAT_ENV, seat)
+                .current_dir(&tree)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+        let drive = detached("cpd-474");
+        let members = detached("cpd-473");
+        let is_npm = |p: u32| crate::check_tree::exes().iter().any(|(q, _, exe)| *q == p && exe.ends_with("npm"));
+        for _ in 0..250 {
+            if is_npm(drive) && is_npm(members) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(is_npm(drive) && is_npm(members), "the detached npms never ran: {drive} {members}");
+        let table = crate::check_tree::exes();
+        let ppid = table.iter().find(|(p, _, _)| *p == drive).map(|r| r.1).unwrap();
+        assert!(!crate::check_tree::descendants(&[agent.id()], &table).contains(&drive), "detached from the seat ({ppid})");
+        let yes = wsp_base::calls::Command::new("sh")
+            .args(["-c", "yes >/dev/null 2>&1 </dev/null & echo $!"])
+            .env_remove(crate::base::seat::SEAT_ENV)
+            .current_dir(&tree)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let yes: u32 = String::from_utf8_lossy(&yes.stdout).trim().parse().unwrap();
+        let mut f = Fake::default();
+        f.state.insert("cpd-474".into(), State::Idle);
+        f.typed.insert("cpd-474".into(), false);
+        f.pids.insert("cpd-474".into(), vec![agent.id()]);
+        f.census = Some(vec![("cpd-474".into(), format!("{row} · verifying"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (drive_alive, members_alive, yes_alive) = (alive(&[drive]), alive(&[members]), alive(&[yes]));
+        crate::host::Host::signal(&crate::host::LOCAL, &[drive, members, yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &children_of(agent.id()), "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert_eq!(drive_alive, vec![drive], "the verifier's detached npm survives the sweep: {log}");
+        assert!(members_alive.is_empty(), "the ended member's detached npm {members} was stopped: {log}");
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert!(!log.contains(&format!("{drive} `")), "{log}");
+    }
+
+    /// `wsp-444`: under `WSP_JOBS=inproc` the daemon runs a ready row's check
+    /// in its own process, each step a job on `wsp-host`'s runner: no `wsp
+    /// check` and no manager job above the step's `npm`, which stands in the
+    /// row's tree. The review tick fires while the step runs: the `npm`
+    /// survives (compound-react-036's was TERMed, exit 143), and an orphaned
+    /// `yes` in the same tree is still stopped.
+    #[test]
+    fn a_check_step_run_in_process_under_wsp_jobs_inproc_keeps_its_npm_through_the_review_sweep() {
+        let env = util::isolated("ending-444-inproc");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-444-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // The npm is a `sleep` under that name, outside the tree, so `ps`
+        // names it `npm`: what descends from a process standing in the tree.
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let npm = bin.join("npm");
+        std::fs::copy(sleep, &npm).unwrap();
+        std::env::set_var(crate::host_tcp::JOBS_ENV, "inproc");
+        let runner = crate::check::Runner::chosen(&store, crate::check::Whose::Row(&row), crate::check::TreeKind::Check, &tree, None);
+        std::env::remove_var(crate::host_tcp::JOBS_ENV);
+        let runner = runner.unwrap();
+        assert!(matches!(runner, crate::check::Runner::Inproc), "WSP_JOBS=inproc runs the check in this process");
+        let step = crate::check::Step {
+            name: "web-chrome check".into(),
+            command: format!("{} 30", npm.display()),
+            limit: std::time::Duration::from_secs(60),
+            of: crate::check::Of::Project,
+            on: Vec::new(),
+            barrier: false,
+            end: false,
+        };
+        let log = root.join("step.log");
+        let ran = {
+            let (tree, log) = (tree.clone(), log.clone());
+            std::thread::spawn(move || crate::check::run_step(&tree, &step, &log, &crate::check::Runner::Inproc))
+        };
+        // The step's npm, started in the tree under this process, before the tick.
+        let me = std::process::id();
+        let npms = || -> Vec<u32> {
+            let table = crate::check_tree::exes();
+            let under_me = |mut p: u32| {
+                for _ in 0..table.len() {
+                    match table.iter().find(|(q, _, _)| *q == p) {
+                        Some(&(_, up, _)) if up == me => return true,
+                        Some(&(_, up, _)) => p = up,
+                        None => return false,
+                    }
+                }
+                false
+            };
+            table.iter().filter(|(p, _, exe)| exe.ends_with("/npm") && under_me(*p)).map(|r| r.0).collect()
+        };
+        let mut found = Vec::new();
+        for _ in 0..250 {
+            found = npms();
+            if found.len() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(found.len(), 1, "the in-process step never started its npm: {found:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), Vec::new());
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, npm_alive) = (alive(&[yes]), alive(&found));
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &found, "KILL");
+        let done = ran.join().unwrap().done;
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert_eq!(npm_alive, found, "the in-process check's npm survives the sweep: {log}");
+        assert!(!log.contains("npm"), "and is not named as stopped: {log}");
+        assert_ne!(done, crate::check::Done::Passed, "the step ended by this test's KILL");
+    }
+
+    /// `wsp-444` where it happened: compound-react-058's `wsp submit` started
+    /// a `wsp check`, whose `web-chrome check` step a manager ran as a job:
+    /// the step's `npm run check` stood in the row's tree under the job's
+    /// wrapper, under `wsp-manager`, not under the `wsp check`; and the daemon
+    /// (`WSP_JOBS=inproc`) asks no manager's job table, so the sweep at review
+    /// TERMed it (exit 143). Here the manager is a shell under that name
+    /// outside the tree, with no job table to ask: the step's `npm` survives
+    /// the review tick and is not named, while a plain `npm` the same manager
+    /// runs in the tree with no job's wrapper, and an orphaned `yes`, are
+    /// still stopped.
+    #[test]
+    fn a_check_step_a_manager_runs_keeps_its_npm_through_the_review_sweep_with_no_job_table() {
+        let env = util::isolated("ending-444-manager");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-444m-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let find = |names: &[&str]| names.iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string()).unwrap();
+        // `ps` names each by the file it runs: an `npm` that is a `sleep`, a
+        // `wsp-manager` that is a shell, both outside the tree.
+        let npm = bin.join("npm");
+        std::fs::copy(find(&["/bin/sleep", "/usr/bin/sleep"]), &npm).unwrap();
+        let manager = bin.join("wsp-manager");
+        std::fs::copy(find(&["/bin/sh", "/usr/bin/sh"]), &manager).unwrap();
+        let exit = root.join("exec").join("jobs").join(format!("{row}+0+check%3Aweb-chrome_check@1.2.3.exit"));
+        // `wsp-host`'s wrapper, word for word, as the manager starts it.
+        let wrapper = "e=$1; shift\n\"$@\"\ns=$?\n{ echo \"exit $s\"; times; } > \"$e.tmp\" 2>/dev/null && mv -f \"$e.tmp\" \"$e\"\nkill -KILL 0";
+        let script = format!(
+            "cd '{tree}' && {{ sh -c \"$W\" sh '{exit}' '{npm}' 30 & '{npm}' 31 & }} ; wait",
+            tree = tree.display(),
+            exit = exit.display(),
+            npm = npm.display()
+        );
+        // In a group of its own, as `wsp-host` starts a job: the wrapper ends
+        // its group with `kill -KILL 0`, which must not be this test's.
+        use std::os::unix::process::CommandExt as _;
+        // A test beside this one that forks while the copy is open makes the
+        // exec "text file busy" for a moment.
+        let spawn = || {
+            std::process::Command::new(&manager)
+                .args(["-c", &script])
+                .process_group(0)
+                .env("W", wrapper)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        let mut started = spawn();
+        for _ in 0..50 {
+            match &started {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    started = spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut run = started.unwrap();
+        let held = run.id();
+        // (the step's npm, the plain one): told apart by their parents.
+        let mut step = Vec::new();
+        let mut plain = Vec::new();
+        for _ in 0..250 {
+            let table = crate::check_tree::exes();
+            let npms: Vec<(u32, u32)> = table.iter().filter(|(_, _, e)| e.ends_with("/npm")).map(|r| (r.0, r.1)).collect();
+            step = npms.iter().filter(|(_, pp)| table.iter().any(|(q, up, _)| q == pp && *up == held)).map(|r| r.0).collect();
+            plain = npms.iter().filter(|(_, pp)| *pp == held).map(|r| r.0).collect();
+            if step.len() == 1 && plain.len() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!((step.len(), plain.len()), (1, 1), "the manager never started both npms: {step:?} {plain:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), Vec::new());
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, step_alive, plain_alive) = (alive(&[yes]), alive(&step), alive(&plain));
+        let all: Vec<u32> = [yes].into_iter().chain(step.iter().copied()).chain(plain.iter().copied()).collect();
+        crate::host::Host::signal(&crate::host::LOCAL, &all, "KILL");
+        let _ = run.kill();
+        let _ = run.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert!(plain_alive.is_empty(), "the plain npm {plain:?}, no job's, was stopped: {log}");
+        assert_eq!(step_alive, step, "the manager's check step's npm survives the sweep: {log}");
+        assert!(!log.contains(&format!("{} `", step[0])), "and is not named as stopped: {log}");
     }
 }

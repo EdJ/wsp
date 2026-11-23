@@ -339,6 +339,37 @@ fn tailnet_addrs() -> Vec<std::net::IpAddr> {
         .collect()
 }
 
+/// The API's view verbs (wsp-307): `throttle`, `spend` and `show` answer the
+/// documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+/// --json` print, from the very functions those print, over a store opened
+/// afresh for each call (so nothing a call reads is older than the call). The
+/// server links nothing of this crate, so this is how it gets them.
+struct Views {
+    root: std::path::PathBuf,
+    state: std::path::PathBuf,
+}
+
+impl Views {
+    fn store(&self) -> Store {
+        Store::at(self.root.clone(), self.state.clone())
+    }
+}
+
+impl wsp_server::Views for Views {
+    fn throttle(&self) -> Result<serde_json::Value, wsp_api::Failure> {
+        Ok(crate::throttle::document(&self.store()))
+    }
+
+    fn spend(&self) -> Result<serde_json::Value, wsp_api::Failure> {
+        Ok(crate::spend::report(&self.store(), crate::util::epoch_secs()))
+    }
+
+    fn show(&self, id: &str) -> Result<serde_json::Value, wsp_api::Failure> {
+        crate::cmd_task::show_json(&self.store(), id)
+            .map_err(|text| wsp_api::Failure { code: wsp_api::Code::NotFound, text, refusal: None })
+    }
+}
+
 /// What `start_api` started; ended with the daemon.
 pub(crate) struct Api {
     pub(crate) db: wsp_server::SharedStore,
@@ -346,6 +377,8 @@ pub(crate) struct Api {
     _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     /// The delivery worker, under `WSP_ORDERS=store` alone (wsp-122).
     _deliver: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// wsp-743: the census reads' inputs, beside the mirror's entities.
+    _readings: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 /// Open `state.db`, serve it, and start the mirror thread. Each failure is one
@@ -371,6 +404,7 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
     let mut cfg = wsp_server::Config::new(&store.state);
     cfg.port = crate::mirror::api_port();
     cfg.addrs = tailnet_addrs();
+    cfg.views = Some(std::sync::Arc::new(Views { root: store.root.clone(), state: store.state.clone() }));
     let server = match wsp_server::Server::start(db.clone(), cfg) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -390,7 +424,8 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         }
         crate::orders::Mode::Files => None,
     };
-    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver })
+    let readings = crate::readings::start(store, db.clone());
+    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver, _readings: readings })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -802,6 +837,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             wsp_base::calls::phase("seat-memory");
             sample_seat_memory(store, now);
         }
+
+        // The CPU burners standing in no tree, for `wsp wip`'s load warning
+        // (wsp-691), read here so `wip` itself runs no `ps` (wsp-716).
+        wsp_base::calls::phase("burners");
+        crate::cmd_role::stamp_burners(store, now);
 
         crate::place_compound::tick_deliver_budget(false);
         wsp_base::calls::tick_end();

@@ -7,9 +7,17 @@
 //! - [`Client::dial_at`] does the same against addresses and a token the
 //!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
+//! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
 //! - [`Client::apply`] sends a command under one idempotency key, again under
 //!   the same key after a lost reply; [`Client::await_order`] follows an order
 //!   to a state.
+//! - [`Client::throttle`], [`Client::spend`] and [`Client::show`] return the
+//!   documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+//!   --json` print, the same value (wsp-307).
+//! - [`Client::rows`], [`Client::lists`], [`Client::asks`] and
+//!   [`Client::readings`] read what web-chrome's census draws (wsp-743): rows
+//!   and lists as heads, the asks, and the daemon's readings, each the input a
+//!   `wsp-view` projection takes, typed.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
 //!
@@ -20,8 +28,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use wsp_api::{ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
-use wsp_store_contract::{Principal, Refusal};
+use wsp_api::{
+    Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
+    Request, Verb, PROTOCOL,
+};
+use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Refusal, Row, RowFilter, State};
 
 mod dial;
 mod orders;
@@ -72,6 +83,31 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Why a view verb ([`Client::throttle`], [`Client::spend`], [`Client::show`])
+/// gave no document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewError {
+    /// The request got no reply.
+    Request(Error),
+    /// The server refused it: `not_found` for a `show` of nothing,
+    /// `unsupported` from a server that answers no views (or predates them).
+    Refused(Failure),
+    /// The reply's `ok` was another verb's answer.
+    Answer(Box<Answer>),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Request(e) => write!(f, "{e}"),
+            ViewError::Refused(r) => write!(f, "refused {:?}: {}", r.code, r.text),
+            ViewError::Answer(a) => write!(f, "the server answered another verb: {a:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ViewError {}
 
 /// What it takes to dial again: where the server is, who for, and how long to wait.
 #[derive(Debug, Clone)]
@@ -158,9 +194,110 @@ impl Client {
         self.send(verb, args, Some(key))
     }
 
+    /// The `wip` verb: open rows whole, every other row and every list
+    /// without its bodies, open asks only, seats and claims whole, and the
+    /// event id that cut is consistent at. A smaller reply than `state` on a
+    /// large store, which is what keeps it under `MAX_LINE`.
+    pub fn wip(&mut self) -> Result<(State, wsp_api::EventId), Error> {
+        let reply = self.send_call(Call::Verb(Verb::Wip(NoArgs {})), None)?;
+        match reply.outcome {
+            Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
+            Outcome::Ok(other) => Err(Error::Unexpected(format!("wip was answered {other:?}"))),
+            Outcome::Err(f) => Err(orders::refused(f)),
+        }
+    }
+
+    /// The document `wsp throttle --json` prints: this machine's build
+    /// throttle and the readings it acts on, as the server's machine reads them.
+    pub fn throttle(&mut self) -> Result<Value, ViewError> {
+        match self.view("throttle", json!({}))? {
+            Answer::Throttle(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    /// The document `wsp spend --json` prints: the last 30 days' tokens and cost.
+    pub fn spend(&mut self) -> Result<Value, ViewError> {
+        match self.view("spend", json!({}))? {
+            Answer::Spend(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    /// The document `wsp show <id> --json` prints, `id` as `wsp show` takes it
+    /// (a row's id or prefix, or a piece's id). None is [`ViewError::Refused`]
+    /// with `not_found`, and the CLI's sentence as its text.
+    pub fn show(&mut self, id: &str) -> Result<Value, ViewError> {
+        match self.view("show", json!({ "id": id }))? {
+            Answer::Show(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    fn view(&mut self, verb: &str, args: Value) -> Result<Answer, ViewError> {
+        match self.request(verb, args).map_err(ViewError::Request)?.outcome {
+            Outcome::Ok(a) => Ok(a),
+            Outcome::Err(f) => Err(ViewError::Refused(f)),
+        }
+    }
+
+    /// The `rows` verb: the rows `filter` keeps, each as its head when
+    /// `filter.heads` (no `body` or `prose`), which is what keeps every row of
+    /// a full store under `MAX_LINE`.
+    pub fn rows(&mut self, filter: RowFilter) -> Result<Vec<Row>, Error> {
+        self.read_typed(Verb::Rows(filter), "rows", |a| match a {
+            Answer::Rows(rows) => Ok(rows),
+            other => Err(other),
+        })
+    }
+
+    /// The `lists` verb: every list, each without its text when `filter.heads`.
+    pub fn lists(&mut self, filter: ListFilter) -> Result<Vec<List>, Error> {
+        self.read_typed(Verb::Lists(filter), "lists", |a| match a {
+            Answer::Lists(lists) => Ok(lists),
+            other => Err(other),
+        })
+    }
+
+    /// The `asks` verb: asks, notes and flags of any of `kinds` in any of
+    /// `states`, all when either is empty.
+    pub fn asks(&mut self, kinds: Vec<AskKind>, states: Vec<AskState>) -> Result<Vec<Ask>, Error> {
+        self.read_typed(Verb::Asks { kinds, states }, "asks", |a| match a {
+            Answer::Asks(asks) => Ok(asks),
+            other => Err(other),
+        })
+    }
+
+    /// The `readings` verb: each of `names` there is a reading of (every one
+    /// when `names` is empty), by name. A reading's `json` is the text of the
+    /// `wsp-view` input `wsp_view::reading` names, decoded with
+    /// `wsp_view::reading::of`.
+    pub fn readings(&mut self, names: &[&str]) -> Result<std::collections::BTreeMap<String, Reading>, Error> {
+        let names = names.iter().map(|n| n.to_string()).collect();
+        self.read_typed(Verb::Readings { names }, "readings", |a| match a {
+            Answer::Readings(readings) => Ok(readings),
+            other => Err(other),
+        })
+    }
+
+    /// One typed read: `verb`'s reply, taken by `want`; another verb's answer
+    /// is a malformed reply, and `err` is [`Error::Failed`].
+    fn read_typed<T>(&mut self, verb: Verb, name: &str, want: impl FnOnce(Answer) -> Result<T, Answer>) -> Result<T, Error> {
+        let reply = self.send_call(Call::Verb(verb), None)?;
+        match reply.outcome {
+            Outcome::Ok(a) => want(a)
+                .map_err(|_| Error::Lost(ConnError::Malformed(format!("`{name}` answered with another verb's answer")))),
+            Outcome::Err(f) => Err(Error::Failed(f)),
+        }
+    }
+
     fn send(&mut self, verb: &str, args: Value, key: Option<IdempotencyKey>) -> Result<Reply, Error> {
         let call: Call = serde_json::from_value(json!({ "verb": verb, "args": args }))
             .map_err(|e| Error::Args(e.to_string()))?;
+        self.send_call(call, key)
+    }
+
+    fn send_call(&mut self, call: Call, key: Option<IdempotencyKey>) -> Result<Reply, Error> {
         let id = ReqId(self.next);
         self.next += 1;
         let request = Request { v: PROTOCOL, id, key, by: self.target.by.clone(), call };

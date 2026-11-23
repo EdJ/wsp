@@ -215,7 +215,9 @@ fn answer(reply: Reply) -> Result<Applied, Error> {
     }
 }
 
-fn refused(f: wsp_api::Failure) -> Error {
+/// An `err` reply as the caller's error: the server's refusal where it gave
+/// one, else the failure whole.
+pub(crate) fn refused(f: wsp_api::Failure) -> Error {
     match f.refusal {
         Some(r) => Error::Refused(r),
         None => Error::Failed(f),
