@@ -1020,6 +1020,10 @@ impl Start {
     /// `install.log` beside `log`; one that fails is said, and the steps that
     /// need it are left to fail as they will.
     pub(crate) fn install(&mut self, tree: &Path, log: &Path, runner: &Runner<'_>) -> Vec<String> {
+        #[cfg(test)]
+        if let Some(npm) = TEST_NPM.with(|n| n.borrow().clone()) {
+            return self.install_by(tree, log, runner, &npm);
+        }
         self.install_by(tree, log, runner, "npm")
     }
 
@@ -1060,6 +1064,12 @@ impl Start {
     pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::json!({ "target": self.target, "load": self.load, "cores": self.cores, "seed": self.seed })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `npm` a test's [`Start::install`] runs, on the thread that calls it.
+    static TEST_NPM: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The longest one `npm ci` in a check tree may take.
@@ -2174,9 +2184,14 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             return gave_up(store, &t.id, entry.as_deref(), &why);
         }
     };
-    // Only in the check tree wsp made: a member's own tree is its own to install in.
+    // The member's own tree too: it is where the verifier's gate checks and the
+    // verifier's seat stands, and nothing else installs there (clonefile is
+    // macOS only), so a Rust-only row met "Cannot find package 'vite'" at its
+    // verifier. A `node_modules/` the member made by hand carries no stamp and
+    // is left as it is; only a missing one, or one wsp made for another
+    // lockfile, is installed.
     let mut start = start;
-    for line in if own.is_none() { start.install(&tree, &dir.join("last.log"), &runner) } else { Vec::new() } {
+    for line in start.install(&tree, &dir.join("last.log"), &runner) {
         if !auto && !args.json() {
             println!("  {}", p.dim(&line));
         }
@@ -4517,6 +4532,50 @@ mod tests {
         std::fs::remove_dir_all(tree.join("web/node_modules")).unwrap();
         let said = start.install_by(&tree, &log, &Runner::Inproc, "false");
         assert!(said.len() == 1 && said[0].starts_with("web/node_modules not installed: `npm ci` ") && said[0].contains("red for the tree, not the row"), "{said:?}");
+    }
+
+    /// `compound-react-045`'s verifier half: a ready row's checks run in the
+    /// member's own tree, which is where the verifier's gate checks and the
+    /// verifier's seat stands. A tree with a lockfile and no `node_modules/` is
+    /// installed in before the steps, so `npm run check` there meets its
+    /// packages and not "Cannot find package 'vite'".
+    #[test]
+    fn a_ready_rows_own_tree_without_node_modules_is_installed_in_before_its_checks() {
+        let env = util::isolated("check-own-install");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::testkit::repo(&repo);
+        std::fs::write(repo.join(".gitignore"), "node_modules\n.worktrees\n").unwrap();
+        git_run(&repo, &["add", ".gitignore"]);
+        git_run(&repo, &["commit", "--quiet", "-m", "trunk"]);
+        let own = repo.join(crate::cmd_checkout::WORKTREES).join("pj-001");
+        git_run(&repo, &["worktree", "add", "--quiet", "-b", "pj-001", &own.display().to_string()]);
+        std::fs::create_dir_all(own.join("web")).unwrap();
+        std::fs::write(own.join("web/package-lock.json"), "{1}").unwrap();
+        git_run(&own, &["add", "web/package-lock.json"]);
+        git_run(&own, &["commit", "--quiet", "-m", "pj-001: a rust-only change"]);
+        let sha = git(&own, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let store = Store::open();
+        let mut p = Project::new("pj");
+        p.roots = vec![repo.display().to_string()];
+        p.body = "## Checks\n- vite: test -d web/node_modules/vite\n".into();
+        store.save_project(&p).unwrap();
+        let mut t = Task::new("a row", "pj-001");
+        t.project = Some("pj".into());
+        t.set_status(Status::Review);
+        crate::log::note(&store, &mut t, &format!("{} {sha} on pj-001", crate::repair::READY)).unwrap();
+        assert_eq!(member_tree_at(&store, &store.find_task("pj-001").unwrap(), &sha, false).as_deref(), Some(own.as_path()), "the check runs in the member's own tree");
+
+        let npm = env.path("npm");
+        std::fs::write(&npm, "#!/bin/sh\nmkdir -p node_modules/vite\n").unwrap();
+        std::fs::set_permissions(&npm, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        TEST_NPM.with(|n| *n.borrow_mut() = Some(npm.display().to_string()));
+        let code = check(&store, &Args::synth("check", &["pj-001"], &[]));
+        TEST_NPM.with(|n| *n.borrow_mut() = None);
+        let runs = v::runs(&store.find_task("pj-001").unwrap());
+        assert_eq!(code, 0, "{:?}", runs.iter().map(|r| &r.text).collect::<Vec<_>>());
+        assert!(own.join("web/node_modules/vite").is_dir(), "installed in the member's own tree");
+        assert!(git(&own, &["status", "--porcelain"]).unwrap().trim().is_empty(), "and the tree is as clean as the member left it");
     }
 
     /// A trunk with a lockfile, an ignored built `target/`, and one commit.
