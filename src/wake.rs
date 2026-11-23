@@ -211,6 +211,12 @@ pub(crate) fn scopes_owed(store: &Store) -> Vec<(String, usize)> {
 /// daemon rather than on a subscription — one pass, many addressees, and each
 /// seat's backlog is its own.
 pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
+    wake_by(store, emits, at, &Primaries::real())
+}
+
+/// [`wake`], with where a user's primary is said — so a test can say who is
+/// logged in here and what the hub does with a message.
+fn wake_by(store: &Store, emits: &[Emit], at: i64, primaries: &Primaries) {
     let mut mine: BTreeMap<String, Vec<&Emit>> = BTreeMap::new();
     // **Every seat that is owed something, not only the seats with news.**
     //
@@ -242,6 +248,22 @@ pub(crate) fn wake(store: &Store, emits: &[Emit], at: i64) {
         // twice — once as the message, once as `unanswered` — and a governor
         // paying 208k a wake is the one reader who cannot afford the pair.
         if already_handed(store, e) {
+            continue;
+        }
+        // **`primary:<user>` is two places** (`wsp-418`): this spoke's own
+        // primary when the user is the one logged in here, spooled and ordered
+        // like a governor's under its slot; another user's, a message through
+        // the hub, once per level.
+        if let Some(user) = crate::governors::user_of_primary(&e.to) {
+            if !primaries.is_here(user) {
+                if e.edge == crate::cmd_watch::Edge::Up {
+                    let text = crate::cmd_watch::said_plain(e, at);
+                    let id = e.signal.record.clone().unwrap_or_else(|| format!("{}:{}", e.signal.kind.word(), e.signal.subject));
+                    route_to_primary(store, primaries, user, &e.to, &text, e.signal.record.as_deref(), Some(&id));
+                }
+                continue;
+            }
+            mine.entry(crate::governors::PRIMARY.to_string()).or_default().push(e);
             continue;
         }
         mine.entry(e.to.clone()).or_default().push(e);
@@ -384,7 +406,7 @@ stamp(rec, scope, delivered + written, &tell.why, &now);
         owed.withhold_for_a_seat(store);
         (owed.depth(), tell.why)
     });
-    Report { scope: scope.to_string(), settled: written + folded.len(), held: left, typed_at: tell.typed_at, why }
+    Report { scope: scope.to_string(), settled: written + folded.len(), held: left, typed_at: tell.typed_at, why, routed_to: None }
 }
 
 /// Take off a scope's spool what [`Spool::stale`] names, inside the lock, and
@@ -465,11 +487,14 @@ pub(crate) struct Report {
     pub(crate) typed_at: Option<i64>,
     /// Why it is still holding, in the words `--status` prints.
     pub(crate) why: String,
+    /// Set when the sentence went to another user's primary through the hub
+    /// rather than to a seat here (`wsp-418`): whose.
+    pub(crate) routed_to: Option<String>,
 }
 
 impl Report {
     fn at_rest() -> Report {
-        Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET.into() }
+        Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET.into(), routed_to: None }
     }
 
     /// Whether the seat has it now — a turn, not a send. See [`Delivery`].
@@ -488,6 +513,12 @@ impl Report {
     /// channel. So it names the post, says whether the seat has it or is owed
     /// it, says why in the same words `doctor` would, and points at the drain.
     pub(crate) fn said(&self, what: &str, p: &util::Paint) -> String {
+        if let Some(user) = &self.routed_to {
+            return match self.settled {
+                0 => format!("{} {} · {}", p.dim("→"), p.bold(&format!("{user}'s primary")), self.why),
+                _ => format!("{} sent to {} · through the hub, queued until it is told", p.dim("→"), p.bold(&format!("{user}'s primary"))),
+            };
+        }
         if self.arrived() {
             return format!("{} {} · the seat has it", p.dim("→"), p.bold(&self.scope));
         }
@@ -575,8 +606,27 @@ pub(crate) fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) 
 /// [`say`], with the port that reads the seat named — so a test can say what the
 /// seat is doing rather than inherit whatever a machine with no backend says.
 fn say_through(store: &Store, seats: &dyn Seats, scope: &str, text: &str, record: Option<&str>) -> Report {
+    say_by(store, seats, scope, text, record, &Primaries::real())
+}
+
+/// [`say_through`], with where a user's primary is said.
+fn say_by(store: &Store, seats: &dyn Seats, scope: &str, text: &str, record: Option<&str>, primaries: &Primaries) -> Report {
     let at = util::epoch_secs();
-    let key = key_for(scope);
+    // **A sentence for `primary:<user>`** (`wsp-418`): through the hub when it is
+    // another user's, else this spoke's own primary slot, the same spool and
+    // order path as any governor. The record's hop names the scope it was asked
+    // for, which is the one the attention pass looks for.
+    let slot;
+    let (spool_scope, key) = match crate::governors::user_of_primary(scope) {
+        Some(user) if !primaries.is_here(user) => {
+            return route_to_primary(store, primaries, user, scope, text, record, record);
+        }
+        Some(_) => {
+            slot = crate::governors::PRIMARY;
+            (slot, key_for(slot))
+        }
+        None => (scope, key_for(scope)),
+    };
     // Written before anything is attempted, and the durability is the reason
     // this is inside the lock rather than after the send: a sentence that has
     // been accepted and lost between the two is the one loss nothing can detect.
@@ -588,7 +638,98 @@ fn say_through(store: &Store, seats: &dyn Seats, scope: &str, text: &str, record
         // either way, and the only thing this hop suppresses is the duplicate.
         let _ = crate::message::sent(store, id, scope);
     }
-    deliver_to(store, seats, scope, &[], at)
+    deliver_to(store, seats, spool_scope, &[], at)
+}
+
+/// Where a user's primary is, and how a sentence for another user's leaves this
+/// spoke (`wsp-418`).
+///
+/// `primary:<user>` is this spoke's own primary slot when `<user>` is the user
+/// logged in here (or nobody is: a spoke with no login has one primary, and it
+/// is that), and another spoke's otherwise — which only the hub reaches.
+struct Primaries<'a> {
+    /// The user logged in here.
+    me: Option<String>,
+    /// A message for `primary:<user>` through the hub: the hub's id for it.
+    route: &'a dyn Fn(&Store, &str, &str) -> Result<String, String>,
+}
+
+impl Primaries<'static> {
+    fn real() -> Primaries<'static> {
+        Primaries { me: crate::address::logged_in_user(), route: &through_the_hub }
+    }
+}
+
+impl Primaries<'_> {
+    fn is_here(&self, user: &str) -> bool {
+        self.me.as_deref().map(str::trim).is_none_or(|me| me == user.trim())
+    }
+}
+
+/// `text` to `to` (`primary:<user>`) as a routed message of the hub's
+/// (`wsp-470`): the hub queues it for an offline spoke and tells it once.
+fn through_the_hub(store: &Store, to: &str, text: &str) -> Result<String, String> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").ok_or("no HOME")?);
+    if !home.join(wsp_client::HUBS_FILE).exists() {
+        return Err("not logged in to a hub: `wsp login <url>`".into());
+    }
+    let book = crate::address::Book::read(store);
+    match crate::cmd_message::hub_tell(store, &home, &book, to, text, None, "wsp", None) {
+        Some(Ok((id, ..))) => Ok(id),
+        Some(Err(why)) => Err(why),
+        None => Err(format!("`{to}` is not another user's primary")),
+    }
+}
+
+/// A sentence for another user's primary, sent through the hub **once**: `once`
+/// names it (a record's id, or a level's key), and a name sent before is not
+/// sent again however many passes ask. What was sent is the record's `Sent` hop
+/// to the scope, so the attention pass does not derive it again either.
+///
+/// A refusal is not remembered, so the next pass tries again: the sentence is
+/// held on the record, and the report says why it has not gone.
+fn route_to_primary(
+    store: &Store,
+    primaries: &Primaries,
+    user: &str,
+    scope: &str,
+    text: &str,
+    record: Option<&str>,
+    once: Option<&str>,
+) -> Report {
+    let report = |settled: usize, why: String| Report {
+        scope: scope.to_string(),
+        settled,
+        held: 0,
+        typed_at: None,
+        why,
+        routed_to: Some(user.to_string()),
+    };
+    let sent_key = format!("routed:{scope}");
+    if let Some(id) = once {
+        let before = store.watches().get(&sent_key).and_then(|r| r.get(id)).is_some();
+        if before {
+            return report(0, "already sent through the hub".into());
+        }
+    }
+    match (primaries.route)(store, scope, text) {
+        Ok(hub_id) => {
+            if let Some(id) = once {
+                store.update_watch(&sent_key, |rec| {
+                    if !rec.is_object() {
+                        *rec = serde_json::json!({});
+                    }
+                    rec[id] = serde_json::Value::from(hub_id.clone());
+                });
+            }
+            if let Some(id) = record {
+                let _ = crate::message::sent(store, id, scope);
+            }
+            crate::store::log_line(store, &format!("told {scope}: sent to {user}'s primary through the hub ({hub_id})"));
+            report(1, hub_id)
+        }
+        Err(why) => report(0, format!("the hub did not take it: {why}")),
+    }
 }
 
 /// How a seat that has tells held for it reads right now.
@@ -1661,6 +1802,97 @@ mod tests {
         wake(&store, &[emit(Kind::Review, "core", "a-1")], 0);
         wake(&store, &[emit(Kind::Review, "core", "a-1")], 60);
         assert_eq!(spool_of(&store, "core").depth(), 2, "both are owed; neither was swallowed as a repeat");
+    }
+
+    /// What the hub was sent, for a test that has no hub.
+    fn counted() -> (std::cell::RefCell<Vec<(String, String)>>,) {
+        (std::cell::RefCell::new(Vec::new()),)
+    }
+
+    fn an_ask_about(store: &Store, row: &str) -> crate::message::Message {
+        let mut t = crate::model::Task::new("the work", row);
+        t.project = Some("core".into());
+        store.save_task(&t).unwrap();
+        let q = crate::message::Message::question(
+            crate::message::Party::seat("core"),
+            crate::message::Kind::Note,
+            "which way?",
+            crate::message::Waiting::new("w1:p1", row),
+        )
+        .about(crate::message::About::Task(row.to_string()));
+        crate::message::raise(store, &q).unwrap();
+        q
+    }
+
+    /// **`wsp-418`: on jesper's spoke, an ask for a row allocated to ed is one
+    /// routed message to `primary:ed`, not one per tick.** The pass says the same
+    /// level every tick it stands, and a message already routed is not routed
+    /// again — by the record's hop, and by what was sent for a level with no
+    /// record. Nothing is spooled on this spoke for a seat that is not here.
+    #[test]
+    fn an_ask_for_another_users_primary_is_one_routed_message_not_one_per_tick() {
+        let env = util::isolated("wake-primary-other");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let q = an_ask_about(&store, "e-1");
+        let (sent,) = counted();
+        let route = |_: &Store, to: &str, text: &str| -> Result<String, String> {
+            sent.borrow_mut().push((to.to_string(), text.to_string()));
+            Ok(format!("hub-{}", sent.borrow().len()))
+        };
+        let primaries = Primaries { me: Some("jesper".into()), route: &route };
+
+        let mut up = emit(Kind::Unanswered, "primary:ed", "e-1");
+        up.signal.record = Some(q.id.clone());
+        for tick in 0..4 {
+            wake_by(&store, &[up.clone()], tick * 20, &primaries);
+        }
+        let told = sent.borrow().clone();
+        assert_eq!(told.len(), 1, "one message however many passes: {told:?}");
+        assert_eq!(told[0].0, "primary:ed", "to ed's primary");
+        assert_eq!(spool_of(&store, "primary:ed").depth(), 0, "and nothing is spooled here for a seat that is not here");
+        assert_eq!(spool_of(&store, "primary").depth(), 0, "jesper's own primary is not told ed's ask");
+
+        // The same words said by `wsp ask` itself, twice: still the one.
+        let first = say_by(&store, &crate::cycle::Fleet, "primary:ed", "which way?", Some(&q.id), &primaries);
+        assert_eq!(sent.borrow().len(), 1, "already sent: {}", first.why);
+        assert!(first.said("ed's primary", &util::Paint::plain()).contains("ed's primary"), "{}", first.said("x", &util::Paint::plain()));
+
+        // A level with no record is one send too, and a down edge is not sent.
+        let bare = emit(Kind::NeedsAPerson, "primary:ed", "e-2");
+        wake_by(&store, &[bare.clone()], 100, &primaries);
+        wake_by(&store, &[bare.clone()], 120, &primaries);
+        let mut down = bare;
+        down.edge = Edge::Down;
+        wake_by(&store, &[down], 140, &primaries);
+        assert_eq!(sent.borrow().len(), 2, "the second level once, its clearing not at all");
+
+        // A hub that does not take it is tried again on the next pass.
+        let refuse = |_: &Store, _: &str, _: &str| -> Result<String, String> { Err("no hub".into()) };
+        let down_hub = Primaries { me: Some("jesper".into()), route: &refuse };
+        let r = say_by(&store, &crate::cycle::Fleet, "primary:ed", "again", None, &down_hub);
+        assert_eq!(r.settled, 0);
+        assert!(r.why.contains("no hub"), "{}", r.why);
+    }
+
+    /// **`wsp-418`: the same ask on ed's own spoke is spooled for his primary**, the
+    /// slot under the one name every governor spool has, and routed nowhere.
+    #[test]
+    fn an_ask_for_this_users_primary_is_spooled_for_the_local_primary_slot() {
+        let env = util::isolated("wake-primary-own");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let q = an_ask_about(&store, "e-1");
+        let route = |_: &Store, to: &str, _: &str| -> Result<String, String> { panic!("{to} is here: nothing goes to the hub") };
+        let primaries = Primaries { me: Some("ed".into()), route: &route };
+
+        wake_by(&store, &[emit(Kind::Unanswered, "primary:ed", "e-1")], 0, &primaries);
+        assert_eq!(spool_of(&store, "primary").depth(), 1, "held for the primary slot, as a governor's is");
+        assert_eq!(spool_of(&store, "primary:ed").depth(), 0);
+
+        say_by(&store, &crate::cycle::Fleet, "primary:ed", "which way?", Some(&q.id), &primaries);
+        assert_eq!(spool_of(&store, "primary").depth(), 2, "a said sentence goes to the same spool");
+        assert!(store.message(&q.id).unwrap().handed_to("primary:ed"), "and the record says the primary was handed it");
     }
 
     fn holding(store: &Store, scope: &str) -> String {

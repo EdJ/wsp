@@ -3259,6 +3259,12 @@ fn column(word: &str, at: i64, said: &str, p: &Paint) -> String {
     format!("{} {} {}", p.dim(&clock(at)), p.dim(&util::pad(word, 14)), p.dim(said))
 }
 
+/// An emit as the one plain line a person reads (`wsp-418`: what goes to another
+/// user's primary through the hub, which has no spool to render it from).
+pub(crate) fn said_plain(e: &Emit, at: i64) -> String {
+    line(e, at, &Paint::plain())
+}
+
 /// One line, as a person reads it.
 fn render(l: &Line, at: i64, p: &Paint) -> String {
     match l {

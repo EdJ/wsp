@@ -371,7 +371,12 @@ fn route_with(
     m.about
         .task()
         .and_then(|id| store.find_task(id))
-        .and_then(|t| crate::governors::seat_for(governors, index, lists.list_of(&t.id), t.project.as_deref(), None))
+        .and_then(|t| {
+            // The row's allocation too (`wsp-418`): past the project levels the
+            // answer is its user's primary.
+            let user = store.allocated_to(&t.id);
+            crate::governors::seat_for(governors, index, lists.list_of(&t.id), t.project.as_deref(), user.as_deref())
+        })
         .map(|s| On::Seat(s.scope))
         .unwrap_or(On::Person)
 }

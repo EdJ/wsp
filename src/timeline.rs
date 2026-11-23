@@ -462,6 +462,12 @@ pub(crate) const PERSON_STEP_CAUSE: &str = "the row waits for a person's step";
 /// Whether a decision says the row holds for the person: it names the person
 /// and says `hold`, or that it waits until the person or for the person
 /// (`wsp-303`'s d5: "hold until the person detaches").
+/// A message's `for` that names the person: `"person"`, or `"person:<user>"` of
+/// an allocated row's question escalated past its user's primary (`wsp-418`).
+fn for_the_person(f: &serde_json::Value) -> bool {
+    f.as_str().is_some_and(|s| s == "person" || s.starts_with("person:"))
+}
+
 fn holds_for_person(text: &str) -> bool {
     let t = text.to_lowercase();
     if !t.contains("person") {
@@ -491,7 +497,7 @@ fn person_step(i: &Inputs, since: i64, from: i64, to: i64) -> Option<(i64, i64, 
     }
     let id = i.id.as_str();
     let msgs: Vec<&(i64, String, Value)> = i.events.iter().filter(|(_, k, d)| k == "message-raised" && d["about"]["task"] == id).collect();
-    for (t, _, d) in msgs.iter().filter(|(t, _, d)| *t >= since && *t < to && d["shape"] == "question" && d["for"] == "person" && d["from"]["pane"].is_string()) {
+    for (t, _, d) in msgs.iter().filter(|(t, _, d)| *t >= since && *t < to && d["shape"] == "question" && for_the_person(&d["for"]) && d["from"]["pane"].is_string()) {
         let Some(mid) = d["id"].as_str() else { continue };
         let answer = msgs.iter().filter(|(a, _, r)| *a > *t && r["reply_to"] == mid).map(|(a, _, _)| *a).min();
         if answer.is_some_and(|a| a <= from) {
@@ -2175,7 +2181,7 @@ pub(crate) fn idle_markers(i: &Inputs) -> Vec<(i64, String)> {
         let Some(mid) = d["id"].as_str() else { continue };
         if d["shape"] == "question" && d["from"]["pane"].is_string() {
             let routed = held.iter().find(|h| h.2 == Some(mid)).map(|h| h.1);
-            let addressed = if d["for"]["seat"].is_string() { Some(Whom::Governor) } else if d["for"] == "person" { Some(Whom::Person) } else { None };
+            let addressed = if d["for"]["seat"].is_string() { Some(Whom::Governor) } else if for_the_person(&d["for"]) { Some(Whom::Person) } else { None };
             if let Some(w) = routed.or(addressed) {
                 asked.push(mid);
                 out.push((*t, w.waiting(&format!("question {mid}"))));

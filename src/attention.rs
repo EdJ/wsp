@@ -361,8 +361,24 @@ fn deliver(store: &Store, emits: &[Emit]) {
         //
         // The address is now taken once, with the predicate, and the ledger
         // remembers it; what arrives here is who this particular line is for.
-        store.log_event(event_kind(e.edge), payload(&e.signal, e.edge, &e.to, &stamp, e.held));
+        let mut v = payload(&e.signal, e.edge, &e.to, &stamp, e.held);
+        // **An ask escalated past `primary:<user>` is that user's** (`wsp-418`):
+        // shown under them, `for <user>`, so Needs you says whose it is.
+        if let Some(user) = for_user(store, &e.signal) {
+            v["for"] = json!(user);
+            if let Some(text) = v["text"].as_str() {
+                v["text"] = json!(format!("for {user} · {text}"));
+            }
+        }
+        store.log_event(event_kind(e.edge), v);
     }
+}
+
+/// The user a level's record is `for: person:<user>` — a question escalated past
+/// that user's primary (`wsp-418`) — if it is one.
+fn for_user(store: &Store, signal: &Signal) -> Option<String> {
+    let m = store.message(signal.record.as_deref()?)?;
+    m.for_person.then_some(m.person).flatten()
 }
 
 /// One edge, as `wsp-095` Part 4's envelope plus the two things an envelope has
@@ -679,6 +695,36 @@ mod tests {
 
     fn stall(subject: &str) -> Signal {
         Signal::new(Kind::NeedsAPerson, subject, "w1:p1 · no turn running")
+    }
+
+    /// **`wsp-418`: an ask escalated past `primary:<user>` is shown under that
+    /// user** — the level's line says `for ed`, and the event carries who.
+    #[test]
+    fn an_ask_escalated_past_a_primary_is_shown_for_its_user() {
+        let (_env, store) = store("for-user");
+        task(&store, "e-1", None);
+        let mut q = crate::message::Message::question(
+            crate::message::Party::seat("primary:ed"),
+            crate::message::Kind::Note,
+            "which way?",
+            crate::message::Waiting::new("w1:p1", "e-1"),
+        )
+        .about(crate::message::About::Task("e-1".into()));
+        q.for_person = true;
+        q.person = Some("ed".into());
+        crate::message::raise(&store, &q).unwrap();
+        let mut sig = Signal::new(Kind::Unanswered, "e-1", "w1:p1 waiting · which way?");
+        sig.record = Some(q.id.clone());
+        let mut pass = Pass::new();
+        tick(&store, &mut pass, &mut Fake(&store, vec![]), 0);
+        tick(&store, &mut pass, &mut Fake(&store, vec![sig, stall("e-1")]), 60);
+
+        let sent = store.events_of("attention-raised");
+        let line = sent.iter().find(|v| v["signal"] == "unanswered").expect("the ask is raised");
+        assert_eq!(line["for"], "ed", "under its user");
+        assert!(line["text"].as_str().unwrap().starts_with("for ed · "), "{}", line["text"]);
+        let other = sent.iter().find(|v| v["signal"] != "unanswered").expect("a stall");
+        assert!(other.get("for").is_none(), "a level that is nobody's in particular is not shown for anyone");
     }
 
     /// Every `attention-*` line in the log, oldest first.
