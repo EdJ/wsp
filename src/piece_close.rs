@@ -92,6 +92,12 @@ pub(crate) fn close_with(store: &Store, row: &str, batch: usize, standing: &dyn 
         return Closed::Held(format!("{row} has no tree of its own to merge in"));
     };
     let done: Vec<&Piece> = members.iter().copied().filter(|p| p.state == State::Done).collect();
+    // What runs the batch's checks, chosen before anything is merged: a
+    // manager that cannot be reached holds the batch with nothing done.
+    let runner = match check::Runner::chosen(store, check::Whose::Row(row), check::TreeKind::Work, &row_dir, None) {
+        Ok(r) => r,
+        Err(why) => return Closed::Held(why),
+    };
 
     // ---- merge
     let branched: Vec<&Piece> = done.iter().copied().filter(|p| p.tree.is_some()).collect();
@@ -139,7 +145,7 @@ pub(crate) fn close_with(store: &Store, row: &str, batch: usize, standing: &dyn 
         let reuse = ledger.as_ref().map(|g| Reuse { greens: g, sha: &head, env: greens::Env::Warm, who: row });
         let dir = store.state_file("checks");
         let _ = std::fs::create_dir_all(&dir);
-        let results = check::run_all(&row_dir, &steps, &dir.join(format!("{row}-batch-{batch}.log")), reuse.as_ref(), |_| {});
+        let results = check::run_all(&row_dir, &steps, &dir.join(format!("{row}-batch-{batch}.log")), reuse.as_ref(), &runner, |_| {});
         let (r, n) = check::tally(&results);
         (reused, ran) = (r, n);
         // `wsp-067`: a tree that went under the run is no red to file a fix for.

@@ -309,8 +309,13 @@ pub struct Show<'a> {
     pub stage: Option<Stage>,
 }
 
-/// `show --json`, pretty.
+/// `show --json`, pretty: [`show_json`] as the CLI prints it.
 pub fn show(row: &Row, s: &Show) -> String {
+    serde_json::to_string_pretty(&show_json(row, s)).unwrap_or_default()
+}
+
+/// `show --json`'s document, the value the API's `show` answers (wsp-307).
+pub fn show_json(row: &Row, s: &Show) -> Value {
     let mut v = task_json(row);
     v["body"] = json!(s.body);
     if let Some(path) = &s.archived {
@@ -327,5 +332,5 @@ pub fn show(row: &Row, s: &Show) -> String {
     v["pieces"] = pieces_json(&s.pieces);
     v["stage"] = json!(s.stage.as_ref().map(stage_json));
     v["stages"] = json!(s.stage.as_ref().map(|g| g.steps.iter().map(Step::json).collect::<Vec<_>>()));
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+    v
 }

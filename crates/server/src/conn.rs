@@ -5,10 +5,26 @@
 //! - A read verb is one call on the store's `Reads` or `Events` (`lists`,
 //!   `asks`, `machines`, and `orders` of no seat, which `Reads` has no verb
 //!   for, read the one `snapshot`).
+//! - `throttle`, `spend` and `show` are the CLI's documents, from the
+//!   [`crate::Views`] the server was started with (wsp-307), `unsupported`
+//!   without one.
 //! - `subscribe` is answered `subscribed`, or `too_old`; then the
 //!   `subscribe` module's thread writes its feed beside the replies.
-//! - Every command verb is `unsupported` at step 1. A verb this build does not
-//!   know is `unsupported`; a known verb whose `args` did not fit, `malformed`.
+//! - A command [`Orders::owns`] is applied through the store's `apply`, under
+//!   the request's key and the connection's principal, and answered `applied`
+//!   with the events it wrote (none for a repeat of a key: the first result).
+//!   Who may send it is checked first ([`may_command`]): `order.send` and
+//!   `order.cancel` a person or a seat; `order.deliver` and the executor's
+//!   answers (`order.delivered`, `order.acked`, `order.refused`,
+//!   `order.done`) only the instance itself (`wsp:<instance>`) or a manager,
+//!   because delivery and the fold apply them in process. Anyone else is
+//!   refused `unauthorised`; a command with no key, `invalid`. Whether the
+//!   machine decides them is the store's domain's business
+//!   ([`crate::domain::Mode`]): under `Mirrored` they come back `illegal`,
+//!   state `mirrored`.
+//! - Every other command verb (`mirror` included: the daemon applies it in
+//!   process) is `unsupported`. A verb this build does not know is
+//!   `unsupported`; a known verb whose `args` did not fit, `malformed`.
 //! - A line that does not decode is answered `malformed` and the connection
 //!   stays up: as a reply to its `id` when it has one, else as `refused`.
 //! - A request whose `by` is not the hello's is `forbidden`; one whose `v` is
@@ -28,7 +44,8 @@ use wsp_api::{
     Answer, Call, Code, ConnError, Connection, Failure, Frame, Hello, Outcome, Refused, Reply, ReqId, Request, Verb,
     Welcome, COMMAND_VERBS, MAX_EVENTS, MISSED_BEATS, PROTOCOL, READ_VERBS,
 };
-use wsp_store_contract::{Error, Refusal};
+use wsp_machines::Orders;
+use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal};
 
 use crate::tcp::Tcp;
 use crate::{subscribe, Shared};
@@ -204,13 +221,7 @@ impl Client<'_> {
         let outcome = match req.call {
             Call::Verb(Verb::Subscribe(sub)) => return self.subscribe(id, sub),
             Call::Verb(verb) => read(self.shared, verb),
-            Call::Command(cmd) => {
-                let verb = serde_json::to_value(&cmd)
-                    .ok()
-                    .and_then(|v| v.get("verb").and_then(Value::as_str).map(str::to_string))
-                    .unwrap_or_default();
-                Err(failure(Code::Unsupported, format!("{verb} is a command, and step 1's server runs none")))
-            }
+            Call::Command(cmd) => return self.command(id, req.key, cmd),
             Call::Unknown { verb, .. } => {
                 if READ_VERBS.contains(&verb.as_str()) || COMMAND_VERBS.contains(&verb.as_str()) {
                     Err(failure(Code::Malformed, format!("{verb}'s args do not fit it")))
@@ -220,6 +231,38 @@ impl Client<'_> {
             }
         };
         send(&self.writer, &reply(id, outcome))
+    }
+
+    /// One command: the orders machine's, from a principal that may send it,
+    /// with a key, applied; every other `unsupported`.
+    fn command(&mut self, id: ReqId, key: Option<IdempotencyKey>, cmd: Command) -> bool {
+        let verb = verb_of(&cmd);
+        if !Orders::owns(&cmd) {
+            let text = format!("{verb} is a command this server does not run over the API");
+            return send(&self.writer, &reply(id, Err(failure(Code::Unsupported, text))));
+        }
+        let by = &self.hello.by;
+        if !may_command(&self.shared.cfg.instance, by, &cmd) {
+            let text = if matches!(cmd, Command::OrderSend { .. } | Command::OrderCancel { .. }) {
+                format!("{verb} is sent by a person or a seat, not {}", wsp_api::principal::text(by))
+            } else {
+                format!(
+                    "{verb} is applied in process: only wsp:{} or a manager sends it, not {}",
+                    self.shared.cfg.instance,
+                    wsp_api::principal::text(by)
+                )
+            };
+            return send(&self.writer, &reply(id, Err(failure(Code::Unauthorised, text))));
+        }
+        let Some(key) = key else {
+            let text = format!("{verb} needs an idempotency key (the request's `key`)");
+            return send(&self.writer, &reply(id, Err(failure(Code::Invalid, text))));
+        };
+        let frame = match self.shared.store.apply(cmd, key, by.clone()) {
+            Ok(applied) => Frame::Reply(Reply { id, outcome: Outcome::Ok(Answer::Applied), events: applied.events }),
+            Err(e) => reply(id, Err(store_failure(e))),
+        };
+        send(&self.writer, &frame)
     }
 
     fn subscribe(&mut self, id: ReqId, sub: wsp_api::Subscribe) -> bool {
@@ -237,6 +280,32 @@ impl Client<'_> {
         let (shared, writer, closed) = (self.shared.clone(), self.writer.clone(), self.closed.clone());
         self.feed = Some(std::thread::spawn(move || subscribe::follow(shared, writer, closed, opened)));
         true
+    }
+}
+
+/// The verb a command is, as the wire names it (`order.send`).
+fn verb_of(cmd: &Command) -> String {
+    serde_json::to_value(cmd)
+        .ok()
+        .and_then(|v| v.get("verb").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Whether `by` may send `cmd` over the API, on the instance `instance`:
+/// `order.send` and `order.cancel` a person or a seat; the orders machine's
+/// other verbs (`order.deliver` and the executor's answers) the instance
+/// itself or a manager. Any other command, nobody.
+pub(crate) fn may_command(instance: &str, by: &Principal, cmd: &Command) -> bool {
+    match cmd {
+        Command::OrderSend { .. } | Command::OrderCancel { .. } => {
+            matches!(by, Principal::Person(_) | Principal::Seat(_))
+        }
+        c if Orders::owns(c) => match by {
+            Principal::Wsp(i) => i == instance,
+            Principal::Manager(_) => true,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -309,6 +378,54 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
             s.events_after(from, limit).and_then(|events| Ok(Answer::Events { events, head: s.head()? }))
         }
         Verb::Subscribe(_) => unreachable!("subscribe is answered by its own path"),
+        Verb::Throttle(_) | Verb::Spend(_) | Verb::Show { .. } => return view(shared, verb),
     };
     r.map_err(store_failure)
+}
+
+/// A view verb, answered by the [`crate::Views`] the server was started with,
+/// whole; `unsupported` without one.
+fn view(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
+    let Some(views) = &shared.cfg.views else {
+        return Err(failure(Code::Unsupported, "this server was started with nothing that answers the view verbs".into()));
+    };
+    match verb {
+        Verb::Throttle(_) => views.throttle().map(Answer::Throttle),
+        Verb::Spend(_) => views.spend().map(Answer::Spend),
+        Verb::Show { id } => views.show(&id).map(Answer::Show),
+        _ => unreachable!("only the view verbs come here"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wsp_store_contract::{At, MachineName, OrderId, SeatId};
+
+    #[test]
+    fn who_may_send_the_orders_machines_commands() {
+        let o = OrderId("o-1".into());
+        let send = Command::OrderSend { to: SeatId("cpd-1".into()), text: "go".into(), first: false };
+        let cancel = Command::OrderCancel { order: o.clone() };
+        let acked = Command::OrderAcked { order: o.clone(), turn_began: At(1) };
+        let done = Command::OrderDone { order: o.clone() };
+        let ed = Principal::Person("ed".into());
+        let seat = Principal::Seat(SeatId("cpd-1".into()));
+        let me = Principal::Wsp("wsp".into());
+        let other = Principal::Wsp("elsewhere".into());
+        let manager = Principal::Manager(MachineName("mac".into()));
+        let executor = Principal::Executor(MachineName("mac".into()));
+        for by in [&ed, &seat] {
+            assert!(may_command("wsp", by, &send) && may_command("wsp", by, &cancel), "{by:?} sends and cancels");
+            assert!(!may_command("wsp", by, &acked) && !may_command("wsp", by, &done), "{by:?} answers nothing");
+        }
+        for by in [&me, &manager] {
+            assert!(may_command("wsp", by, &acked) && may_command("wsp", by, &done), "{by:?} answers");
+        }
+        for by in [&other, &executor] {
+            assert!(!may_command("wsp", by, &acked), "{by:?} is neither this instance nor a manager");
+        }
+        let mirror = Command::Mirror { put: vec![], gone: vec![] };
+        assert!(!may_command("wsp", &me, &mirror), "mirror is no API command");
+    }
 }

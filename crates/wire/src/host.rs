@@ -34,22 +34,19 @@
 //! host's manager, chosen by `WSP_HOST=inproc|manager` ([`chosen`]; `inproc`
 //! until wsp-029).
 //!
-//! The `ps`, `kill` and `lsof` of seat and tree work are there too, as
-//! `seats`'s process table, signals and working directories (wsp-008). Tree
-//! work's check_tree sweep, the throttle's and gc's liveness probes and a
-//! check's kill on timeout ask [`LOCAL`], so at M3 their jobs move and their
-//! calls do not.
-//!
-//! The layers below this crate (base, store) cannot name the host, so where
-//! they need a fact (a pid's liveness, when it started) their callers pass the
-//! host's answer in: `sharing::Alive`, `checks::StartOf`.
+//! The `ps` and `kill` of seat work are there too, as `seats`'s process table
+//! and signals (wsp-008). Tree work asks none of them since wsp-057: its
+//! sweep, slot probes and pid start times are gone, every run is a job
+//! ([`Host::run_job`]), and a holder's liveness is its job in a job table or
+//! a lease it beats (`wsp_store::lease`), never a probed pid.
 //!
 //! Tree work's jobs (M3, wsp-051) are [`Host::run_job`], [`Host::stop_job`]
 //! and [`Host::jobs`]: `job.run`, `job.stop` and `jobs` on [`Tcp`], and
 //! `wsp-host`'s runner in this process on [`InProcess`]. `WSP_JOBS=inproc|manager`
-//! chooses between them ([`choose_jobs`], [`jobs_chosen`]; `inproc` by
-//! default), apart from `WSP_HOST`. Nothing calls them yet; the callers move
-//! at M3's group 5.
+//! chooses between them ([`choose_jobs`], [`jobs_chosen`]; `manager` by
+//! default since wsp-056, `inproc` the rollback), apart from `WSP_HOST`. The callers move at M3's group 5, the
+//! first `throttle run` (wsp-052), which also asks [`Host::job_host`] for the
+//! name a job's place carries and [`Host::facts`] for the beat it decides on.
 //!
 //! Not in the host yet: the far machine's ssh (`far.rs`'s [`crate::far::Wire`], M2's subject), and the
 //! doctor's checks of installed hook snippets, which read config rather than a
@@ -216,9 +213,6 @@ pub trait Host: Sync {
     fn is_alive(&self, pid: u32) -> bool {
         self.alive(&[pid]).contains(&pid)
     }
-    /// When `pid` started, as `ps -o lstart=,stat=` says it with its spaces written
-    /// as `_`; `None` for no such process or a defunct one, `Err` where `ps` could not tell.
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()>;
     /// The process table a seat's running shells are read from:
     /// `ps -A -o pid=,ppid=,etime=,time=,command=`. `None` when `ps` did not run.
     fn shells(&self) -> Option<String>;
@@ -248,6 +242,12 @@ pub trait Host: Sync {
     fn signal_group(&self, group: u32, sig: &str);
     /// `lsof -d cwd -Fpn`, of `pids` alone when given: every process's working
     /// directory as lsof's field lines. `None` when `lsof` would not run.
+    ///
+    /// Not tree work's: tree work asks no pid since wsp-057. This is wsp-691's
+    /// agent-leftover stop (what an agent's shell leaves in its tree, which no
+    /// job holds), kept at the merge of wsp-368 on the person's word. Under the
+    /// manager it answers as in-process does, from this machine, until wsp-389
+    /// has the manager stop a seat's process tree itself.
     fn cwds(&self, pids: Option<&[u32]>) -> Option<String>;
 
     /// Whether `pid` is running: `kill -0`, which a zombie still answers.
@@ -269,12 +269,6 @@ pub trait Host: Sync {
     /// ([`wsp_base::base::procs::ancestors`]).
     fn processes(&self) -> Vec<(u32, u32, String)> {
         wsp_base::base::procs::read_processes(&self.table("pid=,ppid=,command=", true).unwrap_or_default())
-    }
-    /// Every process as `(pid, ppid, "")`: the parent links alone, for a caller
-    /// that only walks `ancestors`. Without `-E` the table is a fifth of the
-    /// work to read.
-    fn parents(&self) -> Vec<(u32, u32, String)> {
-        wsp_base::base::procs::read_parents(&self.table("pid=,ppid=", false).unwrap_or_default())
     }
 
     // ---- seat.read
@@ -316,6 +310,9 @@ pub trait Host: Sync {
     /// Where a Claude Code session was written, `seat.did`'s transcript ref:
     /// the file named after `cwd` first, else any project's file of that id.
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf>;
+    /// Every Claude Code transcript written in a tree whose path ends in
+    /// `tree` (`/.worktrees/<row>`), whatever session wrote it.
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf>;
     /// Where a pi session under `cwd` was written, the newest file of that id.
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf>;
     /// A transcript a line at a time; a transcript is as long as its session.
@@ -378,6 +375,20 @@ pub trait Host: Sync {
     fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
         Err(refused(wsp_host_api::Refusal::Unsupported, "this host runs no jobs"))
     }
+    /// The host its jobs run on, as its `hello` names itself: what a job's
+    /// `HostDir` names (M3 under T2, wsp-052). `None` where this host is not
+    /// asked by name (the in-process runner places a `dir` on this machine).
+    fn job_host(&self) -> Option<HostId> {
+        None
+    }
+    /// The host's facts as its manager's last beat read them (`seats`'s reply
+    /// carries them): what the throttle decides on under `WSP_JOBS=manager`
+    /// (d1 Q11, wsp-052), in place of its own `sysctl`, `pmset`, `ioreg` and
+    /// `vm_stat`. `None` with no beat yet, from a silent manager, and from the
+    /// in-process host, whose caller reads its own probes as before.
+    fn facts(&self) -> Option<wsp_host_api::HostFacts> {
+        None
+    }
 }
 
 /// The host this process is: `wsp-host`'s [`wsp_host::InProcess`], reached
@@ -385,8 +396,8 @@ pub trait Host: Sync {
 /// still names the trait to ask it anything, as it did before the move, and a
 /// second implementation (M1's `host::Tcp`) can stand where this one does.
 ///
-/// It also runs tree jobs here (`WSP_JOBS=inproc`, the default and M3's
-/// rollback): `wsp-host`'s runner ([`wsp_host::jobs`]), the code the manager
+/// It also runs tree jobs here (`WSP_JOBS=inproc`, M3's rollback; the
+/// default is `manager` since wsp-056): `wsp-host`'s runner ([`wsp_host::jobs`]), the code the manager
 /// runs them with, so a job's files, bounds and end are the same under both.
 /// Its job table is this process's; a key that ran before in another process
 /// is found by the runner's files under the exec dir and never run again.
@@ -396,7 +407,8 @@ pub struct InProcess {
     /// is [`default_exec`].
     exec: Option<PathBuf>,
     /// What a job's `dir` is under, as the manager's `--tree-root`; `None` is
-    /// the home directory, the manager's default.
+    /// the home directory, the manager's default. `choose_jobs` gives it the
+    /// root the install wrote, the one wsp places a job under.
     tree_root: Option<PathBuf>,
     jobs: Mutex<BTreeMap<JobKey, Arc<Slot>>>,
 }
@@ -470,9 +482,6 @@ impl Host for InProcess {
     }
     fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
         self.host.alive(pids)
-    }
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.host.started(pid)
     }
     fn shells(&self) -> Option<String> {
         self.host.shells()
@@ -572,6 +581,9 @@ impl Host for InProcess {
     }
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.host.transcript_of(session, cwd)
+    }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.host.transcripts_of_tree(tree)
     }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.host.pi_session_of(session, cwd)

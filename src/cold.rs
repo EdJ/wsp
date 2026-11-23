@@ -178,7 +178,11 @@ fn build(store: &Store, label: &str, n: usize, j: &Job, keep: bool, log: &Path) 
     let greens = Greens::open(store, &j.project, &j.repo);
     let who = format!("cold {label} {n}");
     let reuse = Reuse { greens: &greens, sha: &j.sha, env: Env::Cold, who: &who };
-    built.ran = check::run_every(&tree, &j.steps, log, Some(&reuse), |_| {});
+    built.ran = {
+        // The cold build stays in this process, each step a job on
+        // `wsp-host`'s runner with the tree where it is (wsp-057).
+        check::run_every(&tree, &j.steps, log, Some(&reuse), &check::Runner::Inproc, |_| {})
+    };
     if !keep {
         remove_tree(&j.repo, &tree);
     }
@@ -464,6 +468,7 @@ mod tests {
             tail: String::new(),
             first: None,
             reused: None,
+            build: None,
         };
         let red = [Built { project: "pj".into(), sha: "a".repeat(40), ran: vec![ran], could_not: None }];
         record(&store, "run", &red, 1, Path::new("/x.log"));

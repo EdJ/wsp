@@ -25,7 +25,7 @@
       },
       "said": null,
       "seat": null,
-      "since": null,
+      "since": "2026-11-18T11:06:40Z",
       "spawned_by": null,
       "state": "idle",
       "stuck": null,
@@ -99,7 +99,7 @@
   "load": null,
   "needs_you": 0,
   "review": [],
-  "throttle": "throttle: auto — in force, idle time unreadable so assuming the person is here · cpu clock 100% · check slots 0/4",
+  "throttle": "throttle: auto — in force, idle time unreadable so assuming the person is here · check slots 0/4",
   "turning": 0,
   "unreachable": null,
   "waiting": 0

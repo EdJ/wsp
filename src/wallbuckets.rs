@@ -133,18 +133,54 @@ pub(crate) struct MemberIn {
     /// `(epoch, reason)`, sorted: what the row's log says it was waiting on from
     /// that moment (`wsp-559`). The seat idle is named by the latest one.
     pub markers: Vec<(i64, String)>,
+    /// `(from, line)`: the seat waiting on a shell of its own, from when the
+    /// shell started (the line's time less the age it gives) to the line
+    /// (`compound-react-042`). It runs on past the line until the seat's next
+    /// turn or tool, whatever was told it in between: the shell ending is what
+    /// wakes the seat.
+    pub shells: Vec<(i64, i64)>,
 }
 
 /// The cause a seat idle is booked under, before the reason after ` — `.
 pub(crate) const SEAT_IDLE: &str = "the seat idle (in neither a model call nor a tool)";
 /// The reason where the log says nothing at that moment.
 pub(crate) const NONE_RECORDED: &str = "none recorded";
+/// The reason in place of [`NONE_RECORDED`] where the seat's tokens are the
+/// cost table's because no transcript of it was found: its calls are not timed,
+/// so its idle is not known to be idle (`wsp-313`).
+pub(crate) const NO_TRANSCRIPT: &str = "no call timing: the seat's transcript was not found (no session recorded for it); its tokens are the cost table's";
+/// The same where the transcript was read and its model calls carry no time.
+pub(crate) const NO_TIMESTAMPS: &str = "no call timing: the seat's transcript has no timestamps on its model calls";
 
-/// The reason the row's log gives for the seat idle at `t`: the latest marker
-/// at or before it.
+/// The reason for a seat idle on a shell of its own.
+pub(crate) const OWN_SHELLS: &str = "the seat waiting on shells of its own (wakes when they end)";
+/// The reason where the latest line was a tell, an answer or a shell of its own
+/// and the seat has taken a turn since: the line no longer says what it waits
+/// on, and nothing later does.
+pub(crate) const MOVED_SINCE: &str = "the seat moved since the last line (a tell, an answer or its own shell): no line says what it waits on";
+
+/// Whether the seat started a turn or a tool in `(a, b]`.
+fn moved_in(m: &MemberIn, a: i64, b: i64) -> bool {
+    m.active.iter().any(|(s, _)| *s > a && *s <= b)
+}
+
+/// The reason the row's log gives for the seat idle at `t`. A shell of its own
+/// running is that, whatever was told it (`compound-react-042`); otherwise the
+/// latest marker at or before `t`, where a tell, an answer or a shell lasts only
+/// until the seat moves after it.
 fn idle_reason(m: &MemberIn, t: i64) -> &str {
+    if m.shells.iter().any(|(from, line)| *from <= t && (t <= *line || !moved_in(m, *line, t))) {
+        return OWN_SHELLS;
+    }
     let n = m.markers.partition_point(|(a, _)| *a <= t);
-    if n == 0 { NONE_RECORDED } else { &m.markers[n - 1].1 }
+    if n == 0 {
+        return NONE_RECORDED;
+    }
+    let (at, why) = &m.markers[n - 1];
+    if (why.starts_with("told:") || why.starts_with("answered:") || why == OWN_SHELLS) && moved_in(m, *at, t) {
+        return MOVED_SINCE;
+    }
+    why
 }
 
 /// Seat-idle seconds by reason, from a group's `waits`.
@@ -321,6 +357,7 @@ pub(crate) fn group_wall_for(members: &[MemberIn], open: Option<i64>, pass: Opti
             cuts.extend([*a, *b]);
         }
         cuts.extend(m.markers.iter().map(|(t, _)| *t));
+        cuts.extend(m.shells.iter().flat_map(|(a, b)| [*a, *b]));
     }
     cuts.retain(|t| *t >= first && *t <= close);
     cuts.sort_unstable();
@@ -405,6 +442,7 @@ mod tests {
             blocked: blocked.to_vec(),
             measured: true,
             markers: Vec::new(),
+            shells: Vec::new(),
         }
     }
 
@@ -626,6 +664,24 @@ mod tests {
         assert_eq!(by.get("told: the seat has the sentence"), Some(&100));
         assert_eq!(by.get("reopened: the seat is on the send-back"), Some(&390));
         assert_eq!(by.values().sum::<i64>(), 890, "every idle second of 100-990 carries a reason");
+    }
+
+    /// compound-react-042: a tell or an answer names the seat idle only until
+    /// the seat moves after it; a shell of its own names it whatever was told
+    /// it, until the seat's next turn.
+    #[test]
+    fn a_tell_lasts_until_the_seat_moves_and_a_shell_of_its_own_outlasts_a_tell() {
+        let mut m = seat("r-1", 0, 1000, &[(10, 100), (300, 310), (700, 800)], &[]);
+        m.markers = vec![(200, "told: the seat has the sentence".into()), (500, "answered: the seat has the answer and has not moved yet".into())];
+        m.shells = vec![(450, 600)];
+        let g = group_wall(&[m], None, Some(1000)).unwrap();
+        let by = seat_idle_reasons(g.waits.iter().map(|((_, c), s)| (c.as_str(), *s)));
+        assert_eq!(by.get(NONE_RECORDED), Some(&100), "100-200");
+        assert_eq!(by.get("told: the seat has the sentence"), Some(&100), "200-300, to the seat's turn");
+        assert_eq!(by.get(MOVED_SINCE), Some(&(140 + 200)), "310-450 after the tell, and 800-1000 after the shell's turn");
+        assert_eq!(by.get(OWN_SHELLS), Some(&250), "450-700: the answer at 500 and the line at 600 do not end it, the turn at 700 does");
+        assert!(!by.contains_key("answered: the seat has the answer and has not moved yet"), "{by:?}");
+        assert_eq!(by.values().sum::<i64>(), 790, "every idle second carries one reason");
     }
 
     #[test]

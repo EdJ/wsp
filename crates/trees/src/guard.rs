@@ -530,6 +530,11 @@ mod tests {
             .arg(dir)
             .args(args)
             .env_remove("GIT_INDEX_FILE")
+            // The machine's own git config is not this test's: a global
+            // `tag.gpgsign` turns `git tag v1` into an annotated tag that asks
+            // for a message, and the test fails on that machine alone.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")

@@ -48,12 +48,12 @@ pub(crate) fn crates(tree: &Path) -> Option<Vec<Crate>> {
     crates_of(&metadata(tree)?)
 }
 
-/// `cargo metadata --no-deps` in `tree`.
+/// `cargo metadata --no-deps` in `tree`, run by the real cargo ([`cargo`]).
 fn metadata(tree: &Path) -> Option<serde_json::Value> {
     if !tree.join("Cargo.toml").exists() {
         return None;
     }
-    let out = Command::new("cargo")
+    let out = Command::new(cargo())
         .args(["metadata", "--no-deps", "--format-version", "1", "--offline"])
         .current_dir(tree)
         .stdin(Stdio::null())
@@ -64,6 +64,17 @@ fn metadata(tree: &Path) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_slice(&out.stdout).ok()
+}
+
+/// The cargo [`metadata`] runs: the first on `PATH` that is not wsp's own
+/// build-throttle shim (wsp-367). The read compiles nothing, so it is no build
+/// to throttle; through the shim under `WSP_JOBS=manager` it is a manager job,
+/// refused (126) in any directory outside the manager's tree root, such as a
+/// temporary repository or a `git archive` copy. That refusal read as "cargo
+/// metadata failed", so every key there came out whole and no crate was placed.
+fn cargo() -> PathBuf {
+    let path = std::env::var("PATH").unwrap_or_default();
+    crate::throttle::real_tool("cargo", &path, Path::new("")).unwrap_or_else(|| PathBuf::from("cargo"))
 }
 
 /// The crates in a `cargo metadata` answer.

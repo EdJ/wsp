@@ -349,12 +349,10 @@ AGENTS
                                     seat, back on the session it was on — which
                                     may reach further back than the last census.
                                     --print says how to do it by hand
-  wsp reap <pid>… | --list          stop processes by pid, never by pattern: a dev
-                                    or test tool over an hour old in the tree of a
-                                    row no seat or claim holds, a zsh busy loop, a test
-                                    binary idle 15 min in a finished tree. Never
-                                    a live seat's. The primary any such pid; a
-                                    governor those in its list's trees
+  wsp reap --list                   what this host's manager runs: its seats and its
+                                    jobs, read from the manager. wsp stops no
+                                    process by pid (`wsp reap <pid>` is removed):
+                                    a seat's end with it, a job's with the job
   wsp mandate [<proj>] [--clear]    standing direction: work here without asking
   wsp govern [<proj>]               who is in every seat, or in the one named.
                                     Reports only: it never takes a seat

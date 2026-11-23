@@ -4,7 +4,13 @@
 //! and `too_old`), the silent client dropped, two subscribers in one order,
 //! the start refused while another server answers, and the mirror domain:
 //! silent for an unchanged entity, and its fold equal to the snapshot (2.3
-//! case 6, run with `Mirror` as the domain).
+//! case 6, run with `Mirror` as the domain). Step 2 (wsp-121): the composed
+//! domain under `Owned` applies a client's `order.send` once per key and its
+//! `order.queued` reaches a subscriber, refuses a seat's `order.acked`
+//! `unauthorised` and a `mirror` putting an order `illegal`, state `owned`;
+//! under `Mirrored`, `order.send` is `illegal`, state `mirrored`.
+//! The view verbs (wsp-307): whatever the `Views` hand in, whole, and
+//! `unsupported` without them.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -21,7 +27,7 @@ use wsp_api::{
     ReqId, Request, Subscribe, Verb, LISTEN_FILE, PROTOCOL, TOKEN_FILE,
 };
 use wsp_server::tcp::Tcp;
-use wsp_server::{Config, Mirror, Server, SharedStore, StartError};
+use wsp_server::{Composed, Config, Mirror, Mode, Server, SharedStore, StartError, OWNED};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
 
@@ -70,30 +76,47 @@ fn hello(token: ApiToken) -> Frame {
     Frame::Hello(Hello { token, by: ed(), client: "wsp-server tests".into(), protocol: PROTOCOL })
 }
 
-/// A welcomed client, and the frames it has read past while waiting for a reply.
+/// A welcomed client, who it is, and the frames it has read past while waiting for a reply.
 struct Client {
     conn: Tcp,
+    by: Principal,
     next: u64,
     feed: Vec<Feed>,
 }
 
 fn connect(dir: &Path) -> Client {
+    connect_as(dir, ed())
+}
+
+fn connect_as(dir: &Path, by: Principal) -> Client {
     let mut conn = Tcp::dial(addr(dir), WAIT).unwrap();
-    conn.send(&hello(token(dir))).unwrap();
+    let hello = Frame::Hello(Hello { token: token(dir), by: by.clone(), client: "wsp-server tests".into(), protocol: PROTOCOL });
+    conn.send(&hello).unwrap();
     match conn.recv(WAIT).unwrap() {
         Some(Frame::Welcome(w)) => assert_eq!((w.server.as_str(), w.protocol), ("wsp", PROTOCOL)),
         other => panic!("expected welcome, got {other:?}"),
     }
-    Client { conn, next: 1, feed: vec![] }
+    Client { conn, by, next: 1, feed: vec![] }
 }
 
 impl Client {
     fn send(&mut self, call: Call) -> ReqId {
+        self.send_keyed(call, None)
+    }
+
+    fn send_keyed(&mut self, call: Call, key: Option<&str>) -> ReqId {
         let id = ReqId(self.next);
         self.next += 1;
-        let req = Request { v: PROTOCOL, id, key: None, by: ed(), call };
+        let key = key.map(|k| IdempotencyKey(k.into()));
+        let req = Request { v: PROTOCOL, id, key, by: self.by.clone(), call };
         self.conn.send(&Frame::Request(req)).unwrap();
         id
+    }
+
+    /// A command under `key` (none when `None`), and its whole reply.
+    fn command(&mut self, cmd: Command, key: Option<&str>) -> Reply {
+        let id = self.send_keyed(Call::Command(cmd), key);
+        self.reply(id)
     }
 
     /// The reply to `id`; feed frames read past are kept.
@@ -210,6 +233,8 @@ fn everything() -> Vec<Entity> {
             text: "go".into(),
             state: OrderState::Queued,
             attempts: 0,
+            first: false,
+            why: None,
         }),
         Entity::Ask(Ask {
             id: AskId("a-1".into()),
@@ -455,6 +480,81 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     // `state` is unchanged: the done row's body is there.
     assert_eq!(c.read(Verb::State(NoArgs {})), Answer::State { state: full.clone(), at });
     assert!(full.rows[&RowId("wsp-4".into())].fields.contains_key("body"));
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// What a daemon hands in for the view verbs, faked: fixed documents, a `show`
+/// that knows one id, and a count of the calls (wsp-307).
+struct FakeViews {
+    calls: AtomicUsize,
+}
+
+impl wsp_server::Views for FakeViews {
+    fn throttle(&self) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "builds": [] }))
+    }
+    fn spend(&self) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "currency": "USD", "rows": { "landed_30d": 2, "cost_per_landed_row": 1.75 } }))
+    }
+    fn show(&self, id: &str) -> std::result::Result<serde_json::Value, wsp_api::Failure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match id {
+            "wsp-1" => Ok(json!({ "id": "wsp-1", "body": "the body\n" })),
+            _ => Err(wsp_api::Failure { code: Code::NotFound, text: format!("no task {id}"), refusal: None }),
+        }
+    }
+}
+
+#[test]
+fn the_view_verbs_answer_what_the_views_hand_in_whole_and_are_unsupported_without_them() {
+    let d = dir("views");
+    let views = Arc::new(FakeViews { calls: AtomicUsize::new(0) });
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.views = Some(views.clone());
+    let server = Server::start(Arc::new(mirror_store()), cfg).unwrap();
+    let mut c = connect(&d);
+    assert_eq!(
+        c.read(Verb::Throttle(NoArgs {})),
+        Answer::Throttle(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "builds": [] }))
+    );
+    assert_eq!(
+        c.read(Verb::Spend(NoArgs {})),
+        Answer::Spend(json!({ "currency": "USD", "rows": { "landed_30d": 2, "cost_per_landed_row": 1.75 } }))
+    );
+    assert_eq!(
+        c.read(Verb::Show { id: "wsp-1".into() }),
+        Answer::Show(json!({ "id": "wsp-1", "body": "the body\n" }))
+    );
+    match c.call(Call::Verb(Verb::Show { id: "wsp-404".into() })) {
+        Outcome::Err(f) => assert_eq!((f.code, f.text.as_str()), (Code::NotFound, "no task wsp-404")),
+        other => panic!("a show of no row was answered {other:?}"),
+    }
+    // `show` needs its id: without one it is malformed, and no view is asked.
+    let asked = views.calls.load(Ordering::SeqCst);
+    assert!(matches!(c.call(Call::Unknown { verb: "show".into(), args: json!({}) }), Outcome::Err(f) if f.code == Code::Malformed));
+    // A request by another principal than the hello's is forbidden, as any read's is.
+    let id = ReqId(600);
+    let other = Request { v: PROTOCOL, id, key: None, by: Principal::Seat(SeatId("cpd-9".into())), call: Call::Verb(Verb::Spend(NoArgs {})) };
+    c.conn.send(&Frame::Request(other)).unwrap();
+    assert!(matches!(c.reply(id).outcome, Outcome::Err(f) if f.code == Code::Forbidden));
+    assert_eq!(views.calls.load(Ordering::SeqCst), asked, "neither a malformed nor a forbidden request reaches the views");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+
+    // A server started with no views answers each one unsupported.
+    let d = dir("no-views");
+    let server = start(Arc::new(mirror_store()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+    for verb in [Verb::Throttle(NoArgs {}), Verb::Spend(NoArgs {}), Verb::Show { id: "wsp-1".into() }] {
+        match c.call(Call::Verb(verb)) {
+            Outcome::Err(f) => assert_eq!(f.code, Code::Unsupported, "{f:?}"),
+            other => panic!("a view verb with no views was answered {other:?}"),
+        }
+    }
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
@@ -830,4 +930,138 @@ impl Texts for Retained {
     fn set_text(&self, row: &RowId, section: &str, text: String, expect: Rev) -> Result<Rev> {
         self.inner.set_text(row, section, text, expect)
     }
+}
+
+// ---------------------------------------------------------------- step 2: the orders machine
+
+fn composed_store(mode: Mode) -> MemStore {
+    MemStore::with_domain(Arc::new(Composed::new(mode)))
+}
+
+fn send_to(seat: &str) -> Command {
+    Command::OrderSend { to: SeatId(seat.into()), text: "look at wsp-121".into(), first: false }
+}
+
+/// The failure a reply carries, or a panic naming what it carried instead.
+fn refused(r: Reply) -> wsp_api::Failure {
+    match r.outcome {
+        Outcome::Err(f) => {
+            assert!(r.events.is_empty(), "a refusal writes nothing: {:?}", r.events);
+            f
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn under_owned_an_order_send_is_applied_once_per_key_and_its_order_queued_reaches_a_subscriber() {
+    let d = dir("owned-send");
+    let store = composed_store(Mode::Owned);
+    apply(&store, vec![Entity::Seat(seat("cpd-1", "mac"))], vec![], "seats");
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut watcher = connect(&d);
+    watcher.subscribe(None);
+    assert!(matches!(watcher.next_feed(), Feed::State { .. }), "a subscription opens with the snapshot");
+
+    let mut c = connect(&d);
+    let first = c.command(send_to("cpd-1"), Some("send-1"));
+    assert_eq!(first.outcome, Outcome::Ok(Answer::Applied), "{first:?}");
+    assert_eq!(first.events.len(), 1, "order.send writes one event");
+    let queued = first.events[0];
+    assert_eq!(store.head().unwrap(), queued);
+
+    let again = c.command(send_to("cpd-1"), Some("send-1"));
+    assert_eq!(again.outcome, Outcome::Ok(Answer::Applied));
+    assert_eq!(store.head().unwrap(), queued, "the same key sent twice applies once");
+    let (state, _) = store.snapshot().unwrap();
+    assert_eq!(state.orders.len(), 1, "one order: {:?}", state.orders);
+    let order = state.orders.values().next().unwrap();
+    assert_eq!((order.state, &order.to, &order.from), (OrderState::Queued, &SeatId("cpd-1".into()), &ed()));
+
+    let seen = watcher.events_until(queued);
+    let e = seen.last().unwrap();
+    assert_eq!((e.id, e.kind, &e.subject), (queued, EventKind::OrderQueued, &Subject::Order(order.id.clone())));
+    assert_eq!(e.principal, ed(), "the event is the sender's");
+
+    // A seat sends and cancels too, each under its key; a command with no key is invalid.
+    let mut s = connect_as(&d, Principal::Seat(SeatId("cpd-1".into())));
+    assert_eq!(s.command(Command::OrderCancel { order: order.id.clone() }, Some("cancel-1")).outcome, Outcome::Ok(Answer::Applied));
+    assert_eq!(store.snapshot().unwrap().0.orders[&order.id].state, OrderState::Cancelled);
+    assert_eq!(refused(s.command(send_to("cpd-1"), None)).code, Code::Invalid);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn under_owned_a_seats_answer_is_unauthorised_and_a_mirror_putting_an_order_is_illegal_owned() {
+    let d = dir("owned-refusals");
+    let store = composed_store(Mode::Owned);
+    apply(&store, vec![Entity::Seat(seat("cpd-1", "mac"))], vec![], "seats");
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut ed_c = connect(&d);
+    let sent = ed_c.command(send_to("cpd-1"), Some("send-1"));
+    assert_eq!(sent.outcome, Outcome::Ok(Answer::Applied));
+    let order = store.snapshot().unwrap().0.orders.into_keys().next().unwrap();
+    let head = store.head().unwrap();
+
+    let acked = Command::OrderAcked { order: order.clone(), turn_began: At(1) };
+    let mut seat_c = connect_as(&d, Principal::Seat(SeatId("cpd-1".into())));
+    assert_eq!(refused(seat_c.command(acked.clone(), Some("ack-1"))).code, Code::Unauthorised);
+    assert_eq!(refused(ed_c.command(acked.clone(), Some("ack-2"))).code, Code::Unauthorised, "a person answers nothing");
+    assert_eq!(store.head().unwrap(), head, "an unauthorised answer writes nothing");
+
+    // The instance itself reaches the machine, which decides: acked on a queued order is illegal.
+    let mut me = connect_as(&d, Principal::Wsp("wsp".into()));
+    let f = refused(me.command(acked, Some("ack-3")));
+    assert_eq!(f.code, Code::Illegal, "{f:?}");
+    assert!(matches!(f.refusal, Some(Refusal::Illegal { ref state, .. }) if state == "queued"), "{f:?}");
+
+    // A mirror that puts an order is refused, naming it; over the API it stays unsupported.
+    let mirrored = Order {
+        id: OrderId("cpd-1-first-1".into()),
+        from: ed(),
+        to: SeatId("cpd-1".into()),
+        text: "go".into(),
+        state: OrderState::Queued,
+        attempts: 0,
+        first: true,
+        why: None,
+    };
+    let put = Command::Mirror { put: vec![Entity::Order(mirrored.clone())], gone: vec![] };
+    assert_eq!(
+        store.apply(put.clone(), IdempotencyKey("mirror-1".into()), ed()),
+        Err(Error::Refused(Refusal::Illegal {
+            subject: Subject::Order(mirrored.id.clone()),
+            state: OWNED.into(),
+            verb: "mirror".into()
+        }))
+    );
+    assert_eq!(refused(ed_c.command(put, Some("mirror-2"))).code, Code::Unsupported);
+    assert_eq!(store.head().unwrap(), head);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn under_mirrored_an_order_send_is_illegal_mirrored_and_the_mirror_puts_orders() {
+    let d = dir("mirrored-send");
+    let store = composed_store(Mode::Mirrored);
+    apply(&store, everything(), vec![], "all");
+    let head = store.head().unwrap();
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+    let f = refused(c.command(send_to("cpd-1"), Some("send-1")));
+    assert_eq!(f.code, Code::Illegal, "{f:?}");
+    assert_eq!(
+        f.refusal,
+        Some(Refusal::Illegal {
+            subject: Subject::Seat(SeatId("cpd-1".into())),
+            state: wsp_server::mirror::MIRRORED.into(),
+            verb: "order.send".into()
+        })
+    );
+    assert_eq!(store.head().unwrap(), head, "a refused order.send writes nothing");
+    assert!(store.snapshot().unwrap().0.orders.contains_key(&OrderId("o-1".into())), "the mirror put its order");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
 }

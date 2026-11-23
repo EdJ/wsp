@@ -1,6 +1,6 @@
 //! Task commands.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::cmd_agent::{claim_line, current_project, worked_line};
 use crate::message::{self, Ask, Message, Shape};
@@ -710,21 +710,57 @@ fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Ve
     out
 }
 
-/// `wsp show <piece-id>`: the parent's header line, then the entry whole.
-fn show_piece(a: &crate::pieces::Addressed, args: &Args) -> i32 {
-    if args.json() {
-        let v = match &a.piece {
-            Some(p) => crate::pieces::piece_json(&a.task.id, p),
-            None => json!({ "n": a.n, "id": a.id(), "folded": a.folded }),
-        };
-        let mut v = v;
-        v["row"] = json!(a.task.id);
-        if let Some(path) = &a.archived {
-            v["archived"] = json!(util::contract(path));
-        }
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-        return 0;
+/// `wsp show <piece-id> --json`'s document.
+fn addressed_json(a: &crate::pieces::Addressed) -> Value {
+    let mut v = match &a.piece {
+        Some(p) => crate::pieces::piece_json(&a.task.id, p),
+        None => json!({ "n": a.n, "id": a.id(), "folded": a.folded }),
+    };
+    v["row"] = json!(a.task.id);
+    if let Some(path) = &a.archived {
+        v["archived"] = json!(util::contract(path));
     }
+    v
+}
+
+/// `wsp show <id> --json`'s document: a piece's entry when `needle` names
+/// one, else the row it resolves to, live or archived. `Err` is what the
+/// verb says on stderr instead. The CLI prints this, and the API's `show`
+/// answers it (wsp-307), so the two cannot drift.
+pub(crate) fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
+    match crate::pieces::addressed(store, needle) {
+        Ok(Some(a)) => return Ok(addressed_json(&a)),
+        Ok(None) => {}
+        Err(why) => return Err(format!("wsp: {why}")),
+    }
+    let (t, archived) = match store.resolve_task(needle) {
+        crate::store::Found::One(t) => (*t, None),
+        crate::store::Found::Archived(t, path) => (*t, Some(path)),
+        other => return Err(other.why(needle).unwrap_or_default()),
+    };
+    // Each key's rule is `wsp_view::task::show_json`'s: this reads what it
+    // prints and hands it over.
+    let claims = store.claims();
+    let staged = crate::stage::with_history(store, &[&t]);
+    let running = crate::worklist::Running::read(store);
+    let shown = wsp_view::task::Show {
+        body: &t.body,
+        archived: archived.as_ref().map(|path| util::contract(path)),
+        claim: claims.get(&t.id).cloned(),
+        worked: store.worked().get(&t.id).cloned(),
+        list: running.of(&t.id).map(|l| wsp_view::task::Running { list: l.list.clone(), group: l.group, of: l.of }),
+        raised: raised_about(store, &t.id).iter().map(|m| m.to_json()).collect(),
+        verification: crate::verification::view(&t),
+        legs: crate::legs::view(&t),
+        pieces: crate::pieces::view(&t),
+        stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
+    };
+    Ok(wsp_view::task::show_json(&row_of(&t, &claims), &shown))
+}
+
+/// `wsp show <piece-id>`: the parent's header line, then the entry whole
+/// (under `--json`, [`show_json`] answers instead).
+fn show_piece(a: &crate::pieces::Addressed) -> i32 {
     let p = Paint::new();
     println!("{}  {}", p.bold(&a.task.id), a.task.title);
     match (&a.piece, &a.folded) {
@@ -747,10 +783,22 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // has left the live store. `show` does: displaying the record *is* the
     // verb, and a reader who followed `render-026`'s citation of `render-018`
     // wants the prose it points at, not the path it is filed under.
+    if args.json() {
+        return match show_json(store, &needle) {
+            Ok(v) => {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                0
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        };
+    }
     // A piece id (`docs/pieces.md`, *Seen and told*): the row's header line and
     // the entry whole, or the line it folded into once the row has landed.
     match crate::pieces::addressed(store, &needle) {
-        Ok(Some(a)) => return show_piece(&a, args),
+        Ok(Some(a)) => return show_piece(&a),
         Ok(None) => {}
         Err(why) => {
             eprintln!("wsp: {why}");
@@ -765,27 +813,6 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    if args.json() {
-        // Each key's rule is `wsp_view::task::show`'s: this reads what it
-        // prints and hands it over.
-        let claims = store.claims();
-        let staged = crate::stage::with_history(store, &[&t]);
-        let running = crate::worklist::Running::read(store);
-        let shown = wsp_view::task::Show {
-            body: &t.body,
-            archived: archived.as_ref().map(|path| util::contract(path)),
-            claim: claims.get(&t.id).cloned(),
-            worked: store.worked().get(&t.id).cloned(),
-            list: running.of(&t.id).map(|l| wsp_view::task::Running { list: l.list.clone(), group: l.group, of: l.of }),
-            raised: raised_about(store, &t.id).iter().map(|m| m.to_json()).collect(),
-            verification: crate::verification::view(&t),
-            legs: crate::legs::view(&t),
-            pieces: crate::pieces::view(&t),
-            stage: staged.get(&t.id).map(|(s, h)| crate::stage::view(s, h)),
-        };
-        println!("{}", wsp_view::task::show(&row_of(&t, &claims), &shown));
-        return 0;
-    }
 
     let p = Paint::new();
     let index = Index::new(store.projects());
@@ -1942,8 +1969,30 @@ fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> 
         if let Some(line) = crate::check::review_hint(store, &t) {
             eprintln!("  {}", p.yellow(&line));
         }
+        if let Some(line) = done_when_refused(&t) {
+            eprintln!("  {}", p.yellow(&line));
+        }
     }
     0
+}
+
+/// What a review says, once, when the row's done-when needs a verb its seat is
+/// refused (`wsp-312`): wsp-303's rested on `wsp mv`, and the seat could only
+/// ask and hold. A warning and never a refusal: the item may be the person's
+/// to finish, and the verifier reads the exit's `not held:` for it.
+fn done_when_refused(t: &Task) -> Option<String> {
+    crate::split::warn_done_when(&done_when_of(t), &t.id)
+}
+
+/// The row's done-when: its `## Done when`, or the overview from the line that
+/// opens one (`### Done when`, `Done when:`) on.
+fn done_when_of(t: &Task) -> String {
+    if let Some(dw) = t.section("Done when").filter(|s| !s.trim().is_empty()) {
+        return dw;
+    }
+    let overview = t.section("Overview").unwrap_or_default();
+    let at = overview.lines().position(|l| l.trim_start_matches(['#', ' ']).to_lowercase().starts_with("done when"));
+    at.map(|n| overview.lines().skip(n).collect::<Vec<_>>().join("\n")).unwrap_or_default()
 }
 
 /// The newest pass on the row when it is a block read at `tip`: the commit a
@@ -2492,7 +2541,25 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
             if refs > 0 {
                 println!("  {}", p.dim(&format!("{refs} reference(s) rewritten across {files} file(s)")));
             }
-            0
+            // What names the row outside the store: a list's retro record and
+            // the row's own outputs, both under the artefacts root (`wsp-351`).
+            let mut code = 0;
+            match crate::retro_yours::follow_renames(store, &renumber) {
+                Ok(lists) => {
+                    for l in lists {
+                        println!("  {}", p.dim(&format!("{l}'s retro record follows")));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("wsp: a retro record still names the old id: {e}");
+                    code = 1;
+                }
+            }
+            if let Err(e) = crate::artefact::follow_renames(&crate::artefact::root(), &renumber) {
+                eprintln!("wsp: {e}");
+                code = 1;
+            }
+            code
         }
         Err(e) => {
             eprintln!("wsp: the move landed but the renumbering did not: {e}");
@@ -3302,6 +3369,8 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         crate::log::append_to_body(&mut body, "decisions edited by hand");
     }
 
+    let refused = overview_names_refused(item.what, &item.id, one, &body);
+
     let saved = match item.what {
         "project" => store.project(&item.id).map(|mut p| {
             p.body = body;
@@ -3340,6 +3409,10 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
     );
     store.git_commit(&format!("wsp: edit {} {}", item.what, item.id));
 
+    // Said, not refused: the author may be writing it for a person to run.
+    for why in &refused {
+        eprintln!("wsp: {why}");
+    }
     if args.json() {
         println!(
             "{}",
@@ -3357,6 +3430,19 @@ pub fn edit_prose(store: &Store, args: &Args, item: Prose) -> i32 {
         }
     }
     0
+}
+
+/// What an edit that wrote `body` says about the verbs its overview tells a
+/// seat to run that the seat is refused (`wsp-312`): an overview is the order a
+/// seat reads, so it is said while its author is here. Only when the edit could
+/// reach `## Overview`. A worklist's overview is read by no one row's seat, and
+/// a project's is no order.
+fn overview_names_refused(what: &str, id: &str, one: Option<&str>, body: &str) -> Vec<String> {
+    if what == "project" || one.is_some_and(|sec| sec != "Overview") {
+        return Vec::new();
+    }
+    let own = (what != "worklist").then_some(id);
+    crate::split::warn_order(&crate::model::section_of(body, "Overview").unwrap_or_default(), own)
 }
 
 fn launch_editor(path: &std::path::Path) -> i32 {
@@ -5375,6 +5461,42 @@ pub(crate) mod tests {
             [["spawn", "m-1", "--agent", "--kind", "opencode", "--model", "sonnet", "--effort", "high"]],
             "one spawn, at what it ran with"
         );
+    }
+
+    /// wsp-303's done-when rested on `wsp mv`. Its review says so in one line,
+    /// however many items or verbs; the overview before a done-when, and a
+    /// done-when that needs no refused verb, say nothing (`wsp-312`).
+    #[test]
+    fn a_done_when_that_needs_a_refused_verb_is_warned_about_once_at_review() {
+        let mut t = Task::new("detach the spec rows", "wsp-303");
+        t.body = "## Overview\nThe rows were filed with `wsp add --parent`.\n\n## Done when\n- `wsp mv <id> --parent none` ran for each of the 86\n- wsp mv left wsp-302 alone\n".into();
+        let said = done_when_refused(&t).expect("warned");
+        assert!(!said.contains('\n') && said.contains("needs `wsp mv`,") && !said.contains("`wsp add --parent"), "{said}");
+        // The same done-when inside the overview, as most rows write it.
+        t.body = "## Overview\nThe rows were filed with `wsp add --parent`.\n\n### Done when\n- the 86 are detached with `wsp mv`\n".into();
+        let said = done_when_refused(&t).expect("warned");
+        assert!(said.contains("needs `wsp mv`,") && !said.contains("`wsp add --parent"), "{said}");
+        t.body = "## Overview\nUse `wsp mv` if you must.\n\n## Done when\n`cargo test packet::` passes.\n".into();
+        assert_eq!(done_when_refused(&t), None);
+    }
+
+    /// wsp-154's overview told its own seat to `wsp add --parent`, and wsp-303's
+    /// barrier order told its seat to `wsp mv`. An edit that writes an overview
+    /// like that says which verb, and what the seat does instead; one that writes
+    /// another section, a project, or an overview with nothing refused says
+    /// nothing (`wsp-312`).
+    #[test]
+    fn an_overview_that_tells_its_seat_a_refused_verb_is_said_when_it_is_written() {
+        let body = "## Overview\n2. Sub-tasks of this row (`wsp add --parent`).\n- `wsp mv <id> --parent none` for each of the 86.\n\n## Details\nx\n";
+        let said = overview_names_refused("task", "wsp-154", Some("Overview"), body);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("`wsp add --parent`") && said[0].contains("wsp leg add wsp-154"), "{}", said[0]);
+        assert!(said[1].contains("`wsp mv`") && said[1].contains("`wsp ask wsp-154 --person`"), "{}", said[1]);
+        assert_eq!(overview_names_refused("task", "wsp-154", None, body).len(), 2, "the whole body reaches Overview");
+        assert!(overview_names_refused("task", "wsp-154", Some("Details"), body).is_empty());
+        assert!(overview_names_refused("project", "wsp", None, body).is_empty());
+        assert_eq!(overview_names_refused("worklist", "spec-breakdown", None, body).len(), 2);
+        assert!(overview_names_refused("task", "wsp-154", Some("Overview"), "## Overview\nMake a.\n").is_empty());
     }
 
     /// `compounding-220`: the packet generated for the second seat of a

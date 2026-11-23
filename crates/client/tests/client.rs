@@ -4,7 +4,8 @@
 //! with the right token, subscribing, and refused with a wrong one; `request` for each read verb; `subscribe` handing
 //! out the snapshot and then each event once, across a server restart (a
 //! `Resumed`, and no id twice) and through a `too_old` (a fresh `State`); and a
-//! duplicate id dropped.
+//! duplicate id dropped; `throttle`, `spend` and `show` handing back the
+//! server's documents, and their refusals (wsp-307).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, to_value, Value};
 use wsp_api::{Answer, ApiToken, Code, Listen, Outcome, Reply, LISTEN_FILE, MISSED_BEATS, TOKEN_FILE};
-use wsp_client::{Client, Feed, Item, Silent};
+use wsp_client::{Client, Feed, Item, Silent, ViewError};
 use wsp_server::{Config, Mirror, Server, SharedStore};
 use wsp_store_conformance::MemStore;
 use wsp_store_contract::*;
@@ -120,6 +121,8 @@ fn everything() -> Vec<Entity> {
             text: "go".into(),
             state: OrderState::Queued,
             attempts: 0,
+            first: false,
+            why: None,
         }),
         Entity::Ask(Ask {
             id: AskId("a-1".into()),
@@ -315,6 +318,53 @@ fn request_gets_each_read_verbs_answer_matched_by_id() {
         Outcome::Err(f) => assert_eq!(f.code, Code::Unsupported),
         other => panic!("{other:?}"),
     }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The daemon's documents, faked, for the view calls (wsp-307).
+struct Docs;
+
+impl wsp_server::Views for Docs {
+    fn throttle(&self) -> std::result::Result<Value, wsp_api::Failure> {
+        Ok(json!({ "mode": "on", "in_force": true, "load": [2.5, 2.0, 1.75] }))
+    }
+    fn spend(&self) -> std::result::Result<Value, wsp_api::Failure> {
+        Ok(json!({ "today": "2026-11-20", "currency": "USD" }))
+    }
+    fn show(&self, id: &str) -> std::result::Result<Value, wsp_api::Failure> {
+        match id {
+            "wsp-1" => Ok(json!({ "id": "wsp-1", "title": "one" })),
+            _ => Err(wsp_api::Failure { code: Code::NotFound, text: format!("no task matches '{id}'"), refusal: None }),
+        }
+    }
+}
+
+#[test]
+fn throttle_spend_and_show_return_the_documents_and_a_refusal_says_why() {
+    let d = dir("views");
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.beat = BEAT;
+    cfg.views = Some(Arc::new(Docs));
+    let server = Server::start(Arc::new(mirror_store()), cfg).unwrap();
+    let mut c = dial(&d);
+    assert_eq!(c.throttle().unwrap(), json!({ "mode": "on", "in_force": true, "load": [2.5, 2.0, 1.75] }));
+    assert_eq!(c.spend().unwrap(), json!({ "today": "2026-11-20", "currency": "USD" }));
+    assert_eq!(c.show("wsp-1").unwrap(), json!({ "id": "wsp-1", "title": "one" }));
+    match c.show("wsp-9") {
+        Err(ViewError::Refused(f)) => assert_eq!((f.code, f.text.as_str()), (Code::NotFound, "no task matches 'wsp-9'")),
+        other => panic!("a show of nothing gave {other:?}"),
+    }
+    server.stop();
+    assert!(matches!(c.spend(), Err(ViewError::Request(_))), "the server is gone");
+    let _ = fs::remove_dir_all(&d);
+
+    // A server with no views refuses them `unsupported`, as one from before them would.
+    let d = dir("no-views");
+    let server = start(Arc::new(mirror_store()), &d);
+    let mut c = dial(&d);
+    assert!(matches!(c.throttle(), Err(ViewError::Refused(f)) if f.code == Code::Unsupported));
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
@@ -622,6 +672,336 @@ fn an_event_id_already_handed_out_is_dropped_and_a_silent_server_costs_the_conne
     // The listener takes three connections: the client's, the feed's and its second.
     let _ = accepts.join();
     let _ = fs::remove_dir_all(&d);
+}
+
+// ---------------------------------------------------------------- apply and await_order (wsp-119)
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+/// What a scripted server does with a request.
+enum Say {
+    Frame(wsp_api::Frame),
+    /// Hang up on the connection.
+    Close,
+}
+
+type Script = Box<dyn FnMut(usize, &Value) -> Vec<Say> + Send>;
+
+/// A server of our own: it welcomes every connection (at `head`), and then asks
+/// the script, for each request and the number of the connection it came on
+/// (from 0), what to say. The real server answers no command until group 3.
+struct Scripted {
+    dir: PathBuf,
+    gone: Arc<AtomicBool>,
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Scripted {
+    fn start(name: &str, head: u64, script: impl FnMut(usize, &Value) -> Vec<Say> + Send + 'static) -> Scripted {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let d = dir(name);
+        fs::create_dir_all(&d).unwrap();
+        let listen = Listen { addrs: vec![l.local_addr().unwrap().to_string()] };
+        fs::write(d.join(LISTEN_FILE), serde_json::to_string(&listen).unwrap()).unwrap();
+        fs::write(d.join(TOKEN_FILE), "t").unwrap();
+        let gone = Arc::new(AtomicBool::new(false));
+        let script: Arc<Mutex<Script>> = Arc::new(Mutex::new(Box::new(script)));
+        let (stop, streams) = (gone.clone(), Arc::new(Mutex::new(Vec::<TcpStream>::new())));
+        let accept = std::thread::spawn(move || {
+            let mut n = 0;
+            while !stop.load(Ordering::SeqCst) {
+                match l.accept() {
+                    Ok((s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        streams.lock().unwrap().push(s.try_clone().unwrap());
+                        let script = script.clone();
+                        std::thread::spawn(move || serve(s, n, head, script));
+                        n += 1;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            drop(l);
+            for s in streams.lock().unwrap().iter() {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+        Scripted { dir: d, gone, accept: Some(accept) }
+    }
+
+    /// The server goes: its listener is closed and every connection hung up.
+    fn stop(&mut self) {
+        self.gone.store(true, Ordering::SeqCst);
+        if let Some(t) = self.accept.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Scripted {
+    fn drop(&mut self) {
+        self.stop();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn serve(mut s: TcpStream, n: usize, head: u64, script: Arc<Mutex<Script>>) {
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    let mut text = String::new();
+    if r.read_line(&mut text).unwrap_or(0) == 0 {
+        return;
+    }
+    let welcome = json!({"type": "welcome", "server": "scripted", "protocol": 1, "head": head});
+    if writeln!(s, "{welcome}").is_err() {
+        return;
+    }
+    loop {
+        text.clear();
+        if r.read_line(&mut text).unwrap_or(0) == 0 {
+            return;
+        }
+        let req: Value = serde_json::from_str(&text).unwrap();
+        let says = (script.lock().unwrap())(n, &req);
+        for say in says {
+            match say {
+                Say::Frame(f) => {
+                    if writeln!(s, "{}", serde_json::to_string(&f).unwrap()).is_err() {
+                        return;
+                    }
+                }
+                Say::Close => {
+                    let _ = s.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn reply_to(req: &Value, outcome: Outcome, events: Vec<EventId>) -> Say {
+    let id = wsp_api::ReqId(req["id"].as_u64().unwrap());
+    Say::Frame(wsp_api::Frame::Reply(Reply { id, outcome, events }))
+}
+
+fn says_ok(req: &Value, answer: Answer) -> Vec<Say> {
+    vec![reply_to(req, Outcome::Ok(answer), vec![])]
+}
+
+fn cancel(order: &str) -> Command {
+    Command::OrderCancel { order: OrderId(order.into()) }
+}
+
+#[test]
+fn a_reply_dropped_once_is_retried_under_the_same_key_and_answers_with_the_first_result() {
+    // The server applies on the first sight of a key and hangs up before it replies; on the second
+    // sight of the key it replies with what it applied the first time.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    let mut applied: Vec<(String, Vec<EventId>)> = vec![];
+    let server = Scripted::start("retry", 0, move |_, req| {
+        if req["verb"] != "order.cancel" {
+            return vec![];
+        }
+        let key = req["key"].as_str().expect("a command carries a key").to_string();
+        log.lock().unwrap().push(key.clone());
+        match applied.iter().find(|(k, _)| *k == key) {
+            Some((_, events)) => vec![reply_to(req, Outcome::Ok(Answer::Applied), events.clone())],
+            None => {
+                applied.push((key, vec![EventId(40 + applied.len() as u64)]));
+                vec![Say::Close]
+            }
+        }
+    });
+    let mut c = dial(&server.dir);
+    assert_eq!(c.apply(&cancel("o-1")).unwrap(), Applied { events: vec![EventId(40)] });
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "sent twice: {seen:?}");
+        assert_eq!(seen[0], seen[1], "under one key");
+    }
+
+    // A call is a key of its own: the next command is not the first one again.
+    assert_eq!(c.apply(&cancel("o-2")).unwrap(), Applied { events: vec![EventId(41)] });
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4, "two sends each: {seen:?}");
+    assert_ne!(seen[1], seen[2], "a key for each call");
+}
+
+#[test]
+fn a_reply_that_never_comes_is_sent_again_under_the_same_key_within_the_one_timeout() {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    let server = Scripted::start("silent-reply", 0, move |_, req| {
+        let mut keys = log.lock().unwrap();
+        keys.push(req["key"].as_str().unwrap().to_string());
+        // Hears the first, says nothing; answers the second.
+        if keys.len() == 1 {
+            vec![]
+        } else {
+            vec![reply_to(req, Outcome::Ok(Answer::Applied), vec![EventId(7)])]
+        }
+    });
+    let mut c = dial(&server.dir);
+    c.set_timeout(Duration::from_millis(900));
+    let began = Instant::now();
+    assert_eq!(c.apply(&cancel("o-1")).unwrap().events, [EventId(7)]);
+    assert!(began.elapsed() < Duration::from_millis(900), "within the one timeout: {:?}", began.elapsed());
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1]);
+}
+
+#[test]
+fn a_refusal_is_the_servers_refusal_and_is_never_retried() {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let count = sent.clone();
+    let refusal = Refusal::Illegal { subject: Subject::Order(OrderId("o-1".into())), state: "done".into(), verb: "order.cancel".into() };
+    let said = refusal.clone();
+    let server = Scripted::start("refused", 0, move |_, req| {
+        count.fetch_add(1, Ordering::SeqCst);
+        let failure = wsp_api::Failure { code: Code::Illegal, text: "o-1 is done".into(), refusal: Some(said.clone()) };
+        vec![reply_to(req, Outcome::Err(failure), vec![])]
+    });
+    let mut c = dial(&server.dir);
+    assert_eq!(c.apply(&cancel("o-1")), Err(wsp_client::Error::Refused(refusal)));
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+
+    // Nor is an `err` that is no refusal.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let count = sent.clone();
+    let server = Scripted::start("failed", 0, move |_, req| {
+        count.fetch_add(1, Ordering::SeqCst);
+        let failure = wsp_api::Failure { code: Code::Unsupported, text: "no".into(), refusal: None };
+        vec![reply_to(req, Outcome::Err(failure), vec![])]
+    });
+    let mut c = dial(&server.dir);
+    assert!(matches!(c.apply(&cancel("o-1")), Err(wsp_client::Error::Failed(f)) if f.code == Code::Unsupported));
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+fn order(id: &str, state: OrderState) -> Order {
+    Order {
+        id: OrderId(id.into()),
+        from: ed(),
+        to: SeatId("cpd-1".into()),
+        text: "go".into(),
+        state,
+        attempts: 0,
+        first: false,
+        why: None,
+    }
+}
+
+fn order_event(id: u64, order: &str, kind: EventKind) -> Say {
+    let subject = Subject::Order(OrderId(order.into()));
+    let e = Event { id: EventId(id), at: At(id), principal: ed(), kind, subject, payload: Value::Null };
+    Say::Frame(wsp_api::Frame::Feed(wsp_api::Feed::Event(e)))
+}
+
+/// A server holding `orders`, at `head`, that says `follow` after it answers a subscribe.
+/// `subscribed` counts the subscribes it heard, and `from` is what the last one asked from.
+fn orders_server(
+    name: &str,
+    orders: Vec<Order>,
+    head: u64,
+    follow: fn() -> Vec<Say>,
+    subscribed: Arc<AtomicUsize>,
+    from: Arc<Mutex<Option<u64>>>,
+) -> Scripted {
+    Scripted::start(name, head, move |_, req| match req["verb"].as_str().unwrap() {
+        "events" => says_ok(req, Answer::Events { events: vec![], head: EventId(head) }),
+        "orders" => says_ok(req, Answer::Orders(orders.clone())),
+        "subscribe" => {
+            subscribed.fetch_add(1, Ordering::SeqCst);
+            *from.lock().unwrap() = req["args"]["from"].as_u64();
+            let mut says = says_ok(req, Answer::Subscribed);
+            says.extend(follow());
+            says
+        }
+        other => panic!("unexpected {other}"),
+    })
+}
+
+fn no_events() -> Vec<Say> {
+    vec![]
+}
+
+#[test]
+fn await_order_answers_at_once_for_an_order_already_settled() {
+    let (subscribed, from) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let held = vec![order("o-0", OrderState::Queued), order("o-1", OrderState::Acknowledged)];
+    let server = orders_server("await-settled", held, 5, no_events, subscribed.clone(), from);
+    let mut c = dial(&server.dir);
+    let began = Instant::now();
+    let got = c.await_order(&OrderId("o-1".into()), &[OrderState::Acknowledged, OrderState::Done], WAIT).unwrap();
+    assert_eq!(got, Some(order("o-1", OrderState::Acknowledged)));
+    assert!(began.elapsed() < Duration::from_secs(10), "at once: {:?}", began.elapsed());
+    assert_eq!(subscribed.load(Ordering::SeqCst), 0, "a settled order is not followed");
+}
+
+#[test]
+fn await_order_follows_the_events_of_a_queued_order_to_acknowledged() {
+    fn follow() -> Vec<Say> {
+        vec![
+            order_event(6, "o-1", EventKind::OrderTyped),
+            order_event(7, "o-2", EventKind::OrderAcknowledged), // another order's
+            order_event(8, "o-1", EventKind::OrderDelivered),
+            order_event(9, "o-1", EventKind::OrderAcknowledged),
+            order_event(10, "o-1", EventKind::OrderDone),
+        ]
+    }
+    let (subscribed, from) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let held = vec![order("o-1", OrderState::Queued), order("o-2", OrderState::Queued)];
+    let server = orders_server("await-follow", held, 5, follow, subscribed.clone(), from.clone());
+    let mut c = dial(&server.dir);
+    let got = c.await_order(&OrderId("o-1".into()), &[OrderState::Acknowledged], WAIT).unwrap();
+    assert_eq!(got, Some(order("o-1", OrderState::Acknowledged)), "o-2's acknowledgement is not o-1's");
+    assert_eq!(subscribed.load(Ordering::SeqCst), 1);
+    assert_eq!(*from.lock().unwrap(), Some(5), "from the head read before the order was");
+}
+
+#[test]
+fn await_order_is_none_past_wait() {
+    let (subscribed, from) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let server = orders_server("await-none", vec![order("o-1", OrderState::Queued)], 5, no_events, subscribed, from);
+    let mut c = dial(&server.dir);
+    let wait = Duration::from_millis(400);
+    let began = Instant::now();
+    assert_eq!(c.await_order(&OrderId("o-1".into()), &[OrderState::Done], wait).unwrap(), None);
+    let took = began.elapsed();
+    assert!(took >= wait && took < wait + Duration::from_secs(10), "{took:?}");
+    // An order nothing has is none too.
+    assert_eq!(c.await_order(&OrderId("o-9".into()), &[OrderState::Done], Duration::from_millis(200)).unwrap(), None);
+}
+
+#[test]
+fn await_order_is_silent_within_the_dials_bound_when_the_server_goes() {
+    let (subscribed, from) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let mut server = orders_server("await-silent", vec![order("o-1", OrderState::Queued)], 5, no_events, subscribed.clone(), from);
+    let bound = Duration::from_millis(500);
+    let mut c = Client::dial(&server.dir, ed(), bound).unwrap();
+    let id = OrderId("o-1".into());
+    // Followed for a while, then the server goes; the wait is far longer than the bound.
+    let waiter = std::thread::spawn(move || {
+        let began = Instant::now();
+        let got = c.await_order(&id, &[OrderState::Done], WAIT);
+        (got, began.elapsed())
+    });
+    let deadline = Instant::now() + WAIT;
+    while subscribed.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "never subscribed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let gone_at = Instant::now();
+    server.stop();
+    let (got, _) = waiter.join().unwrap();
+    let after = gone_at.elapsed();
+    assert!(matches!(got, Err(wsp_client::Error::Silent(_))), "{got:?}");
+    assert!(after < bound + Duration::from_secs(5), "within the bound, not the wait: {after:?}");
 }
 
 /// A server of our own at `d`, taking `conns` connections: each is welcomed, and

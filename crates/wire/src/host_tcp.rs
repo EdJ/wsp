@@ -38,8 +38,8 @@
 //! manager code inside this process ([`crate::host_inproc`], wsp-030): the
 //! same `Tcp`, the same events, a different place it runs.
 //! Tree jobs are chosen apart, by `WSP_JOBS=inproc|manager` ([`JobsChoice`],
-//! [`jobs_chosen`]; `inproc` until M3's callers have moved), so they roll back
-//! on their own.
+//! [`jobs_chosen`]; `manager` since wsp-056, `inproc` the rollback), so they
+//! roll back on their own.
 //!
 //! **A job** (M3, wsp-051) runs on a connection of its own: it subscribes
 //! from the journal's head, then sends `job.run`, so the connection owns the
@@ -249,20 +249,22 @@ pub fn chosen(state: &Path, version: &str) -> std::result::Result<&'static dyn H
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobsChoice {
     /// `wsp-host`'s runner in this process: the default until M3's callers
-    /// have moved, and the rollback after.
-    #[default]
+    /// had moved, and the rollback since (wsp-056).
     Inproc,
-    /// `job.run` to the manager the local machine record names. A manager that
-    /// does not answer is "host silent", and the job is not run here instead.
+    /// `job.run` to the manager the local machine record names, the default
+    /// since wsp-056. A manager that does not answer is "host silent", and
+    /// the job is not run here instead.
+    #[default]
     Manager,
 }
 
 impl JobsChoice {
-    /// `None` and the empty string are the default, [`JobsChoice::Inproc`].
+    /// `None` and the empty string are the default, [`JobsChoice::Manager`]
+    /// (wsp-056); `inproc` is the rollback.
     pub fn parse(value: Option<&str>) -> std::result::Result<JobsChoice, HostError> {
         match value.map(str::trim) {
-            None | Some("") | Some("inproc") => Ok(JobsChoice::Inproc),
-            Some("manager") => Ok(JobsChoice::Manager),
+            None | Some("") | Some("manager") => Ok(JobsChoice::Manager),
+            Some("inproc") => Ok(JobsChoice::Inproc),
             Some(other) => Err(HostError::JobsChoice(other.to_string())),
         }
     }
@@ -274,14 +276,28 @@ impl JobsChoice {
 }
 
 /// The host `choice` runs jobs on: the in-process runner, its files under
-/// `<state>/inproc`; or the manager's [`Tcp`], the one [`choose`] makes (so a
-/// silent manager is [`HostError::Silent`] here, and nothing runs).
+/// `<state>/inproc` and a job's `dir` under the tree root the install wrote
+/// (`<state>/manager/jobs.json`, else the home directory: the root wsp places
+/// a job under, `job_place::installed_tree_root`), so the rollback runs a job
+/// in the tree the manager would have; or the manager's [`Tcp`], the one
+/// [`choose`] makes (so a silent manager is [`HostError::Silent`] here, and
+/// nothing runs).
 pub fn choose_jobs(choice: JobsChoice, state: &Path, version: &str) -> std::result::Result<&'static dyn Host, HostError> {
-    static INPROC: OnceLock<InProcess> = OnceLock::new();
     match choice {
-        JobsChoice::Inproc => Ok(INPROC.get_or_init(|| InProcess::new().with_jobs(&state.join("inproc"), &crate::util::home()))),
+        JobsChoice::Inproc => Ok(inproc_for(state)),
         JobsChoice::Manager => choose(Choice::Manager, state, version),
     }
+}
+
+/// The in-process runner for `state` and the tree root it names now: one per
+/// pair, leaked once as [`manager_for`]'s are, so a reinstall that moves the
+/// root is read by the next job and not kept from the first.
+fn inproc_for(state: &Path) -> &'static InProcess {
+    static INPROC: OnceLock<Mutex<BTreeMap<(PathBuf, PathBuf), &'static InProcess>>> = OnceLock::new();
+    let root = manager::read_jobs(state).map(|j| j.tree_root).unwrap_or_else(crate::util::home);
+    let mut map = INPROC.get_or_init(|| Mutex::new(BTreeMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    map.entry((state.to_path_buf(), root.clone()))
+        .or_insert_with(|| Box::leak(Box::new(InProcess::new().with_jobs(&state.join("inproc"), &root))))
 }
 
 /// [`choose_jobs`] by `$WSP_JOBS`, read once per process as the `Tcp` is
@@ -935,9 +951,6 @@ impl Host for Tcp {
     fn answers(&self, socket: &Path) -> bool {
         self.local.answers(socket)
     }
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.local.started(pid)
-    }
     fn shells(&self) -> Option<String> {
         self.local.shells()
     }
@@ -1048,6 +1061,9 @@ impl Host for Tcp {
     // ---- seat.did
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.local.transcript_of(session, cwd)
+    }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.local.transcripts_of_tree(tree)
     }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.local.pi_session_of(session, cwd)
@@ -1188,6 +1204,12 @@ impl Host for Tcp {
                 self.addr
             ))),
         }
+    }
+    fn job_host(&self) -> Option<wsp_host_api::HostId> {
+        self.hello().ok().map(|h| h.host)
+    }
+    fn facts(&self) -> Option<HostFacts> {
+        self.seats_within(SILENT).ok().and_then(|l| l.host)
     }
     fn jobs(&self) -> std::result::Result<Vec<JobRow>, JobError> {
         let said = self.ask(Message::Jobs(Jobs {}), SPAWN_WAIT, |m| matches!(m, Message::JobsList(_))).map_err(JobError::Silent)?;

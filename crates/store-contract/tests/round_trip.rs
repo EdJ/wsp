@@ -69,7 +69,7 @@ fn ed() -> Principal {
     Principal::Person("ed".into())
 }
 
-const COMMANDS: usize = 20;
+const COMMANDS: usize = 25;
 
 fn command(c: &Command) -> (usize, &'static str) {
     match c {
@@ -93,6 +93,11 @@ fn command(c: &Command) -> (usize, &'static str) {
         Command::AskAck { .. } => (17, "ask.ack"),
         Command::MachineSet { .. } => (18, "machine.set"),
         Command::Mirror { .. } => (19, "mirror"),
+        Command::OrderDeliver { .. } => (20, "order.deliver"),
+        Command::OrderDelivered { .. } => (21, "order.delivered"),
+        Command::OrderAcked { .. } => (22, "order.acked"),
+        Command::OrderRefused { .. } => (23, "order.refused"),
+        Command::OrderDone { .. } => (24, "order.done"),
     }
 }
 
@@ -161,6 +166,7 @@ fn commands() -> Vec<Command> {
         Command::OrderSend {
             to: seat(),
             text: "go".into(),
+            first: true,
         },
         Command::OrderCancel {
             order: OrderId("ord-1".into()),
@@ -189,7 +195,37 @@ fn commands() -> Vec<Command> {
             put: entities(),
             gone: vec![Subject::Seat(seat()), Subject::Claim(row())],
         },
+        Command::OrderDeliver {
+            order: OrderId("ord-1".into()),
+            fence: Fence {
+                lease: LeaseName::deliver(&seat()),
+                token: Token(3),
+            },
+        },
+        Command::OrderDelivered {
+            order: OrderId("ord-1".into()),
+        },
+        Command::OrderAcked {
+            order: OrderId("ord-1".into()),
+            turn_began: At(2_000),
+        },
+        Command::OrderRefused {
+            order: OrderId("ord-1".into()),
+            why: "busy".into(),
+            counts: false,
+        },
+        Command::OrderDone {
+            order: OrderId("ord-1".into()),
+        },
     ]
+}
+
+/// `LeaseName::deliver` names `deliver:<seat>` (2.1), on the wire as the bare string.
+#[test]
+fn the_deliver_lease_is_named_deliver_and_the_seat() {
+    let name = LeaseName::deliver(&seat());
+    assert_eq!(name, LeaseName("deliver:cpd-336".into()));
+    assert_eq!(trip(&name), json!("deliver:cpd-336"));
 }
 
 /// `FENCED_VERBS` is exactly the verbs whose `args` carry a `fence` (wsp-065):
@@ -633,6 +669,8 @@ fn state() -> State {
             text: "go".into(),
             state: OrderState::Typed,
             attempts: 1,
+            first: true,
+            why: Some("busy".into()),
         },
     );
     s.asks.insert(
@@ -759,6 +797,32 @@ fn frames_from_before_the_fields_maps_still_decode() {
     }))
     .unwrap();
     assert!(ask.fields.is_empty());
+}
+
+/// An `order.send` frame and an `Order` written before wsp-117 (no `first`, no
+/// `why`) still decode: not the first order, and no refusal's words.
+#[test]
+fn orders_from_before_first_and_why_still_decode() {
+    let send: Command = serde_json::from_value(json!({
+        "verb": "order.send", "args": {"to": "cpd-336", "text": "go"}
+    }))
+    .unwrap();
+    assert_eq!(
+        send,
+        Command::OrderSend {
+            to: seat(),
+            text: "go".into(),
+            first: false,
+        }
+    );
+    let order: Order = serde_json::from_value(json!({
+        "id": "ord-1", "from": {"person": "ed"}, "to": "cpd-336", "text": "go",
+        "state": "queued", "attempts": 0
+    }))
+    .unwrap();
+    assert!(!order.first);
+    assert_eq!(order.why, None);
+    assert_eq!(order.state, OrderState::Queued);
 }
 
 #[test]

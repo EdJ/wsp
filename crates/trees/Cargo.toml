@@ -12,6 +12,8 @@ serde_json = "1"
 wsp-base = { path = "../base" }
 wsp-store = { path = "../store" }
 wsp-wire = { path = "../wire" }
+# throttle run's jobs and the beat's facts it decides on (wsp-052).
+wsp-host-api = { path = "../host-api" }
 # throttle --json's projection (wsp-305).
 wsp-view = { path = "../view" }
 
@@ -20,6 +22,8 @@ wsp-base = { path = "../base", features = ["test-support"] }
 wsp-store = { path = "../store", features = ["test-support"] }
 wsp-wire = { path = "../wire", features = ["test-support"] }
 wsp-testkit = { path = "../testkit" }
+# throttle run's tests (wsp-052) and verify's jobs (wsp-054) stand a loopback manager up.
+wsp-manager = { path = "../manager" }
 
 [features]
 test-support = []

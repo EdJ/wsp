@@ -45,7 +45,7 @@ use wsp_wire::host::{
     self, Choice, Forked, Headless, Host, HostDir, HostError, HostId, InProcess, JobAt, JobClass, JobError, JobKey, JobOutput, JobRun,
     JobState, JobsChoice, Session, Spawn, Stop, Subscription, Tcp, LOCAL,
 };
-use wsp_wire::manager::{install_record, Local};
+use wsp_wire::manager::{install_record, write_jobs, Jobs, Local};
 use wsp_wire::place::{
     new_order_id, Agent, Census, Delivery, Event, FirstOrder, Heard, Order, OrderId, Place, Refusal, Result as PResult, Seat, State,
 };
@@ -379,9 +379,6 @@ impl Host for Counting<'_> {
     fn alive(&self, pids: &[u32]) -> BTreeSet<u32> {
         self.inner.alive(pids)
     }
-    fn started(&self, pid: u32) -> std::result::Result<Option<String>, ()> {
-        self.inner.started(pid)
-    }
     fn shells(&self) -> Option<String> {
         self.inner.shells()
     }
@@ -483,6 +480,9 @@ impl Host for Counting<'_> {
     }
     fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.inner.transcript_of(session, cwd)
+    }
+    fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        self.inner.transcripts_of_tree(tree)
     }
     fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         self.inner.pi_session_of(session, cwd)
@@ -1653,20 +1653,22 @@ fn a_job_under_a_silent_manager_is_host_silent_and_runs_nowhere() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `WSP_JOBS` chooses the jobs' host apart from `WSP_HOST`: `inproc` by
-/// default, and `manager` is the manager's `Tcp`, silent when it is.
+/// `WSP_JOBS` chooses the jobs' host apart from `WSP_HOST`: `manager` by
+/// default since wsp-056, `inproc` the rollback, and `manager` is the
+/// manager's `Tcp`, silent when it is.
 #[test]
-fn wsp_jobs_chooses_apart_from_wsp_host_and_defaults_to_inproc() {
+fn wsp_jobs_chooses_apart_from_wsp_host_and_defaults_to_manager() {
     let (dir, _) = place("jchoice");
-    assert_eq!(JobsChoice::parse(None), Ok(JobsChoice::Inproc));
-    assert_eq!(JobsChoice::parse(Some("")), Ok(JobsChoice::Inproc));
-    assert_eq!(JobsChoice::default(), JobsChoice::Inproc);
+    assert_eq!(JobsChoice::parse(None), Ok(JobsChoice::Manager));
+    assert_eq!(JobsChoice::parse(Some("")), Ok(JobsChoice::Manager));
+    assert_eq!(JobsChoice::default(), JobsChoice::Manager);
     assert_eq!(JobsChoice::parse(Some("inproc")), Ok(JobsChoice::Inproc));
+    assert_eq!(JobsChoice::parse(Some(" inproc ")), Ok(JobsChoice::Inproc));
     assert_eq!(JobsChoice::parse(Some("manager")), Ok(JobsChoice::Manager));
     let bad = JobsChoice::parse(Some("tcp")).err().expect("neither choice");
     assert!(matches!(bad, HostError::JobsChoice(_)));
     assert!(bad.to_string().starts_with("WSP_JOBS=tcp"), "{bad}");
-    // Defaults differ: seats go to the manager, jobs stay in-process.
+    // Seats and jobs both default to the manager, each chosen on its own.
     assert_eq!(Choice::default(), Choice::Manager);
 
     let state = dir.join("state");
@@ -1674,6 +1676,56 @@ fn wsp_jobs_chooses_apart_from_wsp_host_and_defaults_to_inproc() {
     assert!(host::choose_jobs(JobsChoice::Inproc, &state, "test").is_ok(), "in-process asks nobody");
     let err = host::choose_jobs(JobsChoice::Manager, &state, "test").err().expect("no manager answers");
     assert!(matches!(err, HostError::Silent { .. }), "{err:?}");
+    let err = host::choose_jobs(JobsChoice::parse(None).unwrap(), &state, "test").err().expect("unset is the manager");
+    assert!(matches!(err, HostError::Silent { .. }), "unset WSP_JOBS never falls back to in-process: {err:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// wsp-056: with `WSP_JOBS` unset a job runs on the manager (its `job.ended`
+/// names the manager's host and its log is under the manager's exec dir), and
+/// with `WSP_JOBS=inproc` the same job runs in this process (no host by name,
+/// its log under `<state>/inproc`, never the manager's). Both place its `dir`
+/// under the tree root the install wrote in `jobs.json`, here not the home
+/// directory, so the rollback runs in the tree the manager did.
+#[test]
+fn an_unset_wsp_jobs_runs_a_job_on_the_manager_and_inproc_runs_it_here() {
+    let (dir, _) = place("jdefault");
+    let (root, at) = job_place(&dir);
+    let root = root.canonicalize().unwrap();
+    assert_ne!(root, wsp_wire::util::home().canonicalize().unwrap(), "the installed root is not home");
+    let port = free_port();
+    let m = job_manager(&dir, &root, port);
+    let state = dir.join("state");
+    let mut local = Local::new(&dir.join("exec"), port);
+    local.host = "test-host".into();
+    install_record(&state, &local, Duration::from_secs(1)).unwrap();
+    write_jobs(&state, &Jobs { build: 1, check: 2, tree_root: root.clone() }).unwrap();
+    let exec = dir.join("exec").canonicalize().unwrap();
+
+    // Unset: the manager.
+    let on = host::choose_jobs(JobsChoice::parse(None).unwrap(), &state, "test").expect("the manager answers");
+    assert_eq!(on.job_host(), Some(HostId("test-host".into())), "the job's host is the manager's");
+    let run = job(host::job_key("wsp-056-unset", 0, "run@1"), &at, "echo where >> where; echo on-manager", 30);
+    let mut out = String::new();
+    let ended = on.run_job(&run, &mut |o: &JobOutput| out.push_str(&o.text)).expect("the job runs on the manager");
+    assert_eq!(ended.exit, Some(0), "{ended:?}");
+    assert!(out.contains("on-manager"), "{out:?}");
+    let log = PathBuf::from(&ended.log.path);
+    assert!(log.canonicalize().unwrap().starts_with(&exec), "the manager kept its log: {log:?}");
+    m.stop();
+
+    // `inproc`: this process, the same `dir` under the same installed root.
+    let inproc = host::choose_jobs(JobsChoice::parse(Some("inproc")).unwrap(), &state, "test").expect("in-process asks nobody");
+    assert_eq!(inproc.job_host(), None, "the in-process runner is asked by no name");
+    let run = job(host::job_key("wsp-056-inproc", 0, "run@1"), &at, "echo where >> where; echo in-process", 30);
+    let mut out = String::new();
+    let ended = inproc.run_job(&run, &mut |o: &JobOutput| out.push_str(&o.text)).expect("the job runs here, with the manager stopped");
+    assert_eq!(ended.exit, Some(0), "{ended:?}");
+    assert!(out.contains("in-process"), "{out:?}");
+    let log = PathBuf::from(&ended.log.path);
+    assert!(!log.starts_with(&exec), "not the manager's log: {log:?}");
+    assert!(log.starts_with(state.join("inproc")), "the in-process runner's, under this state: {log:?}");
+    assert_eq!(fs::read_to_string(root.join("w").join("where")).unwrap().lines().count(), 2, "each ran once, in the same tree");
     let _ = fs::remove_dir_all(&dir);
 }
 

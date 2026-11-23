@@ -108,8 +108,8 @@ Each line has one of four verdicts:
 | operation | site | verdict | why |
 |---|---|---|---|
 | A seat's process tree from `ps`, then a kill by pgid | crates/wire/src/place_super.rs:844, :886; crates/wire/src/place_compound.rs:1298 | **M** | The manager started the tree, so it ends it and reports the pids. |
-| leaked agents: agents found by `ps` and killed | src/leaked_agents.rs:126 | **D** | Every agent on a host is one of the manager's seats. An agent that is nobody's cannot exist, except one started by hand, and that is not wsp's to kill. |
-| `wsp role reap`: `ps`, `lsof` and kill | src/cmd_role.rs:360, :629, :671 | **D**, or a manager verb if Ed wants a person's reap | The same reason. |
+| leaked agents: agents found by `ps` and killed | src/leaked_agents.rs:126 | **D** (gone, wsp-057) | Every agent on a host is one of the manager's seats. An agent that is nobody's cannot exist, except one started by hand, and that is not wsp's to kill. |
+| `wsp role reap`: `ps`, `lsof` and kill | src/cmd_role.rs:360, :629, :671 | **D**, or a manager verb if Ed wants a person's reap. Gone in wsp-057: `wsp reap <pid>` is removed and `wsp reap --list` reads the manager's seats and jobs (wsp-042's (b)) | The same reason. |
 | a shell waiting on itself, found by `ps` and killed with TERM | src/waiting.rs:872, :875 | **M** | The shell is in the seat's tree. The manager reports `seat.stuck` and wsp decides whether to end it. |
 | strays in a finished tree: `lsof -d cwd`, then kill (wsp-478) | crates/trees/src/check_tree.rs:221, :259, :327, :579, :592 | **D** once tree jobs run under the manager (1.3) | Ownership becomes a record, not a cwd. |
 | a check's own child group, killed on timeout | src/check.rs:1249, :1261, :1272; crates/trees/src/at_stop.rs:98 | **with tree work** (1.3) | The process holds a handle on the child it spawned. This is not inference. |
@@ -572,8 +572,8 @@ taken with `wsp calls` over a day before and a day after, and its incident count
 |---|---|---|---|
 | **M0. herdr out, seam named** | wsp-120 (4.4). `host-api` holds the types of 3.2. Every OS-touching call outside tree work goes through one `Host` trait (`crates/wire/src/host.rs`, its methods grouped by the messages of 3.2). Its only implementation is **in-process** (`host::InProcess`): today's code, behind the trait. The seat operations of place_compound.rs and place_super.rs are behind it first (wsp-005), then the transcript and hook-log reads, grouped as `seat.did` and `turn` (wsp-007), and the host facts (wsp-006): `df`/`du`, per-seat memory and running shells (`ps`), the throttle's `sysctl`, `pmset`, `vm_stat`, `memory_pressure` and `ioreg`, pid liveness and a check run's `lstart`. Layers below wire (base, store) ask nothing themselves: their callers pass the host's answer in. `wsp calls --incidents`. | `grep` finds no `ps`, `lsof`, `kill`, render, transcript or fact probe outside the in-process host (tree work excepted). Spawn p50 ≤ 9.4 s, `wip` CPU no worse, tick no slower. Herdr references → 0. | Revert. It is a pure move plus deletions, behind the same tests. |
 | **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. `WSP_HOST` is `manager` when unset (wsp-029); a manager's start adopts the seats the in-process host started, from compound's run directory. |
-| **M2. The i5 under its own manager** | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
-| **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag. The sweep is restored with them. |
+| **M2. The i5 under its own manager** (the Mac since wsp-314; see "M2's breakdown") | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
+| **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag (`WSP_JOBS=inproc`; the default is `manager` since wsp-056). The sweep is restored with them. |
 | **M4. Trees placed (T2, Ed 2026-11-18; see "M3 under T2")** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
 
 Spawn p50 is the guard rail at every step: a step that makes it worse than 9.4 s, measured the same way, does not
@@ -966,10 +966,146 @@ The last code row of M1: with `manager` the default, wsp no longer does what M1'
   until M2; `hooks.jsonl` is still written by `log_hook`, and `did.rs` and the `ran` clause still read the
   transcript, since no `seat.*` event replaces them. `docs/host-seam-allowed.txt` holds its four lines.
 
+#### M1's result (wsp-031, 2026-11-20)
+
+**The window.** These verdicts are taken from one window: **2026-11-20T07:58:22Z to 08:41:38Z, 43 min (0.72 h),
+128 ticks**. It starts when the M1 trunk (`38e6aa8`, wsp-030) was installed. The daemon's start on that binary is
+`daemon.json`'s `since`, 07:58:22Z, and the manager restarted at 07:58:24Z. The person passed barrier 8 at
+08:25Z on judgement, without waiting for the M1 day. So `wsp calls --since 24h` still holds mostly ticks from
+before M1 (ff9afa6), and is not M1's result. Every figure below comes from `measure.py` in the row's scratch
+directory, run over the window. It reads `calls.jsonl` and `polls.jsonl` the way `wsp calls --since` and
+`--polls` do. The 24 h before the install (2026-11-19T07:58:22Z to 2026-11-20T07:58:22Z, 4,280 ticks) is
+given beside it as the before figure only.
+
+A figure that is a rate per tick or per call is judged on the window when its miss or its hold is far wider
+than the window's noise. A figure that is per day, or that rests on a handful of calls, is **owed**: the
+day-long figure on the M1 trunk is filed as wsp-323, after wsp-324.
+
+**The installed manager is not the M1 trunk's.** `wsp install` at 07:58Z rebuilt `wsp`. It copied the
+`wsp-manager` it found beside it, and that was `target/release/wsp-manager` from 2026-11-19T07:29Z
+(`put_manager`, `src/cmd_install.rs`: a binary beside `wsp` is not rebuilt). `cmp` shows the binaries are the
+same. The live manager lacks every manager and host commit since then: 3488325, f44f2cb, and wsp-030's
+7498607, 9ffd75e and 981dca4. So the window measures the trunk's `wsp` against a manager a day older. The
+owed day is to be taken on a manager built from the trunk.
+
+| measure | 6.1 baseline | M1 asks | **M1 trunk, from 07:58:22Z, 0.72 h** | before: 24 h to the install (ff9afa6) | verdict |
+|---|---|---|---|---|---|
+| `ps` per tick | 37.5 | ≤ 1 | 9.00 (128 ticks) | 6.85 | **missed** |
+| renders per tick (`compound-reader`) | 59.5 | 0 | 35.32 | 14.40 | **missed** |
+| `df` per tick | 24.6 | 0 | 2.69 | 1.36 | **missed** |
+| `lsof` in `wip` | (in the 2.9 s) | 0 | 0 in 54 calls | 0 | met in the window |
+| `wip` CPU per call (polls, p50) | 2.9 CPU-s | < 0.2 | 0.671 (n = 23), `--json` 0.647 (n = 31) | 0.428, `--json` 0.483 | **missed** |
+| compound's host polling, CPU-s per day | 25,268 | < 2,500 | partial: 20.1 CPU-s in 0.72 h, ~668 a day scaled | 660 | **owed** (full day) |
+| spawn p50 | 9.4 s | ≤ 9.4 s | partial: 2 spawns, 1.50 s | 0.93 s (147) | **owed** (full day) |
+| tick p50 / p95 | 19.5 s / 116 s | — | 76 ms / 976 ms | 20 ms / 686 ms | — |
+| wsp-411-kind incidents | 0 of 30 (M0's week) | 0 over a week | 0 of 5 seats ended | 0 of 79 (25 h) | **owed**, 2026-11-27 |
+| manager `kill -9` mid-turn | — | 10 scripted runs | 10 of 10 hold (on the trunk's build) | — | met |
+
+In this window the trunk does worse than the day before it: more renders, more `ps`, and dearer `wip` calls,
+on a machine busy with builds. 43 minutes cannot say whether that is load, the stale manager, or the trunk. The
+owed day will.
+
+How each was taken, and the cause of each miss:
+- **Per tick** is the children counted on every `"k":"tick"` line in the window, over all of them. It includes
+  the light ticks that run only `standing` and `attention`. The causes come from the same lines' `phase_kids`
+  in the window:
+  - **`ps`.** It comes from `ending:verification` (4.03 per tick), `attention` (1.16), `repair:refusing` (0.77),
+    `repair:frozen` (0.59), `tunnels` (0.55) and `sweep:build-output` (0.37). These are `Host::alive`,
+    `tree_of`, `table` and `rows_of`. `host::Tcp` leaves all of them in-process under both choices, because
+    group 4 kept the process table where it was until M3 (`crates/wire/src/host_tcp.rs`, "the process table
+    stays in-process at M1"). M1's line asked for ≤ 1 without a row that moves them. This is a gap in the
+    breakdown, not a regression.
+  - **Renders.** They come from `ending:verification` (9.61), `tunnels` (6.16), `attention` (6.10),
+    `sweep:build-output` (4.13), `ending:checks` (3.80) and `sweep:check-trees` (3.80). They are
+    `Host::screen_state`, which `Tcp` hands to the in-process host (`host_tcp.rs`, `screen_state`).
+    `Compound::detected_state` (`place_compound.rs`) reads the screen first for every seat whose state it is
+    asked. The manager's `seats` reply has the hook-folded state (wsp-038), and nothing in the daemon reads it
+    in place of the screen. The breakdown never planned a row to make that switch.
+  - **`df`.** All of it is `sweep:scratch` (`scratch::tidy`). It asks the disk itself and does not read the
+    beat's `HostFacts.disk` (the throttle reads those, wsp-028).
+- **`wip`** is user+sys of the process and its waited children, from `polls.jsonl`. It has no children: no
+  `ps`, no `lsof`, no render. The 0.67 CPU-s in the window, and the 0.43 the day before, is wsp's own work in
+  the process. On the same store, `ls --json` takes 0.04 s. M0's A/B measured 0.131 on the Mac, with 2 seats
+  and a smaller store. Here there are 12 seats and a 44 MB store of 4,770 files. This machine has no profiler
+  (`perf`, `strace`), so the cost was not isolated to a phase. The cause is named as not found (wsp-327).
+- **compound's host polling.** In 6.1 this was `none via host`, the gpui app. Here compound polls over ssh:
+  `stamp`, `wip --json`, `ls --json`, `spend --json` and `worklist … --json` under `sshd-session`. In the window
+  that is 104 polls and 20.1 CPU-s, about 668 a day if the rate held. Every no-seat poll together, the person's
+  shell's `wip` loop (`zsh`) included, is 42.0 CPU-s, about 1,398 a day. The day before, compound's set was
+  5,711 polls and 658 CPU-s, and everything was 2,448. The figure is partial, so it is owed, not met.
+- **Spawn** is `"verb":"spawn"` with exit 0 in `calls.jsonl`, live, with the agent, as M0's live column. The
+  window holds 2 spawns, too few for a p50. The day before held 147 (0.93 s, p95 2.71 s).
+- **Incidents** are `wsp calls --incidents`. Since the install: none of any kind, and 0 of 5 seats ended on a
+  census were heard from after. On this machine `cycle.log` starts at 2026-11-19T07:36Z, so the week on the M1
+  trunk is owed on 2026-11-27. Over the 25 h before: I1 5 (wsp-478 kind 1, barrier check trees 4), I2 3, I3 3,
+  I4 1. wsp-411 kind: 0 of 79.
+
+**The `kill -9` proof.** The proof is `k9/proof.sh` in the row's scratch directory, run 10 times by
+`k9/ten.sh`. Each run's log, journal, manager log and agent log are in `k9/runs/<n>/`. Each run starts and
+ends its own instance:
+- a `wsp sandbox --fake` store and state, with a one-commit repo, a project and a row;
+- a private `wsp-manager` from this tree's build, on a free loopback port, with its own exec dir. The
+  sandbox's manager record names it;
+- the sandbox's own `wsp daemon`;
+- `wsp spawn <row> --agent`. This gives a real compound-sup session with compound-reader reading its screen.
+  The agent is `k9/claude`, a stand-in with no model: it draws Claude Code's composer (`❯` between two
+  rules) and the title spinner while a turn runs, and it fires the real hooks (`claude-code/wsp-session.sh`,
+  so `wsp report` to the manager and `compound-sup submitted`). Every prompt it is typed is logged.
+
+Order A is told. It is typed, and the seat is mid-turn: the screen is working, and A's `UserPromptSubmit` is
+held 2 s. Order B is told behind it. The manager is killed with SIGKILL 0.5 s later, with **both orders in
+flight in its `orders/`**. Both `wsp tell`s answer "unreachable — held". The manager is started again 2 s
+later, on the same port and exec dir. A run holds when every one of these is true:
+- the agent's process and its compound-sup are the same throughout;
+- the restarted manager adopts the seat under its epoch, and the journal holds one `seat.started` and no
+  `seat.stopped`;
+- `wip` lists the seat;
+- the brief, A and B were each typed exactly once, and each turn ended;
+- the journal acks each order once, and the manager's `orders/` is empty;
+- the row is still claimed by the seat, and `cycle.log` ends nothing.
+
+The restarted manager asks both orders again under their ids. compound-sup answers A from its kept answer
+without typing it again, and types B once the composer is idle. Runs 1–10, 2026-11-20T08:36Z to 08:39Z: **10 of 10 hold**. Every run passed all 15 checks, had 2
+orders in flight at the kill, and re-asked 2 orders on restart (`k9/ten.log`). A run takes 14 s from the kill
+to the checks, and most of that is A's 8 s turn.
+
+The first attempt found a hazard, not a failure. A seat's environment carries `COMPOUND_RUN_DIR`, which names
+the live manager's run directory, and `wsp sandbox` keeps it. So a manager started in a sandbox from a seat
+adopts the live fleet's seats as "started in-process". The private manager adopted all 12, and its first seat
+id, `cpd-1`, collided with the live m3 custodian's. It was killed before it acted, and every live seat was
+checked alive. The script now unsets the variable, points `--inproc-run` at an empty directory, and stops if
+anything is adopted. `wsp sandbox rm` also leaves a manager-forked seat running, because it reaps by
+`WSP_STATE` in a process's arguments. The script ends whatever names its sandbox.
+
+**Against the done-when line** (window 2026-11-20T07:58:22Z, 0.72 h, on the M1 trunk's `wsp` and a stale
+manager):
+- **ps ≤ 1, renders 0, `df` 0: missed.** 9.00, 35.32 and 2.69 per tick over 128 ticks, down from 37.5, 59.5 and
+  24.6. The cause is calls that M1's breakdown left in-process (the process table, `screen_state` and the
+  scratch sweep's disk), not new ones (wsp-326).
+- **`lsof` in `wip` 0: met in the window**, over 54 calls.
+- **`wip` < 0.2 CPU-s: missed.** 0.67 in the window and 0.43 the day before, from 2.9. The cause is in-process
+  work, not isolated (wsp-327).
+- **Host polling < 2,500 CPU-s per day: owed.** It is partial: about 668 a day for compound, and 1,398 for
+  everything that polls, scaled from 0.72 h.
+- **Spawn p50 ≤ 9.4 s: owed.** 2 spawns in the window.
+- **wsp-411 kind 0 over a week: owed** on 2026-11-27. 0 of 5 since the install.
+- **kill -9 mid-turn loses no seat and no order: met,** 10 of 10, with two orders in flight at the manager each
+  time. The agent is a stand-in, so what this proves is wsp, the manager, compound-sup and the hooks, not
+  Claude Code.
+
+Filed from here:
+- wsp-323: the figures owed. That is a full 24 h on the trunk's `wsp` *and* manager, no earlier than 24 h after
+  the reinstall wsp-324 makes possible (and no earlier than 2026-11-21T07:58Z), and the week of incidents on
+  2026-11-27. It comes after wsp-324.
+- wsp-324: `wsp install` keeps a stale `wsp-manager`.
+- wsp-325: `wsp sandbox` keeps `COMPOUND_RUN_DIR`, and `sandbox rm` leaves manager-forked seats.
+- wsp-326: the per-tick `ps`, renders and `df` M1's breakdown left in-process. Which go to M3 is to be decided.
+- wsp-327: where `wip`'s 0.43 CPU-s goes.
+
 #### M3's breakdown (wsp-042, 2026-11-17)
 
 The list is `m3-agent-manager`, at status init. It is planned on top of M1 alone, because no far machine is registered and M2 is not available. It follows wsp-018's three rules:
-- expand, then contract. A job runner is added beside today's in-process runs, behind `WSP_JOBS=inproc|manager`, which defaults to `inproc`. Callers move one area at a time. The old spawns and the sweeps are deleted last;
+- expand, then contract. A job runner is added beside today's in-process runs, behind `WSP_JOBS=inproc|manager`, which defaulted to `inproc` until group 6 made it `manager` (wsp-056). Callers move one area at a time. The old spawns and the sweeps are deleted last;
 - a removal that cannot be staged is one row run as legs;
 - every row's checks build the workspace and test every crate it touches, with at least 120 s per cargo test step.
 
@@ -982,7 +1118,7 @@ Each row's overview names the files it changes.
 | 3 | components | wsp-050 | The manager serves `job.*`: keyed runs, a hard cap per class, events journalled, `job.stop` on its own pgid only, and re-adoption on restart. |
 | 4 | wiring | wsp-051 | `Host::run_job`, `stop_job` and `jobs` on `host::Tcp` (waiting by subscription, never by a poll) and on `InProcess`. `WSP_JOBS` is independent of `WSP_HOST`. |
 | 5 | wiring | wsp-052, wsp-053, wsp-054, wsp-055 | Callers move under `manager`, one row per area: `throttle run` (its output streamed, ^C as `job.stop`, slots from `jobs`, admission from the beat); `check`'s `run_step` and its locks; `verify`'s cargo, listing and `--alone`; barrier runs and warm.rs's cleanup. The barrier row rests on check's. |
-| 6 | contract | wsp-056 | `WSP_JOBS` defaults to `manager`, and `wsp install` writes the job capacities. Stop: a live day on the installed trunk. |
+| 6 | contract | wsp-056 | `WSP_JOBS` defaults to `manager`, and `wsp install` writes the job capacities. Stop: a live day on the installed trunk. Done: see "M3 group 6". |
 | 7 | contract | wsp-057 | Contract, as legs: delete check_tree's sweep, leaked_agents, the slot probes, the direct spawns of tree work, Host methods left with no caller, and warm.rs's allowed line. host_seam loses "tree work excepted". Stop: install, then a day. |
 | 8 | insitu | wsp-058 | The M3 line's measure, written here as "M3's result": `lsof` and `ps` at 0 on the wsp side, every kill matched to a pgid the manager started, wsp-478-kind incidents at 0 over a week, `throttle run`'s wall no worse, and spawn p50 no worse than 9.4 s. |
 
@@ -1085,10 +1221,11 @@ The `Host` trait (crates/wire/src/host.rs) gains `run_job`, `stop_job` and `jobs
   `BEAT_SECS × MISSED_BEATS`, subscribes from the last id it heard, and sends the same frame with its key unchanged.
   The manager hands the job over and does not run it again. `stop_job` and `jobs` go over the CLI's one connection.
 - **`host::InProcess`** runs wsp-host's runner here (`with_jobs(exec, tree_root)`; by default
-  `~/.local/state/wsp/inproc` and the home directory). It places a `dir` by the manager's rule, uses the same 5 s
+  `~/.local/state/wsp/inproc` and the home directory; `WSP_JOBS=inproc` gives it `<state>/inproc` and the tree root
+  in `<state>/manager/jobs.json`, see "One root on both sides" below). It places a `dir` by the manager's rule, uses the same 5 s
   grace between `TERM` and `KILL`, and keeps a job table per process. A key the runner's files show already ran
   gets back that run's end and is not run again.
-- **`WSP_JOBS=inproc|manager`** is read once per process (`host::jobs_chosen`). The default is `inproc`. `manager`
+- **`WSP_JOBS=inproc|manager`** is read once per process (`host::jobs_chosen`). The default was `inproc` until wsp-056 made it `manager`. `manager`
   is the same `Tcp` that `WSP_HOST` uses, but the two variables are independent. A silent manager is "host silent",
   and the job is not run in-process instead.
 - **Keys** come from `host::job_key(row, attempt, job)`, built once per run by the caller. `job` must be unique per
@@ -1099,6 +1236,259 @@ come back. One key sent twice runs once, and the next attempt runs again. A stop
 child. A timeout says `timed_out`, and a `dir` outside the root is refused `no_tree`. They also check that a silent
 manager is "host silent" within a second with nothing run, that `WSP_JOBS` is chosen independently of `WSP_HOST`,
 and that a job whose manager restarts mid-run is resent under its key and runs once.
+
+#### M3 group 5: `throttle run` under `WSP_JOBS=manager` (wsp-052, 2026-11-20)
+
+`wsp throttle run` (crates/trees/src/throttle.rs) is the first caller to move. Under `inproc`, and on a host with no
+manager record (the i5 before M2), nothing changes: `run_in` runs the build in this process as before. Under
+`manager`, `run_raw` takes `run_raw_on`, and `run_on` keeps the decision here (d1 Q11):
+- **The decision reads the beat.** The person's idle time, the clock and the cores come from `Host::facts`, which is
+  the facts on the manager's `seats` reply (hello carries none), and not from `ioreg`, `pmset` or `sysctl`. Through
+  the same reading (`View::of_host`, `Given::of_facts`), `wsp throttle`, `wip`'s files-path line, `doctor` and the
+  daemon's `sweep:throttle` see the same machine. With no beat yet there is no load and no clock, and `auto` holds.
+- **An admitted run is one `job.run`.** That is a heavy build or a `cargo run`, at the shim's cwd as a
+  `HostDir {host: the manager's own name (Host::job_host), path: relative to its tree root}`. The tree root is the
+  home directory, which is the manager's default. Class `check` is for `cargo check` and `clippy`, and `build` is
+  for the rest. The argv is `nice -n 12` when niced, then `env -i` with the allowlist (`PATH`, `HOME`, `TERM`,
+  `CARGO_TERM_COLOR`, `CARGO_*`, `RUST*`, `SCCACHE_*`, `WSP_*` with no `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`,
+  `CRED` or `COOKIE` in the name), then the hold and the job cap the decision set, then the real tool. The output
+  goes to the shim's stdout as `job.output` arrives (the job's log is one stream, so stderr is in it). The exit is
+  the job's. A tool's own signal is the shell's 128+n. A job ended by a stop or its bound exits 143, and one the
+  shim's ^C stopped exits 130. The job is not detached, so a shim killed with its agent stops it. A run refused
+  `full` waits and asks again under the same key. Any other refusal, and a silent manager, run nothing here
+  instead.
+- **^C is `job.stop`.** The job is in its own process group, not the terminal's, so the shim catches SIGINT
+  while the job runs and stops it.
+- **Holds carry the job's key and are read from the job table** (`live_by`). A running job holds. An ended job does
+  not, with no `kill -0`. A job not in the table yet holds for 60 s from the hold's mtime, and the holder refreshes
+  it while it waits for a slot or for `full`. A hold that is no job's (a check's slot, an in-process run), or one
+  whose table could not be read, is judged by its pid as before. wsp-053 moves the check slots.
+
+Tests (crates/trees/src/throttle.rs, `manager_tests`) run a loopback manager with `sh` standing in for cargo. One
+run is one row in `jobs`, and its output, exit, cap, hold and nice reach the caller with no token in the
+environment. A slot left in this process's own name, whose job has ended, is taken at once with no pid asked. A
+beat that says the person left, the person is here, or the clock is limited drives the decision. `run_raw` run as
+its own process ships the build as its job, and its call log has none of `sysctl`, `pmset`, `ioreg`, `vm_stat`, `ps`
+or `kill`. SIGINT to that process stops the job (exit 130, the tool gone, the job ended in the table).
+
+#### M3 group 6: `WSP_JOBS` defaults to `manager` (wsp-056, 2026-11-20)
+
+- **The default.** An unset or empty `WSP_JOBS` is `manager` (`host::JobsChoice`, in `crates/wire/src/host_tcp.rs`,
+  re-exported by `host.rs`). `WSP_JOBS=inproc` still runs jobs in this process through wsp-host's runner, and is the
+  rollback. A silent manager is still "host silent", and an unset `WSP_JOBS` never falls back to in-process.
+- **The capacities.** `wsp install` writes `--build`, `--check` and `--tree-root` into the manager's launcher (the
+  plist on macOS, the systemd unit's `ExecStart` on Linux), after `--port`. It takes them from `manager::Jobs`.
+  `--build` is the throttle's slot count on this machine's cores (`throttle::cores`, a pinned count first), and
+  `--check` is its check slots. Both use the cool counts, the larger, so the manager's hard cap never refuses what
+  the throttle admits. A hand's `slots` and `checks` in `throttle.json` carry through. A change to either is a
+  rewrite of the launcher and a restart.
+- **The tree root.** Each host's install writes its own manager's tree root, as T2 asks. If every registered
+  project root is under the home directory, the root is the home directory (the manager's default). Otherwise it
+  is the deepest directory all the project roots share, for example `/Volumes/Work/src`. A project root is also
+  where its trees are made at M4 (`.worktrees` under it), so the root covers them too. If the roots share nothing
+  below `/`, the install says so in red, since then no job is confined. `--tree-root` stays single: a `HostDir` is
+  a path relative to one root, so a repeatable root would change the contract. Today's project roots on each host
+  share one volume.
+- **One root on both sides.** The install keeps what it told the manager in `<state>/manager/jobs.json`, beside the
+  machine record, and `--uninstall-manager` removes it with the record. wsp places a job under the same root:
+  `job_place::tree_root` and `throttle run`'s `Jobs` read it there (`job_place::installed_tree_root`). Without the
+  file, wsp uses the home directory, as before. The rollback's in-process runner (`WSP_JOBS=inproc`,
+  `host::choose_jobs`) reads the same file by the same rule, so a host whose projects are outside home still runs
+  its jobs in their trees after a rollback.
+- **Doctor** names the capacities in the manager's `hello` ("runs N build and M check jobs at once"). It reports a
+  problem when they differ from what `jobs.json` says the install wrote.
+
+Tests: `crates/wire/tests/host.rs` runs a job with `WSP_JOBS` unset on a loopback manager. The manager's host and
+its exec dir keep the log. The same job under `inproc` runs in this process, with its log under `<state>/inproc`.
+`launchd.rs` and `systemd.rs` check that the launcher carries the capacities in order. `manager.rs` checks that
+doctor names `hello`'s capacities and holds them to `jobs.json`. `cmd_install.rs` checks that the launcher `wsp
+install -n` compares against carries the throttle's settings and a root covering the projects.
+`job_place.rs` checks that wsp reads back the root the install wrote.
+
+#### M3 group 7: the contract (wsp-057, 2026-11-20)
+
+wsp-057 deleted what the jobs replaced. Gone: check_tree's process sweep, `leaked_agents` and `wsp reap <pid>`; the
+throttle's slot probes and check slots; sharing's `alive`, the barrier run's pid start time (`checks::Run`'s
+`started`, `lstart`) and the `TreeLock`'s `kill -0`; and every direct spawn of tree work: check's steps, verify's
+cargo, the throttle's runs, warm's removal and the `at_stop:` teardown are each a job through `Host::run_job` under
+both `WSP_JOBS` choices. With them went the Host methods nothing called (`cwds`, `parents`, the trait's `started`).
+A holder's liveness is now its job in a job table or a lease it beats (`wsp_store::lease`: a tree lock, a barrier
+run), and no process is probed. `tests/host_seam.rs` lost its tree-work exception: a spawn of `sh`, `cargo` or
+`rustc` in tree work's code, or a place built by hand, fails it. Kept under T2 (wsp-093): `place_of` and the rest of
+`job_place`, where M4's `tree.checkout` goes, and treecopy.rs, which M4 retires once no host takes copies.
+
+#### M3's result (wsp-058, 2026-11-20)
+
+**The window.** These verdicts are taken from one window: **2026-11-20T12:08:12Z to 12:16:30Z, 0.14 h, 24
+ticks**. It starts at `wsp install` of the M3 trunk (`afa711e`, wsp-057). The manager restarted at 12:08:12Z,
+and the daemon runs the installed binary (the same inode). This row was started minutes after the install,
+not a day after it. So every figure that rests on a day or a week is **owed**, and is filed as wsp-360. Every
+figure comes from scripts in the row's scratch directory:
+- `measure.py`, which reads `calls.jsonl` and `polls.jsonl` the way `wsp calls --since` and `--polls` do;
+- `pgids.py`, which reads the manager's `manager.log` and `journal.jsonl`;
+- `rollback.sh`.
+
+Their output is kept beside them (`window.txt`, `before.txt`, `before-pgids.txt`, `rollback/`). The before
+figure is the 24 h to the install (2026-11-19T12:08:12Z to 2026-11-20T12:08:12Z, 4,268 ticks). That day ran
+three binaries in turn: `ff9afa6`, then the M1 trunk from 07:58Z, then a later trunk from 10:51Z.
+
+**Under T2 (wsp-093): the measure is one host's.** It was taken on the host the fleet runs on, `omarchy`
+(Linux, under systemd). That host is the trunk's host and has the only manager, which is the role 6.2 gives
+the Mac. Figures per host are left to M4's measure.
+
+**The installed manager is not the trunk's, again.** The install copied the `wsp-manager` it found beside
+`wsp`: `target/release/wsp-manager` from 2026-11-19T07:29Z (sha256 `7de0ac04…`). That is the stale build M1's
+result named, because wsp-324 is still open. Its job runner is wsp-050's (2026-11-17), so the window does
+measure jobs under a manager. But it lacks afa711e's and wsp-030's host commits. The owed day is to be taken
+on a manager built from the trunk, so wsp-360 comes after wsp-324. The rollback proof below used a manager
+built from this tree.
+
+| measure | 6.1 baseline | M3 asks | **M3 trunk, from 12:08:12Z, 0.14 h** | before: 24 h to the install | verdict |
+|---|---|---|---|---|---|
+| `lsof` per tick | 0.9 | 0 | 0 (24 ticks) | 0.34 | met in the window |
+| `lsof` in CLI calls / `throttle run` / polls | — | 0 | 0 / 0 / 0 (238, 8, 90 runs) | 44 / 0 / 0 | met in the window |
+| `ps` per tick | 37.5 | 0 | 9.42 | 7.82 | **missed** |
+| `ps` in CLI calls / `throttle run` / polls | — | 0 | 22 / 0 / 6 | 4,678 / 0 / 2,035 | **missed** |
+| `kill` per tick | 1.3 | 0 | 0 | 0.41 | met in the window |
+| `kill` in CLI calls / `throttle run` / polls | — | 0 | 0 / 0 / 0 | 3,057 / 725 / 686 | met in the window |
+| signals in manager.log on a pgid the manager started | — | every one | 6 of 6 | 354 of 354 (from 2026-11-19T07:29Z) | met in the window |
+| processes that escape a seat's group, counted (wsp-042 (c)) | — | reported and counted | no reporter | — | **missed**, no reporter until wsp-359 |
+| wsp-478-kind incidents | 0 (M0's week) | 0 over a week | 0 | 2 (in 29 h of cycle.log) | **owed**, 2026-11-27; 0 by construction |
+| `throttle run` wall per build (exit 0, ≥ 10 s), p50 | — | no worse | 1 run, 28.1 s | 24.2 s (338 runs), p95 88.4 s | **owed** (full day) |
+| spawn p50 | 9.4 s | ≤ 9.4 s | 1 spawn, 0.89 s | 1.02 s (213), p95 3.12 s | **owed** (full day) |
+| tick p50 / p95 | 19.5 s / 116 s | — | 80 ms / 807 ms | 23 ms / 954 ms | — |
+| `WSP_JOBS=inproc` runs a `wsp check` in-process | — | shown once | the step: holds (`rollback.sh`); the step's cargo: goes to the manager | — | **partly met** |
+
+How each was taken, and the cause of each miss:
+- **`lsof`, `ps` and `kill`** are the children recorded on each record's `children`. These are counted for
+  the daemon's `"k":"tick"` lines, the CLI's `"k":"call"` lines (with `throttle run` counted apart), and
+  `polls.jsonl`. They are given per tick, per phase and per verb. wsp signals a group through `signal_group`,
+  which runs `kill` as a child, so every signal wsp sends to a group is counted here. The call log cannot see
+  two things. One is std's `Child::kill` on a child whose handle wsp holds: the install, `packet_gen`, and the
+  ssh of tunnel.rs and far.rs. That sends SIGKILL by syscall to wsp's own child. The other is `pid_runs`'s
+  kill(2) with signal 0, which sends nothing. Neither reaches a pgid that wsp did not start.
+  - **`lsof` and `kill` went with wsp-057.** The day before, `kill` came from the throttle's slot probes
+    (`kill -0`): 2,295 in `throttle`, 725 in `throttle run`, 686 in polled `wip`s, and `sweep:throttle`'s 0.41
+    per tick. It also came from `check`'s steps (626). `lsof` came from `ending:verification` and `despawn`.
+    None of these runs any in the window.
+  - **`ps` is missed.** It comes from these phases, per tick: `ending:verification` 2.67, `attention` 1.29,
+    `cycle` 1.08, `repair:refusing` 1.00, `tunnels` 0.96, `repair:frozen` 0.67, `closing` 0.42,
+    `ending:checks` 0.33 (barrier check seats), `seats` 0.33, and `sweep:build-output` 0.33 (whether a pane
+    stands in a tree). In the CLI it comes from `brief`, `spawn`, `despawn`, `tell` and `worklist`, and from
+    polled `ls` and `worklist show`. `sandbox`'s 6 are `wsp sandbox`'s own reap, run by this row's rollback
+    proof. All of these are seat liveness and the fleet's census. wsp-326's decision d1 gave those to an M1
+    follow-up, wsp-330 (todo), and not to M3. That none of them is a probe from tree work rests on
+    `tests/host_seam.rs` (wsp-057), which fails on such a probe, not on a trace. The phases that were tree
+    work the day before (`sweep:check-trees` 0.37 and `sweep:leaked-agents` 0.33 per tick) run none: the
+    first runs no `ps`, and the second is gone. So the line as written, `ps` → 0 on the wsp side, is missed.
+    The part of it that M3's breakdown moved holds.
+- **Signals** are matched by `pgids.py SINCE [UNTIL]`. It reads every line of `manager.log` that sends a
+  signal:
+  - `job K: TERM to its group P` and `KILL to its group P` (a stop or a bound);
+  - `job K ended: …; its group P killed` (every end kills the group, wsp-453);
+  - `seat S stopped (epoch E, …)`.
+
+  A job's line matches when the journal holds a `job.started` with that key and that pgid. A seat's line
+  does not name a group. It matches a `seat.started` for that seat and epoch, whose pid (its compound-sup)
+  leads the seat's group. A seat that exits on its own logs the same line with no signal sent, so the count
+  over-counts signals and never under-counts them. A stopped seat that the manager adopted, but did not
+  start, is listed apart. Any other line that names a signal, `kill`, TERM or KILL is printed as
+  unclassified. The script exits 1 if anything is unmatched or unclassified. It was checked against a log
+  written for the purpose, with a job group the journal lacks, a stopped adopted seat and an unknown SIGKILL
+  line. It named all three and exited 1. In the window, 6 of 6 match (5 job ends and 1 seat stop). Over the
+  manager's whole log before the install, 354 of 354 match (102 job ends and 252 seat stops). One path signals
+  without a line: seats.rs sends KILL to a compound-sup that never gave its handshake, which is a failed
+  spawn. The log holds no such failure.
+- **The escape count is missed, for want of a reporter.** wsp-042's decision (c) says that once the sweep
+  goes, processes that escape a seat's group are reported and counted, and stopped by no one. wsp-057
+  deleted the sweep, and with it the only reporter of such processes on wsp's side: `LiveTree::left_in`
+  (src/cmd_spawn.rs) now answers nothing. The manager does not count them either: its seat and job
+  bookkeeping knows a group, not what left it, and manager.log has no line for an escape. So M3 has no
+  number for decision (c) in the window. This is not a 0: an escape in the window would have gone unseen. wsp-359 adds the
+  count, and the owed day (wsp-360) reads it once wsp-359 lands.
+- **Incidents** are counted by `wsp calls --incidents`. Since the install, I1, I2 and I4 are 0, and I3 is 1
+  (a prompt read off the screen). The wsp-478 kind is 0, **by construction**: wsp-057 deleted its writer,
+  `ending.rs`'s `stop_finished` (32df421), and with it the sign that the count reads. So the week's count will
+  be 0 whatever happens. What stands in for it is `pgids.py` over the same week, with `kill` at 0 in the
+  call log. Both are owed on 2026-11-27T12:08Z (wsp-360). In the 29 h before the install, cycle.log holds 2
+  such stops: wsp-139 at 2026-11-19T07:49Z and wsp-120 at 2026-11-20T09:01Z.
+- **`throttle run`'s wall** is taken from `throttle run` calls that exit 0. The call log does not name
+  cargo's subcommand, so a build is read as a run of 10 s or more. The day before gives a p50 of 24.2 s, a p95
+  of 88.4 s and a mean of 30.2 s over 338 runs. The part of that day on the in-process path alone, up to the
+  10:51Z install, gives a p50 of 24.5 s (299 runs). The window holds one such run (28.1 s), too few to judge.
+  Under the manager the build is no longer a child of `throttle run`: it shows no children in the window,
+  where every run the day before had `cargo`. So its CPU is the manager's, and this figure is wall time only.
+  In the window, 7 of 8 runs did not exit 0:
+  - 4 exited 101. They are wsp-128's tests failing, and manager.log has them as jobs that exit 101.
+  - 3 exited 126, from cpd-271. **Exit 126 is a build the shim did not run.** It began with group 6's
+    default. The call log holds 17 such exits, none before the 10:51Z install. Some are wsp-353's (the
+    manager's tree root left at `~`). The rest are filed as wsp-361: a cargo run from outside the tree root is
+    refused, with nothing run. The tree root is `/mnt/data/src`, and outside it are a seat's
+    `$WSP_SCRATCH` and the home directory. `cargo --version` in this row's scratch directory reproduces it.
+    The same root refuses `wsp check <id>` in wsp's shared check tree, which is under the state directory
+    (`~/.local/state/wsp/checks/wsp-wsp/tree`). That happened to wsp-057 and wsp-128, whose checks wsp ran
+    itself on a ready row, and to this row's own `wsp check --at`. Every check job that did run was in a row's
+    own worktree.
+- **Spawn** is `"verb":"spawn"` with exit 0, live, with the agent, as in M0's live column. The window holds 1
+  spawn (0.89 s).
+- **The rollback** is `rollback.sh`, run at 2026-11-20T12:15:23Z. It starts and ends its own instance:
+  - a `wsp sandbox --fake` store and state, with a one-commit repo, and a project whose `## Checks` has one
+    step. The step prints the command lines of its first eight ancestors;
+  - a row;
+  - a private `wsp-manager` built from this tree. It is named for this host, since a row's jobs go to the
+    manager of `job_place::host_of`. It runs on a free loopback port, with its own exec dir and tree root,
+    and the sandbox's manager record and `jobs.json` name it. The seat's `COMPOUND_RUN_DIR` and manager
+    variables are unset first (wsp-325).
+
+  `wsp check <row> --at <commit>` was run twice. With `WSP_JOBS` unset, the step was a job of the private
+  manager: a `job.started` in its journal, its log in the manager's `jobs/`, and `wsp-manager` the first of
+  its ancestors to be either `wsp-manager` or `wsp check`. With `WSP_JOBS=inproc`, the manager's journal gained
+  no job, and the step's log is under the sandbox's `<state>/inproc/jobs`. Its first such ancestor is `wsp
+  check <row> --at …` itself. Both runs exited 0. The manager was then ended, along with anything naming the
+  sandbox, and the sandbox was removed. **It holds**, 6 checks of 6 (`rollback/run.log`, the run at
+  12:21:33Z).
+
+  **But the rollback does not reach the cargo a step runs.** check.rs removes every `WSP_*` variable from
+  a step's environment, so the cargo shim inside the step reads `WSP_JOBS` as unset, which means `manager`.
+  `rollback.sh` prints this as the step's `WSP_JOBS=unset`. Live, `WSP_JOBS=inproc wsp check wsp-058 --at
+  58f7f6f` ran its steps in-process, and its `build` step's cargo went to the manager. The manager refused it
+  with exit 126, since the shared check tree is outside the root (wsp-361; `check-inproc-wsp-058.txt`). A
+  rollback taken because the manager is down would still send every check's build to it. Filed as wsp-362.
+
+**Against the done-when line** (window 2026-11-20T12:08:12Z, 0.14 h, on the M3 trunk's `wsp` and a stale
+manager):
+- **`lsof` → 0 on the wsp side: met in the window.** It is 0 per tick and in every verb, down from 0.34 per
+  tick and 44 in the CLI. The day is owed (wsp-360).
+- **`ps` → 0 on the wsp side: missed.** It is 9.42 per tick, with 22 in CLI calls and 6 in polls. The cause is
+  seat liveness and the census (wsp-330), which wsp-326's d1 left outside M3. Tree work's part of it is 0.
+- **Every `kill` by a manager, on a pgid it started: met in the window.** All 6 signals match a pgid in the
+  journal, and the call log holds no `kill` from wsp. The day before it held 4,468 in calls and polls, and
+  1,759 in ticks. Over the manager's log
+  before the install, 354 of 354 match.
+- **Escapes from a seat's group reported and counted (wsp-042 (c)): missed.** Nothing reports them since
+  wsp-057 deleted the sweep (`LiveTree::left_in` answers nothing), and the manager keeps no count. The figure
+  has no reporter until wsp-359, and wsp-360 reads it after that.
+- **wsp-478-kind incidents → 0 over a week: owed** on 2026-11-27T12:08Z (wsp-360). It is 0 since the install,
+  but the sign's writer is gone, so the count cannot rise. The week's `pgids.py` is the real figure.
+- **`throttle run`'s wall per build no worse: owed.** The window holds one build (28.1 s, against a 24.2 s
+  p50). Builds from outside the tree root, and `wsp check` in the shared check tree, are not run at all
+  (wsp-361).
+- **Spawn p50 ≤ 9.4 s: owed.** There was 1 spawn (0.89 s), against 1.02 s the day before.
+- **The rollback works: partly met.** `WSP_JOBS=inproc` ran a `wsp check` in-process on a sandbox row, with a
+  manager present and unused, and the script ended the sandbox itself. But a step's own cargo still goes to
+  the manager, because the step's environment drops `WSP_JOBS` (wsp-362).
+
+Filed from here:
+- wsp-360: the figures owed. That is a full 24 h on the trunk's `wsp` *and* manager, no earlier than 24 h
+  after the reinstall wsp-324 makes possible (and no earlier than 2026-11-21T12:08Z), and the week of
+  incidents with `pgids.py` beside it, on 2026-11-27T12:08Z. It comes after wsp-324.
+- wsp-361 (high): under `WSP_JOBS=manager`, work outside the manager's tree root is refused and not run. That
+  covers `wsp check` in the shared check tree, and `throttle run` in a seat's scratch or the home directory.
+- wsp-362 (high): `WSP_JOBS=inproc` does not reach a check step's cargo.
+- Owed elsewhere: the escape count waits on wsp-359 (filed by wsp-057), and wsp-360 carries it.
+- On wsp-324, a note that it bit again at M3.
+
+M4 is broken down by the governor once this row is done (d1 Q14).
 
 #### M3 under T2 (wsp-093, 2026-11-18)
 
@@ -1196,6 +1586,128 @@ affected rows among wsp-052..058 are amended to match:
 for every row. So `place_of` makes check, verify and barrier trees on the Mac in-process, and every job is named by
 `(row, host)`. No row in groups 5-8 lands. Land stays today's local fast-forward until M4's fenced push. So no verb is
 pulled into M3.
+
+#### M2's breakdown (wsp-314, 2026-11-23)
+
+M2 was written for a fleet that has since moved. Its row in 6.2 says "the i5": a far Mac mini dialled by wsp on the
+person's Mac. Today wsp, its daemon, its API and the only manager run on **omarchy** (Linux, systemd). No far
+machine is registered (`wsp machine ls`: "no machines — this seat only"), and the i5 is gone. The person's **Mac**
+runs web-chrome with `--target omarchy`. It reaches omarchy through an ssh tunnel to the API port, and through
+`wsp-remote` for the verbs, with ssh polling as web-chrome's fallback (compound-react-022's overview).
+
+**Which machine.** M2's far manager runs on **the Mac**, named `mac` in the machine records. This is the recommended answer to the person's ask m-dn2ee6lcbnb6-p385f80 (which machine, and the Mac's ssh alias and Tailscale). It was put on 2026-11-23 and was unanswered when the lists were filed. It stands until the person answers, and m2-agent-manager's group 3 stop is where the answer is first needed. Another machine changes only the name in the stops' commands. It is the
+only second machine in the fleet, it already speaks to omarchy, and `wsp install` already writes a manager's
+LaunchAgent on macOS (`manager_agent`, src/cmd_install.rs). So M2 is the reverse of the plan as written. Section 5
+still holds line for line, with "the i5" read as "the Mac" and "the Mac" read as "omarchy". The far machine is now
+the macOS one, so the GUI-session note (the keychain token) applies to it as written.
+
+M2 is five lists, all at status init, chained with `wsp worklist after`: `m2-agent-manager` → `m2-manager-path` →
+`m2-default` → `m2-result` → `m2-contract`. Each list ends at a step only the person can take (wsp-091), so the days
+the person spends on an install, a live day or a live week are not counted as standing time at a list's own
+barrier. M1's and M3's lists kept such steps partway through, but they were planned before that rule. The lists
+follow wsp-018's three rules, as M1 and M3 did:
+- expand, then contract. `transport: manager` arrives beside `ssh` per machine, and the v1 path is deleted only
+  after a fortnight on `manager`;
+- a removal that cannot be staged is one row run as legs;
+- every row's checks build the workspace and test every crate it touches.
+
+No row is filed with `--parent`: list membership runs them (wsp-154's rows; wsp-303 and wsp-310 show what a parent
+link cost). Each row's overview names its files and its done-when. The members of one group touch disjoint files
+(wsp-068): wsp-403 and wsp-404 both write crates/wire/src/host_tcp.rs, so wsp-404 runs a group after wsp-403 and
+rests on it.
+
+`m2-agent-manager`, `wsp worklist after m1-agent-manager`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | contract | wsp-398 | host-api, additively: `WspHello.lease_secs`, `Beat.held`/`released` on a daemon's beat, a `check` request and reply, `HostFacts.display_asleep`. `PROTOCOL` unchanged. | host-api's tests green at the barrier |
+| 2 | components, wiring | wsp-399, wsp-400 | The manager serves `gate: required` and writes the gate's lease from the daemon's beat on its own timer, failing closed, and serves `check`. Beside it, the machine record gains `transport: ssh\|manager` (`ssh` when absent) and a far manager record in M1's `Local` shape, with its token 0600 in `<state>/manager/<machine>.secret`, plus `Tcp::for_machine`. | the manager's gate tests, including the wsp-639 reproduction, green at the barrier |
+| 3 | wiring | wsp-401 | `wsp install --manager-only` (the manager and its launcher, no daemon) and `wsp machine install <m>`, run over the ssh door: build at the far checkout, install, read back the token and the tailnet address, dial `hello`. | **The person, ending the list:** Tailscale up on both machines, then on omarchy `wsp install`, `wsp machine add mac mac`, `wsp machine install mac` and `wsp machine check mac`. Then a live day of `wsp spawn <row> --on mac` work on `transport: ssh` (v1), with the Mac's manager installed and unused. |
+
+`m2-manager-path`, `wsp worklist after m2-agent-manager`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | insitu, wiring | wsp-402, wsp-403 | **M2's before**, from m2-agent-manager's v1 day (below), beside the daemon's one connection per manager machine: `hello` with the lease, `subscribe {from}`, folding into the same files, and a 10 s beat on its own thread carrying held and released claims. Silence is three missed beats past the lease. Disjoint files: wsp-402 writes this doc alone, and wsp-403 writes code alone (src/daemon.rs, src/fold.rs, host_tcp.rs, far.rs). | the before is written in this section, and wsp-403's sandbox tests are green at the barrier |
+| 2 | wiring | wsp-404 | `wip`, the census, overlap and verify's sweep read every manager machine. After wsp-403, on host_tcp.rs. | wsp-404's tests green at the barrier |
+| 3 | wiring | wsp-405 | `spawn --on`, `despawn`, `tell` and `machine check` go to the far manager, gated, waiting by subscription. | **The person, ending the list:** `wsp install` on omarchy, `wsp machine install mac` again (an upgrade), `wsp machine set mac transport=manager`, `wsp machine check mac`, then a live day with `mac` seats on `manager`. Once compound-react-022 has landed (in `mp0-reach`), the ssh tunnel to omarchy's API port is ended on the Mac. |
+
+`m2-default`, `wsp worklist after m2-manager-path`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | contract | wsp-406 | `transport` defaults to `manager` for a machine with a far record. `transport=ssh` is the rollback. `wsp doctor` prints a line per machine. | **The person, ending the list:** `wsp install` on omarchy and `wsp machine install mac`, then **a live week** (M2's "a week live" for the flap). The fortnight m2-contract waits on starts at this install, and its date goes in the verdict. |
+
+`m2-result`, `wsp worklist after m2-default`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | insitu | wsp-407 | **M2's result**, against the before. | **The person, ending the list,** reads M2's result: M2 holds, or `wsp machine set mac transport=ssh` on omarchy is the rollback. |
+
+`m2-contract`, `wsp worklist after m2-result`. Its overview says what must be true before group 1: the person's
+read "M2 holds", a fortnight on `manager` since m2-default's install, and no `transport=ssh` written.
+
+| group | kind | rows | what | stop |
+|---|---|---|---|---|
+| 1 | contract | wsp-408 | As legs: delete tunnel.rs's masters and forwards, far.rs's ssh probes and the far beat (`holdings_command` and `DISPLAY_PROBE` with them, so host-seam-allowed.txt loses far.rs's two lines), wait_ready's 150 ms loop and submit's poll for far seats, and the `ssh` word. Kept: the install door, the tree copy (M4's) and the shim's ssh (Q8). | **The person:** `wsp install` on omarchy, `wsp machine install mac` and `wsp machine check mac`, then a live day |
+
+**What the plan keeps from M2's row, and what it changes.**
+- *Reused, not rebuilt.*
+  - host-api's messages, `hello` and its token (3.3), and `Connection`.
+  - The manager's TCP listener, which already binds loopback and `tailscale ip` (crates/manager/src/main.rs).
+  - M1's manager record: `Local {host, addr, port, exec_dir}` plus a secret, written per far machine as it is for
+    this host.
+  - The census, which already folds one `Census::heard` per host name and has only ever been given this host
+    (crates/wire/src/host_tcp.rs).
+  - The store contract's `Transport::Tcp { addr }`, which a `manager` machine mirrors to, so the contract does not
+    change.
+- *The machine `transport` field is new in the record.* remote-agents section 4 named it, but the committed
+  `Machine` (crates/store/src/model.rs) never got one. wsp-400 adds it. `ssh` is the default until wsp-406, and it stays the
+  rollback until m2-contract.
+- *The gate.* Today the manager refuses `gate: required` (seats.rs, d1 Q12). wsp-399 lifts that for far seats only. Local
+  seats stay ungated, as d1 Q12 answered.
+- *The far half of the copy does not move into the manager.* 6.2's M2 row moved it because trees stayed on the
+  store's host (T1). Under T2 (Ed, 2026-11-18, "M3 under T2") trees live with the agents, and M4 retires the copy
+  (treecopy.rs) for `tree.checkout`. Moving the manifest into the manager now would build a part that M4 deletes. So
+  M2 keeps the rsync copy over ssh as tree bytes, and its manifest measure becomes "no worse".
+- *The agent's own `wsp` calls* (the shim, `wsp-remote` on the Mac) keep their ssh, as Q8 recommended. State-core
+  step 1's API now exists (crates/api, with a token, on loopback and the tailnet), so moving the shim onto it is the
+  next step for that ssh. It is not M2's: it needs the agent verbs on the API, which is state-core's work.
+- *The Mac's jobs.* Under M3 a row on a host without a manager kept its builds in-process there. M2 does not move a
+  `mac` row's builds to the Mac's manager. Trees and their jobs on each host are M4's (`place_of`, `tree.checkout`).
+
+**Relations.**
+- *m1-agent-manager.* M2 rests on it, and its first list says so with `wsp worklist after`. M1's group 7 left
+  `tunnels`, far.rs's two ssh lines, wait_ready's loop and submit's poll for far seats to M2. wsp-405 stops using them
+  under `manager`, and wsp-408 deletes them.
+- *m3-agent-manager.* M3 assumed nothing of M2, and M2 assumes nothing of M3 beyond what has landed. M3's
+  `WSP_JOBS=manager` and its job table stay on omarchy. M3's figures owed (wsp-360) and M1's (wsp-323) are not M2's.
+  Taking M2's before on a manager built from the trunk needs wsp-324's fix to hold, and wsp-401's install always rebuilds
+  for that reason. **M4 needs a second manager to measure**, and M2 delivers one. M4 is broken down after M2's
+  result, as d1 Q14 says for every step.
+- *web-chrome's target mode and the tunnel.* compound-react-027 (done) stopped `--target` from dialling the local
+  API. compound-react-022 (todo, after 027) makes it subscribe to the target's API over the tailnet. It is not a
+  member here: it is already in `mp0-reach`'s group 1 (planned, after s2-state-core-2), and a row is run by one list.
+  The tunnel to the API port is what 022 replaces. So the tunnel's end waits on 022, not on M2's code. m2-manager-path's
+  last stop has the person end the tunnel once 022 has landed, and wsp-407 counts the tunnel's sessions until then. The
+  far manager needs no tunnel at any point: wsp dials it over the tailnet. M2's ssh measure counts the Mac's sessions to omarchy, so a tunnel left running shows up in it.
+- *The tailnet* is a precondition of both 022 and the far manager (3.4). The manager serves loopback alone without
+  one, and `wsp machine install` refuses with that step named. Installing Tailscale is the person's step at m2-agent-manager's last stop.
+
+**M2's measures, restated against today's topology.** 6.1's figures were the Mac's daemon dialling the i5, on a
+store and a fleet that no longer exist. Each of M2's four measures is restated here. Where the old baseline no longer
+applies, the new before is taken by wsp-402 from the day of m2-agent-manager's last stop: the Mac registered on `transport: ssh`, from
+omarchy.
+
+| measure | 6.2 asked | what applies now | before | M2 asks |
+|---|---|---|---|---|
+| ssh runs per day | 147 → install and tree bytes only | 147 was the Mac's daemon to the i5. omarchy's wsp makes no far ssh today, because it has no far machine. The ssh that exists runs the other way: the Mac's poll and verbs into omarchy's sshd. The day before M1's install counted compound's polls over ssh at 5,711 and 658 CPU-s (M1's result). | wsp-402: omarchy's ssh per day by phase with `mac` on `ssh`, and the Mac's sessions into omarchy | omarchy → Mac: install and tree bytes only, 0 per tick. Mac → omarchy: web-chrome's polls 0 with 022 live and the tunnel ended. The shim's verbs are counted, not judged. |
+| the wsp-639 flap | a far seat working through a slowed tick never reads unreachable: a sandbox reproduction plus a week live | Unchanged in meaning. The reproduction is now two tests, the manager's (wsp-399) and the daemon's in a sandbox (wsp-403): a 78 s tick against a 60 s lease, with beats every 10 s on their own timer. | wsp-402: `unreachable` readings of live `mac` seats on the v1 day | 0, in 10 runs of each test and in m2-default's live week |
+| the far manifest | compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s) | Under T2, M4 retires the copy, and M2 does not move it. compounding's tree may not be on this fleet. The figure is taken on the largest tree copied up on the before day, with its file count. | wsp-402 | no worse than the before |
+| `spawn --on` p50 | no worse | There is no far spawn today, so there is no baseline. The local rail stands: 0.93 s p50 and 2.71 s p95 over 147 spawns, the day before M1's install, against the 9.4 s ceiling. | wsp-402: `spawn --on mac` p50 and p95 on v1, with the agent. If v1 refuses a Linux seat's spawn on a Mac, that refusal is the before. | no worse than the before, or no worse than local p50 and under 9.4 s where v1 refused |
+
+The rollback is as 6.2 names it: `transport: ssh` per machine. It keeps the v1 path compiled until a fortnight
+passes on `manager`, which is m2-contract's start. wsp-407 proves it in a sandbox, switching to `ssh` and back.
 
 ### 6.3 How this reorders state-core section 7
 

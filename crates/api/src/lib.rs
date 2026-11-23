@@ -87,11 +87,15 @@ pub const READ_VERBS: &[&str] = &[
     "events",
     "subscribe",
     "wip",
+    "throttle",
+    "spend",
+    "show",
     "readings",
 ];
 
 /// The command verbs, as the contract's [`Command`] names them on the wire: the
-/// 19 of 4.2 and step 1's `mirror`. A server that does not run one yet answers
+/// 19 of 4.2, step 1's `mirror`, and step 2's orders machine (`order.deliver`
+/// and the executor's answers, wsp-117). A server that does not run one yet answers
 /// it [`Code::Unsupported`]; a verb in neither table is unknown to this build.
 pub const COMMAND_VERBS: &[&str] = &[
     "row.add",
@@ -114,6 +118,11 @@ pub const COMMAND_VERBS: &[&str] = &[
     "ask.ack",
     "machine.set",
     "mirror",
+    "order.deliver",
+    "order.delivered",
+    "order.acked",
+    "order.refused",
+    "order.done",
 ];
 
 // ---------------------------------------------------------------- identities
@@ -302,6 +311,18 @@ pub enum Verb {
     /// raised asks, the seats and claims; small enough
     /// for one line under [`MAX_LINE`] where `state`'s whole domain is not.
     Wip(#[serde(default)] NoArgs),
+    /// `wsp throttle --json`'s document: this machine's build throttle and
+    /// the readings it acts on (wsp-307). Answered [`Answer::Throttle`].
+    Throttle(#[serde(default)] NoArgs),
+    /// `wsp spend --json`'s document: the last 30 days' tokens and cost
+    /// (wsp-307). Answered [`Answer::Spend`].
+    Spend(#[serde(default)] NoArgs),
+    /// `wsp show <id> --json`'s document: a row's record, or a piece's entry
+    /// when `id` names one, as the CLI resolves it (wsp-307). Answered
+    /// [`Answer::Show`], or `not_found` when the CLI would say there is none.
+    Show {
+        id: String,
+    },
     /// The readings named, every one when `names` is empty (wsp-743): what
     /// the daemon works out and no entity carries, by name, as the store's
     /// `Readings` keeps them. Answered [`Answer::Readings`].
@@ -407,6 +428,13 @@ pub enum Answer {
         state: State,
         at: EventId,
     },
+    /// `throttle`: the document `wsp throttle --json` prints, the same value,
+    /// so that printed pretty it is the same bytes.
+    Throttle(Value),
+    /// `spend`: the document `wsp spend --json` prints.
+    Spend(Value),
+    /// `show`: the document `wsp show <id> --json` prints.
+    Show(Value),
     /// `readings`: each reading asked for that there is, by name.
     Readings(std::collections::BTreeMap<String, Reading>),
 }

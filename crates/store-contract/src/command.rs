@@ -22,7 +22,7 @@
 //! verb carries its fence as the argument named `fence`, and no other argument
 //! has that name, so on the wire a command is fenced when `args.fence` is
 //! present and not `null`. [`FENCED_VERBS`] lists those verbs, and
-//! `tests/round_trip.rs` holds the table to the variants, so a fifth fenced
+//! `tests/round_trip.rs` holds the table to the variants, so a sixth fenced
 //! verb does not pass until it is in the table. A backend may match the verbs
 //! or read `args.fence`; it checks the table in its own tests either way.
 
@@ -43,7 +43,13 @@ pub struct Fence {
 
 /// The verbs whose `args` carry a `fence` (`seat.end`'s may be `null`: the
 /// person's has none), which `apply` checks before `decide` (2.2).
-pub const FENCED_VERBS: &[&str] = &["row.claim", "row.review", "row.land", "seat.end"];
+pub const FENCED_VERBS: &[&str] = &[
+    "row.claim",
+    "row.review",
+    "row.land",
+    "seat.end",
+    "order.deliver",
+];
 
 /// What `apply` returns: the new events' ids, in commit order. A repeated key
 /// returns the first `Applied` and writes nothing; a refusal is no result and
@@ -171,11 +177,38 @@ pub enum Command {
         #[serde(default)]
         lost: bool,
     },
-    /// Queue an order for a seat.
+    /// Queue an order for a seat. `first` is the spawn's first work order,
+    /// which goes out inside `seat.spawn` rather than through delivery.
     #[serde(rename = "order.send")]
-    OrderSend { to: SeatId, text: String },
+    OrderSend {
+        to: SeatId,
+        text: String,
+        #[serde(default)]
+        first: bool,
+    },
     #[serde(rename = "order.cancel")]
     OrderCancel { order: OrderId },
+    /// `queued` → `typed`, by the holder of the `deliver:<seat>` lease
+    /// ([`LeaseName::deliver`]).
+    #[serde(rename = "order.deliver")]
+    OrderDeliver { order: OrderId, fence: Fence },
+    /// The executor's answer: the order's text reached the seat's prompt.
+    #[serde(rename = "order.delivered")]
+    OrderDelivered { order: OrderId },
+    /// The executor's answer: the seat began a turn on it.
+    #[serde(rename = "order.acked")]
+    OrderAcked { order: OrderId, turn_began: At },
+    /// The executor's answer: it did not go in, and why. `counts: false` is a
+    /// refusal that is no attempt (the seat was busy).
+    #[serde(rename = "order.refused")]
+    OrderRefused {
+        order: OrderId,
+        why: String,
+        counts: bool,
+    },
+    /// The order's work is done.
+    #[serde(rename = "order.done")]
+    OrderDone { order: OrderId },
     /// Raise an ask, a note or a flag.
     #[serde(rename = "ask.raise")]
     AskRaise {

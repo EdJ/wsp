@@ -19,7 +19,7 @@
 //! | the agent is gone | the seat reads [`State::Gone`], or `Idle` with the row still `doing` — at its `Stop` (told at once, `wsp-616`) or past [`STALLED_AFTER`] where no hook says | a marker line in the member's `## Log` |
 //! | the start never claimed | `doing`, unclaimed, wsp's own start its last word | the `started by wsp:` line `cycle` already takes on |
 //! | the landing was never recorded | settled, branch level with the trunk, no landing on the row | a landing line, which `wsp land` now writes too |
-//! | `advance` skipped a member | settled, and nothing was started for it | none, and it is stamped on every pass for that reason |
+//! | `advance` skipped a member | settled, and nothing was started for it | a marker holding the reason, so it is said once per reason (`wsp-338`) |
 //!
 //! **A log line and not a state file, and that is the load-bearing choice.** A
 //! separate `reconciled.json` would have to be kept in step with the task files
@@ -377,9 +377,6 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     // And the scratch of rows that have closed (`wsp-373`).
     wsp_base::calls::phase("sweep:scratch");
     crate::scratch::tidy(store);
-    // And agents running for a store no daemon keeps (`wsp-333`).
-    wsp_base::calls::phase("sweep:leaked-agents");
-    crate::leaked_agents::tidy(store);
     wsp_base::calls::phase("sweep:disk");
     crate::disk::tidy(store);
     // And the build holds of processes that died, and the load warning's edges
@@ -423,20 +420,13 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     crate::pickup::tick(store);
 }
 
-/// A beat's facts as the throttle reads them. A thermal state is the top of
-/// its band of `CPU_Speed_Limit` (`wsp_host::facts::parse_thermal`'s bands).
+/// A beat's facts as the throttle reads them: the same reading `throttle run`
+/// decides on under `WSP_JOBS=manager` ([`crate::throttle::Given::of_facts`],
+/// wsp-052): the beat's `CPU_Speed_Limit`, else the top of its thermal state's
+/// band. The holds the sweep reaps are judged by the manager's job table
+/// there, not by `kill -0`.
 pub(crate) fn throttle_given(f: &wsp_host_api::HostFacts) -> crate::throttle::Given {
-    use wsp_host_api::Thermal;
-    crate::throttle::Given {
-        load1: f.load_centi as f64 / 100.0,
-        cores: f.cpus as usize,
-        speed_limit: Some(match f.thermal {
-            Thermal::Nominal => 100,
-            Thermal::Fair => 99,
-            Thermal::Serious => 79,
-            Thermal::Critical => 49,
-        }),
-    }
+    crate::throttle::Given::of_facts(f)
 }
 
 /// The step on every running list: what the tick does first, and again once an
@@ -650,6 +640,9 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
 /// successor on the next pass. The reason goes in `cycle.log` and in the list's
 /// own log, where the person who comes back to the list reads it.
 pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
+    if let Some(door) = crate::refusals::door(store) {
+        return deaf_tick(store, seats, &door);
+    }
     let governors = store.governors();
     for (scope, (n, why)) in crate::refusals::refusing(store) {
         if n < crate::refusals::REFUSED_TICKS {
@@ -675,6 +668,38 @@ pub(crate) fn refusal_tick(store: &Store, seats: &dyn Seats) {
         );
         stamp(store, &line);
         if let Some(mut w) = store.worklist(&scope) {
+            w.log(&line);
+            let _ = store.save_worklist(&w);
+        }
+        if let Err(e) = crate::cycle::end_seat_when_idle(store, &seat.pane) {
+            stamp(store, &format!("{scope}: could not arrange {}'s ending: {e}. `wsp despawn --pane {} --force` ends it", seat.pane, seat.pane));
+        }
+    }
+}
+
+/// [`refusal_tick`] under the orders machine (wsp-125, part 3 of the person's
+/// answer on wsp-115): a governor is deaf when its orders reach `failed` at the
+/// machine's cap ([`crate::refusals::Door::deaf`]), not when
+/// `refused-deliveries.json` counts five, and that file is neither read nor
+/// written. The ending is wsp-634's: not mid-turn, said in `cycle.log` and the
+/// list's log, the seat ended once and its successor seated by [`seat_vacant`].
+fn deaf_tick(store: &Store, seats: &dyn Seats, door: &crate::refusals::Door) {
+    let governors = store.governors();
+    for scope in governors.keys() {
+        let Some(seat) = cmd_govern::seat_held(scope, &governors) else { continue };
+        let Some(why) = door.deaf(&seat.pane) else { continue };
+        if seats.state(&seat.pane) == Some(State::Working) {
+            continue;
+        }
+        if !crate::refusals::first_ending(store, &seat.pane) {
+            continue;
+        }
+        let line = format!(
+            "{scope}: {} refused delivery until its order failed at the cap ({why}) — ended so a successor is seated",
+            seat.pane
+        );
+        stamp(store, &line);
+        if let Some(mut w) = store.worklist(scope) {
             w.log(&line);
             let _ = store.save_worklist(&w);
         }
@@ -730,6 +755,17 @@ fn held_save(store: &Store, all: &std::collections::BTreeMap<String, Held>) {
 /// (`wsp wip`'s `stuck`).
 pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::stuck::Kind, i64)> {
     let now = util::epoch_secs();
+    // Under the orders machine the record is the folded `seat.stuck` (wsp-125).
+    if crate::refusals::door(store).is_some() {
+        return store
+            .bindings()
+            .keys()
+            .filter_map(|seat| {
+                let s = crate::cmd_agent::stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
+                Some((seat.clone(), (s.kind, s.secs)))
+            })
+            .collect();
+    }
     held_all(store).into_iter().map(|(s, h)| (s, (h.kind, (now - h.at).max(0)))).collect()
 }
 
@@ -745,6 +781,11 @@ pub(crate) fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (
 /// The shell is the manager's to end; until the protocol carries that ask, the
 /// seat is told and the shell left.
 pub(crate) fn stuck_tick(store: &Store, seats: &dyn Seats) {
+    if let Some(door) = crate::refusals::door(store) {
+        return stuck_ordered(store, seats, &door, &|seat| {
+            crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), None)
+        }, &|_| Vec::new());
+    }
     let before = held_all(store);
     stuck_tick_with(
         store,
@@ -763,6 +804,9 @@ pub(crate) fn stuck_tick_with(
     read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>,
     end: &dyn Fn(&str) -> Vec<u32>,
 ) {
+    if let Some(door) = crate::refusals::door(store) {
+        return stuck_ordered(store, seats, &door, read, end);
+    }
     let before = held_all(store);
     let mut all = before.clone();
     let mut candidates: Vec<String> = store.bindings().keys().cloned().collect();
@@ -808,6 +852,58 @@ pub(crate) fn stuck_tick_with(
     }
     if all != before {
         held_save(store, &all);
+    }
+}
+
+/// The stall's key in the orders machine: per seat and per the stall's start, so
+/// a stall told on one tick and still open on the next is the same order.
+fn stall_key(seat: &str, at: i64) -> String {
+    format!("stuck:{seat}:{at}")
+}
+
+/// [`stuck_tick_with`] under the orders machine (wsp-125, part 4 of the
+/// person's answer on wsp-115). `stuck-commands.json` is not read or written:
+/// the stall's record is the folded `seat.stuck` (`manager/<host>.stuck.json`,
+/// wsp-028) that `read` reports, and whether the seat was told is its stall
+/// order's state. The tell is [`crate::refusals::Door::send`] under
+/// [`stall_key`], so the tick that finds the stall queues one order and every
+/// tick after it while the stall is open sends nothing more, and says nothing
+/// more in `cycle.log`.
+///
+/// A shell `end` ends is said in `cycle.log` and not in the order: the order's
+/// words are fixed by the tick that queued it, which runs before the ending so
+/// that a repeat tick ends nothing. The daemon's own `end` ends nothing.
+fn stuck_ordered(
+    store: &Store,
+    seats: &dyn Seats,
+    door: &crate::refusals::Door,
+    read: &dyn Fn(&str) -> Vec<crate::stuck::Stall>,
+    end: &dyn Fn(&str) -> Vec<u32>,
+) {
+    for seat in store.bindings().keys() {
+        if !seats.state(seat).is_some_and(|s| s.turn_in_flight()) {
+            continue;
+        }
+        let Some(s) = read(seat).into_iter().find(|s| s.open) else { continue };
+        let text = format!("wsp: your command has been {} for {}s — {}. ({})", s.kind.word(), s.secs, s.kind.advice(), s.command);
+        let sent = match door.send(seat, &text, &stall_key(seat, s.at)) {
+            Ok(sent) => sent,
+            Err(e) => {
+                stamp(store, &format!("{seat}: a command has been {} for {}s and the seat could not be told: {e}", s.kind.word(), s.secs));
+                continue;
+            }
+        };
+        if !sent.fresh {
+            continue;
+        }
+        stamp(store, &format!("{seat}: a command has been {} for {}s: {} (told, order {})", s.kind.word(), s.secs, s.command, sent.id.0));
+        if s.kind == crate::stuck::Kind::SelfWait {
+            let pids = end(seat);
+            if !pids.is_empty() {
+                let pids = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+                stamp(store, &format!("{seat}: ended the shell waiting on itself (pid {pids})"));
+            }
+        }
     }
 }
 
@@ -1059,6 +1155,15 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             ));
             continue;
         };
+        // **A leg's seat is no member's** (`wsp-334`), nor is any seat on a row
+        // that has handed itself to its legs. The leg's own paths end it:
+        // `cycle::legs_finished` once it is done, `closing::tick` once it
+        // stops without closing. Read here, wsp-030's legs were told "finish,
+        // land and review" (a member's rule), ended as members, and the person
+        // was flagged "needs a person" for a row whose finish leg submits.
+        if crate::leg_seat::handed_to_legs(&t) || crate::leg_seat::a_parts_seat(store, &t, &seat) {
+            continue;
+        }
         let state = match seats.state(&seat) {
             Some(s) => s,
             None => continue,
@@ -1183,6 +1288,23 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
         // the seat is ended, because ending it throws the verdict away.
         let ended = state == State::Gone;
         let second = already.is_some_and(|since| since + STALLED_AFTER <= util::epoch_secs());
+        // **Uncommitted work in its tree is asked about, not ended**
+        // (`compound-react-041`): `compound-react-024`'s first seat was ended
+        // here with seven uncommitted paths, 32 minutes of an attempt, and
+        // nobody was asked. Ending throws away the context the paths were made
+        // in, and a review cannot be typed over them; the run holds the seat
+        // and asks once per spell (the one ask: the close below would flag the
+        // same tree a second time). Asked of the person, the ask is a question
+        // the seat waits on, held above like any other until it is answered;
+        // asked of a governor, it is a line, and the seat is ended on the
+        // first tick its tree is clean. A seat that is `Gone` has no context
+        // left to keep.
+        if second && !ended {
+            if let Some((n, tree)) = uncommitted_tree(store, &t.id) {
+                ask_before_ending(store, w, at, &t.id, &seat, n, &tree);
+                continue;
+            }
+        }
         if ended || second {
             let idle = already.map(|since| (util::epoch_secs() - since + STALLED_AFTER) / 60).unwrap_or(0);
             let why = if ended { crate::closing::Why::Ended } else { crate::closing::Why::Idle(idle) };
@@ -1253,6 +1375,73 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
              has been told to finish, land and review, or say what is left. `wsp show {}` has its row.",
             id, w.id, id
         ));
+    }
+}
+
+/// The marker in a member's `## Log` for an idle member past its window that
+/// was not ended because its tree has uncommitted work (`compound-react-041`).
+const DIRTY_HELD: &str = "wsp: idle past its window with uncommitted work in its tree — not ended";
+
+/// The uncommitted paths in a member's own tree, and the tree, contracted —
+/// `None` when it is clean or not the member's own (`.worktrees/<id>`, as
+/// [`crate::cycle::despawn`] reads it: a tree named otherwise is somebody
+/// else's to answer for).
+fn uncommitted_tree(store: &Store, id: &str) -> Option<(usize, String)> {
+    let cwd = store.claims().get(id)?.get("cwd")?.as_str().map(util::expand)?;
+    let dir = std::path::Path::new(&cwd);
+    if dir.file_name().and_then(|n| n.to_str()) != Some(id) {
+        return None;
+    }
+    let n = crate::cmd_checkout::uncommitted(dir);
+    (n > 0).then(|| (n, util::contract(dir)))
+}
+
+/// An idle member past its window, its tree holding `n` uncommitted paths: not
+/// ended, and asked about once per spell (since its last start, wait or tell) —
+/// to the list's governor when one is seated, else to the person.
+fn ask_before_ending(store: &Store, w: &Worklist, at: usize, id: &str, seat: &str, n: usize, tree: &str) {
+    use crate::message::{self, About, Kind, Message, Party, Waiting};
+    let wrote = store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        let mut asked = false;
+        for l in t.section("Log").unwrap_or_default().lines() {
+            if fresh_start(l) || l.contains(WAITING) || l.contains(NOTICED) {
+                asked = false;
+            } else if l.contains(DIRTY_HELD) {
+                asked = true;
+            }
+        }
+        if asked {
+            return false;
+        }
+        t.log(&format!("{DIRTY_HELD} ({n} path(s) in {tree}); asked first"));
+        t.touch();
+        store.save_task(&t).is_ok()
+    });
+    if !wrote {
+        return;
+    }
+    let governor = crate::cycle::governor_seated(store, w);
+    let to = if governor { "the governor" } else { "the person" };
+    stamp(store, &format!(
+        "{} group {at}: {id} ({seat}) was told to finish and still reads idle, with {n} uncommitted path(s) in {tree} — not ending it; asked {to} first",
+        w.id
+    ));
+    let text = format!(
+        "{id} ({seat}) in the {} run was told to finish and still reads idle, and its tree {tree} has {n} uncommitted path(s). \
+         The run does not end it while they stand. `wsp despawn {id}` ends it (the tree is kept for the next start), \
+         `wsp tell {id} \"…\"` reaches it, `wsp peek {id}` shows its screen.",
+        w.id
+    );
+    if governor {
+        crate::cycle::tell(store, w, &text);
+        return;
+    }
+    let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new(seat, id))
+        .about(About::Task(id.to_string()))
+        .for_the_person();
+    if let Err(e) = message::raise(store, &q) {
+        stamp(store, &format!("{} group {at}: {id}'s uncommitted work could not be raised to the person: {e}", w.id));
     }
 }
 
@@ -1881,53 +2070,65 @@ fn sha_after(line: &str, marker: &str) -> Option<String> {
 /// that something changed; a governor told the same sentence every minute has
 /// learned nothing and paid a context read for it.
 ///
-/// **Stamped every pass, told once per reason.** The two differ deliberately.
-/// `cycle.log` is how a governor reads what the run has been doing, and a
-/// member still waiting twenty minutes later has not become less waiting — but
-/// the seat's spool is a queue an agent reads with a whole context behind it,
-/// and the same sentence arriving every minute is a cost paid on every request
-/// of every session. So the sentence carries a marker on the member holding the
-/// reason, and a seat hears it when the reason changes, which is when the
-/// sentence has stopped being the same sentence.
+/// **Said once per reason, in the log and to the seat alike** (`wsp-338`).
+/// This was stamped every pass, on the reading that a member still waiting has
+/// not become less waiting. On retro-8 that was compound-react-040 written twice
+/// a minute for eight minutes, its seat long released, each line ordering a seat
+/// that did not exist to commit and review again — and the second line (here)
+/// said `done` where the first said `review`. `cycle::step` now writes its one
+/// line when the reason changes, this writes none, and a member nothing holds
+/// is not told at all: the seat hears what is owed instead.
 fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     let tasks = store.tasks_shared();
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
-        stamp(store, &format!(
-            "{} group {at}: {} is at {} and nothing was started for it — {why}. {}",
-            w.id,
+        let said = format!("{WHY_NOT} {} is at {} and not on the trunk: {why}.", s.id, s.settlement.word());
+        if !said_once_per_reason(store, &s.id, &format!("{WHY_NOT} {} is at ", s.id), &said) {
+            continue;
+        }
+        // `wsp-338`: a member whose seat was released, or is gone, has nobody
+        // to tell. `wsp tell` refuses it ("nothing holds"), and ordering it to
+        // commit and review again is an order to nobody. Said once to the seat,
+        // with what is owed instead.
+        if store.panes_for_task(&s.id).is_empty() {
+            crate::cycle::tell_logged(store, w, &format!(
+                "{} in the {} run is at {} with nothing started for it — {why} — and nothing holds it: its seat \
+                 was released or is gone, so nobody is told to land it. If nothing changes in {} min, wsp lands it \
+                 itself when the rebase is clean and flags the person when it is not; or `wsp reopen {} \"what is owed\"` \
+                 starts a seat on it now.",
+                s.id,
+                w.id,
+                s.settlement.word(),
+                LAND_GRACE / 60,
+                s.id
+            ));
+            continue;
+        }
+        crate::cycle::tell_logged(store, w, &format!(
+            "{} in the {} run is at {} with nothing started for it — {why}, so no verifier can run \
+             on it. {} wsp has told it so.",
             s.id,
+            w.id,
             s.settlement.word(),
             Flow::Verified.owes(&s.id)
         ));
-        let said = format!("{WHY_NOT} {} is at {} and not on the trunk: {why}.", s.id, s.settlement.word());
-        if told_once(store, &s.id, &said) {
-            crate::cycle::tell(store, w, &format!(
-                "{} in the {} run is at {} with nothing started for it — {why}, so no verifier can run \
-                 on it. {} wsp has told it so.",
-                s.id,
-                w.id,
-                s.settlement.word(),
-                Flow::Verified.owes(&s.id)
-            ));
-            // `wsp-226`: the seat alone was told, and by its order a governor
-            // does not relay — so a member that ran `wsp review` without
-            // `wsp land` sat at its prompt while the run stood behind it. The
-            // member is the one who can act, and it is still claimed; one
-            // marker keys both, so it hears this as often as the seat does.
-            tell_member(store, &s.id, &format!(
-                "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
-                 waits on you. {} Never `wsp land` it or land by hand; if `wsp review` is refused, `wsp ask` about it. \
-                 If nothing has been recorded {} min from now and this seat is idle or gone, wsp lands \
-                 it for you when the rebase is clean, and flags the person when it is not.",
-                s.id,
-                s.settlement.word(),
-                w.id,
-                Flow::Verified.owes(&s.id),
-                LAND_GRACE / 60
-            ));
-        }
+        // `wsp-226`: the seat alone was told, and by its order a governor
+        // does not relay — so a member that ran `wsp review` without
+        // `wsp land` sat at its prompt while the run stood behind it. The
+        // member is the one who can act, and it is still claimed; one
+        // marker keys both, so it hears this as often as the seat does.
+        tell_member(store, &s.id, &format!(
+            "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
+             waits on you. {} Never `wsp land` it or land by hand; if `wsp review` is refused, `wsp ask` about it. \
+             If nothing has been recorded {} min from now and this seat is idle or gone, wsp lands \
+             it for you when the rebase is clean, and flags the person when it is not.",
+            s.id,
+            s.settlement.word(),
+            w.id,
+            Flow::Verified.owes(&s.id),
+            LAND_GRACE / 60
+        ));
     }
     // The barrier's own no-op, one level up and the same silence: every member
     // settled, the run did not move, and nothing said which verdict was
@@ -2051,7 +2252,7 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
         match land_for_the_run(id) {
             Ok(()) => {
                 stamp(store, &format!("{} group {at}: {id} was not landed {} min after it was told — {cause} — so the run landed it", w.id, (now - told_at) / 60));
-                crate::cycle::tell(store, w, &format!(
+                crate::cycle::tell_logged(store, w, &format!(
                     "{id} sat at review without landing ({cause}), so wsp ran `wsp land {id}` for it: the commits are on the trunk \
                      and its verifier starts on the land."
                 ));
@@ -2061,22 +2262,52 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
             }
             Err(why) => {
                 let why = util::truncate(why.trim(), 400);
-                stamp(store, &format!("{} group {at}: {id} was not landed and the run could not land it ({cause}): {why}", w.id));
+                let fix = to_clear(id, &why);
+                stamp(store, &format!("{} group {at}: {id} was not landed and the run could not land it ({cause}): {} {fix}", w.id, first_line(&why)));
                 use crate::message::{self, About, Kind, Message, Party};
                 let text = format!(
                     "{id}: the run could not land it, and the {} run waits on it\n\n\
                      {id} is at review with commits not on the trunk, and {cause}. wsp tried `wsp land {id}`: {why}\n\n\
-                     Land it yourself from its tree once that is cleared, or `wsp reopen {id} \"what is owed\"`.",
+                     {fix}",
                     w.id
                 );
                 let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Task(id.clone()));
                 let _ = message::raise(store, &m);
-                crate::cycle::tell(store, w, &format!(
-                    "{id} sat at review without landing ({cause}) and `wsp land {id}` for it failed: {why}. The person is flagged."
+                crate::cycle::tell_logged(store, w, &format!(
+                    "{id} sat at review without landing ({cause}) and `wsp land {id}` for it failed: {why}. {fix} The person is flagged."
                 ));
             }
         }
     }
+}
+
+/// What clears a land the run could not make, with the verbs (`wsp-338`).
+///
+/// On retro-8 the whole of what a person read was "the rebase onto master does
+/// not apply cleanly: deps: compound -> /mnt/… (unchanged; a sibling of the main
+/// checkout …)" — a hook's chatter where the conflict should be, and no verb.
+/// [`crate::cmd_checkout`] now leads with the conflicting paths; this names the
+/// two ways out, by the paths when it has them.
+fn to_clear(id: &str, why: &str) -> String {
+    let paths = why
+        .lines()
+        .find_map(|l| l.split_once("conflict in ").map(|(_, p)| p.trim().trim_end_matches('.').to_string()))
+        .filter(|p| !p.is_empty());
+    match paths {
+        Some(p) => format!(
+            "To clear it: in {id}'s tree, `git rebase <trunk>`, resolve {p}, `git rebase --continue`, then `wsp land {id}`; \
+             or `wsp reopen {id} \"rebase onto the trunk: resolve {p}\"` to have a seat do it."
+        ),
+        None => format!(
+            "To clear it: fix what git names in {id}'s tree, then `wsp land {id}`; or `wsp reopen {id} \"what is owed\"` to have a seat do it."
+        ),
+    }
+}
+
+/// The first line of a refusal, which [`crate::cmd_checkout`] makes the one that
+/// says what failed and on what.
+fn first_line(why: &str) -> &str {
+    why.lines().next().unwrap_or(why).trim()
 }
 
 /// `wsp land <id> --for-run`, as a process, from nowhere in particular: the
@@ -2157,6 +2388,43 @@ fn told_of_verdict(store: &Store, id: &str, said: &str) -> bool {
         }
         crate::log::note(store, &mut t, said).is_ok()
     })
+}
+
+/// The marker on a member's `## Log` that `cycle.log` has said why the member
+/// waits at review with nothing started — [`crate::cycle::step`]'s line after it.
+pub(crate) const LOGGED_WHY: &str = "wsp: cycle.log has said:";
+
+/// Whether `said` is new for this member since the last time a sentence of its
+/// `kind` was recorded, and records it when it is (`wsp-338`).
+///
+/// **The newest line of its kind, not the last line of the log.** [`told_once`]
+/// asks about the last line, so any later line — the run's own [`LAND_TAKEN`]
+/// marker, a governor's note — bought the same sentence again: on retro-8,
+/// compound-react-040's seat had been released, and the run said "commit what
+/// is left … and end with `wsp review` again" every tick for eight minutes, to a
+/// seat that did not exist. A reason that changes is said again because the
+/// sentence changed; so is one after a new agent, a send-back, a ready or a
+/// landing, which make it a new wait. Not touched, for [`told_of_verdict`]'s
+/// reason: `updated` can be the re-verify key.
+pub(crate) fn said_once_per_reason(store: &Store, id: &str, kind: &str, said: &str) -> bool {
+    store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return false };
+        let log = t.section("Log").unwrap_or_default();
+        let newest = log.lines().map(|l| undated(l.trim())).filter(|l| l.starts_with(kind) || a_new_wait(l)).last();
+        if newest == Some(said) {
+            return false;
+        }
+        crate::log::note(store, &mut t, said).is_ok()
+    })
+}
+
+/// A `## Log` line after which a member's wait at review is a new one.
+fn a_new_wait(line: &str) -> bool {
+    fresh_start(line)
+        || line.starts_with(crate::cycle::SENT_BACK)
+        || line.contains(crate::cycle::RESEAT_ASKED)
+        || line.starts_with(READY)
+        || line.starts_with(LANDED)
 }
 
 /// One `## Log` line with its date taken off, which is what a reader compares.
@@ -2341,6 +2609,62 @@ pub(crate) mod tests {
         assert!(said.contains("cpd-1 refused delivery 5 ticks running (cpd-1: refused) — ended so a successor is seated"), "{said}");
         let log = store.worklist("run").unwrap().render();
         assert!(log.contains("refused delivery 5 ticks running"), "the list's own log: {log}");
+    }
+
+    /// **wsp-125: under the orders machine a governor is deaf when its orders
+    /// fail at the cap**, and it is ended as wsp-634 ends one — not mid-turn,
+    /// once, the reason in both logs — with nothing counted in
+    /// `refused-deliveries.json`.
+    #[test]
+    fn under_the_orders_machine_a_governor_whose_orders_fail_at_the_cap_is_ended_once() {
+        let (_env, store) = in_flight("deaf-orders");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        let opened = crate::refusals::tests::open(&store, &["cpd-1"]);
+        let door = crate::refusals::door(&store).unwrap();
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        let sent = door.send("cpd-1", "a wake", "wake:run:cpd-1:1").unwrap();
+        refusal_tick(&store, &idle);
+        assert!(ended().is_empty(), "an order still out is not a deaf seat");
+
+        crate::refusals::tests::fail(&opened.0, &sent.id, "cpd-1: refused");
+        refusal_tick(&store, &Fake::new(&[("cpd-1", Some(State::Working))]));
+        assert!(ended().is_empty(), "a seat mid-turn is hearing something");
+
+        refusal_tick(&store, &idle);
+        refusal_tick(&store, &idle);
+        assert_eq!(ended(), vec!["cpd-1".to_string()], "ended once, though its order stays failed");
+        let said = stamped().join("\n");
+        assert!(said.contains("cpd-1 refused delivery until its order failed at the cap (cpd-1: refused) — ended so a successor is seated"), "{said}");
+        let log = store.worklist("run").unwrap().render();
+        assert!(log.contains("failed at the cap"), "the list's own log: {log}");
+        assert!(!store.state.join("refused-deliveries.json").exists(), "nothing counted in the file");
+    }
+
+    /// **wsp-125: a stall under the orders machine is one order.** Told on the
+    /// tick that finds it, nothing more sent or said while it stays open, and
+    /// `stuck-commands.json` never written: the record is the folded stall.
+    #[test]
+    fn under_the_orders_machine_a_stall_told_once_and_still_open_sends_nothing_more() {
+        let (_env, store) = in_flight("stuck-orders");
+        let opened = crate::refusals::tests::open(&store, &["cpd-1"]);
+        let working = Orders { state: Some(State::Working), typed: false, sent: Default::default(), pressed: Default::default() };
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 400)], &|_| vec![4242]);
+        stuck_tick_with(&store, &working, &|_| vec![stall(true, 460)], &|_| panic!("ended once"));
+        assert!(working.sent.borrow().is_empty(), "nothing typed past the orders machine: {:?}", working.sent.borrow());
+        let orders = opened.0.orders_for(&wsp_store_contract::SeatId("cpd-1".into()), &[]).unwrap();
+        assert_eq!(orders.len(), 1, "one order for one stall: {orders:?}");
+        assert!(orders[0].text.contains("waiting on itself"), "{}", orders[0].text);
+        let said = stamped();
+        let told = said.iter().filter(|l| l.contains("cpd-1: a command has been")).count();
+        assert_eq!(told, 1, "said once: {said:?}");
+        assert!(said.iter().any(|l| l.contains("pid 4242")), "{said:?}");
+        assert!(!store.state.join(STUCK_FILE).exists(), "stuck-commands.json is not written");
+
+        // Another stall, another start: another order.
+        let later = crate::stuck::Stall { at: 2000, ..stall(true, 30) };
+        stuck_tick_with(&store, &working, &|_| vec![later.clone()], &|_| Vec::new());
+        assert_eq!(opened.0.orders_for(&wsp_store_contract::SeatId("cpd-1".into()), &[]).unwrap().len(), 2);
+        assert!(!store.state.join(STUCK_FILE).exists());
     }
 
     /// A [`Fake`] that also says which seats are **positively** not there — every
@@ -3978,6 +4302,97 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert!(ended().is_empty());
     }
 
+    /// Every stamp in a member's `## Log` set to long ago: the fake clock that
+    /// puts every window the repair reads behind it.
+    fn age_the_log(store: &Store, id: &str) {
+        let mut t = store.find_task(id).unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let aged: Vec<String> =
+            log.lines()
+                .map(|l| match l.strip_prefix("- ").and_then(|r| r.split_once(' ')) {
+                    Some((_, rest)) => format!("- 2026-01-01T00:00:00Z {rest}"),
+                    None => l.to_string(),
+                })
+                .collect();
+        crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+        store.save_task(&t).unwrap();
+    }
+
+    /// `compound-react-041`, as a test: `compound-react-024`'s seat was held on
+    /// its own shell at 21:56:42 and told "finish, land and review" at 21:57:42
+    /// with the shell still running. **While the seat has a shell of its own,
+    /// no tick tells it or ends it, however far the clock moves**, and the
+    /// hold's `cycle.log` line is never followed by "telling it" for the seat.
+    #[test]
+    fn a_member_waiting_on_its_own_shell_is_not_told_or_ended_on_any_later_tick() {
+        let (_env, store) = in_flight("shell-held-long");
+        let waiting = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1", "⏺ The test run wakes me when it ends.");
+        for _ in 0..6 {
+            tick(&store, &waiting, &mut Pass::new());
+            age_the_log(&store, "m-1");
+        }
+        assert!(member_told().is_empty(), "never told while its shell runs");
+        assert!(ended().is_empty(), "never ended while its shell runs");
+        let said = stamped();
+        let hold = said.iter().position(|l| l.contains("not told and not ended")).expect("the hold is said");
+        assert!(!said[hold..].iter().any(|l| l.contains("telling it") || l.contains("ending it")), "{said:?}");
+        assert!(!row_log(&store, "m-1").contains(NOTICED), "{}", row_log(&store, "m-1"));
+    }
+
+    /// `compound-react-041`: the shell has ended and the seat is idle. **It is
+    /// told, ended only a window ([`STALLED_AFTER`]) after the tell — and a tree
+    /// with uncommitted paths blocks the end and asks first**, once, until the
+    /// tree is clean.
+    #[test]
+    fn a_member_whose_shell_ended_is_told_then_ended_after_the_window_unless_its_tree_is_uncommitted() {
+        let (env, store) = in_flight("shell-ended");
+        let tree = env.path("m-1");
+        std::fs::create_dir_all(&tree).unwrap();
+        git_in(&tree, &["init", "--quiet", "-b", "m-1"]);
+        git_in(&tree, &["commit", "--quiet", "--allow-empty", "-m", "start"]);
+        store.set_claim("m-1", serde_json::json!({ "workspace": "cpd-1", "cwd": tree.display().to_string() }));
+        let waiting = Shelled(Fake::new(&[("cpd-1", Some(State::Idle))]), "cpd-1", "");
+        tick(&store, &waiting, &mut Pass::new());
+        age_the_log(&store, "m-1");
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+
+        // The shell ends: told, and not ended inside the window.
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(member_told().len(), 1, "told once its shell has ended");
+        tick(&store, &idle, &mut Pass::new());
+        assert!(ended().is_empty(), "not ended inside the window");
+
+        // Past the window, with seven uncommitted paths: asked, not ended.
+        for i in 0..7 {
+            std::fs::write(tree.join(format!("probe-{i}.rs")), "fn probe() {}\n").unwrap();
+        }
+        age_the_notice(&store, "m-1");
+        for _ in 0..3 {
+            tick(&store, &idle, &mut Pass::new());
+        }
+        assert!(ended().is_empty(), "uncommitted work blocks the end");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "and the row is not put back");
+        let raised = raised_texts(&store);
+        assert_eq!(raised.len(), 1, "asked once, of the person (no governor is seated): {raised:?}");
+        assert!(raised[0].contains("7 uncommitted path(s)") && raised[0].contains("does not end it"), "{}", raised[0]);
+        assert!(stamped().iter().any(|l| l.contains("not ending it; asked the person first")), "{:?}", stamped());
+
+        // The ask is a question the seat waits on: held, with no ceiling, until
+        // it is answered — then told afresh, and ended a window later once its
+        // tree is clean, as before.
+        let q = crate::message::raised(&store).into_iter().find(|m| m.text.contains("does not end it")).unwrap();
+        assert_eq!(crate::cmd_message::answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "commit them, then end it"], &[])), 0);
+        git_in(&tree, &["add", "."]);
+        git_in(&tree, &["commit", "--quiet", "-m", "the probes"]);
+        let _ = member_told();
+        tick(&store, &idle, &mut Pass::new());
+        assert!(ended().is_empty(), "the wait clears the told-mark: told again first");
+        age_the_notice(&store, "m-1");
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(ended(), vec!["m-1".to_string()], "a clean tree past the window is ended: {:?}", stamped());
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
+    }
+
     /// `wsp-581`: agent-029 started its release verify, ended its turn on "What
     /// I need: either despawn both seats yourself … or tell me to", and raised
     /// nothing. **The line the governor gets says the turn is over, quotes the
@@ -4245,6 +4660,9 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         t.set_status(Status::Review);
         store.save_task(&t).unwrap();
         list(&store, &["m-1"], "claude");
+        // A seat holds it, so it is the one told (`wsp-338`: a member nothing
+        // holds is not ordered to review again).
+        claim(&store, "m-1", "cpd-1");
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(key(&store, "m-1").is_none(), "there is no landing to record");
@@ -4266,8 +4684,10 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     fn a_settled_member_nothing_started_for_is_reported_and_the_seat_is_told_once() {
         let (env, store) = scratch("skipped");
         // A branch with the member's commit still on it: settled, and not
-        // finished, so the run owes it a `wsp land` and nothing else.
+        // finished, so the run owes it a `wsp land` and nothing else. Its seat
+        // still holds it, so there is somebody to tell (`wsp-338`).
         landed_member(&env, &store, true);
+        claim(&store, "m-1", "cpd-1");
 
         tick(&store, &Fake::empty(), &mut Pass::new());
         // The line in `cycle.log` comes from `cycle::step`, which already said
@@ -4288,15 +4708,122 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert_eq!(told[0].0, "m-1", "on its own pane: {told:?}");
         assert!(told[0].1.contains("`wsp review m-1`") && !told[0].1.contains("`wsp land m-1`"), "with the line that moves it: {}", told[0].1);
 
-        // Every pass stamps it; the seat hears it once, because the spool is a
-        // queue an agent reads with a whole context behind it.
+        // `wsp-338`: said once per reason, in the log as to the seat — a line a
+        // minute for the same wait was the retro-8 noise.
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(
-            stamped().iter().any(|l| l.contains("m-1 is at review with 1 commit not on master")),
-            "the log says it on every pass: a member still waiting has not stopped waiting"
+            !stamped().iter().any(|l| l.contains("m-1 is at")),
+            "the log does not say the same wait again: {:?}",
+            stamped()
         );
         assert!(governed().is_empty(), "and the seat is not handed the same sentence twice");
         assert!(member_told().is_empty(), "nor the member: once per reason, like the seat");
+
+        // A changed reason is a new sentence, and said again.
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Done);
+        store.save_task(&t).unwrap();
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("m-1 is at")).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("m-1 is at done with 1 commit not on master"), "the status it has: {said:?}");
+    }
+
+    /// `wsp-338`, compound-react-040 on retro-8: the seat was released, the row
+    /// sat with ten commits off master, and every tick the run (a) wrote two
+    /// lines for it, one "at review" and one "at done", each ordering it to
+    /// commit and end with `wsp review` again, and (b) told it so through a
+    /// `wsp tell` that came back "nothing holds". Nothing holds this one.
+    #[test]
+    fn a_released_member_at_review_off_the_trunk_is_ordered_once_and_never_told_through_a_seat_it_has_not() {
+        let (env, store) = scratch("released");
+        landed_member(&env, &store, true);
+        let _ = (stamped(), governed(), member_told());
+
+        for n in 0..8 {
+            tick(&store, &Fake::empty(), &mut Pass::new());
+            let lines: Vec<String> = stamped().into_iter().filter(|l| l.contains("m-1")).collect();
+            // One status line per tick at most, and never two that disagree.
+            assert!(lines.len() <= 1, "tick {n}: one line for the row, not two: {lines:?}");
+            assert!(!lines.iter().any(|l| l.contains("nothing was started for it")), "tick {n}: the repair's twin line is gone: {lines:?}");
+            let ordered = lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count();
+            assert_eq!(ordered, usize::from(n == 0), "tick {n}: the order is given once: {lines:?}");
+            assert!(member_told().is_empty(), "tick {n}: nothing holds m-1, so nothing is sent to it");
+            let gov = governed();
+            if n == 0 {
+                assert_eq!(gov.len(), 1, "{gov:?}");
+                assert!(gov[0].contains("nothing holds it") && gov[0].contains("`wsp reopen m-1"), "what is owed instead: {}", gov[0]);
+            } else {
+                assert!(gov.is_empty(), "tick {n}: told once: {gov:?}");
+            }
+        }
+    }
+
+    /// `wsp-338`'s fourth item: retro-8's cycle.log is already written and
+    /// cannot be rebuilt, so this replays compound-react-040's 07:00-07:08 through
+    /// the new code. The conditions are its own: at `done`, ten commits not on
+    /// master, its seat (cpd-115) released, so nothing holds it; a tick a minute
+    /// (07:00:46 … 07:06:54, eight with the next); and at 07:05:53, past the land
+    /// grace, the run's `wsp land` refused on a conflict in `deps` behind the
+    /// hook's "deps: compound -> …" line. The live window had twenty lines for
+    /// the row: two contradicting status lines each tick, two tells, two
+    /// not-delivered tells, and a refusal naming no file and no verb. The test
+    /// asserts two at most: the status once, and the refusal with its fix.
+    #[test]
+    fn a_released_member_whose_land_fails_on_deps_is_two_lines_in_eight_ticks_and_the_refusal_names_the_path_and_the_verb() {
+        let (env, store) = scratch("releaseddeps");
+        landed_member(&env, &store, true);
+        let repo = env.path("repo");
+        git_in(&repo, &["checkout", "--quiet", "m-1"]);
+        for n in 2..=10 {
+            git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", &format!("work {n}")]);
+        }
+        git_in(&repo, &["checkout", "--quiet", "master"]);
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Done);
+        store.save_task(&t).unwrap();
+        // Its seat held it, then was released: no binding is left.
+        claim(&store, "m-1", "cpd-115");
+        store.clear_binding("cpd-115");
+        assert!(store.panes_for_task("m-1").is_empty(), "nothing holds m-1");
+        let _ = (stamped(), governed(), member_told(), landed_for());
+        // The refusal `wsp land --for-run` gives now for retro-8's conflict.
+        LAND_FAILS.with(|f| *f.borrow_mut() = Some(
+            "wsp: the rebase onto master does not apply cleanly: conflict in deps\n\
+             wsp: the rebase was aborted and ~/src/compound-react/.worktrees/m-1 is as it was. To clear it, in ~/src/compound-react/.worktrees/m-1: \
+             `git rebase master`, resolve deps, `git rebase --continue`\n\
+             git said: CONFLICT (content): Merge conflict in deps".into()
+        ));
+        let mut lines = Vec::new();
+        for n in 0..8 {
+            if n == 5 {
+                // Five minutes on: the notice is past the grace.
+                let mut t = store.find_task("m-1").unwrap();
+                let log = t.section("Log").unwrap_or_default();
+                let aged: Vec<String> = log
+                    .lines()
+                    .map(|l| if l.contains(WHY_NOT) { format!("- {}{}", util::iso_at(util::epoch_secs() - LAND_GRACE - 60), &l[22..]) } else { l.to_string() })
+                    .collect();
+                crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+                store.save_task(&t).unwrap();
+            }
+            tick(&store, &Fake::empty(), &mut Pass::new());
+            lines.extend(stamped().into_iter().filter(|l| l.contains("m-1")));
+        }
+        LAND_FAILS.with(|f| *f.borrow_mut() = None);
+        assert_eq!(landed_for(), vec!["m-1".to_string()], "the land is tried once, not each minute");
+        assert!(member_told().is_empty(), "nothing holds m-1: no tell, so no not-delivered line");
+        assert!(lines.len() <= 2, "no more than two lines for the row in eight ticks: {lines:#?}");
+        let status: Vec<&String> = lines.iter().filter(|l| l.contains("so it has no verifier yet")).collect();
+        assert_eq!(status.len(), 1, "the status once: {lines:#?}");
+        assert!(status[0].contains("m-1 is at done with 10 commits not on master"), "the one state it has: {}", status[0]);
+        assert!(!lines.iter().any(|l| l.contains("is at review")), "never a second, contradicting state: {lines:#?}");
+        assert!(lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count() <= 1, "the order at most once");
+        let gov = governed();
+        assert_eq!(gov.len(), 2, "the seat told twice in all, no seat and the refusal: {gov:#?}");
+        let refused = lines.iter().find(|l| l.contains("could not land it")).expect("the refusal is logged");
+        assert!(refused.contains("conflict in deps"), "the path: {refused}");
+        assert!(refused.contains("resolve deps") && refused.contains("`wsp land m-1`") && refused.contains("`wsp reopen m-1"), "the verbs: {refused}");
     }
 
     /// A member told to land, its notice an hour old and its seat `cpd-1`.

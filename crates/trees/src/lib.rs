@@ -13,6 +13,7 @@ pub mod gc;
 pub mod greens;
 pub mod guard;
 pub mod overlap;
+pub mod job_place;
 pub mod throttle;
 pub mod treecopy;
 pub mod warm;

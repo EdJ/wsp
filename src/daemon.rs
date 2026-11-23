@@ -339,11 +339,44 @@ fn tailnet_addrs() -> Vec<std::net::IpAddr> {
         .collect()
 }
 
+/// The API's view verbs (wsp-307): `throttle`, `spend` and `show` answer the
+/// documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+/// --json` print, from the very functions those print, over a store opened
+/// afresh for each call (so nothing a call reads is older than the call). The
+/// server links nothing of this crate, so this is how it gets them.
+struct Views {
+    root: std::path::PathBuf,
+    state: std::path::PathBuf,
+}
+
+impl Views {
+    fn store(&self) -> Store {
+        Store::at(self.root.clone(), self.state.clone())
+    }
+}
+
+impl wsp_server::Views for Views {
+    fn throttle(&self) -> Result<serde_json::Value, wsp_api::Failure> {
+        Ok(crate::throttle::document(&self.store()))
+    }
+
+    fn spend(&self) -> Result<serde_json::Value, wsp_api::Failure> {
+        Ok(crate::spend::report(&self.store(), crate::util::epoch_secs()))
+    }
+
+    fn show(&self, id: &str) -> Result<serde_json::Value, wsp_api::Failure> {
+        crate::cmd_task::show_json(&self.store(), id)
+            .map_err(|text| wsp_api::Failure { code: wsp_api::Code::NotFound, text, refusal: None })
+    }
+}
+
 /// What `start_api` started; ended with the daemon.
 pub(crate) struct Api {
     pub(crate) db: wsp_server::SharedStore,
     _server: Option<wsp_server::Server>,
     _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// The delivery worker, under `WSP_ORDERS=store` alone (wsp-122).
+    _deliver: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     /// wsp-743: the census reads' inputs, beside the mirror's entities.
     _readings: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
@@ -355,8 +388,13 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         return None;
     }
     let say = |line: String| wsp_store::store::log_line(store, &line);
+    // The composed domain (wsp-121): the mirror still puts orders under
+    // `WSP_ORDERS=files`, today's path; under `store` the orders machine
+    // decides them and the delivery worker runs beside the server (wsp-122).
+    let orders = crate::orders::mode();
+    let domain = std::sync::Arc::new(wsp_server::Composed::new(crate::orders::server_mode(orders)));
     let db: wsp_server::SharedStore =
-        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), std::sync::Arc::new(wsp_server::Mirror)) {
+        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), domain) {
             Ok(db) => std::sync::Arc::new(db),
             Err(e) => {
                 say(format!("api: state.db did not open ({e:?}); the daemon runs without the API"));
@@ -366,6 +404,7 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
     let mut cfg = wsp_server::Config::new(&store.state);
     cfg.port = crate::mirror::api_port();
     cfg.addrs = tailnet_addrs();
+    cfg.views = Some(std::sync::Arc::new(Views { root: store.root.clone(), state: store.state.clone() }));
     let server = match wsp_server::Server::start(db.clone(), cfg) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -374,8 +413,19 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         }
     };
     let mirror = Some(crate::mirror::start(store, db.clone()));
+    let deliver = match orders {
+        crate::orders::Mode::Store => {
+            crate::orders::serve_in_process(db.clone());
+            let started = crate::deliver::start(store, db.clone());
+            if started.is_none() {
+                say("orders: the delivery worker did not start; queued orders wait".into());
+            }
+            started
+        }
+        crate::orders::Mode::Files => None,
+    };
     let readings = crate::readings::start(store, db.clone());
-    Some(Api { db, _server: server, _mirror: mirror, _readings: readings })
+    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver, _readings: readings })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -1249,6 +1299,9 @@ mod tests {
             let exec = env.state().join("exec");
             let (m, thread, stop) = manager(&store, &exec);
             script(&store, &m);
+            // `store` is the default under the manager (wsp-128): the tick's
+            // tells go through an orders store, as the daemon's in-process one.
+            let _door = crate::refusals::tests::open(&store, &["cpd-t1"]);
 
             let line = tick(&store);
             for probe in PROBES {
@@ -1283,6 +1336,90 @@ mod tests {
             stop.store(true, Ordering::SeqCst);
             m.stop();
             let _ = thread.join();
+        }
+
+        /// `WSP_ORDERS` for one test, unset or set, and unset again however it
+        /// ends. Taken after [`util::isolated`], whose lock it is held under.
+        struct OrdersVar;
+        impl OrdersVar {
+            fn set(v: Option<&str>) -> OrdersVar {
+                match v {
+                    Some(v) => std::env::set_var(crate::orders::ENV, v),
+                    None => std::env::remove_var(crate::orders::ENV),
+                }
+                OrdersVar
+            }
+        }
+        impl Drop for OrdersVar {
+            fn drop(&mut self) {
+                std::env::remove_var(crate::orders::ENV);
+            }
+        }
+
+        /// The files the store mode retires (docs/state-core.md, step 2).
+        const ORDER_FILES: &[&str] =
+            &["typed-unsent.json", "first-orders.json", "stuck-commands.json", "refused-deliveries.json"];
+
+        /// One tick under the manager with `WSP_ORDERS` as given: the delivery
+        /// worker as `start_api` starts it (running or not), the tick's line,
+        /// and which of [`ORDER_FILES`] it left behind.
+        fn tick_under(tag: &str, orders: Option<&str>) -> (crate::orders::Mode, bool, Value, Vec<&'static str>) {
+            let env = util::isolated(tag);
+            let _host = HostVar::set("manager");
+            let _orders = OrdersVar::set(orders);
+            let store = Store::open();
+            let exec = env.state().join("exec");
+            let (m, thread, stop) = manager(&store, &exec);
+            script(&store, &m);
+
+            let mode = crate::orders::mode();
+            let db = crate::orders::tests::db(&env.state().join("db"), crate::orders::server_mode(mode));
+            // Under `store` the tick's tells go through the daemon's open store,
+            // which a test stands in for with the door's.
+            let _door = (mode == crate::orders::Mode::Store).then(|| crate::refusals::tests::open(&store, &["cpd-t1"]));
+            let worker = crate::deliver::start(&store, db);
+            let running = worker.as_ref().is_some_and(|(t, _)| !t.is_finished());
+            let line = tick(&store);
+            let left = ORDER_FILES.iter().copied().filter(|f| store.state_file(f).exists()).collect();
+
+            if let Some((t, flag)) = worker {
+                flag.store(true, Ordering::SeqCst);
+                let _ = t.join();
+            }
+            stop.store(true, Ordering::SeqCst);
+            m.stop();
+            let _ = thread.join();
+            (mode, running, line, left)
+        }
+
+        /// wsp-128's done-when: with `WSP_ORDERS` unset under the manager the
+        /// mode is `store`, the delivery worker runs, the tick runs no
+        /// `repair:unsent`, and none of the four order files is written.
+        #[test]
+        fn under_the_manager_orders_default_to_the_store_and_the_tick_writes_no_order_file() {
+            let (mode, running, line, left) = tick_under("tick-orders-default", None);
+            assert_eq!(mode, crate::orders::Mode::Store, "store is the default under the manager");
+            assert!(running, "the delivery worker runs");
+            assert!(line["phases"].get("repair:unsent").is_none(), "repair:unsent ran: {}", line["phases"]);
+            for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
+                assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
+            }
+            assert!(left.is_empty(), "the tick wrote {left:?}");
+        }
+
+        /// The rollback: `WSP_ORDERS=files` under the manager is the files
+        /// path, no worker, and the tick's phases as before.
+        #[test]
+        fn under_the_manager_orders_files_is_the_rollback_and_the_tick_runs_as_before() {
+            let (mode, running, line, _) = tick_under("tick-orders-files", Some("files"));
+            assert_eq!(mode, crate::orders::Mode::Files);
+            assert!(!running, "no delivery worker under files");
+            for gone in ["repair:unsent", "sweep:ended-panes"] {
+                assert!(line["phases"].get(gone).is_none(), "{gone} ran: {}", line["phases"]);
+            }
+            for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
+                assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
+            }
         }
 
         /// The second tick, its line left uncounted by [`tick`]'s filter.

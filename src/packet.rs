@@ -435,7 +435,8 @@ pub fn build_leg(task: &str, leg: &str, path: &str, root: &Path, last: bool) -> 
     let p = parse(&text);
     let kind = if last { crate::exit::Kind::Member } else { crate::exit::Kind::Leg };
     let exit = crate::closing::exit_template(kind, task, &[]);
-    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), &exit)
+    let refused = crate::split::seat_rule(task, &crate::split::named_in(&p.text, Some(task)));
+    render(&format!("# Packet · {task} · leg {leg}\n"), &p, root, &format!("{task} leg {leg}"), refused.as_deref(), &exit)
 }
 
 /// A leg spawn's decision: the size of its packet when it starts short, `None`
@@ -488,7 +489,9 @@ pub fn build(t: &Task, root: &Path) -> Result<String, String> {
         None => format!("# Packet · {} · {}\n", t.id, t.title),
     };
     let exit = crate::closing::exit_template(crate::exit::Kind::Member, &t.id, &crate::cmd_submit::packet_items(t));
-    render(&head, &p, root, &t.id, &exit)
+    let words = format!("{}\n{}", t.section("Overview").unwrap_or_default(), p.text);
+    let refused = crate::split::seat_rule(&t.id, &crate::split::named_in(&words, Some(&t.id)));
+    render(&head, &p, root, &t.id, refused.as_deref(), &exit)
 }
 
 /// Bytes of the owed block: the newest reason is always in (cut to this if it
@@ -573,9 +576,10 @@ pub const WAIT_RULE: &str = "Waiting: never wait on `pgrep -f \"<string>\"` — 
 /// on the machine. The Bash hook refuses that form; this says what to do instead.
 pub const KILL_RULE: &str = "Killing: kill by pid, never by a broad pattern — `kill $(cat <pidfile>)` for what you started (`echo $! > <pidfile>`), or the pids `lsof -t -i :<port>` or `lsof -t +D <dir>` gives. `pkill`/`killall` read every word after the first pattern as another pattern on macOS, so `pkill -f \"x\" -P 0` matches nearly every process; the Bash hook refuses that, `killall node` (or claude, wsp, cargo) and a `pkill` pattern under 4 characters. What you leave running in your tree is stopped when you submit.";
 
-/// The print: a heading, the author's words, the seat's exit template
+/// The print: a heading, the author's words, the verbs the row names that its
+/// seat is refused (`refused`, `wsp-312`), the seat's exit template
 /// (`wsp-617`), then each named file inline, refused over [`CAP`].
-fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<String, String> {
+fn render(head: &str, p: &Packet, root: &Path, who: &str, refused: Option<&str>, exit: &str) -> Result<String, String> {
     let mut parts: Vec<(String, String)> = Vec::new();
     for f in &p.files {
         if !inside(f) {
@@ -593,6 +597,9 @@ fn render(head: &str, p: &Packet, root: &Path, who: &str, exit: &str) -> Result<
         out.push_str(&format!("\n{TEST_SCOPE}\n"));
     }
     out.push_str(&format!("\n{WAIT_RULE}\n\n{KILL_RULE}\n"));
+    if let Some(section) = refused {
+        out.push_str(&format!("\n{section}\n"));
+    }
     if !exit.is_empty() {
         out.push_str(&format!("\n{exit}"));
     }
@@ -826,13 +833,50 @@ mod tests {
 
     #[test]
     fn a_packet_naming_a_cargo_test_says_the_full_suite_is_the_barriers() {
-        let dir = std::env::temp_dir().join(format!("wsp-packet-scope-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wsp-packet-test-scope-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
         let with = build(&row("file: src/a.rs\nverify  cargo test a::"), &dir).unwrap();
         assert!(with.contains(TEST_SCOPE), "{with}");
         let without = build(&row("file: src/a.rs\nSave prints ok."), &dir).unwrap();
         assert!(!without.contains(TEST_SCOPE), "{without}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// spec-breakdown's orders named verbs their seats were refused, and each
+    /// became an ask and an unfinished done-when (`wsp-312`). A planning row
+    /// whose overview says `wsp add --parent` or `wsp leg add`, and a row naming
+    /// `wsp mv`, get a section naming the refused verb and what to do instead; a
+    /// row naming none does not.
+    #[test]
+    fn a_row_naming_a_verb_its_seat_is_refused_gets_a_section_and_one_naming_none_does_not() {
+        let dir = std::env::temp_dir().join(format!("wsp-packet-refused-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let planning = |overview: &str| {
+            let mut t = row("file: src/a.rs\nBreak the spec down.");
+            crate::model::set_section_in(&mut t.body, "Overview", overview);
+            build(&t, &dir).unwrap()
+        };
+        let cases = [
+            (planning("2. Sub-tasks of this row (`wsp add --parent`), each small enough for one seat."), "`wsp add --parent t-1`", "Instead: commit, then `wsp leg add t-1"),
+            (planning("3. Split each phase with `wsp leg add` per piece."), "`wsp leg add <other row>`", "Instead: `wsp ask` a planner"),
+            (build(&row("file: src/a.rs\n- `wsp mv <id> --parent none` for each of the 86."), &dir).unwrap(), "`wsp mv`:", "Instead: `wsp ask t-1 --person`"),
+        ];
+        for (text, verb, instead) in &cases {
+            assert_eq!(text.matches("## Verbs this seat is refused").count(), 1, "{text}");
+            assert!(text.contains(verb) && text.contains(instead), "{verb}: {text}");
+            // Before the exit and the files, where the brief is read.
+            assert!(text.find("## Verbs this seat is refused").unwrap() < text.find("## Your exit").unwrap(), "{text}");
+        }
+        assert!(!cases[2].0.contains("`wsp add --parent"), "only the verbs the row names: {}", cases[2].0);
+        let plain = planning("Make a return 1.");
+        assert!(!plain.contains("## Verbs this seat is refused") && !plain.contains("wsp mv"), "{plain}");
+        // A leg's seat is its row's, and its packet is read the same way.
+        let leg = dir.join("leg.md");
+        std::fs::write(&leg, "Detach them with `wsp mv`.\n").unwrap();
+        let text = build_leg("t-1", "a", leg.to_str().unwrap(), &dir, false).unwrap();
+        assert!(text.contains("## Verbs this seat is refused") && text.contains("`wsp ask t-1 --person`"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

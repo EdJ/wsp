@@ -852,14 +852,19 @@ fn told_unlanded(store: &Store, w: &Worklist, t: &Task) {
     if s.owes_a_verifier() || !s.settlement.settled() {
         return;
     }
-    tell(store, w, &format!("In the {} run, {}", w.id, unlanded(&s.id, &s.note())));
+    tell(store, w, &format!("In the {} run, {}", w.id, unlanded(&s.id, &s.settlement, &s.note())));
 }
 
 /// The sentence for a reviewed member that has not landed, in the log and
 /// to the seat alike.
-fn unlanded(id: &str, note: &str) -> String {
+///
+/// **The status it has, not `review` always** (`wsp-338`): compound-react-040
+/// was at `done`, and this said "at review" on the line above the repair's "at
+/// done" every minute — one row, two states.
+fn unlanded(id: &str, at: &Settlement, note: &str) -> String {
     format!(
-        "{id} is at review with {note}, so it has no verifier yet. {}",
+        "{id} is at {} with {note}, so it has no verifier yet. {}",
+        at.word(),
         crate::cmd_checkout::Flow::Verified.owes(id)
     )
 }
@@ -1061,9 +1066,18 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // log has to say: tokenhub-003 went to review with its commit still on
     // its branch, this started nothing and wrote nothing, and its governor
     // went looking for the cause in the wrong record (`wsp-142`).
+    //
+    // **Once per reason** (`wsp-338`), by a marker on the member: every pass
+    // used to write it, so a member whose seat had been released was ordered
+    // to commit and review again once a minute until a person stepped in. A
+    // changed reason — fewer commits, a new status, a new wait — is said again.
     if all && !barrier_only {
         for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
-            log_line(store, &format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
+            let line = unlanded(&s.id, &s.settlement, &s.note());
+            let kind = format!("{} {} is at ", crate::repair::LOGGED_WHY, s.id);
+            if crate::repair::said_once_per_reason(store, &s.id, &kind, &format!("{} {line}", crate::repair::LOGGED_WHY)) {
+                log_line(store, &format!("{} group {at}: {line}", w.id));
+            }
         }
     }
 
@@ -1415,7 +1429,7 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
         check,
         names.join(", ")
     ));
-    tell_barrier(store, w, &check, &names);
+    tell_barrier(store, w, at, &check, &names);
 }
 
 /// The marker a reopened row carries, so the check can be told what changed
@@ -1427,7 +1441,7 @@ pub(crate) const SENT_BACK: &str = "sent back:";
 /// **`wsp tell` run as a process, for [`crate::cmd_task::reopen`]'s reason**:
 /// its refusals are the answer worth having, and a second implementation here
 /// would be a second answer that could disagree with the verb.
-fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
+fn tell_barrier(store: &Store, w: &Worklist, at: usize, check: &str, members: &[String]) {
     let text = format!(
         "The {} run sent {} back after your barrier check {} opened, so the group is not the one you \
          were given. Read `wsp worklist next {}` again before deciding, and if it already holds, \
@@ -1438,11 +1452,38 @@ fn tell_barrier(store: &Store, w: &Worklist, check: &str, members: &[String]) {
         w.id,
         w.id
     );
-    tell_seat(store, check, &text, "the group moved under it");
+    let key = format!("barrier:{}:{at}", w.id);
+    tell_seat(store, check, &text, "the group moved under it", &key);
+}
+
+/// The seat a tell to `to` reaches: the pane of the row `to` names (its
+/// claim's, where the row has more than one), or `to` itself, a seat.
+fn seat_of(store: &Store, to: &str) -> String {
+    let panes = store.panes_for_task(to);
+    let holder = store
+        .claims()
+        .get(to)
+        .and_then(|claim| crate::address::claim_holder(claim, &panes, &store.agents_held()));
+    holder.or_else(|| panes.first().cloned()).unwrap_or_else(|| to.to_string())
 }
 
 /// `wsp tell <seat> -` with `text`, said in `cycle.log` as `told <seat>: <what>`.
-fn tell_seat(store: &Store, check: &str, text: &str, what: &str) {
+///
+/// **Under the orders machine, an order** (wsp-125): [`crate::refusals::Door::send`]
+/// under `key` and the seat, so the tick that tells and any tick that tells the
+/// same thing again hold one order (the caller's key is per list, group and
+/// what it is about). Nothing waits for the answer; the order's state is the
+/// record of whether the seat heard.
+fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) {
+    if let Some(door) = crate::refusals::door(store) {
+        let seat = seat_of(store, check);
+        match door.send(&seat, text, &format!("{key}:{seat}")) {
+            Ok(sent) if sent.fresh => log_line(store, &format!("told {check}: {what} (order {})", sent.id.0)),
+            Ok(_) => {}
+            Err(e) => log_line(store, &format!("told {check}: not delivered — {e}")),
+        }
+        return;
+    }
     if cfg!(test) {
         #[cfg(test)]
         crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text.to_string())));
@@ -1515,6 +1556,7 @@ fn end_second_seats(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, m
                              commit — anything there you did not write is {p}'s, and is yours to keep or drop."
                         ),
                         &format!("{p} was ended and the tree of {id} is its"),
+                        &format!("second-seat:{}:{at}:{id}:{p}", w.id),
                     );
                 }
                 Err(why) => log_line(store, &format!(
@@ -2705,6 +2747,18 @@ pub(crate) fn legs_finished(store: &Store, seats: &dyn Seats) -> Vec<String> {
             match outcome {
                 Ok(()) => {
                     log_line(store, &format!("ended {seat}, which ran leg {} of {}{}", l.name, t.id, again(&l.ending)));
+                    // A claim on the row in this seat's name goes with it
+                    // (`wsp-334`). A leg claims nothing, but a manager's fold
+                    // of the seat's start wrote one before it learned not to,
+                    // and a row someone holds opens no leg. Left in place, it
+                    // keeps the next leg waiting on a seat that is gone.
+                    let stale = store.locked(|| {
+                        let named = store.claims().get(&t.id).and_then(|c| c.get("workspace_id")?.as_str().map(|w| w == seat)).unwrap_or(false);
+                        named && store.clear_claim(&t.id)
+                    });
+                    if stale {
+                        log_line(store, &format!("{}: the claim in {seat}'s name went with it — a leg claims nothing", t.id));
+                    }
                     ended.push(seat);
                 }
                 Err(_) if l.ending != Ending::Standing => {}
@@ -5367,6 +5421,19 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
         return;
     }
     log_line(store, &format!("tell {}: {}", w.id, util::truncate(text, 120)));
+    tell_now(store, w, text);
+}
+
+/// [`tell`], for a sentence whose fact the caller has already written to
+/// `cycle.log` on its own line: the delivery without a second line saying it
+/// (`wsp-338`). A repair's stamp followed by `tell <list>: <the same fact>`
+/// was two lines a minute for one member in the file a governor reads.
+pub(crate) fn tell_logged(store: &Store, w: &Worklist, text: &str) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
+        return;
+    }
     tell_now(store, w, text);
 }
 
@@ -8445,6 +8512,40 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&ENDED).is_empty() && spawned().is_empty());
     }
 
+    /// **Under `WSP_ORDERS=store` a verifier's seat is replaced once its first
+    /// order is `failed`, and nothing is pressed or resent** (wsp-126): the
+    /// order's retries are the orders machine's, so an order typed and unsent
+    /// is left to them, and the replacement waits on the order's state, not on
+    /// a press's line in `cycle.log`.
+    #[test]
+    fn under_store_a_failed_first_order_replaces_the_verifier_once_and_nothing_is_pressed() {
+        use crate::verification::State as V;
+        let (_env, store) = scratch("untakenstored");
+        let w = verifier_waiting(&store, "cpd-640");
+        let seats = Untaken::holding(Some(true));
+
+        crate::untaken::as_stored(&[]);
+        step(&store, &w, &seats);
+        age_the_log(&store);
+        step(&store, &w, &seats);
+        assert!(seats.pressed.borrow().is_empty() && seats.resent.borrow().is_empty(), "no press, no resend");
+        assert!(drained(&ENDED).is_empty() && spawned().is_empty(), "and no replacement while the order is not failed");
+
+        crate::untaken::as_stored(&[("cpd-640", "the prompt did not take it")]);
+        step(&store, &w, &seats);
+        assert_eq!(drained(&ENDED), vec!["cpd-640".to_string()], "the seat whose order failed is ended");
+        assert_eq!(spawned(), vec![("m-1 · verifying".to_string(), "claude".to_string())], "and another starts");
+        let ps = passes_on(&store, "m-1");
+        assert_eq!(ps.iter().map(|p| p.state).collect::<Vec<_>>(), vec![V::Superseded, V::Running]);
+
+        step(&store, &w, &seats);
+        assert!(drained(&ENDED).is_empty() && spawned().is_empty(), "replaced once");
+        assert!(seats.pressed.borrow().is_empty() && seats.resent.borrow().is_empty());
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap();
+        assert!(log.contains("did not receive its first order") && log.contains("replacing cpd-640:"), "{log}");
+        assert!(!log.contains("pressed submit in cpd-640,"), "{log}");
+    }
+
     /// `wsp-136` item 3. `end_behind` ends the check on the barrier *before* the
     /// one just passed, so the check whose `go` finished the run was left
     /// holding a claim for ever — there being no next pass to reach it from, and
@@ -10140,6 +10241,156 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(drained(&ENDED).is_empty());
     }
 
+    /// The manager host's fold of a seat's start for `row` (`wsp-028`), as
+    /// event `id`: the record that wrote a claim for every leg's seat until
+    /// `wsp-334`.
+    fn fold_start(store: &Store, row: &str, seat: &str, id: u64) {
+        use wsp_host_api::{Epoch, EventId, Frame, Key, Message, RowId, SeatId, SeatStarted};
+        let started = SeatStarted { key: Key { row: RowId(row.into()), attempt: 1 }, seat: SeatId(seat.into()), epoch: Epoch(1), pid: 4242, sockets: vec![] };
+        assert!(crate::fold::fold(store, "manager", &Frame { id: Some(EventId(id)), req: None, msg: Message::SeatStarted(started) }));
+    }
+
+    /// [`seat_leg`] in `cwd`, a directory no repository holds, so the leg's own
+    /// `wsp leg done` ([`crate::leg_seat::finish`]) reads no tree as unclean.
+    fn seat_leg_in(store: &Store, id: &str, name: &str, seat: &str, cwd: &std::path::Path) {
+        let cwd = cwd.display().to_string();
+        let stand = crate::leg_seat::Standing { room: None, cwd: Some(&cwd), kind: "claude" };
+        assert!(crate::leg_seat::attach(store, id, name, seat, &stand), "{name} was not open to seat");
+    }
+
+    /// The fake clock, in the seat's own terms: every seat idle, its turn ended
+    /// an hour ago, so far past the member's idle window (`repair::STALLED_AFTER`).
+    /// Every process is gone once looked for. This is a leg's seat after its
+    /// `wsp leg done`, as wsp-030's read when they were told to finish.
+    struct IdleAnHour;
+
+    impl Seats for IdleAnHour {
+        fn state(&self, _seat: &str) -> Option<State> {
+            Some(State::Idle)
+        }
+        fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
+            Some(crate::waiting::TurnEnd { at: util::epoch_secs() - 3600, words: None, denied: false })
+        }
+        fn pids(&self, _seat: &str) -> Option<Vec<u32>> {
+            Some(vec![1])
+        }
+        fn running(&self, _pids: &[u32]) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    /// What a leg's seat must never be told or flagged as, read off `cycle.log`
+    /// and the row's log: the member's idle tell, its end-and-restart and the
+    /// close that flags the person (`wsp-334`).
+    fn no_member_word(store: &Store, id: &str) {
+        let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        for word in ["told to finish", "needs a person", "with nothing working on it", "open and not closing"] {
+            assert!(!log.contains(word), "{word:?} in cycle.log: {log}");
+        }
+        let row = store.find_task(id).unwrap().section("Log").unwrap_or_default();
+        assert!(!row.contains("told it to finish"), "{row}");
+    }
+
+    /// `wsp-334`: a row with two legs, under the manager host, whose fold of the
+    /// first seat's start wrote a claim on the row. The first leg calls `wsp leg
+    /// done`, and its seat then reads idle an hour. **One tick** ends that seat
+    /// and starts the second leg: no "told to finish", no "needs a person". It
+    /// holds both for a run that folds after the fix (no claim) and for a claim
+    /// a fold wrote before it, which the ending takes with the seat.
+    #[test]
+    fn a_done_legs_seat_is_ended_and_the_next_leg_started_in_one_tick_with_no_member_tell() {
+        for stale in [false, true] {
+            let (env, store) = scratch(if stale { "legs-tick-stale" } else { "legs-tick" });
+            staged(&store, "m-1", Status::Todo);
+            add_leg(&store, "m-1", "second", &["plan"], None, None);
+            let w = list(&store, &[(&["m-1"], "claude")]);
+            step(&store, &w, &Blind);
+            assert_eq!(ids(spawned()), ["m-1 · plan".to_string()]);
+            seat_leg_in(&store, "m-1", "plan", "cpd-1", &env.home());
+            fold_start(&store, "m-1", "cpd-1", 1);
+            assert!(store.claims().is_empty(), "a leg's seat start claims nothing: {:?}", store.claims());
+            if stale {
+                store.set_claim("m-1", serde_json::json!({ "workspace_id": "cpd-1", "host": "manager", "epoch": 1 }));
+            }
+
+            crate::leg_seat::finish(&store, "m-1", "plan", "cpd-1", "handed on", "did it", None).unwrap();
+            let _ = drained(&ENDED);
+            crate::repair::tick(&store, &IdleAnHour, &mut crate::repair::Pass::new());
+
+            assert_eq!(drained(&ENDED), ["cpd-1".to_string()], "stale {stale}: the done leg's seat is ended by this tick");
+            assert_eq!(ids(spawned()), ["m-1 · second".to_string()], "stale {stale}: and the second leg is started in it");
+            assert_eq!(leg_state(&store, "m-1", "second"), crate::legs::State::Running);
+            assert!(store.claims().is_empty(), "stale {stale}: {:?}", store.claims());
+            no_member_word(&store, "m-1");
+        }
+    }
+
+    /// `wsp-334` over wsp-030's five leg boundaries (06:43:38 to 07:08:44 on
+    /// 2026-11-20, `leg-done` each). The run is driven for real: each leg seated,
+    /// its start folded as the manager host folds it, `wsp leg done`, then the
+    /// poke's step and as many ticks as it takes for the next leg to start. The
+    /// starts go into the fixture at the done time, plus a hand-off for the
+    /// poke and plus [`crate::timeline`]'s tick for each tick taken. The
+    /// timeline's gap before each leg is under 30 s. The log as it happened
+    /// (two ticks a boundary) is read the same way for comparison: every gap
+    /// is "nothing the logs name", and 614 s in all.
+    #[test]
+    fn wsp_030s_five_leg_boundaries_each_cost_under_30s() {
+        const NAMES: [&str; 6] = ["wire-inproc", "daemon-tick", "verbs", "tests-docs", "finish", "rework"];
+        let at = |hms: &str| util::epoch_of(&format!("2026-11-20T{hms}Z"));
+        let done = ["06:43:38", "06:57:40", "07:02:46", "07:05:52", "07:08:44"].map(at);
+        let then = ["06:45:26", "06:59:43", "07:04:50", "07:07:55", "07:11:00"].map(at);
+
+        let (env, store) = scratch("legs-030");
+        task(&store, "m-1", Status::Todo);
+        edit_legs(&store, "m-1", |_| Ok(NAMES.iter().map(|n| crate::legs::Leg::pending(n, &format!("do {n}"))).collect()));
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1 · wire-inproc".to_string()]);
+        let mut ticks = Vec::new();
+        for (k, name) in NAMES.iter().take(5).enumerate() {
+            let seat = format!("cpd-{}", 161 + k);
+            seat_leg_in(&store, "m-1", name, &seat, &env.home());
+            fold_start(&store, "m-1", &seat, k as u64 + 1);
+            crate::leg_seat::finish(&store, "m-1", name, &seat, "handed on", "did it", None).unwrap();
+            let next = format!("m-1 · {}", NAMES[k + 1]);
+            // The poke `leg done` sends is a step; a tick after it if it took none.
+            step(&store, &w, &Blind);
+            let mut n = 0;
+            while !ids(spawned()).contains(&next) {
+                n += 1;
+                assert!(n <= 3, "{next} never started: {:?}", store.claims());
+                crate::repair::tick(&store, &IdleAnHour, &mut crate::repair::Pass::new());
+            }
+            ticks.push(n);
+        }
+        assert_eq!(ticks, [0; 5], "each next leg is started by the poke of the leg done before it");
+        crate::repair::tick(&store, &IdleAnHour, &mut crate::repair::Pass::new());
+        no_member_word(&store, "m-1");
+
+        let gaps = |starts: &[i64]| {
+            let mut i = crate::timeline::Inputs { id: "wsp-030".into(), ..Default::default() };
+            i.legs = NAMES.iter().map(|n| crate::timeline::LegIn { name: n.to_string(), ..Default::default() }).collect();
+            i.cycle.push((at("06:35:26"), "m1-agent-manager group 8: starting leg wire-inproc of wsp-030".into()));
+            for k in 0..5 {
+                i.events.push((done[k], "leg-done".into(), serde_json::json!({ "id": "wsp-030", "leg": NAMES[k] })));
+                i.cycle.push((starts[k], format!("m1-agent-manager group 8: starting leg {} of wsp-030", NAMES[k + 1])));
+            }
+            crate::timeline::build(&i).into_iter().filter(|p| p.gap && p.label.starts_with("gap before leg")).collect::<Vec<_>>()
+        };
+        let fixed: Vec<i64> = (0..5).map(|k| done[k] + crate::timeline::HAND_OFF / 2 + ticks[k] as i64 * crate::timeline::TICK).collect();
+        let now = gaps(&fixed);
+        assert_eq!(now.len(), 5, "{now:?}");
+        for g in &now {
+            assert!(g.seconds() < 30, "{g:?}");
+            assert!(!g.waiting_for.as_deref().unwrap_or_default().contains("did not run for longer than a tick"), "{g:?}");
+        }
+        let was = gaps(&then);
+        assert_eq!(was.len(), 5, "{was:?}");
+        assert!(was.iter().all(|g| g.waiting_for.as_deref().unwrap_or_default().contains("the step of wsp-030 did not run for longer than a tick")), "{was:?}");
+        assert_eq!(was.iter().map(|g| g.seconds()).sum::<i64>(), 614);
+    }
+
     /// A row at `doing`: the plan done, two siblings and their join.
     fn fanned_out(store: &Store, id: &str) {
         staged(store, id, Status::Doing);
@@ -11471,5 +11722,28 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(log.matches("wsp: not adding held to run group 1: elsewhere holds it").count(), 1, "said once: {log}");
         assert!(!log.contains("fin"), "a done row owes nothing, so nothing is said: {log}");
         assert!(!log.contains("wsp: prerequisite"), "{log}");
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// **wsp-125: under the orders machine a barrier check is told by an
+    /// order**, keyed per list, group and seat: the same tell on the next tick
+    /// is the same order, another group is another, and nothing runs `wsp tell`.
+    #[test]
+    fn under_the_orders_machine_a_barrier_check_told_twice_is_one_order() {
+        let env = util::isolated("cycle-tell-orders");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let opened = crate::refusals::tests::open(&store, &["cpd-9"]);
+        let orders = || opened.0.orders_for(&wsp_store_contract::SeatId("cpd-9".into()), &[]).unwrap().len();
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:2");
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:2");
+        assert_eq!(orders(), 1, "one order across two ticks");
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:3");
+        assert_eq!(orders(), 2, "another group is another order");
+        assert!(tests::MEMBER_TOLD.with(|t| t.borrow().is_empty()), "no `wsp tell` past the orders machine");
     }
 }

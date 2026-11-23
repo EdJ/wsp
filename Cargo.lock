@@ -301,6 +301,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsp-machines"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-store-contract",
+]
+
+[[package]]
 name = "wsp-manager"
 version = "0.1.0"
 dependencies = [
@@ -316,6 +324,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-api",
+ "wsp-machines",
  "wsp-store-conformance",
  "wsp-store-contract",
 ]
@@ -366,6 +375,8 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-base",
+ "wsp-host-api",
+ "wsp-manager",
  "wsp-store",
  "wsp-testkit",
  "wsp-view",

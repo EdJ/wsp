@@ -2,9 +2,12 @@
 //! only what step 1 serves: the read verbs of 4.2 and `subscribe` (4.3), on TCP
 //! on loopback and the tailnet from the start (D19, agent-manager 3.4), over
 //! any `dyn Store`, and [`mirror::Mirror`], the domain step 1's store runs.
-//! Commands, leased once-only work and the executor half come at steps 2-5;
-//! until then every command verb is answered `unsupported`. Nothing starts
-//! the server until step 1's group 6. See `MAP.md`.
+//! Step 2 (wsp-121) adds [`domain::Composed`], the mirror and the orders
+//! machine under a [`domain::Mode`], and the orders machine's commands over
+//! the API (`conn`'s module docs): `order.send` and `order.cancel` from a
+//! person or a seat, the answers and `order.deliver` from the instance itself
+//! or a manager. Every other command verb is answered `unsupported` until its
+//! step. See `MAP.md`.
 //!
 //! **Listening** ([`Server::start`]). It binds loopback and the tailnet
 //! addresses it is given, on one port; it refuses any address, and any peer,
@@ -20,8 +23,8 @@
 //! replay, then the head followed through `wait_for`, with a beat. The
 //! carrier is [`tcp::Tcp`].
 //!
-//! It goes through `Store` only, and links `wsp-api` and `wsp-store-contract`
-//! alone of the workspace (never the sqlite crate: section 6).
+//! It goes through `Store` only, and links `wsp-api`, `wsp-store-contract` and
+//! `wsp-machines` alone of the workspace (never the sqlite crate: section 6).
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -33,16 +36,20 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
 use wsp_api::{
-    ApiToken, Code, Connection, Frame, Hello, Listen, Principal, LISTEN_FILE, PROTOCOL, TOKEN_FILE, TOKEN_MODE,
+    ApiToken, Code, Connection, Failure, Frame, Hello, Listen, Principal, LISTEN_FILE, PROTOCOL, TOKEN_FILE,
+    TOKEN_MODE,
 };
 use wsp_store_contract::{At, Store};
 
 mod conn;
+pub mod domain;
 pub mod mirror;
 mod subscribe;
 pub mod tcp;
 
+pub use domain::{Composed, Mode, OWNED};
 pub use mirror::Mirror;
 
 /// The store a server serves: any backend, shared with its threads.
@@ -55,6 +62,30 @@ pub const DEFAULT_PORT: u16 = 7488;
 /// The server's log, under `state_dir`: one line per start, refusal, and
 /// connection that ends other than by its client.
 pub const LOG_FILE: &str = "api.log";
+
+/// The CLI's documents the view verbs answer (`throttle`, `spend`, `show`;
+/// wsp-307): what `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+/// --json` print, as the value they print. Their inputs are this machine's
+/// readings, the stop ledger and the store's files, none of which a `dyn
+/// Store` holds, so whatever starts the server (the daemon) hands in the one
+/// code the CLI prints from, and the server, linking nothing of the CLI,
+/// passes its answer through whole.
+///
+/// Each is called on the asking connection's thread, after its hello and the
+/// request's `by` were checked as every read's are. An `Err` is the reply's
+/// `err` as it stands (`not_found` for a `show` the CLI would say has none).
+pub trait Views: Send + Sync {
+    fn throttle(&self) -> Result<Value, Failure>;
+    fn spend(&self) -> Result<Value, Failure>;
+    /// `id` as `wsp show` takes it: a row's id or prefix, or a piece's id.
+    fn show(&self, id: &str) -> Result<Value, Failure>;
+}
+
+impl std::fmt::Debug for dyn Views {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Views(..)")
+    }
+}
 
 /// What a server is started with.
 #[derive(Debug, Clone)]
@@ -70,10 +101,13 @@ pub struct Config {
     /// The beat's period, [`wsp_api::BEAT_SECS`] outside tests. A client
     /// silent for [`wsp_api::MISSED_BEATS`] of them is dropped.
     pub beat: Duration,
+    /// What answers the view verbs; none answers each `unsupported`.
+    pub views: Option<Arc<dyn Views>>,
 }
 
 impl Config {
-    /// Loopback alone, on [`DEFAULT_PORT`], instance `wsp`, a 10 s beat.
+    /// Loopback alone, on [`DEFAULT_PORT`], instance `wsp`, a 10 s beat, no
+    /// [`Views`].
     pub fn new(state_dir: &Path) -> Config {
         Config {
             addrs: Vec::new(),
@@ -81,6 +115,7 @@ impl Config {
             port: DEFAULT_PORT,
             instance: "wsp".into(),
             beat: Duration::from_secs(wsp_api::BEAT_SECS),
+            views: None,
         }
     }
 }
@@ -452,8 +487,7 @@ mod tests {
         let mut cfg = Config::new(&d);
         let unheld: IpAddr = "100.127.255.254".parse().unwrap();
         cfg.addrs = vec![unheld];
-        // Any free port: the default is the live daemon's, which would answer instead.
-        cfg.port = 0;
+        cfg.port = 0; // the live server on DEFAULT_PORT is no part of this test
         let store: SharedStore = Arc::new(NoStore);
         let server = Server::start(store, cfg).expect("loopback serves when a tailnet address cannot be bound");
         assert!(server.addrs().iter().all(|a| a.ip().is_loopback()), "only loopback is bound: {:?}", server.addrs());

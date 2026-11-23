@@ -161,6 +161,8 @@ fn world() -> Vec<Entity> {
         text: "go".into(),
         state: OrderState::Queued,
         attempts: 0,
+        first: false,
+        why: None,
     }));
     es.push(Entity::Machine(Machine { name: MachineName("local".into()), transport: Transport::Local, beat: Some(At(1)), facts: BTreeMap::new() }));
     es

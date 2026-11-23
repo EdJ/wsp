@@ -408,7 +408,8 @@ pub(crate) fn finish(
         let scratch = crate::scratch::path(store, &t.id);
         let _ = std::fs::create_dir_all(&scratch);
         let log = scratch.join(format!("piece-{n}-check.log"));
-        let ran = crate::check::run_all(&run_dir, &steps, &log, None, |_| {});
+        let runner = crate::check::Runner::chosen(store, crate::check::Whose::Row(&t.id), crate::check::TreeKind::Work, &run_dir, None)?;
+        let ran = crate::check::run_all(&run_dir, &steps, &log, None, &runner, |_| {});
         if let Some(red) = ran.iter().find(|r| r.done != crate::check::Done::Passed) {
             return Err(format!("piece {n} is not done: {}", red_line(red)));
         }

@@ -28,6 +28,7 @@
 //! | `seat.despawn` | `ending`; `lost` with `lost: true` | `illegal` |
 //! | `order.send` | to a seat not `ending` or `gone` | `illegal`, `not_found` |
 //! | `order.cancel` | `queued`, `typed` | `illegal` |
+//! | `order.deliver`, `order.delivered`, `order.acked`, `order.refused`, `order.done` | never: this domain stops an order at `queued` (wsp-117) | `illegal` |
 //! | `mirror` | never: it is step 1's, and only the server's mirror domain decides it | `illegal` |
 //!
 //! `row.add` and `seat.spawn` are always legal (a second `seat.spawn` with the
@@ -39,6 +40,10 @@
 //! `illegal`, with the state `owned` (this domain owns its entities, so nothing
 //! mirrors them), naming the first subject it would `put` or remove, or the
 //! project `""` when it names none.
+//!
+//! The orders machine's verbs past `order.send` (wsp-117) are refused the same
+//! way: `illegal`, naming the order, with its state's wire name, or `""` when
+//! the state has no such order. `order.send`'s `first` is kept on the [`Order`].
 
 use serde_json::{json, Value};
 use wsp_store_contract::*;
@@ -269,7 +274,7 @@ impl Domain for TestDomain {
                 }
                 vec![draft(EventKind::SeatGone, Subject::Seat(seat.clone()), Value::Null)]
             }
-            Command::OrderSend { to, text } => {
+            Command::OrderSend { to, text, first } => {
                 let s = Self::seat(state, to)?;
                 if matches!(s.state, SeatState::Ending | SeatState::Gone) {
                     return Err(illegal!(Subject::Seat(to.clone()), &s.state, cmd));
@@ -282,6 +287,8 @@ impl Domain for TestDomain {
                     text: text.clone(),
                     state: OrderState::Queued,
                     attempts: 0,
+                    first: *first,
+                    why: None,
                 };
                 vec![draft(EventKind::OrderQueued, Subject::Order(id), to_value!(&order))]
             }
@@ -302,6 +309,14 @@ impl Domain for TestDomain {
                     .or_else(|| gone.first().cloned())
                     .unwrap_or_else(|| Subject::Project(ProjectId(String::new())));
                 return Err(Refusal::Illegal { subject, state: "owned".into(), verb: verb(cmd) });
+            }
+            Command::OrderDeliver { order, .. }
+            | Command::OrderDelivered { order }
+            | Command::OrderAcked { order, .. }
+            | Command::OrderRefused { order, .. }
+            | Command::OrderDone { order } => {
+                let state = state.orders.get(order).map(|o| wire!(&o.state)).unwrap_or_default();
+                return Err(Refusal::Illegal { subject: Subject::Order(order.clone()), state, verb: verb(cmd) });
             }
             Command::ListGo { .. }
             | Command::ListHold { .. }
@@ -439,5 +454,42 @@ mod tests {
         );
         let none = Command::Mirror { put: vec![], gone: vec![] };
         assert!(matches!(TestDomain.decide(&State::default(), &none, &ed), Err(Refusal::Illegal { .. })));
+    }
+    /// The orders machine's verbs past `order.send` (wsp-117) are refused
+    /// `illegal`, naming the order, with its state (`""` when there is none).
+    #[test]
+    fn the_orders_machine_verbs_are_refused_as_illegal() {
+        let ed = Principal::Person("ed".into());
+        let o = OrderId("o-1".into());
+        let fence = Fence { lease: LeaseName::deliver(&SeatId("s-1".into())), token: Token(1) };
+        let verbs = [
+            Command::OrderDeliver { order: o.clone(), fence },
+            Command::OrderDelivered { order: o.clone() },
+            Command::OrderAcked { order: o.clone(), turn_began: At(1) },
+            Command::OrderRefused { order: o.clone(), why: "busy".into(), counts: false },
+            Command::OrderDone { order: o.clone() },
+        ];
+        let mut queued = State::default();
+        queued.orders.insert(
+            o.clone(),
+            Order {
+                id: o.clone(),
+                from: ed.clone(),
+                to: SeatId("s-1".into()),
+                text: "go".into(),
+                state: OrderState::Queued,
+                attempts: 0,
+                first: false,
+                why: None,
+            },
+        );
+        for cmd in &verbs {
+            for (state, word) in [(&State::default(), ""), (&queued, "queued")] {
+                assert_eq!(
+                    TestDomain.decide(state, cmd, &ed),
+                    Err(Refusal::Illegal { subject: Subject::Order(o.clone()), state: word.into(), verb: verb(cmd) })
+                );
+            }
+        }
     }
 }

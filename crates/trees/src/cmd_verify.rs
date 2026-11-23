@@ -247,10 +247,184 @@ use serde_json::json;
 
 use crate::sharing::{self, Share};
 
-/// Which build-slot holders are running, asked of the in-process host.
-fn alive(pids: &[u32]) -> std::collections::BTreeSet<u32> {
-    use wsp_wire::host::Host;
-    wsp_wire::host::LOCAL.alive(pids)
+// ---------------------------------------------------------------- jobs (wsp-054)
+
+/// How verify's runs are run (docs/agent-manager.md 6.2, M3): every one of
+/// them (cargo, the test listing and `--alone`'s per-test runs) is a `job.run`
+/// on the tree's host, its output echoed from `job.output` and its end read
+/// from `job.ended`; nothing is spawned or killed here, and a warm tree's lock
+/// names the run, whose liveness is that host's job table. The host is the
+/// manager's, or `wsp-host`'s runner in this process under `WSP_JOBS=inproc`
+/// and on a host with no manager ([`jobs_host`]).
+/// One verify's jobs: the host they go to and the run they belong to.
+struct Jobs<'a> {
+    host: &'a dyn wsp_wire::host::Host,
+    /// The key's row and attempt and the mark every job name ends with
+    /// (`verify:<what>:<n>@<mark>`); also what a warm lock names.
+    run: sharing::Run,
+    /// Jobs sent so far, so each key is unique per run (wsp-040).
+    sent: std::sync::atomic::AtomicU32,
+    /// A `PATH` every job of this run is given, ahead of the call's own env;
+    /// `None` (every run wsp makes) leaves the job the host's. A test's
+    /// manager runs in the test, so its jobs inherit the seat's `PATH`, shim
+    /// first, and a `cargo` there would go to the seat's manager as a second
+    /// job and be refused for a tree outside its root (wsp-395).
+    path: Option<String>,
+}
+
+/// The longest a build may run as a job. `job.run` needs a bound and the
+/// direct path has none: this is a backstop against a build that never ends,
+/// far beyond any this suite has taken, and not a budget.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+
+impl<'a> Jobs<'a> {
+    fn new(host: &'a dyn wsp_wire::host::Host, run: sharing::Run) -> Jobs<'a> {
+        Jobs { host, run, sent: std::sync::atomic::AtomicU32::new(0), path: None }
+    }
+
+    /// The next job's key, `verify:<what>:<n>@<mark>`.
+    fn key(&self, what: &str) -> wsp_wire::host::JobKey {
+        let n = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        wsp_wire::host::job_key(&self.run.row, self.run.attempt, &format!("verify:{what}:{n}@{}", self.run.mark))
+    }
+
+    /// The host's job table, as [`sharing::Live`] reads it: the rows
+    /// of the host this run's jobs go to, `None` for any other host or a table
+    /// that could not be read.
+    fn table(&self, host: &str) -> Option<Vec<sharing::Seen>> {
+        if host != self.run.host {
+            return None;
+        }
+        let rows = self.host.jobs().ok()?;
+        Some(
+            rows.into_iter()
+                .map(|r| sharing::Seen {
+                    row: r.key.row.0,
+                    attempt: r.key.attempt,
+                    job: r.key.job,
+                    started: r.started.0,
+                    running: r.state == wsp_wire::host::JobState::Running,
+                })
+                .collect(),
+        )
+    }
+
+    /// Run `argv` as one job in `dir`, its env prefix `env`, and answer its
+    /// end and the whole of what it wrote. `seen` is handed each `job.output`
+    /// as it arrives, which is what the two pump threads did for a child.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        what: &str,
+        class: wsp_wire::host::JobClass,
+        dir: &Path,
+        env: &[(String, String)],
+        argv: Vec<String>,
+        timeout: Duration,
+        seen: &mut dyn FnMut(&str),
+    ) -> Result<(wsp_wire::host::JobEnded, String), String> {
+        // The place comes from `place_of`, never from a path joined here.
+        let at = place_of(Whose::Row(&self.run.row), TreeKind::Verify, dir)?.at;
+        // `env -u K -- K=V … cmd`: the values wsp mints cross on the argv
+        // (host-api `JobRun`), and the caller's private index does not.
+        let mut full: Vec<String> = vec!["env".into(), "-u".into(), "GIT_INDEX_FILE".into(), "--".into()];
+        full.extend(self.path.iter().map(|p| format!("PATH={p}")));
+        full.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
+        full.extend(argv);
+        let run = wsp_wire::host::JobRun {
+            key: self.key(what),
+            class,
+            argv: full,
+            at,
+            timeout_secs: timeout.as_secs().max(1),
+            hung_after_secs: None,
+            detach: false,
+        };
+        let mut text = String::new();
+        let mut sink = |o: &wsp_wire::host::JobOutput| {
+            text.push_str(&o.text);
+            seen(&o.text);
+        };
+        let ended = self.host.run_job(&run, &mut sink).map_err(|e| format!("{e:?}"))?;
+        // The log is the whole of it; `job.output` is a view a slow reader can
+        // have gaps in. It is on this host, so it is read when it is there.
+        let log = std::fs::read_to_string(&ended.log.path).ok().filter(|l| l.len() >= text.len());
+        Ok((ended, log.unwrap_or(text)))
+    }
+}
+
+// Where a verify job runs: `place_of(row, verify)`, the one function a check,
+// a verifier and a barrier take a job's place from (wsp-053). It answers a
+// `HostDir` on the row's host relative to that host's tree root, never a
+// path on wsp's machine.
+use crate::job_place::{host_of, place_of, TreeKind, Whose};
+
+/// `to` as seen from `from`, both on the jobs' host: how a job names its
+/// target directory and a test binary without a path on wsp's machine.
+fn relative(from: &Path, to: &Path) -> PathBuf {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (from, to) = (canon(from), canon(to));
+    let a: Vec<_> = from.components().collect();
+    let b: Vec<_> = to.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut out = PathBuf::new();
+    for _ in common..a.len() {
+        out.push("..");
+    }
+    for c in &b[common..] {
+        out.push(c.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// The run this verify is, under `manager`: its row is the checkout's when it
+/// stands in one, else [`agent_key`]'s workspace, standing in for a row as a
+/// barrier's list and group do (the governor's answer, 2026-11-20); the mark
+/// is the start in milliseconds and this pid, so each run's keys are its own
+/// (wsp-051).
+///
+/// Its host is the row's, as `place_of` names it ([`host_of`]), so a warm
+/// lock is read from the job table of the host its jobs run on.
+fn this_run(checkout: Option<&Path>, key: &str) -> sharing::Run {
+    let row = checkout
+        .and_then(|c| c.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| key.to_string());
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let host = host_of(Whose::Row(&row));
+    sharing::Run { host, row, attempt: 0, mark: format!("{ms}-{}", std::process::id()) }
+}
+
+/// The host `run`'s jobs go to: the manager's under `WSP_JOBS=manager` when
+/// the run's host is the host this machine's manager is (6.2: while the Mac's
+/// manager is the only one, a row on a host with no manager runs in this
+/// process), else `wsp-host`'s runner in this process. An error is the choice
+/// or the manager failing, said once, and nothing is run in this process in
+/// its place.
+fn jobs_host(state: &Path, run: &sharing::Run) -> Result<&'static dyn wsp_wire::host::Host, String> {
+    use wsp_wire::host::{choose_jobs, JobsChoice};
+    let version = env!("CARGO_PKG_VERSION");
+    match JobsChoice::from_env().map_err(|e| e.to_string())? {
+        JobsChoice::Inproc => choose_jobs(JobsChoice::Inproc, state, version).map_err(|e| e.to_string()),
+        JobsChoice::Manager => {
+            let ours = wsp_wire::manager::read_record(state).map(|(local, _)| local.host);
+            if ours.as_deref() != Some(run.host.as_str()) {
+                return choose_jobs(JobsChoice::Inproc, state, version).map_err(|e| e.to_string());
+            }
+            wsp_wire::host::jobs_chosen(state, version).map_err(|e| e.to_string())
+        }
+    }
+}
+
+impl Jobs<'_> {
+    /// How a warm lock's holder is asked whether it is still there: by the
+    /// job table of the host the run's jobs go to.
+    fn live<'s>(&'s self, table: &'s dyn Fn(&str) -> Option<Vec<sharing::Seen>>) -> sharing::Live<'s> {
+        sharing::Live { me: &self.run, table }
+    }
 }
 use crate::store::Store;
 use crate::util;
@@ -538,9 +712,9 @@ pub fn last_build(store: &Store, repo: &Path, key: &str) -> Scratch {
 /// registration goes with the directory. A directory removed without it makes
 /// the next `worktree add` refuse, with a message that reads like a bug in this
 /// command rather than a stale registration.
-fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: bool) -> usize {
+fn clear_warm(store: &Store, live: sharing::Live, repo: &Path, named_for: &Path, dir: &Path, all: bool) -> usize {
     let mut gone = 0;
-    for w in free_warm(store, named_for, dir, all) {
+    for w in free_warm(store, live, named_for, dir, all) {
         let _ = git(repo, &["worktree", "remove", "--force", &w.tree().display().to_string()]);
         if std::fs::remove_dir_all(&w.dir).is_ok() {
             gone += 1;
@@ -572,9 +746,9 @@ fn clear_warm(store: &Store, repo: &Path, named_for: &Path, dir: &Path, all: boo
 /// on a slot nothing has built in yet succeeds and hands back a directory that
 /// is not there ([`crate::sharing::claim_at`] makes the lock, not the tree), so
 /// a preview without it would name three trees on a machine that has one.
-fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crate::sharing::Warm> {
+fn free_warm(store: &Store, live: sharing::Live, named_for: &Path, dir: &Path, all: bool) -> Vec<crate::sharing::Warm> {
     let claimed = if all {
-        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES, &alive)
+        crate::sharing::warm_each(&store.state, named_for, crate::sharing::WARM_TREES, live)
     } else {
         // Which one it was is not a guess: the build wrote it down.
         std::fs::read_to_string(dir.join(BUILT_AT))
@@ -582,7 +756,7 @@ fn free_warm(store: &Store, named_for: &Path, dir: &Path, all: bool) -> Vec<crat
             .map(|s| PathBuf::from(s.trim()))
             .and_then(|target| target.parent().map(Path::to_path_buf))
             .filter(|d| d.starts_with(store.state.join("warm")))
-            .and_then(|d| crate::sharing::warm_named(&d, &alive))
+            .and_then(|d| crate::sharing::warm_named(&d, live))
             .into_iter()
             .collect()
     };
@@ -752,70 +926,37 @@ fn ensure_tree(repo: &Path, tree: &Path, head: &str) -> Result<bool, String> {
 /// usually green. Nothing here decides that a run is interesting; by the time
 /// anything could, the output would be gone.
 ///
-/// Two threads rather than one [`Command::output`] call, which would be
-/// simpler and would print nothing until cargo exited — for a 25s test run
-/// that is the difference between watching a build and watching a cursor.
-fn cargo(tree: &Path, target: &Path, argv: &[&str], echo: bool, share: &Share) -> (bool, String) {
-    let mut cmd = Command::new("cargo");
-    cmd.args(argv)
-        .current_dir(tree)
-        .env("CARGO_TARGET_DIR", target)
-        .env_remove("GIT_INDEX_FILE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // The one thing this build does not decide for itself: how much of the
-    // machine it may have, and where the compiler cache is. See
-    // [`crate::sharing`] — the target directory above is still its own, and the
-    // cache is keyed on inputs rather than on paths, so neither can make this
-    // build tell the truth about somebody else's tree.
-    share.apply(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+/// One `job.run` of class `build` in the tree's place. `CARGO_TARGET_DIR`
+/// (relative to the tree, so no path on wsp's machine crosses) and the share's `CARGO_BUILD_JOBS` cross as the env
+/// prefix, and the output is echoed from `job.output` as it arrives.
+fn cargo_job(jobs: &Jobs, tree: &Path, target: &Path, argv: &[&str], echo: bool, share: &Share) -> (bool, String) {
+    let (k, v) = share.env();
+    let env = vec![
+        ("CARGO_TARGET_DIR".to_string(), relative(tree, target).display().to_string()),
+        (k.to_string(), v),
+    ];
+    let mut full = vec!["cargo".to_string()];
+    full.extend(argv.iter().map(|a| a.to_string()));
+    let what = argv.first().copied().unwrap_or("cargo");
+    let mut seen = |text: &str| {
+        use std::io::Write;
+        if echo {
+            // Flushed per chunk, as the pumps did: progress is only progress
+            // if it arrives while the build is still running.
+            let mut h = std::io::stdout();
+            let _ = h.write_all(text.as_bytes());
+            let _ = h.flush();
+        }
+    };
+    match jobs.run(&format!("cargo-{what}"), wsp_wire::host::JobClass::Build, tree, &env, full, BUILD_TIMEOUT, &mut seen) {
+        Ok((ended, text)) => (ended.exit == Some(0), text),
         Err(e) => {
             if echo {
                 eprintln!("wsp: cargo: {e}");
             }
-            return (false, format!("cargo: {e}"));
-        }
-    };
-    // Both streams are drained concurrently because a pipe nobody reads fills
-    // and stops the writer: reading stdout to the end first would deadlock the
-    // moment cargo wrote more warnings than a pipe buffer holds.
-    let out = child.stdout.take().map(|s| std::thread::spawn(move || pump(s, echo, false)));
-    let err = child.stderr.take().map(|s| std::thread::spawn(move || pump(s, echo, true)));
-    let ok = child.wait().map(|st| st.success()).unwrap_or(false);
-    let mut text = out.and_then(|t| t.join().ok()).unwrap_or_default();
-    text.push_str(&err.and_then(|t| t.join().ok()).unwrap_or_default());
-    (ok, text)
-}
-
-/// Read one of cargo's streams to the end, passing it on as it arrives.
-fn pump(mut r: impl std::io::Read, echo: bool, is_err: bool) -> String {
-    use std::io::Write;
-    let mut kept: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                kept.extend_from_slice(&buf[..n]);
-                if echo {
-                    // Flushed per chunk: cargo's progress is only progress if
-                    // it arrives while the build is still running.
-                    if is_err {
-                        let mut h = std::io::stderr();
-                        let _ = h.write_all(&buf[..n]);
-                        let _ = h.flush();
-                    } else {
-                        let mut h = std::io::stdout();
-                        let _ = h.write_all(&buf[..n]);
-                        let _ = h.flush();
-                    }
-                }
-            }
+            (false, format!("cargo: {e}"))
         }
     }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// One test the run reported as failed: where it panicked, and what it said.
@@ -929,14 +1070,14 @@ fn assertion(block: &[&str]) -> Option<String> {
 ///
 /// `None` is "not measured", which is not the same as passing and is printed as
 /// nothing at all rather than as a green word.
-fn rerun_alone(tree: &Path, target: &Path, name: &str, share: &Share) -> Option<bool> {
+fn rerun_alone(runs: &Jobs, tree: &Path, target: &Path, name: &str, share: &Share) -> Option<bool> {
     // A doc test is named `src/store.rs - Store::at (line 12)`, which is not
     // something libtest can be handed as an exact filter. Anything with a space
     // in it is left alone rather than guessed at.
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return None;
     }
-    let (ok, text) = cargo(tree, target, &["test", "--workspace", "--quiet", "--", "--exact", name], false, share);
+    let (ok, text) = cargo_job(runs, tree, target, &["test", "--workspace", "--quiet", "--", "--exact", name], false, share);
     if !ok {
         return Some(false);
     }
@@ -986,9 +1127,9 @@ const ALONE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The JSON is on stdout and everything a human reads is on stderr, so the two
 /// halves separate on the leading brace — which is also how a compile failure
 /// gets reported here without printing a build log made of objects.
-fn test_binaries(tree: &Path, target: &Path, share: &Share) -> Result<Vec<PathBuf>, String> {
+fn test_binaries(runs: &Jobs, tree: &Path, target: &Path, share: &Share) -> Result<Vec<PathBuf>, String> {
     let argv = &["test", "--workspace", "--no-run", "--message-format=json"];
-    let (ok, text) = cargo(tree, target, argv, false, share);
+    let (ok, text) = cargo_job(runs, tree, target, argv, false, share);
     if !ok {
         let msg: Vec<&str> = text.lines().filter(|l| !l.starts_with('{')).collect();
         return Err(msg.join("\n"));
@@ -1024,11 +1165,16 @@ fn executables(text: &str) -> Vec<PathBuf> {
 /// Doc tests are not here and are not missing: rustdoc compiles and runs each
 /// one as its own process already, so they are the one part of `cargo test`
 /// that this pass would have nothing to add to.
-fn test_names(exe: &Path) -> Vec<String> {
-    let Ok(out) = Command::new(exe).args(["--list", "--format", "terse"]).output() else {
-        return Vec::new();
-    };
-    listed(&String::from_utf8_lossy(&out.stdout))
+///
+/// Under `WSP_JOBS=manager` the listing is a job in the tree's place, bounded
+/// by [`ALONE_TIMEOUT`] as a per-test run is: a binary that never answers its
+/// `--list` is ended by the manager and lists nothing.
+fn test_names(runs: &Jobs, tree: &Path, exe: &Path) -> Vec<String> {
+    let argv = vec![relative(tree, exe).display().to_string(), "--list".into(), "--format".into(), "terse".into()];
+    match runs.run("list", wsp_wire::host::JobClass::Check, tree, &[], argv, ALONE_TIMEOUT, &mut |_| {}) {
+        Ok((ended, text)) if ended.exit == Some(0) => listed(&text),
+        _ => Vec::new(),
+    }
 }
 
 /// `name: test` per line, and a trailing count line that is not one.
@@ -1057,69 +1203,23 @@ fn listed(out: &str) -> Vec<String> {
 /// done, however long the machine takes to get round to it. A budget is for
 /// the one caller that cannot afford a hang, and it is a backstop rather than
 /// an expectation: see `ALONE_TIMEOUT`.
-fn run_alone(exe: &Path, name: &str, log: &Path, timeout: Option<Duration>) -> Option<Failure> {
-    let Ok(file) = std::fs::File::create(log) else {
-        return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
+/// Run one test in a process of its own and say what happened to it: one job of class
+/// `check` in the tree's place, its budget the job's timeout. The manager ends
+/// a job past it and says `timed_out`, which reads as the direct path's "no
+/// answer … — killed"; the failure is parsed out of the job's log.
+fn run_alone(jobs: &Jobs, tree: &Path, exe: &Path, name: &str, timeout: Option<Duration>) -> Option<Failure> {
+    let argv = vec![relative(tree, exe).display().to_string(), "--exact".into(), name.to_string()];
+    let limit = timeout.unwrap_or(BUILD_TIMEOUT);
+    let (ended, text) = match jobs.run("alone", wsp_wire::host::JobClass::Check, tree, &[], argv, limit, &mut |_| {}) {
+        Ok(r) => r,
+        Err(e) => return Some(Failure { name: name.into(), at: None, message: Some(e) }),
     };
-    let Ok(err) = file.try_clone() else {
-        return Some(Failure { name: name.into(), at: None, message: Some("no log file".into()) });
-    };
-    let child = Command::new(exe)
-        .args(["--exact", name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
-        .stderr(Stdio::from(err))
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return Some(Failure { name: name.into(), at: None, message: Some(format!("{e}")) })
-        }
-    };
-    // Both arms wait on the child's own state and nothing standing in for it.
-    // With no budget that is one blocking wait, which is the only wait that
-    // cannot be wrong about a slow machine. With one it is `try_wait` in a
-    // loop; the median test alone is 10ms, so a 5ms poll overshoots by 2.5ms
-    // on average and costs about two seconds across the whole 776. The one
-    // caller that polls is spending that to bound a hang. The child is asked
-    // about before the clock is, so a parent descheduled past its own deadline
-    // still reports the child that finished while it was away — the deadline
-    // can only be reached by a child that is genuinely still running.
-    let waited: Result<bool, String> = match timeout {
-        None => child.wait().map(|st| st.success()).map_err(|e| format!("the wait failed: {e}")),
-        Some(limit) => {
-            let started = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(st)) => break Ok(st.success()),
-                    // Not a timeout, and it must not be reported as one: this
-                    // is the wait itself failing, and "no answer" would send
-                    // the next reader after a hang that never happened.
-                    Err(e) => break Err(format!("the wait failed: {e}")),
-                    Ok(None) => {}
-                }
-                if started.elapsed() > limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(format!("no answer in {limit:?} — killed"));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-    };
-    let ok = match waited {
-        Ok(ok) => ok,
-        Err(message) => {
-            return Some(Failure { name: name.into(), at: None, message: Some(message) })
-        }
-    };
-    if ok {
+    if ended.timed_out || ended.hung {
+        return Some(Failure { name: name.into(), at: None, message: Some(format!("no answer in {limit:?} — killed")) });
+    }
+    if ended.exit == Some(0) {
         return None;
     }
-    let text = std::fs::read_to_string(log).unwrap_or_default();
-    // The same parser the suite's own red runs use, so a failure reads the same
-    // whichever run found it. A name it cannot find a block for is still the
-    // failure — the exit status already said so.
     Some(
         failures(&text)
             .into_iter()
@@ -1139,11 +1239,10 @@ fn run_alone(exe: &Path, name: &str, log: &Path, timeout: Option<Duration>) -> O
 /// the panic site and the assertion are what the suite's own red runs give and
 /// what both investigations here worked from, and a named test is one command
 /// to run again.
-fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> (usize, Vec<Failure>) {
-    let log = dir.join("alone.out");
+fn alone_pass(runs: &Jobs, p: &util::Paint, tree: &Path, exes: &[PathBuf], json_out: bool) -> (usize, Vec<Failure>) {
     let names: Vec<(PathBuf, String)> = exes
         .iter()
-        .flat_map(|e| test_names(e).into_iter().map(move |n| (e.clone(), n)))
+        .flat_map(|e| test_names(runs, tree, e).into_iter().map(move |n| (e.clone(), n)))
         .collect();
     if !json_out {
         println!(
@@ -1163,7 +1262,7 @@ fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> 
             print!("\r{} {}/{}  ", p.dim("alone"), i + 1, names.len());
             let _ = std::io::stdout().flush();
         }
-        if let Some(f) = run_alone(exe, name, &log, Some(ALONE_TIMEOUT)) {
+        if let Some(f) = run_alone(runs, tree, exe, name, Some(ALONE_TIMEOUT)) {
             if tick {
                 print!("\r\x1b[K");
             }
@@ -1187,7 +1286,6 @@ fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> 
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
-    let _ = std::fs::remove_file(&log);
     (names.len(), bad)
 }
 
@@ -1197,10 +1295,11 @@ fn alone_pass(p: &util::Paint, dir: &Path, exes: &[PathBuf], json_out: bool) -> 
 /// Everything before this point is ordinary `verify` — the private index, the
 /// patch, a tree reset to HEAD with the patch on it — so what is measured is
 /// this agent's change and not whatever is in the checkout.
+#[allow(clippy::too_many_arguments)]
 fn alone(
+    runs: &Jobs,
     p: &util::Paint,
     state: &Path,
-    dir: &Path,
     tree: &Path,
     target: &Path,
     json_out: bool,
@@ -1211,14 +1310,15 @@ fn alone(
     // as one would hand every other agent a smaller slice of the cores for the
     // whole of it, and this pass wants one core and the machine quiet.
     let exes = {
-        let share = sharing::take(state, &alive);
+        let table = |h: &str| runs.table(h);
+        let share = sharing::take(state, runs.live(&table));
         if !json_out {
             if let Some(note) = share.note() {
                 println!("{} {}", p.dim("machine"), p.dim(&note));
             }
             println!("{} cargo test --workspace --no-run", p.dim("→"));
         }
-        match test_binaries(tree, target, &share) {
+        match test_binaries(runs, tree, target, &share) {
             Ok(e) => e,
             Err(msg) => {
                 eprintln!("{msg}");
@@ -1228,7 +1328,7 @@ fn alone(
         }
     };
 
-    let (n, bad) = alone_pass(p, dir, &exes, json_out);
+    let (n, bad) = alone_pass(runs, p, tree, &exes, json_out);
     let secs = started.elapsed().as_secs_f64();
 
     if json_out {
@@ -1284,6 +1384,18 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // comes from and where the worktree is added; `scratch` decides where the
     // build goes from what kind of tree that is.
     let Scratch { dir, tree, target, checkout } = scratch(store, &repo, &key);
+    // `WSP_JOBS` decides how the runs below are run (the run's [`Jobs`]), once, before
+    // anything is claimed: a warm lock says which kind of holder it is.
+    let run = this_run(checkout.as_deref(), &key);
+    let runs = match jobs_host(&store.state, &run) {
+        Ok(host) => Jobs::new(host, run),
+        Err(e) => {
+            eprintln!("wsp: verify's jobs: {e}");
+            return 2;
+        }
+    };
+    let table = |h: &str| runs.table(h);
+    let live = runs.live(&table);
     // The warm pool is keyed on the repository, and inside a checkout `repo` is
     // named for the task rather than the repository — `.worktrees/robustness-070`
     // — so the trunk is what names it. Otherwise every task would have a pool of
@@ -1304,12 +1416,12 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         // the directory the next line removes — and, in the preview, because
         // holding the claim is what makes the answer true while it is printed.
         let warm_paths: Vec<String> = match dry {
-            true => free_warm(store, &named_for, &dir, all).iter().map(|w| util::contract(&w.dir)).collect(),
+            true => free_warm(store, live, &named_for, &dir, all).iter().map(|w| util::contract(&w.dir)).collect(),
             false => Vec::new(),
         };
         let warm = match dry {
             true => warm_paths.len(),
-            false => clear_warm(store, &repo, &named_for, &dir, all),
+            false => clear_warm(store, live, &repo, &named_for, &dir, all),
         };
         if !dry {
             let _ = git(&repo, &["worktree", "remove", "--force", &tree.display().to_string()]);
@@ -1474,7 +1586,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // agent's own tree instead and pays 21s for it.
     let alone_pass_asked = args.has("alone");
     let warm = (!alone_pass_asked)
-        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES, &alive))
+        .then(|| sharing::warm(&store.state, &named_for, sharing::WARM_TREES, live))
         .flatten();
     let (tree, target) = match &warm {
         Some(w) => (w.tree(), w.target()),
@@ -1510,7 +1622,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     }
 
     if alone_pass_asked {
-        return alone(&p, &store.state, &dir, &tree, &target, json_out, started);
+        return alone(&runs, &p, &store.state, &tree, &target, json_out, started);
     }
 
     let mut steps: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -1526,7 +1638,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // Registered here rather than at the top of the command: the share is
     // held for as long as it is being used, so a verify that spends a minute
     // resolving a patch is not counted against the builds running while it does.
-    let share = sharing::take(&store.state, &alive);
+    let share = sharing::take(&store.state, live);
     if !json_out {
         if let Some(note) = share.note() {
             println!("{} {}", p.dim("machine"), p.dim(&note));
@@ -1539,7 +1651,17 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         if !json_out {
             println!("{} cargo {}", p.dim("→"), argv.join(" "));
         }
-        let (ok, text) = cargo(&tree, &target, argv, !json_out, &share);
+        // Under `manager` the warm tree's lock is touched before each job, so
+        // its holder reads as there from the table; a lock that is no longer
+        // this run's means the tree was taken, and nothing runs in it.
+        if let Some(w) = &warm {
+            if !w.touch() {
+                output.push_str("wsp: the warm tree was taken by another build before this one ran in it\n");
+                failed = Some(name);
+                break;
+            }
+        }
+        let (ok, text) = cargo_job(&runs, &tree, &target, argv, !json_out, &share);
         output.push_str(&text);
         if !ok {
             failed = Some(name);
@@ -1563,7 +1685,10 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         }
         failed_tests = failures(&output);
         if let Some(first) = failed_tests.first() {
-            alone = rerun_alone(&tree, &target, &first.name, &share);
+            let held = warm.as_ref().is_none_or(|w| w.touch());
+            if held {
+                alone = rerun_alone(&runs, &tree, &target, &first.name, &share);
+            }
         }
     }
 
@@ -1735,12 +1860,7 @@ mod tests {
         let exe = dir.join("hangs");
         wsp_testkit::script(&exe, "#!/bin/sh\nexec sleep 300\n");
 
-        let out = run_alone(
-            &exe,
-            "whatever::hangs",
-            &dir.join("log"),
-            Some(Duration::from_millis(150)),
-        );
+        let out = run_alone(&inproc_runs(&dir), &dir.join("tree"), &exe, "whatever::hangs", Some(Duration::from_millis(150)));
 
         let f = out.expect("a test that never returned was reported as passing");
         assert_eq!(f.name, "whatever::hangs");
@@ -1761,17 +1881,18 @@ mod tests {
     /// test that was going to answer, it prints the accusation this instrument
     /// exists to make — *this test does not survive alone* — about a test that
     /// does. The child below is the same shape as the `exit 0` script that was
-    /// reported as never answering, only slowed to a fifth of a second so it
+    /// reported as never answering, only slowed to three seconds (a job's bound is whole seconds) so it
     /// can say so without a loaded machine.
     #[test]
     fn a_slow_test_is_not_a_hung_one_unless_a_budget_was_asked_for() {
         let dir = scratch_dir("alone-slow");
         let exe = dir.join("slow");
-        wsp_testkit::script(&exe, "#!/bin/sh\nsleep 0.2\nexit 0\n");
-        let log = dir.join("log");
+        wsp_testkit::script(&exe, "#!/bin/sh\nsleep 3\nexit 0\n");
+        let runs = inproc_runs(&dir);
+        let tree = dir.join("tree");
 
         // A budget it cannot meet accuses a test that passes.
-        let accused = run_alone(&exe, "a::b", &log, Some(Duration::from_millis(20)))
+        let accused = run_alone(&runs, &tree, &exe, "a::b", Some(Duration::from_secs(1)))
             .expect("the budget did not fire on a child that outlives it");
         assert!(
             accused.message.as_deref().unwrap_or_default().contains("no answer"),
@@ -1781,7 +1902,7 @@ mod tests {
 
         // The same child, no budget, and there is no clock left to be wrong.
         assert!(
-            run_alone(&exe, "a::b", &log, None).is_none(),
+            run_alone(&runs, &tree, &exe, "a::b", None).is_none(),
             "a test that passed was reported as a failure"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1805,7 +1926,8 @@ mod tests {
         // five seconds it did — 11 of 150 runs on a loaded machine reported a
         // script that is `exit 0` as a test that never answered, which is the
         // instrument accusing the suite of the fault it was built to find.
-        let f = run_alone(&exe, "a::b", &dir.join("log"), None)
+        let runs = inproc_runs(&dir);
+        let f = run_alone(&runs, &dir.join("tree"), &exe, "a::b", None)
             .expect("a failing test was reported as passing");
         assert_eq!(f.at.as_deref(), Some("src/a.rs:12:9"), "the panic site was lost");
         assert_eq!(f.message.as_deref(), Some("the seat was empty"), "the assertion was lost");
@@ -1813,7 +1935,7 @@ mod tests {
         let ok = dir.join("passes");
         wsp_testkit::script(&ok, "#!/bin/sh\nexit 0\n");
         assert!(
-            run_alone(&ok, "a::b", &dir.join("log"), None).is_none(),
+            run_alone(&runs, &dir.join("tree"), &ok, "a::b", None).is_none(),
             "a passing test was reported as a failure"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1851,6 +1973,29 @@ bench::b: benchmark
             vec!["store::tests::a".to_string()],
             "the count line or the benchmark was taken for a test"
         );
+    }
+
+    /// A verify's jobs on `wsp-host`'s runner in this process, the tree root
+    /// the parent of `dir`: a tree is `dir/tree` and a script beside it is
+    /// `../script`.
+    fn inproc_runs(dir: &Path) -> Jobs<'static> {
+        let root = dir.parent().unwrap().to_path_buf();
+        crate::job_place::set_tree_root(Some(root.clone()));
+        let host: &'static crate::host::InProcess =
+            Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&dir.join("jobs-exec"), &root)));
+        let run = sharing::Run { host: util::hostname(), row: "t".into(), attempt: 0, mark: "m".into() };
+        Jobs::new(host, run)
+    }
+
+    /// The warm-tree tests' run, on host `h` with no job yet: a lock it takes
+    /// is held through the setup grace and freed when it lets go.
+    fn live() -> sharing::Live<'static> {
+        fn no_jobs(_: &str) -> Option<Vec<sharing::Seen>> {
+            Some(Vec::new())
+        }
+        static ME: std::sync::OnceLock<sharing::Run> = std::sync::OnceLock::new();
+        let me = ME.get_or_init(|| sharing::Run { host: "h".into(), row: "t".into(), attempt: 0, mark: "m".into() });
+        sharing::Live { me, table: &no_jobs }
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
@@ -2342,7 +2487,7 @@ bench::b: benchmark
         let dir = scratch_dir("foresee-warm");
         repo(&dir);
         let store = Store::at(dir.join("store"), dir.join("state"));
-        let warm = store.state.join("warm");
+        let warm = store.state.join("warm").join("h");
         let named = util::slugify(dir.file_name().unwrap().to_str().unwrap());
         std::fs::create_dir_all(&warm).unwrap();
         for slot in [0, 1] {
@@ -2353,7 +2498,7 @@ bench::b: benchmark
         assert!(!warm.join(format!("{named}-2")).exists());
 
         let said: Vec<String> =
-            free_warm(&store, &dir, Path::new("/nowhere"), true).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, Path::new("/nowhere"), true).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(said.len(), 2, "a slot nothing has built in was named as a tree: {said:?}");
         assert!(warm.join(format!("{named}-0")).exists(), "a dry run removed a warm tree");
         assert!(warm.join(format!("{named}-1")).exists(), "a dry run removed a warm tree");
@@ -2361,7 +2506,7 @@ bench::b: benchmark
         // The claims are dropped with the `Warm`s above, so the removal can
         // take them: a preview that held its locks past the line it printed
         // would make the next real `--rm` a no-op.
-        let did = clear_warm(&store, &dir, &dir, Path::new("/nowhere"), true);
+        let did = clear_warm(&store, live(), &dir, &dir, Path::new("/nowhere"), true);
         assert_eq!(did, said.len(), "the removal disagreed with the preview");
         assert!(!warm.join(format!("{named}-0")).exists(), "the tree the preview named was left standing");
         assert!(!warm.join(format!("{named}-1")).exists(), "the tree the preview named was left standing");
@@ -2375,8 +2520,8 @@ bench::b: benchmark
     /// The old shape computed the narrow answer first, unconditionally: it
     /// claimed the tree the last build wrote down, *held that claim*, and then
     /// under `--all` asked [`crate::sharing::warm_each`] for every free tree.
-    /// The lock it was still holding is a lock, and the pid inside it is this
-    /// process, which `ps` reports as alive — so the claim it had just taken
+    /// The lock it was still holding is a lock, and the run inside it is this
+    /// one, which reads as alive — so the claim it had just taken
     /// made its own tree read as busy, and the widest removal in wsp left
     /// standing the one tree the caller most certainly meant.
     ///
@@ -2387,7 +2532,7 @@ bench::b: benchmark
     fn rm_all_takes_the_tree_the_caller_last_built_in_and_not_only_the_others() {
         let dir = scratch_dir("foresee-mine");
         let store = Store::at(dir.join("store"), dir.join("state"));
-        let warm = store.state.join("warm");
+        let warm = store.state.join("warm").join("h");
         let named = util::slugify(dir.file_name().unwrap().to_str().unwrap());
         for slot in [0, 1, 2] {
             std::fs::create_dir_all(warm.join(format!("{named}-{slot}")).join("tree")).unwrap();
@@ -2403,21 +2548,21 @@ bench::b: benchmark
         .unwrap();
 
         let narrow: Vec<String> =
-            free_warm(&store, &dir, &scratch, false).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, &scratch, false).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(narrow.len(), 1, "the pointer did not name one tree: {narrow:?}");
 
         // The mechanism, reproduced rather than argued: hold the narrow claim
         // across the wide question, which is exactly what the old shape did to
         // itself, and the wide answer comes back short of the tree being held.
-        let held = free_warm(&store, &dir, &scratch, false);
+        let held = free_warm(&store, live(), &dir, &scratch, false);
         let while_held: Vec<String> =
-            free_warm(&store, &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(while_held.len(), 2, "a held claim did not take its slot out of the wide answer");
         assert!(!while_held.contains(&narrow[0]), "the held tree was claimed twice at once");
         drop(held);
 
         let wide: Vec<String> =
-            free_warm(&store, &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
+            free_warm(&store, live(), &dir, &scratch, true).iter().map(|w| util::contract(&w.dir)).collect();
         assert_eq!(wide.len(), 3, "--all did not reach every free tree: {wide:?}");
         assert!(
             wide.contains(&narrow[0]),
@@ -2481,10 +2626,408 @@ bench::b: benchmark
     fn a_name_libtest_cannot_filter_on_is_not_rerun_at_all() {
         let nowhere = Path::new("/nowhere");
         let share = sharing::unregistered();
+        let runs = inproc_runs(&scratch_dir("rerun-name"));
         assert_eq!(
-            rerun_alone(nowhere, nowhere, "src/store.rs - Store::at (line 12)", &share),
+            rerun_alone(&runs, nowhere, nowhere, "src/store.rs - Store::at (line 12)", &share),
             None
         );
-        assert_eq!(rerun_alone(nowhere, nowhere, "", &share), None);
+        assert_eq!(rerun_alone(&runs, nowhere, nowhere, "", &share), None);
+    }
+}
+
+/// verify under `WSP_JOBS=manager` (wsp-054): its cargo runs, test listing and
+/// `--alone` runs are jobs on a manager on loopback, and a warm tree's lock is
+/// read from that manager's job table. Every job is a `sh` script or `cargo
+/// --version`-sized, under the test's own tree root.
+#[cfg(test)]
+mod jobs_tests {
+    use super::*;
+    use std::net::{SocketAddr, TcpListener};
+    use wsp_host_api::{Role, Token};
+    use wsp_manager::{Config, Manager, TOKEN_FILE};
+    use wsp_wire::host::{Host, JobClass, JobState, Tcp};
+
+    /// The host `place_of` names a row's tree on: this machine, until rows
+    /// record their seat's host. The manager must be it, or it refuses the
+    /// place as another host's.
+    fn host() -> String {
+        host_of(Whose::Row("any"))
+    }
+
+    /// A verify's jobs on `host`, as [`Jobs::new`] makes them, but whose
+    /// children run the real tools: the manager here is this test's, its jobs
+    /// inherit the seat's `PATH` with wsp's shim first, and a `cargo` through
+    /// the shim is sent to the seat's manager, which refuses this test's tree
+    /// as outside its root (wsp-395).
+    fn jobs_for(host: &dyn Host, run: sharing::Run) -> Jobs<'_> {
+        let mut jobs = Jobs::new(host, run);
+        jobs.path = Some(crate::throttle::without_shims("cargo", &std::env::var("PATH").unwrap_or_default()));
+        jobs
+    }
+
+    /// Jobs placed under this test's tree root, on this thread.
+    fn rooted(place: &Place) {
+        crate::job_place::set_tree_root(Some(place.root.clone()));
+    }
+
+    /// A tree root with a `tree` and a `target` in it, an exec dir and a
+    /// state dir beside it.
+    struct Place {
+        top: PathBuf,
+        root: PathBuf,
+        /// A place another process made, left for it to remove.
+        borrowed: bool,
+    }
+
+    impl Place {
+        fn new(tag: &str) -> Place {
+            let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            let top = base.join(format!("wvj-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&top);
+            let root = top.join("trees");
+            std::fs::create_dir_all(root.join("w").join("tree")).unwrap();
+            std::fs::create_dir_all(root.join("w").join("target")).unwrap();
+            std::fs::create_dir_all(top.join("state")).unwrap();
+            Place { top, root, borrowed: false }
+        }
+        fn tree(&self) -> PathBuf {
+            self.root.join("w").join("tree")
+        }
+        fn state(&self) -> PathBuf {
+            self.top.join("state")
+        }
+    }
+
+    impl Drop for Place {
+        fn drop(&mut self) {
+            if !self.borrowed {
+                let _ = std::fs::remove_dir_all(&self.top);
+            }
+        }
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A manager on loopback whose tree root is the place's, and a client
+    /// for it as wsp dials one.
+    fn manager(place: &Place) -> (Manager, Tcp) {
+        let (m, port, token) = manager_at(place);
+        (m, client(port, &token))
+    }
+
+    fn client(port: u16, token: &str) -> Tcp {
+        Tcp::new(SocketAddr::from(([127, 0, 0, 1], port)), Token(token.into()), Role::Cli, "test")
+    }
+
+    /// The manager alone, and the port and token a client dials it with.
+    fn manager_at(place: &Place) -> (Manager, u16, String) {
+        let exec = place.top.join("exec");
+        let mut cfg = Config::new(&exec, &host());
+        cfg.port = free_port();
+        cfg.tree_root = place.root.clone();
+        cfg.job_grace = Duration::from_millis(500);
+        let since = Instant::now();
+        let m = loop {
+            match Manager::start(cfg.clone()) {
+                Ok(m) => break m,
+                Err(wsp_manager::StartError::Locked { .. }) if since.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("the manager starts on loopback: {e}"),
+            }
+        };
+        let token = std::fs::read_to_string(exec.join(TOKEN_FILE)).unwrap().trim().to_string();
+        (m, cfg.port, token)
+    }
+
+    fn run(row: &str, mark: &str) -> sharing::Run {
+        sharing::Run { host: host(), row: row.into(), attempt: 0, mark: mark.into() }
+    }
+
+    fn within(wait: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + wait;
+        while Instant::now() < until {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        f()
+    }
+
+    /// The job rows of this run, as `(job, class, state)`.
+    fn rows_of(host: &dyn Host, run: &sharing::Run) -> Vec<(String, JobClass, JobState)> {
+        let mut rows: Vec<_> = host
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|r| run.owns(&r.key.row.0, r.key.attempt, &r.key.job))
+            .map(|r| (r.key.job, r.class, r.state))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// A verify job takes its place from `place_of(row, verify)`: a
+    /// `HostDir` naming the row's host and a path relative to that host's
+    /// tree root, never a path on wsp's machine; and the job runs there. A
+    /// tree outside the root is no place.
+    #[test]
+    fn a_verify_job_takes_its_place_from_place_of_and_names_the_rows_host() {
+        let place = Place::new("place");
+        rooted(&place);
+        let (m, tcp) = manager(&place);
+        let p = place_of(Whose::Row("wsp-054"), TreeKind::Verify, &place.tree()).unwrap();
+        assert_eq!(p.host(), host(), "the row's host");
+        match &p.at {
+            wsp_wire::host::JobAt::Dir(d) => {
+                assert_eq!(d.path, "w/tree", "relative to the host's tree root");
+                assert!(!d.escapes());
+            }
+            other => panic!("expected a HostDir, got {other:?}"),
+        }
+        let me = run("wsp-054", "p1");
+        assert_eq!(me.host, p.host(), "the run's locks are read from the host its jobs run on");
+        let jobs = jobs_for(&tcp, me);
+        let (ended, out) = jobs
+            .run("pwd", JobClass::Check, &place.tree(), &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {})
+            .unwrap();
+        assert_eq!(ended.exit, Some(0), "{out}");
+        assert_eq!(PathBuf::from(out.trim()).canonicalize().unwrap(), place.tree().canonicalize().unwrap(), "it ran in the place");
+
+        let outside = place.top.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(place_of(Whose::Row("wsp-054"), TreeKind::Verify, &outside).is_err(), "a tree outside the root is no place");
+        assert!(jobs.run("pwd", JobClass::Check, &outside, &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {}).is_err());
+        assert_eq!(relative(&place.tree(), &place.root.join("w").join("target")), PathBuf::from("../target"));
+        m.stop();
+    }
+
+    /// The build is one `job.run` of class `build`: `CARGO_TARGET_DIR` and
+    /// the share's `CARGO_BUILD_JOBS` cross as the env prefix (cargo reads
+    /// the target back), and its output comes back from the job.
+    #[test]
+    fn verifys_cargo_is_a_build_job_with_its_target_and_share_in_the_env_prefix() {
+        let place = Place::new("cargo");
+        rooted(&place);
+        let tree = place.tree();
+        std::fs::write(tree.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("src/lib.rs"), "").unwrap();
+        let (m, tcp) = manager(&place);
+        let me = run("wsp-054", "c1");
+        let runs = jobs_for(&tcp, me.clone());
+        let share = sharing::unregistered();
+        let target = place.root.join("w").join("target");
+        let (ok, text) =
+            cargo_job(&runs, &tree, &target, &["metadata", "--no-deps", "--format-version", "1", "--offline"], false, &share);
+        assert!(ok, "{text}");
+        let meta: serde_json::Value = serde_json::from_str(text.lines().find(|l| l.starts_with('{')).unwrap()).unwrap();
+        let said = PathBuf::from(meta["target_directory"].as_str().unwrap());
+        assert_eq!(said.canonicalize().unwrap(), target.canonicalize().unwrap(), "CARGO_TARGET_DIR crossed");
+        let rows = rows_of(&tcp, &me);
+        assert_eq!(rows.len(), 1, "one job: {rows:?}");
+        assert!(rows[0].0.starts_with("verify:cargo-metadata:0@"), "{rows:?}");
+        assert_eq!(rows[0].1, JobClass::Build);
+
+        // The share's job count is in the env, as `apply` puts it on a child.
+        let jobs = &runs;
+        let (k, v) = share.env();
+        let (ended, out) = jobs
+            .run("env", JobClass::Build, &tree, &[(k.into(), v)], vec!["sh".into(), "-c".into(), "echo jobs=$CARGO_BUILD_JOBS idx=${GIT_INDEX_FILE-unset}".into()], Duration::from_secs(30), &mut |_| {})
+            .unwrap();
+        assert_eq!(ended.exit, Some(0));
+        assert!(out.contains("jobs=1 idx=unset"), "{out}");
+        m.stop();
+    }
+
+    /// The build's output is handed on while the job runs, not when it ends:
+    /// the job waits for a file the echo of its first line makes, so output
+    /// held back to the end would leave it to time out.
+    #[test]
+    fn a_build_jobs_output_echoes_while_it_runs() {
+        let place = Place::new("echo");
+        let (m, tcp) = manager(&place);
+        echo_flow(&place, &tcp);
+        m.stop();
+    }
+
+    fn echo_flow(place: &Place, tcp: &Tcp) {
+        rooted(place);
+        let me = run("wsp-054", "e1");
+        let jobs = jobs_for(tcp, me.clone());
+        let go = place.tree().join("go");
+        let script = "echo first; i=0; while [ ! -e go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; [ -e go ] && echo second";
+        let mut heard = Vec::new();
+        let (ended, text) = jobs
+            .run("cargo-test", JobClass::Build, &place.tree(), &[], vec!["sh".into(), "-c".into(), script.into()], Duration::from_secs(30), &mut |t| {
+                heard.push(t.to_string());
+                if t.contains("first") {
+                    std::fs::write(&go, "").unwrap();
+                }
+            })
+            .unwrap();
+        assert_eq!(ended.exit, Some(0), "the job saw the echo before it ended: {text:?}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+        assert!(heard.concat().contains("second"));
+    }
+
+    /// A warm tree whose build was killed is free by the job table, with no
+    /// `kill -0`: held while its build job runs, free once the job ends, even
+    /// though the killed verify never removed its lock. A run that never ran
+    /// a job holds its claim through setup.
+    #[test]
+    fn a_lock_left_by_a_killed_build_is_free_by_the_job_table() {
+        let place = Place::new("lock");
+        let (m, tcp) = manager(&place);
+        lock_flow(&place, &tcp);
+        m.stop();
+    }
+
+    fn lock_flow(place: &Place, tcp: &Tcp) {
+        rooted(place);
+        let repo = place.top.join("repo");
+        let a = run("wsp-054", "a1");
+        let b = run("wsp-099", "b1");
+        let jobs_a = jobs_for(tcp, a.clone());
+        let jobs_b = jobs_for(tcp, b.clone());
+        let table_a = |h: &str| jobs_a.table(h);
+        let table_b = |h: &str| jobs_b.table(h);
+        let live_a = sharing::Live { me: &a, table: &table_a };
+        let live_b = sharing::Live { me: &b, table: &table_b };
+
+        let warm = sharing::warm(&place.state(), &repo, 1, live_a).expect("a free tree");
+        assert!(warm.dir.starts_with(place.state().join("warm").join(crate::util::slugify(&host()))), "warm trees are per host: {:?}", warm.dir);
+        assert!(sharing::warm(&place.state(), &repo, 1, live_b).is_none(), "held through setup, with no job yet");
+        assert!(warm.touch());
+
+        std::thread::scope(|s| {
+            let build = s.spawn(|| {
+                rooted(place);
+                jobs_a.run("cargo-test", JobClass::Build, &place.tree(), &[], vec!["sh".into(), "-c".into(), "sleep 30".into()], Duration::from_secs(60), &mut |_| {})
+            });
+            assert!(
+                within(Duration::from_secs(10), || rows_of(tcp, &a).iter().any(|r| r.2 == JobState::Running)),
+                "the build job runs"
+            );
+            assert!(sharing::warm(&place.state(), &repo, 1, live_b).is_none(), "held while its build runs");
+            // The build is killed, and its verify with it: the lock stays.
+            let key = tcp.jobs().unwrap().into_iter().find(|r| a.owns(&r.key.row.0, r.key.attempt, &r.key.job)).unwrap().key;
+            tcp.stop_job(&key, Duration::from_secs(10)).expect("the manager ends it");
+            let (ended, _) = build.join().unwrap().unwrap();
+            assert_ne!(ended.exit, Some(0), "{ended:?}");
+        });
+        let lock = warm.dir.with_extension("lock");
+        std::mem::forget(warm);
+        assert!(lock.exists(), "the killed verify left its lock");
+        let again = sharing::warm(&place.state(), &repo, 1, live_b).expect("free by the job table");
+        assert!(again.dir.ends_with(format!("{}-0", crate::util::slugify("repo"))));
+        assert!(std::fs::read_to_string(&lock).unwrap().contains("wsp-099"), "the lock is the new run's");
+        assert!(again.touch(), "and the new run holds it");
+    }
+
+    /// `--alone`'s listing and per-test runs are jobs of class `check`: a
+    /// pass, a red test read from the job's log, and a test past its budget
+    /// ended by the manager and reported as the direct path reports it.
+    #[test]
+    fn alones_listing_and_runs_are_check_jobs() {
+        let place = Place::new("alone");
+        let (m, tcp) = manager(&place);
+        alone_flow(&place, &tcp);
+        m.stop();
+    }
+
+    fn alone_flow(place: &Place, tcp: &Tcp) {
+        rooted(place);
+        let me = run("wsp-054", "al1");
+        let runs = jobs_for(tcp, me.clone());
+        let tree = place.tree();
+        let bin = place.root.join("w").join("target");
+        let lists = bin.join("lists");
+        wsp_testkit::script(&lists, "#!/bin/sh\nprintf 'a::b: test\\nc::d: test\\nx: benchmark\\n\\n2 tests\\n'\n");
+        assert_eq!(test_names(&runs, &tree, &lists), vec!["a::b".to_string(), "c::d".to_string()]);
+
+        let ok = bin.join("passes");
+        wsp_testkit::script(&ok, "#!/bin/sh\nexit 0\n");
+        assert!(run_alone(&runs, &tree, &ok, "a::b", Some(Duration::from_secs(30))).is_none());
+
+        let red = bin.join("fails");
+        wsp_testkit::script(
+            &red,
+            "#!/bin/sh\ncat <<'OUT'\nrunning 1 test\ntest a::b ... FAILED\n\nfailures:\n\n---- a::b stdout ----\nthread 'a::b' panicked at src/a.rs:12:9:\nthe seat was empty\n\nfailures:\n    a::b\n\ntest result: FAILED. 0 passed; 1 failed\nOUT\nexit 101\n",
+        );
+        let f = run_alone(&runs, &tree, &red, "a::b", Some(Duration::from_secs(30))).expect("red");
+        assert_eq!(f.at.as_deref(), Some("src/a.rs:12:9"));
+        assert_eq!(f.message.as_deref(), Some("the seat was empty"));
+
+        let hangs = bin.join("hangs");
+        wsp_testkit::script(&hangs, "#!/bin/sh\nexec sleep 300\n");
+        let f = run_alone(&runs, &tree, &hangs, "a::b", Some(Duration::from_secs(1))).expect("a hang is a failure");
+        assert!(f.message.as_deref().unwrap_or_default().contains("no answer"), "{f:?}");
+
+        let rows = rows_of(tcp, &me);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.iter().all(|r| r.1 == JobClass::Check), "{rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.0.starts_with("verify:alone:")).count(), 3, "{rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.0.starts_with("verify:list:")).count(), 1, "{rows:?}");
+    }
+
+    /// The child's half of `under_manager_wsp_runs_no_ps_and_no_kill`: the
+    /// flows above in a process of its own, so the call log it prints holds
+    /// what they ran and nothing a test beside them did.
+    #[test]
+    #[ignore = "run by under_manager_wsp_runs_no_ps_and_no_kill, in a process of its own"]
+    fn manager_flows_for_the_call_log() {
+        let Ok(said) = std::env::var("WSP_TEST_CALL_LOG") else { return };
+        let parts: Vec<&str> = said.split('\t').collect();
+        let place = Place { top: PathBuf::from(parts[2]), root: PathBuf::from(parts[3]), borrowed: true };
+        let tcp = client(parts[0].parse().unwrap(), parts[1]);
+        let _ = wsp_base::calls::drain_children();
+        lock_flow(&place, &tcp);
+        alone_flow(&place, &tcp);
+        echo_flow(&place, &tcp);
+        println!("\nCALLS {}", wsp_base::calls::drain_children().json());
+    }
+
+    /// Under `manager` the call log of verify's flows holds no `ps` and no
+    /// `kill` from wsp: a killed build is read free from the job table, and
+    /// a test past its budget is ended by the manager. The manager runs here,
+    /// in this process, as it runs in a process of its own in use; what it
+    /// spawns and signals is its own and not in the child's log.
+    #[test]
+    fn under_manager_wsp_runs_no_ps_and_no_kill() {
+        let place = Place::new("calls");
+        let (m, port, token) = manager_at(&place);
+        let said = format!("{port}\t{token}\t{}\t{}", place.top.display(), place.root.display());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cmd_verify::jobs_tests::manager_flows_for_the_call_log"])
+            .args(["--ignored", "--nocapture", "--test-threads=1"])
+            .env("WSP_TEST_CALL_LOG", said)
+            .output()
+            .unwrap();
+        m.stop();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child failed:\n{said}");
+        let line = said.lines().find_map(|l| l.strip_prefix("CALLS ")).unwrap_or_else(|| panic!("no call log:\n{said}"));
+        let calls: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(calls.get("sh").is_none() && calls.get("cargo").is_none(), "the jobs ran in this process: {line}");
+        for program in ["ps", "kill", "lsof"] {
+            assert!(calls.get(program).is_none(), "wsp ran {program}: {line}");
+        }
+    }
+
+    /// A verify in a checkout is keyed by its row; one outside any row by the
+    /// agent's workspace, and two runs never share a mark.
+    #[test]
+    fn a_verify_with_no_row_is_keyed_by_its_workspace_and_each_run_by_its_mark() {
+        let in_row = this_run(Some(Path::new("/x/.worktrees/wsp-054")), "cpd-185");
+        assert_eq!(in_row.row, "wsp-054");
+        assert_eq!(in_row.host, host(), "the row's host, as place_of names it");
+        let bare = this_run(None, "cpd-185");
+        assert_eq!(bare.row, "cpd-185", "the workspace stands in for the row");
+        std::thread::sleep(Duration::from_millis(2));
+        assert_ne!(this_run(None, "cpd-185").mark, bare.mark, "unique per run");
     }
 }

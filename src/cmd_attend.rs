@@ -206,7 +206,16 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
 
     let ran = agent_commands::of("attention").ran(&session, "", 0);
     let ran_clause = clause(ran.as_ref(), opted.cap_cents, &exit);
-    let checks = check::run_all(&here, &opted.steps, &dir.join("verify.log"), None, |_| {});
+    // Under `WSP_JOBS=manager` the checks are jobs in the row's own tree, as
+    // `wsp check`'s are; under `inproc`, here as before.
+    let runner = match check::Runner::chosen(store, check::Whose::Row(&t.id), check::TreeKind::Work, &here, None) {
+        Ok(r) => r,
+        Err(why) => {
+            eprintln!("wsp attend: {why}");
+            return 1;
+        }
+    };
+    let checks = check::run_all(&here, &opted.steps, &dir.join("verify.log"), None, &runner, |_| {});
     let green = check::passed(&checks);
     say("Stop", &session);
     let account = format!(

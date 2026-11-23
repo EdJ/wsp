@@ -451,6 +451,10 @@ impl InProcess {
         signal_group(group, sig)
     }
 
+    /// `lsof -d cwd -Fpn`, of `pids` alone when given. Back since wsp-057 took
+    /// it (afa711e) for wsp-691's agent-leftover stop, which no job holds
+    /// (wsp-368, the person's word); wsp-389 has the manager stop a seat's
+    /// process tree itself.
     pub fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
         let mut cmd = Command::new("lsof");
         match pids {
@@ -589,6 +593,10 @@ impl InProcess {
 
     pub fn transcript_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
         claude_transcript(session, cwd)
+    }
+
+    pub fn transcripts_of_tree(&self, tree: &str) -> Vec<PathBuf> {
+        claude_transcripts_of_tree(tree)
     }
 
     pub fn pi_session_of(&self, session: &str, cwd: &str) -> Option<PathBuf> {
@@ -1856,6 +1864,32 @@ pub fn claude_transcript(session: &str, cwd: &str) -> Option<PathBuf> {
         .filter_map(|e| e.ok())
         .map(|e| e.path().join(&file))
         .find(|p| p.is_file())
+}
+
+/// Every Claude Code transcript written in a tree whose path ends in `tree`
+/// (`/.worktrees/wsp-313`): the `*.jsonl` files of each project directory whose
+/// name ends in that tail as [`mangle`] spells it. The tail and not the whole
+/// path, because a tree may have moved since, or sat under another checkout;
+/// a tail that is empty finds nothing rather than every project.
+pub fn claude_transcripts_of_tree(tree: &str) -> Vec<PathBuf> {
+    let tail = mangle(tree);
+    if tail.trim_matches('-').is_empty() {
+        return Vec::new();
+    }
+    let projects = util::home().join(".claude").join("projects");
+    let mut out = Vec::new();
+    for dir in fs::read_dir(&projects).into_iter().flatten().flatten() {
+        if !dir.file_name().to_string_lossy().ends_with(&tail) {
+            continue;
+        }
+        for f in fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+            if f.path().extension().is_some_and(|x| x == "jsonl") {
+                out.push(f.path());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// A cwd as Claude Code spells it in a directory name.

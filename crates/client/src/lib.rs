@@ -8,6 +8,12 @@
 //!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
 //! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
+//! - [`Client::apply`] sends a command under one idempotency key, again under
+//!   the same key after a lost reply; [`Client::await_order`] follows an order
+//!   to a state.
+//! - [`Client::throttle`], [`Client::spend`] and [`Client::show`] return the
+//!   documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
+//!   --json` print, the same value (wsp-307).
 //! - [`Client::rows`], [`Client::lists`], [`Client::asks`] and
 //!   [`Client::readings`] read what web-chrome's census draws (wsp-743): rows
 //!   and lists as heads, the asks, and the daemon's readings, each the input a
@@ -26,12 +32,14 @@ use wsp_api::{
     Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
     Request, Verb, PROTOCOL,
 };
-use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Row, RowFilter, State};
+use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Refusal, Row, RowFilter, State};
 
 mod dial;
+mod orders;
 mod subscribe;
 
 pub use dial::Silent;
+pub use orders::APPLY_ATTEMPTS;
 pub use subscribe::{Feed, Item};
 
 /// How long [`Client::request`] waits for a reply unless [`Client::set_timeout`]
@@ -50,9 +58,14 @@ pub enum Error {
     Silent(Silent),
     /// `args` do not fit the verb, so the request could not be made.
     Args(String),
-    /// A typed read ([`Client::wip`], [`Client::rows`], ...) was answered
-    /// `err`; the failure whole.
-    Refused(Failure),
+    /// The server refused a command, and said why; the same command under the
+    /// same key would be refused the same, so it is not sent again.
+    Refused(Refusal),
+    /// The server answered `err` with a code and no refusal (a verb it does not
+    /// run, a malformed request, a failed store).
+    Failed(Failure),
+    /// The server answered with something other than what the verb answers.
+    Unexpected(String),
 }
 
 impl std::fmt::Display for Error {
@@ -62,12 +75,39 @@ impl std::fmt::Display for Error {
             Error::Lost(e) => write!(f, "{e}"),
             Error::Silent(s) => write!(f, "{s}"),
             Error::Args(why) => write!(f, "the arguments do not fit the verb: {why}"),
-            Error::Refused(why) => write!(f, "refused ({:?}): {}", why.code, why.text),
+            Error::Refused(r) => write!(f, "the server refused it: {r:?}"),
+            Error::Failed(x) => write!(f, "the server failed it: {:?}: {}", x.code, x.text),
+            Error::Unexpected(what) => write!(f, "the server's answer was not the verb's: {what}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Why a view verb ([`Client::throttle`], [`Client::spend`], [`Client::show`])
+/// gave no document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewError {
+    /// The request got no reply.
+    Request(Error),
+    /// The server refused it: `not_found` for a `show` of nothing,
+    /// `unsupported` from a server that answers no views (or predates them).
+    Refused(Failure),
+    /// The reply's `ok` was another verb's answer.
+    Answer(Box<Answer>),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Request(e) => write!(f, "{e}"),
+            ViewError::Refused(r) => write!(f, "refused {:?}: {}", r.code, r.text),
+            ViewError::Answer(a) => write!(f, "the server answered another verb: {a:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ViewError {}
 
 /// What it takes to dial again: where the server is, who for, and how long to wait.
 #[derive(Debug, Clone)]
@@ -162,8 +202,42 @@ impl Client {
         let reply = self.send_call(Call::Verb(Verb::Wip(NoArgs {})), None)?;
         match reply.outcome {
             Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
-            Outcome::Ok(_) => Err(Error::Lost(ConnError::Malformed("`wip` answered with another verb's answer".into()))),
-            Outcome::Err(f) => Err(Error::Refused(f)),
+            Outcome::Ok(other) => Err(Error::Unexpected(format!("wip was answered {other:?}"))),
+            Outcome::Err(f) => Err(orders::refused(f)),
+        }
+    }
+
+    /// The document `wsp throttle --json` prints: this machine's build
+    /// throttle and the readings it acts on, as the server's machine reads them.
+    pub fn throttle(&mut self) -> Result<Value, ViewError> {
+        match self.view("throttle", json!({}))? {
+            Answer::Throttle(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    /// The document `wsp spend --json` prints: the last 30 days' tokens and cost.
+    pub fn spend(&mut self) -> Result<Value, ViewError> {
+        match self.view("spend", json!({}))? {
+            Answer::Spend(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    /// The document `wsp show <id> --json` prints, `id` as `wsp show` takes it
+    /// (a row's id or prefix, or a piece's id). None is [`ViewError::Refused`]
+    /// with `not_found`, and the CLI's sentence as its text.
+    pub fn show(&mut self, id: &str) -> Result<Value, ViewError> {
+        match self.view("show", json!({ "id": id }))? {
+            Answer::Show(v) => Ok(v),
+            other => Err(ViewError::Answer(Box::new(other))),
+        }
+    }
+
+    fn view(&mut self, verb: &str, args: Value) -> Result<Answer, ViewError> {
+        match self.request(verb, args).map_err(ViewError::Request)?.outcome {
+            Outcome::Ok(a) => Ok(a),
+            Outcome::Err(f) => Err(ViewError::Refused(f)),
         }
     }
 
@@ -171,7 +245,7 @@ impl Client {
     /// `filter.heads` (no `body` or `prose`), which is what keeps every row of
     /// a full store under `MAX_LINE`.
     pub fn rows(&mut self, filter: RowFilter) -> Result<Vec<Row>, Error> {
-        self.read(Verb::Rows(filter), "rows", |a| match a {
+        self.read_typed(Verb::Rows(filter), "rows", |a| match a {
             Answer::Rows(rows) => Ok(rows),
             other => Err(other),
         })
@@ -179,7 +253,7 @@ impl Client {
 
     /// The `lists` verb: every list, each without its text when `filter.heads`.
     pub fn lists(&mut self, filter: ListFilter) -> Result<Vec<List>, Error> {
-        self.read(Verb::Lists(filter), "lists", |a| match a {
+        self.read_typed(Verb::Lists(filter), "lists", |a| match a {
             Answer::Lists(lists) => Ok(lists),
             other => Err(other),
         })
@@ -188,7 +262,7 @@ impl Client {
     /// The `asks` verb: asks, notes and flags of any of `kinds` in any of
     /// `states`, all when either is empty.
     pub fn asks(&mut self, kinds: Vec<AskKind>, states: Vec<AskState>) -> Result<Vec<Ask>, Error> {
-        self.read(Verb::Asks { kinds, states }, "asks", |a| match a {
+        self.read_typed(Verb::Asks { kinds, states }, "asks", |a| match a {
             Answer::Asks(asks) => Ok(asks),
             other => Err(other),
         })
@@ -200,20 +274,20 @@ impl Client {
     /// `wsp_view::reading::of`.
     pub fn readings(&mut self, names: &[&str]) -> Result<std::collections::BTreeMap<String, Reading>, Error> {
         let names = names.iter().map(|n| n.to_string()).collect();
-        self.read(Verb::Readings { names }, "readings", |a| match a {
+        self.read_typed(Verb::Readings { names }, "readings", |a| match a {
             Answer::Readings(readings) => Ok(readings),
             other => Err(other),
         })
     }
 
     /// One typed read: `verb`'s reply, taken by `want`; another verb's answer
-    /// is a malformed reply, and `err` is [`Error::Refused`].
-    fn read<T>(&mut self, verb: Verb, name: &str, want: impl FnOnce(Answer) -> Result<T, Answer>) -> Result<T, Error> {
+    /// is a malformed reply, and `err` is [`Error::Failed`].
+    fn read_typed<T>(&mut self, verb: Verb, name: &str, want: impl FnOnce(Answer) -> Result<T, Answer>) -> Result<T, Error> {
         let reply = self.send_call(Call::Verb(verb), None)?;
         match reply.outcome {
             Outcome::Ok(a) => want(a)
                 .map_err(|_| Error::Lost(ConnError::Malformed(format!("`{name}` answered with another verb's answer")))),
-            Outcome::Err(f) => Err(Error::Refused(f)),
+            Outcome::Err(f) => Err(Error::Failed(f)),
         }
     }
 

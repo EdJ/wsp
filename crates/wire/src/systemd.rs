@@ -519,8 +519,9 @@ pub fn manager_definition_path() -> PathBuf {
 ///   every seat on the machine.
 ///
 /// `--port` is written out, so the machine record and the process cannot
-/// disagree about it; the log is the plist's `<exec_dir>/log/launchd.log`.
-pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str) -> String {
+/// disagree about it, and so are the job capacities and tree root the plist
+/// writes (`jobs`, wsp-056); the log is the plist's `<exec_dir>/log/launchd.log`.
+pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, jobs: &crate::manager::Jobs, path_var: &str) -> String {
     let log = crate::launchd::manager_log(exec_dir).display().to_string();
     format!(
         "[Unit]\n\
@@ -529,7 +530,7 @@ pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str
          [Service]\n\
          Type=exec\n\
          KillMode=process\n\
-         ExecStart={bin} --exec-dir {exec_dir} --port {port}\n\
+         ExecStart={bin} --exec-dir {exec_dir} --port {port} {jobs}\n\
          Environment={path}\n\
          Restart=always\n\
          RestartSec={sec}\n\
@@ -540,6 +541,7 @@ pub fn manager_definition(bin: &Path, exec_dir: &Path, port: u16, path_var: &str
          WantedBy=default.target\n",
         bin = quote(&bin.display().to_string()),
         exec_dir = quote(&exec_dir.display().to_string()),
+        jobs = jobs.args().iter().map(|a| if a.starts_with("--") { a.clone() } else { quote(a) }).collect::<Vec<_>>().join(" "),
         path = quote_env(&format!("PATH={path_var}")),
         sec = crate::launchd::MANAGER_THROTTLE,
         log = bare(&log),
@@ -559,10 +561,10 @@ pub fn manager_step(change: &Plan, active: bool, sandboxed: bool, restarted: boo
 /// running: [`ensure`]'s steps for [`MANAGER_LABEL`]. `restarted` says the
 /// binary beside it was just replaced, so a running unit whose text did not
 /// change is restarted to run it.
-pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, path_var: &str, restarted: bool) -> Result<Done, String> {
+pub fn ensure_manager(bin: &Path, exec_dir: &Path, port: u16, jobs: &crate::manager::Jobs, path_var: &str, restarted: bool) -> Result<Done, String> {
     let _ = std::fs::create_dir_all(exec_dir.join("log"));
     let path = manager_definition_path();
-    let want = manager_definition(bin, exec_dir, port, path_var);
+    let want = manager_definition(bin, exec_dir, port, jobs, path_var);
     let change = plan(&want, &path);
     let sandboxed = crate::launchd::sandboxed();
     if !sandboxed {
@@ -726,10 +728,13 @@ mod tests {
             Path::new("/home/u/.local/bin/wsp-manager"),
             Path::new("/home/u/.local/state/wsp-manager"),
             7487,
+            &crate::manager::Jobs { build: 3, check: 6, tree_root: "/mnt/data/src".into() },
             "/usr/bin:/bin",
         );
         assert!(
-            u.contains("ExecStart=\"/home/u/.local/bin/wsp-manager\" --exec-dir \"/home/u/.local/state/wsp-manager\" --port 7487\n"),
+            u.contains(
+                "ExecStart=\"/home/u/.local/bin/wsp-manager\" --exec-dir \"/home/u/.local/state/wsp-manager\" --port 7487 --build \"3\" --check \"6\" --tree-root \"/mnt/data/src\"\n"
+            ),
             "{u}"
         );
         assert!(u.contains("Restart=always\n"), "no clean exit to leave alone: {u}");

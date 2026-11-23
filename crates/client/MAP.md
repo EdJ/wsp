@@ -13,11 +13,24 @@ dependencies to hold this.
 ## Holds
 
 - `src/lib.rs`: `Client::dial(state_dir, by, wait)`, `Client::{request, request_keyed, set_timeout, server, head,
-  subscribe}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`), `REQUEST_TIMEOUT`. `request(verb, args)` builds the
+  subscribe, wip, throttle, spend, show}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`, `Refused`, `Failed`, `Unexpected`),
+  `ViewError` (`Request`, `Refused`, `Answer`), `REQUEST_TIMEOUT`. `throttle()`, `spend()` and `show(id)` return the
+  documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id> --json` print, as the `Value` (wsp-307); a
+  refusal (`not_found`, `unsupported` from a server without them) is `ViewError::Refused`. `request(verb, args)` builds the
   envelope from a verb name and JSON `args` (so a verb this build does not know still goes out, and the server
   answers `unsupported`), and returns the `Reply` whose id matches; a refusal is a `Reply` with `err`. One timeout
   covers send to reply; on a timeout or a lost connection the connection is dropped, and the next request dials
   again.
+- `src/orders.rs` (wsp-119, step 2's senders): `Client::apply(&Command) -> Applied` mints a key and sends the command
+  keyed, again under the same key after a lost reply (`Timeout`) or a lost connection (`Lost`), at most
+  `APPLY_ATTEMPTS` sends sharing the one timeout; a server's refusal is `Error::Refused(Refusal)` and any other `err`
+  is `Error::Failed(Failure)`, neither retried, and a server that cannot be dialled before anything was sent is
+  `Silent` at once. `Client::await_order(id, settled, wait) -> Option<Order>` reads the head, reads `orders` once (an
+  order already settled answers at once), then follows `subscribe { from: head }` for `order.*` events on that id
+  until one lands it in `settled`; `None` past `wait`; `Error::Silent` once the feed has been unable to connect for
+  the dial's `wait`. An `order.refused` is followed by a re-read (it does not say `queued` or `failed`). Window: an
+  event between the head read and the `orders` read is replayed, so a refused-and-requeued order can show an older
+  state for a moment.
 - `src/dial.rs`: `Silent` and `open`. `open` reads `api.json` and `api.token`, gives each address an even share of
   what is left of `wait`, and says `hello`. `Silent` is `NoListenFile`, `BadListenFile`, `NoToken`, `Unreachable`
   (each address, with why), `NoWelcome`, `Refused` (the server's code, `unauthorised` for a wrong token) or
@@ -45,6 +58,12 @@ dependencies to hold this.
 for no `api.json`, a wrong token, no token file, a bad file, a stopped server, and a listener that never welcomes;
 `request` for each read verb, and a request after the server was away; `subscribe` for the snapshot then each event
 once, a restart mid-stream (`Resumed`, then every later event once, ids contiguous), a feed that never connected
-(no `Resumed`), `too_old` (a fresh `State`), and, against a fake server, a repeated id dropped and a silent
+(no `Resumed`), `too_old` (a fresh `State`), `throttle`, `spend` and `show` against a server with fake views (and
+`unsupported` without them), and, against a fake server, a repeated id dropped and a silent
 connection dialled again; a connection lost before it delivered anything backed off, each wait longer than the
 last, and a snapshot in parts handed out as one `State` with the event after it following.
+
+wsp-119's tests run against a scripted server of the test file's own (it welcomes, then asks a closure what to say):
+a reply dropped by hanging up, and one never sent, each retried under one key and answered with the first result; a
+refusal and a plain `err` sent once; `await_order` for a settled order (no subscribe), a queued one followed to
+`acknowledged` past another order's event, `None` past `wait`, and `Silent` within the dial's bound once the server goes.

@@ -252,10 +252,11 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
 /// I5 has none: a row's state is joined per call and never logged as a guess
 /// (it is state-core's rows machine, not the manager's).
 pub(crate) const SIGNS: &[Sign] = &[
+    // Its writer, ending.rs's `stop_finished`, went with M3 (wsp-057) and came
+    // back with Ed's wsp-691 at the merge of wsp-368: what an agent's shell
+    // leaves in a finished tree is no job, so the tick stops it again. The
+    // sign stays first, as `wsp_478` counts it.
     Sign { kind: "I1", name: "stopped in a finished row's tree (wsp-478)", site: "ending.rs stop_finished", test: |l| l.starts_with("stopped in finished row ") },
-    Sign { kind: "I1", name: "stopped in a barrier check tree", site: "check_tree.rs signalled_line", test: |l| l.starts_with("stopped in barrier check tree ") },
-    Sign { kind: "I1", name: "leaked agent ended", site: "leaked_agents.rs sentence", test: |l| l.starts_with("leaked agent: ") && (l.ends_with("ended it") || l.ends_with("killed it")) },
-    Sign { kind: "I1", name: "reaped by a person", site: "cmd_role.rs", test: |l| l.starts_with("reap ") && l.contains(" by ") },
     Sign { kind: "I2", name: "never became ready (screen)", site: "cmd_spawn.rs", test: |l| l.contains("started but never became ready for input") },
     Sign { kind: "I2", name: "screen overruled by opencode's record", site: "repair.rs", test: |l| l.contains("the screen says working and opencode finished") },
     Sign { kind: "I3", name: "typed, no turn seen", site: "wake.rs", test: |l| l.starts_with("told ") && l.contains("typed at the seat — no turn seen yet") },
@@ -531,10 +532,7 @@ mod tests {
     fn each_sign_reads_the_words_its_writer_prints() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let words: &[(&str, &[&str])] = &[
-            ("src/ending.rs", &["stopped in finished row {}", "wsp: the seat of an accepted exit had already gone —"]),
-            ("crates/trees/src/check_tree.rs", &["stopped in barrier check tree {path}"]),
-            ("src/leaked_agents.rs", &["leaked agent: {}", "ended it", "killed it"]),
-            ("src/cmd_role.rs", &["reap {pid} by {}"]),
+            ("src/ending.rs", &["wsp: the seat of an accepted exit had already gone —"]),
             ("src/cmd_spawn.rs", &["started but never became ready for input"]),
             ("src/wake.rs", &["typed at the seat — no turn seen yet"]),
             ("src/cmd_task.rs", &["but its pane did not get it"]),
@@ -555,9 +553,6 @@ mod tests {
         // And each sign matches a line as its writer would print it.
         let lines = [
             "stopped in finished row wsp-1 tree ~/w/wsp-1: TERM 4 5",
-            "stopped in barrier check tree ~/c/x: TERM 9",
-            "leaked agent: claude pid 7 in seat cpd-1 of /tmp/s: no daemon kept that store for the grace; ended it",
-            "reap 77 by person: its row is done — cargo test",
             "FAILED spawn wsp-2: wsp: claude did not start in cpd-9: claude started but never became ready for input",
             "cpd-4: the screen says working and opencode finished this session at 10:00 — read as idle",
             "told m0: typed at the seat — no turn seen yet, and still owed · 1 held",
@@ -570,7 +565,6 @@ mod tests {
         for sign in SIGNS {
             assert!(lines.iter().any(|l| (sign.test)(l)), "no line reads as {:?}", sign.name);
         }
-        assert!(!SIGNS.iter().any(|s| (s.test)("leaked agent: claude pid 7 in seat cpd-1 of /tmp/s: no daemon keeps that store; ending it in 30 min unless one starts")), "a warning is not an act");
     }
 
     /// The counts are by kind and in the window; a seat ended on a census and

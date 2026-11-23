@@ -1281,6 +1281,53 @@ impl Compound<'_> {
         draft(&self.read_screen(seat).ok()?)
     }
 
+    /// What `tell` and `deliver_order` share: the state check, the trust
+    /// prompt, and for a seat that delivers the asked `deliver` (under `order`
+    /// where the caller gave one, else under the seat's own pending id).
+    fn tell_by(&self, seat: &Seat, text: &str, order: Option<&str>) -> Result<Delivery> {
+        let state = self.state(seat)?;
+        // `insist` is a person saying they have looked; see its own doc.
+        if !self.insist && !state.will_take_a_prompt() {
+            return Err(Refusal::NotReady(state));
+        }
+        if let Some(why) = self.at_trust_prompt(seat) {
+            return Err(Refusal::Backend(why));
+        }
+        // wsp-477: a seat whose supervisor can be asked is told through its
+        // `deliver` verb and the answer is read, not inferred from a
+        // transcript. The supervisor owns the retry; `failed` is the only
+        // thing wsp escalates.
+        //
+        // **Only a seat spawned for it** (`"deliver": true` in its record, set
+        // by [`Place::start`] with `--agent`): a supervisor built before
+        // compound-999 drops the connection on a `Deliver` frame, and every seat
+        // already running is one. Those keep the typed path below.
+        if let (true, Some(session), Ok(rec)) = (self.host.can_deliver(), self.socket_of(seat), self.record(seat)) {
+            if delivers(&rec) {
+                let dir = self.dir_of(seat)?;
+                let answer = deliver_waited(|wait| match order {
+                    Some(order) => self.host.deliver(&session, order, text, wait, seat),
+                    None => deliver_through(self.host, &session, &dir, seat, text, wait),
+                });
+                let answer = past_a_refusal(answer, || self.typed(seat), || {
+                    let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+                    self.host.type_in(&socket, text)
+                });
+                return name_the_draft(answer, || self.draft_in(seat));
+            }
+        }
+        if order.is_some() {
+            return Err(Refusal::Unsupported("deliver under an order id to a seat whose supervisor cannot be asked"));
+        }
+        let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
+        self.host.type_in(&socket, text)?;
+        // Typed rather than watched: this backend has not read the reply
+        // that would let it say more, so `Unconfirmed` is the honest answer
+        // `place.rs` asks for from a backend that delivered without seeing
+        // whether a turn started.
+        Ok(Delivery::Unconfirmed)
+    }
+
     /// `compound-sup spawn --label <seat> …` and nothing more: no `--socket`
     /// (see the module docs on why this backend does not mint into
     /// compound's run directory itself), `program`/`args` as the pty's own
@@ -1821,41 +1868,15 @@ impl Place for Compound<'_> {
     /// anything. A seat with no renderer up has nothing to type into either
     /// way; that failure belongs to the dial below, not to a silent no-op.
     fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery> {
-        let state = self.state(seat)?;
-        // `insist` is a person saying they have looked; see its own doc.
-        if !self.insist && !state.will_take_a_prompt() {
-            return Err(Refusal::NotReady(state));
-        }
-        if let Some(why) = self.at_trust_prompt(seat) {
-            return Err(Refusal::Backend(why));
-        }
-        // wsp-477: a seat whose supervisor can be asked is told through its
-        // `deliver` verb and the answer is read, not inferred from a
-        // transcript. The supervisor owns the retry; `failed` is the only
-        // thing wsp escalates.
-        //
-        // **Only a seat spawned for it** (`"deliver": true` in its record, set
-        // by [`Place::start`] with `--agent`): a supervisor built before
-        // compound-999 drops the connection on a `Deliver` frame, and every seat
-        // already running is one. Those keep the typed path below.
-        if let (true, Some(session), Ok(rec)) = (self.host.can_deliver(), self.socket_of(seat), self.record(seat)) {
-            if delivers(&rec) {
-                let dir = self.dir_of(seat)?;
-                let answer = deliver_waited(|wait| deliver_through(self.host, &session, &dir, seat, text, wait));
-                let answer = past_a_refusal(answer, || self.typed(seat), || {
-                    let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
-                    self.host.type_in(&socket, text)
-                });
-                return name_the_draft(answer, || self.draft_in(seat));
-            }
-        }
-        let socket = self.render_socket_of(seat).ok_or_else(|| Refusal::NoSeat(seat.clone()))?;
-        self.host.type_in(&socket, text)?;
-        // Typed rather than watched: this backend has not read the reply
-        // that would let it say more, so `Unconfirmed` is the honest answer
-        // `place.rs` asks for from a backend that delivered without seeing
-        // whether a turn started.
-        Ok(Delivery::Unconfirmed)
+        self.tell_by(seat, text, None)
+    }
+
+    /// [`Place::tell`] under the store's order id: the same path, `order`
+    /// handed to the host as the delivery id, and no `deliver.pending` read or
+    /// written. A seat that cannot be asked to `deliver` has no id to carry and
+    /// is [`Refusal::Unsupported`], not typed at.
+    fn deliver_order(&self, seat: &Seat, order: &str, text: &str) -> Result<Delivery> {
+        self.tell_by(seat, text, Some(order))
     }
 
     /// Press submit on a seat whose composer is sitting on a work order.
@@ -2364,6 +2385,87 @@ mod tests {
             Ok(Delivery::Acked)
         );
         assert_ne!(fs::read_to_string(&asked).unwrap(), first, "an answered id is spent: the next tell is new");
+    }
+
+    /// A seat made by hand that delivers: this process as its pid, an agent, a
+    /// socket that exists, and a hook's fresh word that it is `state`.
+    /// Takes the seat's directory away on drop, ahead of `Scratch`, whose own
+    /// drop would otherwise `stop` a seat whose pid is this test process.
+    struct Forget(PathBuf);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seat_that_delivers(place: &Compound<'_>, scratch: &Scratch, state: &str) -> (Seat, Forget) {
+        let seat = Seat::new("cpd-1");
+        let dir = place.dir_of(&seat).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let socket = scratch.root.join("s.sock");
+        fs::write(&socket, "").unwrap();
+        let rec = json!({
+            "pid": std::process::id(),
+            "socket": socket.display().to_string(),
+            "deliver": true,
+            "agent": { "kind": "claude", "name": "a", "args": [] },
+        });
+        write_atomic(&dir.join(SEAT_FILE), &rec.to_string()).unwrap();
+        let said = json!({ "state": state, "hook": "Stop", "at": util::now_iso() });
+        write_atomic(&dir.join(SAID_FILE), &said.to_string()).unwrap();
+        (seat, Forget(dir))
+    }
+
+    /// wsp-120: `deliver_order` hands the store's order id to the host as the
+    /// delivery id. The first ask is one the sup never answers (it takes the id
+    /// and goes); asked again under the same id the sup answers it, and has
+    /// delivered it once. The seat's directory holds no `deliver.pending`.
+    #[test]
+    fn deliver_order_asked_again_under_one_id_is_one_delivery_and_keeps_no_pending() {
+        let scratch = Scratch::new("deliver-order");
+        let log = scratch.root.join("delivered");
+        let (sup, _, asked) = script_sup(
+            &scratch,
+            &format!(
+                "grep -qx \"$3\" '{0}' 2>/dev/null && {{ echo \"delivered $3\"; exit 0; }}\n\
+                 [ -e '{0}.once' ] || {{ touch '{0}.once'; exit 1; }}\n\
+                 echo \"$3\" >> '{0}'; echo \"delivered $3\"",
+                log.display()
+            ),
+        );
+        let host = InProcess::with_sup(&sup);
+        let place = Compound { host: &host, ..scratch.place() };
+        let (seat, _forget) = seat_that_delivers(&place, &scratch, "idle");
+
+        let first = place.deliver_order(&seat, "ord-7", "do the thing");
+        assert!(first.is_err(), "the first ask was not answered: {first:?}");
+        assert_eq!(fs::read_to_string(&asked).unwrap().trim(), "ord-7", "asked under the order's id");
+        assert_eq!(place.deliver_order(&seat, "ord-7", "do the thing"), Ok(Delivery::Acked));
+        assert_eq!(place.deliver_order(&seat, "ord-7", "do the thing"), Ok(Delivery::Acked));
+        assert_eq!(fs::read_to_string(&log).unwrap(), "ord-7\n", "one delivery under one id");
+        assert!(!place.dir_of(&seat).unwrap().join(DELIVER_PENDING).exists(), "no deliver.pending");
+
+        // `tell` is unchanged: it mints its own id and keeps its pending file.
+        let _ = place.tell(&seat, "a tell");
+        assert_ne!(fs::read_to_string(&asked).unwrap().trim(), "ord-7");
+    }
+
+    /// wsp-120: a busy seat is `NotReady` for `deliver_order` as for `tell`, and
+    /// the sup is never asked; a refusal on a composer wsp cannot read stays the
+    /// sup's answer (the empty-composer case is `past_a_refusal`'s, shared).
+    #[test]
+    fn deliver_order_refuses_a_busy_seat_and_keeps_a_refusal_it_cannot_type_past() {
+        let scratch = Scratch::new("deliver-order-busy");
+        let (sup, _, asked) = script_sup(&scratch, "echo \"failed $3 refused\"; exit 1");
+        let host = InProcess::with_sup(&sup);
+        let place = Compound { host: &host, ..scratch.place() };
+        let (seat, _forget) = seat_that_delivers(&place, &scratch, "working");
+        assert_eq!(place.deliver_order(&seat, "ord-8", "go"), Err(Refusal::NotReady(State::Working)));
+        assert!(!asked.exists(), "a busy seat is not asked");
+
+        let (seat, _forget) = seat_that_delivers(&place, &scratch, "idle");
+        assert_eq!(place.deliver_order(&seat, "ord-8", "go"), Err(Refusal::Failed("cpd-1: refused".into())));
+        assert_eq!(fs::read_to_string(&asked).unwrap().trim(), "ord-8");
     }
 
     /// wsp-666: a process that capped its deliveries waits the cap on a supervisor

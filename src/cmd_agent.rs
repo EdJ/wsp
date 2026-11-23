@@ -1,7 +1,7 @@
 //! Agent binding, context resolution, and the views that join the store to
 //! the live seats.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
@@ -1478,6 +1478,18 @@ fn tell_seat(
     // order; a seat that ends first has it said back to the sender. And a tell
     // to a seat that already has tells queued queues behind them, whatever the
     // seat reads now, so the order they were sent in is the order they land.
+    // **Under `WSP_ORDERS=store` a tell is an order** (wsp-124): `order.send`,
+    // and the daemon's delivery worker types it under `deliver:<seat>` when
+    // the seat reads idle. The machine's queue is the queue, so a busy seat's
+    // tell is an order at once and not a line in the held-tell spool.
+    // `--anyway` (a person who has looked at the seat) keeps the files path;
+    // wsp-130, the deletion row of s2-state-core-2, decides what it becomes.
+    let by_order = !args.has("anyway") && crate::orders::mode() == crate::orders::Mode::Store;
+    if by_order && queues_for_idle(row.state) {
+        if let Some(code) = queue_as_order(store, args, p, from, re, text, needle, &said, &seat, &what, row.state) {
+            return code;
+        }
+    }
     let queue = crate::wake::held_tells(store, &seat);
     let queued = queue.len();
     if !args.has("anyway") && (queues_for_idle(row.state) || (queued > 0 && row.state != State::Unknown)) {
@@ -1547,12 +1559,130 @@ fn tell_seat(
             return twice(&sent, ago, p);
         }
     }
+    if by_order {
+        match tell_as_order(store, &seat, &said, from, crate::orders::TELL_WAIT) {
+            Ok((_, Some(outcome))) => return delivered(store, outcome, &sent),
+            Ok((id, None)) => return left_for_the_daemon(store, args, p, &sent, &id),
+            // No API, or a store that holds no such seat yet: the files path
+            // takes it, and cycle.log says so.
+            Err(e) => crate::store::log_line(store, &format!("told {what}: not sent as an order ({e}); typed the files way")),
+        }
+    }
     match how.tell(place.as_ref(), &crate::place::Seat::new(&seat), &said) {
         // The host went silent between the census and the order: held, as a
         // seat found unreachable is, and asked again under the same order id.
         Err(Refusal::Unreachable(_)) => held("unreachable"),
         outcome => delivered(store, outcome, &sent),
     }
+}
+
+// ---- tells as orders (wsp-124) ---------------------------------------------
+
+/// `said` to `seat` as an order: sent, its answer waited for up to `wait`, and
+/// what it came to by then ([`crate::orders::said`]; `None` is left for the daemon).
+/// An `Err` is an order that was not sent, which the caller types the files way.
+pub(crate) fn tell_as_order(
+    store: &Store,
+    seat: &str,
+    said: &str,
+    from: &str,
+    wait: std::time::Duration,
+) -> Result<(wsp_store_contract::OrderId, Option<crate::place::Result<Delivery>>), crate::orders::Error> {
+    let id = crate::orders::send(store, &wsp_store_contract::SeatId(seat.into()), said, &crate::orders::principal(from), false)?;
+    let now = match crate::orders::answer(store, &id, wait)? {
+        Some(o) => Some(o),
+        None => crate::orders::order(store, &id)?,
+    };
+    Ok((id, now.as_ref().and_then(crate::orders::said)))
+}
+
+/// `seat`'s orders the daemon has still to type: `queued` and `typed`.
+fn orders_waiting(store: &Store, seat: &str) -> Vec<wsp_store_contract::Order> {
+    use wsp_store_contract::OrderState as S;
+    crate::orders::orders_of(store, &wsp_store_contract::SeatId(seat.into()), &[S::Queued, S::Typed]).unwrap_or_default()
+}
+
+/// A tell whose order had not settled when the wait ran out: the daemon types
+/// it, and the receipt is the files path's for a tell it holds.
+fn left_for_the_daemon(store: &Store, args: &Args, p: &Paint, sent: &Sent, id: &wsp_store_contract::OrderId) -> i32 {
+    let n = orders_waiting(store, &sent.pane).len().max(1);
+    store.log_event(
+        "agent-told",
+        json!({
+            "target": sent.target, "pane": sent.pane, "chars": sent.chars, "id": sent.id, "from": sent.from,
+            "re": sent.re, "text": sent.text, "held": true, "order": id.0, "at": util::epoch_secs(), "turn": false,
+        }),
+    );
+    crate::store::log_line(store, &format!("told {}: order {} left for the daemon ({n} waiting), from {}", sent.what, id.0, sent.from));
+    match args.json() {
+        true => println!("{}", json!({ "held": true, "pane": sent.pane, "waiting": n })),
+        false => println!(
+            "{} {} has not answered yet — left for the daemon as order {} ({n} waiting), typed under deliver:{}",
+            p.yellow("…"),
+            sent.what,
+            id.0,
+            sent.pane
+        ),
+    }
+    0
+}
+
+/// A tell to a busy seat under `store`: an order at once, which the daemon
+/// types at the seat's next idle, with the files path's queued receipt.
+/// `None` when the order could not be sent, and the held-tell spool takes it.
+#[allow(clippy::too_many_arguments)]
+fn queue_as_order(
+    store: &Store,
+    args: &Args,
+    p: &Paint,
+    from: &str,
+    re: Option<&str>,
+    text: &str,
+    needle: &str,
+    said: &str,
+    seat: &str,
+    what: &str,
+    state: State,
+) -> Option<i32> {
+    let waiting = orders_waiting(store, seat);
+    if !args.has("again") && waiting.iter().any(|o| o.text == said) {
+        let n = waiting.len();
+        match args.json() {
+            true => println!("{}", json!({ "held": true, "queued": true, "pane": seat, "waiting": n, "already": true })),
+            false => println!(
+                "{} {what} has that sentence queued already ({n} waiting) — not queued twice; `--again` queues it anyway",
+                p.dim("·")
+            ),
+        }
+        return Some(0);
+    }
+    let id = match crate::orders::send(store, &wsp_store_contract::SeatId(seat.into()), said, &crate::orders::principal(from), false) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::store::log_line(store, &format!("told {what}: not sent as an order ({e}); held the files way"));
+            return None;
+        }
+    };
+    let n = orders_waiting(store, seat).len().max(1);
+    store.log_event(
+        "agent-told",
+        json!({
+            "target": addressee_id(store, needle, what), "pane": seat, "chars": text.len(),
+            "id": message_id(seat, text), "from": from, "re": re, "text": text, "held": true,
+            "queued": true, "order": id.0, "at": util::epoch_secs(), "turn": false,
+        }),
+    );
+    crate::store::log_line(store, &format!("told {what}: order {} queued for its next idle ({n} waiting), from {from}", id.0));
+    let word = format!(
+        "{what} is {} — queued as order {} ({n} waiting), typed by the daemon at its next idle",
+        state.as_str(),
+        id.0
+    );
+    match args.json() {
+        true => println!("{}", json!({ "held": true, "queued": true, "pane": seat, "waiting": n })),
+        false => println!("{} {word}", p.yellow("…")),
+    }
+    Some(0)
 }
 
 /// The sentence as the seat reads it (`wsp-521`): it opens by saying who
@@ -3863,20 +3993,28 @@ fn silent_lines(store: &Store) -> Vec<String> {
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
     // The files unless `WSP_READ=api`; a silent or failed dial reads the files
-    // and says why, once (wsp-076).
+    // and says why, once (wsp-076). The orders, which under `WSP_ORDERS=store`
+    // are read through the API on the files path too (wsp-127), are not dialled
+    // for a second time after it failed: that is said on the same line.
+    let mut fell = false;
     let api = match wip_reads_api() {
         false => None,
         true => match api_state(store) {
             Ok(state) => Some(state),
             Err(why) => {
-                eprintln!("wsp: wip reads the files: {why}");
+                let orders = match crate::orders::mode() {
+                    crate::orders::Mode::Store => "; no orders drawn, as they are read through it too",
+                    _ => "",
+                };
+                eprintln!("wsp: wip reads the files: {why}{orders}");
+                fell = true;
                 None
             }
         },
     };
     let w = match &api {
         Some(state) => Wip::from_api(store, state),
-        None => Wip::from_managers(store),
+        None => Wip::from_managers(store, !fell),
     };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     // wsp-384: the planned lists wsp started on its own, for a day after.
@@ -3995,9 +4133,9 @@ pub(crate) struct Wip {
     /// governor's spawn a `helper`.
     pub spawned: std::collections::BTreeMap<String, serde_json::Value>,
     /// Seats whose prompt has held typed text, never submitted, for more than a
-    /// tick (`wsp-386`). Drawn as `typed, not sent` in place of `idle`. Nothing
-    /// fills it since wsp-030 deleted `typed-unsent.json`: the manager's
-    /// `order.refused` is the cause, and is `refusing`.
+    /// tick (`wsp-386`). Drawn as `typed, not sent` in place of `idle`. On the
+    /// files path nothing fills it since wsp-030 deleted `typed-unsent.json`;
+    /// under `orders::mode() == store` it is [`DeliveryColumns::unsent`].
     pub unsent: std::collections::BTreeSet<String>,
     /// Tells queued for a seat's next idle, or held for its link (`wsp-659`):
     /// seat -> how many. Drawn as `· N tells queued`; published as `queued`.
@@ -4005,10 +4143,13 @@ pub(crate) struct Wip {
     /// Seats whose supervisor has answered `failed` to a tell, tick after tick
     /// (`wsp-634`): pane → (ticks, the last reason). Drawn as `refusing delivery`,
     /// which is what is true when `typed, not sent` is not — nothing was typed.
+    /// Under `store`, [`DeliveryColumns::refusing`]: by seat, the attempts and the
+    /// failed order's `why`.
     pub refusing: std::collections::BTreeMap<String, (u64, String)>,
     /// Seats whose first work order was sent again and still started no turn
-    /// (`wsp-420`). Drawn as `order not received` in place of `idle`. Nothing
-    /// fills it since wsp-030 deleted `first-orders.json`.
+    /// (`wsp-420`). Drawn as `order not received` in place of `idle`. On the
+    /// files path nothing fills it since wsp-030 deleted `first-orders.json`;
+    /// under `store` it is [`DeliveryColumns::dropped`].
     pub dropped: std::collections::BTreeSet<String>,
     /// Seats that started a full-suite `cargo test` (`wsp-389`):
     /// [`crate::throttle::full_suite_seats`]. By seat, so a row reopened into a
@@ -4016,7 +4157,8 @@ pub(crate) struct Wip {
     /// seat`; published as `full_suite`.
     pub full_suite: std::collections::BTreeSet<String>,
     /// Seats in a shell command that waits on itself or on a bare `cat`
-    /// (`wsp-397`), with the seconds it has held: [`crate::repair::stuck_seats`].
+    /// (`wsp-397`), with the seconds it has held: [`crate::repair::stuck_seats`],
+    /// and under `store` the folded `seat.stuck` alone ([`stuck_folded`]).
     /// Drawn as a flag, published as `stuck`.
     pub stuck: std::collections::BTreeMap<String, (crate::stuck::Kind, i64)>,
     /// The far machines gone silent, and the seats on them (`docs/remote-agents.md`
@@ -4055,12 +4197,32 @@ struct Gathering {
     /// The census, each gone seat with its quiet time where one is known.
     agents: Vec<(crate::place::Seated, Option<i64>)>,
     since: BTreeMap<String, String>,
+    /// Delivery's seat columns from the orders machine, under
+    /// `orders::mode() == store` (wsp-127); `None` on the files path.
+    delivery: Option<DeliveryColumns>,
 }
 
 impl Gathering {
     /// The files' half, read as `wip` always has.
     fn files(store: &Store, agents: Vec<(crate::place::Seated, Option<i64>)>, since: BTreeMap<String, String>) -> Gathering {
+        Gathering::files_dialling(store, agents, since, true)
+    }
+
+    /// [`Gathering::files`], the orders read through the API only where
+    /// `dial` is set: not after `wip`'s own dial of it failed, whose line said
+    /// so. Not dialled, the delivery columns are drawn empty, as a failed read
+    /// draws them.
+    fn files_dialling(
+        store: &Store,
+        agents: Vec<(crate::place::Seated, Option<i64>)>,
+        since: BTreeMap<String, String>,
+        dial: bool,
+    ) -> Gathering {
         Gathering {
+            delivery: OrderReads::of(store).map(|r| match dial {
+                true => DeliveryColumns::read(&r, None, now_ms()),
+                false => DeliveryColumns::default(),
+            }),
             tasks: wip_tasks(store),
             bindings: store.bindings(),
             claims: store.claims(),
@@ -4072,6 +4234,164 @@ impl Gathering {
             since,
         }
     }
+}
+
+/// How long an order may sit `typed` before `wip` draws its seat `typed, not
+/// sent`: one of the daemon's 20 s ticks (`daemon::TICK`), the tick the files
+/// path's `typed-unsent.json` waited out (wsp-386).
+const ORDER_TICK_MS: u64 = 20_000;
+
+/// The clock the orders machine dates its events by: epoch milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Where `wip` reads the orders machine from, under `orders::mode() == store`
+/// (wsp-127): the store handle ([`crate::orders`], the daemon's open store in
+/// its own process and the API anywhere else), or a test's store.
+enum OrderReads<'a> {
+    Handle(&'a Store),
+    #[cfg(test)]
+    Db(wsp_server::SharedStore),
+}
+
+impl OrderReads<'_> {
+    /// The reads under `store`; `None` under `files`. A test's store
+    /// (`refusals::tests::open`) stands for `store`, as it does for the door.
+    fn of(store: &Store) -> Option<OrderReads<'_>> {
+        #[cfg(test)]
+        if let Some(db) = crate::refusals::TEST_DOOR.with(|d| d.borrow().clone()) {
+            return Some(OrderReads::Db(db));
+        }
+        (crate::orders::mode() == crate::orders::Mode::Store).then_some(OrderReads::Handle(store))
+    }
+
+    fn all(&self) -> Result<Vec<wsp_store_contract::Order>, crate::orders::Error> {
+        match self {
+            OrderReads::Handle(store) => crate::orders::all(store, API_BUDGET),
+            #[cfg(test)]
+            OrderReads::Db(db) => crate::orders::all_in(db),
+        }
+    }
+
+    fn typed_since(&self, since: wsp_store_contract::At) -> Result<BTreeSet<wsp_store_contract::OrderId>, crate::orders::Error> {
+        match self {
+            OrderReads::Handle(store) => crate::orders::typed_since(store, since, API_BUDGET),
+            #[cfg(test)]
+            OrderReads::Db(db) => crate::orders::typed_since_in(db, since),
+        }
+    }
+}
+
+/// `wip`'s delivery columns as the orders machine says them (wsp-127): what
+/// `typed-unsent.json`, `first-orders.json` and `refused-deliveries.json` said
+/// on the files path, by seat.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeliveryColumns {
+    /// A seat with an order `typed` for more than a tick ([`ORDER_TICK_MS`]),
+    /// or `queued` again after a refusal that counted (`attempts > 0`).
+    pub unsent: BTreeSet<String>,
+    /// A seat whose last order to settle `failed` (the delivery worker's
+    /// attempts ran out at the cap), as `refusals::Door::deaf` reads it: the
+    /// attempts, and the last refusal's `why`. A failed first order is
+    /// `dropped` instead.
+    pub refusing: BTreeMap<String, (u64, String)>,
+    /// A seat whose `first` order is `failed`.
+    pub dropped: BTreeSet<String>,
+}
+
+impl DeliveryColumns {
+    /// The columns of `orders`; `typed_lately` names the orders typed within
+    /// the last tick.
+    pub(crate) fn of<'a>(
+        orders: impl IntoIterator<Item = &'a wsp_store_contract::Order>,
+        typed_lately: &BTreeSet<wsp_store_contract::OrderId>,
+    ) -> DeliveryColumns {
+        use wsp_store_contract::OrderState as S;
+        let mut d = DeliveryColumns::default();
+        let mut settled: BTreeMap<&str, &wsp_store_contract::Order> = BTreeMap::new();
+        for o in orders {
+            let seat = o.to.0.as_str();
+            match o.state {
+                S::Typed if !typed_lately.contains(&o.id) => {
+                    d.unsent.insert(seat.to_string());
+                }
+                S::Queued if o.attempts > 0 => {
+                    d.unsent.insert(seat.to_string());
+                }
+                S::Failed if o.first => {
+                    d.dropped.insert(seat.to_string());
+                }
+                _ => {}
+            }
+            if matches!(o.state, S::Acknowledged | S::Done | S::Failed) {
+                let later = settled.get(seat).is_none_or(|was| order_number(&was.id) < order_number(&o.id));
+                if later {
+                    settled.insert(seat, o);
+                }
+            }
+        }
+        for (seat, o) in settled.into_iter().filter(|(_, o)| o.state == S::Failed && !o.first) {
+            let why = o.why.clone().unwrap_or_else(|| format!("order {} failed", o.id.0));
+            d.refusing.insert(seat.to_string(), (u64::from(o.attempts), why));
+        }
+        d
+    }
+
+    /// The columns as `reads` gives the orders, or as the mirror's `state`
+    /// does when `Wip::from_api` reads (wsp-076). Whether a `typed` order has
+    /// sat a tick is its `order.typed` event's moment, read through `reads`
+    /// only when some order is `typed`. A read that fails draws nothing and
+    /// says so on stderr: an order not read is not an order unsent.
+    fn read(reads: &OrderReads, state: Option<&wsp_store_contract::State>, now_ms: u64) -> DeliveryColumns {
+        let fetched;
+        let orders: Vec<&wsp_store_contract::Order> = match state {
+            Some(s) => s.orders.values().collect(),
+            None => match reads.all() {
+                Ok(o) => {
+                    fetched = o;
+                    fetched.iter().collect()
+                }
+                Err(e) => {
+                    eprintln!("wsp: wip read no orders: {e}");
+                    return DeliveryColumns::default();
+                }
+            },
+        };
+        let typed: BTreeSet<wsp_store_contract::OrderId> =
+            orders.iter().filter(|o| o.state == wsp_store_contract::OrderState::Typed).map(|o| o.id.clone()).collect();
+        let lately = match typed.is_empty() {
+            true => typed,
+            false => reads.typed_since(wsp_store_contract::At(now_ms.saturating_sub(ORDER_TICK_MS))).unwrap_or_else(|e| {
+                eprintln!("wsp: wip read no order's typing time: {e}");
+                typed
+            }),
+        };
+        DeliveryColumns::of(orders, &lately)
+    }
+}
+
+/// Where an order falls in its seat's sequence: `cpd-1-o12` is 12.
+fn order_number(id: &wsp_store_contract::OrderId) -> u64 {
+    id.0.rsplit_once("-o").and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+}
+
+/// `wip`'s `stuck` under the orders machine: each seat's open stall as the
+/// manager's `seat.stuck` was folded (`manager/<host>.stuck.json`, wsp-028),
+/// not `stuck-commands.json`. Whether the seat was told is its stall order's
+/// state (`repair::stuck_ordered`), which `wip` does not publish.
+fn stuck_folded<'a>(
+    store: &Store,
+    seats: impl IntoIterator<Item = &'a String>,
+    now: i64,
+) -> BTreeMap<String, (crate::stuck::Kind, i64)> {
+    seats
+        .into_iter()
+        .filter_map(|seat| {
+            let s = stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
+            Some((seat.clone(), (s.kind, s.secs)))
+        })
+        .collect()
 }
 
 /// Since when each seat `wip` draws has been in its state: what the fold dated
@@ -4133,7 +4453,8 @@ impl Wip {
     /// daemon's tick last stamped ([`crate::cmd_role::burners_stamped`],
     /// wsp-716), not a process table read here. A seat the manager does not run (one started
     /// in-process) is not here until adoption (wsp-029).
-    pub(crate) fn from_managers(store: &Store) -> Wip {
+    /// `dial_orders` unset leaves the orders unread ([`Gathering::files_dialling`]).
+    pub(crate) fn from_managers(store: &Store, dial_orders: bool) -> Wip {
         let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
         let census = &reading.census;
         let seen: Vec<crate::place::Seated> = census.seats().filter(|s| s.state != State::Empty).cloned().collect();
@@ -4157,7 +4478,7 @@ impl Wip {
                 })
             })
             .collect();
-        let read = Gathering::files(store, seen.into_iter().map(|s| (s, None)).collect(), since);
+        let read = Gathering::files_dialling(store, seen.into_iter().map(|s| (s, None)).collect(), since, dial_orders);
         let mut w = Wip::gathered(store, read, |agents, bindings| {
             let shells = crate::waiting::Shells::counted(
                 agents.iter().filter(|a| a.state == State::Idle && bindings.contains_key(a.seat.as_str())).map(|a| a.seat.as_str()),
@@ -4269,6 +4590,7 @@ impl Wip {
             alive: Box::new(|pid| crate::host::LOCAL.pid_runs(pid)),
             agents,
             since,
+            delivery: OrderReads::of(store).map(|r| DeliveryColumns::read(&r, Some(state), now_ms())),
         };
         // The moment readings stay out of the contract (wsp-076, the person's
         // decision): the seats' rss and shells and the host's disks and load
@@ -4301,7 +4623,22 @@ impl Wip {
         read: Gathering,
         probe: impl FnOnce(&[crate::place::Seated], &BTreeMap<String, Value>) -> Probed,
     ) -> Wip {
-        let Gathering { tasks, bindings, claims, spawned, lists, messages, alive, agents, since } = read;
+        let Gathering { tasks, bindings, claims, spawned, lists, messages, alive, agents, since, delivery } = read;
+        // Under the orders machine the four delivery columns are the orders'
+        // and the folded stall's (wsp-127): typed-unsent.json,
+        // first-orders.json, refused-deliveries.json and stuck-commands.json
+        // are not read.
+        let (unsent, refusing, dropped, stuck) = match delivery {
+            Some(d) => (d.unsent, d.refusing, d.dropped, stuck_folded(store, bindings.keys(), util::epoch_secs())),
+            None => {
+                let governors = store.governors();
+                let refusing = crate::refusals::refusing(store)
+                    .into_iter()
+                    .filter_map(|(scope, v)| crate::cmd_govern::seat_held(&scope, &governors).map(|s| (s.pane, v)))
+                    .collect();
+                (Default::default(), refusing, Default::default(), crate::repair::stuck_seats(store))
+            }
+        };
         let tasks = std::rc::Rc::new(tasks);
         let governors = store.governors();
         let agents_held = store.agents_held();
@@ -4349,18 +4686,12 @@ impl Wip {
             lists,
             since,
             spawned,
-            unsent: Default::default(),
+            unsent,
             queued: crate::wake::queued_tells(store),
-            refusing: {
-                let governors = store.governors();
-                crate::refusals::refusing(store)
-                    .into_iter()
-                    .filter_map(|(scope, v)| crate::cmd_govern::seat_held(&scope, &governors).map(|s| (s.pane, v)))
-                    .collect()
-            },
-            dropped: Default::default(),
+            refusing,
+            dropped,
             full_suite: crate::throttle::full_suite_seats(&store.state),
-            stuck: crate::repair::stuck_seats(store),
+            stuck,
             silent: crate::far::Silence::read(store),
         }
     }
@@ -4370,7 +4701,10 @@ impl Wip {
 /// `ioreg`, `pmset` and a `kill` per build holder, for [`Wip::from_api`]: the
 /// person's idle time (so `auto` is in force or away as on the files path),
 /// the clock and the cores as the beat read them, each holder's pid asked of
-/// kill(2). With no beat the idle time is unreadable, as where `ioreg` fails.
+/// kill(2), and under `WSP_JOBS=manager` a build's hold read from the
+/// manager's job table instead (wsp-052; the files path's `status_line` reads
+/// the beat there too). With no beat the idle time is unreadable, as where
+/// `ioreg` fails.
 ///
 /// The beat says 100 where `pmset` records no `CPU_Speed_Limit`, which the
 /// files path reads as no clock at all (Apple silicon prints none): an
@@ -4382,7 +4716,7 @@ fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> Strin
         speed_limit: f.and_then(|f| f.speed_limit_pct).filter(|&p| p < 100),
     };
     let idle = f.and_then(|f| f.hid_idle_secs);
-    crate::throttle::View::of_beat(&store.state, given, idle, &|pid| crate::host::LOCAL.pid_runs(pid)).status_line()
+    crate::throttle::View::of_beat(&store.state, given, idle).status_line()
 }
 
 /// The load warning with the tree-less CPU burners (wsp-691) under it: either
@@ -4403,7 +4737,7 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
     let five = f.load5_centi.map(centi).unwrap_or(one);
     let fifteen = f.load15_centi.map(centi).unwrap_or(five);
     let given = crate::throttle::Given { load1: one, cores: f.cpus as usize, speed_limit: f.speed_limit_pct };
-    let mut view = crate::throttle::View::of_beat(&store.state, given, None, &|pid| crate::host::LOCAL.pid_runs(pid));
+    let mut view = crate::throttle::View::of_beat(&store.state, given, None);
     view.load = Some((one, five, fifteen));
     view.warning(store.seat_cap())
 }
@@ -5249,7 +5583,7 @@ fn census_of(store: &Store, w: &Wip, cap_waits: Vec<String>, picked_up: bool) ->
 /// the files path (`WSP_READ` unset), so a reader of the reading prints what
 /// `wip --json` prints.
 pub(crate) fn wip_reading(store: &Store) -> wsp_view::wip::Census {
-    let w = Wip::from_managers(store);
+    let w = Wip::from_managers(store, true);
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
     let picked_up = !crate::pickup::wip_lines(store).is_empty() || !silent_lines(store).is_empty();
     census_of(store, &w, cap_waits, picked_up)
@@ -6673,6 +7007,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
+    crate::orders::health(store, &mut notes);
     crate::mirror::api_health(
         &store.state,
         crate::daemon::running(&store.state).as_deref(),
@@ -8834,6 +9169,201 @@ mod tests {
         assert!(row("w2:p1")["stuck"].is_null());
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert_eq!(text.matches("waiting on itself 6m").count(), 1, "{text}");
+    }
+
+    // ---- delivery under the orders machine (wsp-127) ----------------------
+
+    const STALL: &str = "until ! pgrep -f claude; do sleep 5; done";
+
+    /// An order sent to `seat` and typed under its lease, never answered:
+    /// the delivery worker's ask that nobody took.
+    fn typed_order(db: &wsp_server::SharedStore, seat: &str) -> wsp_store_contract::OrderId {
+        use wsp_store_contract::{Command, Fence, IdempotencyKey, LeaseName, Leases, Principal, SeatId};
+        let to = SeatId(seat.into());
+        let cmd = Command::OrderSend { to: to.clone(), text: "go".into(), first: false };
+        let id = crate::orders::send_in(db, cmd, &Principal::Person("ed".into())).unwrap();
+        let by = Principal::Wsp("wsp".into());
+        let lease = LeaseName::deliver(&to);
+        let token = Leases::take(&**db, &lease, &by, std::time::Duration::from_secs(60)).unwrap().expect("free");
+        let deliver = Command::OrderDeliver { order: id.clone(), fence: Fence { lease: lease.clone(), token } };
+        db.apply(deliver, IdempotencyKey(format!("test:deliver:{}", id.0)), by).unwrap();
+        Leases::release(&**db, &lease, token).unwrap();
+        id
+    }
+
+    /// An order to `seat` refused until the machine's attempts ran out.
+    fn failed_order(db: &wsp_server::SharedStore, seat: &str, first: bool, why: &str) {
+        let by = wsp_store_contract::Principal::Wsp("daemon".into());
+        let id = crate::orders::send_keyed_in(db, &wsp_store_contract::SeatId(seat.into()), "go", &by, first, &format!("test:{seat}:{first}"))
+            .unwrap();
+        crate::refusals::tests::fail(db, &id, why);
+    }
+
+    /// The manager's `seat.stuck` for `seat`, folded: a call `waited` seconds
+    /// old when it was heard at `heard`.
+    fn folded_stall(store: &Store, seat: &str, waited: i64, heard: i64) {
+        let local = crate::manager::Local {
+            host: "test-host".into(),
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 9,
+            exec_dir: store.state.join("exec"),
+        };
+        crate::manager::write_record(&store.state, &local, "token").unwrap();
+        let path = crate::fold::stuck_path(&store.state, "test-host");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let was: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
+        let mut all = was.as_object().cloned().unwrap_or_default();
+        all.insert(seat.into(), json!({ "command": STALL, "waited_secs": waited, "heard": heard }));
+        std::fs::write(&path, Value::Object(all).to_string()).unwrap();
+    }
+
+    /// Under `store`, an order typed two ticks ago draws `typed, not sent`, a
+    /// failed first order `order not received` and a manager stall `stuck`; and
+    /// `wip --json` is byte-identical to the files path's for the same facts
+    /// (the files path's `unsent` and `dropped` as `typed-unsent.json` and
+    /// `first-orders.json` filled them, its `stuck` from `stuck-commands.json`).
+    #[test]
+    fn under_the_orders_machine_wip_draws_the_files_paths_words_and_json_from_the_orders() {
+        let env = util::isolated("wip-orders-json");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        // `store` holds only under the manager, whose folded stall `stuck` reads
+        // (`isolated` holds the env lock and puts `WSP_HOST` back).
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+        let now = util::epoch_secs();
+
+        // The files path's facts: a stall recorded in stuck-commands.json.
+        std::fs::write(
+            store.state.join("stuck-commands.json"),
+            json!({ "w3:p1": { "kind": "self", "command": STALL, "at": now - 400, "told": true } }).to_string(),
+        )
+        .unwrap();
+        let mut files = wip_world();
+        files.agents[0].state = State::Idle;
+        files.unsent.insert("w2:p1".into());
+        files.dropped.insert("w1:p1".into());
+        files.stuck = crate::repair::held_all(&store).into_iter().map(|(s, h)| (s, (h.kind, now - h.at))).collect();
+        assert_eq!(files.stuck.len(), 1, "the files path reads its stall");
+
+        // The same facts in the orders machine and the fold.
+        let opened = crate::refusals::tests::open(&store, &["w1:p1", "w2:p1", "w3:p1"]);
+        typed_order(&opened.0, "w2:p1");
+        failed_order(&opened.0, "w1:p1", true, "no prompt came up");
+        folded_stall(&store, "w3:p1", 400, now);
+        let reads = OrderReads::of(&store).expect("the test's store stands for `store`");
+        let two_ticks = now_ms() + 2 * ORDER_TICK_MS;
+        let cols = DeliveryColumns::read(&reads, None, two_ticks);
+        assert_eq!(cols.unsent, BTreeSet::from(["w2:p1".to_string()]), "typed two ticks ago");
+        assert_eq!(cols.dropped, BTreeSet::from(["w1:p1".to_string()]), "a failed first order");
+        assert!(cols.refusing.is_empty(), "a failed first order is not refusing: {:?}", cols.refusing);
+        assert!(DeliveryColumns::read(&reads, None, now_ms()).unsent.is_empty(), "typed this tick is not unsent yet");
+
+        let mut stored = wip_world();
+        stored.agents[0].state = State::Idle;
+        stored.unsent = cols.unsent;
+        stored.dropped = cols.dropped;
+        stored.refusing = cols.refusing;
+        stored.stuck = stuck_folded(&store, stored.bindings.keys().chain(["w3:p1".to_string()].iter()), now);
+
+        let (a, b) = (wip_json(&files), wip_json(&stored));
+        let row = |j: &Value, pane: &str| j["agents"].as_array().unwrap().iter().find(|r| r["pane"] == pane).unwrap().clone();
+        assert_eq!(row(&b, "w2:p1")["unsent"], true);
+        assert_eq!(row(&b, "w1:p1")["dropped"], true);
+        assert_eq!(row(&b, "w3:p1")["stuck"]["kind"], "self");
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap(), "byte-identical for the same facts");
+        let text = wip_lines(&stored, &Paint::new(), false).join("\n");
+        assert!(text.contains(UNSENT_WORD) && text.contains(DROPPED_WORD), "{text}");
+        assert!(text.contains("waiting on itself"), "{text}");
+        assert_eq!(text, wip_lines(&files, &Paint::new(), false).join("\n"));
+    }
+
+    /// Under `store`, the gather reads none of typed-unsent.json,
+    /// first-orders.json, refused-deliveries.json or stuck-commands.json: each
+    /// names a seat the orders do not, which the files path draws and `store`
+    /// does not. The store handle's reading and the mirror's `state` through
+    /// `Wip::from_api` give the same columns.
+    #[test]
+    fn under_the_orders_machine_wip_reads_none_of_the_delivery_files() {
+        let env = util::isolated("wip-orders-files");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        // `store` holds only under the manager, whose folded stall `stuck` reads
+        // (`isolated` holds the env lock and puts `WSP_HOST` back).
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+        let now = util::epoch_secs();
+        for seat in ["w1:p1", "w2:p1", "w3:p1", "w9:p9"] {
+            store.set_binding(seat, json!({ "pane_id": seat }));
+        }
+        store.set_governor("wsp", json!({ "workspace": "w9:p9", "pane": "w9:p9", "host": util::hostname() }));
+        let file = |name: &str, v: Value| std::fs::write(store.state.join(name), v.to_string()).unwrap();
+        file("typed-unsent.json", json!({ "w9:p9": { "at": now - 100 } }));
+        file("first-orders.json", json!({ "w9:p9": { "at": now - 100, "sent": 2 } }));
+        file("refused-deliveries.json", json!({ "wsp": { "n": 4, "since": now - 100, "why": "from the file" } }));
+        file("stuck-commands.json", json!({ "w9:p9": { "kind": "self", "command": STALL, "at": now - 100, "told": true } }));
+
+        // The files path is the rollback under the manager (wsp-128): `store`
+        // is the default there, so the files read names it.
+        std::env::set_var(crate::orders::ENV, "files");
+        let by_files = Wip::live(&store);
+        std::env::remove_var(crate::orders::ENV);
+        assert!(by_files.refusing.contains_key("w9:p9"), "the files path reads refused-deliveries.json: {:?}", by_files.refusing);
+        assert!(by_files.stuck.contains_key("w9:p9"), "the files path reads stuck-commands.json: {:?}", by_files.stuck);
+
+        let opened = crate::refusals::tests::open(&store, &["w1:p1", "w2:p1", "w3:p1"]);
+        failed_order(&opened.0, "w1:p1", true, "no prompt came up");
+        failed_order(&opened.0, "w2:p1", false, "the seat refused it");
+        folded_stall(&store, "w3:p1", 400, now);
+        let w = Wip::live(&store);
+        assert_eq!(w.dropped, BTreeSet::from(["w1:p1".to_string()]));
+        assert_eq!(w.refusing, BTreeMap::from([("w2:p1".to_string(), (3, "the seat refused it".to_string()))]));
+        assert!(w.unsent.is_empty(), "{:?}", w.unsent);
+        assert_eq!(w.stuck.keys().collect::<Vec<_>>(), ["w3:p1"], "the folded stall alone");
+        assert_eq!(w.stuck["w3:p1"].0, crate::stuck::Kind::SelfWait);
+
+        // The mirror's `state`, its seats carrying the same bindings.
+        let mut state = opened.0.snapshot().unwrap().0;
+        for s in state.seats.values_mut() {
+            s.fields.insert(crate::mirror::BINDING.into(), json!({ "pane_id": s.id.0 }).to_string());
+        }
+        let reads = OrderReads::of(&store).unwrap();
+        let later = now_ms() + 2 * ORDER_TICK_MS;
+        assert_eq!(DeliveryColumns::read(&reads, Some(&state), later), DeliveryColumns::read(&reads, None, later));
+        let api = Wip::from_api(&store, &state);
+        assert_eq!((&api.unsent, &api.dropped, &api.refusing), (&w.unsent, &w.dropped, &w.refusing));
+        assert_eq!(api.stuck.keys().collect::<Vec<_>>(), ["w3:p1"]);
+        drop(opened);
+    }
+
+    /// The columns' rules, on orders alone: `typed` past a tick or `queued`
+    /// again after a counted refusal is unsent; the last settled order failed
+    /// is refusing, unless an acknowledged one came after it.
+    #[test]
+    fn delivery_columns_follow_the_orders_states() {
+        use wsp_store_contract::{Order, OrderId, OrderState as S, Principal, SeatId};
+        let o = |id: &str, state: S, attempts: u32, first: bool, why: Option<&str>| Order {
+            id: OrderId(id.into()),
+            from: Principal::Person("ed".into()),
+            to: SeatId(id.rsplit_once("-o").unwrap().0.into()),
+            text: "go".into(),
+            state,
+            attempts,
+            first,
+            why: why.map(str::to_string),
+        };
+        let orders = [
+            o("a-o1", S::Typed, 0, false, None),
+            o("b-o1", S::Typed, 0, false, None),
+            o("c-o1", S::Queued, 1, false, Some("busy")),
+            o("d-o1", S::Queued, 0, false, None),
+            o("e-o1", S::Failed, 3, false, Some("deaf")),
+            o("f-o1", S::Failed, 3, false, Some("deaf")),
+            o("f-o2", S::Acknowledged, 0, false, None),
+        ];
+        let lately = BTreeSet::from([OrderId("b-o1".into())]);
+        let d = DeliveryColumns::of(orders.iter(), &lately);
+        assert_eq!(d.unsent, BTreeSet::from(["a".to_string(), "c".to_string()]), "typed past a tick, or queued after a counted refusal");
+        assert_eq!(d.refusing, BTreeMap::from([("e".to_string(), (3, "deaf".to_string()))]));
+        assert!(d.dropped.is_empty());
     }
 
     #[test]

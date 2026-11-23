@@ -808,6 +808,18 @@ pub trait Place {
     /// to all of it, which is the truth about what it knows.
     fn tell(&self, seat: &Seat, text: &str) -> Result<Delivery>;
 
+    /// [`Place::tell`] under an id the caller keeps: `order` is the store's
+    /// order id and goes to the host as the delivery id, so a wait that ran out
+    /// and is asked again under the same `order` is one delivery. The seat keeps
+    /// no `deliver.pending` for it; the id is wsp's store's, not the seat's
+    /// directory's.
+    ///
+    /// [`Refusal::Unsupported`] by default: a backend with no supervisor to ask
+    /// has no id to hand over, and `tell` is its way.
+    fn deliver_order(&self, _seat: &Seat, _order: &str, _text: &str) -> Result<Delivery> {
+        Err(Refusal::Unsupported("deliver under an order id"))
+    }
+
     /// Submit whatever is sitting unsent in the agent's input.
     ///
     /// The one verb here that exists because another verb cannot keep a promise

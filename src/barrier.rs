@@ -48,13 +48,8 @@ use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::Args;
 
-/// When a pid started, asked of the in-process host: what tells a barrier's
-/// run from a process that took its pid after it.
-fn started(pid: u32) -> Result<Option<String>, ()> {
-    crate::host::Host::started(&crate::host::LOCAL, pid)
-}
 #[cfg(test)]
-pub(crate) use crate::checks::{ps_says, push, text};
+pub(crate) use crate::checks::{push, text};
 pub(crate) use crate::checks::{wait_after, RETRY_BACKOFF, TRIES, instant, Check, Ending, Run, State, Suite};
 
 /// What `wsp wip` and the seat's own label call a check: against its list,
@@ -154,7 +149,7 @@ pub(crate) fn would_open(g: &Group, gone: &dyn Fn(&str) -> bool) -> bool {
         None => true,
         Some(c) => match c.pane.as_deref() {
             Some(p) => gone(p),
-            None => c.wait_before_next_try(&started).is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w),
+            None => c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w),
         },
     }
 }
@@ -247,14 +242,17 @@ pub(crate) fn open_within(
                     c.ending = Ending::Ended;
                 }
                 Some(_) => return false,
-                None if c.wait_before_next_try(&started).is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w) => {
+                None if c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w) => {
                     if !admit() {
                         return false;
                     }
                     let before = c.suite;
-                    let died = c.run.as_ref().filter(|_| c.run_died(&started)).map(|r| r.pid);
+                    let died = c.run.as_ref().filter(|_| c.run_died()).map(|r| r.pid);
+                    // A dead run's lease is left where it stopped beating.
+                    if let Some(r) = c.run.take().filter(|_| died.is_some()) {
+                        r.forget();
+                    }
                     c.at = util::now_iso();
-                    c.run = None;
                     // A suite that never finished, or one not asked for until
                     // now, is a run and not another try of the agent's start;
                     // a finished suite's start is what is retried. A run that
@@ -300,7 +298,7 @@ pub(crate) enum Opening {
 /// [`open_within`], except that a mechanical run that reads as dead while
 /// `held` says a live process has its tree lock is left alone. **Whoever holds
 /// the lock counts**, not only the pid the entry records: a copy that did start
-/// has replaced that pid with its own (`note_pid`), and the lock is still the
+/// has replaced that run with its own (`note_run_lease`), and the lock is still the
 /// first run's.
 pub(crate) fn open_unless_held(
     store: &Store,
@@ -425,23 +423,27 @@ pub(crate) fn note_run(store: &Store, list: &str, at: usize, suite: Suite, by: O
     })
 }
 
-/// Record that this process is making the open check's mechanical run, so a
-/// run that is killed is seen to be dead and not believed for hours. Only while
-/// the entry reads `suite:running`.
-pub(crate) fn note_pid(store: &Store, list: &str, at: usize) -> bool {
-    let Some(run) = Run::this(&started) else { return false };
-    change(store, list, at, |g| match g.checks.iter_mut().rev().find(|c| c.open() && c.suite == Some(Suite::Running)) {
+/// Record that this process is making the open check's mechanical run, with
+/// the lease it beats while it lives (wsp-057), so a run that is killed is
+/// seen to be dead and not believed for hours. Only while the entry reads
+/// `suite:running`. The lease is the caller's to hold for the whole run;
+/// `None` where it could not be taken or recorded.
+pub(crate) fn note_run_lease(store: &Store, list: &str, at: usize) -> Option<crate::lease::Lease> {
+    let lease = crate::lease::Lease::take(Run::lease_for_this(), crate::lease::GRACE)?;
+    let run = Run::this(&lease)?;
+    let noted = change(store, list, at, |g| match g.checks.iter_mut().rev().find(|c| c.open() && c.suite == Some(Suite::Running)) {
         Some(c) => {
             c.run = Some(run);
             true
         }
         None => false,
-    })
+    });
+    noted.then_some(lease)
 }
 
 /// Whether the open check on `g` is a mechanical run whose process has died.
 pub(crate) fn run_died(g: &Group) -> bool {
-    running(g).is_some_and(|c| c.run_died(&started))
+    running(g).is_some_and(|c| c.run_died())
 }
 
 /// The open check's suite state on group `at`, if it has one.
@@ -522,7 +524,7 @@ pub(crate) fn lines(p: &Paint, g: &Group) -> Vec<String> {
             if let Some(s) = c.suite {
                 parts.push(format!("suite {}", s.as_str()));
             }
-            if c.run_died(&started) {
+            if c.run_died() {
                 parts.push("barrier run died".into());
             }
             if let Some(b) = &c.by {
@@ -710,25 +712,13 @@ mod tests {
     use super::*;
     use crate::model::{parse_groups, render_groups};
 
-    #[test]
-    fn only_an_exit_one_with_nothing_printed_from_ps_is_a_pid_that_is_gone() {
-        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Ss\n"), Ok(Some("Tue_Nov_4_11:19:05_2026".into())));
-        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Z+\n"), Ok(None), "a defunct process is gone");
-        assert_eq!(ps_says(Some(0), b"Tue Nov  4 11:19:05 2026 Zs\n"), Ok(None));
-        assert_eq!(ps_says(Some(1), b""), Ok(None), "no such process");
-        assert_eq!(ps_says(Some(1), b"\n"), Ok(None));
-        assert_eq!(ps_says(None, b""), Err(()), "killed by a signal says nothing of the pid");
-        assert_eq!(ps_says(Some(2), b""), Err(()));
-        assert_eq!(ps_says(Some(1), b"Tue Nov  4 11:19:05 2026\n"), Err(()));
-    }
-
     /// `wsp-391`: the run reads dead but holds the tree lock, so the tick starts
     /// no copy of it; the same record with nobody holding the lock is retaken.
     #[test]
     fn a_dead_reading_run_that_holds_the_tree_lock_is_not_started_again() {
         let (_env, store) = scratch("held-run");
         let w = list(&store, &[&["m-1"]]);
-        let (_, _retake) = running_with(&store, Run { pid: 2_000_000_000, started: "x".into() });
+        let (_, _retake) = running_with(&store, dead(2_000_000_000));
         let try_it = |held: bool| open_unless_held(&store, &w, 1, None, None, Mechanical::Yes, &|_: &str| false, &|| true, &|| held);
         assert!(matches!(try_it(true), Opening::Held));
         assert_eq!(checks(&store, 1)[0].tries, 1, "nothing was written");
@@ -743,10 +733,10 @@ mod tests {
         let (_env, store) = scratch("copy-pid");
         let w = list(&store, &[&["m-1"]]);
         let lock = _env.state().join("lock");
-        let (_, _retake) = running_with(&store, Run { pid: 2_000_000_000, started: "x".into() });
+        let (_, _retake) = running_with(&store, dead(2_000_000_000));
         let first = crate::check::TreeLock::take(lock.clone(), std::time::Duration::from_secs(1)).unwrap();
         change(&store, "run", 1, |g| {
-            g.checks.last_mut().unwrap().run = Some(Run { pid: 2_000_000_001, started: "y".into() });
+            g.checks.last_mut().unwrap().run = Some(dead(2_000_000_001));
             true
         });
         let held = || crate::check::TreeLock::live(&lock);
@@ -756,40 +746,9 @@ mod tests {
         assert!(matches!(t(&held), Opening::Opened(_)));
     }
 
-    #[test]
-    fn this_process_is_not_gone_and_a_pid_nothing_has_is() {
-        let me = Run::this(&started).unwrap();
-        assert!(!me.gone(&started));
-        let none = Run { pid: 4_000_000, started: me.started.clone() };
-        assert!(none.gone(&started));
-    }
-
-    /// A run whose process has died and is not reaped is still a pid with a
-    /// start time; it reads as gone, so the barrier is retaken.
-    #[test]
-    fn a_run_whose_pid_is_defunct_reads_as_gone() {
-        let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
-        let pid = child.id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let stat = || {
-            let o = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        };
-        while !stat().starts_with('Z') && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(stat().starts_with('Z'), "the child is a zombie until it is waited on");
-        let (_env, store) = scratch("zombie-run");
-        let _w = list(&store, &[&["m-1"]]);
-        // the start it had while it lived: ps still gives one for a zombie
-        let o = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().unwrap();
-        let started = String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().join("_");
-        let run = Run { pid, started };
-        assert!(run.gone(&super::started), "a defunct pid is not a run that is going");
-        let (_, retake) = running_with(&store, run);
-        assert!(run_died(&store.worklist("run").unwrap().groups()[0]));
-        assert!(matches!(retake(), Some(o) if o.retaken && o.died == Some(pid)));
-        child.wait().unwrap();
+    /// A run whose lease is nowhere: gone.
+    fn dead(pid: u32) -> Run {
+        Run { pid, lease: format!("{pid}-0.nowhere.run") }
     }
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
@@ -827,7 +786,7 @@ mod tests {
             tries: 3,
             gave_up: true,
             suite: Some(Suite::Red),
-            run: Some(Run { pid: 25037, started: "Tue_Nov_4_11:19:05_2026".into() }),
+            run: Some(Run { pid: 25037, lease: "25037-1763639349.run".into() }),
             by: Some("wsp".into()),
         };
         let bare = Check::opened(None, None);
@@ -888,7 +847,7 @@ mod tests {
     }
 
     /// `wsp-369`: a barrier run killed by hand leaves `suite:running`; the entry
-    /// names the run's process, and a gone one is retaken at once.
+    /// names the run's lease, and a run whose lease is gone is retaken at once.
     fn running_with(store: &Store, run: Run) -> (Option<Opened>, impl Fn() -> Option<Opened> + '_) {
         let never = |_: &str| false;
         assert!(open_within(store, &store.worklist("run").unwrap(), 1, None, None, Mechanical::Yes, &never, &|| true).is_some());
@@ -903,7 +862,7 @@ mod tests {
     fn a_run_whose_process_is_gone_is_retaken_at_once_and_counts_a_try() {
         let (_env, store) = scratch("dead-run");
         let _w = list(&store, &[&["m-1"]]);
-        let (_, retake) = running_with(&store, Run { pid: 2_000_000_000, started: "Tue_Nov_4_11:19:05_2026".into() });
+        let (_, retake) = running_with(&store, dead(2_000_000_000));
         let g = store.worklist("run").unwrap().groups()[0].clone();
         assert!(run_died(&g) && would_open(&g, &|_| false));
         let o = retake().expect("a dead run is not waited out");
@@ -917,7 +876,7 @@ mod tests {
     fn a_run_that_dies_every_time_stops_at_the_tries() {
         let (_env, store) = scratch("dead-run-tries");
         let _w = list(&store, &[&["m-1"]]);
-        let dead = Run { pid: 2_000_000_000, started: "x".into() };
+        let dead = dead(2_000_000_000);
         let (_, retake) = running_with(&store, dead.clone());
         let mut n = 1;
         while let Some(o) = retake() {
@@ -932,22 +891,26 @@ mod tests {
     }
 
     #[test]
-    fn a_run_whose_process_is_alive_is_left_alone() {
+    fn a_run_that_beats_its_lease_is_left_alone() {
         let (_env, store) = scratch("live-run");
         let _w = list(&store, &[&["m-1"]]);
-        let (_, retake) = running_with(&store, Run::this(&started).expect("ps reads this process"));
+        let lease = crate::lease::Lease::take(Run::lease_for_this(), crate::lease::GRACE).unwrap();
+        let (_, retake) = running_with(&store, Run::this(&lease).expect("a lease path with no space"));
         let g = store.worklist("run").unwrap().groups()[0].clone();
         assert!(!run_died(&g) && !would_open(&g, &|_| false));
         assert!(retake().is_none());
     }
 
     #[test]
-    fn a_pid_that_has_been_reused_is_a_dead_run() {
-        let (_env, store) = scratch("reused-run");
+    fn a_run_whose_lease_aged_out_is_a_dead_run_whatever_its_pid() {
+        let (_env, store) = scratch("aged-run");
         let _w = list(&store, &[&["m-1"]]);
-        let mut other = Run::this(&started).expect("ps reads this process");
-        other.started = "Mon_Jan_1_00:00:00_2001".into();
-        let (_, retake) = running_with(&store, other);
+        let path = Run::dir().join("4000000000-1.run");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        let old = std::time::SystemTime::now() - crate::lease::GRACE * 2;
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        let (_, retake) = running_with(&store, Run { pid: std::process::id(), lease: "4000000000-1.run".into() });
         assert!(run_died(&store.worklist("run").unwrap().groups()[0]));
         assert!(retake().is_some_and(|o| o.died == Some(std::process::id())));
     }
@@ -956,10 +919,10 @@ mod tests {
     fn the_pid_is_written_and_read_back_and_dropped_when_the_run_has_a_result() {
         let (_env, store) = scratch("pid-text");
         let _w = list(&store, &[&["m-1"]]);
-        let (_, _retake) = running_with(&store, Run { pid: 25037, started: "Tue_Nov_4_11:19:05_2026".into() });
+        let (_, _retake) = running_with(&store, Run { pid: 25037, lease: "25037-1763639349.run".into() });
         let g = store.worklist("run").unwrap().groups()[0].clone();
         let t = text(&g.checks);
-        assert!(t.contains("suite:running pid:25037@Tue_Nov_4_11:19:05_2026"), "{t}");
+        assert!(t.contains("suite:running pid:25037@lease=25037-1763639349.run"), "{t}");
         let mut back = Vec::new();
         push(&mut back, &t);
         assert_eq!(back, g.checks);
