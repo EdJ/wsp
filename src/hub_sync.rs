@@ -220,17 +220,34 @@ pub(crate) fn dial(home: &std::path::Path) -> Result<Client, String> {
 /// why not.
 pub(crate) type Hand<'a> = dyn Fn(&wsp_store_contract::SeatId, &str, &Principal, &str) -> Result<String, String> + 'a;
 
+/// What keeps a tell for a seat's next idle under `WSP_ORDERS=files`: the
+/// seats layer's held-tell spool, which this layer cannot reach, so the daemon
+/// lends it ([`install_spool`]).
+pub(crate) type Spool = fn(&Store, &str, &str);
+
+static SPOOL: std::sync::OnceLock<Spool> = std::sync::OnceLock::new();
+
+/// Lend the worker the held-tell spool (the daemon's `wake::hold_tell`). Set
+/// once; a second call is ignored.
+pub(crate) fn install_spool(spool: Spool) {
+    let _ = SPOOL.set(spool);
+}
+
 /// The daemon's [`Hand`]: an order through the orders machine under
-/// `WSP_ORDERS=store`; else the seat's held-tell spool, typed at its next idle.
+/// `WSP_ORDERS=store`; else the seat's held-tell spool, typed at its next
+/// idle. With no spool lent, the message stays queued on the hub.
 pub(crate) fn hand_to_orders(store: &Store) -> impl Fn(&wsp_store_contract::SeatId, &str, &Principal, &str) -> Result<String, String> + '_ {
     move |seat, text, from, key| match crate::orders::mode() {
         crate::orders::Mode::Store => {
             crate::orders::send_keyed(store, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
         }
-        crate::orders::Mode::Files => {
-            crate::wake::hold_tell(store, &seat.0, text);
-            Ok(format!("held for {}", seat.0))
-        }
+        crate::orders::Mode::Files => match SPOOL.get() {
+            Some(spool) => {
+                spool(store, &seat.0, text);
+                Ok(format!("held for {}", seat.0))
+            }
+            None => Err("no held-tell spool in this process to keep it for the seat".into()),
+        },
     }
 }
 

@@ -619,6 +619,11 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // thread syncs the shared workspaces with it. Without one, nothing starts.
     // What the hub-lease follower cannot reach from below (wsp-466).
     crate::hub_lease::install(|s, row, why| crate::cmd_spawn::release_lost(s, row, why).map(|_| ()), seat_alive);
+    // And the held-tell spool a message from another user waits in under
+    // `WSP_ORDERS=files` (wsp-470).
+    crate::hub_sync::install_spool(|s, seat, text| {
+        crate::wake::hold_tell(s, seat, text);
+    });
     let _sync = crate::hub_sync::start(store);
 
     // Every executor's ssh master, held open on this machine. Inert until
