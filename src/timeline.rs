@@ -1926,6 +1926,8 @@ pub(crate) struct RowFigures {
     /// What the row's log says it was waiting on, from each moment (`wsp-559`):
     /// the seat idle is named by the latest one.
     pub markers: Vec<(i64, String)>,
+    /// When the seat waited on a shell of its own, `(from, line)` ([`own_shells`]).
+    pub shells: Vec<(i64, i64)>,
     /// Seconds between a row's attempts (`compounding-217`): parked or waiting
     /// to be restarted, or sent back after a review and reopened. Named gaps
     /// of their own, so neither the seat finishing nor the seat idle.
@@ -2021,8 +2023,8 @@ pub(crate) fn idle_markers(i: &Inputs) -> Vec<(i64, String)> {
         out.push((t, w.waiting(&q.map_or("a prompt on its screen".to_string(), |q| format!("question {q}")))));
     }
     for (t, l) in &i.cycle {
-        let why = if l.contains("of its own still running") && l.contains(" is waiting on ") {
-            "the seat waiting on shells of its own (wakes when they end)".to_string()
+        let why = if own_shell_line(l, id).is_some() {
+            crate::wallbuckets::OWN_SHELLS.to_string()
         } else if l.contains("A verifier found a problem") && l.starts_with("tell ") {
             "sent back: the verdict with the governor".into()
         } else if l.starts_with(&format!("tell {id}: not delivered")) || l.starts_with(&format!("told {id}: not delivered")) {
@@ -2053,6 +2055,53 @@ pub(crate) fn idle_markers(i: &Inputs) -> Vec<(i64, String)> {
         out.push((*t, why));
     }
     out.sort_by_key(|m| m.0);
+    out
+}
+
+/// How long the shell a run line says the row's seat waits on has run, where
+/// the line is one of the two the run writes for it: the held line (`… r-1
+/// (cpd-1) is waiting on 2 shells of its own still running`, no age: 0) and the
+/// turn-over line the governor is told (`r-1 (cpd-1): turn over, waiting on its
+/// own `sh` (`11m`)`).
+fn own_shell_line(l: &str, id: &str) -> Option<i64> {
+    let named = l.contains(&format!("{id} ("));
+    if named && l.contains("of its own still running") && l.contains(" is waiting on ") {
+        return Some(0);
+    }
+    let rest = l.split_once(&format!("{id} ("))?.1.split_once("): turn over, waiting on its own `")?.1;
+    let age = rest.split_once("` (`").and_then(|(_, a)| a.split_once('`')).map(|(a, _)| a).unwrap_or("");
+    Some(age_secs(age).unwrap_or(0))
+}
+
+/// The seconds in an age as [`util::duration_human`] writes it (`45s`, `11m`,
+/// `1h5m`, `2d3h`); `None` for anything else (`just now`).
+fn age_secs(s: &str) -> Option<i64> {
+    let (mut total, mut n, mut any) = (0i64, String::new(), false);
+    for c in s.trim().chars() {
+        if c.is_ascii_digit() {
+            n.push(c);
+            continue;
+        }
+        let unit = match c {
+            'd' => 86_400,
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        total += n.parse::<i64>().ok()? * unit;
+        n.clear();
+        any = true;
+    }
+    (any && n.is_empty()).then_some(total)
+}
+
+/// When the row's seat waited on a shell of its own, `(from, line)`: from when
+/// the shell started (the line less the age it gives) to the run's line
+/// (`compound-react-042`). The sweep runs each on to the seat's next turn.
+pub(crate) fn own_shells(i: &Inputs) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = i.cycle.iter().filter_map(|(t, l)| own_shell_line(l, &i.id).map(|age| (t - age, *t))).collect();
+    out.sort_unstable();
     out
 }
 
@@ -2104,6 +2153,7 @@ pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
     let mut f = figures_of(&phases, &seat);
     f.blocked = blocked_spans(&i, f.end);
     f.markers = idle_markers(&i);
+    f.shells = own_shells(&i);
     (f.spawn_to_first, f.verifier_spawn_to_first, f.verifier_test_secs, f.verdict_to_despawn) = fixed_of(&i, &phases);
     f
 }
@@ -2366,6 +2416,42 @@ mod tests {
         assert_eq!(at(1400), "waiting on a person's answer (a prompt on its screen)", "another row's wait is not this row's");
         assert!(!m.iter().any(|x| x.1.contains("m-x") || x.1.contains("m-other")), "{m:?}");
         assert_eq!(m.iter().filter(|x| x.1.contains("m-g")).count(), 2, "the question and its held line are one reason");
+    }
+
+    /// compound-react-042: 024's seat ran five baseline trials in a tracked
+    /// background shell. The run wrote its turn-over line (22:21:04, the shell
+    /// `11m` old), told it at 22:23:07, and wrote nothing more until 23:10:31,
+    /// when the shell ended and the seat moved: the 47 minutes are the seat's
+    /// own shells, not "told" and not "none recorded".
+    #[test]
+    fn a_seat_on_its_own_trial_shell_is_its_own_shells_not_the_tell_or_none_recorded() {
+        use crate::wallbuckets::{group_wall, seat_idle_reasons, Class, MemberIn, Span, NONE_RECORDED, OWN_SHELLS};
+        let at = |hms: &str| util::epoch_of(&format!("2026-11-19T{hms}Z"));
+        let id = "compound-react-024";
+        let mut i = Inputs { id: id.into(), ..Default::default() };
+        i.events.push(ev(at("22:05:00"), "task-claimed", json!({"id": id})));
+        i.events.push(ev(at("23:14:00"), "task-review", json!({"id": id})));
+        i.cycle.push((at("22:21:04"), "tell retro-8: compound-react-024 (cpd-79): turn over, waiting on its own `sh` (`11m`); its last words: \"Five 10-minute baseline trials are running".into()));
+        i.cycle.push((at("22:23:07"), "told compound-react-024: it has the sentence".into()));
+        i.cycle.push((at("22:23:07"), "tell retro-8: compound-react-024 (cpd-79): this member's seat reads idle with this row still at doing — told it to finish".into()));
+        assert_eq!(own_shells(&i), vec![(at("22:10:04"), at("22:21:04"))], "from the shell's start, the line less its age");
+        assert_eq!(own_shell_line("tell l: r-1 (cpd-1): turn over, waiting on its own `cargo test` (`1h5m`); its", "r-1"), Some(3900));
+        assert_eq!(own_shell_line("tell l: r-1 (cpd-1): turn over, waiting on its own `a shell` (`just now`); its", "r-1"), Some(0));
+        assert_eq!(own_shell_line("tell l: r-12 (cpd-1): turn over, waiting on its own `sh` (`2m`); its", "r-1"), None, "another row's line");
+        let m = MemberIn {
+            id: id.into(),
+            spans: vec![Span { start: at("22:05:00"), end: at("22:05:10"), class: Class::Start }, Span { start: at("22:05:10"), end: at("23:15:00"), class: Class::Seat }],
+            active: vec![(at("22:05:10"), at("22:21:00")), (at("23:10:31"), at("23:15:00"))],
+            measured: true,
+            markers: idle_markers(&i),
+            shells: own_shells(&i),
+            ..Default::default()
+        };
+        let g = group_wall(&[m], None, Some(at("23:15:00"))).unwrap();
+        let by = seat_idle_reasons(g.waits.iter().map(|((_, c), s)| (c.as_str(), *s)));
+        assert_eq!(by.get(OWN_SHELLS), Some(&(at("23:10:31") - at("22:21:00"))), "{by:?}");
+        assert!(!by.keys().any(|k| k.starts_with("told") || k == NONE_RECORDED), "{by:?}");
+        assert_eq!(by.values().sum::<i64>(), at("23:10:31") - at("22:21:00"), "every idle second carries one reason");
     }
 
     /// The run's lines say `told`, not `tell`, for a row's own seat (`compounding-465`).

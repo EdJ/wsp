@@ -275,7 +275,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         for m in &g.members {
             let mut f = figures(m);
             let seat_filled = fill_from_seat(&mut f, cost["groups"].get(gi).and_then(|c| c["members"].as_array()).and_then(|ms| ms.iter().find(|x| x["task"] == m.as_str())).map(|x| &x["total"]));
-            sweep.push(crate::wallbuckets::MemberIn { id: m.clone(), spans: f.spans.clone(), active: f.active.clone(), blocked: f.blocked.clone(), measured: f.measured, markers: f.markers.clone() });
+            sweep.push(crate::wallbuckets::MemberIn { id: m.clone(), spans: f.spans.clone(), active: f.active.clone(), blocked: f.blocked.clone(), measured: f.measured, markers: f.markers.clone(), shells: f.shells.clone() });
             if f.end > 0 && f.start > 0 && (gstart == 0 || f.start < gstart) {
                 gstart = f.start;
             }
