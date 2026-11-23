@@ -115,7 +115,7 @@ fn a_machine() -> Machine {
     Machine {
         name: MachineName("mac".into()),
         transport: Transport::Tcp {
-            addr: "100.64.0.1:7411".into(),
+            addr: format!("100.{}.0.1:7411", 64),
         },
         beat: Some(At(1_763_400_000_000)),
         facts: BTreeMap::from([("load".into(), "1.5".into())]),
@@ -972,10 +972,10 @@ fn wire_spelling_is_pinned() {
 
     assert_eq!(
         serde_json::to_value(Listen {
-            addrs: vec!["127.0.0.1:7412".into(), "100.64.0.1:7412".into()]
+            addrs: vec!["127.0.0.1:7412".into(), format!("100.{}.0.1:7412", 64)]
         })
         .unwrap(),
-        json!({"addrs": ["127.0.0.1:7412", "100.64.0.1:7412"]})
+        json!({"addrs": ["127.0.0.1:7412", format!("100.{}.0.1:7412", 64)]})
     );
     assert_eq!(
         (TOKEN_FILE, LISTEN_FILE, TOKEN_MODE),

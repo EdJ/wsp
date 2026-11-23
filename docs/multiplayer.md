@@ -23,7 +23,7 @@ The protocol is already ready for many people; the credentials and the rules are
 | --- | --- | --- |
 | `api.token` | 32 random bytes per instance, mode 0600 | Whoever holds the file is anyone. `hello` names its own `by`, and the server only checks later requests against that hello. |
 | `Principal::Person` | `person:ed`, or `$USER` in web-chrome's dial | Any token holder can claim to be any person. |
-| Peer rule | Loopback plus the tailnet ranges (100.64.0.0/10, fd7a:115c:a1e0::/48) | Reaching Omarchy at 192.168.0.186 means an ssh tunnel; leaving the office drops it. |
+| Peer rule | Loopback plus the tailnet ranges (100.64.0.0/10, fd7a:115c:a1e0::/48) | Reaching the Linux host over the LAN means an ssh tunnel; leaving the office drops it. |
 | State rules | "the person" may end a seat, `despawn --lost`, release a held group | One person holds every power. |
 | Asks | An ask has `of` and `answered_by` | Already per-person in the record; Needs you shows them all to whoever looks. |
 | Managers | One token per host (D13 leaves identity for later) | Fine for machines; people were deferred to state-core step 6. |
@@ -110,7 +110,7 @@ The server already streams every event to every subscriber in one order, so all 
 
 ## Reaching the server
 
-Put the server and every player on one tailnet; the server's peer rule already admits the tailnet ranges, so no protocol change is needed. Today each Mac reaches Omarchy through an ssh tunnel to 192.168.0.186, which only works on the office network and drops whenever the laptop sleeps or leaves.
+Put the server and every player on one tailnet; the server's peer rule already admits the tailnet ranges, so no protocol change is needed. Today each Mac reaches the Linux host through an ssh tunnel to its LAN address, which only works on the office network and drops whenever the laptop sleeps or leaves.
 
 | Option | Works off the LAN | Per-person identity | Change to wsp |
 | --- | --- | --- | --- |

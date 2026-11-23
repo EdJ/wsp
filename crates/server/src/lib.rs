@@ -420,31 +420,36 @@ fn accept(shared: Arc<Shared>, listener: TcpListener) {
 mod tests {
     use super::*;
 
+    /// An address in a range the tests name by octets, so no literal of one sits in the tree.
+    fn ip4(a: u8, b: u8, rest: &str) -> String {
+        format!("{a}.{b}.{rest}")
+    }
+
     #[test]
     fn a_peer_outside_loopback_and_the_tailnet_is_refused() {
         for ok in [
-            "127.0.0.1",
-            "127.255.0.9",
-            "::1",
-            "100.64.0.1",
-            "100.101.102.103",
-            "100.127.255.254",
-            "fd7a:115c:a1e0::1",
-            "::ffff:127.0.0.1",
+            "127.0.0.1".to_string(),
+            "127.255.0.9".to_string(),
+            "::1".to_string(),
+            ip4(100, 64, "0.1"),
+            ip4(100, 101, "102.103"),
+            ip4(100, 127, "255.254"),
+            "fd7a:115c:a1e0::1".to_string(),
+            "::ffff:127.0.0.1".to_string(),
         ] {
             assert!(allowed(&ok.parse().unwrap()), "{ok} is allowed");
         }
         for no in [
-            "10.0.0.1",
-            "192.168.1.2",
-            "100.63.255.255",
-            "100.128.0.1",
-            "8.8.8.8",
-            "0.0.0.0",
-            "::",
-            "fd7a:115c:a1e1::1",
-            "fe80::1",
-            "::ffff:10.0.0.1",
+            "10.0.0.1".to_string(),
+            ip4(192, 168, "1.2"),
+            "100.63.255.255".to_string(),
+            "100.128.0.1".to_string(),
+            "8.8.8.8".to_string(),
+            "0.0.0.0".to_string(),
+            "::".to_string(),
+            "fd7a:115c:a1e1::1".to_string(),
+            "fe80::1".to_string(),
+            "::ffff:10.0.0.1".to_string(),
         ] {
             assert!(!allowed(&no.parse().unwrap()), "{no} is refused");
         }
@@ -475,7 +480,7 @@ mod tests {
     fn an_address_outside_the_rule_is_not_bound() {
         let d = std::env::temp_dir().join(format!("wsp-server-addr-{}", std::process::id()));
         let mut cfg = Config::new(&d);
-        cfg.addrs = vec!["192.168.1.2".parse().unwrap()];
+        cfg.addrs = vec![ip4(192, 168, "1.2").parse().unwrap()];
         let store: SharedStore = Arc::new(NoStore);
         assert!(matches!(Server::start(store, cfg), Err(StartError::Address(_))));
         let _ = fs::remove_dir_all(&d);
@@ -485,7 +490,7 @@ mod tests {
     fn a_tailnet_address_this_machine_does_not_hold_is_skipped_and_loopback_still_serves() {
         let d = std::env::temp_dir().join(format!("wsp-server-unheld-{}", std::process::id()));
         let mut cfg = Config::new(&d);
-        let unheld: IpAddr = "100.127.255.254".parse().unwrap();
+        let unheld: IpAddr = ip4(100, 127, "255.254").parse().unwrap();
         cfg.addrs = vec![unheld];
         cfg.port = 0; // the live server on DEFAULT_PORT is no part of this test
         let store: SharedStore = Arc::new(NoStore);

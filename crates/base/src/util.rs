@@ -1080,7 +1080,7 @@ pub fn exe_stamp() -> Option<(u64, u64)> {
 /// `wsp-152`: on Linux `current_exe` reads `/proc/self/exe`, and once an install
 /// has replaced the binary under a running process that link reads
 /// `<path> (deleted)`. The daemon's `wsp despawn` was spawned at that name, so
-/// on Omarchy 2026-11-19 every verifier seat it went to end failed with "No
+/// on the Linux host 2026-11-19 every verifier seat it went to end failed with "No
 /// such file or directory (os error 2)", tried again each tick. Its
 /// [`exe_stamp`] read nothing at that name either, so it never reloaded onto
 /// the new binary, which would have cleared it. macOS reports the path, so it

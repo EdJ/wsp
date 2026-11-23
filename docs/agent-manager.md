@@ -1332,7 +1332,7 @@ Their output is kept beside them (`window.txt`, `before.txt`, `before-pgids.txt`
 figure is the 24 h to the install (2026-11-19T12:08:12Z to 2026-11-20T12:08:12Z, 4,268 ticks). That day ran
 three binaries in turn: `ff9afa6`, then the M1 trunk from 07:58Z, then a later trunk from 10:51Z.
 
-**Under T2 (wsp-093): the measure is one host's.** It was taken on the host the fleet runs on, `omarchy`
+**Under T2 (wsp-093): the measure is one host's.** It was taken on the host the fleet runs on, the Linux host
 (Linux, under systemd). That host is the trunk's host and has the only manager, which is the role 6.2 gives
 the Mac. Figures per host are left to M4's measure.
 
@@ -1590,15 +1590,15 @@ pulled into M3.
 #### M2's breakdown (wsp-314, 2026-11-23)
 
 M2 was written for a fleet that has since moved. Its row in 6.2 says "the i5": a far Mac mini dialled by wsp on the
-person's Mac. Today wsp, its daemon, its API and the only manager run on **omarchy** (Linux, systemd). No far
+person's Mac. Today wsp, its daemon, its API and the only manager run on **the Linux host** (systemd). No far
 machine is registered (`wsp machine ls`: "no machines — this seat only"), and the i5 is gone. The person's **Mac**
-runs web-chrome with `--target omarchy`. It reaches omarchy through an ssh tunnel to the API port, and through
+runs web-chrome with `--target the-linux-host`. It reaches the Linux host through an ssh tunnel to the API port, and through
 `wsp-remote` for the verbs, with ssh polling as web-chrome's fallback (compound-react-022's overview).
 
 **Which machine.** M2's far manager runs on **the Mac**, named `mac` in the machine records. This is the recommended answer to the person's ask m-dn2ee6lcbnb6-p385f80 (which machine, and the Mac's ssh alias and Tailscale). It was put on 2026-11-23 and was unanswered when the lists were filed. It stands until the person answers, and m2-agent-manager's group 3 stop is where the answer is first needed. Another machine changes only the name in the stops' commands. It is the
-only second machine in the fleet, it already speaks to omarchy, and `wsp install` already writes a manager's
+only second machine in the fleet, it already speaks to the Linux host, and `wsp install` already writes a manager's
 LaunchAgent on macOS (`manager_agent`, src/cmd_install.rs). So M2 is the reverse of the plan as written. Section 5
-still holds line for line, with "the i5" read as "the Mac" and "the Mac" read as "omarchy". The far machine is now
+still holds line for line, with "the i5" read as "the Mac" and "the Mac" read as "the Linux host". The far machine is now
 the macOS one, so the GUI-session note (the keychain token) applies to it as written.
 
 M2 is five lists, all at status init, chained with `wsp worklist after`: `m2-agent-manager` → `m2-manager-path` →
@@ -1622,7 +1622,7 @@ rests on it.
 |---|---|---|---|---|
 | 1 | contract | wsp-398 | host-api, additively: `WspHello.lease_secs`, `Beat.held`/`released` on a daemon's beat, a `check` request and reply, `HostFacts.display_asleep`. `PROTOCOL` unchanged. | host-api's tests green at the barrier |
 | 2 | components, wiring | wsp-399, wsp-400 | The manager serves `gate: required` and writes the gate's lease from the daemon's beat on its own timer, failing closed, and serves `check`. Beside it, the machine record gains `transport: ssh\|manager` (`ssh` when absent) and a far manager record in M1's `Local` shape, with its token 0600 in `<state>/manager/<machine>.secret`, plus `Tcp::for_machine`. | the manager's gate tests, including the wsp-639 reproduction, green at the barrier |
-| 3 | wiring | wsp-401 | `wsp install --manager-only` (the manager and its launcher, no daemon) and `wsp machine install <m>`, run over the ssh door: build at the far checkout, install, read back the token and the tailnet address, dial `hello`. | **The person, ending the list:** Tailscale up on both machines, then on omarchy `wsp install`, `wsp machine add mac mac`, `wsp machine install mac` and `wsp machine check mac`. Then a live day of `wsp spawn <row> --on mac` work on `transport: ssh` (v1), with the Mac's manager installed and unused. |
+| 3 | wiring | wsp-401 | `wsp install --manager-only` (the manager and its launcher, no daemon) and `wsp machine install <m>`, run over the ssh door: build at the far checkout, install, read back the token and the tailnet address, dial `hello`. | **The person, ending the list:** Tailscale up on both machines, then on the Linux host `wsp install`, `wsp machine add mac mac`, `wsp machine install mac` and `wsp machine check mac`. Then a live day of `wsp spawn <row> --on mac` work on `transport: ssh` (v1), with the Mac's manager installed and unused. |
 
 `m2-manager-path`, `wsp worklist after m2-agent-manager`:
 
@@ -1630,26 +1630,26 @@ rests on it.
 |---|---|---|---|---|
 | 1 | insitu, wiring | wsp-402, wsp-403 | **M2's before**, from m2-agent-manager's v1 day (below), beside the daemon's one connection per manager machine: `hello` with the lease, `subscribe {from}`, folding into the same files, and a 10 s beat on its own thread carrying held and released claims. Silence is three missed beats past the lease. Disjoint files: wsp-402 writes this doc alone, and wsp-403 writes code alone (src/daemon.rs, src/fold.rs, host_tcp.rs, far.rs). | the before is written in this section, and wsp-403's sandbox tests are green at the barrier |
 | 2 | wiring | wsp-404 | `wip`, the census, overlap and verify's sweep read every manager machine. After wsp-403, on host_tcp.rs. | wsp-404's tests green at the barrier |
-| 3 | wiring | wsp-405 | `spawn --on`, `despawn`, `tell` and `machine check` go to the far manager, gated, waiting by subscription. | **The person, ending the list:** `wsp install` on omarchy, `wsp machine install mac` again (an upgrade), `wsp machine set mac transport=manager`, `wsp machine check mac`, then a live day with `mac` seats on `manager`. Once compound-react-022 has landed (in `mp0-reach`), the ssh tunnel to omarchy's API port is ended on the Mac. |
+| 3 | wiring | wsp-405 | `spawn --on`, `despawn`, `tell` and `machine check` go to the far manager, gated, waiting by subscription. | **The person, ending the list:** `wsp install` on the Linux host, `wsp machine install mac` again (an upgrade), `wsp machine set mac transport=manager`, `wsp machine check mac`, then a live day with `mac` seats on `manager`. Once compound-react-022 has landed (in `mp0-reach`), the ssh tunnel to the Linux host's API port is ended on the Mac. |
 
 `m2-default`, `wsp worklist after m2-manager-path`:
 
 | group | kind | rows | what | stop (the person's steps are planned here) |
 |---|---|---|---|---|
-| 1 | contract | wsp-406 | `transport` defaults to `manager` for a machine with a far record. `transport=ssh` is the rollback. `wsp doctor` prints a line per machine. | **The person, ending the list:** `wsp install` on omarchy and `wsp machine install mac`, then **a live week** (M2's "a week live" for the flap). The fortnight m2-contract waits on starts at this install, and its date goes in the verdict. |
+| 1 | contract | wsp-406 | `transport` defaults to `manager` for a machine with a far record. `transport=ssh` is the rollback. `wsp doctor` prints a line per machine. | **The person, ending the list:** `wsp install` on the Linux host and `wsp machine install mac`, then **a live week** (M2's "a week live" for the flap). The fortnight m2-contract waits on starts at this install, and its date goes in the verdict. |
 
 `m2-result`, `wsp worklist after m2-default`:
 
 | group | kind | rows | what | stop (the person's steps are planned here) |
 |---|---|---|---|---|
-| 1 | insitu | wsp-407 | **M2's result**, against the before. | **The person, ending the list,** reads M2's result: M2 holds, or `wsp machine set mac transport=ssh` on omarchy is the rollback. |
+| 1 | insitu | wsp-407 | **M2's result**, against the before. | **The person, ending the list,** reads M2's result: M2 holds, or `wsp machine set mac transport=ssh` on the Linux host is the rollback. |
 
 `m2-contract`, `wsp worklist after m2-result`. Its overview says what must be true before group 1: the person's
 read "M2 holds", a fortnight on `manager` since m2-default's install, and no `transport=ssh` written.
 
 | group | kind | rows | what | stop |
 |---|---|---|---|---|
-| 1 | contract | wsp-408 | As legs: delete tunnel.rs's masters and forwards, far.rs's ssh probes and the far beat (`holdings_command` and `DISPLAY_PROBE` with them, so host-seam-allowed.txt loses far.rs's two lines), wait_ready's 150 ms loop and submit's poll for far seats, and the `ssh` word. Kept: the install door, the tree copy (M4's) and the shim's ssh (Q8). | **The person:** `wsp install` on omarchy, `wsp machine install mac` and `wsp machine check mac`, then a live day |
+| 1 | contract | wsp-408 | As legs: delete tunnel.rs's masters and forwards, far.rs's ssh probes and the far beat (`holdings_command` and `DISPLAY_PROBE` with them, so host-seam-allowed.txt loses far.rs's two lines), wait_ready's 150 ms loop and submit's poll for far seats, and the `ssh` word. Kept: the install door, the tree copy (M4's) and the shim's ssh (Q8). | **The person:** `wsp install` on the Linux host, `wsp machine install mac` and `wsp machine check mac`, then a live day |
 
 **What the plan keeps from M2's row, and what it changes.**
 - *Reused, not rebuilt.*
@@ -1681,7 +1681,7 @@ read "M2 holds", a fortnight on `manager` since m2-default's install, and no `tr
   `tunnels`, far.rs's two ssh lines, wait_ready's loop and submit's poll for far seats to M2. wsp-405 stops using them
   under `manager`, and wsp-408 deletes them.
 - *m3-agent-manager.* M3 assumed nothing of M2, and M2 assumes nothing of M3 beyond what has landed. M3's
-  `WSP_JOBS=manager` and its job table stay on omarchy. M3's figures owed (wsp-360) and M1's (wsp-323) are not M2's.
+  `WSP_JOBS=manager` and its job table stay on the Linux host. M3's figures owed (wsp-360) and M1's (wsp-323) are not M2's.
   Taking M2's before on a manager built from the trunk needs wsp-324's fix to hold, and wsp-401's install always rebuilds
   for that reason. **M4 needs a second manager to measure**, and M2 delivers one. M4 is broken down after M2's
   result, as d1 Q14 says for every step.
@@ -1690,18 +1690,18 @@ read "M2 holds", a fortnight on `manager` since m2-default's install, and no `tr
   member here: it is already in `mp0-reach`'s group 1 (planned, after s2-state-core-2), and a row is run by one list.
   The tunnel to the API port is what 022 replaces. So the tunnel's end waits on 022, not on M2's code. m2-manager-path's
   last stop has the person end the tunnel once 022 has landed, and wsp-407 counts the tunnel's sessions until then. The
-  far manager needs no tunnel at any point: wsp dials it over the tailnet. M2's ssh measure counts the Mac's sessions to omarchy, so a tunnel left running shows up in it.
+  far manager needs no tunnel at any point: wsp dials it over the tailnet. M2's ssh measure counts the Mac's sessions to the Linux host, so a tunnel left running shows up in it.
 - *The tailnet* is a precondition of both 022 and the far manager (3.4). The manager serves loopback alone without
   one, and `wsp machine install` refuses with that step named. Installing Tailscale is the person's step at m2-agent-manager's last stop.
 
 **M2's measures, restated against today's topology.** 6.1's figures were the Mac's daemon dialling the i5, on a
 store and a fleet that no longer exist. Each of M2's four measures is restated here. Where the old baseline no longer
 applies, the new before is taken by wsp-402 from the day of m2-agent-manager's last stop: the Mac registered on `transport: ssh`, from
-omarchy.
+the Linux host.
 
 | measure | 6.2 asked | what applies now | before | M2 asks |
 |---|---|---|---|---|
-| ssh runs per day | 147 → install and tree bytes only | 147 was the Mac's daemon to the i5. omarchy's wsp makes no far ssh today, because it has no far machine. The ssh that exists runs the other way: the Mac's poll and verbs into omarchy's sshd. The day before M1's install counted compound's polls over ssh at 5,711 and 658 CPU-s (M1's result). | wsp-402: omarchy's ssh per day by phase with `mac` on `ssh`, and the Mac's sessions into omarchy | omarchy → Mac: install and tree bytes only, 0 per tick. Mac → omarchy: web-chrome's polls 0 with 022 live and the tunnel ended. The shim's verbs are counted, not judged. |
+| ssh runs per day | 147 → install and tree bytes only | 147 was the Mac's daemon to the i5. The Linux host's wsp makes no far ssh today, because it has no far machine. The ssh that exists runs the other way: the Mac's poll and verbs into the Linux host's sshd. The day before M1's install counted compound's polls over ssh at 5,711 and 658 CPU-s (M1's result). | wsp-402: the Linux host's ssh per day by phase with `mac` on `ssh`, and the Mac's sessions into the Linux host | The Linux host → Mac: install and tree bytes only, 0 per tick. Mac → the Linux host: web-chrome's polls 0 with 022 live and the tunnel ended. The shim's verbs are counted, not judged. |
 | the wsp-639 flap | a far seat working through a slowed tick never reads unreachable: a sandbox reproduction plus a week live | Unchanged in meaning. The reproduction is now two tests, the manager's (wsp-399) and the daemon's in a sandbox (wsp-403): a 78 s tick against a 60 s lease, with beats every 10 s on their own timer. | wsp-402: `unreachable` readings of live `mac` seats on the v1 day | 0, in 10 runs of each test and in m2-default's live week |
 | the far manifest | compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s) | Under T2, M4 retires the copy, and M2 does not move it. compounding's tree may not be on this fleet. The figure is taken on the largest tree copied up on the before day, with its file count. | wsp-402 | no worse than the before |
 | `spawn --on` p50 | no worse | There is no far spawn today, so there is no baseline. The local rail stands: 0.93 s p50 and 2.71 s p95 over 147 spawns, the day before M1's install, against the 9.4 s ceiling. | wsp-402: `spawn --on mac` p50 and p95 on v1, with the agent. If v1 refuses a Linux seat's spawn on a Mac, that refusal is the before. | no worse than the before, or no worse than local p50 and under 9.4 s where v1 refused |

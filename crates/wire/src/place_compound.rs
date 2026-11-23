@@ -3962,7 +3962,7 @@ mod tests {
         // forks while this process holds the script open for writing hands the
         // fd to its child, and on Linux exec of the script then fails with
         // ETXTBSY until that child execs (4 runs in 20 in parallel, 0 in 20
-        // single-threaded, on Omarchy).
+        // single-threaded, on the Linux host).
         let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg("cat > \"$1\" && chmod 755 \"$1\"")

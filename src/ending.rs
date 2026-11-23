@@ -2644,7 +2644,7 @@ mod tests {
     /// running `wsp despawn` again at its own path. Linux names a replaced
     /// binary `<path> (deleted)`, and spawning that name failed with "No such
     /// file or directory (os error 2)" for cpd-10, cpd-14 and cpd-15 every tick
-    /// on Omarchy 2026-11-19. Here a real process loses its binary to an
+    /// on the Linux host 2026-11-19. Here a real process loses its binary to an
     /// "install", the name its `/proc/<pid>/exe` gives is shown to fail as it
     /// did, and [`util::on_disk`] gives the path that runs the new binary, as
     /// `cycle::despawn_seat_keeping` runs it (cwd `/`).

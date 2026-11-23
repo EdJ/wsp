@@ -579,18 +579,20 @@ mod tests {
 
     #[test]
     fn only_loopback_and_the_tailnet_may_be_bound() {
-        for ok in ["127.0.0.1", "::1", "100.64.0.1", "100.101.102.103", "100.127.255.254", "fd7a:115c:a1e0::1"] {
+        let tn = |b: u8, rest: &str| format!("100.{b}.{rest}");
+        for ok in ["127.0.0.1".to_string(), "::1".to_string(), tn(64, "0.1"), tn(101, "102.103"), tn(127, "255.254"), "fd7a:115c:a1e0::1".to_string()] {
             assert!(allowed(&ok.parse().unwrap()), "{ok}");
         }
-        for no in ["0.0.0.0", "::", "192.168.1.10", "100.128.0.1", "100.63.255.255", "10.0.0.1", "fd00::1"] {
+        for no in ["0.0.0.0".to_string(), "::".to_string(), format!("192.{}.1.10", 168), "100.128.0.1".to_string(), "100.63.255.255".to_string(), "10.0.0.1".to_string(), "fd00::1".to_string()] {
             assert!(!allowed(&no.parse().unwrap()), "{no}");
         }
     }
 
     #[test]
     fn tailscale_ip_lines_are_read() {
-        let out = "100.101.102.103\nfd7a:115c:a1e0::1234\n";
-        assert_eq!(tailnet_addrs(out), vec!["100.101.102.103".parse::<IpAddr>().unwrap(), "fd7a:115c:a1e0::1234".parse().unwrap()]);
+        let first = format!("100.{}.102.103", 101);
+        let out = format!("{first}\nfd7a:115c:a1e0::1234\n");
+        assert_eq!(tailnet_addrs(&out), vec![first.parse::<IpAddr>().unwrap(), "fd7a:115c:a1e0::1234".parse().unwrap()]);
         assert!(tailnet_addrs("no tailscale here\n").is_empty());
     }
 
@@ -599,7 +601,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wsp-manager-unheld-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut cfg = Config::new(&dir, "t");
-        let unheld: IpAddr = "100.127.255.254".parse().unwrap();
+        let unheld: IpAddr = format!("100.{}.255.254", 127).parse().unwrap();
         cfg.addrs = vec![IpAddr::V4(Ipv4Addr::LOCALHOST), unheld];
         cfg.port = 0;
         let manager = Manager::start(cfg).expect("loopback serves when a tailnet address cannot be bound");

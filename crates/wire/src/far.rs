@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn a_connect_that_failed_is_a_dead_far_link_and_a_slow_answer_is_not() {
         for dead in [
-            "ssh: connect to host 100.64.0.7 port 22: Operation timed out",
+            "ssh: connect to host the.far.host port 22: Operation timed out",
             "ssh: connect to host mb2 port 22: Connection timed out",
             "ssh: connect to host mb2 port 22: No route to host",
             "ssh: connect to host mb2 port 22: Connection refused",

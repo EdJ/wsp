@@ -724,7 +724,7 @@ lines are marked below, each with its follow-up row.
 **What the measure could not be.** The stop in front of this group asked for a full day on the installed trunk and
 on web-chrome's app. The person passed it on 2026-11-20 on judgement, not on the full day, and named the gaps to record
 without blocking on them. They hold, and they bound every figure here:
-- **There is no pre-group-6 day on this host.** This is Omarchy (Linux, 32 CPUs). The daemon that wrote the first
+- **There is no pre-group-6 day on this host.** This is the Linux host (32 CPUs). The daemon that wrote the first
   record of `calls.jsonl` (2026-11-19T07:29:08Z) was already serving the API (`api.log`: `started … on 127.0.0.1:7488`
   at 07:29:20Z). So every figure below is an *after*. The before figures are 1.5's (the Mac, before M0) and the Mac's
   own `calls.jsonl`, which is not reachable from here (`wsp machine ls`: this seat only). They are not comparable for
@@ -759,7 +759,7 @@ without blocking on them. They hold, and they bound every figure here:
 | `wip --json` A/B, API against files | | API: wall p50 **693 ms** (p95 978), CPU p50 **0.628 s** (p95 0.928), n=20. Files: wall p50 **61 ms** (p95 72), CPU p50 **0.032 s** (p95 0.039), n=20. The first run, n=16: API 774 ms and 0.702 s, files 65 ms and 0.035 s | `ab.py`, alternating |
 | `ps`/`lsof` children of read verbs | | `wip` 0 of 2,937 calls, `wip --json` 0 of 2,355, `show` 0 of 1,883, `ls` 0 of 39, `worklist show` 2 of 3,431. **`ls --json` runs one `ps` in 1,129 of 1,139 calls, with 5.5 `compound-reader`; `worklist show --json` runs `ps` in 216 of 381.** `lsof`: 0 in all. | the script, `children` by verb and flag |
 | daemon tick | 1.5 (Mac, before M0): p50 2.2 s, p95 54 s. M0's live day (Mac): 85 ms / 1.60 s | whole log, this host: **p50 20 ms, p95 640 ms** (4,137 ticks at the first read). First 4.33 h (776 ticks): p50 17 ms, p95 381 ms. Last 18.97 h (3,381 ticks): p50 20 ms, p95 664 ms | the `"k":"tick"` lines |
-| daemon CPU | none on this host | process 433 s in 18.97 h (**22.8 CPU-s/h**). **Mirror thread 51.6 s (2.7 CPU-s/h, 12%)**; `fold:omarchy` 140.7 s (7.4/h); the tick thread's own user+sys 8.1/h | `/proc/<pid>/task` |
+| daemon CPU | none on this host | process 433 s in 18.97 h (**22.8 CPU-s/h**). **Mirror thread 51.6 s (2.7 CPU-s/h, 12%)**; `fold:<host>` 140.7 s (7.4/h); the tick thread's own user+sys 8.1/h | `/proc/<pid>/task` |
 
 Where the 693 ms goes: the server answers `state` in 22 ms, but the reply is **6.84 MB** (5.94 MB of it the 366
 task rows with their prose, 0.61 the 74 lists, 0.31 the 132 asks), and the client takes the other ~670 ms and 0.6
