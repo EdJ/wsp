@@ -377,6 +377,8 @@ pub(crate) struct Api {
     _mirror: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     /// The delivery worker, under `WSP_ORDERS=store` alone (wsp-122).
     _deliver: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// wsp-743: the census reads' inputs, beside the mirror's entities.
+    _readings: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 /// Open `state.db`, serve it, and start the mirror thread. Each failure is one
@@ -422,7 +424,8 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         }
         crate::orders::Mode::Files => None,
     };
-    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver })
+    let readings = crate::readings::start(store, db.clone());
+    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver, _readings: readings })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,

@@ -14,10 +14,13 @@ impl Reads for SqliteStore {
     }
 
     fn rows(&self, filter: &RowFilter) -> Result<Vec<Row>> {
-        let (state, _) = self.snapshot()?;
-        Ok(state
-            .rows
-            .values()
+        let all = match filter.heads {
+            // Cut in SQL, as `wip_snapshot` is, so the text is never decoded (wsp-743).
+            true => self.cut("$.rows", true)?.iter().map(|t| from_json!(t)).collect::<Result<Vec<Row>>>()?,
+            false => self.snapshot()?.0.rows.into_values().collect(),
+        };
+        Ok(all
+            .iter()
             .filter(|r| filter.project.as_ref().is_none_or(|p| r.project == *p))
             .filter(|r| filter.states.is_empty() || filter.states.contains(&r.state))
             .filter(|r| filter.list.as_ref().is_none_or(|l| r.group.as_ref().is_some_and(|g| g.list == *l)))
@@ -44,6 +47,11 @@ impl Reads for SqliteStore {
 
     fn list(&self, id: &ListId) -> Result<Option<List>> {
         Ok(self.snapshot()?.0.lists.get(id).cloned())
+    }
+
+    /// Over the state row's lists alone, whole or cut in SQL: the rows are never decoded.
+    fn lists(&self, filter: &ListFilter) -> Result<Vec<List>> {
+        self.cut("$.lists", filter.heads)?.iter().map(|t| from_json!(t)).collect()
     }
 
     fn orders_for(&self, seat: &SeatId, states: &[OrderState]) -> Result<Vec<Order>> {
@@ -121,6 +129,56 @@ impl Reads for SqliteStore {
                 )
                 .map_err(be)?;
             Ok((from_json!(&json)?, EventId(head as u64)))
+        })
+    }
+}
+
+impl SqliteStore {
+    /// The JSON of each entity under `path` (`$.rows`, `$.lists`) of the state row, in key
+    /// order (a `BTreeMap`'s), each without its `WIP_BODIES` fields where `heads`.
+    fn cut(&self, path: &str, heads: bool) -> Result<Vec<String>> {
+        let [body, prose] = WIP_BODIES.map(|k| format!("$.fields.{k}"));
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare_cached(
+                    "SELECT CASE WHEN ?2 THEN json_remove(e.value, ?3, ?4) ELSE json(e.value) END
+                     FROM state AS s, json_each(s.json, ?1) AS e WHERE s.id = 1 ORDER BY e.key",
+                )
+                .map_err(be)?;
+            let texts = stmt.query_map(params![path, heads, body, prose], |r| r.get::<_, String>(0)).map_err(be)?;
+            texts.map(|t| t.map_err(be)).collect()
+        })
+    }
+}
+
+impl Readings for SqliteStore {
+    /// From the `reading` table, beside the state row: no event, no fold.
+    fn readings(&self, names: &[String]) -> Result<std::collections::BTreeMap<String, Reading>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare_cached("SELECT name, json, at FROM reading ORDER BY name").map_err(be)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+                .map_err(be)?;
+            let mut out = std::collections::BTreeMap::new();
+            for row in rows {
+                let (name, json, at) = row.map_err(be)?;
+                if names.is_empty() || names.contains(&name) {
+                    out.insert(name, Reading { json, at: At(at as u64) });
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn set_reading(&self, name: &str, json: String) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO reading (name, json, at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET json = excluded.json, at = excluded.at",
+                params![name, json, crate::now().0 as i64],
+            )
+            .map_err(be)?;
+            Ok(())
         })
     }
 }

@@ -399,6 +399,57 @@ fn wip_reads_the_cut_typed_bodies_only_on_open_rows() {
     let _ = fs::remove_dir_all(&d);
 }
 
+/// The census's reads, typed (wsp-743): `rows` and `lists` as heads keep
+/// every row and list less its text, `asks` filters by kind and state, and
+/// `readings` hands back what the store keeps by name, every one for none.
+#[test]
+fn the_census_reads_come_back_typed() {
+    let d = dir("census");
+    let store = mirror_store();
+    let text = |f: &mut std::collections::BTreeMap<String, String>| {
+        f.insert("body".into(), "long".into());
+        f.insert("prose".into(), "longer".into());
+        f.insert("status".into(), "todo".into());
+    };
+    let mut r = row("wsp-1", "one");
+    text(&mut r.fields);
+    let mut l = List { id: ListId("s1".into()), state: ListState::Running, groups: vec![], fields: Default::default() };
+    text(&mut l.fields);
+    let mut put = everything();
+    put.retain(|e| !matches!(e, Entity::Row(x) if x.id.0 == "wsp-1") && !matches!(e, Entity::List(_)));
+    put.push(Entity::Row(r));
+    put.push(Entity::List(l));
+    apply(&store, put, vec![], "census");
+    store.set_reading("throttle", r#"{"mode":"auto"}"#.into()).unwrap();
+    store.set_reading("spend", r#"{"landed":2}"#.into()).unwrap();
+    let server = start(Arc::new(store.handle()), &d);
+    let mut c = dial(&d);
+
+    let heads = c.rows(RowFilter { heads: true, ..Default::default() }).unwrap();
+    assert_eq!(heads, store.rows(&RowFilter { heads: true, ..Default::default() }).unwrap());
+    let one = heads.iter().find(|r| r.id.0 == "wsp-1").unwrap();
+    assert!(!one.fields.contains_key("body") && !one.fields.contains_key("prose"), "{one:?}");
+    assert_eq!(one.fields.get("status").map(String::as_str), Some("todo"));
+    assert_eq!(c.rows(RowFilter::default()).unwrap(), store.rows(&RowFilter::default()).unwrap(), "whole rows as before");
+
+    let lists = c.lists(ListFilter { heads: true }).unwrap();
+    assert_eq!(lists.len(), 1);
+    assert!(!lists[0].fields.contains_key("body") && lists[0].fields.contains_key("status"), "{lists:?}");
+    assert!(c.lists(ListFilter::default()).unwrap()[0].fields.contains_key("body"), "whole lists as before");
+
+    assert_eq!(c.asks(vec![AskKind::Flag], vec![AskState::Raised]).unwrap().len(), 1);
+    assert_eq!(c.asks(vec![AskKind::Ask], vec![]).unwrap(), vec![]);
+
+    let all = c.readings(&[]).unwrap();
+    assert_eq!(all.keys().collect::<Vec<_>>(), ["spend", "throttle"]);
+    let one = c.readings(&["throttle", "nothing"]).unwrap();
+    assert_eq!(one.keys().collect::<Vec<_>>(), ["throttle"]);
+    assert_eq!(one["throttle"].json, r#"{"mode":"auto"}"#);
+    assert_eq!(one["throttle"], all["throttle"]);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_request_after_a_lost_connection_dials_again() {
     let d = dir("redial");
@@ -1171,6 +1222,7 @@ impl Claims for Retained {
     }
 }
 
+impl Readings for Retained {}
 impl Texts for Retained {
     fn text(&self, row: &RowId, section: &str) -> Result<(String, Rev)> {
         self.inner.text(row, section)

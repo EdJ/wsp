@@ -31,8 +31,8 @@ pub use event::{Draft, Event, EventKind, Subject};
 pub use id::*;
 pub use refusal::{Error, Refusal, Result};
 pub use store::{
-    Claims, Commands, Events, Leases, Reads, RowFilter, SeatFilter, Store, Texts, STORE_INSTANCE,
-    WIP_BODIES, WIP_SEATED,
+    heads_only, Claims, Commands, Events, Leases, ListFilter, Reading, Readings, Reads, RowFilter,
+    SeatFilter, Store, Texts, STORE_INSTANCE, WIP_BODIES, WIP_SEATED,
 };
 pub use subscribe::{Feed, Subscribe, BEAT_SECS, MISSED_BEATS, SNAPSHOT_PART};
 

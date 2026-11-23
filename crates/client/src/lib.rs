@@ -14,6 +14,10 @@
 //! - [`Client::throttle`], [`Client::spend`] and [`Client::show`] return the
 //!   documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id>
 //!   --json` print, the same value (wsp-307).
+//! - [`Client::rows`], [`Client::lists`], [`Client::asks`] and
+//!   [`Client::readings`] read what web-chrome's census draws (wsp-743): rows
+//!   and lists as heads, the asks, and the daemon's readings, each the input a
+//!   `wsp-view` projection takes, typed.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
 //!
@@ -28,7 +32,7 @@ use wsp_api::{
     Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
     Request, Verb, PROTOCOL,
 };
-use wsp_store_contract::{Principal, Refusal, State};
+use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Refusal, Row, RowFilter, State};
 
 mod dial;
 mod orders;
@@ -234,6 +238,56 @@ impl Client {
         match self.request(verb, args).map_err(ViewError::Request)?.outcome {
             Outcome::Ok(a) => Ok(a),
             Outcome::Err(f) => Err(ViewError::Refused(f)),
+        }
+    }
+
+    /// The `rows` verb: the rows `filter` keeps, each as its head when
+    /// `filter.heads` (no `body` or `prose`), which is what keeps every row of
+    /// a full store under `MAX_LINE`.
+    pub fn rows(&mut self, filter: RowFilter) -> Result<Vec<Row>, Error> {
+        self.read_typed(Verb::Rows(filter), "rows", |a| match a {
+            Answer::Rows(rows) => Ok(rows),
+            other => Err(other),
+        })
+    }
+
+    /// The `lists` verb: every list, each without its text when `filter.heads`.
+    pub fn lists(&mut self, filter: ListFilter) -> Result<Vec<List>, Error> {
+        self.read_typed(Verb::Lists(filter), "lists", |a| match a {
+            Answer::Lists(lists) => Ok(lists),
+            other => Err(other),
+        })
+    }
+
+    /// The `asks` verb: asks, notes and flags of any of `kinds` in any of
+    /// `states`, all when either is empty.
+    pub fn asks(&mut self, kinds: Vec<AskKind>, states: Vec<AskState>) -> Result<Vec<Ask>, Error> {
+        self.read_typed(Verb::Asks { kinds, states }, "asks", |a| match a {
+            Answer::Asks(asks) => Ok(asks),
+            other => Err(other),
+        })
+    }
+
+    /// The `readings` verb: each of `names` there is a reading of (every one
+    /// when `names` is empty), by name. A reading's `json` is the text of the
+    /// `wsp-view` input `wsp_view::reading` names, decoded with
+    /// `wsp_view::reading::of`.
+    pub fn readings(&mut self, names: &[&str]) -> Result<std::collections::BTreeMap<String, Reading>, Error> {
+        let names = names.iter().map(|n| n.to_string()).collect();
+        self.read_typed(Verb::Readings { names }, "readings", |a| match a {
+            Answer::Readings(readings) => Ok(readings),
+            other => Err(other),
+        })
+    }
+
+    /// One typed read: `verb`'s reply, taken by `want`; another verb's answer
+    /// is a malformed reply, and `err` is [`Error::Failed`].
+    fn read_typed<T>(&mut self, verb: Verb, name: &str, want: impl FnOnce(Answer) -> Result<T, Answer>) -> Result<T, Error> {
+        let reply = self.send_call(Call::Verb(verb), None)?;
+        match reply.outcome {
+            Outcome::Ok(a) => want(a)
+                .map_err(|_| Error::Lost(ConnError::Malformed(format!("`{name}` answered with another verb's answer")))),
+            Outcome::Err(f) => Err(Error::Failed(f)),
         }
     }
 

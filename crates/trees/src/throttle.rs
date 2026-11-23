@@ -2177,6 +2177,34 @@ pub fn holding_back(store: &Store) -> Option<Pause> {
 
 /// The memory readings as `wsp throttle --json` carries them, and which, if
 /// any, is holding. Blank under test, like [`holding_back`].
+/// `throttle --json`'s input, as `wsp-view` takes it (wsp-743: the daemon's
+/// `throttle` reading is this, read afresh).
+pub fn view(store: &Store) -> wsp_view::throttle::Throttle {
+    view_of(store, &View::read(&store.state))
+}
+
+fn view_of(store: &Store, v: &View) -> wsp_view::throttle::Throttle {
+    wsp_view::throttle::Throttle {
+        mode: v.settings.mode.word().to_string(),
+        in_force: v.in_force,
+        idle_secs: v.idle,
+        cores: v.cores,
+        slots: v.settings.slot_count(v.cores),
+        jobs: v.settings.job_cap(v.cores),
+        load: v.load,
+        load_warning: v.load_warning(),
+        memory: memory_json(store),
+        cpu_speed_limit: v.thermal,
+        thermal_below: v.settings.thermal_below,
+        thermally_limited: v.hot(),
+        hot_slots: v.settings.slots_at(v.cores, true),
+        hot_jobs: v.settings.jobs_at(v.cores, true),
+        suggested_agents: v.hot().then(|| v.settings.hot_agents(v.cores)),
+        agents: store.seat_cap(),
+        builds: v.builds.iter().map(|b| (b.holder.clone(), b.slot)).collect(),
+    }
+}
+
 pub fn memory_json(store: &Store) -> Value {
     if cfg!(test) {
         return Value::Null;

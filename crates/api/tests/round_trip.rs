@@ -274,7 +274,7 @@ fn every_frame_type_round_trips() {
 // ---------------------------------------------------------------- verbs
 
 /// Read verbs, then the contract's commands, then the unknown verb.
-const VERBS: usize = 16;
+const VERBS: usize = 17;
 const COMMANDS: usize = 25;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
@@ -296,6 +296,7 @@ fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
         Verb::Throttle(_) => (13, "throttle"),
         Verb::Spend(_) => (14, "spend"),
         Verb::Show { .. } => (15, "show"),
+        Verb::Readings { .. } => (16, "readings"),
     }
 }
 
@@ -356,9 +357,10 @@ fn requests() -> Vec<Frame> {
             states: vec![RowState::Doing, RowState::Review],
             list: Some(list_id()),
             seat: None,
+            heads: false,
         }),
         Verb::List { list: list_id() },
-        Verb::Lists(NoArgs {}),
+        Verb::Lists(ListFilter { heads: true }),
         Verb::Seat { seat: seat_id() },
         Verb::Seats(SeatFilter {
             machine: Some(MachineName("mac".into())),
@@ -386,6 +388,9 @@ fn requests() -> Vec<Frame> {
         Verb::Spend(NoArgs {}),
         Verb::Show {
             id: "wsp-307".into(),
+        },
+        Verb::Readings {
+            names: vec!["throttle".into()],
         },
     ];
     let commands = vec![
@@ -542,7 +547,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 17;
+const ANSWERS: usize = 18;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -570,6 +575,7 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Throttle(_) => (14, "throttle"),
         Answer::Spend(_) => (15, "spend"),
         Answer::Show(_) => (16, "show"),
+        Answer::Readings(_) => (17, "readings"),
     }
 }
 
@@ -622,6 +628,17 @@ fn answers() -> Vec<Frame> {
         ok(15, Answer::Throttle(json!({ "mode": "auto", "load": [1.5, 1.25, 1.0], "agents": null })), vec![]),
         ok(16, Answer::Spend(json!({ "currency": "USD", "rows": { "landed_30d": 0 } })), vec![]),
         ok(17, Answer::Show(json!({ "id": "wsp-307", "tags": ["api"] })), vec![]),
+        ok(
+            18,
+            Answer::Readings(BTreeMap::from([(
+                "throttle".into(),
+                Reading {
+                    json: r#"{"mode":"auto"}"#.into(),
+                    at: At(1_763_400_010_000),
+                },
+            )])),
+            vec![],
+        ),
     ]
 }
 
@@ -856,8 +873,8 @@ fn wire_spelling_is_pinned() {
         json!({
             "type": "request",
             "v": 1,
-            "id": 19,
-            "key": "k-19",
+            "id": 20,
+            "key": "k-20",
             "by": "seat:cpd-3698",
             "verb": "row.claim",
             "args": {
@@ -882,6 +899,12 @@ fn wire_spelling_is_pinned() {
     assert_eq!(rows["verb"], "rows");
     assert!(rows.get("key").is_none(), "a read carries no key");
     assert_eq!(rows["args"]["states"], json!(["doing", "review"]));
+    assert!(rows["args"].get("heads").is_none(), "heads false is left out: the frame a filter always sent");
+    assert_eq!(serde_json::to_value(&requests()[4]).unwrap()["args"], json!({"heads": true}));
+    assert_eq!(
+        serde_json::to_value(&requests()[16]).unwrap()["args"],
+        json!({"names": ["throttle"]})
+    );
 
     assert_eq!(
         serde_json::to_value(&requests()[0]).unwrap()["args"],
@@ -964,7 +987,7 @@ fn a_verb_without_arguments_decodes_either_way() {
     ] {
         for (verb, want) in [
             ("state", Verb::State(NoArgs {})),
-            ("lists", Verb::Lists(NoArgs {})),
+            ("lists", Verb::Lists(ListFilter::default())),
             ("machines", Verb::Machines(NoArgs {})),
             ("throttle", Verb::Throttle(NoArgs {})),
             ("spend", Verb::Spend(NoArgs {})),

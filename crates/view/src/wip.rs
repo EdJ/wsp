@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 
 /// One seat's row, as `wip --json` publishes it. The parts that are their own
 /// documents (`waiting`, `wait`, `role`, `stuck`, `leg`) arrive rendered.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Agent {
     pub project: String,
     pub task: String,
@@ -48,7 +49,8 @@ pub struct Agent {
 }
 
 /// The document around the seats: what the machine reported, and the queues.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Head {
     pub attention: Value,
     pub daemon: Option<String>,
@@ -89,6 +91,34 @@ pub fn agent_json(r: &Agent) -> Value {
 }
 
 /// The whole `wip --json` document.
+/// Everything `wip --json` prints: the seats and the head, and the two keys
+/// the CLI adds after [`wip_json`] only when it has them (wsp-743: one
+/// function, so a reader of the `wip` reading prints what the CLI does).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Census {
+    pub agents: Vec<Agent>,
+    pub head: Head,
+    /// `room::waiting_lines`: rows waiting at the seat cap; the key is left
+    /// out when there are none.
+    pub waiting_at_cap: Vec<String>,
+    /// The planned lists wsp started on its own lately (`pickup`), present
+    /// when it has lines to say (wsp-384), else the key is left out.
+    pub planned_started: Option<Vec<Value>>,
+}
+
+/// `wip --json`, whole.
+pub fn census_json(c: &Census) -> Value {
+    let mut v = wip_json(&c.agents, &c.head);
+    if let (Some(o), false) = (v.as_object_mut(), c.waiting_at_cap.is_empty()) {
+        o.insert("waiting_at_cap".into(), json!(c.waiting_at_cap));
+    }
+    if let (Some(o), Some(started)) = (v.as_object_mut(), &c.planned_started) {
+        o.insert("planned_started".into(), json!(started));
+    }
+    v
+}
+
 pub fn wip_json(rows: &[Agent], head: &Head) -> Value {
     json!({
         "attention": head.attention,
