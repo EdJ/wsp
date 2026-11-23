@@ -155,7 +155,7 @@ fn named(pane: &str, what: impl Into<String>) -> Named {
 
 /// The user `hubs.json` says this machine is logged in as. A login that cannot
 /// be read is no login here; `wsp login` is what the refusal names either way.
-fn logged_in_user() -> Option<String> {
+pub(crate) fn logged_in_user() -> Option<String> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     let login = wsp_client::hub_login_in(&home).ok().flatten()?;
     Some(login.user).filter(|u| !u.trim().is_empty())

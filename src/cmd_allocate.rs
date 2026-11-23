@@ -34,6 +34,26 @@ pub fn allocated_to(store: &Store, row: &str) -> Option<String> {
         .find_map(|w| w.for_user)
 }
 
+/// The other user `row` is allocated to, when it is a shared row and this
+/// machine is logged in as somebody else: the one reading behind every refusal
+/// to claim, start or spawn it here, made without asking the hub (wsp-416).
+/// `None` for a private row, an unallocated one, one allocated to the user
+/// logged in here, and a spoke with no login (the standalone case).
+pub(crate) fn allocated_elsewhere(store: &Store, row: &str) -> Option<String> {
+    let t = store.find_task(row)?;
+    if t.workspace.is_private() {
+        return None;
+    }
+    let to = allocated_to(store, &t.id)?;
+    let me = crate::address::logged_in_user()?;
+    (to != me).then_some(to)
+}
+
+/// What the refusal says: `<row> is allocated to <user>; it runs on their wsp`.
+pub(crate) fn elsewhere_said(row: &str, user: &str) -> String {
+    format!("{row} is allocated to {user}; it runs on their wsp")
+}
+
 fn refuse_private(id: &str) -> i32 {
     eprintln!(
         "wsp: {id} is private, and only this spoke ever sees it — allocation means something only in a shared workspace; `wsp publish {id}` it first"

@@ -2705,6 +2705,15 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         }
     };
 
+    // A shared row allocated to another user runs on their wsp: refused before
+    // anything opens, and before the hub is asked (wsp-416).
+    if let Some(t) = work.task.as_deref() {
+        if let Some(user) = crate::cmd_allocate::allocated_elsewhere(store, t) {
+            eprintln!("wsp: {}", crate::cmd_allocate::elsewhere_said(t, &user));
+            return 1;
+        }
+    }
+
     let on = match placement(store, args) {
         Ok(v) => v,
         Err(e) => {

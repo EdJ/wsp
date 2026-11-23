@@ -1190,7 +1190,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         end_second_seats(store, seats, &w, at, &g.members);
         let holds = crate::after::waiting(store, g);
         let unstarted = pos.members.iter().any(|s| {
-            !holds.contains_key(&s.id) && store.find_task(&s.id).is_some_and(|t| t.status() == Status::Todo)
+            !holds.contains_key(&s.id) && crate::cmd_allocate::allocated_elsewhere(store, &s.id).is_none() && store.find_task(&s.id).is_some_and(|t| t.status() == Status::Todo)
         });
         if gate.cap.is_some() && unstarted {
             // Each under its own list's lock, and a list already being stepped
@@ -1217,6 +1217,12 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         for s in pos.members.iter().filter(|_| blocked.is_none()) {
             if let Some(on) = holds.get(&s.id) {
                 log_line(store, &format!("{} group {at}: {} waits on {} — after: it has not landed", w.id, s.id, on.join(" ")));
+                continue;
+            }
+            // A member allocated to another user runs on their wsp (wsp-416):
+            // not started here, not a failure and not stuck, only said.
+            if let Some(user) = crate::cmd_allocate::allocated_elsewhere(store, &s.id) {
+                log_line(store, &format!("{} group {at}: {} runs elsewhere — allocated to {user}", w.id, s.id));
                 continue;
             }
             let Some(t) = store.find_task(&s.id) else { continue };

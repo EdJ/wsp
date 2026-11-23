@@ -97,6 +97,10 @@ pub(crate) fn before_claim(store: &Store, row: &str) -> Result<Option<Held>, Str
     if t.workspace.is_private() {
         return Ok(None);
     }
+    // Said here first, without a round trip (wsp-416).
+    if let Some(user) = crate::cmd_allocate::allocated_elsewhere(store, &t.id) {
+        return Err(crate::cmd_allocate::elsewhere_said(&t.id, &user));
+    }
     let Some(home) = home().filter(|h| logged_in(h)) else { return Ok(None) };
     let mut client = crate::cmd_publish::dial(&home)?;
     take(&mut client, &t.workspace.to_string(), &t.id).map(Some)
@@ -477,5 +481,63 @@ mod tests {
         assert_eq!(claim[TOKEN], 4);
         assert_eq!(wsp_store::store::record_expires(&claim), Some(at));
         assert!(claim["ttl_s"].as_i64().unwrap() > 6 * 86_400);
+    }
+    /// A hub that counts what dials it, and a home logged in to it as `who`.
+    fn counted_login(env: &crate::util::Isolated, who: &str) -> (std::net::TcpListener, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let home = env.path("login-home");
+        let file = home.join(".config/wsp/hubs.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        std::fs::write(&file, json!({ "url": url, "token": "t", "user": who, "at": "2026-11-23T00:00:00Z" }).to_string()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (listener, home)
+    }
+
+    /// Done-when (wsp-416): logged in as jesper, `wsp start` on a shared row
+    /// allocated to ed is refused in the words, with no request to the hub; on an
+    /// unallocated shared row it goes on to the hub lease; a private row is
+    /// today's path.
+    #[test]
+    fn hub_lease_start_on_a_row_allocated_to_another_user_is_refused_before_the_hub() {
+        let env = crate::util::isolated("hub-lease-416");
+        let (listener, home) = counted_login(&env, "jesper");
+        let was = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        for (id, ws, owner) in [("wsp-1", "shared:team", Some("ed")), ("wsp-2", "shared:team", None), ("t-1", "", Some("ed")), ("wsp-3", "shared:team", Some("jesper"))] {
+            let mut t = wsp_store::model::Task::new(id, id);
+            if !ws.is_empty() {
+                t.workspace = ws.parse().unwrap();
+            }
+            t.for_user = owner.map(str::to_string);
+            store.save_task(&t).unwrap();
+        }
+        let dialled = || listener.accept().is_ok();
+
+        let why = before_claim(&store, "wsp-1").unwrap_err();
+        assert_eq!(why, "wsp-1 is allocated to ed; it runs on their wsp");
+        let args = crate::base::args::Args::parse(vec!["start".to_string(), "wsp-1".to_string()]);
+        assert_eq!(crate::cmd_task::set_status(&store, &args, wsp_store::model::Status::Doing), 1);
+        assert_eq!(store.task("wsp-1").unwrap().status(), wsp_store::model::Status::Todo, "nothing moved");
+        assert!(!dialled(), "no request reached the hub");
+
+        // Unallocated, and allocated to the user logged in: on to the hub lease.
+        for row in ["wsp-2", "wsp-3"] {
+            let why = before_claim(&store, row).unwrap_err();
+            assert!(!why.contains("allocated to"), "{why}");
+            assert!(dialled(), "{row}: the hub was asked");
+        }
+        // A private row never asks.
+        assert_eq!(before_claim(&store, "t-1").unwrap(), None);
+        assert!(!dialled());
+
+        match was {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
