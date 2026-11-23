@@ -584,10 +584,14 @@ hands-on is the one-time setup.
 - An unreachable i5 **holds** its far seats. It does not lose them (section 3).
   The run does not wait forever on it. New heavy members fall back after
   `heavy.wait`, and a verifier is replaced (11.3, step 5). A held *member* is
-  never released automatically, because releasing it loses work. After `heavy.wait`
-  the run tells the list's governor, and through it the person, that the member
-  is held, with the two verbs (`despawn --lost`, `machine retire`). The list's
-  other members go on, and only its barrier waits.
+  not released within `heavy.wait`, because releasing it loses work. It is
+  released only when its claim lapses (the lease, `WSP_CLAIM_TTL`, 7 days by
+  default, section 3), as `despawn --lost` releases it, or when a person acts;
+  `WSP_CLAIM_TTL=off` leaves it held until a person does. The last checkpoint
+  stays in the seat's worktree either way. After `heavy.wait` the run tells the
+  list's governor, and through it the person, that the member is held, with the
+  two verbs (`despawn --lost`, `machine retire`). The list's other members go
+  on, and only its barrier waits.
 - Light rows, barriers and a person's `spawn --on` behave as they do today.
 
 ### 11.7 The build, as the `i5-heavy` list
