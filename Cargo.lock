@@ -375,6 +375,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsp-hub"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-api",
+ "wsp-objects",
+ "wsp-store-contract",
+ "wsp-store-sqlite",
+]
+
+[[package]]
 name = "wsp-machines"
 version = "0.1.0"
 dependencies = [

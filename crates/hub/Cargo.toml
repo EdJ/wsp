@@ -1,0 +1,15 @@
+[package]
+name = "wsp-hub"
+version = "0.1.0"
+edition = "2021"
+description = "The hub's store (wsp-460): objects in a directory keyed by hash, refs and leases in one small SQLite through wsp-store-sqlite; no agents, builds or worktrees"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wsp-api = { path = "../api" }
+wsp-objects = { path = "../objects" }
+wsp-store-contract = { path = "../store-contract" }
+wsp-store-sqlite = { path = "../store-sqlite" }
+serde_json = "1"

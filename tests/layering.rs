@@ -706,20 +706,20 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
     );
 }
 
-/// No manifest of the workspace but the root's names `wsp-store-sqlite`: nothing but the root
-/// binary links the backend.
+/// No manifest of the workspace but the root's and the hub's names `wsp-store-sqlite`: nothing
+/// but the two binaries links the backend (wsp-460: the hub keeps its refs and leases in it).
 #[test]
 fn no_manifest_but_the_roots_names_the_sqlite_crate() {
-    let root_manifest = root().join("Cargo.toml");
+    let binaries = [root().join("Cargo.toml"), root().join("crates/hub/Cargo.toml")];
     for m in manifests() {
-        if m == root_manifest {
+        if binaries.contains(&m) {
             continue;
         }
         let text = fs::read_to_string(&m).unwrap();
         let own = text.lines().any(|l| l.trim() == "name = \"wsp-store-sqlite\"");
         assert!(
             own || !text.contains("wsp-store-sqlite"),
-            "{} names wsp-store-sqlite; only the root manifest may (docs/state-core.md section 6)",
+            "{} names wsp-store-sqlite; only the root manifest and the hub's may (docs/state-core.md section 6)",
             m.display()
         );
     }
