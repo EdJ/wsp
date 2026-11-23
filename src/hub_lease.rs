@@ -295,10 +295,10 @@ pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
         let Some(token) = token_of(&claim) else { continue };
         let Some(t) = store.task(&row).filter(|t| !t.workspace.is_private()) else { continue };
         // The verifier's hold on a member this spoke holds goes first (wsp-486).
-        if let Some((commit, key)) = held_verdict(&t) {
+        if let Some((commit, key, word)) = held_verdict(&t, &claim) {
             let pushed = |c: &Value| c.get("hub_verdict").and_then(|p| p.as_str()) == Some(key.as_str());
             if !pushed(&claim) {
-                let payload = json!({ "commit": commit, "verdict": "holds" });
+                let payload = json!({ "commit": commit, "verdict": word });
                 if push_verdict(client, &t.workspace.to_string(), &row, EventKind::RowReviewed, &payload, token).is_ok() {
                     if let Some(mut now) = store.claims().get(&row).cloned().filter(|c| token_of(c) == Some(token)) {
                         now["hub_verdict"] = json!(key);
@@ -339,16 +339,20 @@ pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
     out
 }
 
-/// The verdict of a member this spoke holds a verifier's hold for, owed to the
-/// hub and not yet sent (wsp-486): `(commit, key)` for the newest pass holding.
-fn held_verdict(t: &crate::model::Task) -> Option<(String, String)> {
+/// The verdict of a member this spoke holds a verifier's pass for, owed to the
+/// hub and not yet sent (wsp-486): `(commit, key, word)` for the newest pass
+/// holding, or blocking a member whose earlier hold was pushed (it overrides it).
+fn held_verdict(t: &crate::model::Task, claim: &Value) -> Option<(String, String, &'static str)> {
     let tasks = [t.clone()];
-    if !crate::verification::verified(&tasks, &t.id) {
-        return None;
-    }
     let commit = crate::repair::commit_of(t)?;
-    let key = format!("verdict:{commit}");
-    Some((commit, key))
+    if crate::verification::verified(&tasks, &t.id) {
+        return Some((commit.clone(), format!("verdict:{commit}"), "holds"));
+    }
+    let earlier = claim.get("hub_verdict").and_then(|p| p.as_str()).is_some_and(|k| k.starts_with("verdict:") && !k.ends_with(":blocks"));
+    if earlier && crate::verification::blocked(&tasks, &t.id).is_some() {
+        return Some((commit.clone(), format!("verdict:{commit}:blocks"), "blocks"));
+    }
+    None
 }
 
 /// Whether the barrier may count `row` verified by the verdict its holder's
@@ -370,6 +374,10 @@ pub(crate) fn verdict_held(store: &Store, row: &str) -> bool {
 /// Takes in a `row.reviewed` object read from the hub's line for `row`: one
 /// carrying `verdict: holds` is the holder's verifier's verdict (wsp-486).
 pub(crate) fn take_verdict(store: &Store, row: &str, payload: &Value) {
+    if payload["verdict"].as_str() == Some("blocks") {
+        Book::edit(store, |b| b.verdicts.remove(row));
+        return;
+    }
     if payload["verdict"].as_str() != Some("holds") {
         return;
     }
@@ -1021,6 +1029,13 @@ pub(crate) mod tests {
         m.log(&format!("{} deadbee on m-1", crate::repair::READY));
         ds.save_task(&m).unwrap();
         assert!(!verdict_held(&ds, "wsp-1"), "the member moved on to another commit");
+        // A later blocks for the same row overrides the earlier hold.
+        let mut m = wsp_store::model::Task::new("wsp-1", "wsp-1");
+        m.log(&format!("{} abc1234 on m-1", crate::repair::READY));
+        ds.save_task(&m).unwrap();
+        assert!(verdict_held(&ds, "wsp-1"), "back at the held commit");
+        take_verdict(&ds, "wsp-1", &json!({ "commit": "abc1234", "verdict": "blocks" }));
+        assert!(!verdict_held(&ds, "wsp-1"), "a later blocks overrides the hold");
 
         running.stop();
         let _ = std::fs::remove_dir_all(&dir);

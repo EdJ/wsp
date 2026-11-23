@@ -11898,10 +11898,12 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(spawned().is_empty(), "no verifier on Ed's spoke for Jesper's row");
         assert!(checks(&store, 1).is_empty(), "and no barrier before its verdict");
         // A verdict that blocks is not counted; one that holds is, as pulled (wsp-486).
+        let hold = serde_json::json!({ "commit": "abc1234", "verdict": "holds" });
+        crate::hub_lease::take_verdict(&store, "wsp-2", &hold);
         crate::hub_lease::take_verdict(&store, "wsp-2", &serde_json::json!({ "commit": "abc1234", "verdict": "blocks" }));
         step(&store, &w, &Blind);
-        assert!(checks(&store, 1).is_empty(), "a verdict that does not hold holds the barrier");
-        crate::hub_lease::take_verdict(&store, "wsp-2", &serde_json::json!({ "commit": "abc1234", "verdict": "holds" }));
+        assert!(checks(&store, 1).is_empty(), "a later blocks clears the hold: the barrier waits");
+        crate::hub_lease::take_verdict(&store, "wsp-2", &hold);
         step(&store, &w, &Blind);
         assert_eq!(checks(&store, 1).len(), 1, "the barrier opens");
         assert_eq!(spawned(), vec![("run · barrier 1".into(), "claude".into())]);
