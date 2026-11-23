@@ -540,6 +540,7 @@ fn main() {
     die_on_broken_pipe();
     let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
     let _ = mirror::LIST_OUTPUTS.set(cmd_report::list_outputs);
+    let _ = mirror::LIST_SHOW.set(cmd_worklist::show_facts);
     let _ = mirror::SEAT_WORKING.set(cmd_machine::seat_working);
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,

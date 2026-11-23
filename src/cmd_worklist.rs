@@ -3380,7 +3380,9 @@ fn flagged_in(pos: &Position) -> BTreeSet<usize> {
 ///
 /// One function so `show <slug>` and `show --all` cannot drift: the window
 /// reads every open list in one process, and each must equal what asking for
-/// it alone would have given.
+/// it alone would have given. The CLI prints [`wsp_view::worklist::show_of_state`]
+/// now (wsp-308); this is the oracle its tests hold that to.
+#[cfg(test)]
 fn show_json(store: &Store, w: &Worklist, shared: &ShowShared, pos: &Position) -> serde_json::Value {
     let tasks = &shared.tasks;
     let groups = w.groups();
@@ -3419,6 +3421,37 @@ fn show_json(store: &Store, w: &Worklist, shared: &ShowShared, pos: &Position) -
     });
     v["overview"] = json!(w.section("Overview").unwrap_or_default());
     v
+}
+
+/// What `worklist show --json` draws beside each list's head, for the mirror
+/// to write into the list's fields ([`crate::mirror::LIST_SHOW`], wsp-308):
+/// every value is JSON text under its [`wsp_view::worklist::key`] but the
+/// overview, which is its prose. [`wsp_view::worklist::show_of_list`] puts
+/// them back together; the position is `listed`'s own, as `show --all`'s was.
+pub(crate) fn show_facts(store: &Store, listed: &[worklist::Listed]) -> Vec<Vec<(&'static str, String)>> {
+    use wsp_view::worklist::key as k;
+    let shared = ShowShared::read(store, &listed.iter().map(|l| &l.list).collect::<Vec<_>>());
+    listed
+        .iter()
+        .map(|l| {
+            let (w, pos) = (&l.list, &l.at);
+            let groups = w.groups();
+            let past = history::of(w, &groups);
+            let waiting_on: Vec<serde_json::Value> = pos.holding().iter().map(|s| json!({ "id": s.id, "status": s.settlement.word() })).collect();
+            vec![
+                (k::SHOW_HOME, home_json(shared.home(store, w).as_ref()).to_string()),
+                (k::SHOW_GROUPS, groups_json_with(store, w, pos, &shared.tasks, &past, &shared.archive, &shared.stages).to_string()),
+                (k::SHOW_DROPPED, json!(past.dropped.iter().map(history::dropped_json).collect::<Vec<_>>()).to_string()),
+                (k::SHOW_BARRIER, json!(pos.at_barrier()).to_string()),
+                (k::SHOW_WAITING_ON, json!(waiting_on).to_string()),
+                (k::SHOW_BEHIND, behind_json(&pos.slipped).to_string()),
+                (k::SHOW_DANGLING, json!(worklist::dangling(store, w)).to_string()),
+                (k::SHOW_HOLD_CAPTION, json!(hold_caption(w).map(|c| c.json())).to_string()),
+                (k::SHOW_UNRUN, crate::split::json(&crate::split::on_list(&shared.tasks, w, &shared.running)).to_string()),
+                (k::OVERVIEW, w.section("Overview").unwrap_or_default()),
+            ]
+        })
+        .collect()
 }
 
 /// What `show --json` reads that is the same for every list, read once: `--all`
@@ -3471,13 +3504,10 @@ fn show_all(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp worklist show --all --json [--include-closed]");
         return 2;
     }
-    // "Closed" is `ls`'s word: a done list with nothing left that is anybody's.
-    let listed: Vec<_> = worklist::listing(store, store.worklists())
-        .into_iter()
-        .filter(|l| args.has("include-closed") || l.segment != worklist::Segment::Closed)
-        .collect();
-    let shared = ShowShared::read(store, &listed.iter().map(|l| &l.list).collect::<Vec<_>>());
-    let out: Vec<_> = listed.iter().map(|l| show_json(store, &l.list, &shared, &l.at)).collect();
+    // Printed by `wsp-view` over the `State` the files make (wsp-308), as
+    // web-chrome draws it from the daemon's fold.
+    let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    let out = wsp_view::worklist::show_all_of_state(&state, util::epoch_secs(), args.has("include-closed"));
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     0
 }
@@ -3512,7 +3542,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     };
 
     if args.json() {
-        println!("{}", serde_json::to_string_pretty(&show_json(store, &w, &ShowShared::read(store, &[&w]), &worklist::position(store, &w, Reading::Settled))).unwrap_or_default());
+        let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+        let out = wsp_view::worklist::show_of_state(&state, &w.id, util::epoch_secs()).unwrap_or_default();
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
 
@@ -7879,6 +7911,87 @@ mod tests {
         assert_eq!(overview("one"), json!("Start when ready."));
         assert_eq!(overview("two"), json!(""));
         assert_eq!(dispatch(&store, &Args::synth("worklist", &["show"], &[("all", "true"), ("json", "true")])), 0);
+    }
+
+    /// `wsp-308`: `show <id> --json` and `show --all --json` print through
+    /// `wsp-view` over the `State` the files make, and for every list that is
+    /// the object [`show_json`] reads from the store: edges and holds, a
+    /// passed barrier's verdict and history with each member's timeline, a
+    /// hold, an overview, a draft and a done list.
+    #[test]
+    fn show_over_state_is_show_json_for_every_list() {
+        let (_env, store) = running("show-state");
+        let _ = crate::mirror::LIST_OUTPUTS.set(crate::cmd_report::list_outputs);
+        let _ = crate::mirror::LIST_SHOW.set(show_facts);
+        for (id, on) in [("e-1", vec![]), ("x-9", vec![]), ("e-2", vec!["e-1"]), ("e-3", vec!["x-9"]), ("e-4", vec!["e-1"])] {
+            let mut t = Task::new(id, id);
+            t.after = on.into_iter().map(String::from).collect();
+            store.save_task(&t).unwrap();
+        }
+        assert_eq!(run(&store, &["new", "dep", "Dep"]), 0);
+        assert_eq!(run(&store, &["add", "dep", "e-1", "e-2", "e-3"]), 0);
+        assert_eq!(run(&store, &["add", "dep", "e-4"]), 0);
+        let mut w = store.worklist("dep").unwrap();
+        w.set_status(WorklistStatus::Running);
+        crate::model::set_section_in(&mut w.body, "Overview", "Edges first.");
+        store.save_worklist(&w).unwrap();
+
+        task(&store, "s-1", "review");
+        task(&store, "s-2", "doing");
+        for (id, log) in [
+            ("s-1", "- 2026-10-08T08:00:00Z claimed by pane w1:p1\n- 2026-10-08T08:30:00Z review: built it\n"),
+            ("s-2", "- 2026-10-08T09:01:00Z claimed by pane w1:p2\n"),
+        ] {
+            let mut t = store.task(id).unwrap();
+            crate::model::set_section_in(&mut t.body, "Log", log);
+            store.save_task(&t).unwrap();
+        }
+        assert_eq!(run(&store, &["new", "tms", "Tms"]), 0);
+        assert_eq!(run(&store, &["add", "tms", "s-1"]), 0);
+        assert_eq!(run(&store, &["add", "tms", "s-2"]), 0);
+        let mut w = store.worklist("tms").unwrap();
+        let mut groups = w.groups();
+        groups[0].verdict = "2026-10-08T09:00:00Z Group passes.".into();
+        groups[1].stop = "if the spike goes badly, flag Ed".into();
+        w.set_groups(&groups);
+        crate::model::set_section_in(
+            &mut w.body,
+            "Log",
+            "- 2026-10-08T07:55:00Z started · go\n- 2026-10-08T09:00:00Z passed s-1 · Group passes.\n",
+        );
+        w.set_status(WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        assert_eq!(run(&store, &["hold", "tms", "the vendor is late"]), 0);
+
+        task(&store, "d-1", "todo");
+        task(&store, "g-1", "todo");
+        assert_eq!(run(&store, &["new", "plan", "Plan"]), 0);
+        assert_eq!(run(&store, &["add", "plan", "d-1", "g-1"]), 0);
+        // A member no task answers to any more: `dangling`.
+        std::fs::remove_file(store.task_path("g-1")).unwrap();
+        task(&store, "f-1", "done");
+        assert_eq!(run(&store, &["new", "fin", "Fin"]), 0);
+        assert_eq!(run(&store, &["add", "fin", "f-1"]), 0);
+        let mut w = store.worklist("fin").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+
+        let state = crate::mirror::state_of(&store, crate::mirror::LOCAL);
+        let now = util::epoch_secs();
+        let lists = store.worklists();
+        assert_eq!(lists.len(), 4);
+        for w in &lists {
+            let was = show_json(&store, w, &ShowShared::read(&store, &[w]), &worklist::position(&store, w, Reading::Settled));
+            let drawn = wsp_view::worklist::show_of_state(&state, &w.id, now).expect("every list is in the State");
+            assert_eq!(drawn, was, "{}", w.id);
+        }
+        let open: Vec<_> = worklist::listing(&store, store.worklists()).into_iter().filter(|l| l.segment != Segment::Closed).collect();
+        let all = wsp_view::worklist::show_all_of_state(&state, now, false);
+        let ids: Vec<&str> = all.as_array().unwrap().iter().map(|v| v["worklist"]["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, open.iter().map(|l| l.list.id.as_str()).collect::<Vec<_>>(), "ls's order, closed ones left out");
+        assert_eq!(wsp_view::worklist::show_all_of_state(&state, now, true).as_array().unwrap().len(), 4);
+        let tms = wsp_view::worklist::show_of_state(&state, "tms", now).unwrap();
+        assert!(!tms["groups"][0]["events"].as_array().unwrap().is_empty() && tms["hold_caption"].is_object(), "{tms}");
     }
 
     /// `wsp-134`, Ed: configured when the group is created, with a sensible

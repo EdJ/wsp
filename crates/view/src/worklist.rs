@@ -1,5 +1,6 @@
-//! `worklist ls --json` (and the object every worklist verb emits): pure
-//! functions over plain values the CLI has already read.
+//! `worklist ls --json`, `worklist show --json` (one list or `--all`) and the
+//! object every worklist verb emits: pure functions over plain values the CLI
+//! has already read, or over the `State` whose lists carry them.
 //!
 //! A worklist's phase, position and queue come from the store's files and the
 //! machine's seats, so the caller works them out and hands the answers in as
@@ -46,6 +47,25 @@ pub mod key {
     pub const QUEUE: &str = "queue";
     /// What it waits on, `""` where it may start; with `queue`.
     pub const WAITS: &str = "waits";
+    /// `worklist show --json`'s facts beside the head, each JSON text
+    /// (`cmd_worklist::show_facts`): where the list's seat stands (`{id,
+    /// from}` or null), the groups whole (stage, captions, each member's
+    /// stage and timeline, edges, holds, times, barrier history), the groups
+    /// dropped while the run stood at them, whether it stands at an unpassed
+    /// barrier, the members holding it, those the floor stepped over, the
+    /// members no task answers to, the newest hold's caption and the members
+    /// split into sub-tasks no run starts.
+    pub const SHOW_HOME: &str = "show_home";
+    pub const SHOW_GROUPS: &str = "show_groups";
+    pub const SHOW_DROPPED: &str = "show_dropped";
+    pub const SHOW_BARRIER: &str = "show_barrier";
+    pub const SHOW_WAITING_ON: &str = "show_waiting_on";
+    pub const SHOW_BEHIND: &str = "show_behind";
+    pub const SHOW_DANGLING: &str = "show_dangling";
+    pub const SHOW_HOLD_CAPTION: &str = "show_hold_caption";
+    pub const SHOW_UNRUN: &str = "show_unrun";
+    /// The list's `## Overview`, its prose.
+    pub const OVERVIEW: &str = "overview";
 }
 
 /// One declared output of a worklist and whether its file is there.
@@ -223,6 +243,47 @@ pub fn ls_of_state(state: &State, _now: i64) -> Value {
 /// `project`: the head alone, from the State.
 pub fn head_of_state(state: &State, id: &str) -> Option<Value> {
     state.lists.values().find(|l| l.id.0 == id).map(|l| head_json(&head_of_list(l)))
+}
+
+/// A list's field read back as the JSON it was written as, or `or` where it
+/// is absent or is not JSON.
+fn value_of(l: &List, k: &str, or: Value) -> Value {
+    serde_json::from_str(f(l, k)).unwrap_or(or)
+}
+
+/// The object `worklist show <id> --json` prints for one list, from its
+/// fields: the head with `project`, and what [`key`]'s `show_*` keys carry.
+pub fn show_of_list(l: &List) -> Value {
+    let mut head = head_json(&head_of_list(l));
+    head["project"] = value_of(l, key::SHOW_HOME, Value::Null);
+    json!({
+        "worklist": head,
+        "groups": value_of(l, key::SHOW_GROUPS, json!([])),
+        "dropped": value_of(l, key::SHOW_DROPPED, json!([])),
+        "at": f(l, key::AT).parse::<usize>().ok(),
+        "barrier": value_of(l, key::SHOW_BARRIER, json!(false)),
+        "waiting_on": value_of(l, key::SHOW_WAITING_ON, json!([])),
+        "behind": value_of(l, key::SHOW_BEHIND, json!([])),
+        "unwritten": value_of(l, key::UNWRITTEN, json!([])),
+        "dangling": value_of(l, key::SHOW_DANGLING, json!([])),
+        "hold_caption": value_of(l, key::SHOW_HOLD_CAPTION, Value::Null),
+        "unrun": value_of(l, key::SHOW_UNRUN, json!([])),
+        "overview": f(l, key::OVERVIEW),
+    })
+}
+
+/// `worklist show <id> --json` over the State: `None` for a list it has not.
+pub fn show_of_state(state: &State, id: &str, _now: i64) -> Option<Value> {
+    state.lists.values().find(|l| l.id.0 == id).map(show_of_list)
+}
+
+/// `worklist show --all --json` over the State: each list `ls` would draw,
+/// in its order, as [`show_of_list`] gives it; a closed one (`ls`'s word: done,
+/// with nothing left that is anybody's) only with `include_closed`.
+pub fn show_all_of_state(state: &State, _now: i64, include_closed: bool) -> Value {
+    let mut lists: Vec<&List> = state.lists.values().filter(|l| include_closed || f(l, key::SEGMENT) != "closed").collect();
+    lists.sort_by_key(|l| (f(l, key::ORDER).parse::<usize>().unwrap_or(usize::MAX), l.id.0.clone()));
+    Value::Array(lists.into_iter().map(show_of_list).collect())
 }
 
 #[cfg(test)]

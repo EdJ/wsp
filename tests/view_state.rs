@@ -26,6 +26,8 @@ const PROJECTIONS: &[Projection] = &[
     ("ls-all", &["ls", "--all", "--json"], wsp_view::task::ls_all),
     ("wip", &["wip", "--json"], wip),
     ("worklist-ls", &["worklist", "ls", "--json"], worklist_ls),
+    ("worklist-show", &["worklist", "show", "list-a", "--json"], worklist_show),
+    ("worklist-show-all", &["worklist", "show", "--all", "--json"], worklist_show_all),
     ("machine-ls", &["machine", "ls", "--json"], machine_ls),
     ("flag-person", &["flag", "--person", "--json"], flag_person),
     ("yours", &["yours", "--json"], yours),
@@ -39,6 +41,14 @@ fn wip(state: &State, now: i64) -> String {
 
 fn worklist_ls(state: &State, now: i64) -> String {
     serde_json::to_string_pretty(&wsp_view::worklist::ls_of_state(state, now)).unwrap()
+}
+
+fn worklist_show(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::worklist::show_of_state(state, "list-a", now).expect("list-a is in the State")).unwrap()
+}
+
+fn worklist_show_all(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::worklist::show_all_of_state(state, now, false)).unwrap()
 }
 
 fn machine_ls(state: &State, now: i64) -> String {

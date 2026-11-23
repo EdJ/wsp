@@ -882,17 +882,28 @@ fn seat_machine(store: &Store, out: &mut Vec<Entity>, local: &str) {
     out.push(Entity::Machine(c::Machine { name: MachineName(local.to_string()), transport: Transport::Local, beat: None, facts: f }));
 }
 
-/// What `worklist ls --json` reads that the files alone do not say, written
-/// into each list's `fields` (wsp-308; keys in [`wsp_view::worklist::key`]):
-/// phase word and flags, the group it stands at, which declared outputs are on
-/// disk, members gone, unwritten barriers, the segment and its place in `ls`'s
-/// order, activity, the priority word, and a planned list's queue place and
-/// what it waits on. One `worklist::listing` and one `waits::read`, as the CLI does.
 /// A list's declared outputs as `{name, kind, file, present}` and the
 /// directory they are in, read from disk. Installed by `main` (`cmd_report`
 /// is above the mirror); unset, a list says no outputs.
 pub static LIST_OUTPUTS: std::sync::OnceLock<fn(&Worklist) -> (Vec<serde_json::Value>, String)> = std::sync::OnceLock::new();
 
+/// What `worklist show --json` reads beside the head, per list of `listed`
+/// in its order: `(key, value)` pairs under [`wsp_view::worklist::key`]'s
+/// `show_*` keys and `overview` (wsp-308). Installed by `main` (`cmd_worklist`
+/// is above the mirror); unset, a list carries none and `show` over State
+/// draws it bare.
+pub static LIST_SHOW: std::sync::OnceLock<ListShow> = std::sync::OnceLock::new();
+
+/// [`LIST_SHOW`]'s shape.
+pub type ListShow = fn(&Store, &[crate::worklist::Listed]) -> Vec<Vec<(&'static str, String)>>;
+
+/// What `worklist ls --json` reads that the files alone do not say, written
+/// into each list's `fields` (wsp-308; keys in [`wsp_view::worklist::key`]):
+/// phase word and flags, the group it stands at, which declared outputs are on
+/// disk, members gone, unwritten barriers, the segment and its place in `ls`'s
+/// order, activity, the priority word, and a planned list's queue place and
+/// what it waits on. One `worklist::listing` and one `waits::read`, as the CLI does;
+/// and, through [`LIST_SHOW`], what `worklist show --json` draws beside the head.
 pub fn list_facts(store: &Store, lists: Vec<Worklist>, out: &mut [Entity]) {
     use wsp_view::worklist::key as k;
     let listed = crate::worklist::listing(store, lists);
@@ -923,6 +934,13 @@ pub fn list_facts(store: &Store, lists: Vec<Worklist>, out: &mut [Entity]) {
         if let Some(n) = waits.iter().position(|(id, _)| *id == l.list.id) {
             put(f, k::QUEUE, &(n + 1).to_string());
             put(f, k::WAITS, &waits[n].1.as_ref().map(|w| w.text()).unwrap_or_default());
+        }
+    }
+    let Some(show) = LIST_SHOW.get() else { return };
+    for (l, facts) in listed.iter().zip(show(store, &listed)) {
+        let Some(Entity::List(e)) = out.iter_mut().find(|e| matches!(e, Entity::List(x) if x.id.0 == l.list.id)) else { continue };
+        for (key, value) in facts {
+            e.fields.insert(key.into(), value);
         }
     }
 }

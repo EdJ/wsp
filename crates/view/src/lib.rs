@@ -23,7 +23,7 @@ pub mod task;
 pub mod stage;
 /// `wip --json`.
 pub mod wip;
-/// `worklist ls --json`.
+/// `worklist ls --json` and `worklist show --json` (one list or `--all`).
 pub mod worklist;
 /// `machine ls --json`.
 pub mod machine;
