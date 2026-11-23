@@ -18,6 +18,10 @@
 //! anything answers its port, and names what does. Once bound it writes
 //! `$state_dir/api.json` ([`wsp_api::Listen`]), loopback first.
 //!
+//! **TLS** (wsp-461). The hub sets [`Config::tls`] and every connection it
+//! accepts is inside a TLS session (`tls`, `tcp::Tcp::accept_tls`); the
+//! daemon sets none. The peer rule is the same either way.
+//!
 //! **Per connection** (`conn`): `hello` first, or the connection is closed;
 //! then requests answered by id. **Subscribe** (`subscribe`): a snapshot or a
 //! replay, then the head followed through `wait_for`, with a beat. The
@@ -50,6 +54,9 @@ pub mod mirror;
 pub mod ranges;
 mod subscribe;
 pub mod tcp;
+pub mod tls;
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 pub use domain::{Composed, Mode, OWNED};
 pub use mirror::Mirror;
@@ -155,6 +162,10 @@ pub struct Config {
     /// The ranges a peer must be in, and an address to bind (loopback aside,
     /// which is always bound): none keeps [`allowed`]'s loopback and tailnet.
     pub peers: Option<Ranges>,
+    /// TLS for every accepted connection (the hub's, wsp-461: [`tls::server_config`]);
+    /// none keeps plain TCP, which is the daemon's. It does not change who is
+    /// admitted: [`Config::admits`] reads `peers` or [`allowed`] either way.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Config {
@@ -171,6 +182,7 @@ impl Config {
             sync: None,
             gate: None,
             peers: None,
+            tls: None,
         }
     }
 

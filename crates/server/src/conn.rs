@@ -76,7 +76,11 @@ fn refuse(conn: &mut Tcp, code: Code, text: &str) {
 
 /// Serve one accepted connection until it ends.
 pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
-    let Ok(mut conn) = Tcp::new(stream) else { return };
+    let made = match &shared.cfg.tls {
+        Some(config) => Tcp::accept_tls(stream, config.clone()),
+        None => Tcp::new(stream),
+    };
+    let Ok(mut conn) = made else { return };
     let peer = conn.peer().map_or("?".into(), |p| p.to_string());
     let patience = shared.cfg.beat * MISSED_BEATS;
 
@@ -98,7 +102,13 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
             }
             return conn.shutdown();
         }
-        Err(_) => return conn.shutdown(),
+        Err(e) => {
+            // A client that refuses the certificate ends the handshake here; a TLS server says so.
+            if conn.is_tls() && !matches!(e, ConnError::Closed) {
+                shared.log.line(&format!("{peer}: closed before a hello: {e}"));
+            }
+            return conn.shutdown();
+        }
     };
     let by = match &shared.cfg.gate {
         Some(gate) => match gate.hello(&hello, &shared.token) {

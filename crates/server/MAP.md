@@ -77,3 +77,12 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
 - **No retention in `MemStore`**, so `too_old` is tested through a wrapper store that refuses before an id.
 - **Case 6 with `Mirror` is a test of its own.** The suite's `case_snapshot` folds with `TestDomain` and drives
   `row.add`, which `Mirror` refuses, so the test drives mirrors, leases, claims and texts and folds with `Mirror`.
+
+## TLS (wsp-461)
+
+`src/tls.rs`: `server_config(cert, key)`, a `rustls::ServerConfig` (the `ring` provider) from PEM files, which the hub
+puts in `Config::tls`. With it `conn::serve` accepts each connection inside TLS (`tcp::Tcp::accept_tls`): one
+`ServerConnection` per stream, shared by the stream's handles behind a mutex that the reader takes only to hand it the
+bytes it read (it waits on the socket without it), so a feed's writes are not held up by a read. The handshake is the
+first `recv_line`. `testing.rs` (behind `test-support`) is a generated CA and a `localhost` certificate for tests. The
+peer rule (`Config::admits`) is the same with or without TLS: the daemon sets no `tls` and no `peers`.

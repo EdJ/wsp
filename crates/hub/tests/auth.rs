@@ -33,6 +33,7 @@ impl Served {
             bind: vec![],
             port: 0,
             peers: vec!["127.0.0.0/8".into()],
+            tls: None,
             name: "hub-t".into(),
         };
         let running = serve::start(&cfg).expect("the hub starts");

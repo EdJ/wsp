@@ -50,7 +50,7 @@ use wsp_store_contract::{
 };
 use wsp_store_sqlite::SqliteStore;
 
-pub use config::{Config, DEFAULT_PORT};
+pub use config::{Config, TlsFiles, DEFAULT_PORT};
 pub use objects::ObjectDir;
 pub use store::HubStore;
 

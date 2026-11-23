@@ -1302,3 +1302,76 @@ fn local_still_dials_with_the_instance_token() {
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
+
+// ------------------------------------------------------------ TLS (wsp-461)
+
+/// A server whose every connection is inside TLS, with the certificate of a generated CA.
+fn start_tls(store: SharedStore, dir: &Path, pki: &wsp_server::testing::TestPki) -> Server {
+    let mut cfg = Config::new(dir);
+    cfg.port = 0;
+    cfg.beat = BEAT;
+    cfg.tls = Some(wsp_server::tls::server_config(&pki.cert, &pki.key).expect("the test certificate reads"));
+    Server::start(store, cfg).unwrap()
+}
+
+#[test]
+fn a_tls_url_is_dialled_over_tls_against_the_pinned_ca_and_a_feed_follows_it() {
+    use wsp_server::testing::TestPki;
+    let d = dir("tls");
+    let pki = TestPki::new(&d.join("pki"), "hub");
+    let other = TestPki::new(&d.join("pki"), "other");
+    let store = mirror_store();
+    let server = start_tls(Arc::new(store.handle()), &d, &pki);
+    let token = fs::read_to_string(d.join(TOKEN_FILE)).unwrap().trim().to_string();
+    let port = server.addrs()[0].port();
+    let url = format!("tls://localhost:{port}");
+    let wait = Duration::from_secs(10);
+
+    let mut c = Client::dial_hub_ca(&url, Credential::User(token.clone()), Some(&pki.ca), WAIT)
+        .unwrap_or_else(|s| panic!("silent: {s}"));
+    assert_eq!(c.server(), "wsp");
+    assert!(c.wip().is_ok(), "a request is answered over TLS");
+    let mut f = feed(&c, None);
+    assert!(matches!(f.next_within(WAIT), Some(Item::State { .. })), "a feed over TLS opens with the state");
+    let at = store.handle().head().unwrap();
+    store.handle().apply(Command::Mirror { put: vec![Entity::Row(row("wsp-1", "one"))], gone: vec![] }, IdempotencyKey("k1".into()), Principal::Wsp("wsp".into())).unwrap();
+    let mut told = false;
+    while let Some(item) = f.next_within(WAIT) {
+        if matches!(item, Item::Event(ref e) if e.id.0 > at.0) {
+            told = true;
+            break;
+        }
+    }
+    assert!(told, "an event written after the snapshot arrives on the TLS feed");
+    drop((c, f));
+
+    // Without the CA, the platform's roots do not vouch for it: refused, naming the certificate.
+    match Client::dial_hub(&url, Credential::User(token.clone()), wait) {
+        Err(Silent::Tls(why)) => assert!(why.contains("UnknownIssuer"), "{why}"),
+        other => panic!("expected a certificate refusal, got {:?}", other.map(|c| c.server().to_string())),
+    }
+    // Another CA pinned is the same: only the pinned one is trusted.
+    match Client::dial_hub_ca(&url, Credential::User(token.clone()), Some(&other.ca), wait) {
+        Err(Silent::Tls(why)) => assert!(why.contains("UnknownIssuer"), "{why}"),
+        other => panic!("expected a certificate refusal, got {:?}", other.map(|c| c.server().to_string())),
+    }
+    // The right CA but the wrong name: the certificate is for `localhost`.
+    let by_ip = format!("tls://{}", server.addrs()[0]);
+    match Client::dial_hub_ca(&by_ip, Credential::User(token.clone()), Some(&pki.ca), wait) {
+        Err(Silent::Tls(why)) => assert!(why.contains("not valid for name"), "{why}"),
+        other => panic!("expected a name refusal, got {:?}", other.map(|c| c.server().to_string())),
+    }
+    // A CA file that is not one, or is not there, is said.
+    let junk = d.join("junk.pem");
+    fs::write(&junk, "not a pem").unwrap();
+    for ca in [junk, d.join("absent.pem")] {
+        match Client::dial_hub_ca(&url, Credential::User(token.clone()), Some(&ca), wait) {
+            Err(Silent::Tls(why)) => assert!(why.contains(&ca.display().to_string()), "{why}"),
+            other => panic!("expected the CA file refused, got {:?}", other.map(|c| c.server().to_string())),
+        }
+    }
+    // Plain TCP to a TLS server is no welcome, and a TLS dial to a plain one is a refused handshake.
+    assert!(Client::dial_hub(&format!("tcp://localhost:{port}"), Credential::User(token), Duration::from_secs(1)).is_err());
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}

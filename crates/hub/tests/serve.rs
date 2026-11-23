@@ -10,9 +10,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wsp_api::{ApiToken, Blob, EventId, ObjectId, Refs, WorkspaceId};
-use wsp_client::{Client, Item, Silent, SyncReport};
+use wsp_client::{Client, Credential, Item, Silent, SyncReport};
 use wsp_hub::Hub;
 use wsp_machines::token;
+use wsp_server::testing::TestPki;
 use wsp_objects::{encode, Object};
 use wsp_store_contract::{
     At, Command as Cmd, Entity, EventKind, IdempotencyKey, Principal, ProjectId, Row, RowId, RowState, Subject, TokenId,
@@ -345,4 +346,104 @@ impl Hubd {
         BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
         Hubd { child }
     }
+}
+
+// ------------------------------------------------------------ TLS (wsp-461)
+
+/// A hub over TLS with a generated CA's certificate for `localhost`; its URL and `users`' tokens.
+fn tls_hub(dir: &Scratch, users: &[&str]) -> (Hubd, TestPki, String, BTreeMap<String, String>) {
+    let tokens = seed(&dir.data(), users);
+    let pki = TestPki::new(&dir.0.join("pki"), "hub");
+    let tls = format!(r#", "tls": {{"cert": {:?}, "key": {:?}}}"#, pki.cert, pki.key);
+    let hub = Hubd::start(&dir.config(&tls));
+    let listen = std::fs::read_to_string(dir.data().join("api.json")).unwrap();
+    let addr = serde_json::from_str::<wsp_api::Listen>(&listen).unwrap().addrs.remove(0);
+    let port = addr.rsplit_once(':').unwrap().1.to_string();
+    (hub, pki, format!("tls://localhost:{port}"), tokens)
+}
+
+#[test]
+fn a_client_holding_the_ca_syncs_over_tls_and_one_without_it_is_refused_naming_the_certificate() {
+    let dir = Scratch::new("tls");
+    let (_hub, pki, url, tokens) = tls_hub(&dir, &["ann", "bo"]);
+    let user = |who: &str| Credential::User(tokens[who].clone());
+
+    // Two spokes holding the CA converge through the hub, as they do in the clear.
+    let (mut a, mut b) = (Spoke::new("ann"), Spoke::new("bo"));
+    a.write("wsp-1", "first");
+    a.write("wsp-2", "second");
+    b.write("wsp-3", "third");
+    let mut ca = Client::dial_hub_ca(&url, user("ann"), Some(&pki.ca), WAIT).unwrap_or_else(|s| panic!("silent: {s}"));
+    let mut cb = Client::dial_hub_ca(&url, user("bo"), Some(&pki.ca), WAIT).unwrap_or_else(|s| panic!("silent: {s}"));
+    assert_eq!(ca.server(), "wsp-hub");
+    let ra = a.sync(&mut ca);
+    assert_eq!((ra.sent, ra.received.len()), (2, 0), "{ra:?}");
+    let rb = b.sync(&mut cb);
+    assert_eq!((rb.sent, rb.received.len()), (1, 2), "{rb:?}");
+    a.sync(&mut ca);
+    assert_eq!(a.refs, b.refs);
+    assert_eq!(a.objects, b.objects);
+
+    // Without the CA the platform's roots do not vouch for the certificate: refused, by name.
+    match Client::dial_hub(&url, user("ann"), Duration::from_secs(10)) {
+        Err(e @ Silent::Tls(_)) => {
+            let said = e.to_string();
+            assert!(said.contains("invalid peer certificate") && said.contains("UnknownIssuer"), "{said}");
+        }
+        other => panic!("a client without the CA must be refused: {:?}", other.map(|c| c.server().to_string())),
+    }
+    // Plain TCP to it is not welcomed either: the hub speaks TLS on every connection.
+    let plain = url.replacen("tls://", "tcp://", 1);
+    assert!(Client::dial_hub(&plain, user("ann"), Duration::from_secs(1)).is_err());
+    // And the hub is still serving whoever holds the CA after those.
+    assert!(Client::dial_hub_ca(&url, user("bo"), Some(&pki.ca), WAIT).is_ok());
+}
+
+#[test]
+fn the_hub_refuses_to_start_on_a_non_loopback_bind_without_a_certificate() {
+    let wide = r#", "bind": ["0.0.0.0"], "peers": ["0.0.0.0/0", "::/0"]"#;
+    // As a process: the config is refused with the reason, before anything is bound or made.
+    let dir = Scratch::new("no-cert");
+    let out = Command::new(env!("CARGO_BIN_EXE_wsp-hub"))
+        .args(["serve", "--config"])
+        .arg(dir.config(wide))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("0.0.0.0") && said.contains("tls"), "{said}");
+    assert!(!dir.data().exists(), "nothing was made");
+
+    // As the library: a config built in code is refused the same, by `start`.
+    let cfg = wsp_hub::Config {
+        data_dir: dir.data(),
+        bind: vec!["0.0.0.0".parse().unwrap()],
+        port: 0,
+        peers: vec!["0.0.0.0/0".into()],
+        tls: None,
+        name: "wsp-hub".into(),
+    };
+    match wsp_hub::serve::start(&cfg) {
+        Err(why) => assert!(why.contains("tls"), "{why}"),
+        Ok(_) => panic!("a hub bound to a public address without TLS"),
+    }
+    assert!(!dir.data().exists(), "and nothing was made");
+
+    // With a certificate that is not there, or not a certificate, the start is refused naming the file.
+    let pki = TestPki::new(&dir.0.join("pki"), "hub");
+    let junk = dir.0.join("junk.pem");
+    std::fs::write(&junk, "not a pem").unwrap();
+    for (cert, key) in [(dir.0.join("absent.pem"), pki.key.clone()), (junk.clone(), pki.key.clone()), (pki.cert.clone(), junk)] {
+        let cfg = wsp_hub::Config { tls: Some(wsp_hub::TlsFiles { cert: cert.clone(), key: key.clone() }), ..cfg.clone() };
+        match wsp_hub::serve::start(&cfg) {
+            Err(why) => {
+                let named = why.contains(&cert.display().to_string()) || why.contains(&key.display().to_string());
+                assert!(named, "{why}");
+            }
+            Ok(_) => panic!("a hub started on {cert:?} and {key:?}"),
+        }
+    }
+    // Loopback needs none.
+    let ok = wsp_hub::Config { bind: vec![], peers: vec!["127.0.0.0/8".into()], ..cfg };
+    wsp_hub::serve::start(&ok).expect("loopback serves in the clear").stop();
 }

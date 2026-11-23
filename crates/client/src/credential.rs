@@ -8,7 +8,8 @@
 //! `~/.config/wsp/hubs.json`, a file only its owner may read (0600: a wider one
 //! is refused, naming it). The hub's URL is `$WSP_HUB_URL`, else the file's
 //! `url`. No host is a literal here: both come from the environment or the file.
-//! The file is one login, `{"url": "...", "token": "..."}`; its `user`, if any, is not read (the hello's hint is `$WSP_HUB_USER`, else `$USER`).
+//! The file is one login, `{"url": "...", "token": "..."}`, and a `ca` (a PEM file) when
+//! the hub's certificate is a private CA's (wsp-461; `$WSP_HUB_CA`, `--ca <file>`); its `user`, if any, is not read (the hello's hint is `$WSP_HUB_USER`, else `$USER`).
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,9 @@ use crate::Silent;
 pub const HUB_TOKEN_ENV: &str = "WSP_HUB_TOKEN";
 /// The environment variable that holds the hub's URL.
 pub const HUB_URL_ENV: &str = "WSP_HUB_URL";
+/// The environment variable that holds the path of the CA file a private hub's
+/// certificate chains to (`ca` in `hubs.json`, `--ca <file>`).
+pub const HUB_CA_ENV: &str = "WSP_HUB_CA";
 /// The environment variable that holds the user's name, the hello's hint.
 pub const HUB_USER_ENV: &str = "WSP_HUB_USER";
 /// The file of the login, under the home directory.
@@ -91,9 +95,24 @@ pub fn hub_url_in(env_url: Option<String>, home: &Path) -> Result<String, Silent
     }
 }
 
+/// The CA file a private hub's certificate chains to: `$WSP_HUB_CA`, else
+/// `hubs.json`'s `ca`; none when neither names one (the platform's roots then).
+pub fn hub_ca() -> Result<Option<PathBuf>, Silent> {
+    hub_ca_in(std::env::var(HUB_CA_ENV).ok(), &home())
+}
+
+/// [`hub_ca`] with the environment's value and the home directory given.
+pub fn hub_ca_in(env_ca: Option<String>, home: &Path) -> Result<Option<PathBuf>, Silent> {
+    if let Some(c) = env_ca.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
+        return Ok(Some(PathBuf::from(c)));
+    }
+    Ok(read_login(home)?.and_then(|l| l.ca).filter(|c| !c.is_empty()).map(PathBuf::from))
+}
+
 struct Login {
     url: Option<String>,
     token: Option<String>,
+    ca: Option<String>,
 }
 
 fn home() -> PathBuf {
@@ -127,24 +146,27 @@ fn read_login(home: &Path) -> Result<Option<Login>, Silent> {
     if !v.is_object() {
         return Err(Silent::BadHubsFile(format!("{} is not a login: not an object", path.display())));
     }
-    Ok(Some(Login { url: field("url"), token: field("token") }))
+    Ok(Some(Login { url: field("url"), token: field("token"), ca: field("ca") }))
 }
 
-/// The `host:port` a hub's URL names: `tcp://host:port` or bare `host:port`
-/// (plain TCP until wsp-461's TLS). Any other scheme is refused rather than
-/// dialled in the clear.
-pub(crate) fn hub_addr(url: &str) -> Result<String, Silent> {
+/// The `host:port` a hub's URL names, and whether it is dialled over TLS:
+/// `tls://host:port` is (wsp-461); `tcp://host:port` and a bare `host:port` are
+/// plain TCP. Any other scheme is refused rather than dialled in the clear.
+pub(crate) fn hub_addr(url: &str) -> Result<(String, bool), Silent> {
     let url = url.trim();
-    let addr = match url.split_once("://") {
-        Some(("tcp", rest)) => rest,
-        Some((scheme, _)) => return Err(Silent::BadListenFile(format!("hub url {url}: scheme {scheme} is not supported yet"))),
-        None => url,
+    let (addr, secure) = match url.split_once("://") {
+        Some(("tls", rest)) => (rest, true),
+        Some(("tcp", rest)) => (rest, false),
+        Some((scheme, _)) => {
+            return Err(Silent::BadListenFile(format!("hub url {url}: scheme {scheme} is not supported (tls:// or tcp://)")))
+        }
+        None => (url, false),
     };
     let addr = addr.trim_end_matches('/');
     if addr.is_empty() || !addr.contains(':') {
         return Err(Silent::BadListenFile(format!("hub url {url} is not host:port")));
     }
-    Ok(addr.to_string())
+    Ok((addr.to_string(), secure))
 }
 
 /// Who the hello says it is for, as a hint the hub ignores (wsp-161).
@@ -219,10 +241,22 @@ mod tests {
     }
 
     #[test]
-    fn a_url_is_host_port_over_tcp_only() {
-        assert_eq!(hub_addr("tcp://hub.invalid:7000/").unwrap(), "hub.invalid:7000");
-        assert_eq!(hub_addr("hub.invalid:7000").unwrap(), "hub.invalid:7000");
+    fn a_url_is_host_port_over_tls_or_tcp_and_nothing_else() {
+        assert_eq!(hub_addr("tls://hub.invalid:7000/").unwrap(), ("hub.invalid:7000".to_string(), true));
+        assert_eq!(hub_addr("tcp://hub.invalid:7000/").unwrap(), ("hub.invalid:7000".to_string(), false));
+        assert_eq!(hub_addr("hub.invalid:7000").unwrap(), ("hub.invalid:7000".to_string(), false));
         assert!(hub_addr("https://hub.invalid:7000").is_err());
+        assert!(hub_addr("tls://hub.invalid").is_err());
         assert!(hub_addr("hub.invalid").is_err());
+    }
+
+    #[test]
+    fn the_ca_is_the_environments_then_the_files_and_none_without_either() {
+        let h = home("ca", 0o600, r#"{"url":"tls://hub.invalid:7000","token":"t","ca":"/etc/hub-ca.pem"}"#);
+        assert_eq!(hub_ca_in(Some("/env/ca.pem".into()), &h).unwrap(), Some(PathBuf::from("/env/ca.pem")));
+        assert_eq!(hub_ca_in(None, &h).unwrap(), Some(PathBuf::from("/etc/hub-ca.pem")));
+        let none = home("noca", 0o600, LOGIN);
+        assert_eq!(hub_ca_in(None, &none).unwrap(), None);
+        assert_eq!(hub_ca_in(None, &std::env::temp_dir().join("wsp-no-such-home")).unwrap(), None);
     }
 }

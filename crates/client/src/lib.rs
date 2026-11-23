@@ -46,10 +46,14 @@ mod dial;
 mod orders;
 mod subscribe;
 mod sync;
+mod tls;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
-pub use credential::{hub_url, hub_url_in, Credential, Target, HUBS_FILE, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV};
+pub use credential::{
+    hub_ca, hub_ca_in, hub_url, hub_url_in, Credential, Target, HUBS_FILE, HUB_CA_ENV, HUB_TOKEN_ENV, HUB_URL_ENV,
+    HUB_USER_ENV,
+};
 pub use dial::Silent;
 pub use orders::APPLY_ATTEMPTS;
 pub use subscribe::{Feed, Item};
@@ -137,8 +141,9 @@ pub(crate) struct Dial {
 pub(crate) enum Where {
     StateDir(PathBuf),
     Addrs { addrs: Vec<String>, token: ApiToken },
-    /// A hub, by the address its URL names, and the user's token (never the instance's).
-    Hub { addr: String, token: ApiToken },
+    /// A hub, by the address its URL names, and the user's token (never the instance's);
+    /// `tls` when the URL is `tls://`.
+    Hub { addr: String, token: ApiToken, tls: Option<tls::Tls> },
 }
 
 /// A welcomed connection to the server, for requests.
@@ -168,27 +173,44 @@ impl Client {
         Client::dial_target(Dial { at: Where::Addrs { addrs, token }, by, wait })
     }
 
-    /// Dial the hub at `url` (`host:port`, or `tcp://host:port`: plain TCP until
-    /// TLS, wsp-461) and say `hello` with the user's token from `credential`,
-    /// within `wait` in all. The hub ignores the hello's `by` (wsp-161), so the
+    /// Dial the hub at `url` and say `hello` with the user's token from
+    /// `credential`, within `wait` in all. `tls://host:port` is TLS, the
+    /// hub's certificate checked against the platform's roots and for `host`
+    /// (wsp-461); `tcp://host:port` and a bare `host:port` are plain TCP, for
+    /// loopback and a private network. A refused certificate is [`Silent::Tls`],
+    /// naming its fault. The hub ignores the hello's `by` (wsp-161), so the
     /// client sends the user's name (`$WSP_HUB_USER`, else `$USER`) as a hint
-    /// only. The instance token is never sent to a hub: [`Credential::Instance`]
+    /// only, and makes every request as the principal the `welcome` names. The
+    /// instance token is never sent to a hub: [`Credential::Instance`]
     /// is [`Silent::NotLoggedIn`], and `api.token` is never read. A lost
     /// connection dials the same hub again.
     pub fn dial_hub(url: &str, credential: Credential, wait: Duration) -> Result<Client, Silent> {
+        Client::dial_hub_ca(url, credential, None, wait)
+    }
+
+    /// [`Client::dial_hub`] trusting the CA in `ca` (a PEM file) and nothing
+    /// else, for a hub whose certificate a private CA signed (a test, a
+    /// self-hosted hub): `--ca <file>`, [`hub_ca`]. It applies to `tls://` only.
+    pub fn dial_hub_ca(url: &str, credential: Credential, ca: Option<&Path>, wait: Duration) -> Result<Client, Silent> {
         let token = match credential {
             Credential::User(token) => ApiToken(token),
             Credential::Instance => {
                 return Err(Silent::NotLoggedIn("the instance token is never sent to a hub".into()))
             }
         };
-        let addr = credential::hub_addr(url)?;
-        Client::dial_target(Dial { at: Where::Hub { addr, token }, by: credential::hint(), wait })
+        let (addr, secure) = credential::hub_addr(url)?;
+        let tls = if secure { Some(tls::Tls::new(&addr, ca)?) } else { None };
+        Client::dial_target(Dial { at: Where::Hub { addr, token, tls }, by: credential::hint(), wait })
     }
 
-    fn dial_target(target: Dial) -> Result<Client, Silent> {
+    fn dial_target(mut target: Dial) -> Result<Client, Silent> {
         let wait = target.wait;
         let open = dial::open(&target)?;
+        // Every request's `by` must be who the connection is: a hub names that from the token
+        // (wsp-161), whatever `by` the hello sent, and a server that trusts the hello names the hello's.
+        if let Some(by) = open.welcome.by.clone() {
+            target.by = by;
+        }
         Ok(Client {
             target,
             conn: Some(open.conn),

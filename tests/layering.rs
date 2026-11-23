@@ -886,8 +886,9 @@ fn the_machines_link_the_contract_alone_and_do_no_io() {
 /// step 2 (wsp-121), `wsp-machines` (the pure machines it composes beside the mirror), and with
 /// its tests it reaches only those and `wsp-store-conformance` (for `MemStore`) of the workspace,
 /// so nothing that does OS or store-file work: never `wsp-store-sqlite` ("not the sqlite crate,
-/// except in main"), `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`. Its one external
-/// dependency is `serde_json`.
+/// except in main"), `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`. Its external
+/// dependencies are `serde_json` and, since wsp-461's TLS on the hub's listener, `rustls` (and
+/// `rcgen`, optional, behind `test-support`, for the tests' generated CA).
 #[test]
 fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_file_work() {
     let dir = root().join("crates/server");
@@ -910,10 +911,24 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
     let extra: Vec<&String> = named
         .iter()
         .filter(|d| {
-            !["serde_json", "wsp-api", "wsp-store-contract", "wsp-machines", "wsp-store-conformance"].contains(&d.as_str())
+            // `wsp-server` itself: the dev-dependency that turns its own `test-support` on in its tests.
+            ![
+                "serde_json",
+                "rustls",
+                "rcgen",
+                "wsp-server",
+                "wsp-api",
+                "wsp-store-contract",
+                "wsp-machines",
+                "wsp-store-conformance",
+            ]
+            .contains(&d.as_str())
         })
         .collect();
-    assert!(extra.is_empty(), "wsp-server depends on serde_json, the api, the machines and the contract alone, not {extra:?}");
+    assert!(
+        extra.is_empty(),
+        "wsp-server depends on serde_json, rustls, the api, the machines and the contract alone, not {extra:?}"
+    );
 }
 
 /// `wsp-client`, the state core's client, speaks the protocol and nothing else: its normal
@@ -921,8 +936,9 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
 /// `wsp-objects` (pure: the ids it holds objects to and the refs it diffs), so that web-chrome,
 /// which links it by path, links no more of wsp than that (`docs/state-core.md` section 6; wsp-074). Its tests may also
 /// reach `wsp-server` and `wsp-store-conformance` (a loopback server over `MemStore`), never the
-/// store, the wire, the host, the manager or the sqlite crate. Its one external dependency is
-/// `serde_json`.
+/// store, the wire, the host, the manager or the sqlite crate. Its external dependencies are
+/// `serde_json` and, since a hub URL can be `tls://` (wsp-461), `rustls` and `rustls-native-certs`
+/// (the platform's roots).
 #[test]
 fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone() {
     let dir = root().join("crates/client");
@@ -946,11 +962,24 @@ fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone(
     let extra: Vec<&String> = named
         .iter()
         .filter(|d| {
-            !["serde_json", "wsp-api", "wsp-store-contract", "wsp-objects", "wsp-client", "wsp-server", "wsp-store-conformance"]
-                .contains(&d.as_str())
+            ![
+                "serde_json",
+                "rustls",
+                "rustls-native-certs",
+                "wsp-api",
+                "wsp-store-contract",
+                "wsp-objects",
+                "wsp-client",
+                "wsp-server",
+                "wsp-store-conformance",
+            ]
+            .contains(&d.as_str())
         })
         .collect();
-    assert!(extra.is_empty(), "wsp-client depends on serde_json, the api, the objects and the contract alone, not {extra:?}");
+    assert!(
+        extra.is_empty(),
+        "wsp-client depends on serde_json, rustls, the api, the objects and the contract alone, not {extra:?}"
+    );
 
     // The server is a dev-dependency: a normal dependency would link it into web-chrome.
     let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();

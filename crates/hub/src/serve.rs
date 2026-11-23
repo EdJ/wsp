@@ -7,6 +7,9 @@
 //! Who a hello is, is [`crate::auth`]'s: a user's token names that user, and
 //! the bootstrap token, `api.token` in the data directory, names the hub
 //! itself only to make the first admin (wsp-161).
+//!
+//! **TLS** (wsp-461). With `tls` in the config every connection is inside a TLS
+//! session, and an address that is not loopback is refused without it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -29,11 +32,17 @@ pub struct Running {
     server: Server,
     hub: Arc<Hub>,
     token_path: PathBuf,
+    tls: bool,
 }
 
 /// Opens the hub's data directory and starts listening as `cfg` says.
 pub fn start(cfg: &Config) -> Result<Running, String> {
     let peers = cfg.ranges()?;
+    cfg.tls_required()?;
+    let tls = match &cfg.tls {
+        Some(files) => Some(wsp_server::tls::server_config(&files.cert, &files.key)?),
+        None => None,
+    };
     let hub = Arc::new(Hub::open(&cfg.data_dir).map_err(|e| format!("opening {}: {e:?}", cfg.data_dir.display()))?);
     let store: SharedStore = Arc::new(HubStore::new(hub.clone()));
     let mut server_cfg = wsp_server::Config::new(&cfg.data_dir);
@@ -43,14 +52,21 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
     server_cfg.sync = Some(hub.clone());
     server_cfg.gate = Some(Arc::new(Auth::new(hub.clone(), cfg.name.clone())));
     server_cfg.peers = Some(peers);
+    let secure = tls.is_some();
+    server_cfg.tls = tls;
     let server = Server::start(store, server_cfg).map_err(|e| e.to_string())?;
-    Ok(Running { server, hub, token_path: cfg.data_dir.join(TOKEN_FILE) })
+    Ok(Running { server, hub, token_path: cfg.data_dir.join(TOKEN_FILE), tls: secure })
 }
 
 impl Running {
     /// The addresses it listens on, loopback first.
     pub fn addrs(&self) -> &[SocketAddr] {
         self.server.addrs()
+    }
+
+    /// Whether every connection is inside TLS.
+    pub fn tls(&self) -> bool {
+        self.tls
     }
 
     /// Where the bootstrap token is.

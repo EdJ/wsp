@@ -39,7 +39,8 @@ fn main() -> ExitCode {
     };
     let addrs: Vec<String> = running.addrs().iter().map(ToString::to_string).collect();
     // One line a supervisor or a test can wait for; the token is a file, never printed.
-    println!("wsp-hub: listening on {}; bootstrap token in {}", addrs.join(" "), running.token_path().display());
+    let tls = if running.tls() { "; tls" } else { "" };
+    println!("wsp-hub: listening on {}; bootstrap token in {}{tls}", addrs.join(" "), running.token_path().display());
     // Serves until it is killed: the store is transactional and every object is
     // renamed into place, so an end at any moment leaves it whole.
     loop {

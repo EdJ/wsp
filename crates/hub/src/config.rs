@@ -3,9 +3,10 @@
 //! ```json
 //! {
 //!   "data_dir": "/var/lib/wsp-hub",
-//!   "bind": ["100.64.0.7"],
+//!   "bind": ["0.0.0.0"],
 //!   "port": 7489,
-//!   "peers": ["127.0.0.0/8", "::1/128", "100.64.0.0/10"],
+//!   "peers": ["0.0.0.0/0", "::/0"],
+//!   "tls": { "cert": "/etc/wsp-hub/fullchain.pem", "key": "/etc/wsp-hub/privkey.pem" },
 //!   "name": "wsp-hub"
 //! }
 //! ```
@@ -15,12 +16,18 @@
 //!   (`api.log`) live. A relative path is read from the config file's own
 //!   directory.
 //! - `bind`: addresses to listen on beside loopback, which is always bound.
-//!   Each must be in `peers`. None by default: loopback alone, until
-//!   wsp-461's TLS makes anything wider safe.
+//!   Each must be in `peers`. None by default: loopback alone. An address that
+//!   is not loopback needs `tls`: the hub refuses to start without it (wsp-461).
 //! - `port`: one port for every address; `0` takes an ephemeral one, which
 //!   `api.json` and the start line then name. Default [`DEFAULT_PORT`].
 //! - `peers`: the CIDR blocks a peer's address must be in. Default loopback
-//!   (`127.0.0.0/8`, `::1/128`).
+//!   (`127.0.0.0/8`, `::1/128`); a public hub names `0.0.0.0/0` and `::/0`.
+//!   Only the hub reads this: the daemon's own server keeps loopback and the
+//!   tailnet.
+//! - `tls`: the PEM certificate chain (`cert`) and private key (`key`) the
+//!   listener serves; with it every connection, loopback included, is TLS.
+//!   A relative path is read from the config file's own directory. A client
+//!   dials such a hub with a `tls://host:port` URL.
 //! - `name`: the instance `welcome` names. Default `wsp-hub`.
 //!
 //! A key this file does not know is an error, so a misspelt `peers` does not
@@ -46,8 +53,18 @@ pub struct Config {
     pub port: u16,
     #[serde(default = "loopback")]
     pub peers: Vec<String>,
+    #[serde(default)]
+    pub tls: Option<TlsFiles>,
     #[serde(default = "default_name")]
     pub name: String,
+}
+
+/// The certificate chain and private key of the listener, both PEM.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsFiles {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 fn default_port() -> u16 {
@@ -71,8 +88,28 @@ impl Config {
             let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
             cfg.data_dir = base.join(&cfg.data_dir);
         }
+        if let Some(tls) = &mut cfg.tls {
+            let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            for file in [&mut tls.cert, &mut tls.key] {
+                if file.is_relative() {
+                    *file = base.join(&*file);
+                }
+            }
+        }
         cfg.ranges()?;
+        cfg.tls_required()?;
         Ok(cfg)
+    }
+
+    /// An address to bind that is not loopback is refused without `tls`: the
+    /// user's token and every object would cross the network in the clear.
+    pub fn tls_required(&self) -> Result<(), String> {
+        match self.bind.iter().find(|ip| !ip.is_loopback()) {
+            Some(ip) if self.tls.is_none() => {
+                Err(format!("bind: {ip} is not loopback, so the hub needs a \"tls\" certificate and key to listen on it"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The `peers` as ranges, or the first that does not read.
@@ -105,8 +142,29 @@ mod tests {
         assert_eq!((cfg.port, cfg.name.as_str()), (DEFAULT_PORT, "wsp-hub"));
         assert!(cfg.bind.is_empty());
         assert!(cfg.ranges().unwrap().contains(&"127.0.0.1".parse().unwrap()));
-        assert!(!cfg.ranges().unwrap().contains(&"100.64.0.1".parse().unwrap()));
+        assert!(!cfg.ranges().unwrap().contains(&"8.8.8.8".parse().unwrap()));
         assert!(cfg.data_dir.ends_with("d") && cfg.data_dir.is_absolute(), "from the config's directory: {:?}", cfg.data_dir);
+    }
+
+    #[test]
+    fn a_bind_past_loopback_needs_tls_and_a_public_hub_names_its_ranges() {
+        let wide = r#""peers": ["0.0.0.0/0", "::/0"]"#;
+        let err = load(&format!(r#"{{"data_dir": "d", "bind": ["0.0.0.0"], {wide}}}"#)).unwrap_err();
+        assert!(err.contains("0.0.0.0") && err.contains("tls"), "{err}");
+        assert!(load(r#"{"data_dir": "d", "bind": ["::"]}"#).is_err(), "the unspecified address is not loopback");
+        assert!(load(r#"{"data_dir": "d", "bind": ["127.0.0.2", "::1"]}"#).is_ok(), "loopback needs none");
+
+        let cfg = load(&format!(
+            r#"{{"data_dir": "d", "bind": ["0.0.0.0"], {wide}, "tls": {{"cert": "c.pem", "key": "/abs/k.pem"}}}}"#
+        ))
+        .unwrap();
+        let tls = cfg.tls.unwrap();
+        assert!(tls.cert.is_absolute() && tls.cert.ends_with("c.pem"), "from the config's directory: {:?}", tls.cert);
+        assert_eq!(tls.key, PathBuf::from("/abs/k.pem"));
+        let ranges = load(&format!(r#"{{"data_dir": "d", {wide}}}"#)).unwrap().ranges().unwrap();
+        for ip in ["8.8.8.8", "2001:db8::1", "10.1.2.3", "127.0.0.1"] {
+            assert!(ranges.contains(&ip.parse().unwrap()), "{ip} is admitted by a public hub");
+        }
     }
 
     #[test]
@@ -117,6 +175,8 @@ mod tests {
             r#"{"data_dir": "d", "peers": ["10.0.0.0/40"]}"#,
             r#"{"data_dir": "d", "peers": []}"#,
             r#"{"data_dir": "d", "bind": ["not an ip"]}"#,
+            r#"{"data_dir": "d", "tls": {"cert": "c.pem"}}"#,
+            r#"{"data_dir": "d", "tls": {"cert": "c.pem", "key": "k.pem", "ca": "x"}}"#,
             r#"not json"#,
         ] {
             assert!(load(bad).is_err(), "{bad}");

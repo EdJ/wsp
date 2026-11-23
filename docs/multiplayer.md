@@ -116,9 +116,30 @@ Put the server and every player on one tailnet; the server's peer rule already a
 | --- | --- | --- | --- |
 | ssh tunnel (today) | No, unless the LAN is exposed | ssh key, not seen by wsp | None |
 | Tailscale or another WireGuard mesh | Yes | Tailnet node, plus the wsp token | None: the ranges are already allowed |
-| Public TLS endpoint | Yes | wsp token only | TLS listener, rate limits, a wider attack surface |
+| Public TLS endpoint | Yes | wsp token only | A TLS listener (wsp-461, below); rate limits and a wider attack surface remain |
 
 Recommended: Tailscale, with tailnet ACLs limiting port 7488 to the team's devices, and the per-person wsp token on top. web-chrome's `--target` then dials the target's tailnet name directly instead of the local `api.json`, which also fixes compound-react-014.
+
+### The hub over TLS (wsp-461)
+
+The hub (`wsp-hub serve --config <file>`) serves TLS when its config names a certificate, and a hub on a public endpoint must: it refuses to start bound to an address that is not loopback without one. No host is written in the code or the tests; the hub is whatever the config says, and a tailnet stays optional.
+
+```json
+{
+  "data_dir": "/var/lib/wsp-hub",
+  "bind": ["0.0.0.0"],
+  "port": 7489,
+  "peers": ["0.0.0.0/0", "::/0"],
+  "tls": { "cert": "/etc/wsp-hub/fullchain.pem", "key": "/etc/wsp-hub/privkey.pem" }
+}
+```
+
+- `tls.cert` is the PEM certificate chain and `tls.key` its private key (relative paths are read from the config's directory). With `tls` every connection is TLS, loopback included.
+- `peers` is the hub's own list of CIDR blocks it admits; a public hub names `0.0.0.0/0` and `::/0`. It is the hub's alone: the daemon's server still admits loopback and the tailnet and nothing else, and sets no TLS.
+
+**The URL.** A client names a hub by `tls://host:port` for TLS, which is the form for any hub that is not on loopback or a private network. `tcp://host:port`, or a bare `host:port`, is plain TCP, as before: the user's token crosses it in the clear. Any other scheme (`https://` too: the protocol is not HTTP) is refused, and a port is required.
+
+**Trust.** A `tls://` hub's certificate must be for the URL's host and chain to the platform's root certificates. A private CA (a test, a self-hosted hub) is *pinned* with a PEM file, named by `--ca <file>`, `$WSP_HUB_CA`, or `"ca"` in `~/.config/wsp/hubs.json`: the client then trusts that CA's certificates and no other root. A certificate it refuses ends the dial as `Silent::Tls`, naming the fault (`invalid peer certificate: UnknownIssuer`, `... not valid for name ...`); the user's token is not sent.
 
 ## Budgets, audit and trust
 

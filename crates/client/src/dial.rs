@@ -4,6 +4,10 @@
 //! within one budget, send [`Hello`] and wait for [`Welcome`]. Anything else is
 //! [`Silent`], which names what failed.
 //!
+//! A hub dialled over TLS (wsp-461) has the same lines inside a TLS session;
+//! the handshake is part of the dial, and a certificate it refuses is
+//! [`Silent::Tls`], naming the certificate's fault.
+//!
 //! [`Tcp`] is the dial-side twin of `wsp-server`'s carrier: newline JSON over a
 //! stream, the framing rule of `crates/api/src/conn.rs`. It is copied so that a
 //! process that only calls does not link the server.
@@ -20,6 +24,7 @@ use wsp_api::{
 };
 use wsp_store_contract::Principal;
 
+use crate::tls::Tls;
 use crate::{Dial, Where};
 
 /// Why nothing answered. Never a panic or a hang: the CLI falls back and
@@ -44,6 +49,9 @@ pub enum Silent {
     NotLoggedIn(String),
     /// `hubs.json` is unusable: wider than 0600, unreadable or not a login.
     BadHubsFile(String),
+    /// TLS failed: the hub's certificate was refused (the text names why, as
+    /// `invalid peer certificate: UnknownIssuer`), or the CA file did not read.
+    Tls(String),
 }
 
 impl fmt::Display for Silent {
@@ -58,6 +66,7 @@ impl fmt::Display for Silent {
             Silent::NotAServer(what) => write!(f, "not a wsp server: {what}"),
             Silent::NotLoggedIn(why) => write!(f, "not logged in: {why}"),
             Silent::BadHubsFile(why) => write!(f, "hubs.json is not usable: {why}"),
+            Silent::Tls(why) => write!(f, "tls: {why}"),
         }
     }
 }
@@ -75,14 +84,16 @@ pub(crate) fn open(target: &Dial) -> Result<Open, Silent> {
     match &target.at {
         Where::StateDir(dir) => {
             let (addrs, token) = read_state_dir(dir)?;
-            open_at(&addrs, token, &target.by, target.wait)
+            open_at(&addrs, token, &target.by, target.wait, None)
         }
-        Where::Hub { addr, token } => open_at(std::slice::from_ref(addr), token.clone(), &target.by, target.wait),
+        Where::Hub { addr, token, tls } => {
+            open_at(std::slice::from_ref(addr), token.clone(), &target.by, target.wait, tls.as_ref())
+        }
         Where::Addrs { addrs, token } => {
             if addrs.is_empty() {
                 return Err(Silent::BadListenFile("no address was given".into()));
             }
-            open_at(addrs, token.clone(), &target.by, target.wait)
+            open_at(addrs, token.clone(), &target.by, target.wait, None)
         }
     }
 }
@@ -98,24 +109,27 @@ fn read_state_dir(state_dir: &Path) -> Result<(Vec<String>, ApiToken), Silent> {
     Ok((listen.addrs, ApiToken(token.trim().to_string())))
 }
 
-/// Dial `addrs` in order and say hello with `token` as `by`, in `wait` at most.
-fn open_at(addrs: &[String], token: ApiToken, by: &Principal, wait: Duration) -> Result<Open, Silent> {
+/// Dial `addrs` in order and say hello with `token` as `by`, in `wait` at most,
+/// inside TLS when `tls` is given. A name that resolves to several addresses
+/// (`localhost` to both loopbacks) is tried at each.
+fn open_at(addrs: &[String], token: ApiToken, by: &Principal, wait: Duration, tls: Option<&Tls>) -> Result<Open, Silent> {
     let deadline = Instant::now() + wait;
     let mut tried = Vec::new();
-    for (i, text) in addrs.iter().enumerate() {
+    let mut candidates: Vec<(&str, SocketAddr)> = Vec::new();
+    for text in addrs {
+        match text.to_socket_addrs() {
+            Ok(found) if found.len() > 0 => candidates.extend(found.map(|a| (text.as_str(), a))),
+            _ => tried.push(format!("{text}: not an address")),
+        }
+    }
+    for (i, (text, addr)) in candidates.iter().enumerate() {
         // Each address gets an even share of what is left, so one that swallows
         // its packets does not take the whole budget.
-        let share = deadline.saturating_duration_since(Instant::now()) / (addrs.len() - i) as u32;
-        let addr = match text.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            Some(a) => a,
-            None => {
-                tried.push(format!("{text}: not an address"));
-                continue;
-            }
-        };
-        match Tcp::dial(addr, share.max(Duration::from_millis(1))) {
+        let share = deadline.saturating_duration_since(Instant::now()) / (candidates.len() - i) as u32;
+        match Tcp::dial(*addr, share.max(Duration::from_millis(1)), tls, deadline) {
             Ok(conn) => return hello(conn, text, token, by, deadline),
-            Err(e) => tried.push(format!("{text}: {e}")),
+            Err(Dialled::Tls(why)) => return Err(Silent::Tls(format!("{text}: {why}"))),
+            Err(Dialled::Net(e)) => tried.push(format!("{text}: {e}")),
         }
     }
     Err(Silent::Unreachable(tried))
@@ -138,15 +152,64 @@ fn client_name() -> String {
     format!("wsp-client {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Why a dial gave no connection.
+enum Dialled {
+    /// The connect failed or timed out.
+    Net(ConnError),
+    /// The TLS handshake failed; the text names why.
+    Tls(String),
+}
+
 /// One end of a TCP connection that carries frames.
 pub(crate) struct Tcp {
-    stream: TcpStream,
+    wire: Wire,
     /// Bytes read past the last whole line.
     partial: Vec<u8>,
     /// How much of `partial` is known to hold no newline: each read searches
     /// only what it added, so a reply of n bytes costs n, not n²/8 KiB
     /// (wsp-692: a 16 MiB `state` spent 14 CPU-s rescanning its own head).
     scanned: usize,
+}
+
+/// The stream, plain or inside a TLS session this end owns whole (a client
+/// reads and writes from one handle, so nothing of it is shared).
+enum Wire {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Wire {
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Wire::Plain(s) => s,
+            Wire::Tls(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.read(buf),
+            Wire::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.write(buf),
+            Wire::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Wire::Plain(s) => s.flush(),
+            Wire::Tls(s) => s.flush(),
+        }
+    }
 }
 
 fn io(e: std::io::Error) -> ConnError {
@@ -161,23 +224,61 @@ fn io(e: std::io::Error) -> ConnError {
 }
 
 impl Tcp {
-    fn dial(addr: SocketAddr, timeout: Duration) -> Result<Tcp, ConnError> {
-        let stream = TcpStream::connect_timeout(&addr, timeout).map_err(io)?;
-        stream.set_nodelay(true).map_err(io)?;
-        stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(io)?;
-        Ok(Tcp { stream, partial: Vec::new(), scanned: 0 })
+    /// Connect to `addr` within `timeout`; with `tls`, also finish the handshake
+    /// before `deadline`.
+    fn dial(addr: SocketAddr, timeout: Duration, tls: Option<&Tls>, deadline: Instant) -> Result<Tcp, Dialled> {
+        let stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| Dialled::Net(io(e)))?;
+        stream.set_nodelay(true).map_err(|e| Dialled::Net(io(e)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| Dialled::Net(io(e)))?;
+        let wire = match tls {
+            None => Wire::Plain(stream),
+            Some(tls) => Wire::Tls(Box::new(handshake(stream, tls, deadline)?)),
+        };
+        Ok(Tcp { wire, partial: Vec::new(), scanned: 0 })
     }
 
     pub(crate) fn shutdown(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        let _ = self.wire.socket().shutdown(Shutdown::Both);
     }
+}
+
+/// The TLS handshake over `stream`, within `deadline`: a certificate the
+/// client's roots do not vouch for ends it, and the error says which fault.
+fn handshake(
+    stream: TcpStream,
+    tls: &Tls,
+    deadline: Instant,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Dialled> {
+    let session = rustls::ClientConnection::new(tls.config.clone(), tls.name.clone())
+        .map_err(|e| Dialled::Tls(e.to_string()))?;
+    let mut s = rustls::StreamOwned::new(session, stream);
+    while s.conn.is_handshaking() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Dialled::Tls("the handshake did not finish in time".into()));
+        }
+        s.sock.set_read_timeout(Some(left)).map_err(|e| Dialled::Net(io(e)))?;
+        match s.conn.complete_io(&mut s.sock) {
+            Ok(_) => {}
+            // A refused certificate arrives as an `InvalidData` error that holds rustls's own.
+            Err(e) if e.kind() == ErrorKind::InvalidData => return Err(Dialled::Tls(e.to_string())),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(Dialled::Tls("the handshake did not finish in time".into()))
+            }
+            Err(e) if io(e.kind().into()) == ConnError::Closed => {
+                return Err(Dialled::Tls(format!("the hub closed the connection during the handshake: {e}")))
+            }
+            Err(e) => return Err(Dialled::Net(io(e))),
+        }
+    }
+    Ok(s)
 }
 
 impl Connection for Tcp {
     fn send(&mut self, frame: &Frame) -> Result<(), ConnError> {
         let mut line = serde_json::to_vec(frame).map_err(|e| ConnError::Malformed(e.to_string()))?;
         line.push(b'\n');
-        self.stream.write_all(&line).map_err(io)
+        self.wire.write_all(&line).map_err(io)
     }
 
     fn recv(&mut self, wait: Duration) -> Result<Option<Frame>, ConnError> {
@@ -198,8 +299,8 @@ impl Connection for Tcp {
                 return Ok(None);
             }
             // A zero read timeout is refused by the OS; a millisecond is the floor.
-            self.stream.set_read_timeout(Some(left.max(Duration::from_millis(1)))).map_err(io)?;
-            match self.stream.read(&mut chunk) {
+            self.wire.socket().set_read_timeout(Some(left.max(Duration::from_millis(1)))).map_err(io)?;
+            match self.wire.read(&mut chunk) {
                 Ok(0) => return Err(ConnError::Closed),
                 Ok(n) => self.partial.extend_from_slice(&chunk[..n]),
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
@@ -254,7 +355,7 @@ mod tests {
             }
             s.write_all(&rest).unwrap();
         });
-        let mut conn = Tcp::dial(addr, Duration::from_secs(5)).unwrap();
+        let mut conn = Tcp::dial(addr, Duration::from_secs(5), None, Instant::now() + Duration::from_secs(5)).ok().unwrap();
         let wait = Duration::from_secs(10);
         assert_eq!(text(conn.recv(wait).unwrap().unwrap()), (1, long));
         assert_eq!(text(conn.recv(wait).unwrap().unwrap()), (2, "two".into()));

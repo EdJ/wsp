@@ -1071,3 +1071,36 @@ fn under_mirrored_an_order_send_is_illegal_mirrored_and_the_mirror_puts_orders()
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
+
+// ------------------------------------------------------------ TLS (wsp-461)
+
+/// TLS is the hub's: the daemon's own server sets none, and a server that has it admits and binds
+/// exactly what it did without, unless it is handed ranges, which only the hub does.
+#[test]
+fn tls_leaves_the_daemons_peer_rule_as_it_was_and_a_public_peer_is_still_refused() {
+    use std::net::IpAddr;
+    let d = dir("tls-rule");
+    let pki = wsp_server::testing::TestPki::new(&d, "t");
+    let plain = Config::new(&d);
+    assert!(plain.tls.is_none(), "the daemon's server is plain TCP");
+    let mut with_tls = Config::new(&d);
+    with_tls.tls = Some(wsp_server::tls::server_config(&pki.cert, &pki.key).unwrap());
+
+    let public: [IpAddr; 4] = [[8, 8, 8, 8].into(), [10, 0, 0, 1].into(), [192, 168, 1, 2].into(), [0, 0, 0, 0].into()];
+    let own: [IpAddr; 4] = [[127, 0, 0, 1].into(), [100, 64, 0, 1].into(), "::1".parse().unwrap(), "fd7a:115c:a1e0::1".parse().unwrap()];
+    for cfg in [&plain, &with_tls] {
+        for ip in &public {
+            assert!(!cfg.admits(ip), "{ip} is a public peer: refused with or without TLS");
+        }
+        for ip in &own {
+            assert!(cfg.admits(ip), "{ip} is loopback or the tailnet: admitted");
+        }
+    }
+    // And a server that has TLS still will not bind an address the rule refuses.
+    let mut cfg = with_tls;
+    cfg.port = 0;
+    cfg.addrs = vec![public[0]];
+    let store: SharedStore = Arc::new(mirror_store().handle());
+    assert!(matches!(Server::start(store, cfg), Err(StartError::Address(_))));
+    let _ = fs::remove_dir_all(&d);
+}

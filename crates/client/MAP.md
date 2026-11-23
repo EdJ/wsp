@@ -5,7 +5,7 @@ what step 1 needs: dial and hello, request, and subscribe with reconnect. It is 
 daemon talks to the API: the CLI (wsp-076) and web-chrome (wsp-078, by path dependency). Nothing calls it until
 group 7.
 
-It depends on `wsp-api`, `wsp-store-contract`, `wsp-objects` (pure; since wsp-459's sync) and `serde_json`. `wsp-server` (a loopback server) and
+It depends on `wsp-api`, `wsp-store-contract`, `wsp-objects` (pure; since wsp-459's sync), `serde_json` and, since wsp-461's TLS, `rustls` (the `ring` provider) and `rustls-native-certs` (the platform's roots). `wsp-server` (a loopback server) and
 `wsp-store-conformance` (`MemStore`) are dev-dependencies, so a process that only calls does not link the server. It
 never links the store, the wire, the host, the manager or the sqlite crate. `tests/layering.rs` walks its path
 dependencies to hold this.
@@ -32,8 +32,10 @@ dependencies to hold this.
   event between the head read and the `orders` read is replayed, so a refused-and-requeued order can show an older
   state for a moment.
 - `src/credential.rs` (wsp-160): `Target` (`Local`, `Hub { url }`) and `Credential` (`Instance`, `User(token)`).
-  `Client::dial_hub(url, credential, wait)` dials a hub (`host:port` or `tcp://host:port`, plain TCP until wsp-461)
-  with the user's token; `Credential::Instance` is `Silent::NotLoggedIn` and `api.token` is never read for a hub.
+  `Client::dial_hub(url, credential, wait)` dials a hub with the user's token: `tls://host:port` over TLS with the
+  platform's roots (wsp-461), `tcp://host:port` or a bare `host:port` in the clear; `Client::dial_hub_ca(.., ca, ..)` pins a
+  private CA's PEM file instead (`--ca`, `$WSP_HUB_CA`, `ca` in `hubs.json`: `hub_ca()`), trusting that CA and nothing
+  else; a refused certificate is `Silent::Tls`, naming its fault (`src/tls.rs` holds the roots and the name checked, `src/dial.rs` the handshake); `Credential::Instance` is `Silent::NotLoggedIn` and `api.token` is never read for a hub.
   `Credential::for_hub()` is `$WSP_HUB_TOKEN`, else `token` in `~/.config/wsp/hubs.json` (a file wider than 0600 is
   `Silent::BadHubsFile`, naming it; none is `NotLoggedIn`); `hub_url()` is `$WSP_HUB_URL`, else its `url`. The
   `_in` forms take the env value and home as arguments. The hello's `by` is a hint (`$WSP_HUB_USER`, else `$USER`).
