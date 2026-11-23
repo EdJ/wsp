@@ -296,7 +296,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
             };
             let governors = store.governors();
             let index = crate::resolve::Index::new(store.projects());
-            let seat = crate::governors::seat_for(&governors, &index, Some(&w.id), None);
+            let seat = crate::governors::seat_for(&governors, &index, Some(&w.id), None, None);
             let to = match &seat {
                 Some(s) => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(&governors, s)),
                 None => "asked of every panel — no governor above it".into(),
@@ -1623,7 +1623,7 @@ fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
     }
     let governors = store.governors();
     let index = crate::resolve::Index::new(store.projects());
-    let Some(seat) = crate::governors::seat_for(&governors, &index, Some(&list), None) else { return };
+    let Some(seat) = crate::governors::seat_for(&governors, &index, Some(&list), None, None) else { return };
     let what = match (&closed.question.about, group) {
         (About::Task(t), Some(g)) => format!("{t}, a member of group {g} of {list}"),
         (_, Some(g)) => format!("barrier {g} of {list}"),

@@ -371,17 +371,18 @@ pub fn seat_for_task(
     list: Option<&str>,
     task: &crate::model::Task,
     project: Option<&str>,
+    allocated_to: Option<&str>,
 ) -> Option<Seat> {
     if governors.is_empty() {
         return None;
     }
-    if let Some(seat) = list.and_then(|l| seat_for(governors, index, Some(l), None)) {
+    if let Some(seat) = list.and_then(|l| seat_for(governors, index, Some(l), None, None)) {
         return Some(seat);
     }
     if let Some(seat) = started_by(task).and_then(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec))) {
         return Some(seat);
     }
-    seat_for(governors, index, None, project)
+    seat_for(governors, index, None, project, allocated_to)
 }
 
 /// The seat that answers for one task, asked once.
@@ -402,7 +403,8 @@ pub fn answering_seat(store: &Store, task: &crate::model::Task) -> Option<Seat> 
     let index = Index::new(store.projects());
     let lists = crate::worklist::Running::read(store);
     let governors = store.governors();
-    seat_for_task(&governors, &index, lists.list_for(task), task, task.project.as_deref())
+    let allocated = store.allocated_to(&task.id);
+    seat_for_task(&governors, &index, lists.list_for(task), task, task.project.as_deref(), allocated.as_deref())
 }
 
 /// Is this stopped agent a person's problem?
@@ -1944,8 +1946,8 @@ fn report(store: &Store, index: &Index, args: &Args, workspace: Option<&str>, pa
         let task = held.as_deref().and_then(|t| store.find_task(t));
         let list = task.as_ref().and_then(|t| lists.list_for(t));
         let found = match &task {
-            Some(t) => seat_for_task(&governors, index, list, t, project.as_deref()),
-            None => seat_for(&governors, index, None, project.as_deref()),
+            Some(t) => seat_for_task(&governors, index, list, t, project.as_deref(), store.allocated_to(&t.id).as_deref()),
+            None => seat_for(&governors, index, None, project.as_deref(), None),
         };
         match found {
             Some(s) if s.vacant => {
@@ -2011,7 +2013,7 @@ pub(crate) mod tests {
     #[test]
     fn a_hand_raised_in_a_project_with_a_seat_reaches_that_seat() {
         let g = seated(&[("robustness", "w1"), ("wsp", "w9")]);
-        let s = seat_for(&g, &tree(), None, Some("robustness")).unwrap();
+        let s = seat_for(&g, &tree(), None, Some("robustness"), None).unwrap();
         assert_eq!((s.scope.as_str(), room_of(&g, &s.scope).as_str()), ("robustness", "w1"));
     }
 
@@ -2020,7 +2022,7 @@ pub(crate) mod tests {
     #[test]
     fn a_hand_raised_where_the_local_seat_is_empty_reaches_the_one_above() {
         let g = seated(&[("wsp", "w9")]);
-        let s = seat_for(&g, &tree(), None, Some("data")).unwrap();
+        let s = seat_for(&g, &tree(), None, Some("data"), None).unwrap();
         assert_eq!(s.scope, "wsp", "past robustness, which has nobody in it");
     }
 
@@ -2044,8 +2046,8 @@ pub(crate) mod tests {
     /// caller already draws as today's behaviour.
     #[test]
     fn no_seat_anywhere_above_a_project_is_simply_no_seat() {
-        assert_eq!(seat_for(&BTreeMap::new(), &tree(), None, Some("data")), None);
-        assert_eq!(seat_for(&seated(&[("robustness", "w1")]), &tree(), None, Some("tooling")), None);
+        assert_eq!(seat_for(&BTreeMap::new(), &tree(), None, Some("data"), None), None);
+        assert_eq!(seat_for(&seated(&[("robustness", "w1")]), &tree(), None, Some("tooling"), None), None);
     }
 
     /// A seat is reachable from below and from nowhere else. `robustness` is
@@ -2056,8 +2058,8 @@ pub(crate) mod tests {
     fn a_seat_answers_for_what_is_under_it_and_not_for_its_siblings() {
         let g = seated(&[("robustness", "w1")]);
         let index = tree();
-        assert!(seat_for(&g, &index, None, Some("data")).is_some());
-        assert_eq!(seat_for(&g, &index, None, Some("wsp")), None);
+        assert!(seat_for(&g, &index, None, Some("data"), None).is_some());
+        assert_eq!(seat_for(&g, &index, None, Some("wsp"), None), None);
     }
 
     /// A workspace id is a host's, and a host's ids are per machine. A seat taken
@@ -2069,7 +2071,7 @@ pub(crate) mod tests {
             [("robustness".to_string(), json!({ "workspace": "w1", "host": "somewhere-else" }))]
                 .into_iter()
                 .collect();
-        assert_eq!(seat_for(&g, &tree(), None, Some("robustness")), None);
+        assert_eq!(seat_for(&g, &tree(), None, Some("robustness"), None), None);
     }
 
     /// The step this task added, and the whole of what it is for: a hand
@@ -2082,14 +2084,14 @@ pub(crate) mod tests {
     #[test]
     fn a_hand_on_a_member_of_a_running_list_reaches_the_lists_seat() {
         let g = seated(&[("batch", "w7"), ("robustness", "w1"), ("wsp", "w9")]);
-        let s = seat_for(&g, &tree(), Some("batch"), Some("robustness")).unwrap();
+        let s = seat_for(&g, &tree(), Some("batch"), Some("robustness"), None).unwrap();
         assert_eq!((s.scope.as_str(), room_of(&g, &s.scope).as_str()), ("batch", "w7"));
 
         // And the same task with nothing running is answered by its project,
         // which is the sentence above read backwards: the list is the only
         // thing that changed, so it is the only thing that may change the
         // answer.
-        let s = seat_for(&g, &tree(), None, Some("robustness")).unwrap();
+        let s = seat_for(&g, &tree(), None, Some("robustness"), None).unwrap();
         assert_eq!(s.scope, "robustness");
     }
 
@@ -2108,18 +2110,18 @@ pub(crate) mod tests {
     #[test]
     fn a_list_with_nobody_in_its_seat_falls_through_to_the_project_chain() {
         let g = seated(&[("robustness", "w1")]);
-        let s = seat_for(&g, &tree(), Some("batch"), Some("data")).unwrap();
+        let s = seat_for(&g, &tree(), Some("batch"), Some("data"), None).unwrap();
         assert_eq!(s.scope, "robustness", "past a list with no seat, and past data");
 
         let (_env, store) = store("fallthrough");
         take(&store, "batch", "w7", "w7:p1").unwrap();
         take(&store, "robustness", "w1", "w1:p1").unwrap();
         assert!(vacate(&store, "batch"), "the governor died mid-run");
-        let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data")).unwrap();
+        let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data"), None).unwrap();
         assert_eq!((s.scope.as_str(), s.vacant), ("batch", true), "its successor is on the way, and it waits for one");
 
         mark_stood_down(&store, "batch");
-        let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data")).unwrap();
+        let s = seat_for(&store.governors(), &tree(), Some("batch"), Some("data"), None).unwrap();
         assert_eq!(s.scope, "robustness", "stood down, an empty list seat routes nothing, as an empty project one does");
     }
 
@@ -2133,7 +2135,7 @@ pub(crate) mod tests {
         let index = tree();
         for project in ["data", "robustness", "wsp", "tooling"] {
             assert_eq!(
-                seat_for(&g, &index, None, Some(project)).map(|s| s.scope),
+                seat_for(&g, &index, None, Some(project), None).map(|s| s.scope),
                 std::iter::once(project.to_string())
                     .chain(index.ancestors(project))
                     .find(|p| g.contains_key(p)),
@@ -2184,7 +2186,7 @@ pub(crate) mod tests {
         let robustness = slots.iter().find(|s| s.scope == "robustness").expect("the post stayed");
         assert!(!robustness.filled(), "and it was handed back, empty");
         assert_eq!(
-            seat_for(&store.governors(), &tree(), Some("batch"), Some("robustness"))
+            seat_for(&store.governors(), &tree(), Some("batch"), Some("robustness"), None)
                 .map(|s| room_of(&store.governors(), &s.scope)),
             Some("w1".to_string())
         );
@@ -2432,12 +2434,12 @@ pub(crate) mod tests {
     fn standing_down_empties_the_seat_and_leaves_it_standing() {
         let (_env, store) = store("vacate");
         take(&store, "wsp", "w1", "w1:p1").unwrap();
-        assert!(seat_for(&store.governors(), &tree(), None, Some("wsp")).is_some());
+        assert!(seat_for(&store.governors(), &tree(), None, Some("wsp"), None).is_some());
 
         assert!(vacate(&store, "wsp"), "there was somebody in it");
         let g = store.governors();
         assert!(g.contains_key("wsp"), "the position went with the agent");
-        assert_eq!(seat_for(&g, &tree(), None, Some("wsp")), None, "an empty seat routes nothing");
+        assert_eq!(seat_for(&g, &tree(), None, Some("wsp"), None), None, "an empty seat routes nothing");
 
         let slots = slots(&g);
         assert_eq!(slots.len(), 1);
@@ -2449,7 +2451,7 @@ pub(crate) mod tests {
         assert!(!vacate(&store, "wsp"), "already empty");
         take(&store, "wsp", "w2", "w2:p1").unwrap();
         assert_eq!(
-            seat_for(&store.governors(), &tree(), None, Some("wsp")).map(|s| room_of(&store.governors(), &s.scope)),
+            seat_for(&store.governors(), &tree(), None, Some("wsp"), None).map(|s| room_of(&store.governors(), &s.scope)),
             Some("w2".to_string())
         );
     }
@@ -2655,7 +2657,7 @@ pub(crate) mod tests {
         t.log("claimed by pane w9:p1 · spawned at opus/high");
         t.log(&format!("{ORDERED_BY}proc · w9:p1"));
         let walk = |g: &BTreeMap<String, Value>, list: Option<&str>, t: &crate::model::Task| {
-            seat_for_task(g, &tree(), list, t, t.project.as_deref()).map(|s| s.scope)
+            seat_for_task(g, &tree(), list, t, t.project.as_deref(), None).map(|s| s.scope)
         };
         assert_eq!(walk(&g, None, &t).as_deref(), Some("proc"), "the starter, before data's walk");
         assert_eq!(walk(&g, Some("batch"), &t).as_deref(), Some("batch"), "a running list first");

@@ -371,7 +371,7 @@ fn route_with(
     m.about
         .task()
         .and_then(|id| store.find_task(id))
-        .and_then(|t| crate::governors::seat_for(governors, index, lists.list_of(&t.id), t.project.as_deref()))
+        .and_then(|t| crate::governors::seat_for(governors, index, lists.list_of(&t.id), t.project.as_deref(), None))
         .map(|s| On::Seat(s.scope))
         .unwrap_or(On::Person)
 }

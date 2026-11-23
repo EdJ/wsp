@@ -5563,7 +5563,7 @@ fn notice_reaches_a_seat(store: &Store, w: &Worklist) -> bool {
     let index = crate::resolve::Index::new(store.projects());
     let lists = worklist::Running::read(store);
     let governors = store.governors();
-    crate::governors::seat_for(&governors, &index, lists.list_for(&task), task.project.as_deref()).is_some()
+    crate::governors::seat_for(&governors, &index, lists.list_for(&task), task.project.as_deref(), None).is_some()
 }
 
 /// Whether a sentence asks anybody for anything, by the rule a turn's last

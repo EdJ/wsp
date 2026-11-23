@@ -1162,7 +1162,7 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     for m in &rows {
         let id = m.about.task().unwrap_or_default();
         let task = store.task(id);
-        let seat = task.as_ref().and_then(|t| cmd_govern::seat_for_task(&governors, &index, lists.list_for(t), t, t.project.as_deref()));
+        let seat = task.as_ref().and_then(|t| cmd_govern::seat_for_task(&governors, &index, lists.list_for(t), t, t.project.as_deref(), store.allocated_to(&t.id).as_deref()));
         let held_here = seat.as_ref().map(|s| mine.as_deref() == Some(s.scope.as_str())).unwrap_or(false);
         if only_mine && !held_here {
             continue;
@@ -5567,8 +5567,8 @@ fn answers_to(
     // A row's walk is the task's (`wsp-216`): the seat that started it comes
     // before its project's, as its `wsp ask` and its review go.
     let found = match task {
-        Some(t) => cmd_govern::seat_for_task(&w.governors, &w.index, list, t, project),
-        None => crate::governors::seat_for(&w.governors, &w.index, list, project),
+        Some(t) => cmd_govern::seat_for_task(&w.governors, &w.index, list, t, project, None),
+        None => crate::governors::seat_for(&w.governors, &w.index, list, project, None),
     };
     match found {
         // A post wsp is filling is where the row's ask waits, and it is empty:

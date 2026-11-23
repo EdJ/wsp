@@ -818,6 +818,11 @@ pub struct Message {
     /// derived: the item reaches the governor as `unanswered` like any other
     /// question, so the governor knows Ed owes it and cannot close it.
     pub for_person: bool,
+    /// **Which user's person it is** (`wsp-418`), with [`Message::for_person`]:
+    /// written `"for": "person:<user>"`. Set when an allocated row's question
+    /// is escalated past its user's primary ([`escalate`]); `None` is the
+    /// person at this keyboard, written `"for": "person"` as before.
+    pub person: Option<String>,
     /// **Written for a seat, and so not the person's** (`wsp-272`), written
     /// `"for": {"seat": scope}`.
     ///
@@ -902,6 +907,7 @@ impl Message {
             waiting: None,
             reply_to: None,
             for_person: false,
+            person: None,
             for_seat: None,
             caption: None,
             choices: None,
@@ -1193,7 +1199,10 @@ impl Message {
             // way; compound's fixture holds it that way.
             "choices": self.choices.as_ref().map(|c| c.json().clone()).unwrap_or(Value::Null),
             "for": match self.route() {
-                Route::Person => Value::from("person"),
+                Route::Person => match &self.person {
+                    Some(user) => Value::from(format!("person:{user}")),
+                    None => Value::from("person"),
+                },
                 Route::Seat(scope) => json!({ "seat": scope }),
                 Route::Unrouted => Value::Null,
             },
@@ -1257,7 +1266,17 @@ impl Message {
                 .and_then(Value::as_str)
                 .filter(|r| !r.is_empty())
                 .map(str::to_string),
-            for_person: v.get("for").and_then(Value::as_str) == Some("person"),
+            for_person: v
+                .get("for")
+                .and_then(Value::as_str)
+                .is_some_and(|f| f == "person" || f.starts_with("person:")),
+            person: v
+                .get("for")
+                .and_then(Value::as_str)
+                .and_then(|f| f.strip_prefix("person:"))
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string),
             for_seat: v
                 .get("for")
                 .and_then(|f| f.get("seat"))
@@ -1550,8 +1569,58 @@ pub fn note(store: &Store, id: &str, by: &Party, note: &str) -> Result<Message, 
 /// derived from the chain and the chain has one more level in it, not because
 /// anything about the question changed. Nothing decides to escalate; the walk
 /// simply does not stop at a level that has nobody in it.
+///
+/// **An allocated row's question climbs to its user** (`wsp-418`). Escalated by
+/// a project's seat with no seat above it seated, a question about a row
+/// allocated to `<user>` ([`Store::allocated_to`]) is routed to
+/// `primary:<user>`; escalated by `primary:<user>` it is that user's — `for:
+/// person:<user>`. Every other escalation — an unallocated row, a list's seat,
+/// a project seat with a seated parent — is the bare hop it always was.
 pub fn escalate(store: &Store, id: &str, by: &Party, note: &str) -> Result<Message, Refused> {
-    hop(store, id, by, Act::Escalated, note)
+    store.locked(|| {
+        let m = hop_locked(store, id, by, Act::Escalated, note, None)?;
+        let Some(next) = next_level(store, &m, by) else { return Ok(m) };
+        let mut m = m;
+        match next {
+            Level::Primary(key) => {
+                m.for_person = false;
+                m.person = None;
+                m.for_seat = Some(key);
+            }
+            Level::Person(user) => {
+                m.for_seat = None;
+                m.for_person = true;
+                m.person = Some(user);
+            }
+        }
+        store.save_message(&m)?;
+        Ok(m)
+    })
+}
+
+/// Where an escalation by `by` routes an allocated row's question, when it
+/// routes it anywhere new: see [`escalate`].
+enum Level {
+    Primary(String),
+    Person(String),
+}
+
+fn next_level(store: &Store, m: &Message, by: &Party) -> Option<Level> {
+    let scope = by.scope()?;
+    if let Some(user) = crate::governors::user_of_primary(scope) {
+        return Some(Level::Person(user.to_string()));
+    }
+    let user = store.allocated_to(m.about.task()?)?;
+    let user = user.trim();
+    if user.is_empty() || crate::governors::is_primary_key(scope) {
+        return None;
+    }
+    let index = crate::resolve::Index::new(store.projects());
+    index.get(scope)?;
+    if crate::governors::seat_above(&store.governors(), &index, scope, None).is_some() {
+        return None;
+    }
+    Some(Level::Primary(crate::governors::primary_of(user)))
 }
 
 /// The seat that answers for this was handed the record, and it is still open.
@@ -2803,6 +2872,62 @@ mod tests {
 
         let closed = answer(&store, &q.id, &Party::seat("wsp"), "move it").unwrap();
         assert_eq!(closed.question.via.len(), 3, "the answer is the third hop, not a fresh record");
+    }
+
+    /// `wsp-418`: escalation ends at the allocated user's primary, then the
+    /// user. A member of a list allocated to ed, its list's post stood down and
+    /// its project's vacant, asks: the walk past the project levels is
+    /// `primary:ed`, the local primary's seat, and it is handed there; escalated
+    /// from there it is `for: person:ed`. A project seat with nobody above it
+    /// escalates an allocated row's question to `primary:ed`. An unallocated
+    /// row walks to nobody — the person — and escalates as the bare hop.
+    #[test]
+    fn an_allocated_rows_ask_ends_at_its_users_primary_then_the_user() {
+        use crate::governors::{seat_for, PRIMARY};
+        let store = scratch("allocated-walk");
+        store.save_project(&crate::model::Project::new("worklist")).unwrap();
+        let mut w = crate::model::Worklist::new("mp", "multiplayer");
+        w.set_groups(&[crate::model::Group { members: vec!["worklist-418".into()], ..Default::default() }]);
+        w.for_user = Some("ed".into());
+        store.save_worklist(&w).unwrap();
+        asker(&store, "worklist-418");
+        asker(&store, "worklist-419");
+        store.set_governor("mp", json!({ "workspace": "", "pane": "", "stood_down": util::now_iso() }));
+        store.set_governor("worklist", json!({ "workspace": "", "pane": "" }));
+        store.set_governor(PRIMARY, json!({ "workspace": "wsp-primary", "pane": "pr:1" }));
+
+        let governors = store.governors();
+        let index = crate::resolve::Index::new(store.projects());
+        let allocated = store.allocated_to("worklist-418");
+        assert_eq!(allocated.as_deref(), Some("ed"), "the list's for: is the member's");
+        let seat = seat_for(&governors, &index, Some("mp"), Some("worklist"), allocated.as_deref())
+            .expect("an allocated row's walk ends at its user's primary");
+        assert_eq!((seat.scope.as_str(), seat.pane.as_str(), seat.vacant), ("primary:ed", "pr:1", false));
+        assert_eq!(store.allocated_to("worklist-419"), None);
+        assert_eq!(seat_for(&governors, &index, None, Some("worklist"), None), None, "unallocated: the person, as today");
+
+        let q = a_question(&store, "worklist-418");
+        let handed = sent(&store, &q.id, &seat.scope).unwrap();
+        assert_eq!(handed.route(), Route::Seat("primary:ed".into()), "handed to the local primary");
+        let up = escalate(&store, &q.id, &Party::seat("primary:ed"), "this is ed's call").unwrap();
+        assert!(up.is_open() && up.is_the_persons());
+        assert_eq!((up.route(), up.person.as_deref()), (Route::Person, Some("ed")));
+        assert_eq!(up.to_json()["for"], "person:ed");
+        let back = store.message(&q.id).unwrap();
+        assert_eq!((back.route(), back.person.as_deref(), back.via.len()), (Route::Person, Some("ed"), 2), "it reads back");
+
+        // A project seat with nothing seated above it passes it to the primary.
+        let q2 = a_question(&store, "worklist-418");
+        sent(&store, &q2.id, "worklist").unwrap();
+        let up = escalate(&store, &q2.id, &Party::seat("worklist"), "not mine").unwrap();
+        assert_eq!(up.route(), Route::Seat("primary:ed".into()));
+        assert_eq!(up.to_json()["for"], json!({ "seat": "primary:ed" }));
+
+        // An unallocated row's escalation is the bare hop it always was.
+        let q3 = a_question(&store, "worklist-419");
+        sent(&store, &q3.id, "worklist").unwrap();
+        let up = escalate(&store, &q3.id, &Party::seat("worklist"), "not mine").unwrap();
+        assert_eq!((up.route(), up.person.clone(), up.via.len()), (Route::Seat("worklist".into()), None, 2));
     }
 
     /// A notification's disposition is a real act — *I have this and I am not

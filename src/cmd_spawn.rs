@@ -1279,7 +1279,7 @@ fn governed(args: &Args, kind: &str, agent: bool, scope: &Scope) -> (Option<Stri
     if agent_commands::of(kind).tier(Some(GOVERNED_MODEL), Some(GOVERNED_EFFORT)).is_err() {
         return unstated;
     }
-    let Some(seat) = crate::governors::seat_for(scope.governors, scope.index, scope.list, scope.project)
+    let Some(seat) = crate::governors::seat_for(scope.governors, scope.index, scope.list, scope.project, None)
     else {
         return unstated;
     };

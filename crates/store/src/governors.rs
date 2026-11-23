@@ -131,11 +131,24 @@ pub fn str_at(rec: &Value, key: &str) -> String {
 /// does the walk go on up. A list with no record at all has no post to wait
 /// on, which is a list run by hand from its project's seat; a list wsp runs
 /// has one from the reconciler's first tick after `go`.
+///
+/// **Past the project levels, an allocated row's walk ends at its user's
+/// primary** (`wsp-418`). `allocated_to` is the user the row is allocated to
+/// (`Store::allocated_to`, wsp-414), `None` for an unallocated row, which
+/// walks exactly as it did and ends at `None` — the person. For an allocated
+/// row with no list or project seat answering, the answer is `primary:<user>`
+/// ([`primary_of`]) when the primary is seated, carrying its occupant. On a
+/// spoke the local primary *is* its user's primary (wsp-417), and the store
+/// holds no login, so whether `<user>` is this spoke's own user — delivered
+/// locally — or another's — routed through the hub — is the delivering
+/// caller's to ask. A seat named `primary:<user>` in the map is that user's
+/// primary first; otherwise the local [`PRIMARY`] slot is.
 pub fn seat_for(
     governors: &BTreeMap<String, Value>,
     index: &Index,
     list: Option<&str>,
     project: Option<&str>,
+    allocated_to: Option<&str>,
 ) -> Option<Seat> {
     if governors.is_empty() {
         return None;
@@ -162,6 +175,23 @@ pub fn seat_for(
         .into_iter()
         .flat_map(|p| std::iter::once(p.to_string()).chain(index.ancestors(p)))
         .find_map(|s| governors.get(&s).and_then(|rec| seat_of(&s, rec)))
+        .or_else(|| user_primary_seat(governors, allocated_to?))
+}
+
+/// The seat `primary:<user>` names, if seated: a record under that key, else
+/// the local [`PRIMARY`]'s occupant under the user's name — the step
+/// [`seat_for`] takes past the project levels for an allocated row.
+pub fn user_primary_seat(governors: &BTreeMap<String, Value>, user: &str) -> Option<Seat> {
+    let user = user.trim();
+    if user.is_empty() {
+        return None;
+    }
+    let key = primary_of(user);
+    if let Some(seat) = governors.get(&key).and_then(|rec| seat_of(&key, rec)) {
+        return Some(seat);
+    }
+    let seat = governors.get(PRIMARY).and_then(|rec| seat_of(PRIMARY, rec))?;
+    Some(Seat { scope: key, ..seat })
 }
 
 /// Whether wsp is coming to fill this post, read off its record: nobody in it

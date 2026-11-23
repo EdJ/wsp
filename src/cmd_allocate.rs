@@ -15,23 +15,12 @@
 use serde_json::json;
 
 use crate::base::args::Args;
-use crate::model::WorklistStatus;
 use crate::store::Store;
 
 /// The user `row` is allocated to: its own `for:`, else the `for:` of a list
 /// that holds it and has not finished, else `None`.
 pub fn allocated_to(store: &Store, row: &str) -> Option<String> {
-    if let Some(t) = store.task(row) {
-        if t.for_user.is_some() {
-            return t.for_user;
-        }
-    }
-    store
-        .worklists()
-        .into_iter()
-        .filter(|w| w.status() != WorklistStatus::Done)
-        .filter(|w| w.groups().iter().any(|g| g.members.iter().any(|m| m == row)))
-        .find_map(|w| w.for_user)
+    store.allocated_to(row)
 }
 
 /// The other user `row` is allocated to, when it is a shared row and this

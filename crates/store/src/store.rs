@@ -1369,6 +1369,23 @@ impl Store {
         Some(Task::from_doc(&fm::parse(&text), id))
     }
 
+    /// The user `row` is allocated to (`wsp allocate`, wsp-414): its own `for:`,
+    /// else the `for:` of a list that holds it and has not finished, else
+    /// `None`. The one reading of it — `cmd_allocate::allocated_to` is this —
+    /// here so the escalation chain (`message::escalate`, wsp-418) can ask it.
+    pub fn allocated_to(&self, row: &str) -> Option<String> {
+        if let Some(t) = self.task(row) {
+            if t.for_user.is_some() {
+                return t.for_user;
+            }
+        }
+        self.worklists()
+            .into_iter()
+            .filter(|w| w.status() != crate::model::WorklistStatus::Done)
+            .filter(|w| w.groups().iter().any(|g| g.members.iter().any(|m| m == row)))
+            .find_map(|w| w.for_user)
+    }
+
     pub fn task_path(&self, id: &str) -> PathBuf {
         self.tasks_dir().join(format!("{id}.md"))
     }
