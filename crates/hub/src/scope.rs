@@ -5,8 +5,8 @@
 //!
 //! - `sync.heads` and `refs.move` name a workspace; one the caller is no member
 //!   of (or that is no shared workspace at all) is `forbidden`.
-//! - `sync.put` names none, so each object that reads as one is held to its own
-//!   workspace, which the caller must be a member of; a caller who is a member
+//! - `sync.put` names none, so each object is held to the workspace it names (also
+//!   one of a kind this build cannot read), which the caller must be a member of; a caller who is a member
 //!   of none puts nothing.
 //! - An object id is served (`sync.get`, and as held by `sync.have`) only if it
 //!   is one a member workspace references: a head of it, or the parent chain
@@ -76,6 +76,17 @@ fn not_found(text: String) -> Failure {
     Failure { code: Code::NotFound, text, refusal: None }
 }
 
+/// The workspace an object's bytes name: through [`wsp_objects::decode`] where
+/// this build reads the object, else the `workspace` string of its JSON, so an
+/// object of a kind this build does not know is held to its workspace as well.
+fn workspace_of(bytes: &[u8]) -> Option<WorkspaceId> {
+    if let Ok(object) = wsp_objects::decode(bytes) {
+        return Some(object.workspace().clone());
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    value.get("workspace")?.as_str().map(|w| WorkspaceId(w.to_string()))
+}
+
 impl Hub {
     /// One sync verb's outcome for `by`, within the workspaces `by` is a member of.
     pub fn answer(&self, by: &Principal, call: SyncCall) -> Outcome {
@@ -118,12 +129,13 @@ impl Hub {
                     return Err(forbidden(by, "a member of no shared workspace puts nothing".into()));
                 }
                 for blob in &objects {
-                    // One that does not read as an object is the put's to refuse (invalid).
-                    if let Ok(object) = wsp_objects::decode(&blob.bytes) {
-                        if !scope.allows(object.workspace()) {
+                    // One of a kind this build cannot read is held to the workspace it names, too;
+                    // one that names none is never served (see `served`), so it is let through.
+                    if let Some(workspace) = workspace_of(&blob.bytes) {
+                        if !scope.allows(&workspace) {
                             return Err(forbidden(
                                 by,
-                                format!("{} belongs to {}, which the caller is not a member of", blob.id, object.workspace().0),
+                                format!("{} belongs to {}, which the caller is not a member of", blob.id, workspace.0),
                             ));
                         }
                     }
@@ -169,13 +181,13 @@ impl Hub {
                         break;
                     }
                     let Some(bytes) = self.objects().get(&id).map_err(backend)? else { break };
-                    let parent = match wsp_objects::decode(&bytes) {
-                        // An object of another workspace is none of this one's, whatever moved to it.
-                        Ok(object) if object.workspace() != &workspace => break,
-                        Ok(object) => object.parent().copied(),
-                        // One this build cannot read has no parent to follow.
-                        Err(_) => None,
-                    };
+                    // An object of another workspace, or one that names none, is none of this
+                    // one's, whatever moved to it: a head alone is no right to its bytes.
+                    if workspace_of(&bytes).as_ref() != Some(&workspace) {
+                        break;
+                    }
+                    // One this build cannot read has no parent to follow.
+                    let parent = wsp_objects::decode(&bytes).ok().and_then(|object| object.parent().copied());
                     if want.remove(&id) {
                         served.insert(id);
                     }

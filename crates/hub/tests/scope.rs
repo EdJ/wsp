@@ -207,6 +207,35 @@ fn an_object_a_workspace_was_moved_to_from_another_is_not_served_by_the_move() {
 }
 
 #[test]
+fn an_object_of_a_kind_the_hub_cannot_read_is_held_to_its_workspace_too() {
+    let f = fixture("unknown");
+    let json = format!(r#"{{"kind":"from_a_newer_build","workspace":"shared:team","n":1}}"#);
+    let bytes = wsp_objects::canonical(json.as_bytes()).unwrap();
+    assert!(wsp_objects::decode(&bytes).is_err(), "a kind this build does not know");
+    let unknown = Blob { id: ObjectId::of(&bytes), bytes };
+    let (ann, cy) = (person("ann"), person("cy"));
+    assert_eq!(put(&f.hub, &ann, &[&unknown]), Outcome::Ok(Answer::Stored { stored: 1 }));
+    // A member of `other` may not put one that claims `team`.
+    assert_eq!(code(&put(&f.hub, &cy, &[&unknown])), Some(Code::Forbidden));
+    // Cy knows the hash and moves a head of `other` to it: that serves nothing.
+    let moved = f.hub.answer(&cy, mv("other", "r7", None, unknown.id));
+    assert_eq!(moved, Outcome::Ok(Answer::Move(Move::Moved { head: unknown.id })));
+    assert_eq!(code(&f.hub.answer(&cy, SyncCall::Get { ids: vec![unknown.id] })), Some(Code::NotFound));
+    assert_eq!(
+        f.hub.answer(&cy, SyncCall::Have { ids: vec![unknown.id] }),
+        Outcome::Ok(Answer::Missing(vec![unknown.id]))
+    );
+    // Ann is served it through a head of her own workspace.
+    let moved = f.hub.answer(&ann, mv("team", "r6", None, unknown.id));
+    assert_eq!(moved, Outcome::Ok(Answer::Move(Move::Moved { head: unknown.id })));
+    assert_eq!(
+        f.hub.answer(&ann, SyncCall::Get { ids: vec![unknown.id] }),
+        Outcome::Ok(Answer::Objects(vec![unknown.clone()]))
+    );
+    assert_eq!(f.hub.answer(&ann, SyncCall::Have { ids: vec![unknown.id] }), Outcome::Ok(Answer::Missing(vec![])));
+}
+
+#[test]
 fn a_non_members_put_and_ref_move_are_forbidden() {
     let f = fixture("write");
     let mine = version("team", "r2", "mine", None, 4);

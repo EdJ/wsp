@@ -38,10 +38,12 @@ impl Drop for Scratch {
     }
 }
 
-/// An object: canonical JSON, named by its hash.
+/// An object (of a kind the hub does not read, in `shared:team`): canonical JSON, named by its hash.
 fn blob(n: u64) -> Blob {
-    let bytes =
-        wsp_objects::canonical(format!("{{\"n\":{n},\"kind\":\"test\"}}").as_bytes()).unwrap();
+    let bytes = wsp_objects::canonical(
+        format!("{{\"n\":{n},\"kind\":\"test\",\"workspace\":\"shared:team\"}}").as_bytes(),
+    )
+    .unwrap();
     Blob {
         id: ObjectId::of(&bytes),
         bytes,
