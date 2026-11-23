@@ -7702,7 +7702,7 @@ mod tests {
         assert!(items[0].for_person);
         assert_eq!(store.events_of("agent-told").last().unwrap()["target"], json!("person"));
         // From a shell there is nobody to tell the person *from*.
-        assert_eq!(tell_the_person_as(&store, &args, "hello", None, Party::Human, None, "person"), 1);
+        assert_eq!(tell_the_person_as(&store, &args, "hello", None, Party::Human(None), None, "person"), 1);
         assert_eq!(message::for_the_person(&store).len(), 1);
     }
 

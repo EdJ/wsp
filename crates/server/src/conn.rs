@@ -251,6 +251,8 @@ impl Client<'_> {
         }
         let outcome = match req.call {
             Call::Verb(Verb::Subscribe(sub)) => return self.subscribe(id, sub),
+            // Who this connection is: the principal it was welcomed as, which `read` does not hold (wsp-165).
+            Call::Verb(Verb::Whoami(_)) => Ok(Answer::Whoami { by: self.by.clone(), server: self.shared.cfg.instance.clone() }),
             Call::Verb(verb) => read(self.shared, verb),
             Call::Command(cmd) => return self.command(id, req.key, cmd),
             // The sync verbs are the hub's (wsp-460): answered by what it handed in, else not this server's.
@@ -422,6 +424,7 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
         }
         Verb::Subscribe(_) => unreachable!("subscribe is answered by its own path"),
         Verb::Throttle(_) | Verb::Spend(_) | Verb::Show { .. } => return view(shared, verb),
+        Verb::Whoami(_) => return Err(failure(Code::Backend, "whoami is answered by the connection".into())),
     };
     r.map_err(store_failure)
 }

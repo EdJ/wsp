@@ -405,7 +405,7 @@ fn held(
             // The person's, and only the person's: a pane's answer is already
             // what the dialog did, and a decision built from it would go back
             // to a dialog that is gone.
-            return m.closing().filter(|h| h.by == Party::Human).and(m.answer_choice()).and_then(|a| decision_of(payload, a));
+            return m.closing().filter(|h| h.by.is_human()).and(m.answer_choice()).and_then(|a| decision_of(payload, a));
         }
         if gone() {
             let _ = message::close_from_pane(
@@ -663,7 +663,7 @@ pub(crate) mod tests {
             assert_eq!((c.kind(), c.json()["via"].as_str(), q.for_person), ("permission", Some("hook"), true));
             assert_eq!(q.about, About::Task("hold-1".into()));
             let (stored, _) = c.accept(&json!({ "behavior": "deny", "message": "not that" }), "").unwrap();
-            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human(None), "", &stored).unwrap();
             assert_eq!(held.join().unwrap(), 0);
         });
         // An answered question is left answered, not abandoned by the hook.
@@ -696,7 +696,7 @@ pub(crate) mod tests {
             let new = raised(&store);
             assert_ne!(new.id, old.id);
             let answer = json!({ "answers": { "Which figure?": { "pick": ["USD"] }, "Which views?": { "pick": ["Card"] } } });
-            message::answer_choice(&store, &new.id, &Party::Human, "", &answer).unwrap();
+            message::answer_choice(&store, &new.id, &Party::Human(None), "", &answer).unwrap();
             assert_eq!(second.join().unwrap(), 0);
         });
     }
@@ -803,7 +803,7 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             };
             let (stored, _) = q.choices.as_ref().unwrap().accept(answer, "").unwrap();
-            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human(None), "", &stored).unwrap();
             held.join().unwrap();
             q.id
         })
@@ -857,7 +857,7 @@ pub(crate) mod tests {
             assert_eq!(about["seat"], "ux-next", "D8: the question is keyed by its seat");
             assert!(about.get("task").is_none_or(|t| t.is_null()));
             let (stored, _) = q.choices.as_ref().unwrap().accept(&json!({ "behavior": "allow" }), "").unwrap();
-            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human(None), "", &stored).unwrap();
             assert_eq!(held.join().unwrap(), 0);
         });
         let store = at(&root);
@@ -881,7 +881,7 @@ pub(crate) mod tests {
                 assert_eq!((w.why, w.on), (crate::waiting::Why::Question(q.id.clone()), crate::waiting::On::Person));
             }
             let (stored, _) = q.choices.as_ref().unwrap().accept(&json!({ "behavior": "allow" }), "").unwrap();
-            message::answer_choice(&store, &q.id, &Party::Human, "", &stored).unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human(None), "", &stored).unwrap();
             held.join().unwrap();
             let after = crate::waiting::Asks::read(&store);
             assert!(crate::waiting::reading(Some(State::Working), &after, &Default::default(), "cpd-1", "hold-1").is_none(), "answered, it is held no longer");

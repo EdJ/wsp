@@ -94,6 +94,7 @@ pub const READ_VERBS: &[&str] = &[
     "spend",
     "show",
     "readings",
+    "whoami",
 ];
 
 /// The command verbs, as the contract's [`Command`] names them on the wire: the
@@ -348,6 +349,10 @@ pub enum Verb {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         names: Vec<String>,
     },
+    /// Who this connection is (wsp-165): the principal the server holds it as,
+    /// and the instance it is on. On a hub the principal is what the hello's
+    /// token names; groups and roles are not in v1. Answered [`Answer::Whoami`].
+    Whoami(#[serde(default)] NoArgs),
 }
 
 /// The `args` of a verb that takes none: written `{}`, and read from `{}`,
@@ -455,6 +460,12 @@ pub enum Answer {
     Show(Value),
     /// `readings`: each reading asked for that there is, by name.
     Readings(std::collections::BTreeMap<String, Reading>),
+    /// `whoami`: who the connection is, in the text form, and the instance.
+    Whoami {
+        #[serde(with = "principal")]
+        by: Principal,
+        server: String,
+    },
     /// `sync.heads`: the workspace's refs, each subject's head.
     Heads(Refs),
     /// `sync.have`: the ids asked about that the hub does not hold.

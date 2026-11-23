@@ -10316,7 +10316,7 @@ mod tests {
         assert_eq!(gate_of(&store, "batch"), "after 1 ");
         assert_eq!(run(&store, &["go", "batch"]), 1, "held on the person");
         assert_eq!(gate_of(&store, "batch"), "after 1 ", "and still shut");
-        message::answer(&store, &q.id, &Party::Human, "read it; go").unwrap();
+        message::answer(&store, &q.id, &Party::Human(None), "read it; go").unwrap();
         assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
         assert_eq!(gate_of(&store, "batch"), "ready wl-002");
     }
@@ -10347,7 +10347,7 @@ mod tests {
         message::raise(&store, &q).unwrap();
         assert_eq!(run(&store, &["go", "batch"]), 1, "held on the person, through its member");
         assert_eq!(gate_of(&store, "batch"), "after 1 ");
-        message::answer(&store, &q.id, &Party::Human, "closed clean").unwrap();
+        message::answer(&store, &q.id, &Party::Human(None), "closed clean").unwrap();
         assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
     }
 
@@ -10397,7 +10397,7 @@ mod tests {
         assert_eq!(gate_of(&store, "batch"), "after 1 ");
         assert_eq!(run(&store, &["go", "batch"]), 1, "held on the person, through the governor's own member");
         assert_eq!(gate_of(&store, "batch"), "after 1 ", "and still shut");
-        message::answer(&store, &q.id, &message::Party::Human, "explain it in the log; ship").unwrap();
+        message::answer(&store, &q.id, &message::Party::Human(None), "explain it in the log; ship").unwrap();
         assert_eq!(run(&store, &["go", "batch"]), 0, "answered, the same go passes");
     }
 

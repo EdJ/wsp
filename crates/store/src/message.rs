@@ -532,8 +532,10 @@ pub enum Party {
     /// An agent addressed by handle rather than by location, for a sender that
     /// is not in a pane.
     Agent(String),
-    /// A keyboard. The fallback, and see above for why.
-    Human,
+    /// A keyboard. The fallback, and see above for why. Named (`Some`) when
+    /// the person is an engineer logged in to a hub (wsp-165): written
+    /// `{"human": true, "name": …}`, and read back from both forms.
+    Human(Option<String>),
 }
 
 impl Party {
@@ -549,6 +551,29 @@ impl Party {
     /// parses both.
     pub fn wsp() -> Party {
         Party::Agent("wsp".into())
+    }
+    /// A person, named by the engineer they are logged in as.
+    pub fn engineer(name: &str) -> Party {
+        Party::Human(Some(name.to_string()).filter(|n| !n.is_empty()))
+    }
+    /// A person, named or not.
+    pub fn is_human(&self) -> bool {
+        matches!(self, Party::Human(_))
+    }
+    /// `line` as this party signs it into a log: a named person's ends
+    /// `· <engineer>` (wsp-165), anyone else's is as written.
+    pub fn signed(&self, line: &str) -> String {
+        match self.engineer_name() {
+            Some(n) => format!("{line} · {n}"),
+            None => line.to_string(),
+        }
+    }
+    /// The engineer a person is, if they are named.
+    pub fn engineer_name(&self) -> Option<&str> {
+        match self {
+            Party::Human(Some(n)) => Some(n),
+            _ => None,
+        }
     }
     pub fn is_wsp(&self) -> bool {
         matches!(self, Party::Agent(h) if h == "wsp")
@@ -581,7 +606,8 @@ impl Party {
             Party::Pane { pane, .. } => pane.clone(),
             Party::Seat(scope) => format!("{scope} seat"),
             Party::Agent(handle) => handle.clone(),
-            Party::Human => "a person".into(),
+            Party::Human(None) => "a person".into(),
+            Party::Human(Some(_)) => "a person".into(),
         }
     }
 
@@ -612,12 +638,13 @@ impl Party {
             Party::Pane { pane, workspace } => json!({ "pane": pane, "workspace": workspace }),
             Party::Seat(scope) => json!({ "seat": scope }),
             Party::Agent(handle) => json!({ "agent": handle }),
-            Party::Human => json!({ "human": true }),
+            Party::Human(None) => json!({ "human": true }),
+            Party::Human(Some(name)) => json!({ "human": true, "name": name }),
         }
     }
 
     fn from_json(v: Option<&Value>) -> Party {
-        let Some(v) = v else { return Party::Human };
+        let Some(v) = v else { return Party::Human(None) };
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
         let pane = s("pane");
         if !pane.is_empty() {
@@ -631,7 +658,7 @@ impl Party {
         if !agent.is_empty() {
             return Party::Agent(agent);
         }
-        Party::Human
+        Party::Human(Some(s("name")).filter(|n| !n.is_empty()))
     }
 }
 
@@ -917,7 +944,7 @@ impl Message {
         match (self.shape(), &self.from) {
             (Some(Shape::Signal), _) => Source::Wsp,
             (_, from) if from.is_wsp() => Source::Wsp,
-            (_, Party::Human) => Source::Human,
+            (_, Party::Human(_)) => Source::Human,
             _ => Source::Agent,
         }
     }
@@ -1286,7 +1313,7 @@ impl Message {
             _ => "abandoned",
         };
         let by = match (&h.by, h.act) {
-            (Party::Human, _) => "person",
+            (Party::Human(_), _) => "person",
             (Party::Seat(_), _) => "seat",
             (Party::Agent(h), _) if h == SEAT_GONE => "seat",
             (p, _) if p.is_lapsed() => "wsp",
@@ -1322,7 +1349,7 @@ impl Message {
     fn closing_kind(&self, h: &Hop) -> &'static str {
         match (&h.by, h.act) {
             (_, Act::Answered) => "answered",
-            (Party::Human, _) => "cancelled",
+            (Party::Human(_), _) => "cancelled",
             (p, _) if p.is_lapsed() => "lapsed",
             (Party::Agent(a), _) if a == SEAT_GONE => "seat-gone",
             (p, _) if p.is_wsp() => "timeout",
@@ -1951,7 +1978,7 @@ pub fn close_from_pane(store: &Store, id: &str, by: &Party, act: Act, text: &str
         if !held {
             return Err(Refused::BadChoice("only a question the hold raised is closed from the pane".into()));
         }
-        if !matches!(act, Act::Answered | Act::Abandoned) || matches!(by, Party::Human | Party::Seat(_)) {
+        if !matches!(act, Act::Answered | Act::Abandoned) || matches!(by, Party::Human(_) | Party::Seat(_)) {
             return Err(Refused::NotThePersons(by.byline()));
         }
         match q.shape() {
@@ -2062,7 +2089,7 @@ fn close_locked(
                 Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", t.id)),
             })
         } else if let Some(mut w) = q.about.scope().and_then(|l| store.worklist(l)) {
-            w.log(&format!("answered by a person, {}: {}", q.id, text.trim()));
+            w.log(&by.signed(&format!("answered by a person, {}: {}", q.id, text.trim())));
             Some(match store.save_worklist(&w) {
                 Ok(()) => Landed::List(w.id.clone()),
                 Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", w.id)),
@@ -2078,7 +2105,7 @@ fn close_locked(
             let mine = waiting.task.as_str();
             if !mine.is_empty() && mine != on {
                 if let Some(mut own) = store.task(mine) {
-                    let _ = crate::log::note(store, &mut own, &format!("{} by {} on {}: {text}", act.as_str(), by.byline(), q.about.task().or(q.about.scope()).unwrap_or(on)));
+                    let _ = crate::log::note(store, &mut own, &by.signed(&format!("{} by {} on {}: {text}", act.as_str(), by.byline(), q.about.task().or(q.about.scope()).unwrap_or(on))));
                 }
             }
             return finish(store, id, by, act, text, stored, waiting, landed);
@@ -2089,14 +2116,14 @@ fn close_locked(
     let landed = match home.as_deref().and_then(|id| store.task(id)) {
         None if list.is_some() => {
             let mut w = list.expect("matched");
-            w.log(&format!("{} by {}: {text}", act.as_str(), by.byline()));
+            w.log(&by.signed(&format!("{} by {}: {text}", act.as_str(), by.byline())));
             match store.save_worklist(&w) {
                 Ok(()) => Landed::List(w.id.clone()),
                 Err(e) => Landed::RecordOnly(format!("could not write {}: {e}", w.id)),
             }
         }
         Some(mut t) => {
-            t.log(&format!("{} by {}: {text}", act.as_str(), by.byline()));
+            t.log(&by.signed(&format!("{} by {}: {text}", act.as_str(), by.byline())));
             t.touch();
             match store.save_task(&t) {
                 Ok(()) => Landed::Task(t.id.clone()),
@@ -2392,7 +2419,7 @@ pub fn adopt_legacy_flags(store: &Store) -> Vec<Message> {
             };
             let (pane, workspace) = (field("pane"), field("workspace"));
             let from = match pane.is_empty() {
-                true => Party::Human,
+                true => Party::Human(None),
                 false => Party::pane(&pane, &workspace),
             };
             let mut m = Message::new(
@@ -2460,7 +2487,7 @@ pub fn legacy_run_notices(store: &Store) -> Vec<Message> {
     };
     raised(store)
         .into_iter()
-        .filter(|m| m.from == Party::Human && m.shape() == Some(Shape::Notification) && m.about.task().is_some())
+        .filter(|m| m.from.is_human() && m.shape() == Some(Shape::Notification) && m.about.task().is_some())
         .filter(|m| says_a_run(&m.text))
         .collect()
 }
@@ -2973,7 +3000,7 @@ mod tests {
         let store = scratch("for-seat");
         let mut notice = Message::new(Party::wsp(), Kind::Note, "Barrier 2 of ux-build passed.");
         notice.for_seat = Some("compound".into());
-        let hand = Message::new(Party::Human, Kind::Note, "look at this");
+        let hand = Message::new(Party::Human(None), Kind::Note, "look at this");
         raise(&store, &notice).unwrap();
         raise(&store, &hand).unwrap();
 
@@ -2997,7 +3024,7 @@ mod tests {
         w.set_groups(&[crate::model::Group { members: vec!["compound-474".into()], ..Default::default() }]);
         store.save_worklist(&w).unwrap();
         let on = |text: &str| {
-            let mut m = Message::new(Party::Human, Kind::Note, text);
+            let mut m = Message::new(Party::Human(None), Kind::Note, text);
             m.about = About::Task("compound-474".into());
             raise(&store, &m).unwrap();
             m.id
@@ -3143,12 +3170,12 @@ mod tests {
     /// One field with a first line has no such state.
     #[test]
     fn there_is_always_a_headline_to_draw() {
-        let one = Message::new(Party::Human, Kind::Note, "both in worklist.rs");
+        let one = Message::new(Party::Human(None), Kind::Note, "both in worklist.rs");
         assert_eq!(one.title(), "both in worklist.rs");
         assert_eq!(one.body(), "", "a one-line message has no detail and that is not a fault");
 
         let long = Message::new(
-            Party::Human,
+            Party::Human(None),
             Kind::Note,
             "the index is behind HEAD\n\n4,962 lines, and a plain commit would drop them",
         );
@@ -3157,7 +3184,7 @@ mod tests {
 
         // The failing shape: detail and no headline. There is no way to write
         // it, because the detail's own first line is the headline.
-        let body_only = Message::new(Party::Human, Kind::Note, "\nonly a paragraph");
+        let body_only = Message::new(Party::Human(None), Kind::Note, "\nonly a paragraph");
         assert_eq!(body_only.title(), "", "an empty first line is the writer's, not the record's");
         assert!(!body_only.text.is_empty(), "and the words are still all there to draw");
     }
@@ -3169,7 +3196,7 @@ mod tests {
     #[test]
     fn who_put_it_here_is_read_off_the_shape_and_the_sender() {
         assert_eq!(Message::signal(Kind::Note, "stalled").source(), Source::Wsp);
-        assert_eq!(Message::new(Party::Human, Kind::Stop, "stop").source(), Source::Human);
+        assert_eq!(Message::new(Party::Human(None), Kind::Stop, "stop").source(), Source::Human);
         assert_eq!(Message::new(Party::pane("w4J:p1", "ws"), Kind::Note, "hi").source(), Source::Agent);
         assert_eq!(Message::new(Party::seat("wsp"), Kind::Note, "hi").source(), Source::Agent);
         // A shape this build cannot parse is not a level, so it is not wsp's.
@@ -3184,7 +3211,16 @@ mod tests {
     fn every_message_says_who_sent_it_and_an_unsigned_one_reads_as_a_person() {
         assert_eq!(Party::pane("w4J:p1", "wsp-022").byline(), "w4J:p1");
         assert_eq!(Party::seat("worklist").byline(), "worklist seat");
-        assert_eq!(Party::Human.byline(), "a person");
+        assert_eq!(Party::Human(None).byline(), "a person");
+        // A named person (wsp-165) is written with the name, read back from both forms, and signs a log line.
+        let ed = Party::engineer("jesper");
+        assert_eq!(ed.to_json(), json!({ "human": true, "name": "jesper" }));
+        assert_eq!(Party::from_json(Some(&ed.to_json())), ed);
+        assert_eq!(Party::from_json(Some(&json!({ "human": true }))), Party::Human(None));
+        assert_eq!(Party::from_json(Some(&Party::Human(None).to_json())), Party::Human(None));
+        assert_eq!(ed.signed("noted by a person: x"), "noted by a person: x · jesper");
+        assert_eq!(Party::Human(None).signed("noted"), "noted");
+        assert!(ed.is_human() && ed.byline() == "a person");
         assert_eq!(Party::pane("w4J:p1", "wsp-022").workspace(), Some("wsp-022"));
         assert_eq!(Party::seat("worklist").workspace(), None);
 
@@ -3192,7 +3228,7 @@ mod tests {
         // without an envelope, because the one channel wsp does not control is
         // a human keyboard.
         let unsigned = Message::from_json("m-1-p1", &json!({ "text": "carry on" }));
-        assert_eq!(unsigned.from, Party::Human);
+        assert_eq!(unsigned.from, Party::Human(None));
     }
 
     /// Everything on the envelope survives the round trip, including the parts

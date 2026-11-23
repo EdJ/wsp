@@ -457,7 +457,7 @@ mod tests {
         let ran = post(&request, json!({}));
         let (printed, ended) = driven("person-first", &request, &no, |store, q| {
             let (stored, _) = q.choices.as_ref().unwrap().accept(&json!({ "behavior": "allow" }), "").unwrap();
-            message::answer_choice(store, &q.id, &Party::Human, "", &stored).unwrap();
+            message::answer_choice(store, &q.id, &Party::Human(None), "", &stored).unwrap();
             // Claude Code then runs the tool, and the hooks fire for it.
             for hook in ["PostToolUse", "Stop", "SessionEnd"] {
                 assert_eq!(heard(store, hook, &if hook == "PostToolUse" { ran.clone() } else { json!({ "session_id": "s1" }) }), 0, "{hook}");
@@ -521,7 +521,7 @@ mod tests {
         assert!(store.message(&q.id).unwrap().is_open());
         // And the road is not a way to answer for the person.
         driven("narrow-held", &bash_payload(), &no, |store, q| {
-            for by in [Party::Human, Party::seat("ux")] {
+            for by in [Party::Human(None), Party::seat("ux")] {
                 assert!(message::close_from_pane(store, &q.id, &by, Act::Answered, "yes", None).is_err(), "{by:?}");
             }
             assert!(message::close_from_pane(store, &q.id, &pane, Act::Noted, "looked", None).is_err());

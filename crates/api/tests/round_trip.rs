@@ -280,7 +280,7 @@ fn every_frame_type_round_trips() {
 // ---------------------------------------------------------------- verbs
 
 /// Read verbs, then the contract's commands, then the unknown verb.
-const VERBS: usize = 17;
+const VERBS: usize = 18;
 const COMMANDS: usize = 31;
 const SYNCS: usize = 5;
 const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
@@ -322,6 +322,7 @@ fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
         Verb::Spend(_) => (14, "spend"),
         Verb::Show { .. } => (15, "show"),
         Verb::Readings { .. } => (16, "readings"),
+        Verb::Whoami(_) => (17, "whoami"),
     }
 }
 
@@ -427,6 +428,7 @@ fn requests() -> Vec<Frame> {
         Verb::Readings {
             names: vec!["throttle".into()],
         },
+        Verb::Whoami(NoArgs {}),
     ];
     let commands = vec![
         Command::RowAdd {
@@ -625,7 +627,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 23;
+const ANSWERS: usize = 24;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -659,6 +661,7 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Stored { .. } => (20, "stored"),
         Answer::Objects(_) => (21, "objects"),
         Answer::Move(_) => (22, "move"),
+        Answer::Whoami { .. } => (23, "whoami"),
     }
 }
 
@@ -736,6 +739,7 @@ fn answers() -> Vec<Frame> {
         ok(22, Answer::Objects(vec![a_blob()]), vec![]),
         ok(23, Answer::Move(Move::Stale { head: Some(an_id(1)) }), vec![]),
         ok(24, Answer::Move(Move::Moved { head: an_id(2) }), vec![]),
+        ok(25, Answer::Whoami { by: Principal::Person("jesper".into()), server: "core".into() }, vec![]),
     ]
 }
 
@@ -970,8 +974,8 @@ fn wire_spelling_is_pinned() {
         json!({
             "type": "request",
             "v": 1,
-            "id": 20,
-            "key": "k-20",
+            "id": 21,
+            "key": "k-21",
             "by": "seat:cpd-3698",
             "verb": "row.claim",
             "args": {

@@ -13,7 +13,7 @@ Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the 
   `Hello` (4.1's credential: `token`, `by`, `client`, `protocol`), `Welcome` (`server`, `protocol`, `head`),
   `Refused` (`code`, `text`); `Request` (4.1's envelope `v`, `id`, `key?`, `by`, then `verb` and `args`) and its
   `Call` (a read `Verb`, a contract `Command`, a `SyncCall`, or `Unknown`); `Verb` (4.2's read verbs, 4.3's `subscribe`, wsp-695's `wip`,
-  and the view verbs `throttle`, `spend` and `show { id }`, wsp-307) and
+  the view verbs `throttle`, `spend` and `show { id }`, wsp-307, and `whoami`, wsp-165: the principal the connection is held as and the instance) and
   `NoArgs`; `Reply` (`id`, `ok` | `err`, `events`), `Outcome`, `Answer` (one per verb), `Failure` and `Code`;
   `ReqId`, `ApiToken`, `Listen`; `PROTOCOL`, `TOKEN_FILE`, `TOKEN_MODE`, `LISTEN_FILE`, `MAX_EVENTS`,
   `READ_VERBS`, `COMMAND_VERBS`; the contract's types re-exported where a frame carries them

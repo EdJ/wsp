@@ -23,6 +23,8 @@ use crate::Silent;
 
 /// The environment variable that holds the user's hub token (tests).
 pub const HUB_TOKEN_ENV: &str = "WSP_HUB_TOKEN";
+/// The shorter name of the same token, `$WSP_TOKEN` (wsp-165), read when `$WSP_HUB_TOKEN` is unset.
+pub const TOKEN_ENV: &str = "WSP_TOKEN";
 /// The environment variable that holds the hub's URL.
 pub const HUB_URL_ENV: &str = "WSP_HUB_URL";
 /// The environment variable that holds the path of the CA file a private hub's
@@ -66,7 +68,7 @@ impl Credential {
     /// for a file wider than 0600 (named), unreadable or malformed. It never
     /// reads `api.token`.
     pub fn for_hub() -> Result<Credential, Silent> {
-        Credential::for_hub_in(std::env::var(HUB_TOKEN_ENV).ok(), &home())
+        Credential::for_hub_in(std::env::var(HUB_TOKEN_ENV).or_else(|_| std::env::var(TOKEN_ENV)).ok(), &home())
     }
 
     /// [`Credential::for_hub`] with the environment's token and the home

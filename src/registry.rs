@@ -8,6 +8,7 @@ pub const ALL: &[&[crate::verbs::Verb]] = &[
     crate::check::VERBS,
     crate::cmd_agent::VERBS,
     crate::cmd_allocate::VERBS,
+    crate::cmd_whoami::VERBS,
     crate::cmd_attempts::VERBS,
     crate::cmd_attend::VERBS,
     crate::cmd_brief::VERBS,

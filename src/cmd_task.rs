@@ -2236,7 +2236,7 @@ pub fn note(store: &Store, args: &Args) -> i32 {
         }
         _ => (None, String::new()),
     };
-    mutate_saying_at(store, args, "note", said.as_deref(), row, |t| t.log(&format!("{prefix}{text}")))
+    mutate_saying_at(store, args, "note", said.as_deref(), row, |t| t.log(&crate::cmd_whoami::sign(format!("{prefix}{text}"))))
 }
 
 /// Refuse a `--supersedes` that names nothing on this body.
@@ -4632,7 +4632,7 @@ pub(crate) mod tests {
     fn a_hand_with_nothing_written_on_it_is_said_rather_than_left_blank() {
         let store = scratch("show-raised-empty");
         let t = task_with(&store, "worklist-011", "normal");
-        let m = message::Message::new(message::Party::Human, message::Kind::Note, "")
+        let m = message::Message::new(message::Party::Human(None), message::Kind::Note, "")
             .about(message::About::Task(t.id.clone()));
         message::raise(&store, &m).unwrap();
 

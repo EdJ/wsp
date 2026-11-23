@@ -256,6 +256,18 @@ impl Client {
         self.send(verb, args, Some(key))
     }
 
+    /// The `whoami` verb (wsp-165): who the server holds this connection as,
+    /// and the instance it is on. On a hub the principal is what the token
+    /// names.
+    pub fn whoami(&mut self) -> Result<(Principal, String), Error> {
+        let reply = self.send_call(Call::Verb(Verb::Whoami(NoArgs {})), None)?;
+        match reply.outcome {
+            Outcome::Ok(Answer::Whoami { by, server }) => Ok((by, server)),
+            Outcome::Ok(other) => Err(Error::Unexpected(format!("whoami was answered {other:?}"))),
+            Outcome::Err(f) => Err(orders::refused(f)),
+        }
+    }
+
     /// The `wip` verb: open rows whole, every other row and every list
     /// without its bodies, open asks only, seats and claims whole, and the
     /// event id that cut is consistent at. A smaller reply than `state` on a

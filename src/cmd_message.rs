@@ -168,7 +168,7 @@ fn ask_of(store: &Store, args: &Args) -> i32 {
         Ok(t) => t,
         Err(code) => return code,
     };
-    let mut q = Message::question(Party::Human, Kind::Note, &text, Waiting::new("", &task.id)).about(About::Task(task.id.clone()));
+    let mut q = Message::question(a_person(), Kind::Note, &text, Waiting::new("", &task.id)).about(About::Task(task.id.clone()));
     q.of = Some(name.clone());
     q.then = Some(then);
     if let Err(e) = message::raise(store, &q) {
@@ -1005,7 +1005,7 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         }
     };
     if let Some(name) = &relayed {
-        match message::relay(store, &closed.question.id, name, "person") {
+        match message::relay(store, &closed.question.id, name, &crate::cmd_whoami::person()) {
             Ok(m) => closed.question = m,
             Err(e) => eprintln!("wsp: answered, but could not record who answered: {e}"),
         }
@@ -1181,7 +1181,7 @@ fn cancel_as(store: &Store, args: &Args, caller: &Answerer) -> i32 {
     };
     let p = Paint::new();
     if q.shape() == Some(Shape::Question) {
-        let closed = match message::abandon(store, &q.id, &Party::Human, &why) {
+        let closed = match message::abandon(store, &q.id, &a_person(), &why) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("wsp: {e}");
@@ -1194,7 +1194,7 @@ fn cancel_as(store: &Store, args: &Args, caller: &Answerer) -> i32 {
         }
         return deliver(store, &closed, args);
     }
-    match message::lapse(store, &q.id, &Party::Human, &why) {
+    match message::lapse(store, &q.id, &a_person(), &why) {
         Ok(m) => {
             if args.json() {
                 println!("{}", json!({ "id": m.id, "state": m.state_raw, "closed": m.closed_json() }));
@@ -1272,7 +1272,7 @@ fn closer(store: &Store, q: &Message, me: Party, caller: &Answerer) -> Result<Pa
             return Ok(me);
         }
     }
-    the_person(caller).map(|_| Party::Human)
+    the_person(caller).map(|_| a_person())
 }
 
 /// Does this pane hold an agent: bound to a task, or a seat wsp started one in?
@@ -2348,7 +2348,7 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
         ),
         // Outside backend entirely, which is a person at a shell. The fallback is
         // the honest one rather than a convenience: unattributed is a human.
-        (None, None) => (Party::Human, None),
+        (None, None) => (a_person(), None),
     }
 }
 
@@ -2381,7 +2381,7 @@ impl Caller {
         let pane = crate::place::seat_from_env().map(|s| s.to_string());
         let by = match pane {
             Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
-            None => "person".into(),
+            None => crate::cmd_whoami::person(),
         };
         Caller { by, via_hub: false }
     }
@@ -2414,8 +2414,19 @@ pub(crate) fn sender_of(
     bindings: &std::collections::BTreeMap<String, serde_json::Value>,
     pane: Option<&str>,
 ) -> String {
+    sender_as(governors, bindings, pane, None)
+}
+
+/// [`sender_of`] with the engineer a person at a shell is logged in as (wsp-165):
+/// `person:<engineer>` for a caller outside any pane, `person` without one.
+pub(crate) fn sender_as(
+    governors: &std::collections::BTreeMap<String, serde_json::Value>,
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    pane: Option<&str>,
+    engineer: Option<&str>,
+) -> String {
     let Some(pane) = pane.filter(|p| !p.is_empty()) else {
-        return "person".into();
+        return crate::cmd_whoami::person_named(engineer);
     };
     if let Some(scope) = crate::place::governs(governors, &crate::place::Seat::new(pane)) {
         return match crate::governors::is_primary(&scope) {
@@ -2434,7 +2445,16 @@ pub(crate) fn sender_of(
 pub(crate) fn sender(store: &Store) -> String {
     let pane = crate::place::seat_from_env()
         .map(|s| s.to_string());
-    sender_of(&store.governors(), &store.bindings(), pane.as_deref())
+    let engineer = pane.is_none().then(crate::cmd_whoami::engineer).flatten();
+    sender_as(&store.governors(), &store.bindings(), pane.as_deref(), engineer.as_deref())
+}
+
+/// The person at a shell as a record's party: named when an engineer is logged in (wsp-165).
+fn a_person() -> Party {
+    match crate::cmd_whoami::engineer() {
+        Some(name) => Party::engineer(&name),
+        None => Party::Human(None),
+    }
 }
 
 /// The record a needle names: an id, or an unambiguous prefix of one.
@@ -3000,7 +3020,7 @@ mod tests {
         assert!(after.is_open() && after.awaited.is_none(), "still open, and nobody is marked as waiting on it");
 
         // Five minutes on, with the seat mid-turn (it had not yet asked again).
-        let closed = message::answer(&store, &q.id, &Party::Human, "yes, land").unwrap();
+        let closed = message::answer(&store, &q.id, &Party::Human(None), "yes, land").unwrap();
         assert!(closed.question.awaited.is_none(), "no live waiter to carry the answer");
         message::held(&store, &closed.reply.id, "cpd-893", "the seat is mid-turn").unwrap();
         let pane = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
@@ -3041,7 +3061,7 @@ mod tests {
         let q = waited_on(&store, "wsp-149", None);
         let clock = Fake::new();
         clock.at(540_000, || {
-            message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
+            message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
         });
         assert_eq!(wait_and_report(&store, &q.id, None, &args, &clock), 0, "an answer at the deadline is not lost");
 
@@ -3123,7 +3143,7 @@ mod tests {
             assert!(matches!(refused, Err(message::Refused::NotThePersons(_))), "{refused:?}");
         }
         assert!(store.message(&q.id).unwrap().is_open(), "still the person's, still open");
-        assert!(message::answer(&store, &q.id, &Party::Human, "accepted: +190 ms is the cost of gpui").is_ok());
+        assert!(message::answer(&store, &q.id, &Party::Human(None), "accepted: +190 ms is the cost of gpui").is_ok());
     }
 
     /// wsp itself is the one party besides the person that may end one, and
@@ -3245,7 +3265,7 @@ mod tests {
         .for_the_person();
         message::raise(&store, &q).unwrap();
 
-        let closed = message::answer(&store, &q.id, &Party::Human, "keep the bump; old hosts refuse cleanly").unwrap();
+        let closed = message::answer(&store, &q.id, &Party::Human(None), "keep the bump; old hosts refuse cleanly").unwrap();
         assert_eq!(closed.landed, Landed::Task("compound-392".into()));
         let decided = crate::model::decisions(&store.task("compound-392").unwrap().body);
         assert_eq!(decided.len(), 1, "one decision: {decided:?}");
@@ -3272,7 +3292,7 @@ mod tests {
             .for_the_person();
         message::raise(&store, &q).unwrap();
 
-        let closed = message::answer(&store, &q.id, &Party::Human, "accepted; gpui costs that").unwrap();
+        let closed = message::answer(&store, &q.id, &Party::Human(None), "accepted; gpui costs that").unwrap();
         assert_eq!(closed.landed, Landed::List("run".into()));
         let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
         assert!(log.contains("answered by a person") && log.contains("accepted; gpui costs that"), "{log}");
@@ -3414,7 +3434,7 @@ mod tests {
         assert_eq!(held, vec![g13.id.clone()]);
         assert!(message::holding_group(&store, "gpui-migration", 12).is_empty());
         assert!(message::holding_group(&store, "ux-build", 13).is_empty());
-        message::answer(&store, &g13.id, &Party::Human, "read parity.md §1–§7").unwrap();
+        message::answer(&store, &g13.id, &Party::Human(None), "read parity.md §1–§7").unwrap();
         assert!(message::holding_group(&store, "gpui-migration", 13).is_empty(), "answered, it holds nothing");
     }
 
@@ -3749,7 +3769,7 @@ mod tests {
         // A hop with no structure writes no `choice` key, so a previous build
         // reading a newer file finds the hops it knew.
         message::raise(&store, &m).unwrap();
-        message::answer(&store, "m-old", &Party::Human, "ok").unwrap();
+        message::answer(&store, "m-old", &Party::Human(None), "ok").unwrap();
         let hops = store.message("m-old").unwrap().to_json()["via"].clone();
         assert!(hops[0].get("choice").is_none(), "{hops}");
         assert_eq!(store.message("m-old").unwrap().closed_json().unwrap()["answer"], serde_json::json!({ "text": "ok" }));
@@ -3854,7 +3874,7 @@ mod tests {
                 Do::Nothing => {}
                 Do::Answer(t) => clock.at(t, || the_person_answers(&store, &q.id, &[("choice", "Land=Wait")])),
                 Do::Abandon(t) => clock.at(t, || {
-                    message::abandon(&store, &q.id, &Party::Human, "not now").unwrap();
+                    message::abandon(&store, &q.id, &Party::Human(None), "not now").unwrap();
                 }),
             }
             let got = wait_for(&store, &q.id, timeout, &clock).unwrap();
@@ -3875,7 +3895,7 @@ mod tests {
                 _ => assert!(!after.is_open(), "{what}"),
             }
             // Leave nothing open for the next row to find.
-            let _ = message::abandon(&store, &q.id, &Party::Human, "next row");
+            let _ = message::abandon(&store, &q.id, &Party::Human(None), "next row");
         }
     }
 
@@ -3910,12 +3930,12 @@ mod tests {
             ("a permission denied", Some(perm), serde_json::json!({ "behavior": "deny" }), "deny"),
         ] {
             let q = waited_on(&store, "lone-1", choices.as_ref());
-            message::answer_choice(&store, &q.id, &Party::Human, "", &given).unwrap();
+            message::answer_choice(&store, &q.id, &Party::Human(None), "", &given).unwrap();
             assert_eq!(told(&store.message(&q.id).unwrap()), read, "{what}");
         }
         // No choices: the words.
         let q = waited_on(&store, "lone-1", None);
-        message::answer(&store, &q.id, &Party::Human, "yes, after the verify").unwrap();
+        message::answer(&store, &q.id, &Party::Human(None), "yes, after the verify").unwrap();
         assert_eq!(told(&store.message(&q.id).unwrap()), "yes, after the verify");
     }
 
@@ -3927,13 +3947,13 @@ mod tests {
         let args = crate::Args::synth("ask", &[], &[]);
         let q = waited_on(&store, "lone-1", None);
         let answered = || {
-            message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
+            message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
             store.message(&q.id).unwrap()
         };
         let a = answered();
         assert_eq!(report_wait(&store, &q.id, &Ended::Answered(a), None, &args), 0);
         let q = waited_on(&store, "lone-1", None);
-        message::abandon(&store, &q.id, &Party::Human, "dropped").unwrap();
+        message::abandon(&store, &q.id, &Party::Human(None), "dropped").unwrap();
         assert_eq!(report_wait(&store, &q.id, &Ended::Abandoned(store.message(&q.id).unwrap()), None, &args), 3);
         assert_eq!(report_wait(&store, &q.id, &Ended::TimedOut, Some(30), &args), 3);
     }
@@ -3946,7 +3966,7 @@ mod tests {
         let store = scratch("wait-once");
         task(&store, "lone-1");
         let live = waited_on(&store, "lone-1", None);
-        let c = message::answer(&store, &live.id, &Party::Human, "ok").unwrap();
+        let c = message::answer(&store, &live.id, &Party::Human(None), "ok").unwrap();
         assert!(c.question.awaited.as_ref().is_some_and(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)), "the close carries the waiter it found");
         // `deliver` returns on it before it looks for a pane to type at; with
         // no backend here, the other road would have reported the pane gone.
@@ -3959,7 +3979,7 @@ mod tests {
             .for_the_person();
         q.awaited = Some(message::Awaited { pid: a_dead_pid(), at: util::now_iso() });
         message::raise(&store, &q).unwrap();
-        let c = message::answer(&store, &q.id, &Party::Human, "ok").unwrap();
+        let c = message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
         assert!(!crate::host::Host::is_alive(&crate::host::LOCAL, c.question.awaited.as_ref().unwrap().pid));
     }
 
@@ -4025,7 +4045,7 @@ mod tests {
         let q = last_question(&store);
         assert!(q.is_open() && q.awaited.is_none());
 
-        message::answer(&store, &q.id, &Party::Human, "yes").unwrap();
+        message::answer(&store, &q.id, &Party::Human(None), "yes").unwrap();
         // A reply held for the busy asker, as `deliver` held it before waiting
         // existed: the retry returns the answer and ends the hold.
         let reply = message::all(&store).into_iter().find(|m| m.reply_to.as_deref() == Some(q.id.as_str())).expect("the reply");
@@ -4214,7 +4234,7 @@ mod tests {
         assert_eq!(ask(&store, &asked), 0);
         let q = message::all(&store).pop().unwrap();
         assert_eq!((q.of.as_deref(), q.then.as_deref()), (Some("ed"), Some("merge the bump")));
-        assert_eq!(q.from, Party::Human, "an ask from the person");
+        assert_eq!(q.from, Party::Human(None), "an ask from the person");
         assert!(q.is_open() && q.answered_by.is_none());
         assert_eq!(q.about, About::Task("lone-1".into()));
 
@@ -4230,7 +4250,7 @@ mod tests {
         assert_eq!((after.answered_by.as_deref(), after.relayed_by.as_deref()), (Some("ed"), Some("person")));
         let j = after.to_json();
         assert_eq!((j["of"].as_str(), j["answered_by"].as_str(), j["relayed_by"].as_str()), (Some("ed"), Some("ed"), Some("person")));
-        assert_eq!(after.closing().map(|h| h.by.clone()), Some(Party::Human));
+        assert_eq!(after.closing().map(|h| h.by.clone()), Some(Party::Human(None)));
     }
 
     /// The answered `--of` ask's action, run as the button would, ends it; and a

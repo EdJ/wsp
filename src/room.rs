@@ -964,7 +964,7 @@ mod tests {
         assert!(full(&store, &AllWorking).is_none(), "an old ask holds none");
         assert!(store.message(&q.id).unwrap().wants_answering(), "and it is still open");
 
-        message::answer(&store, &q.id, &Party::Human, "yes").unwrap();
+        message::answer(&store, &q.id, &Party::Human(None), "yes").unwrap();
         assert!(full(&store, &AllWorking).is_some(), "answered, the seat is an agent working again");
     }
 }

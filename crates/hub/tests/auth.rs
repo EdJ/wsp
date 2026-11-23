@@ -183,6 +183,17 @@ fn an_active_tokens_hello_is_welcomed_as_its_user_whatever_by_it_sent() {
 }
 
 #[test]
+fn whoami_answers_the_principal_the_token_names_and_the_hubs_name_for_itself() {
+    let hub = Served::start("whoami");
+    let tokens = hub.with_users(&["ann"]);
+    let mut ann = hub.connect(&tokens[1], person("mallory")).unwrap();
+    match ann.ask(Call::Verb(Verb::Whoami(NoArgs {}))) {
+        Outcome::Ok(Answer::Whoami { by, server }) => assert_eq!((by, server), (person("ann"), "hub-t".to_string())),
+        other => panic!("whoami is answered with the token's principal, not {other:?}"),
+    }
+}
+
+#[test]
 fn a_request_naming_another_principal_than_the_tokens_is_forbidden() {
     let hub = Served::start("forbidden");
     let tokens = hub.with_users(&["ann"]);

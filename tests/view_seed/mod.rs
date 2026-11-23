@@ -203,7 +203,7 @@ pub fn seeded(tag: &str) -> Sandbox {
     // person answered at the pinned instant (`yours --json` keeps it ten minutes).
     {
         use wsp_store::message::{self, About, Kind, Party};
-        let mut m = message::Message::new(Party::Human, Kind::Note, "The vendor has not answered");
+        let mut m = message::Message::new(Party::Human(None), Kind::Note, "The vendor has not answered");
         m.id = "m-seed-flag".into();
         m.about = About::Task("beta-001".into());
         message::raise(&store, &m).unwrap();

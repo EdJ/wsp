@@ -249,7 +249,7 @@ mod tests {
     fn answer(store: &Store, row: &str, text: &str) {
         let q = store.messages().into_values().find(|m| m.about.task() == Some(row)).unwrap();
         let choice = json!({"answers": [{"label": text}]});
-        let _ = message::answer_choice(store, &q.id, &Party::Human, text, &choice).or_else(|_| message::answer(store, &q.id, &Party::Human, text));
+        let _ = message::answer_choice(store, &q.id, &Party::Human(None), text, &choice).or_else(|_| message::answer(store, &q.id, &Party::Human(None), text));
     }
 
     #[test]

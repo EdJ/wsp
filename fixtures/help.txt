@@ -168,6 +168,7 @@ TASKS
                                     is reachable however it is written
   wsp prio <id> high|normal|low     what comes first inside its project
   wsp allocate <id> <user>|none     bind shared work to one user's agents
+  wsp whoami                        who the hub says you are (person:<engineer>)
   wsp next [-p proj]                highest-priority actionable task
   wsp rm <id>                       retire it to the archive
   wsp archive [--days N] [-n] [--full]

@@ -1256,6 +1256,10 @@ fn dial_hub_sends_the_users_token_and_never_reads_api_token() {
     let mut c = Client::dial_hub(&url, Credential::User(token.clone()), WAIT).unwrap_or_else(|s| panic!("silent: {s}"));
     assert_eq!(c.server(), "wsp");
     assert!(c.wip().is_ok());
+    // `whoami` is the principal the connection was welcomed as, and the instance (wsp-165).
+    let (by, server_name) = c.whoami().expect("whoami");
+    assert_eq!(server_name, "wsp");
+    assert!(matches!(by, wsp_api::Principal::Person(_)), "{by:?}");
     // The same address bare is the same hub.
     assert!(Client::dial_hub(&listen.addrs[0], Credential::User(token), WAIT).is_ok());
 

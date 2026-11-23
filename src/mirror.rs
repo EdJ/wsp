@@ -525,7 +525,7 @@ fn principal(p: &Party) -> Principal {
         Party::Seat(scope) => Principal::Seat(SeatId(scope.clone())),
         Party::Agent(h) if h == "wsp" => Principal::Wsp("wsp".into()),
         Party::Agent(h) => Principal::Seat(SeatId(h.clone())),
-        Party::Human => Principal::Person("person".into()),
+        Party::Human(name) => Principal::Person(name.clone().unwrap_or_else(|| "person".into())),
     }
 }
 
