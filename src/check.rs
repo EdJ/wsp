@@ -1964,7 +1964,7 @@ pub(crate) fn timed_out_under_load(ran: &[Ran], start: &Start, load_end: Option<
     Some(format!("load {} at the start, {} at the end, of {} cores", f(start.load), f(load_end), start.cores))
 }
 
-const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed:\n\n";
+pub(crate) const CHECK_HEAD: &str = "`wsp check` failed on this row's landing. What is owed:\n\n";
 
 // ---- the verb -----------------------------------------------------------------
 
@@ -2151,6 +2151,9 @@ pub fn check(store: &Store, args: &Args) -> i32 {
         if let Some(t) = store.find_task(&t.id) {
             crate::cmd_task::deliver_reason(store, &t.id, &owed(&ran, &tg.sha));
         }
+        // At the leg cap no rework leg carries the failure, and nothing else
+        // would say so to whoever decides (`wsp-690`).
+        crate::verification::tell_if_capped(store, &t.id, &owed(&ran, &tg.sha));
     }
     if settled == Settled::Malformed {
         let ask = owed(&ran, &tg.sha).replace("<id>", &t.id);

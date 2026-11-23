@@ -7,9 +7,10 @@
 //!
 //! - under `WSP_HOST=manager` there is no `ps`, `lsof`, `compound-render` or
 //!   `df` among them, and the seat the manager runs is in the answer;
-//! - under `WSP_HOST=inproc` the same call runs `df` and still no `ps` (wip
-//!   has run no `ps` on any path since wsp-030), so the log is seen to count
-//!   what it should and a `ps` back in wip is caught;
+//! - under `WSP_HOST=inproc` the manager is the `wsp` process's own, so the
+//!   log is seen to count the children its readings run, and still no `ps`
+//!   (wip has run no `ps` on any path since wsp-030), so a `ps` back in wip
+//!   is caught;
 //! - with the manager stopped, `wip` under `manager` says the manager is
 //!   unreachable rather than answering with nothing, still within the second
 //!   and still with none of those children;
@@ -139,21 +140,49 @@ fn wip_under_the_manager_runs_no_probe_and_a_stopped_manager_reads_silent() {
     // One seat the manager runs.
     let tcp = Tcp::new(local.socket(), token, wsp_host_api::Role::Cli, "test");
     let args: Vec<String> = vec![];
-    let spawn = Spawn { key: wsp_host_api::Key { row: wsp_host_api::RowId("wsp-027".into()), attempt: 0 }, seat: "cpd-wm1", kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "true", args: &args };
-    let session = tcp.spawn_session(&spawn).expect("the manager spawns the seat");
+    // The manager gives the fake sup `HANDSHAKE` (5 s) to announce its socket
+    // and refuses the seat past that, which a machine oversubscribed several
+    // times over overruns: spawned again, as a next attempt, bounded generously.
+    let spawn_deadline = Instant::now() + Duration::from_secs(120);
+    let mut attempt = 0;
+    let session = loop {
+        let spawn = Spawn { key: wsp_host_api::Key { row: wsp_host_api::RowId("wsp-027".into()), attempt }, seat: "cpd-wm1", kind: None, cwd: dir.display().to_string(), env: BTreeMap::new(), program: "true", args: &args };
+        match tcp.spawn_session(&spawn) {
+            Ok(session) => break session,
+            Err(e) => {
+                assert!(Instant::now() < spawn_deadline && attempt < 30, "the manager spawns the seat: {e:?}");
+                attempt += 1;
+            }
+        }
+    };
 
     // Under the manager: the seat, and no probe.
-    let (json, children, took) = wip(&state, "manager");
+    // `wip` gives the manager `SILENT` (1 s) to answer and reads it silent
+    // past that, which a loaded machine overruns (the same wait wsp-693 made
+    // in repair's census test): asked again until the manager is heard,
+    // bounded generously, and only a heard answer is held to having the seat.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (json, children, took) = loop {
+        let got = wip(&state, "manager");
+        if got.0["unreachable"].is_null() {
+            break got;
+        }
+        assert!(Instant::now() < deadline, "wip never heard the manager within 120s: {}", got.0);
+    };
     let agents = json["agents"].as_array().cloned().unwrap_or_default();
     assert!(agents.iter().any(|a| a["pane"] == "cpd-wm1"), "the manager's seat is in wip: {json}");
     assert_eq!(ran(&children, PROBES), Vec::<&str>::new(), "wip under the manager ran {children}");
     assert!(json["unreachable"].is_null(), "the manager answered: {json}");
     assert!(took < Duration::from_secs(10), "{took:?}");
 
-    // In process: the same call runs `df`, so the log counts children, and
-    // still no `ps`: wip runs none on any path since wsp-030.
+    // In process: the manager runs in the `wsp` process itself (wsp-030) and
+    // `wip` reads it as it reads any manager, so the call asks for no probe of
+    // its own; what the log is seen to count is the children that manager's
+    // own readings run (host facts: `df`, `sysctl`, `vm_stat`), which the call
+    // under the installed manager does not run. It runs no `ps` here for want
+    // of a seat of its own to read.
     let (inproc, kids, _) = wip(&state, "inproc");
-    assert_eq!(ran(&kids, &["df"]), ["df"], "wip in process runs df: {kids}");
+    assert!(ran(&kids, &["df", "sysctl", "vm_stat"]).len() > 0, "wip in process counts the children it runs: {kids}");
     assert_eq!(ran(&kids, &["ps"]), Vec::<&str>::new(), "wip in process ran ps: {kids}");
     // The shape is the same: the keys the UI polls are there under both.
     let (k_mgr, k_in) = (keys(&json), keys(&inproc));

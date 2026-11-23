@@ -252,10 +252,11 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
 /// I5 has none: a row's state is joined per call and never logged as a guess
 /// (it is state-core's rows machine, not the manager's).
 pub(crate) const SIGNS: &[Sign] = &[
-    // Its writer, ending.rs's `stop_finished`, went with M3 (wsp-057): nothing
-    // stops a process in a finished tree now. The sign stays first, as
-    // `wsp_478` counts it, so M3's measure reads the old lines and then none.
-    Sign { kind: "I1", name: "stopped in a finished row's tree (wsp-478)", site: "ending.rs stop_finished (gone, wsp-057)", test: |l| l.starts_with("stopped in finished row ") },
+    // Its writer, ending.rs's `stop_finished`, went with M3 (wsp-057) and came
+    // back with Ed's wsp-691 at the merge of wsp-368: what an agent's shell
+    // leaves in a finished tree is no job, so the tick stops it again. The
+    // sign stays first, as `wsp_478` counts it.
+    Sign { kind: "I1", name: "stopped in a finished row's tree (wsp-478)", site: "ending.rs stop_finished", test: |l| l.starts_with("stopped in finished row ") },
     Sign { kind: "I2", name: "never became ready (screen)", site: "cmd_spawn.rs", test: |l| l.contains("started but never became ready for input") },
     Sign { kind: "I2", name: "screen overruled by opencode's record", site: "repair.rs", test: |l| l.contains("the screen says working and opencode finished") },
     Sign { kind: "I3", name: "typed, no turn seen", site: "wake.rs", test: |l| l.starts_with("told ") && l.contains("typed at the seat — no turn seen yet") },

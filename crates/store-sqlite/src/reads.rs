@@ -86,6 +86,43 @@ impl Reads for SqliteStore {
             Ok((state, EventId(head as u64)))
         })
     }
+
+    /// Cut down in SQL, over the state row, so the full domain is never decoded into Rust: one
+    /// statement, so the cut and the head are of one moment, as `snapshot()`'s are.
+    fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
+        let done = word(serde_json::json!(RowState::Done));
+        let raised = word(serde_json::json!(AskState::Raised));
+        let finished = word(serde_json::json!(ListState::Finished));
+        let [body, prose] = WIP_BODIES.map(|k| format!("$.fields.{k}"));
+        let seated = format!("$.fields.{WIP_SEATED}");
+        self.with_conn(|c| {
+            let (json, head): (String, i64) = c
+                .query_row(
+                    "SELECT json_object(
+                        'rows', (SELECT json_group_object(key,
+                                    CASE WHEN json_extract(value, '$.state') = ?1
+                                         THEN json_remove(value, ?3, ?4) ELSE json(value) END)
+                                 FROM json_each(s.json, '$.rows')),
+                        'lists', (SELECT json_group_object(key,
+                                     CASE WHEN json_extract(value, '$.state') = ?5
+                                               AND json_extract(value, ?6) IS NULL
+                                          THEN json_remove(value, ?3, ?4) ELSE json(value) END)
+                                  FROM json_each(s.json, '$.lists')),
+                        'seats', json(COALESCE(json_extract(s.json, '$.seats'), '{}')),
+                        'claims', json(COALESCE(json_extract(s.json, '$.claims'), '{}')),
+                        'asks', (SELECT json_group_object(key, json(value))
+                                 FROM json_each(s.json, '$.asks')
+                                 WHERE json_extract(value, '$.state') = ?2)),
+                     (SELECT COALESCE(MAX(id), 0) FROM event)
+                     FROM (SELECT (SELECT json FROM state WHERE id = 1) AS json) AS s",
+                    params![done, raised, body, prose, finished, seated],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(be)?;
+            Ok((from_json!(&json)?, EventId(head as u64)))
+        })
+    }
 }
 
 impl Events for SqliteStore {

@@ -1281,6 +1281,124 @@ pub(crate) fn deliver_unless_reworked(store: &Store, member: &str, text: &str) {
     if !reworked {
         crate::cmd_task::deliver_reason(store, member, text.trim());
     }
+    tell_if_capped(store, member, text);
+}
+
+/// What a row's log says once whoever decides a cap stall has been told: this,
+/// who, and the verdict's first line (`wsp-690`).
+pub(crate) const STALL_TOLD: &str = "wsp: stalled at the cap, told";
+
+/// The cap a row sent back could not carry, when that is where it stands: at
+/// `doing`, nothing of its legs (or pieces) pending or running, and the last
+/// send-back on its log refused its rework (`legs::rework_by`, or `pieces`'
+/// count) with no leg or piece appended since. `None` once anything moves it —
+/// a leg added by hand, the verdict decided, the row split and closed.
+///
+/// The run starts nothing for such a row and seats nobody on it, so unless
+/// somebody is told it waits forever: `compounding-760`, 14 hours on
+/// 2026-11-19 behind a governor that believed a rework leg was running.
+pub(crate) fn stalled_at_cap(t: &Task) -> Option<String> {
+    if t.status() != Status::Doing {
+        return None;
+    }
+    let legs = crate::legs::legs(t);
+    let rec = crate::pieces::record(t);
+    let cap = if !legs.is_empty() {
+        if legs.iter().any(|l| matches!(l.state, crate::legs::State::Pending | crate::legs::State::Running)) {
+            return None;
+        }
+        format!("{}-leg cap", crate::legs::MAX_LEGS)
+    } else if !rec.pieces.is_empty() {
+        if rec.pieces.iter().any(|p| matches!(p.state, crate::pieces::State::Pending | crate::pieces::State::Running)) {
+            return None;
+        }
+        format!("{}-piece cap", crate::pieces::MAX_PIECES)
+    } else {
+        return None;
+    };
+    let log = t.section("Log").unwrap_or_default();
+    let mut refused = false;
+    for l in log.lines() {
+        if l.contains("no rework leg was added") || (l.contains("wsp: ") && l.contains("pieces is over the")) {
+            refused = true;
+        } else if l.contains("wsp: appended leg") || l.contains("wsp: appended piece") {
+            refused = false;
+        }
+    }
+    refused.then_some(cap)
+}
+
+/// Whether a stall tell is on the log since the row last moved (a leg or
+/// piece appended) — for this verdict's first line, or any with `None`.
+fn told_since_moved(t: &Task, first: Option<&str>) -> bool {
+    let mut told = false;
+    for l in t.section("Log").unwrap_or_default().lines() {
+        if l.contains("wsp: appended leg") || l.contains("wsp: appended piece") {
+            told = false;
+        } else if l.contains(STALL_TOLD) && first.is_none_or(|f| l.trim_end().ends_with(&format!("— {f}"))) {
+            told = true;
+        }
+    }
+    told
+}
+
+/// A row stalled at the cap whose decider has been told so: what the verdict
+/// tell at the run's advance stays quiet on, so a governor hears it once.
+pub(crate) fn stall_told(t: &Task) -> bool {
+    stalled_at_cap(t).is_some() && told_since_moved(t, None)
+}
+
+/// The first line of a verdict, folded and short: what a stall tell names it by.
+fn first_line(verdict: &str) -> String {
+    let line = verdict.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("(no verdict text)");
+    util::truncate(&crate::util::fold(line), 160)
+}
+
+/// A send-back the row could not carry, said to whoever decides it — the
+/// list's governor through [`tell_governor`] (the spool, so a busy seat has it
+/// on its next turn), or for a row on no list a hand raised with
+/// [`crate::cycle::notice_on_row`], which reaches its project's custodian or else
+/// the person. Before `wsp-690` the refusal was only logged on the row, and
+/// nobody reads a row nothing is running.
+///
+/// Once per verdict: a second send-back with the same first line, and nothing
+/// appended between, tells nobody again. Returns whether it told.
+pub(crate) fn tell_if_capped(store: &Store, member: &str, verdict: &str) -> bool {
+    let Some(t) = store.find_task(member) else { return false };
+    let Some(cap) = stalled_at_cap(&t) else { return false };
+    let first = first_line(verdict);
+    if told_since_moved(&t, Some(&first)) {
+        return false;
+    }
+    let what = if cap.contains("-leg") { "leg" } else { "piece" };
+    let text = format!(
+        "{member} ({}) was sent back at the {cap}, so NO rework {what} was added and the run will start nothing for it: \
+         it waits on you. The verdict's first line: {first}\n\
+         `wsp show {member}` has all of it. Your choices: split the row into rows of its own; \
+         add a {what} by hand (`wsp leg add {member} <name> --order FILE`); \
+         or decide the verdict — `wsp verified {member} --holds --from FILE --caption \"…\"` if the finding is wrong, \
+         `wsp decide {member} \"…\"` to answer it.",
+        util::truncate(&t.title, 60)
+    );
+    let whom = match crate::cycle::list_of(store, &t) {
+        Some(w) => {
+            crate::cycle::tell(store, &w, &text);
+            format!("the {} governor", w.id)
+        }
+        None => {
+            if !crate::cycle::notice_on_row(store, member, &text) {
+                return false;
+            }
+            "a hand on the row".to_string()
+        }
+    };
+    store.locked(|| {
+        let mut t = store.find_task(member)?;
+        t.log(&format!("{STALL_TOLD} {whom} — {first}"));
+        store.save_task(&t).ok()
+    });
+    store.git_commit(&format!("wsp: {member} stalled at the {cap}, {whom} told"));
+    true
 }
 
 /// The store half of [`verified`]: the pass written, and the member moved when
@@ -2444,5 +2562,81 @@ mod tests {
         assert!(crate::repair::landed(&t).is_none(), "nothing landed");
         assert_ne!(g.trunk(), before, "the racing step really moved it");
         let _ = &g.repo;
+    }
+
+    /// A row at the leg cap, every leg done, at `review` as a check finds it.
+    fn at_the_leg_cap(store: &Store, id: &str) {
+        let mut t = Task::new(id, id);
+        t.status_raw = Status::Review.as_str().into();
+        let mut all: Vec<crate::legs::Leg> = (0..crate::legs::MAX_LEGS)
+            .map(|n| crate::legs::Leg { state: crate::legs::State::Done, ..crate::legs::Leg::pending(&format!("l{n}"), "x") })
+            .collect();
+        all[0].after = Some(Vec::new());
+        crate::legs::write(&mut t, &all);
+        store.save_task(&t).unwrap();
+    }
+
+    /// The send-back as `wsp check` makes it, then what follows it outside the lock.
+    fn sent_back_by_check(store: &Store, id: &str, verdict: &str) {
+        let mut t = store.find_task(id).unwrap();
+        send_back(&mut t, util::now_iso(), "wsp check failed", None, verdict, Some(crate::check::CHECK_HEAD));
+        store.save_task(&t).unwrap();
+        deliver_unless_reworked(store, id, verdict);
+    }
+
+    /// `wsp-690`: a legs row at MAX_LEGS that is sent back gets no leg, and its
+    /// list's governor is told once — naming the row, the cap, the verdict's
+    /// first line and the three choices. The same verdict again tells nobody.
+    #[test]
+    fn a_send_back_at_the_leg_cap_tells_the_governor_once_and_appends_no_leg() {
+        let (_env, store) = scratch("cap-told");
+        at_the_leg_cap(&store, "m-1");
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        let _ = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).count());
+
+        let verdict = "`cargo test` failed: 2 of 40\nthe rest of the verdict";
+        sent_back_by_check(&store, "m-1", verdict);
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Doing);
+        assert_eq!(crate::legs::legs(&t).len(), crate::legs::MAX_LEGS, "no leg appended");
+        assert_eq!(stalled_at_cap(&t).as_deref(), Some("8-leg cap"));
+        let told: Vec<String> = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).collect());
+        assert_eq!(told.len(), 1, "exactly one tell: {told:?}");
+        let said = &told[0];
+        for want in ["m-1", "8-leg cap", "NO rework leg", "`cargo test` failed: 2 of 40", "split the row", "wsp leg add m-1", "--holds"] {
+            assert!(said.contains(want), "{want:?} in {said}");
+        }
+        assert!(!said.contains("the rest of the verdict"), "the first line, not the whole: {said}");
+        assert!(stall_told(&t));
+
+        sent_back_by_check(&store, "m-1", verdict);
+        assert!(crate::cycle::tests::TOLD.with(|t| t.borrow().is_empty()), "the same verdict is not told again");
+        assert_eq!(crate::legs::legs(&store.find_task("m-1").unwrap()).len(), crate::legs::MAX_LEGS);
+
+        // A leg added by hand moves it: no longer stalled.
+        let mut t = store.find_task("m-1").unwrap();
+        t.set_status(Status::Doing);
+        let mut legs = crate::legs::legs(&t);
+        legs[crate::legs::MAX_LEGS - 1].state = crate::legs::State::Pending;
+        crate::legs::write(&mut t, &legs);
+        assert!(stalled_at_cap(&t).is_none(), "a pending leg is the row moving");
+    }
+
+    /// And a row on no list raises a hand instead, so it never stops silently.
+    #[test]
+    fn a_send_back_at_the_leg_cap_on_no_list_raises_a_hand() {
+        let (_env, store) = scratch("cap-flag");
+        at_the_leg_cap(&store, "m-1");
+        let _ = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).count());
+        sent_back_by_check(&store, "m-1", "a step failed");
+        assert!(crate::cycle::tests::TOLD.with(|t| t.borrow().is_empty()), "no list, no governor");
+        let hands: Vec<_> = crate::message::raised(&store).into_iter().filter(|m| m.about.task() == Some("m-1")).collect();
+        assert_eq!(hands.len(), 1, "{hands:?}");
+        assert!(hands[0].text.contains("8-leg cap") && hands[0].text.contains("a step failed"), "{}", hands[0].text);
+        sent_back_by_check(&store, "m-1", "a step failed");
+        assert_eq!(crate::message::raised(&store).into_iter().filter(|m| m.about.task() == Some("m-1")).count(), 1, "once");
     }
 }

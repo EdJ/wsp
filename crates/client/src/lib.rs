@@ -7,6 +7,7 @@
 //! - [`Client::dial_at`] does the same against addresses and a token the
 //!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
+//! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
 //! - [`Client::apply`] sends a command under one idempotency key, again under
 //!   the same key after a lost reply; [`Client::await_order`] follows an order
 //!   to a state.
@@ -20,8 +21,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use wsp_api::{ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, Reply, ReqId, Request, PROTOCOL};
-use wsp_store_contract::{Principal, Refusal};
+use wsp_api::{
+    Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
+    Request, Verb, PROTOCOL,
+};
+use wsp_store_contract::{Principal, Refusal, State};
 
 mod dial;
 mod orders;
@@ -158,9 +162,26 @@ impl Client {
         self.send(verb, args, Some(key))
     }
 
+    /// The `wip` verb: open rows whole, every other row and every list
+    /// without its bodies, open asks only, seats and claims whole, and the
+    /// event id that cut is consistent at. A smaller reply than `state` on a
+    /// large store, which is what keeps it under `MAX_LINE`.
+    pub fn wip(&mut self) -> Result<(State, wsp_api::EventId), Error> {
+        let reply = self.send_call(Call::Verb(Verb::Wip(NoArgs {})), None)?;
+        match reply.outcome {
+            Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
+            Outcome::Ok(other) => Err(Error::Unexpected(format!("wip was answered {other:?}"))),
+            Outcome::Err(f) => Err(orders::refused(f)),
+        }
+    }
+
     fn send(&mut self, verb: &str, args: Value, key: Option<IdempotencyKey>) -> Result<Reply, Error> {
         let call: Call = serde_json::from_value(json!({ "verb": verb, "args": args }))
             .map_err(|e| Error::Args(e.to_string()))?;
+        self.send_call(call, key)
+    }
+
+    fn send_call(&mut self, call: Call, key: Option<IdempotencyKey>) -> Result<Reply, Error> {
         let id = ReqId(self.next);
         self.next += 1;
         let request = Request { v: PROTOCOL, id, key, by: self.target.by.clone(), call };

@@ -310,6 +310,15 @@ pub(crate) trait Seats {
     fn end_exit_when_idle(&self, _store: &Store, _seat: &str) -> Result<(), String> {
         Ok(())
     }
+
+    /// Fold what was typed at `scope`'s seat and never confirmed, so a successor
+    /// is not handed the payload its predecessor refused —
+    /// `wake::fold_what_was_typed` (`wsp-694`). How many were folded. **Does
+    /// nothing by default**, for [`Seats::rotate`]'s reason: the spool is the
+    /// seats layer's, and a fake has none to fold.
+    fn fold_typed(&self, _store: &Store, _scope: &str) -> usize {
+        0
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
@@ -797,6 +806,11 @@ fn told_about_task(store: &Store, id: &str, verb: &str) {
 fn told_verdict(store: &Store, w: &Worklist, t: &Task) {
     let tasks = store.tasks_shared();
     let Some(p) = crate::verification::blocked(&tasks, &t.id) else { return };
+    // A send-back at the cap has told the governor already, once, with its
+    // choices (`verification::tell_if_capped`): not a second time here.
+    if store.find_task(&t.id).is_some_and(|now| crate::verification::stall_told(&now)) {
+        return;
+    }
     tell(store, w, &format!(
         "A verifier found a problem in the {} run: {} ({}) was sent back to doing{}. \
          `wsp show {}` has the verdict under ## Verification. {} \
@@ -5405,6 +5419,14 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
     crate::cmd_agent::notice(store, &first, &text).is_some()
+}
+
+/// wsp's notice on a row on no list, for the seat that answers for it (its
+/// project's custodian, else the person): [`crate::cmd_agent::notice`], here so
+/// the engine modules that tell a row's stall reach it through the run and not
+/// up into the seats (`wsp-690`). Returns whether it was raised.
+pub(crate) fn notice_on_row(store: &Store, member: &str, text: &str) -> bool {
+    crate::cmd_agent::notice(store, member, text).is_some()
 }
 
 /// The member [`tell_now`] puts a run's notice on: the first of the group the

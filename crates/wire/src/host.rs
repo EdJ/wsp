@@ -240,6 +240,15 @@ pub trait Host: Sync {
     /// `sig` to a whole process group, by its leader's id — never this
     /// process's own group.
     fn signal_group(&self, group: u32, sig: &str);
+    /// `lsof -d cwd -Fpn`, of `pids` alone when given: every process's working
+    /// directory as lsof's field lines. `None` when `lsof` would not run.
+    ///
+    /// Not tree work's: tree work asks no pid since wsp-057. This is wsp-691's
+    /// agent-leftover stop (what an agent's shell leaves in its tree, which no
+    /// job holds), kept at the merge of wsp-368 on the person's word. Under the
+    /// manager it answers as in-process does, from this machine, until wsp-389
+    /// has the manager stop a seat's process tree itself.
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String>;
 
     /// Whether `pid` is running: `kill -0`, which a zombie still answers.
     /// `None` when `kill` would not run, as [`Host::signal`].
@@ -515,6 +524,9 @@ impl Host for InProcess {
     }
     fn signal_group(&self, group: u32, sig: &str) {
         self.host.signal_group(group, sig)
+    }
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        self.host.cwds(pids)
     }
     fn answers(&self, socket: &Path) -> bool {
         self.host.answers(socket)

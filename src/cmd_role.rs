@@ -29,6 +29,8 @@
 //! member's Claude Code is not allowed to call these verbs without a prompt,
 //! and wsp refuses the call besides.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
 use crate::model::Status;
@@ -45,6 +47,7 @@ pub(crate) const RETRO_SETTINGS: &str = include_str!("../claude-code/retro.setti
 /// The settings a member seat is started with, `<row>` its own row (wsp-681).
 pub(crate) const MEMBER_SETTINGS: &str = include_str!("../claude-code/member.settings.json");
 const RETRO_FILE: &str = "wsp-retro.settings.json";
+const GUARD_FILE: &str = "wsp-seat.settings.json";
 const PRIMARY_FILE: &str = "wsp-primary.settings.json";
 const GOVERNOR_FILE: &str = "wsp-governor.settings.json";
 
@@ -313,6 +316,199 @@ pub fn daemon_reload(store: &Store, answering: Option<Vec<u32>>) -> i32 {
 }
 
 // ---- reap -------------------------------------------------------------------
+
+// What stays of the process table here is wsp-691's burner line (`wsp wip`'s
+// load warning, stamped by the daemon's tick, wsp-716): it names CPU burners
+// in no tree and stops none, so it keeps to wsp-057's rule for reap below.
+
+/// The CPU a `while :` loop must be over to be a busy loop.
+const LOOP_CPU: f32 = 20.0;
+
+/// One row of `ps`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    /// Seconds since it started.
+    pub age: u64,
+    pub cpu: f32,
+    /// CPU seconds it has used in all.
+    pub cputime: u64,
+    pub command: String,
+}
+
+/// `[[dd-]hh:]mm:ss` (`etime`) or `[hh:]mm:ss[.cc]` (`time`), in seconds.
+pub(crate) fn clock_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let rest = rest.split('.').next()?;
+    let mut secs = 0u64;
+    for part in rest.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
+/// One `ps -o pid=,ppid=,etime=,pcpu=,time=,command=` line.
+pub(crate) fn parse_ps(line: &str) -> Option<Proc> {
+    let mut it = line.split_whitespace();
+    let pid = it.next()?.parse().ok()?;
+    let ppid = it.next()?.parse().ok()?;
+    let age = clock_secs(it.next()?)?;
+    let cpu = it.next()?.parse().ok()?;
+    let cputime = clock_secs(it.next()?)?;
+    let command = it.collect::<Vec<_>>().join(" ");
+    Some(Proc { pid, ppid, age, cpu, cputime, command })
+}
+
+pub(crate) fn processes() -> Vec<Proc> {
+    let Some(out) = crate::host::Host::table(&crate::host::LOCAL, "pid=,ppid=,etime=,pcpu=,time=,command=", false) else {
+        return Vec::new();
+    };
+    out.lines().filter_map(parse_ps).collect()
+}
+
+/// Every process's working directory, from `lsof -d cwd -Fpn`.
+pub(crate) fn parse_cwds(lsof: &str) -> BTreeMap<u32, String> {
+    let mut out = BTreeMap::new();
+    let mut pid = None;
+    for line in lsof.lines() {
+        match line.split_at_checked(1) {
+            Some(("p", rest)) => pid = rest.trim().parse::<u32>().ok(),
+            Some(("n", rest)) => {
+                if let Some(p) = pid {
+                    out.entry(p).or_insert_with(|| rest.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The tree a working directory is in: `(its name, its root)`, the directory
+/// under a `.worktrees/` the path goes through.
+pub(crate) fn tree_named(cwd: &str) -> Option<(String, String)> {
+    let mut root = std::path::PathBuf::new();
+    let mut parts = std::path::Path::new(cwd).components();
+    while let Some(c) = parts.next() {
+        root.push(c);
+        if c.as_os_str() == ".worktrees" {
+            let name = parts.next()?;
+            root.push(name);
+            return Some((name.as_os_str().to_string_lossy().into_owned(), root.display().to_string()));
+        }
+    }
+    None
+}
+
+/// A zsh `while :` loop left running.
+pub(crate) fn is_busy_loop(p: &Proc) -> bool {
+    let prog = p.command.split_whitespace().next().unwrap_or_default();
+    prog.rsplit('/').next() == Some("zsh") && p.command.contains("while :") && p.cpu > LOOP_CPU && p.ppid == 1
+}
+
+/// How old a tree-less burner is before `wsp wip` names it.
+const BURNER_AGE: u64 = 10 * 60;
+
+/// A CPU burner: a `yes`, a `stress`, or a busy `while :` loop, orphaned to
+/// launchd, busy, and older than [`BURNER_AGE`].
+pub(crate) fn is_burner(p: &Proc) -> bool {
+    if p.ppid != 1 || p.age <= BURNER_AGE || p.cpu <= LOOP_CPU {
+        return false;
+    }
+    let prog = p.command.split_whitespace().next().unwrap_or_default();
+    matches!(prog.rsplit('/').next(), Some("yes" | "stress" | "stress-ng")) || is_busy_loop(p)
+}
+
+/// Whether a working directory is in a tree: under a project root or a
+/// `.worktrees/` directory.
+fn in_a_tree(cwd: &str, roots: &[String]) -> bool {
+    tree_named(cwd).is_some()
+        || roots.iter().any(|r| {
+            let r = r.trim_end_matches('/');
+            !r.is_empty() && (cwd == r || cwd.starts_with(&format!("{r}/")))
+        })
+}
+
+/// The burners standing in no tree, as one line for the load warning, from
+/// the process table and a working-directory read passed in. They are named,
+/// never stopped: they are outside every tree. A burner whose directory is
+/// unknown is not named.
+pub(crate) fn burners_line(procs: &[Proc], cwd_of: &dyn Fn(&[u32]) -> BTreeMap<u32, String>, roots: &[String]) -> Option<String> {
+    let cand: Vec<&Proc> = procs.iter().filter(|p| is_burner(p)).collect();
+    if cand.is_empty() {
+        return None;
+    }
+    let pids: Vec<u32> = cand.iter().map(|p| p.pid).collect();
+    let cwds = cwd_of(&pids);
+    let loose: Vec<String> = cand
+        .iter()
+        .filter(|p| cwds.get(&p.pid).is_some_and(|c| !in_a_tree(c, roots)))
+        .map(|p| format!("{} {}", p.pid, util::truncate(&p.command, 40)))
+        .collect();
+    if loose.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} CPU burner{} in no tree, orphaned for over 10 minutes: {} — not stopped, they are outside every tree (`kill <pid>`)",
+        loose.len(),
+        if loose.len() == 1 { "" } else { "s" },
+        loose.join("; ")
+    ))
+}
+
+/// [`burners_line`] from the machine.
+pub(crate) fn burners_now(store: &Store) -> Option<String> {
+    let procs = processes();
+    let roots: Vec<String> = store.projects().into_iter().flat_map(|p| p.roots).collect();
+    let cwd_of = |pids: &[u32]| crate::host::Host::cwds(&crate::host::LOCAL, Some(pids)).map(|o| parse_cwds(&o)).unwrap_or_default();
+    burners_line(&procs, &cwd_of, &roots)
+}
+
+/// The state file the daemon's tick writes [`burners_now`] into: its epoch
+/// second, then the line (empty for none). `wsp wip` reads it here rather
+/// than reading the process table itself, because under the manager `wip`
+/// runs no `ps` (wsp-030, `docs/agent-manager.md` 4.3; wsp-716).
+const BURNERS_FILE: &str = "burners";
+
+/// How often the tick reads the process table for burners: they are named
+/// only past [`BURNER_AGE`], so a minute late is no burner missed.
+const BURNERS_EVERY: i64 = 60;
+
+/// How old a stamped burner line may be and still be said: past this the
+/// daemon is not ticking (which `wip` says on its own), and a pid named from
+/// that long ago may be gone.
+const BURNERS_FRESH: i64 = 5 * 60;
+
+/// `<at>\n<line>` out of [`BURNERS_FILE`].
+fn parse_burners(text: &str) -> Option<(i64, String)> {
+    let (at, line) = text.split_once('\n')?;
+    Some((at.trim().parse().ok()?, line.trim().to_string()))
+}
+
+/// On the daemon's tick: [`burners_now`] into [`BURNERS_FILE`], at most once
+/// per [`BURNERS_EVERY`]. Best effort, as the tick stamp is.
+pub(crate) fn stamp_burners(store: &Store, now: i64) {
+    let path = store.state_file(BURNERS_FILE);
+    let last = std::fs::read_to_string(&path).ok().and_then(|t| parse_burners(&t));
+    if last.is_some_and(|(at, _)| (0..BURNERS_EVERY).contains(&(now - at))) {
+        return;
+    }
+    let line = burners_now(store).unwrap_or_default();
+    let _ = std::fs::write(&path, format!("{now}\n{line}\n"));
+}
+
+/// The burners line the daemon last stamped, for `wsp wip`'s load warning:
+/// none where nothing was stamped, the stamp names none, or it is older than
+/// [`BURNERS_FRESH`]. Reads one file and runs nothing.
+pub(crate) fn burners_stamped(store: &Store, now: i64) -> Option<String> {
+    let (at, line) = parse_burners(&std::fs::read_to_string(store.state_file(BURNERS_FILE)).ok()?)?;
+    (now - at <= BURNERS_FRESH && !line.is_empty()).then_some(line)
+}
 
 /// `wsp reap --list`: what this host's manager runs, its seats and its jobs,
 /// read from the manager (wsp-057, the person's (b) on wsp-042). wsp finds no
@@ -589,13 +785,48 @@ pub(crate) fn seat_spawn_args(kind: &str, member_row: Option<&str>, verifying: b
     vec!["--settings".into(), path.display().to_string()]
 }
 
-/// What a spawn adds for a retro seat: the settings pair when the row is
-/// tagged `retro` and the seat is not its verifier, nothing otherwise.
+/// What a spawn adds for a seat that is no member: a retro seat's settings
+/// when the row is tagged `retro` and the seat is not its verifier, and for any
+/// other Claude seat (a verifier, a check's or a leg's seat) the guard settings,
+/// so that every seat runs the Bash kill guard (wsp-691).
 pub(crate) fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
     match retro_wanted(verifying, row_tags) {
         true => retro_settings_args(kind, state),
-        false => Vec::new(),
+        false => guard_settings_args(kind, state),
     }
+}
+
+/// The settings of a seat with no role file of its own (wsp-691): the hooks
+/// every role file holds, which is the PreToolUse kill guard, and nothing else.
+/// On 2026-11-19 a verifier, which was started with no `--settings` at all, ran
+/// the `pkill -f "scripts/check.mjs" -P 0` that ended every session.
+pub(crate) fn guard_settings() -> String {
+    let member: Value = serde_json::from_str(MEMBER_SETTINGS).unwrap_or_else(|_| json!({}));
+    let v = json!({
+        "_comment": "Written by wsp under its state and passed with --settings to a Claude seat that has no role file of its own: a verifier, a check's seat, a leg's (wsp-691). It holds only the hooks every role file holds, the Bash kill guard.",
+        "hooks": member.get("hooks").cloned().unwrap_or_else(|| json!({})),
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+}
+
+/// The argument pair for the guard settings, written under `state` when it is
+/// missing or differs; nothing for an agent that is not Claude, or when the
+/// file cannot be written.
+pub(crate) fn guard_settings_args(kind: &str, state: &std::path::Path) -> Vec<String> {
+    if kind != "claude" {
+        return Vec::new();
+    }
+    let path = state.join("claude-code").join(GUARD_FILE);
+    let body = guard_settings();
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, &body).is_err() {
+            return Vec::new();
+        }
+    }
+    vec!["--settings".into(), path.display().to_string()]
 }
 
 pub const VERBS: &[crate::verbs::Verb] = &[
@@ -631,6 +862,65 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 mod tests {
     use super::*;
 
+    #[test]
+    fn burners_are_named_only_when_in_no_tree() {
+        let orphan = |pid, age, cpu, ppid, cmd: &str| Proc { pid, ppid, age, cpu, cputime: 9, command: cmd.into() };
+        let procs = vec![
+            orphan(10, 700, 90.0, 1, "/usr/bin/yes"),
+            orphan(11, 700, 90.0, 1, "yes"),
+            orphan(12, 700, 90.0, 1, "/usr/local/bin/stress --cpu 4"),
+            orphan(13, 700, 90.0, 1, "/bin/zsh -c while :; do :; done"),
+            orphan(14, 300, 90.0, 1, "yes"),
+            orphan(15, 700, 90.0, 400, "yes"),
+            orphan(16, 700, 2.0, 1, "yes"),
+            orphan(17, 700, 90.0, 1, "/usr/bin/yes"),
+            orphan(18, 700, 90.0, 1, "sleep 100"),
+        ];
+        let cwds: BTreeMap<u32, String> = [
+            (10, "/Users/e/scratch"),
+            (11, "/Users/e/claude/wsp/.worktrees/wsp-693"),
+            (12, "/tmp/x"),
+            (13, "/Users/e/claude/wsp"),
+            (14, "/tmp"),
+            (15, "/tmp"),
+            (16, "/tmp"),
+        ]
+        .into_iter()
+        .map(|(p, c)| (p, c.to_string()))
+        .collect();
+        let read = std::cell::RefCell::new(Vec::new());
+        let cwd_of = |pids: &[u32]| {
+            read.borrow_mut().extend_from_slice(pids);
+            cwds.clone()
+        };
+        let line = burners_line(&procs, &cwd_of, &["/Users/e/claude/wsp".to_string()]).unwrap();
+        assert!(line.starts_with("2 CPU burners in no tree"), "{line}");
+        assert!(line.contains("10 /usr/bin/yes") && line.contains("12 /usr/local/bin/stress"), "{line}");
+        assert!(!line.contains("11 yes") && !line.contains("13 ") && !line.contains("17 "), "{line}");
+        // only the candidates were looked up, and none is named without a cwd
+        assert_eq!(*read.borrow(), vec![10, 11, 12, 13, 17]);
+        assert!(burners_line(&procs[..1], &|_| BTreeMap::new(), &[]).is_none());
+        assert!(burners_line(&procs[4..], &cwd_of, &[]).is_none());
+    }
+
+    #[test]
+    fn wip_reads_the_burners_the_tick_stamped_and_runs_nothing() {
+        let env = crate::util::isolated("role-burners-stamped");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let now = 1_000_000;
+        assert_eq!(burners_stamped(&store, now), None, "nothing stamped is nothing said");
+        let line = "1 CPU burner in no tree, orphaned for over 10 minutes: 10 /usr/bin/yes";
+        std::fs::write(store.state_file(BURNERS_FILE), format!("{now}\n{line}\n")).unwrap();
+        assert_eq!(burners_stamped(&store, now + 20).as_deref(), Some(line));
+        assert_eq!(burners_stamped(&store, now + BURNERS_FRESH + 1), None, "a stamp the daemon left long ago is not said");
+        // Within the interval the tick reads no process table: the stamp stands.
+        stamp_burners(&store, now + BURNERS_EVERY - 1);
+        assert_eq!(burners_stamped(&store, now + BURNERS_EVERY - 1).as_deref(), Some(line));
+        std::fs::write(store.state_file(BURNERS_FILE), format!("{now}\n\n")).unwrap();
+        assert_eq!(burners_stamped(&store, now), None, "a stamp naming none says none");
+        assert_eq!(parse_burners("garbage"), None);
+    }
     #[test]
     fn the_stale_done_deny_comes_out_and_nothing_else_does() {
         let old = "{\n  \"model\": \"x\",\n  \"permissions\": {\n    \"allow\": [\"Bash(ls:*)\"],\n    \"deny\": [\n      \"Bash(git push:*)\",\n      \"Bash(wsp done:*)\",\n      \"Bash(rm -rf:*)\"\n    ]\n  },\n  \"zed\": 1\n}\n";
@@ -755,8 +1045,9 @@ mod tests {
         assert!(!retro_wanted(false, &[]));
         let state = std::env::temp_dir().join(format!("wsp-retro-args-{}", std::process::id()));
         assert!(retro_spawn_args("opencode", false, &retro, &state).is_empty());
-        assert!(retro_spawn_args("claude", true, &retro, &state).is_empty());
-        assert!(retro_spawn_args("claude", false, &["wsp".to_string()], &state).is_empty());
+        assert_eq!(retro_spawn_args("claude", true, &retro, &state), guard_settings_args("claude", &state), "its verifier gets the guard");
+        assert_eq!(retro_spawn_args("claude", false, &["wsp".to_string()], &state), guard_settings_args("claude", &state));
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -798,11 +1089,48 @@ mod tests {
         let args = seat_spawn_args("claude", Some("wsp-9"), false, &[], &state);
         assert_eq!(args, ["--settings".to_string(), member_settings_path(&state, "wsp-9").display().to_string()]);
         assert_eq!(std::fs::read_to_string(member_settings_path(&state, "wsp-9")).unwrap(), member_settings("wsp-9", false));
-        assert!(seat_spawn_args("claude", Some("wsp-9"), true, &[], &state).is_empty(), "a verifier is no member");
-        assert!(seat_spawn_args("claude", None, false, &[], &state).is_empty(), "no member row, no file");
+        let guard = guard_settings_args("claude", &state);
+        assert_eq!(seat_spawn_args("claude", Some("wsp-9"), true, &[], &state), guard, "a verifier is no member: the guard alone");
+        assert_eq!(seat_spawn_args("claude", None, false, &[], &state), guard, "no member row: the guard alone");
         assert!(seat_spawn_args("opencode", Some("wsp-9"), false, &[], &state).is_empty());
         let retro = vec!["retro".to_string()];
         assert_eq!(seat_spawn_args("claude", None, false, &retro, &state), retro_settings_args("claude", &state), "a retro seat as before");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// wsp-691: every seat's settings run the Bash kill guard, and the guard
+    /// itself refuses the 11-19 command (claude-code/test-kill-guard.sh).
+    #[test]
+    fn every_seats_settings_run_the_kill_guard_on_bash() {
+        let guard_of = |s: &str| -> String {
+            let v: Value = serde_json::from_str(s).unwrap();
+            let e = &v["hooks"]["PreToolUse"][0];
+            assert_eq!(e["matcher"], "Bash", "{s}");
+            e["hooks"][0]["command"].as_str().unwrap().to_string()
+        };
+        let snippet = include_str!("../claude-code/settings.snippet.json");
+        let want = guard_of(snippet);
+        assert!(want.contains("wsp-session.sh") && want.ends_with("PreToolUse"), "{want}");
+        for body in [PRIMARY_SETTINGS, GOVERNOR_SETTINGS, RETRO_SETTINGS, MEMBER_SETTINGS] {
+            assert_eq!(guard_of(body), want);
+        }
+        assert_eq!(guard_of(&member_settings("wsp-9", true)), want);
+        assert_eq!(guard_of(&guard_settings()), want);
+        let state = std::env::temp_dir().join(format!("wsp-guard-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = guard_settings_args("claude", &state);
+        assert_eq!(args[0], "--settings");
+        assert_eq!(std::fs::read_to_string(&args[1]).unwrap(), guard_settings());
+        assert!(guard_settings_args("opencode", &state).is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_kill_guard_shell_tests_pass() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let out = std::process::Command::new("sh").arg(format!("{dir}/claude-code/test-kill-guard.sh")).output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("cases pass"), "{said}");
     }
 }

@@ -969,6 +969,9 @@ impl Host for Tcp {
     fn signal_group(&self, group: u32, sig: &str) {
         self.local.signal_group(group, sig)
     }
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        self.local.cwds(pids)
+    }
 
     // ---- seat.read
     fn read_screen(&self, render: &Path) -> Result<String> {

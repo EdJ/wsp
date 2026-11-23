@@ -487,6 +487,7 @@ mod tests {
         fn lease(&self, _: &LeaseName) -> Result<Option<Lease>> { never!() }
         fn machine(&self, _: &MachineName) -> Result<Option<Machine>> { never!() }
         fn snapshot(&self) -> Result<(State, EventId)> { never!() }
+        fn wip_snapshot(&self) -> Result<(State, EventId)> { never!() }
     }
     impl Events for NoStore {
         fn events_after(&self, _: EventId, _: usize) -> Result<Vec<Event>> { never!() }

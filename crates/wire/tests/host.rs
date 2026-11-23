@@ -424,6 +424,9 @@ impl Host for Counting<'_> {
     fn signal_group(&self, group: u32, sig: &str) {
         self.inner.signal_group(group, sig)
     }
+    fn cwds(&self, pids: Option<&[u32]>) -> Option<String> {
+        self.inner.cwds(pids)
+    }
     fn answers(&self, socket: &Path) -> bool {
         self.inner.answers(socket)
     }

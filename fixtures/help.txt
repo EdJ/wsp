@@ -2,6 +2,20 @@
 PROJECTS
   wsp init                          create the store at ~/wsp
   wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…
+  wsp product add <slug> [--name N] [--brief …] | ls | show <slug>  a grouping of
+                                    projects (move one in: wsp project set <p> parent=<product>)
+  wsp initiative add "title" --product P [-p proj]… | ls [--product P] | show <id>
+                                    | edit <id> --brief|--requirements|… [--from F|-]
+                                    | set <id> k=v… | link <id> --list L|--task T [--clear]
+                                    | criterion add|edit|rm <id> …  | assume add|edit|accept|rm <id> …
+                                    | increment add <id> ["caption"] [--criteria C1,C2] [--list L]…
+                                    | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
+                                    | plan show <id> [--json]  increments → lists → groups → rows
+                                    | approve <id> "verdict"  | changes <id> "what to change"
+                                    | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
+                                    planner (opus) on the order in docs/initiative-plan.md
+                                    | brief <id>  a record below a product: artefacts and
+                                    decisions (wsp decide init-N "…"), ids init-N
   wsp project ls|projects [--tag T] list projects
   wsp tree                          hierarchy with open counts
   wsp project show <id> [--decisions] [--handbook]  brief, tags, roots, tasks
@@ -542,7 +556,8 @@ WORKLISTS
                                     --caption "…" is its line for a glance;
                                     -p <project> is where it stands, whose
                                     governor its seat answers to — unsaid,
-                                    the project its members share
+                                    the project its members share;
+                                    --initiative init-N links it as it's made
   wsp worklist add <slug> <task>…   one call, one group; its members run at
                                     the same time. --group N joins a group
                                     that exists instead of making one;
@@ -823,6 +838,14 @@ PLUMBING
                                     description, preview?}]}], plan?, tool?,
                                     command?}); the text may be left out, and a
                                     surface that ignores choices still reads it
+  wsp ask <id> --person --set F|-   a set of 2-30 questions, one ask (F: JSON
+                                    {title, intro?, questions:[{header, question,
+                                    multi, options (2-4), recommended?, why?}]});
+                                    `wsp answer <mid> --question H|N --choice L
+                                    [--other W] [--note W]` saves one (a decision
+                                    on the row each), `--finish ["words"]` ends it
+                                    with some left; the asker is told once, at the
+                                    end; `wsp ask <mid>` reads it so far
   wsp answer <mid> --choice 'Q=Label' [--choice …] [--other 'Q=words']
                                     answer one that has options: a label or an
                                     Other, refused with the options named

@@ -136,6 +136,10 @@ pub(crate) struct Tcp {
     stream: TcpStream,
     /// Bytes read past the last whole line.
     partial: Vec<u8>,
+    /// How much of `partial` is known to hold no newline: each read searches
+    /// only what it added, so a reply of n bytes costs n, not n²/8 KiB
+    /// (wsp-692: a 16 MiB `state` spent 14 CPU-s rescanning its own head).
+    scanned: usize,
 }
 
 fn io(e: std::io::Error) -> ConnError {
@@ -154,7 +158,7 @@ impl Tcp {
         let stream = TcpStream::connect_timeout(&addr, timeout).map_err(io)?;
         stream.set_nodelay(true).map_err(io)?;
         stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(io)?;
-        Ok(Tcp { stream, partial: Vec::new() })
+        Ok(Tcp { stream, partial: Vec::new(), scanned: 0 })
     }
 
     pub(crate) fn shutdown(&self) {
@@ -173,10 +177,12 @@ impl Connection for Tcp {
         let deadline = Instant::now() + wait;
         let mut chunk = [0u8; 8192];
         loop {
-            if let Some(at) = self.partial.iter().position(|b| *b == b'\n') {
+            if let Some(at) = self.partial[self.scanned..].iter().position(|b| *b == b'\n').map(|i| self.scanned + i) {
+                self.scanned = 0;
                 let line: Vec<u8> = self.partial.drain(..=at).collect();
                 return serde_json::from_slice(&line[..at]).map(Some).map_err(|e| ConnError::Malformed(e.to_string()));
             }
+            self.scanned = self.partial.len();
             if self.partial.len() > MAX_LINE {
                 return Err(ConnError::Io(format!("a line longer than {MAX_LINE} bytes")));
             }
@@ -193,5 +199,59 @@ impl Connection for Tcp {
                 Err(e) => return Err(io(e)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use wsp_api::{Code, Failure, Outcome, Reply, ReqId};
+
+    fn reply(id: u64, text: String) -> Frame {
+        Frame::Reply(Reply {
+            id: ReqId(id),
+            outcome: Outcome::Err(Failure { code: Code::Stale, text, refusal: None }),
+            events: Vec::new(),
+        })
+    }
+
+    fn line(f: &Frame) -> Vec<u8> {
+        let mut l = serde_json::to_vec(f).unwrap();
+        l.push(b'\n');
+        l
+    }
+
+    fn text(f: Frame) -> (u64, String) {
+        match f {
+            Frame::Reply(Reply { id, outcome: Outcome::Err(e), .. }) => (id.0, e.text),
+            other => panic!("not the reply sent: {other:?}"),
+        }
+    }
+
+    /// A frame that arrives in many reads, then two that arrive in one, come
+    /// out whole and in order: the search that resumes where the last read
+    /// ended (wsp-692) starts over at each line it hands back.
+    #[test]
+    fn a_line_read_in_pieces_and_two_in_one_read_come_out_whole() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let long = "x".repeat(300_000);
+        let (a, b, c) = (reply(1, long.clone()), reply(2, "two".into()), reply(3, "three".into()));
+        let (first, rest) = (line(&a), [line(&b), line(&c)].concat());
+        let writer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            for piece in first.chunks(1000) {
+                s.write_all(piece).unwrap();
+                s.flush().unwrap();
+            }
+            s.write_all(&rest).unwrap();
+        });
+        let mut conn = Tcp::dial(addr, Duration::from_secs(5)).unwrap();
+        let wait = Duration::from_secs(10);
+        assert_eq!(text(conn.recv(wait).unwrap().unwrap()), (1, long));
+        assert_eq!(text(conn.recv(wait).unwrap().unwrap()), (2, "two".into()));
+        assert_eq!(text(conn.recv(wait).unwrap().unwrap()), (3, "three".into()));
+        writer.join().unwrap();
     }
 }

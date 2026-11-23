@@ -271,7 +271,14 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         return 2;
     };
     match done(store, args, task, pane) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // `wsp-691`: what the leg left running in the row's tree goes with
+            // it, all but this seat's agent and the chain this runs on.
+            if let Some(t) = store.find_task(task) {
+                crate::ending::stop_in_tree(store, &t.id, true, &format!("{} leg done", t.id));
+            }
+            0
+        }
         Err(why) => {
             let why = why.trim_start_matches("wsp: ").to_string();
             crate::store::log_line(

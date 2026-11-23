@@ -424,7 +424,10 @@ itself.
 ### 4.3 Subscribe (v1, deliberately small)
 
 - One connection. `subscribe { from: N }` streams every event with id > N in commit order, then follows the head.
-- `subscribe {}` (N absent) sends `{ "state": <snapshot>, "at": M }` first, then events from M.
+- `subscribe {}` (N absent) sends `{ "state": <snapshot>, "at": M }` first, then events from M. A snapshot too
+  large for one line (16 MiB) comes as pieces of about 4 MiB, each `{ "part": <some of it>, "at": M }`, with
+  `state` holding the rest. The pieces are disjoint, and taken in order they are the snapshot. A snapshot that
+  fits in one line is still one `state`, so an older client reads it as before (wsp-702).
 - On a reconnect or a gap the client asks again `from` its last id. If the server answers `too_old` (retention,
   Q7) the client takes `state` afresh. Ids are the de-duplication key, so delivery is at-least-once and the client
   drops an id it has seen.
