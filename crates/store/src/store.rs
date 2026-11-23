@@ -3009,6 +3009,31 @@ impl Store {
         record_expires(self.claims().get(task)?)
     }
 
+    /// Move the claim on `task`'s `expires` forward to `until` (epoch seconds)
+    /// and say whether the file was written (`wsp-410`). Never back: an
+    /// `until` that is not later than the record's own leaves the file alone,
+    /// and so does a record with no `expires` — one from before `wsp-409`, or
+    /// written under `WSP_CLAIM_TTL=off` — which never expires and is not given
+    /// an expiry by being renewed. A task nobody holds is not a claim to renew.
+    pub fn renew_claim(&self, task: &str, until: i64) -> bool {
+        match self.claim_expires(task) {
+            Some(at) if until > at => {}
+            _ => return false,
+        }
+        let mut moved = false;
+        self.update_json("claims.json", |c| {
+            let Some(rec) = c.get_mut(task) else { return };
+            // Read again under the lock: the file may have moved since the look above.
+            if record_expires(rec).is_some_and(|at| until > at) {
+                if let Some(o) = rec.as_object_mut() {
+                    o.insert("expires".into(), json!(util::iso_at(until)));
+                    moved = true;
+                }
+            }
+        });
+        moved
+    }
+
     pub fn clear_claim(&self, task: &str) -> bool {
         let mut removed = false;
         self.update_json("claims.json", |c| removed = c.remove(task).is_some());
@@ -4161,6 +4186,28 @@ mod tests {
         store.set_claim("t-3", json!({ "workspace": "w" }));
         assert_eq!(store.claim_expires("t-3"), None, "an old record never expires");
         assert_eq!(store.claim_expires("nobody"), None);
+    }
+
+    /// `wsp-410`: renewing moves `expires` forward and never back, and leaves a
+    /// record with no `expires`, and a task nobody holds, alone.
+    #[test]
+    fn renewing_a_claim_moves_its_expiry_forward_and_never_back() {
+        let d = lock_dir("claim-renew");
+        let store = Store::at(d.join("root"), d.join("state"));
+        let at = util::epoch_of("2026-11-23T10:00:00Z");
+        store.set_claim("t-1", json!({ "workspace": "w", "expires": util::iso_at(at) }));
+        store.set_claim("t-2", json!({ "workspace": "w" }));
+
+        assert!(store.renew_claim("t-1", at + 3600));
+        assert_eq!(store.claim_expires("t-1"), Some(at + 3600));
+        assert!(!store.renew_claim("t-1", at + 60), "never back");
+        assert!(!store.renew_claim("t-1", at + 3600), "not to the same instant either");
+        assert_eq!(store.claim_expires("t-1"), Some(at + 3600));
+
+        assert!(!store.renew_claim("t-2", at + 3600));
+        assert!(store.claims()["t-2"].get("expires").is_none(), "no expiry is not given one");
+        assert!(!store.renew_claim("nobody", at + 3600));
+        assert!(!store.claims().contains_key("nobody"));
     }
 
     /// `wsp-663`: outside a step a busy lock is carried on past; inside one

@@ -838,6 +838,16 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             sample_seat_memory(store, now);
         }
 
+        // A claim whose seat is alive is renewed, so a holder that is still
+        // working never reaches its expiry (wsp-410). Every tick, and cheap:
+        // a claim is written about once an hour, and nothing is looked at
+        // unless one is due.
+        wsp_base::calls::phase("claims-renew");
+        let renewed = renew_claims(store, now, || crate::place::local_backends()[0].census().ok());
+        if verbose && renewed > 0 {
+            eprintln!("wsp daemon: renewed {renewed} claim(s)");
+        }
+
         // The CPU burners standing in no tree, for `wsp wip`'s load warning
         // (wsp-691), read here so `wip` itself runs no `ps` (wsp-716).
         wsp_base::calls::phase("burners");
@@ -846,6 +856,67 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         crate::place_compound::tick_deliver_budget(false);
         wsp_base::calls::tick_end();
     }
+}
+
+/// The seat a claim record names, as the census and the seat records call it:
+/// the workspace id, else the workspace, else its label.
+fn claim_seat_id(rec: &serde_json::Value) -> Option<&str> {
+    ["workspace_id", "workspace", "workspace_label"]
+        .iter()
+        .find_map(|k| rec.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))
+}
+
+/// Whether the machine a far seat sits on is one the daemon can see alive: it
+/// is a machine this store knows, not retired, its link answers and the
+/// remote-agents lease is current (`docs/remote-agents.md` section 3).
+fn machine_alive(store: &Store, name: &str) -> bool {
+    let (Some(m), Some(l)) = (store.machine(name), store.machine_live(name)) else { return false };
+    m.is_active() && !crate::far::is_silent(&m, &l)
+}
+
+/// The renewal pass (wsp-410): every claim whose holder seat the daemon can
+/// see alive moves to `now + claim_ttl()` once less than the ttl minus an hour
+/// is left of it, so `claims.json` is written about once an hour per claim and
+/// not every tick. A local seat is alive while the census lists it; a far seat
+/// while its machine is reachable and its lease current. A seat on a machine
+/// that is silent, or one the census no longer lists, is not renewed, and
+/// nothing is released here (wsp-411). Returns how many claims moved.
+///
+/// `census` is asked at most once, and only when a claim is due, so an idle
+/// tick costs one read of `claims.json`. `None` is a census nobody could take:
+/// no local seat is renewed on it, and none is dropped either.
+fn renew_claims(store: &Store, now: i64, census: impl FnOnce() -> Option<crate::place::Census>) -> usize {
+    let Some(ttl) = wsp_store::store::claim_ttl() else { return 0 };
+    // The hour a renewal is held back by, kept to half the ttl for a short one.
+    let margin = ttl.min(3600).min(ttl / 2).max(0);
+    let due: Vec<(String, String)> = store
+        .claims()
+        .iter()
+        .filter(|(task, _)| store.claim_expires(task).is_some_and(|at| at - now < ttl - margin))
+        .filter_map(|(task, rec)| Some((task.clone(), claim_seat_id(rec)?.to_string())))
+        .collect();
+    if due.is_empty() {
+        return 0;
+    }
+    let mut census = Some(census);
+    let mut seen: Option<Vec<String>> = None;
+    let mut renewed = 0;
+    for (task, seat) in due {
+        let machine = crate::place_compound::seat_machine(store, &seat);
+        let alive = match machine.is_empty() {
+            true => {
+                if let Some(ask) = census.take() {
+                    seen = ask().map(|c| c.seats().map(|s| s.seat.as_str().to_string()).collect());
+                }
+                seen.as_ref().is_some_and(|seats| seats.contains(&seat))
+            }
+            false => machine_alive(store, &machine),
+        };
+        if alive && store.renew_claim(&task, now + ttl) {
+            renewed += 1;
+        }
+    }
+    renewed
 }
 
 /// One sample of every seated agent's resident memory into
@@ -926,6 +997,82 @@ mod tests {
         assert!(!nothing_answered(&[true, true]));
         assert!(nothing_answered(&[false, false]), "nothing answering was let through");
         assert!(nothing_answered(&[]), "an empty backend list answered for nobody");
+    }
+
+    /// wsp-410: the renewal pass, against a fake census and two machines. A
+    /// local seat the census lists and a far seat on a machine that answers move
+    /// forward; a far seat on a machine that is silent and a seat the census no
+    /// longer lists do not — and ten ticks write `claims.json` once per claim.
+    #[test]
+    fn the_renewal_pass_moves_the_claims_of_live_seats_and_only_those_once() {
+        use crate::place::{Agent, Census, Seat, Seated, State};
+        use wsp_store::model::Machine;
+        use wsp_store::store::MachineLive;
+
+        let _env = crate::util::isolated("claim-renew");
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let store = Store::open();
+        let now = crate::util::epoch_secs();
+        let ttl = wsp_store::store::claim_ttl().expect("a default ttl");
+
+        // Two machines: mb2 answers and its lease is current; mb3 does not.
+        for name in ["mb2", "mb3"] {
+            store.save_machine(&Machine::new(name, name)).unwrap();
+        }
+        let iso = |s: i64| crate::util::iso_at(s);
+        store.set_machine_live("mb2", &MachineLive { reachable: true, last_seen: iso(now), heard: iso(now - 10), ..Default::default() });
+        store.set_machine_live("mb3", &MachineLive { reachable: false, last_seen: iso(now - 900), heard: iso(now - 900), ..Default::default() });
+
+        // Seats: a far one on each machine; the local ones have no record.
+        for (seat, machine) in [("cpd-far-up", "mb2"), ("cpd-far-down", "mb3")] {
+            let dir = store.state.join("compound-seats").join(seat);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("seat.json"), serde_json::json!({ "machine": machine }).to_string()).unwrap();
+        }
+        // Every claim is an hour from its end: due, in a week-long lease.
+        let about_to_end = now + 3600;
+        for (task, seat) in [("t-local", "cpd-here"), ("t-far-up", "cpd-far-up"), ("t-far-down", "cpd-far-down"), ("t-gone", "cpd-gone")] {
+            store.set_claim(task, serde_json::json!({ "workspace_id": seat, "expires": iso(about_to_end) }));
+        }
+        store.set_claim("t-old", serde_json::json!({ "workspace_id": "cpd-here" }));
+
+        let census = || {
+            let seat = Seated {
+                seat: Seat::new("cpd-here"),
+                label: String::new(),
+                cwd: String::new(),
+                agent: Agent::default(),
+                state: State::Idle,
+                session: String::new(),
+            };
+            Some(Census::heard("", vec![seat]))
+        };
+        let expires = |t: &str| store.claim_expires(t).unwrap();
+
+        assert_eq!(renew_claims(&store, now, census), 2);
+        for t in ["t-local", "t-far-up"] {
+            assert_eq!(expires(t), now + ttl, "{t} moves to now plus the ttl");
+        }
+        for t in ["t-far-down", "t-gone"] {
+            assert_eq!(expires(t), about_to_end, "{t} is not renewed");
+        }
+        assert_eq!(store.claim_expires("t-old"), None, "a record with no expiry stays without one");
+
+        // Nine more ticks: the two renewed claims are not due again, and the
+        // two that were not renewed change nothing, so nothing is written.
+        let file = store.state_file("claims.json");
+        let stamp = || std::fs::metadata(&file).unwrap().modified().unwrap();
+        let written = stamp();
+        for _ in 0..9 {
+            assert_eq!(renew_claims(&store, now + 30, census), 0);
+        }
+        assert_eq!(stamp(), written, "claims.json was not rewritten");
+        assert_eq!(expires("t-local"), now + ttl);
+
+        // A census nobody could take renews no local seat, and drops nothing.
+        store.set_claim("t-local", serde_json::json!({ "workspace_id": "cpd-here", "expires": iso(about_to_end) }));
+        assert_eq!(renew_claims(&store, now, || None), 0, "the far seat was renewed above, the local one cannot be seen");
+        assert_eq!(expires("t-local"), about_to_end);
     }
 
     /// The marker a crash leaves behind must never be the reason a machine has

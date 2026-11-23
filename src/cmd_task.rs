@@ -903,6 +903,9 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     if let Some(c) = store.claims().get(&t.id) {
         println!("{} {}", p.dim(&util::pad("claimed", 9)), claim_line(c));
+        if let Some(line) = claim_expires_line(c, util::epoch_secs()) {
+            println!("{}", p.dim(&line));
+        }
     } else if let Some(w) = store.worked().get(&t.id) {
         // The last agent on it, once there is no current one — the trace a
         // migration leaves, so a task never loses every sign it was worked.
@@ -3980,6 +3983,18 @@ fn outstanding_for(store: &Store, task: &str) -> Vec<String> {
     crate::cmd_checkout::outstanding(store, task, by_a_run, ready)
 }
 
+/// `claim expires <when>`, under the claim line (wsp-410): the record's own
+/// `expires` and how far off it is. `None` for a claim with none, which never
+/// expires and says nothing.
+fn claim_expires_line(claim: &serde_json::Value, now: i64) -> Option<String> {
+    let at = wsp_store::store::record_expires(claim)?;
+    let when = util::iso_at(at);
+    Some(match at - now {
+        left if left > 0 => format!("claim expires {when} (in {})", util::duration_human(left)),
+        left => format!("claim expires {when} (lapsed {} ago)", util::duration_human(-left)),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3999,6 +4014,19 @@ pub(crate) mod tests {
         t.set_status(Status::Review);
         t.log(claim);
         crate::log::note(store, &mut t, "released after 28m · ran sonnet-5-5/high · 93 turns").unwrap();
+    }
+
+    /// wsp-410: `wsp show` says when a claim expires, and says nothing for one
+    /// that never does.
+    #[test]
+    fn show_says_when_a_claim_expires() {
+        let now = util::epoch_of("2026-11-23T10:00:00Z");
+        let c = serde_json::json!({ "expires": "2026-11-30T10:00:00Z" });
+        let said = claim_expires_line(&c, now).unwrap();
+        assert!(said.starts_with("claim expires 2026-11-30T10:00:00Z (in "), "{said}");
+        let late = claim_expires_line(&c, now + 8 * 86_400).unwrap();
+        assert!(late.contains("lapsed"), "{late}");
+        assert_eq!(claim_expires_line(&serde_json::json!({ "workspace": "w" }), now), None);
     }
 
     fn scratch(tag: &str) -> Store {
