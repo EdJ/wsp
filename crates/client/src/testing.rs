@@ -33,6 +33,8 @@ pub struct MemHub {
     refs: BTreeMap<WorkspaceId, Refs>,
     writes: u64,
     moves: u64,
+    /// Per project, the last id number `ids.alloc` handed out.
+    ids: BTreeMap<String, u64>,
 }
 
 impl MemHub {
@@ -57,6 +59,18 @@ impl MemHub {
                     .collect(),
             )),
             SyncCall::Move(mv) => Outcome::Ok(Answer::Move(self.move_ref(mv))),
+            SyncCall::Alloc(ask) => match ask.invalid() {
+                Some(text) => Outcome::Err(Failure { code: Code::Invalid, text, refusal: None }),
+                None => {
+                    let last = self.ids.entry(ask.project.clone()).or_insert(0);
+                    let first = (*last).max(ask.past.unwrap_or(0)) + 1;
+                    let ids = (first..first + u64::from(ask.n)).map(|n| wsp_api::row_id(&ask.project, n)).collect();
+                    if ask.n > 0 {
+                        *last = first + u64::from(ask.n) - 1;
+                    }
+                    Outcome::Ok(Answer::Ids(ids))
+                }
+            },
         }
     }
 

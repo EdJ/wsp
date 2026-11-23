@@ -3,7 +3,7 @@
 //! exception for content: an admin who is no member of a workspace reads none
 //! of it.
 //!
-//! - `sync.heads` and `refs.move` name a workspace; one the caller is no member
+//! - `sync.heads`, `refs.move` and `ids.alloc` name a workspace; one the caller is no member
 //!   of (or that is no shared workspace at all) is `forbidden`.
 //! - `sync.put` names none, so each object is held to the workspace it names (also
 //!   one of a kind this build cannot read), which the caller must be a member of; a caller who is a member
@@ -128,6 +128,10 @@ impl Hub {
             SyncCall::Move(mv) => {
                 self.member_of(by, scope, &mv.workspace)?;
                 Ok(SyncCall::Move(mv))
+            }
+            SyncCall::Alloc(ask) => {
+                self.member_of(by, scope, &ask.workspace)?;
+                Ok(SyncCall::Alloc(ask))
             }
             SyncCall::Put { objects } => {
                 if scope.is_empty() {

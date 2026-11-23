@@ -47,7 +47,7 @@ pub mod sync;
 #[cfg(any(test, feature = "test-support"))]
 pub use conn::{pair, Memory};
 pub use conn::{ConnError, Connection, MAX_LINE};
-pub use sync::{Blob, Move, ObjectId, RefMove, Refs, SyncCall, WorkspaceId, SYNC_VERBS};
+pub use sync::{row_id, Blob, IdsAlloc, Move, ObjectId, RefMove, Refs, SyncCall, WorkspaceId, MAX_IDS, SYNC_VERBS};
 
 pub use wsp_store_contract::{
     Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListFilter,
@@ -477,6 +477,8 @@ pub enum Answer {
     Objects(Vec<Blob>),
     /// `refs.move`: moved, or stale with the head there is.
     Move(Move),
+    /// `ids.alloc`: the ids handed out, in increasing order.
+    Ids(Vec<String>),
 }
 
 /// What `err` carries: `{ code, text }` (4.1), and the contract's refusal

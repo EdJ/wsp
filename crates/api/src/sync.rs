@@ -21,8 +21,18 @@
 //!   request was understood and the writer has a reconcile to do (wsp-176),
 //!   with the head to do it from.
 //!
+//! - `ids.alloc { workspace, project, n, past? }` answers [`Answer::Ids`]
+//!   (wsp-185): `n` row ids for `project`, from the hub's one counter for that
+//!   project, so two spokes that publish at once get disjoint ids. An id is
+//!   never handed out twice; each is above `past` (the caller's highest number
+//!   in the project, so none is one it already uses) and above every id handed
+//!   out before. The caller must be a member of `workspace`, the shared
+//!   workspace it publishes into.
+//!
 //! None of them carries an idempotency key: a put is idempotent by its hash
-//! and a move by its `from`, so a retry after a lost reply is harmless.
+//! and a move by its `from`, so a retry after a lost reply is harmless. An
+//! `ids.alloc` retried after a lost reply allocates again; the ids lost are
+//! gaps, never reused, which is the counter's whole promise.
 //!
 //! Which workspaces a principal may read or write is the hub's (wsp-460), not
 //! the wire's.
@@ -36,7 +46,10 @@ pub use wsp_objects::{ObjectId, Refs, WorkspaceId};
 use crate::Answer;
 
 /// The sync verbs, as [`SyncCall`] names them on the wire.
-pub const SYNC_VERBS: &[&str] = &["sync.heads", "sync.have", "sync.put", "sync.get", "refs.move"];
+pub const SYNC_VERBS: &[&str] = &["sync.heads", "sync.have", "sync.put", "sync.get", "refs.move", "ids.alloc"];
+
+/// The most ids one `ids.alloc` hands out; more is refused `invalid`.
+pub const MAX_IDS: u32 = 1000;
 
 /// A sync verb, tagged by `verb`, with its `args`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +71,9 @@ pub enum SyncCall {
     /// [`Answer::Move`].
     #[serde(rename = "refs.move")]
     Move(RefMove),
+    /// Row ids for a project from the hub's counter. Answered [`Answer::Ids`].
+    #[serde(rename = "ids.alloc")]
+    Alloc(IdsAlloc),
 }
 
 impl SyncCall {
@@ -69,6 +85,7 @@ impl SyncCall {
             SyncCall::Put { .. } => "sync.put",
             SyncCall::Get { .. } => "sync.get",
             SyncCall::Move(_) => "refs.move",
+            SyncCall::Alloc(_) => "ids.alloc",
         }
     }
 }
@@ -91,6 +108,42 @@ pub struct RefMove {
     /// The head the writer saw: none for a subject it saw no head for.
     pub from: Option<ObjectId>,
     pub to: ObjectId,
+}
+
+/// `ids.alloc`'s `args`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdsAlloc {
+    /// The shared workspace the ids are for; the caller must be its member.
+    pub workspace: WorkspaceId,
+    /// The id prefix the rows number under (a project's code: `wsp` for
+    /// `wsp-185`): the counter is this one's.
+    pub project: String,
+    /// How many, at most [`MAX_IDS`].
+    pub n: u32,
+    /// The caller's highest number under `project`: every id handed out is
+    /// above it. Left out, nothing is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub past: Option<u64>,
+}
+
+impl IdsAlloc {
+    /// Why these `args` cannot be answered, or `None` when they can: a
+    /// project that is no id prefix (empty, or a character an id cannot
+    /// hold), or more than [`MAX_IDS`].
+    pub fn invalid(&self) -> Option<String> {
+        if self.project.is_empty() || !self.project.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return Some(format!("{:?} is no project id prefix: letters, digits, - and _ only", self.project));
+        }
+        if self.n > MAX_IDS {
+            return Some(format!("{} ids asked for, and one ids.alloc hands out at most {MAX_IDS}", self.n));
+        }
+        None
+    }
+}
+
+/// The id numbered `n` under `project`, as a store names it (`wsp-007`).
+pub fn row_id(project: &str, n: u64) -> String {
+    format!("{project}-{n:03}")
 }
 
 /// What `refs.move` did.

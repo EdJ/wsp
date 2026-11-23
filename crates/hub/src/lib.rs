@@ -26,6 +26,14 @@
 //! subject in the same workspace also bumps the revision; the loser of that
 //! race reads again and, its own subject's head being still `from`, moves.)
 //!
+//! **Ids** (wsp-185). `ids.alloc` hands out row ids from one counter per
+//! project, kept the way refs are: a revisioned text (row
+//! `hub-ids:<project>`, section `last`) holding the last number handed out,
+//! moved with `set_text` expecting the revision read. Of two allocations at
+//! once one writes and the other is refused `Conflict`, reads the counter
+//! again and allocates past the winner, so the ids two spokes get are
+//! disjoint, and none is ever handed out again.
+//!
 //! [`Hub::answer`] (scope.rs: a caller reads and writes only the shared
 //! workspaces it is a member of, wsp-173) gives each of wsp-459's sync verbs the meaning wsp-client's
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
@@ -44,7 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wsp_api::{
-    Answer, Blob, Code, Failure, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId,
+    Answer, Blob, Code, Failure, IdsAlloc, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId,
 };
 use wsp_machines::Identity;
 use wsp_store_contract::{
@@ -99,6 +107,13 @@ impl Domain for HubDomain {
     fn evolve(&self, state: State, event: &Event) -> State {
         Identity.evolve(state, event)
     }
+}
+
+/// The section of a project's id counter.
+const LAST: &str = "last";
+
+fn ids_row(project: &str) -> RowId {
+    RowId(format!("hub-ids:{project}"))
 }
 
 fn refs_row(workspace: &WorkspaceId) -> RowId {
@@ -252,6 +267,47 @@ impl Hub {
         }
     }
 
+    // Ids.
+
+    /// The last number handed out under `project`, and the revision it was
+    /// read at; 0 for a project never asked for.
+    fn last_id(&self, project: &str) -> Result<(u64, Rev)> {
+        let (body, rev) = self.db.text(&ids_row(project), LAST)?;
+        if body.trim().is_empty() {
+            return Ok((0, rev));
+        }
+        let last = body
+            .trim()
+            .parse()
+            .map_err(|e| backend(format!("the id counter of {project}: {body:?}: {e}")))?;
+        Ok((last, rev))
+    }
+
+    /// `ids.alloc`: `n` ids under `project`, above `past` and above every one
+    /// handed out before, in increasing order. A compare-and-swap on the
+    /// counter; see the crate's documentation. The caller is not checked here
+    /// ([`Hub::answer`] checks it).
+    pub fn alloc_ids(&self, ask: &IdsAlloc) -> Result<Vec<String>> {
+        if let Some(reason) = ask.invalid() {
+            return Err(Error::Refused(Refusal::Invalid { reason }));
+        }
+        if ask.n == 0 {
+            return Ok(Vec::new());
+        }
+        let row = ids_row(&ask.project);
+        loop {
+            let (last, rev) = self.last_id(&ask.project)?;
+            let first = last.max(ask.past.unwrap_or(0)) + 1;
+            let end = first + u64::from(ask.n) - 1;
+            match self.db.set_text(&row, LAST, end.to_string(), rev) {
+                Ok(_) => return Ok((first..=end).map(|n| wsp_api::row_id(&ask.project, n)).collect()),
+                // Another allocation moved the counter since it was read: read again.
+                Err(Error::Refused(Refusal::Conflict { .. })) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     // Leases: wsp-store-sqlite's, with its tokens.
 
     /// The lease table, as wsp-store-sqlite keeps it: `take` issues a token
@@ -282,6 +338,7 @@ impl Hub {
             SyncCall::Put { objects } => self.put(&objects).map(|stored| Answer::Stored { stored }),
             SyncCall::Get { ids } => self.get(&ids).map(Answer::Objects),
             SyncCall::Move(mv) => self.move_ref(&mv).map(Answer::Move),
+            SyncCall::Alloc(ask) => self.alloc_ids(&ask).map(Answer::Ids),
         };
         match answered {
             Ok(answer) => Outcome::Ok(answer),

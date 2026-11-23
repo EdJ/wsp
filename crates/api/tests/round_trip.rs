@@ -282,7 +282,7 @@ fn every_frame_type_round_trips() {
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 18;
 const COMMANDS: usize = 31;
-const SYNCS: usize = 5;
+const SYNCS: usize = 6;
 const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
 
 fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
@@ -292,6 +292,7 @@ fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
         SyncCall::Put { .. } => (2, "sync.put"),
         SyncCall::Get { .. } => (3, "sync.get"),
         SyncCall::Move(_) => (4, "refs.move"),
+        SyncCall::Alloc(_) => (5, "ids.alloc"),
     }
 }
 
@@ -575,7 +576,8 @@ fn requests() -> Vec<Frame> {
             SyncCall::Have { ids: vec![an_id(1), an_id(2)] },
             SyncCall::Put { objects: vec![a_blob()] },
             SyncCall::Get { ids: vec![an_id(1)] },
-            SyncCall::Move(RefMove { workspace, subject: Subject::Row(row_id()), from: None, to: an_id(1) }),
+            SyncCall::Move(RefMove { workspace: workspace.clone(), subject: Subject::Row(row_id()), from: None, to: an_id(1) }),
+            SyncCall::Alloc(IdsAlloc { workspace, project: "wsp".into(), n: 3, past: Some(184) }),
         ]
         .into_iter()
         .map(Call::Sync),
@@ -627,7 +629,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 24;
+const ANSWERS: usize = 25;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -662,6 +664,7 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Objects(_) => (21, "objects"),
         Answer::Move(_) => (22, "move"),
         Answer::Whoami { .. } => (23, "whoami"),
+        Answer::Ids(_) => (24, "ids"),
     }
 }
 
@@ -740,6 +743,7 @@ fn answers() -> Vec<Frame> {
         ok(23, Answer::Move(Move::Stale { head: Some(an_id(1)) }), vec![]),
         ok(24, Answer::Move(Move::Moved { head: an_id(2) }), vec![]),
         ok(25, Answer::Whoami { by: Principal::Person("jesper".into()), server: "core".into() }, vec![]),
+        ok(26, Answer::Ids(vec!["wsp-185".into(), "wsp-186".into()]), vec![]),
     ]
 }
 
@@ -1425,4 +1429,14 @@ fn the_sync_verbs_spelling_is_pinned() {
     // A sync verb whose args do not fit is an unknown call, as any verb's are.
     let line = r#"{"type":"request","v":1,"id":4,"by":"seat:cpd-3698","verb":"sync.have","args":{"ids":["md5:x"]}}"#;
     assert!(matches!(call_of(&decode(line)), Call::Unknown { verb, .. } if verb == "sync.have"));
+    // `ids.alloc` (wsp-185): `past` is left out when there is none, and read so.
+    let ask = IdsAlloc { workspace: WorkspaceId("shared:mp".into()), project: "wsp".into(), n: 3, past: None };
+    let alloc = serde_json::to_value(request(5, Call::Sync(SyncCall::Alloc(ask.clone())))).unwrap();
+    assert_eq!(alloc["verb"], "ids.alloc");
+    assert_eq!(alloc["args"], json!({"workspace": "shared:mp", "project": "wsp", "n": 3}));
+    assert!(matches!(call_of(&decode(&alloc.to_string())), Call::Sync(SyncCall::Alloc(a)) if *a == ask));
+    assert_eq!(
+        serde_json::to_value(ok(6, Answer::Ids(vec!["wsp-185".into()]), vec![])).unwrap()["ok"],
+        json!({"ids": ["wsp-185"]})
+    );
 }

@@ -2,7 +2,8 @@
 //! and why it scales"): [`Client::sync`] syncs one workspace with the hub as
 //! git fetches and pushes, and the five verbs are here one by one for whoever
 //! needs only one ([`Client::sync_heads`], [`Client::sync_have`],
-//! [`Client::sync_put`], [`Client::sync_get`], [`Client::refs_move`]).
+//! [`Client::sync_put`], [`Client::sync_get`], [`Client::refs_move`]), with
+//! [`Client::ids_alloc`], the hub's row ids for a publish (wsp-185).
 //!
 //! The client stores nothing. It reads the spoke's objects through an
 //! [`ObjectSource`] and its heads from the [`Refs`] it is handed, and returns
@@ -12,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
-use wsp_api::{Answer, Blob, Call, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId};
+use wsp_api::{Answer, Blob, Call, IdsAlloc, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId};
 use wsp_store_contract::Subject;
 
 use crate::{orders, Client, Error};
@@ -232,6 +233,17 @@ impl Client {
         match self.sync_call(SyncCall::Move(mv))? {
             Answer::Move(m) => Ok(m),
             other => Err(Error::Unexpected(format!("refs.move was answered {other:?}"))),
+        }
+    }
+
+    /// `ids.alloc`: `n` row ids under `project` from the hub's counter, each
+    /// above `past`, for a publish into `workspace` (which the caller must be
+    /// a member of). In increasing order; never one handed out before.
+    pub fn ids_alloc(&mut self, workspace: &WorkspaceId, project: &str, n: u32, past: Option<u64>) -> Result<Vec<String>, Error> {
+        let ask = IdsAlloc { workspace: workspace.clone(), project: project.to_string(), n, past };
+        match self.sync_call(SyncCall::Alloc(ask))? {
+            Answer::Ids(ids) => Ok(ids),
+            other => Err(Error::Unexpected(format!("ids.alloc was answered {other:?}"))),
         }
     }
 
