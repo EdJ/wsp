@@ -649,7 +649,9 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                     // person was flagged, and each boundary cost two ticks.
                     let part = store.find_task(row).is_some_and(|t| crate::leg_seat::a_parts_seat(store, &t, seat));
                     if !part && !store.claims().contains_key(row) {
-                        store.set_claim(row, json!({ "workspace_id": seat, "host": host, "epoch": s.epoch.0, "claimed_at": util::now_iso() }));
+                        let mut claim = json!({ "workspace_id": seat, "host": host, "epoch": s.epoch.0, "claimed_at": util::now_iso() });
+                        wsp_store::store::stamp_claim_expiry(&mut claim);
+                        store.set_claim(row, claim);
                     }
                 });
             }
@@ -1120,6 +1122,44 @@ mod tests {
         let claims = store.claims();
         assert!(!claims.contains_key("wsp-200") && !claims.contains_key("wsp-202"), "{claims:?}");
         assert_eq!(claims["wsp-201"]["workspace_id"], "cpd-m1", "a member's seat is claimed as before");
+    }
+
+    /// `wsp-477`: the claim a `seat.started` writes for a row holding none
+    /// carries an expiry like `wsp claim`'s: 7 days after `claimed_at` and
+    /// `ttl_s` 604800 by default, neither under `WSP_CLAIM_TTL=off`; a row that
+    /// already holds a claim keeps its record.
+    #[test]
+    fn a_fresh_claim_from_a_seat_start_carries_an_expiry() {
+        let _env = util::isolated("fold-claim-expiry");
+        let store = Store::open();
+        for row in ["wsp-300", "wsp-301", "wsp-302"] {
+            let mut t = crate::model::Task::new(row, row);
+            t.status_raw = "doing".into();
+            store.save_task(&t).unwrap();
+        }
+        let held = json!({ "workspace": "someone", "claimed_at": "2026-11-01T00:00:00Z" });
+        store.set_claim("wsp-302", held.clone());
+        let started = |id: u64, seat: &str, row: &str| Frame {
+            id: Some(EventId(id)),
+            req: None,
+            msg: Message::SeatStarted(SeatStarted { key: Key { row: RowId(row.into()), attempt: 1 }, seat: SeatId(seat.into()), epoch: Epoch(1), pid: 1, sockets: vec![] }),
+        };
+        std::env::remove_var("WSP_CLAIM_TTL");
+        assert!(fold(&store, HOST, &started(1, "cpd-e1", "wsp-300")));
+        std::env::set_var("WSP_CLAIM_TTL", "off");
+        assert!(fold(&store, HOST, &started(2, "cpd-e2", "wsp-301")));
+        assert!(fold(&store, HOST, &started(3, "cpd-e3", "wsp-302")));
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let claims = store.claims();
+        let c = &claims["wsp-300"];
+        assert_eq!(c["workspace_id"], "cpd-e1", "{c}");
+        assert_eq!(c["ttl_s"], 604_800, "{c}");
+        let at = util::epoch_of(c["claimed_at"].as_str().unwrap());
+        assert_eq!(util::epoch_of(c["expires"].as_str().unwrap()), at + 7 * 86_400, "{c}");
+        let off = &claims["wsp-301"];
+        assert_eq!(off["workspace_id"], "cpd-e2", "{off}");
+        assert!(off.get("expires").is_none() && off.get("ttl_s").is_none(), "{off}");
+        assert_eq!(claims["wsp-302"], held, "a held claim is kept as it was");
     }
 
     /// A seat's start makes its entry, a `turn` edge and an `order.acked` date
