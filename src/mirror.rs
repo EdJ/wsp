@@ -268,6 +268,34 @@ pub fn rows(
         .collect()
 }
 
+/// The tasks of each shared workspace, by workspace, ids in order: what the
+/// hub's sync worker projects and pushes (wsp-464). A private task is in none,
+/// so nothing private is ever projected for the hub.
+pub fn by_shared_workspace(tasks: Vec<Task>) -> BTreeMap<wsp_store_contract::WorkspaceId, Vec<Task>> {
+    let mut out: BTreeMap<_, Vec<Task>> = BTreeMap::new();
+    for t in tasks.into_iter().filter(|t| !t.workspace.is_private()) {
+        out.entry(t.workspace.clone()).or_default().push(t);
+    }
+    for ts in out.values_mut() {
+        ts.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    out
+}
+
+/// One shared task as the row the hub is sent: [`rows`] over it alone, with its
+/// file's `text` as the body, so the row is the file and nothing of this
+/// spoke's claims, lists or seats rides along. `None` for a private task.
+pub fn shared_row(t: &Task, text: &str) -> Option<c::Row> {
+    if t.workspace.is_private() {
+        return None;
+    }
+    let texts = BTreeMap::from([(t.id.clone(), text.to_string())]);
+    rows(std::slice::from_ref(t), &BTreeMap::new(), &[], &texts, &BTreeMap::new()).into_iter().find_map(|e| match e {
+        Entity::Row(r) => Some(r),
+        _ => None,
+    })
+}
+
 /// A row's `fields` key holding the task file's text.
 pub const BODY: &str = key::BODY;
 /// A row's `fields` key holding the task's head, on every row: what `wip`

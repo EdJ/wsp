@@ -615,6 +615,9 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // none of it, and nothing here ends the run.
     let _api = start_api(store);
     let _fold = crate::fold::start(store, _api.as_ref().map(|a| a.db.clone()));
+    // Spoke mode (wsp-464): with a login in `~/.config/wsp/hubs.json`, one
+    // thread syncs the shared workspaces with it. Without one, nothing starts.
+    let _sync = crate::hub_sync::start(store);
 
     // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.
