@@ -191,17 +191,30 @@ pub(crate) fn keep_head(store: &Store, cache: &mut Cache, row: &Row, workspace: 
     let mut t = task_of_record(row).ok_or_else(|| format!("{} is not a task", row.id.0))?;
     t.body = String::new();
     let caller = Caller::hub(&user_of(by));
+    // The cache entry goes down before the stub, so a reader that sees the
+    // stub in `ls` finds the entry that says it is a head (`show`, a test).
+    let id = t.id.clone();
+    let before = cache.0.insert(id.clone(), head);
+    let undo = |cache: &mut Cache| {
+        match &before {
+            Some(h) => cache.0.insert(id.clone(), h.clone()),
+            None => cache.0.remove(&id),
+        };
+        let _ = cache.write(store);
+    };
+    cache.write(store).map_err(|e| e.to_string())?;
     let written = match store.task(&t.id) {
         Some(_) => cmd_task::write_task(store, &t, "head", &caller),
         None => cmd_task::file_new(store, &mut t, &caller),
     };
-    written.map_err(|e| e.to_string())?;
+    if let Err(e) = written {
+        undo(cache);
+        return Err(e.to_string());
+    }
     let subject = Subject::Row(RowId(t.id.clone()));
     let mut heads = Heads::read(store);
     heads.set(&subject, to, digest(store, &t.id));
-    heads.write(store).map_err(|e| e.to_string())?;
-    cache.0.insert(t.id, head);
-    cache.write(store).map_err(|e| e.to_string())
+    heads.write(store).map_err(|e| e.to_string())
 }
 
 /// A head becomes the spoke's own: its stub, synced head and cache entry go, so

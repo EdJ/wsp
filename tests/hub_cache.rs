@@ -384,6 +384,35 @@ fn a_row_spoke_a_adds_is_a_head_in_spoke_bs_ls_within_two_turns_and_whole_once_i
 }
 
 #[test]
+fn a_head_only_row_bob_claims_is_whole_on_bobs_next_turn() {
+    let mut rig = Rig::up("c");
+    rig.a.start_daemon();
+    rig.b.start_daemon();
+    rig.b.wait("B's first turn", Duration::from_secs(60), |s| s.turns() >= 1);
+    rig.a.wait("A's first turn", Duration::from_secs(60), |s| s.turns() >= 1);
+
+    let id = rig.a.add("Written on A");
+    rig.a.wait("A's row on the hub", Duration::from_secs(30), |_| rig.hub_head(&id).is_some());
+    rig.b.wait("the row a head in B's cache", Duration::from_secs(30), |s| {
+        s.ls().contains(&id) && std::fs::read_to_string(s.state().join("hub/heads.json")).unwrap_or_default().contains(&id)
+    });
+    let shown = rig.b.ok(&["show", &id]);
+    assert!(shown.contains("head only"), "the row is a head on B before it is leased: {shown}");
+    let cache = std::fs::read_to_string(rig.b.state().join("hub/heads.json")).unwrap_or_default();
+    assert!(cache.contains(&id), "heads.json: {cache}");
+
+    // B leases it: the next turn fetches it whole and drops the cache entry.
+    rig.b.ok(&["claim", &id, "--pane", "w1:p1"]);
+    let now = rig.b.turns();
+    rig.b.wait("B's next turn", Duration::from_secs(30), |s| s.turns() > now);
+    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    let whole = rig.b.ok(&["show", &id]);
+    assert!(whole.contains("Written on A"), "{whole}");
+    let cache = std::fs::read_to_string(rig.b.state().join("hub/heads.json")).unwrap_or_default();
+    assert!(!cache.contains(&id), "heads.json still holds the leased row: {cache}");
+}
+
+#[test]
 fn b_offline_across_a_thousand_changes_reconnects_with_one_heads_diff_not_a_thousand_events() {
     let mut rig = Rig::up("g");
     rig.a.start_daemon();
