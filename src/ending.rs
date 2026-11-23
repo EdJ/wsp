@@ -2803,4 +2803,77 @@ mod tests {
         assert!(said.iter().any(|l| l.starts_with("y-691s submitted: stopped what row y-691s left") && l.contains(&format!("TERM {yes}"))), "{said:?}");
         assert!(log_of(&store, row).contains(&format!("{yes} `")), "the pid and its command, on the row");
     }
+
+    /// `wsp-426`: a `wsp check` run from outside a member's tree (a stand-in,
+    /// a `wsp` script in a directory of the test's own) with its `cargo`
+    /// standing in the tree. The review tick fires while the member's seat
+    /// waits: the check's cargo survives, and an orphaned `yes` in the same
+    /// tree is still stopped.
+    #[test]
+    fn a_wsp_check_run_from_outside_the_tree_keeps_its_cargo_through_the_review_sweep() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let env = util::isolated("ending-426-check");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-426-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": row }));
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // The cargo is a `sleep` under that name, so `ps` names it `cargo` as it
+        // named wsp-307's, a dev tool the sweep stops by name.
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let cargo = bin.join("cargo");
+        std::fs::copy(sleep, &cargo).unwrap();
+        let wsp = script("wsp", "(cd \"$3\" && exec \"$4\" 60) &\nwait");
+        let mut check = wsp_base::calls::Command::new(&wsp)
+            .args(["check", &row, &tree.display().to_string(), &cargo.display().to_string()])
+            .current_dir(&bin)
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // The check's cargo, started in the tree, before the tick.
+        let is_cargo = |p: u32| crate::check_tree::exes().iter().any(|(q, _, exe)| *q == p && exe.ends_with("cargo"));
+        let mut ran = Vec::new();
+        for _ in 0..250 {
+            ran = children_of(check.id());
+            if ran.len() == 1 && is_cargo(ran[0]) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(ran.len() == 1 && is_cargo(ran[0]), "the stand-in check never started its cargo: {ran:?}");
+        let yes = orphaned_yes(&tree);
+        let mut f = Fake::default();
+        f.state.insert("cpd-1".into(), State::Idle);
+        f.typed.insert("cpd-1".into(), false);
+        f.pids.insert("cpd-1".into(), Vec::new());
+        f.census = Some(vec![("cpd-1".into(), format!("{row} · working"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (yes_alive, ran_alive, check_alive) = (alive(&[yes]), alive(&ran), check.try_wait().unwrap().is_none());
+        crate::host::Host::signal(&crate::host::LOCAL, &[yes], "KILL");
+        crate::host::Host::signal_group(&crate::host::LOCAL, check.id(), "KILL");
+        let _ = check.kill();
+        let _ = check.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        let mut want = ran.clone();
+        want.sort();
+        assert_eq!(ran_alive, want, "the check's cargo survives the sweep: {log}");
+        assert!(check_alive, "and the check itself");
+    }
 }

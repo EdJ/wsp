@@ -395,6 +395,84 @@ fn wsp_above(mut at: u32, in_tree: &[u32], table: &[(u32, u32, String)]) -> Opti
     None
 }
 
+/// The verbs whose `wsp` runs a row's checks: `wsp check` (a verifier's, the
+/// barrier's, a seat's) and the verifier's `wsp verified`, which reruns them.
+const CHECK_VERBS: &[&str] = &["check", "verified", "verify"];
+
+/// The rows this command line's `wsp` runs checks on ([`CHECK_VERBS`]):
+/// every word after the verb that is not a flag (`wsp check --at <sha> <row>`
+/// names the sha too, which no tree is named after). Empty unless its first
+/// word is a `wsp`, or its second where the first is the shell a `wsp` script
+/// (a shim) runs under, and its first word after that not a flag is a check
+/// verb.
+fn checked_rows(command: &str) -> Vec<String> {
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else { return Vec::new() };
+    if base_of(first) != "wsp" && !(shell_named(first) && words.next().map(base_of) == Some("wsp")) {
+        return Vec::new();
+    }
+    let mut args = words.filter(|w| !w.starts_with('-'));
+    if !args.next().is_some_and(|verb| CHECK_VERBS.contains(&verb)) {
+        return Vec::new();
+    }
+    args.map(str::to_string).collect()
+}
+
+/// How [`runners`] asks the command lines of some pids: [`commands`].
+pub type Ask = dyn Fn(&[u32]) -> Vec<(u32, String)>;
+
+/// What runs a check (`wsp-426`), as `(its pid, the row it is for)`: a `wsp`
+/// in `table` ([`exes`]) whose command line ([`commands`], asked through `ask`)
+/// runs a row's checks ([`checked_rows`]), wherever it stands (a `wsp` script
+/// under its shell too); and each running job of `jobs` (the manager's job
+/// table), by its group's leader, the job's `pgid`, under its key's row: the
+/// check's own steps and the builds they send through the throttle. What
+/// descends from one is that row's check's, never a leftover in its tree: the
+/// verifier's `wsp check` runs from outside the tree, and its cargo was TERMed
+/// with exit 143.
+pub fn runners(table: &[(u32, u32, String)], ask: &Ask, jobs: &[wsp_host_api::JobRow]) -> Vec<(u32, String)> {
+    let running = jobs.iter().filter(|j| j.state == wsp_host_api::JobState::Running);
+    let mut out: Vec<(u32, String)> = running.map(|j| (j.pgid, j.key.row.0.clone())).collect();
+    // A `wsp` script's executable is its shell where `ps` names the interpreter.
+    let wsps: Vec<u32> = table.iter().filter(|(_, _, e)| base_of(e) == "wsp" || shell_named(e)).map(|r| r.0).collect();
+    if !wsps.is_empty() {
+        for (pid, command) in ask(&wsps) {
+            out.extend(checked_rows(&command).into_iter().map(|row| (pid, row)));
+        }
+    }
+    out
+}
+
+/// The running jobs of this machine's manager, for [`runners`]: none where
+/// there is no manager or it did not answer, and then a check's own `wsp`
+/// still spares what it runs.
+fn manager_jobs() -> Vec<wsp_host_api::JobRow> {
+    let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(Store::default_state);
+    match crate::throttle::manager_jobs(&state) {
+        Ok(Some(host)) => host.jobs().unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The nearest of `runners` at or above `at`, climbing until a host that is
+/// not one, or the top.
+fn runner_above(mut at: u32, runners: &[u32], table: &[(u32, u32, String)]) -> Option<u32> {
+    for _ in 0..table.len() {
+        if at <= 1 {
+            return None;
+        }
+        if runners.contains(&at) {
+            return Some(at);
+        }
+        let &(_, up, ref exe) = table.iter().find(|(q, _, _)| *q == at)?;
+        if host_named(exe).is_some() {
+            return None;
+        }
+        at = up;
+    }
+    None
+}
+
 /// Is `pid`, standing in `tree` by working directory, the tree's to stop?
 ///
 /// **Only what the tree started**: a process whose executable is under the tree
@@ -429,6 +507,20 @@ pub fn orphaned(ppid: u32, table: &[(u32, u32, String)]) -> bool {
 /// submit: there the tree is the row's alone, so what nobody holds is its
 /// leftovers. Hosts, servers, apps and a wsp's check are spared as ever.
 pub fn judge(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)], orphans: bool) -> Verdict {
+    judge_among(pid, tree, in_tree, &[], table, orphans)
+}
+
+/// [`judge`], sparing what descends from one of `runners`, the pids
+/// [`runners`] gives for this tree's row: a running check's, wherever its
+/// `wsp` stands (`wsp-426`).
+pub fn judge_among(
+    pid: u32,
+    tree: &Path,
+    in_tree: &[u32],
+    runners: &[u32],
+    table: &[(u32, u32, String)],
+    orphans: bool,
+) -> Verdict {
     let find = |p: u32| table.iter().find(|(q, _, _)| *q == p);
     let Some(&(_, ppid, ref exe)) = find(pid) else { return Verdict::Spare("it is not in the process table".into()) };
     if let Some(why) = host_named(exe) {
@@ -441,6 +533,11 @@ pub fn judge(pid: u32, tree: &Path, in_tree: &[u32], table: &[(u32, u32, String)
     // host above; a pane's backend does not spare what it holds.
     if let Some(wsp) = wsp_above(ppid, in_tree, table) {
         return Verdict::Spare(format!("it descends from a running wsp, pid {wsp}: a check runs in this tree"));
+    }
+    // A check run from outside the tree (`wsp-426`): the verifier's `wsp check`,
+    // or the manager's job, whose cargo stands in the tree and its wsp does not.
+    if let Some(run) = runner_above(pid, runners, table) {
+        return Verdict::Spare(format!("it is this row's running check's, pid {run}, run from outside this tree"));
     }
     let built = BUILT_SERVERS.contains(&base_of(exe));
     if exe_in(exe, tree) {
@@ -492,14 +589,21 @@ pub fn sorted(lsof: &str, lefts: Vec<Left>, table: &[(u32, u32, String)]) -> Vec
 /// [`sorted`], judging the trees of the rows `orphans` names with
 /// [`judge`]'s `orphans` set.
 pub fn sorted_with(lsof: &str, lefts: Vec<Left>, table: &[(u32, u32, String)], orphans: &dyn Fn(&str) -> bool) -> Vec<Left> {
+    // The check runners are asked once, and only where there is a tree to sort.
+    let mut running: Option<Vec<(u32, String)>> = None;
     lefts
         .into_iter()
         .filter_map(|mut l| {
             let in_tree = pids_in(lsof, Path::new(&l.tree));
             let (mut stop, mut spare) = (Vec::new(), Vec::new());
             let orphans = orphans(&l.row);
+            let all = running.get_or_insert_with(|| runners(table, &commands, &manager_jobs()));
+            // Only a check on this row spares what stands in its tree: a check
+            // elsewhere (a seat's suite run, whose tests start processes in
+            // trees of their own) does not.
+            let ours: Vec<u32> = all.iter().filter(|(_, row)| *row == l.row).map(|r| r.0).collect();
             for p in std::mem::take(&mut l.pids) {
-                match judge(p, Path::new(&l.tree), &in_tree, table, orphans) {
+                match judge_among(p, Path::new(&l.tree), &in_tree, &ours, table, orphans) {
                     Verdict::Stop => stop.push(p),
                     Verdict::Spare(why) => spare.push((p, why)),
                 }
@@ -1443,6 +1547,67 @@ mod tests {
         for pid in [70, 71] {
             assert_eq!(judged(pid, &all, &table), Verdict::Stop, "{pid}: a node only under a pane's backend is still the tree's");
         }
+    }
+
+    /// `wsp-426`: wsp-307's verifier ran `wsp check` from outside the row's
+    /// tree, and at review the sweep TERMed its cargo and rustc (exit 143). A
+    /// check on the tree's row is spared wherever its wsp stands, whether the
+    /// wsp runs the job or a manager does (by its job's key); an orphan beside
+    /// it, a cargo under a plain wsp elsewhere (`wsp-653`), and what a check
+    /// on another row runs, still go.
+    #[test]
+    fn a_check_on_the_row_run_from_outside_its_tree_is_spared_and_an_orphan_beside_it_is_not() {
+        use wsp_host_api::{At, JobClass, JobRow, JobState};
+        let tree = Path::new("/r/.worktrees/c-1");
+        let table = [
+            proc(60, 1, "/opt/homebrew/bin/tmux"),
+            proc(61, 60, "/bin/zsh"),
+            proc(70, 61, "/usr/local/bin/wsp"),
+            proc(71, 70, "/bin/sh"),
+            proc(72, 71, "/Users/e/.cargo/bin/cargo"),
+            proc(73, 72, "/Users/e/.rustup/bin/rustc"),
+            proc(80, 1, "/usr/local/bin/wsp-manager"),
+            proc(81, 80, "sh"),
+            proc(82, 81, "cargo"),
+            proc(83, 80, "sh"),
+            proc(84, 83, "cargo"),
+            proc(90, 61, "/usr/local/bin/wsp"),
+            proc(91, 90, "cargo"),
+            proc(95, 1, "yes"),
+        ];
+        let ask = |pids: &[u32]| -> Vec<(u32, String)> {
+            let line = |p: &u32| match p {
+                70 => "/usr/local/bin/wsp check --at abc1234 c-1",
+                90 => "wsp sandbox exec cargo test",
+                71 => "/bin/sh -c cargo test",
+                _ => "(gone)",
+            };
+            pids.iter().map(|p| (*p, line(p).to_string())).collect()
+        };
+        let job = |row: &str, pgid: u32, state| JobRow {
+            key: crate::host::job_key(row, 0, "throttle:test@1.1"),
+            class: JobClass::Build,
+            pgid,
+            started: At(0),
+            state,
+        };
+        let jobs = [job("c-1", 81, JobState::Running), job("c-2", 83, JobState::Running), job("c-1", 99, JobState::Ended)];
+        let run = runners(&table, &ask, &jobs);
+        assert_eq!(run, vec![(81, "c-1".into()), (83, "c-2".into()), (70, "abc1234".into()), (70, "c-1".into())]);
+        let ours: Vec<u32> = run.iter().filter(|(_, r)| r == "c-1").map(|r| r.0).collect();
+        let in_tree = [72, 73, 82, 84, 91, 95];
+        for pid in [72, 73, 82] {
+            let v = judge_among(pid, tree, &in_tree, &ours, &table, true);
+            assert!(matches!(&v, Verdict::Spare(why) if why.contains("running check's")), "{pid}: {v:?}");
+        }
+        for pid in [84, 91, 95] {
+            assert_eq!(judge_among(pid, tree, &in_tree, &ours, &table, true), Verdict::Stop, "{pid}");
+        }
+        assert_eq!(checked_rows("/bin/sh /home/e/bin/wsp check wsp-307"), vec!["wsp-307"], "a wsp script under its shell");
+        assert_eq!(checked_rows("wsp --quiet verified --holds wsp-307"), vec!["wsp-307"]);
+        assert!(checked_rows("/bin/sh -c wsp check wsp-307").is_empty());
+        assert!(checked_rows("wsp land wsp-307").is_empty());
+        assert!(checked_rows("wspx check a").is_empty());
     }
 
     #[test]
