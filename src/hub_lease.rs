@@ -154,7 +154,7 @@ pub(crate) fn stamp(claim: &mut Value, held: &Held) {
     }
 }
 
-fn token_of(rec: &Value) -> Option<Token> {
+pub(crate) fn token_of(rec: &Value) -> Option<Token> {
     rec.get(TOKEN).and_then(|t| t.as_u64()).map(Token)
 }
 
@@ -294,6 +294,20 @@ pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
     for (row, claim) in store.claims() {
         let Some(token) = token_of(&claim) else { continue };
         let Some(t) = store.task(&row).filter(|t| !t.workspace.is_private()) else { continue };
+        // The verifier's hold on a member this spoke holds goes first (wsp-486).
+        if let Some((commit, key)) = held_verdict(&t) {
+            let pushed = |c: &Value| c.get("hub_verdict").and_then(|p| p.as_str()) == Some(key.as_str());
+            if !pushed(&claim) {
+                let payload = json!({ "commit": commit, "verdict": "holds" });
+                if push_verdict(client, &t.workspace.to_string(), &row, EventKind::RowReviewed, &payload, token).is_ok() {
+                    if let Some(mut now) = store.claims().get(&row).cloned().filter(|c| token_of(c) == Some(token)) {
+                        now["hub_verdict"] = json!(key);
+                        store.set_claim(&row, now);
+                    }
+                    out.sent += 1;
+                }
+            }
+        }
         let (kind, commit) = match (crate::repair::landed_line(&t), crate::repair::ready(&t)) {
             (Some(sha), _) => (EventKind::RowLanded, sha),
             (None, Some(sha)) => (EventKind::RowReviewed, sha),
@@ -323,6 +337,35 @@ pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
         }
     }
     out
+}
+
+/// The verdict of a member this spoke holds a verifier's hold for, owed to the
+/// hub and not yet sent (wsp-486): `(commit, key)` for the newest pass holding.
+fn held_verdict(t: &crate::model::Task) -> Option<(String, String)> {
+    let tasks = [t.clone()];
+    if !crate::verification::verified(&tasks, &t.id) {
+        return None;
+    }
+    let commit = crate::repair::commit_of(t)?;
+    let key = format!("verdict:{commit}");
+    Some((commit, key))
+}
+
+/// Whether the barrier may count `row` verified by the verdict its holder's
+/// spoke pushed (wsp-486): only for a member held elsewhere.
+pub(crate) fn verdict_held(store: &Store, row: &str) -> bool {
+    let book = Book::read(store);
+    book.elsewhere.contains_key(row) && book.verdicts.contains_key(row)
+}
+
+/// Takes in a `row.reviewed` object read from the hub's line for `row`: one
+/// carrying `verdict: holds` is the holder's verifier's verdict (wsp-486).
+pub(crate) fn take_verdict(store: &Store, row: &str, payload: &Value) {
+    if payload["verdict"].as_str() != Some("holds") {
+        return;
+    }
+    let Some(commit) = payload["commit"].as_str() else { return };
+    Book::edit(store, |b| b.verdicts.insert(row.to_string(), commit.to_string()));
 }
 
 /// What a verdict or landing object of `t` says: the `commit`; for a landing,
@@ -441,6 +484,9 @@ pub(crate) struct Book {
     pub(crate) elsewhere: std::collections::BTreeMap<String, String>,
     /// List → the user it was last read as driven by.
     pub(crate) driven_by: std::collections::BTreeMap<String, String>,
+    /// Row → the commit a verifier held, as the spoke holding the row pushed it
+    /// (wsp-486): what the driver's barrier reads for a member held elsewhere.
+    pub(crate) verdicts: std::collections::BTreeMap<String, String>,
 }
 
 impl Book {
@@ -466,7 +512,7 @@ impl Book {
                 Some((l.clone(), Drive { token: Token(d["token"].as_u64()?), expires: d["expires"].as_i64()?, ttl: d["ttl"].as_i64().unwrap_or(0) }))
             })
             .collect();
-        Book { drives, elsewhere: strings("elsewhere"), driven_by: strings("driven_by") }
+        Book { drives, elsewhere: strings("elsewhere"), driven_by: strings("driven_by"), verdicts: strings("verdicts") }
     }
 
     fn write(&self, store: &Store) {
@@ -475,7 +521,7 @@ impl Book {
             .iter()
             .map(|(l, d)| (l.clone(), json!({ "token": d.token.0, "expires": d.expires, "ttl": d.ttl })))
             .collect();
-        let v = json!({ "drives": drives, "elsewhere": self.elsewhere, "driven_by": self.driven_by });
+        let v = json!({ "drives": drives, "elsewhere": self.elsewhere, "driven_by": self.driven_by, "verdicts": self.verdicts });
         let path = Book::path(store);
         let Some(dir) = path.parent() else { return };
         let _ = std::fs::create_dir_all(dir);

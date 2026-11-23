@@ -1282,6 +1282,11 @@ impl Worker {
                     if let Object::Event { kind: EventKind::RowLanded, payload, .. } = obj {
                         crate::hub_lease::fetch_landed(store, payload);
                     }
+                    if let (Object::Event { kind: EventKind::RowReviewed, payload, .. }, Subject::Lease(name)) = (obj, s) {
+                        if let Some(row) = name.0.strip_prefix("row:") {
+                            crate::hub_lease::take_verdict(store, row, payload);
+                        }
+                    }
                 }
                 let mut heads = Heads::read(store);
                 heads.set(s, head, None);

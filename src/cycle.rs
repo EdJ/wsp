@@ -986,7 +986,13 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // A shared list moves only on the spoke holding its drive lease (wsp-467):
     // any other spoke's run leaves it as it is — nothing started, nothing
     // written to the list.
-    if !driven_here(store, &w) {
+    // Not the driver's spoke: it still opens the verifier of a member it holds
+    // the lease of (wsp-486), the tree being here, and does nothing else.
+    let held_only = !driven_here(store, &w);
+    if held_only && !w.workspace.is_private() && store.claims().values().all(|c| crate::hub_lease::token_of(c).is_none()) {
+        return started;
+    }
+    if held_only && w.workspace.is_private() {
         return started;
     }
     let groups = w.groups();
@@ -1005,7 +1011,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
             None => return started,
         },
     };
-    let all = starts == Starts::All;
+    let all = starts == Starts::All && !held_only;
     // A prerequisite a member names with `after` and no list holds joins the
     // group first (`wsp-495`), and the pass reads the group as it now stands.
     if all && !barrier_only && pull_prerequisites(store, &w, at) {
@@ -1044,6 +1050,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         // A member another user's spoke holds is verified there (wsp-467): its
         // verdict arrives with the row, and the barrier waits for it.
         if crate::hub_lease::running_elsewhere(store, &s.id).is_some() {
+            continue;
+        }
+        // Another spoke's list: only a member this spoke holds (wsp-486).
+        if held_only && !store.claims().get(&s.id).is_some_and(|c| crate::hub_lease::token_of(c).is_some()) {
             continue;
         }
         let Some(member) = store.find_task(&s.id) else { continue };
@@ -1096,6 +1106,10 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
         }
     }
 
+    if held_only {
+        return started;
+    }
+
     // 2a. And one that is reviewed and *not* landed gets nothing, which the
     // log has to say: tokenhub-003 went to review with its commit still on
     // its branch, this started nothing and wrote nothing, and its governor
@@ -1118,7 +1132,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // 3. The barrier, once every member is landed, every verdict is in, and
     // every member has stopped working. `wsp-164`.
     let tasks = store.tasks_shared();
-    if pos.at_barrier() && (barrier_only || pos.members.iter().all(|s| verified(&tasks, &s.id))) {
+    if pos.at_barrier() && (barrier_only || pos.members.iter().all(|s| verified(&tasks, &s.id) || crate::hub_lease::verdict_held(store, &s.id))) {
         match holding_barrier(store, seats, &w, &pos) {
             // A Barrier row filed before `wsp-230` and still open is that
             // barrier's check, whose agent may be mid-read: nothing is owed.
@@ -11883,7 +11897,11 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert!(spawned().is_empty(), "no verifier on Ed's spoke for Jesper's row");
         assert!(checks(&store, 1).is_empty(), "and no barrier before its verdict");
-        crate::verification::record(&store, "wsp-2", crate::verification::State::Holds, "checked on Jesper's spoke", Some("jesper-v"), None).unwrap();
+        // A verdict that blocks is not counted; one that holds is, as pulled (wsp-486).
+        crate::hub_lease::take_verdict(&store, "wsp-2", &serde_json::json!({ "commit": "abc1234", "verdict": "blocks" }));
+        step(&store, &w, &Blind);
+        assert!(checks(&store, 1).is_empty(), "a verdict that does not hold holds the barrier");
+        crate::hub_lease::take_verdict(&store, "wsp-2", &serde_json::json!({ "commit": "abc1234", "verdict": "holds" }));
         step(&store, &w, &Blind);
         assert_eq!(checks(&store, 1).len(), 1, "the barrier opens");
         assert_eq!(spawned(), vec![("run · barrier 1".into(), "claude".into())]);
@@ -11899,6 +11917,26 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(!crate::hub_lease::Book::read(&store).drives.contains_key("run"));
         step(&store, &w, &Blind);
         assert!(crate::hub_lease::Book::read(&store).drives["run"].token > token, "taken again");
+        running.stop();
+    }
+
+    /// wsp-486: Jesper's spoke, which does not drive Ed's list, opens the
+    /// verifier of the member it holds, and of no other.
+    #[test]
+    fn drive_the_holder_spoke_opens_a_verifier_for_a_member_of_a_list_it_does_not_drive() {
+        let (env, store) = scratch("drive-held");
+        let (running, _tokens, _home) = two_spokes(&env, &store, "jesper");
+        let mut w = store.worklist("run").unwrap();
+        w.for_user = Some("ed".into());
+        store.save_worklist(&w).unwrap();
+        for id in ["wsp-2", "wsp-3"] {
+            set(&store, id, Status::Review);
+        }
+        store.set_claim("wsp-2", serde_json::json!({ "hub_token": 5, "expires": crate::util::iso_at(crate::util::epoch_secs() + 3600) }));
+        let before = std::fs::read_to_string(store.worklist_path("run")).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("wsp-2 · verifying".into(), "claude".into())], "only the member held here");
+        assert_eq!(std::fs::read_to_string(store.worklist_path("run")).unwrap(), before, "the list untouched");
         running.stop();
     }
 
