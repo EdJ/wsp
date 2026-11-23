@@ -2687,6 +2687,7 @@ pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
     let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let from = get("claimed_at");
     let secs = util::since(&from);
+    crate::hub_lease::let_go(task_id, &claim);
 
     // What the attempt was actually served at, asked for while the record that
     // answers it is still standing: `thread_for_task` reads the binding first
@@ -2991,6 +2992,23 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         return 1;
     }
 
+    // A row in a shared workspace is the hub's to lease (wsp-466): taken before
+    // anything is written, so a row another user's spoke holds, or one allocated
+    // to someone else, is refused with nothing changed here.
+    let leased = match crate::hub_lease::before_claim(store, &t.id) {
+        Ok(l) => l,
+        Err(why) => {
+            if args.json() {
+                println!("{}", json!({ "error": "leased", "task": t.id, "reason": why }));
+            } else {
+                let p = Paint::new();
+                eprintln!("{} {}  {}", p.yellow("✗"), p.bold(&t.id), t.title);
+                eprintln!("  {}", p.dim(&why));
+            }
+            return 1;
+        }
+    };
+
     // Whatever this agent was on, it is not on it after this. The claim moves
     // with the agent; the trace stays with the task.
     let left = leaving(store, &pane, &workspace, &t.id);
@@ -3082,6 +3100,9 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
             claim["agent_kind"] = json!(k);
         }
         wsp_store::store::stamp_claim_expiry(&mut claim);
+        if let Some(held) = &leased {
+            crate::hub_lease::stamp(&mut claim, held);
+        }
         store.set_claim(&t.id, claim);
 
         // A hand raised about this task has been answered by somebody taking

@@ -617,6 +617,8 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     let _fold = crate::fold::start(store, _api.as_ref().map(|a| a.db.clone()));
     // Spoke mode (wsp-464): with a login in `~/.config/wsp/hubs.json`, one
     // thread syncs the shared workspaces with it. Without one, nothing starts.
+    // What the hub-lease follower cannot reach from below (wsp-466).
+    crate::hub_lease::install(|s, row, why| crate::cmd_spawn::release_lost(s, row, why).map(|_| ()), seat_alive);
     let _sync = crate::hub_sync::start(store);
 
     // Every executor's ssh master, held open on this machine. Inert until
@@ -886,6 +888,19 @@ fn machine_alive(store: &Store, name: &str) -> bool {
     m.is_active() && !crate::far::is_silent(&m, &l)
 }
 
+/// Whether the seat holding a claim is alive: a local one is in the census
+/// (`seen` holds it once read), a far one when its machine answers (wsp-410's rule).
+pub(crate) fn seat_alive(store: &Store, seat: &str, seen: &mut Option<Option<Vec<String>>>) -> bool {
+    let machine = crate::place_compound::seat_machine(store, seat);
+    if !machine.is_empty() {
+        return machine_alive(store, &machine);
+    }
+    let seats = seen.get_or_insert_with(|| {
+        crate::place::local_backends()[0].census().ok().map(|c| c.seats().map(|s| s.seat.as_str().to_string()).collect())
+    });
+    seats.as_ref().is_some_and(|s| s.iter().any(|x| x == seat))
+}
+
 /// The renewal pass (wsp-410): every claim whose holder seat the daemon can
 /// see alive moves to `now + claim_ttl()` once less than the ttl minus an hour
 /// is left of it, so `claims.json` is written about once an hour per claim and
@@ -905,6 +920,8 @@ fn renew_claims(store: &Store, now: i64, census: impl FnOnce() -> Option<crate::
         .claims()
         .iter()
         .filter(|(task, _)| store.claim_expires(task).is_some_and(|at| at - now < ttl - margin))
+        // A claim with a hub lease is renewed by the hub's word, not here (wsp-466).
+        .filter(|(_, rec)| rec.get(crate::hub_lease::TOKEN).is_none())
         .filter_map(|(task, rec)| Some((task.clone(), claim_seat_id(rec)?.to_string())))
         .collect();
     if due.is_empty() {

@@ -348,6 +348,7 @@ impl Worker {
                 if self.client.is_some() {
                     self.link = Link::Up;
                 }
+                self.renew_leases(store);
                 self.backoff = BACKOFF_MIN;
                 self.retry_at = None;
             }
@@ -371,6 +372,13 @@ impl Worker {
         }
         self.write_status(store, out.as_ref().ok());
         out
+    }
+
+    /// The hub leases of the claims here whose seats are alive, renewed at most
+    /// hourly each (wsp-466, [`crate::hub_lease::renew_due`]).
+    fn renew_leases(&mut self, store: &Store) {
+        let Some(client) = self.client.as_mut() else { return };
+        crate::hub_lease::renew_all(store, client, crate::util::epoch_secs());
     }
 
     fn url(&self) -> String {
@@ -477,6 +485,9 @@ impl Worker {
             let left = end.saturating_duration_since(Instant::now());
             match feed.next_within(left) {
                 Some(Item::Event(e)) => {
+                    if e.kind == EventKind::LeaseExpired {
+                        crate::hub_lease::follow_expired(store, &e.payload);
+                    }
                     if e.kind == EventKind::RefMoved {
                         woke = true;
                         if let Some(w) = e.payload.get("workspace").and_then(|w| w.as_str()) {

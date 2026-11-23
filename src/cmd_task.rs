@@ -1244,6 +1244,16 @@ pub(crate) fn move_status(t: &mut Task, status: Status, caller: &crate::cmd_mess
 
 pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
     let verb = status.as_str().to_string();
+    // `wsp start` on a row in a shared workspace takes the hub's lease first
+    // (wsp-466): refused, naming the holder, with nothing changed.
+    if status == Status::Doing {
+        if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
+            if let Err(why) = crate::hub_lease::before_claim(store, &t.id) {
+                eprintln!("wsp: {verb}: {why}");
+                return 1;
+            }
+        }
+    }
     let caller = crate::cmd_message::Caller::here(store);
     mutate(store, args, &verb, |t| move_status(t, status, &caller))
 }

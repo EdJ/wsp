@@ -237,6 +237,10 @@ pub fn rows(
                 }
             }
             f.insert(HEAD.into(), TaskHead::of(t).to_json().to_string());
+            // The allocation travels as a field, where the hub's lease guard reads it (wsp-466).
+            if let Some(u) = t.for_user.as_deref().filter(|u| !u.is_empty()) {
+                f.insert("for".into(), u.to_string());
+            }
             if let Some(st) = staged.remove(&t.id) {
                 f.insert(key::STAGE.into(), crate::stage::told_view(&st.told).json().to_string());
                 f.insert(key::STAGE_STEPS.into(), serde_json::Value::Array(st.steps.iter().map(|s| s.json()).collect()).to_string());
@@ -538,6 +542,9 @@ fn lists_with(
             put(&mut f, "planned", w.planned.as_deref().unwrap_or(""));
             if let Some(text) = texts.get(&w.id) {
                 f.insert(BODY.into(), text.clone());
+            }
+            if let Some(u) = w.for_user.as_deref().filter(|u| !u.is_empty()) {
+                f.insert("for".into(), u.to_string());
             }
             if status == WorklistStatus::Done && seated(w, governed) {
                 f.insert(c::WIP_SEATED.into(), "true".into());

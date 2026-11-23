@@ -13,9 +13,13 @@
 //!
 //! Refused: a logged-out spoke (`wsp login`), a record already shared (there is
 //! no unpublish in v1), a sub-task or piece on its own (it lives in its row's
-//! workspace), a claimed row (the hub's lease verbs are wsp-466's, and a claimed
-//! row published unleased would be a row two seats could move), and a workspace
-//! the hub says the caller is not a member of.
+//! workspace), and a workspace the hub says the caller is not a member of.
+//!
+//! A claimed row is published under a hub lease (wsp-466): once the hub has
+//! given its new id, `lease.take` is asked for it before anything is written,
+//! and a refusal (another user's lease, an allocation to someone else) leaves
+//! every row as it was. The lease's token and expiry go into the claim, which
+//! follows the row to its new id with its seat.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -99,14 +103,6 @@ pub(crate) fn plan(store: &Store, target: &str) -> Result<Plan, String> {
             return Err(format!("{} is already in {}: there is no unpublish in v1", t.id, t.workspace));
         }
     }
-    let claims = store.claims();
-    if let Some(t) = set.values().find(|t| claims.contains_key(&t.id)) {
-        return Err(format!(
-            "{} is claimed: publishing it would put a row two seats could move, and the hub's lease verbs (wsp-466) are not built; release it first",
-            t.id
-        ));
-    }
-
     let depth = |t: &Task| {
         let (mut d, mut at) = (0usize, t.id.clone());
         while let Some(p) = set.get(&at).and_then(|t| t.parent.clone()).filter(|p| set.contains_key(p)) {
@@ -186,7 +182,7 @@ fn say(e: HubError) -> String {
 
 /// The hub's client for this machine's login: the URL, token and CA the way the
 /// sync worker reads them.
-fn dial(home: &Path) -> Result<Client, String> {
+pub(crate) fn dial(home: &Path) -> Result<Client, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let not_in = |why: String| format!("not logged in to a hub ({why}): `wsp login <hub-url>` first");
     let url = wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home).map_err(|e| not_in(e.to_string()))?;
@@ -212,6 +208,23 @@ pub(crate) fn publish(store: &Store, target: &str, ws: &WorkspaceId, home: &Path
             map.insert(old.to_string(), new);
         }
     }
+    // A claimed row goes under a hub lease at its new id, before any write.
+    let claims = store.claims();
+    let mut leased: Vec<(String, String, crate::hub_lease::Held)> = Vec::new();
+    for (old, _) in &plan.rows {
+        if !claims.contains_key(old) {
+            continue;
+        }
+        match crate::hub_lease::take(&mut client, &hub_ws.0, &map[old]) {
+            Ok(held) => leased.push((old.clone(), map[old].clone(), held)),
+            Err(why) => {
+                for (_, new, held) in &leased {
+                    let _ = client.lease_release(&wsp_store_contract::RowId(new.clone()), held.token);
+                }
+                return Err(format!("{old} is claimed and the hub would not lease it, so nothing was published: {why}"));
+            }
+        }
+    }
     let mut made: Vec<(String, String)> = plan.rows.iter().map(|(id, _)| (id.clone(), map[id].clone())).collect();
     for (piece, row) in &plan.pieces {
         let n = split_piece_id(piece).map(|(_, n)| n).unwrap_or(0);
@@ -221,6 +234,21 @@ pub(crate) fn publish(store: &Store, target: &str, ws: &WorkspaceId, home: &Path
     }
     let lists: Vec<String> = plan.list.into_iter().collect();
     store.renumber_into(&map, ws, &lists).map_err(|e| format!("the hub gave the ids, but the renumbering failed part-way: {e}"))?;
+    // The claim, and the seat's binding, follow the row to its new id, with the lease in it.
+    for (old, new, held) in &leased {
+        let Some(mut claim) = claims.get(old).cloned() else { continue };
+        crate::hub_lease::stamp(&mut claim, held);
+        store.locked(|| {
+            store.clear_claim(old);
+            store.set_claim(new, claim);
+            for pane in store.panes_for_task(old) {
+                if let Some(mut b) = store.bindings().get(&pane).cloned() {
+                    b["task_id"] = serde_json::json!(new);
+                    store.set_binding(&pane, b);
+                }
+            }
+        });
+    }
     Ok(made)
 }
 
@@ -275,6 +303,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
         text: r##"  wsp publish <row|list> --to shared:<name>   move a private row (with its sub-tasks and pieces)
                                     or list (with its members) into a shared workspace:
                                     new ids from the hub, old ones still resolve. Refused
-                                    when logged out, already shared, claimed, or not a member"##,
+                                    when logged out, already shared, or not a member; a claimed
+                                    row takes the hub's lease first and is refused if it is held"##,
     }],
 }];
