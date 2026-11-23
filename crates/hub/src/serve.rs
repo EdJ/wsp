@@ -22,8 +22,8 @@ use crate::auth::Auth;
 use crate::{Config, Hub, HubStore};
 
 impl SyncVerbs for Hub {
-    fn answer(&self, _by: &Principal, call: SyncCall) -> Outcome {
-        Hub::answer(self, call)
+    fn answer(&self, by: &Principal, call: SyncCall) -> Outcome {
+        Hub::answer(self, by, call)
     }
 }
 

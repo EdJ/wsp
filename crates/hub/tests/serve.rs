@@ -16,7 +16,7 @@ use wsp_machines::token;
 use wsp_server::testing::TestPki;
 use wsp_objects::{encode, Object};
 use wsp_store_contract::{
-    At, Command as Cmd, Entity, EventKind, IdempotencyKey, Principal, ProjectId, Row, RowId, RowState, Subject, TokenId,
+    At, Command as Cmd, Entity, EventKind, IdempotencyKey, Principal, ProjectId, Row, RowId, RowState, SharedName, Subject, TokenId,
     UserName,
 };
 
@@ -106,9 +106,12 @@ fn seed(data: &Path, users: &[&str]) -> BTreeMap<String, String> {
     let root = Principal::Person("root".into());
     apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
     let mut tokens = BTreeMap::new();
+    let mp = SharedName("mp".into());
+    apply(Cmd::HubWorkspaceAdd { name: mp.clone() }, &root);
     for user in users {
         let (secret, hash) = token::mint();
         apply(Cmd::HubUserAdd { name: UserName(user.to_string()), admin: false }, &root);
+        apply(Cmd::HubMemberSet { workspace: mp.clone(), user: UserName(user.to_string()), member: true }, &root);
         apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.to_string()), hash }, &root);
         tokens.insert(user.to_string(), secret);
     }

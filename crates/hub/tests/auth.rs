@@ -14,7 +14,7 @@ use wsp_api::{
 };
 use wsp_hub::{serve, Config};
 use wsp_machines::token;
-use wsp_store_contract::{Command, IdempotencyKey, Principal, TokenId, UserName};
+use wsp_store_contract::{Command, IdempotencyKey, Principal, SharedName, TokenId, UserName};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -54,13 +54,16 @@ impl Served {
         self.running().hub().apply(cmd, key, by.clone()).expect("the identity machine takes it");
     }
 
-    /// The first admin, `root`, and a token for it; and a user with a token.
+    /// The first admin, `root`, and a token for it; and each user with a token and a seat in `shared:mp`.
     fn with_users(&self, users: &[&str]) -> Vec<String> {
         let root = person("root");
         self.apply(Command::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("hub-t".into()));
         let mut tokens = vec![self.issue("root", &root)];
+        let mp = SharedName("mp".into());
+        self.apply(Command::HubWorkspaceAdd { name: mp.clone() }, &root);
         for user in users {
             self.apply(Command::HubUserAdd { name: UserName(user.to_string()), admin: false }, &root);
+            self.apply(Command::HubMemberSet { workspace: mp.clone(), user: UserName(user.to_string()), member: true }, &root);
             tokens.push(self.issue(user, &root));
         }
         tokens

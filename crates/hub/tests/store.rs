@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wsp_api::{Answer, Blob, Code, Move, ObjectId, Outcome, RefMove, SyncCall, WorkspaceId};
 use wsp_hub::Hub;
-use wsp_store_contract::{LeaseName, Principal, RowId, SeatId, Subject};
+use wsp_store_contract::{
+    Command, IdempotencyKey, LeaseName, Principal, RowId, SeatId, SharedName, Subject, UserName,
+};
 
 /// A directory of its own, removed when dropped.
 struct Scratch(PathBuf);
@@ -44,6 +46,29 @@ fn blob(n: u64) -> Blob {
         id: ObjectId::of(&bytes),
         bytes,
     }
+}
+
+/// `ann`, a member of `shared:team`: who the verbs below are answered for.
+fn ann() -> Principal {
+    Principal::Person("ann".into())
+}
+
+/// A hub in `dir` where `ann` is a member of `shared:team`.
+fn hub_with_ann(dir: &Path) -> Hub {
+    let hub = Hub::open(dir).unwrap();
+    let apply = |cmd: Command, by: &Principal| {
+        let key = IdempotencyKey(format!("{cmd:?}"));
+        hub.apply(cmd, key, by.clone()).expect("the identity machine takes it");
+    };
+    let root = Principal::Person("root".into());
+    apply(Command::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("hub".into()));
+    apply(Command::HubUserAdd { name: UserName("ann".into()), admin: false }, &root);
+    apply(Command::HubWorkspaceAdd { name: SharedName("team".into()) }, &root);
+    apply(
+        Command::HubMemberSet { workspace: SharedName("team".into()), user: UserName("ann".into()), member: true },
+        &root,
+    );
+    hub
 }
 
 fn ws() -> WorkspaceId {
@@ -118,7 +143,7 @@ fn objects_and_refs_survive_a_reopen() {
 #[test]
 fn a_present_object_is_not_rewritten_and_a_bad_one_refuses_the_whole_put() {
     let dir = Scratch::new("present");
-    let hub = Hub::open(dir.path()).unwrap();
+    let hub = hub_with_ann(dir.path());
     let a = blob(1);
     assert_eq!(hub.put(std::slice::from_ref(&a)).unwrap(), 1);
     // Mark the file: a rewrite would put the object's bytes back.
@@ -135,7 +160,7 @@ fn a_present_object_is_not_rewritten_and_a_bad_one_refuses_the_whole_put() {
     let good = blob(2);
     let mut bad = blob(3);
     bad.bytes = b"{\"n\":4}".to_vec();
-    match hub.answer(SyncCall::Put {
+    match hub.answer(&ann(), SyncCall::Put {
         objects: vec![good.clone(), bad.clone()],
     }) {
         Outcome::Err(f) => {
@@ -160,37 +185,38 @@ fn a_present_object_is_not_rewritten_and_a_bad_one_refuses_the_whole_put() {
 #[test]
 fn the_verbs_answer_as_memhub_does() {
     let dir = Scratch::new("verbs");
-    let hub = Hub::open(dir.path()).unwrap();
+    let hub = hub_with_ann(dir.path());
     let (a, b) = (blob(1), blob(2));
     assert_eq!(
-        hub.answer(SyncCall::Have {
+        hub.answer(&ann(), SyncCall::Have {
             ids: vec![a.id, b.id]
         }),
         Outcome::Ok(Answer::Missing(vec![a.id, b.id]))
     );
     assert_eq!(
-        hub.answer(SyncCall::Put {
+        hub.answer(&ann(), SyncCall::Put {
             objects: vec![a.clone()]
         }),
         Outcome::Ok(Answer::Stored { stored: 1 })
     );
+    let s = row("r1");
     assert_eq!(
-        hub.answer(SyncCall::Get {
+        hub.answer(&ann(), SyncCall::Move(mv(&s, None, a.id))),
+        Outcome::Ok(Answer::Move(Move::Moved { head: a.id }))
+    );
+    assert_eq!(
+        hub.answer(&ann(), SyncCall::Move(mv(&s, None, b.id))),
+        Outcome::Ok(Answer::Move(Move::Stale { head: Some(a.id) })),
+        "a stale move is an ok answer, not an err"
+    );
+    // Held and referenced, an object is served; one not held is left out.
+    assert_eq!(
+        hub.answer(&ann(), SyncCall::Get {
             ids: vec![b.id, a.id]
         }),
         Outcome::Ok(Answer::Objects(vec![a.clone()]))
     );
-    let s = row("r1");
-    assert_eq!(
-        hub.answer(SyncCall::Move(mv(&s, None, a.id))),
-        Outcome::Ok(Answer::Move(Move::Moved { head: a.id }))
-    );
-    assert_eq!(
-        hub.answer(SyncCall::Move(mv(&s, None, b.id))),
-        Outcome::Ok(Answer::Move(Move::Stale { head: Some(a.id) })),
-        "a stale move is an ok answer, not an err"
-    );
-    match hub.answer(SyncCall::Heads { workspace: ws() }) {
+    match hub.answer(&ann(), SyncCall::Heads { workspace: ws() }) {
         Outcome::Ok(Answer::Heads(refs)) => assert_eq!(refs.get(&s), Some(&a.id)),
         other => panic!("{other:?}"),
     }

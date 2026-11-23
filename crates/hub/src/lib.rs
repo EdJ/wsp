@@ -26,13 +26,15 @@
 //! subject in the same workspace also bumps the revision; the loser of that
 //! race reads again and, its own subject's head being still `from`, moves.)
 //!
-//! [`Hub::answer`] gives each of wsp-459's sync verbs the meaning wsp-client's
+//! [`Hub::answer`] (scope.rs: a caller reads and writes only the shared
+//! workspaces it is a member of, wsp-173) gives each of wsp-459's sync verbs the meaning wsp-client's
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
 //! `ok` answer, not an `err`.
 
 pub mod auth;
 mod config;
 mod objects;
+pub mod scope;
 pub mod serve;
 mod store;
 
@@ -270,8 +272,9 @@ impl Hub {
 
     // The verbs.
 
-    /// One sync verb's outcome, as wsp-client's `MemHub` answers it.
-    pub fn answer(&self, call: SyncCall) -> Outcome {
+    /// One sync verb's outcome, as wsp-client's `MemHub` answers it, with no
+    /// caller: [`Hub::answer`] (scope.rs) is the one that checks who asks.
+    pub(crate) fn run(&self, call: SyncCall) -> Outcome {
         let answered = match call {
             SyncCall::Heads { workspace } => self.heads(&workspace).map(Answer::Heads),
             SyncCall::Have { ids } => Ok(Answer::Missing(self.missing(&ids))),
