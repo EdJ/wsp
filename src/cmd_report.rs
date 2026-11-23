@@ -373,6 +373,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
                 "verifier_spawn_to_first_line_seconds": f.verifier_spawn_to_first,
                 "verifier_test_seconds": f.verifier_test_secs,
                 "verdict_to_despawn_seconds": f.verdict_to_despawn,
+                "verdict_to_despawn_by_seat": f.verdict_to_despawn_seats.iter().map(|(seat, secs)| json!({"seat": seat, "seconds": secs})).collect::<Vec<_>>(),
                 "record_empty_seat_measured": seat_filled,
             }));
             fixed_first.extend(f.spawn_to_first);
@@ -975,7 +976,7 @@ pub fn effort_html(v: &Value) -> String {
             vec!["seat spawn to its first line (median per row)".into(), hms(n(t, "spawn_to_first_line_median_seconds") as i64)],
             vec!["verifier spawn to its first line (median per row)".into(), hms(n(t, "verifier_spawn_to_first_line_median_seconds") as i64)],
             vec!["verifier test and build time (all passes)".into(), hms(n(t, "verifier_test_seconds") as i64)],
-            vec!["verdict to the verifier's despawn (median per row)".into(), hms(n(t, "verdict_to_despawn_median_seconds") as i64)],
+            vec!["verdict to the last seat's despawn (median per row)".into(), hms(n(t, "verdict_to_despawn_median_seconds") as i64)],
         ],
     ));
     let ss = &t["standing_seats"];
