@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use wsp_client::{Client, Item};
 use wsp_manager::{Config, Manager, TOKEN_FILE};
-use wsp_store_contract::{AskState, ListFilter, Principal, RowFilter};
+use wsp_store_contract::{ListFilter, Principal, RowFilter};
 use wsp_view::reading;
 use wsp_wire::host::{Host, Spawn, Tcp, LOCAL};
 use wsp_wire::manager::{install_record, Local};
@@ -775,24 +775,63 @@ fn the_census_spend_through_the_api_is_spend_json() {
     assert_eq!(spend["totals"]["today"]["turns"], 3, "the banked burn is counted: {spend}");
 }
 
-/// flags: host-core's flags read is `flag --person --json` (the hands) and
-/// `yours --json` (the questions). No wsp-view function draws either, so this
-/// pins coverage, not bytes: every id the two list is a raised ask in the
-/// API's `asks` reply, with its text.
+/// The CLI's `--json` for `args`, as the bytes it prints.
+fn cli_text(sb: &Sandbox, args: &[&str]) -> String {
+    let out = sb.cmd(args).output().expect("wsp runs");
+    assert!(out.status.success(), "wsp {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).expect("utf-8")
+}
+
+/// The seeded store and, for `yours --json`'s `closed`, one more question of
+/// the person's, answered by the person just now.
+fn seeded_flags(tag: &str) -> Seeded {
+    let seed = seeded(tag);
+    let mut asked = ask_message("m-4", "ship it?", SEAT, "inbox-003");
+    asked.for_person = true;
+    seed.sb.store().save_message(&asked).unwrap();
+    seed.sb.wsp(&["answer", "m-4", "--as-person", "yes"]);
+    seed
+}
+
+/// flags, the hands (wsp-745): the `flags` reading's `person`, drawn by
+/// `flag::person_json`, is `flag --person --json` byte for byte.
 #[test]
-fn the_census_flags_are_raised_asks_through_the_api() {
-    let mut seed = seeded("flags");
+fn the_census_flags_through_the_api_are_flag_person_json() {
+    let mut seed = seeded_flags("flags-person");
     let Seeded { sb, client, .. } = &mut seed;
+    draws_what_the_cli_prints(
+        "flag --person",
+        || {
+            let f: wsp_view::flag::Flags = reading_of!(client, reading::FLAGS)?;
+            Some(format!("{}\n", serde_json::to_string_pretty(&wsp_view::flag::person_json(&f.person)).unwrap()))
+        },
+        || cli_text(sb, &["flag", "--person", "--json"]),
+    );
     let hands = cli_json(sb, &["flag", "--person", "--json"]);
+    let ids: Vec<&str> = hands.as_array().into_iter().flatten().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"m-2") && ids.contains(&"m-3"), "the person's question and note: {hands}");
+}
+
+/// flags, the questions (wsp-745): the `flags` reading, drawn by
+/// `flag::yours_json`, is `yours --json` byte for byte, a closed question
+/// included.
+#[test]
+fn the_census_flags_through_the_api_are_yours_json() {
+    let mut seed = seeded_flags("flags-yours");
+    let Seeded { sb, client, .. } = &mut seed;
+    draws_what_the_cli_prints(
+        "yours",
+        || {
+            let f: wsp_view::flag::Flags = reading_of!(client, reading::FLAGS)?;
+            Some(format!("{}\n", serde_json::to_string_pretty(&wsp_view::flag::yours_json(&f)).unwrap()))
+        },
+        || cli_text(sb, &["yours", "--json"]),
+    );
     let yours = cli_json(sb, &["yours", "--json"]);
-    let listed: Vec<&Value> = hands.as_array().into_iter().flatten().chain(yours["items"].as_array().into_iter().flatten()).collect();
-    let ids: Vec<&str> = listed.iter().filter_map(|m| m["id"].as_str()).collect();
-    assert!(ids.contains(&"m-2") && ids.contains(&"m-3"), "the person's question and note: hands {hands} yours {yours}");
-    let asks = client.asks(vec![], vec![AskState::Raised]).expect("asks answers");
-    for m in listed {
-        let id = m["id"].as_str().unwrap();
-        let ask = asks.iter().find(|a| a.id.0 == id).unwrap_or_else(|| panic!("{id} is not a raised ask: {asks:?}"));
-        let text = m.get("text").or_else(|| m.get("asked")).and_then(Value::as_str).unwrap_or_default();
-        assert_eq!(ask.text, text, "{id}'s text");
-    }
+    let items: Vec<&str> = yours["items"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str()).collect();
+    // m-1 too: a question with no route is the person's, since nobody else has it.
+    assert_eq!(items, ["m-1", "m-2"], "the person's open questions: {yours}");
+    assert_eq!(yours["review"], 1, "the review row: {yours}");
+    let closed: Vec<&str> = yours["closed"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(closed, ["m-4"], "the question answered just now: {yours}");
 }

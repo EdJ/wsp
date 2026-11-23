@@ -211,3 +211,32 @@ ignored; state.db opened read-only, each reading taken by the CLI's builder), ea
 
 The live daemon serves none of the readings until the land's reinstall: the running daemon predates
 `src/readings.rs`, and its state.db has no `reading` table yet.
+
+## What flags did (wsp-745's work, in this row)
+
+`flag --person --json` and `yours --json`, host-core's `fetch_flags`, are now drawn by wsp-view
+(`crates/view/src/flag.rs`) over `flag::Flags`: `person` (each hand raised to the person, replies left out,
+oldest first, as its `Message::to_json` record) and `yours`'s inputs (items and lately closed questions, each
+the record plus what src/ works out beside it: headline, byline, project, unblocks; the review count, the run's
+unseen closes, the retro lines). `person_json` and `yours_json` are the projections; the CLI prints through them
+(`cmd_agent::list_flags`, `cmd_message::yours` via `yours_reading`, which keeps `-p`), and the daemon writes a
+seventh reading, `flags`, with `cmd_message::flags_reading` every 10 s.
+
+Byte for byte:
+- `tests/wip_api.rs` `the_census_flags_through_the_api_are_flag_person_json` and `..._are_yours_json`: the
+  `flags` reading through `person_json` / `yours_json`, pretty-printed, is the CLI's stdout, on the seeded store
+  plus one question the person answered (so `closed` is not empty). They replace the coverage test.
+- On the live store, the installed (pre-change) binary and this build printed identical bytes for `flag
+  --person --json` (181,384 B), `yours --json` (5,139 B), `flag --json` and `yours -p compounding --json`,
+  three rounds each.
+
+Measured 2026-11-23 04:17 on the live store, read-only (same ignored test), load 3.71 / 3.88 / 3.57 on 8
+cores, the fleet's own:
+
+| reply | bytes | of MAX_LINE 16,777,216 |
+|---|---|---|
+| `readings [flags]` | 171,456 | 1.02% (taken in 190 ms) |
+| `readings {}` (all seven) | 4,865,329 | 29.00% |
+
+The rest re-measured within a few KB of wire-and-measure's figures (`wip` unchanged at 14,847,057, 88.50%).
+The live daemon was not reinstalled; it serves the readings, `flags` included, only after the land's reinstall.

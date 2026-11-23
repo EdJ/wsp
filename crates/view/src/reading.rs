@@ -13,6 +13,7 @@
 //! | [`MACHINES`]  | `machine::Fleet` | `machine::list_json`                     |                        |
 //! | [`THROTTLE`]  | `throttle::Throttle` | `throttle::json`                     |                        |
 //! | [`SPEND`]     | [`Spend`]      | `spend::report(lines, places, landed, now)` | the reader's clock    |
+//! | [`FLAGS`]     | `flag::Flags`  | `flag::person_json(&person)`, `flag::yours_json` |                  |
 //!
 //! A reading is as fresh as its `at`: the daemon takes each again on its own
 //! period, so it may trail the entities by that much.
@@ -35,9 +36,12 @@ pub const MACHINES: &str = "machines";
 pub const THROTTLE: &str = "throttle";
 /// `spend --json`'s inputs; the clock is the reader's.
 pub const SPEND: &str = "spend";
+/// `flag --person --json` and `yours --json` (every project), host-core's
+/// flags read.
+pub const FLAGS: &str = "flags";
 
 /// Every name the daemon writes.
-pub const ALL: [&str; 6] = [TASKS, WIP, WORKLISTS, MACHINES, THROTTLE, SPEND];
+pub const ALL: [&str; 7] = [TASKS, WIP, WORKLISTS, MACHINES, THROTTLE, SPEND, FLAGS];
 
 /// What `ls --json --all` needs beyond the rows' heads, which carry each
 /// task's record (`common::task_json`). Every row of `ls --json --all` is

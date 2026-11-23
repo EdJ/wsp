@@ -1113,7 +1113,11 @@ fn list_flags(store: &Store, args: &Args) -> i32 {
     .rev()
     .collect();
     if args.json() {
-        let out: Vec<serde_json::Value> = rows.iter().map(Message::to_json).collect();
+        // `--person`'s is drawn by wsp-view (wsp-745), as the daemon's `flags` reading is.
+        let out = match args.has("person") {
+            true => wsp_view::flag::person_json(&rows.iter().rev().map(Message::to_json).collect::<Vec<_>>()),
+            false => serde_json::Value::Array(rows.iter().map(Message::to_json).collect()),
+        };
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }

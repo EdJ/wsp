@@ -1,5 +1,6 @@
 //! `wsp-view`: the `--json` projections of `wsp ls`, `show`, `wip`, `worklist
-//! ls`, `machine ls`, `throttle` and `spend` as pure functions (wsp-305), so
+//! ls`, `machine ls`, `throttle`, `spend`, `flag --person` and `yours` as pure
+//! functions (wsp-305, wsp-745), so
 //! the CLI and web-chrome draw the same shapes from the same code.
 //!
 //! **Inputs are the contract's entities** (the row's decision d1, 2026-11-20):
@@ -28,5 +29,7 @@ pub mod machine;
 pub mod throttle;
 /// `spend --json`.
 pub mod spend;
+/// `flag --person --json` and `yours --json`.
+pub mod flag;
 /// The readings: the inputs above the CLI works out, by name, as JSON (wsp-743).
 pub mod reading;

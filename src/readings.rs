@@ -3,8 +3,8 @@
 //! CLI's own builder and written through the store's `Readings` as the JSON
 //! of `wsp-view`'s input struct, under the name `wsp_view::reading` gives it.
 //! The API's `readings` verb serves them, so a reader (web-chrome's census)
-//! draws what `ls`, `wip`, `worklist ls`, `machine ls`, `throttle` and `spend`
-//! print, with the same `wsp-view` function and no `wsp` child.
+//! draws what `ls`, `wip`, `worklist ls`, `machine ls`, `throttle`, `spend`,
+//! `flag --person` and `yours` print, with the same `wsp-view` function and no `wsp` child.
 //!
 //! One thread, beside the mirror's: each reading is taken again on its own
 //! period ([`PERIODS`]); a builder that panics is one `cycle.log` line and is
@@ -20,11 +20,12 @@ use wsp_view::reading as r;
 
 /// How often each reading is taken again. `ls --all`'s stages and `spend`'s
 /// ledger walk are the dear ones.
-pub const PERIODS: [(&str, Duration); 6] = [
+pub const PERIODS: [(&str, Duration); 7] = [
     (r::THROTTLE, Duration::from_secs(10)),
     (r::MACHINES, Duration::from_secs(10)),
     (r::WIP, Duration::from_secs(10)),
     (r::WORKLISTS, Duration::from_secs(10)),
+    (r::FLAGS, Duration::from_secs(10)),
     (r::TASKS, Duration::from_secs(30)),
     (r::SPEND, Duration::from_secs(60)),
 ];
@@ -44,6 +45,7 @@ pub fn take(store: &Store, name: &str) -> Option<String> {
         r::MACHINES => r::text(&crate::cmd_machine::view(&crate::cmd_machine::Fleet::live(store))),
         r::THROTTLE => r::text(&crate::throttle::view(store)),
         r::SPEND => r::text(&crate::spend::reading(store, wsp_base::util::epoch_secs())),
+        r::FLAGS => r::text(&crate::cmd_message::flags_reading(store)),
         _ => return None,
     })
 }
@@ -99,7 +101,7 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use wsp_store::model::Task;
-    use wsp_view::{machine, spend, throttle, wip, worklist};
+    use wsp_view::{flag, machine, spend, throttle, wip, worklist};
 
     /// The `tasks` reading beside the mirror's rows cut to heads (what `rows {heads: true}`
     /// serves) gives `ls --json --all` row for row: each is `ls_json_row` of the head's
@@ -245,6 +247,26 @@ mod tests {
             planned_started: Some(vec![json!({"worklist": "w"})]),
         };
         assert_eq!(wip::census_json(&again!(c)), wip::census_json(&c));
+        let item = flag::Item {
+            record: json!({"id": "m-1", "caption": {"from": "derived", "text": "Ship?"}, "text": "ship?", "about": {"task": "wsp-1"}, "at": "2026-11-23T00:00:00Z", "waiting": null, "for": "person", "choices": {"kind": "ask", "questions": []}}),
+            asked: "ship?".into(),
+            from: "cpd-1".into(),
+            project: Some("wsp".into()),
+            unblocks: Some("w group 2".into()),
+        };
+        let fl = flag::Flags {
+            person: vec![item.record.clone(), json!({"id": "m-0", "shape": "notification", "closed": {"how": "answered"}})],
+            project: None,
+            items: vec![item.clone()],
+            review: 4,
+            closed_by_the_run: 1,
+            retro: vec!["w cleared".into()],
+            closed: vec![flag::Closed { item, closed: json!({"how": "answered", "by": "person", "answer": {"text": "yes"}}) }],
+        };
+        let back_f: flag::Flags = again!(fl);
+        assert_eq!(flag::person_json(&back_f.person), flag::person_json(&fl.person));
+        assert_eq!(flag::yours_json(&back_f), flag::yours_json(&fl));
+
         let bare = wip::Census::default();
         let v = wip::census_json(&again!(bare));
         assert!(v.get("waiting_at_cap").is_none() && v.get("planned_started").is_none(), "the CLI's keys stay absent: {v}");
@@ -255,7 +277,7 @@ mod tests {
     /// The SQL replies come from a read-only open of `state.db`; each reading is
     /// [`take`]n with the CLI's own builder over the live files (the read paths
     /// `wsp ls`, `wip`, `worklist ls`, `machine ls`, `throttle` and `spend`
-    /// run), and one `readings` reply carries all six. It writes nothing. Not
+    /// run), and one `readings` reply carries all seven. It writes nothing. Not
     /// run with the suite; the `wip` builder opens the store by its env, which
     /// a test must name, so on that one command:
     /// `WSP_HOME=~/wsp WSP_STATE=~/.local/state/wsp cargo test --bin wsp readings::tests::the_census_replies_on_the_live_store -- --ignored --nocapture`
@@ -314,7 +336,7 @@ mod tests {
             line(&format!("readings {{names: [{name}]}}"), size(Answer::Readings([(name.to_string(), one.clone())].into())), took);
             all.insert(name.to_string(), one);
         }
-        line("readings {} (all six)", size(Answer::Readings(all)), Duration::ZERO);
+        line("readings {} (all seven)", size(Answer::Readings(all)), Duration::ZERO);
     }
 
     /// Every name `wsp-view` lists is one this module takes, with a period.

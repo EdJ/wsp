@@ -1339,33 +1339,65 @@ fn project_of(store: &Store, about: &About) -> Option<String> {
     task.project.clone().filter(|p| !p.is_empty())
 }
 
-/// An item, as `wsp yours --json` gives it.
-fn item_json(store: &Store, q: &Message) -> serde_json::Value {
-    let whole = q.to_json();
-    json!({
-        "id": q.id,
-        "asked": q.title(),
-        "caption": whole["caption"],
-        "text": q.text,
-        "about": whole["about"],
-        "project": project_of(store, &q.about),
-        "from": q.from.byline(),
-        "at": q.at,
-        "unblocks": unblocks(store, q),
-        "waiting": whole["waiting"],
-        "for": whole["for"],
-        "unrouted": whole["unrouted"],
-        // Null for a question with none, which is today's.
-        "choices": whole["choices"],
-    })
+/// An item's inputs, as `wsp yours --json` draws it ([`wsp_view::flag::item_json`]):
+/// the record, and what is worked out here beside it.
+fn item_of(store: &Store, q: &Message) -> wsp_view::flag::Item {
+    wsp_view::flag::Item {
+        record: q.to_json(),
+        asked: q.title().to_string(),
+        from: q.from.byline(),
+        project: project_of(store, &q.about),
+        unblocks: unblocks(store, q),
+    }
 }
 
-/// A closed question of the person's, as `yours --json` lists it for ten
-/// minutes after (compound's §26.8 D7): the item, and how it ended.
-fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
-    let mut v = item_json(store, q);
-    v["closed"] = closed;
-    v
+/// `yours --json`'s inputs for `project` (none is every project), over the
+/// items and review count `yours` has already read. `person` is left empty:
+/// it is `flag --person`'s, which [`flags_reading`] adds.
+fn yours_reading(store: &Store, project: Option<&str>, index: &crate::resolve::Index, items: &[Message], review: usize) -> wsp_view::flag::Flags {
+    wsp_view::flag::Flags {
+        person: Vec::new(),
+        project: project.map(str::to_string),
+        items: items.iter().map(|q| item_of(store, q)).collect(),
+        review,
+        closed_by_the_run: crate::auto_close::unseen(store).len(),
+        retro: crate::retro_yours::yours_lines(store),
+        // The person's questions closed in the last ten minutes, so a
+        // reader can tell *answered in the pane* from *gone*.
+        closed: recently_closed(store)
+            .into_iter()
+            .filter(|(m, _)| project.is_none() || yours_scope(store, m, project, index))
+            .map(|(m, closed)| wsp_view::flag::Closed { item: item_of(store, &m), closed })
+            .collect(),
+    }
+}
+
+/// How many rows wait at `review` in `project` and every project under it,
+/// or in all.
+fn review_count(store: &Store, project: Option<&str>, index: &crate::resolve::Index) -> usize {
+    store
+        .tasks()
+        .iter()
+        .filter(|t| t.status() == crate::model::Status::Review)
+        .filter(|t| match project {
+            None => true,
+            Some(p) => t.project.as_deref().is_some_and(|tp| tp == p || index.ancestors(tp).iter().any(|a| a == p)),
+        })
+        .count()
+}
+
+/// The `flags` reading (wsp-745): `flag --person --json`'s hands and `yours
+/// --json`'s inputs for every project, taken with the builders the two verbs
+/// print through, so [`wsp_view::flag::person_json`] and
+/// [`wsp_view::flag::yours_json`] draw what each prints.
+pub(crate) fn flags_reading(store: &Store) -> wsp_view::flag::Flags {
+    let index = crate::resolve::Index::new(store.projects());
+    let items = yours_in(store, None);
+    let mut flags = yours_reading(store, None, &index, &items, review_count(store, None, &index));
+    // `flag --person`'s hands: each raised to the person, replies left out,
+    // oldest first, as its record (`cmd_agent::list_flags` prints the same).
+    flags.person = message::raised_to_the_person(store).iter().map(Message::to_json).collect();
+    flags
 }
 
 /// How long a closed question stays in `yours --json`'s `closed`.
@@ -1535,35 +1567,12 @@ pub fn yours(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     let items = yours_in(store, project.as_deref());
-    let review = store
-        .tasks()
-        .iter()
-        .filter(|t| t.status() == crate::model::Status::Review)
-        .filter(|t| match &project {
-            None => true,
-            Some(p) => t.project.as_deref().is_some_and(|tp| tp == p || index.ancestors(tp).iter().any(|a| a == p)),
-        })
-        .count();
+    let review = review_count(store, project.as_deref(), &index);
 
     if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "project": project,
-                "items": items.iter().map(|q| item_json(store, q)).collect::<Vec<_>>(),
-                "review": review,
-                "closed_by_the_run": crate::auto_close::unseen(store).len(),
-                "retro": crate::retro_yours::yours_lines(store),
-                // The person's questions closed in the last ten minutes, so a
-                // reader can tell *answered in the pane* from *gone*.
-                "closed": recently_closed(store)
-                    .into_iter()
-                    .filter(|(m, _)| project.is_none() || yours_scope(store, m, project.as_deref(), &index))
-                    .map(|(m, c)| closed_json(store, &m, c))
-                    .collect::<Vec<_>>(),
-            }))
-            .unwrap_or_default()
-        );
+        // Drawn by wsp-view (wsp-745), as the daemon's `flags` reading is.
+        let flags = yours_reading(store, project.as_deref(), &index, &items, review);
+        println!("{}", serde_json::to_string_pretty(&wsp_view::flag::yours_json(&flags)).unwrap_or_default());
         return 0;
     }
     let p = Paint::new();
@@ -2438,6 +2447,16 @@ pub(crate) fn say_to_governor(store: &Store, scope: &str, q: &Message) {
 mod tests {
     use super::*;
     use crate::model::Task;
+
+    /// An item as `yours --json` prints it, through the builder and wsp-view's projection.
+    fn item_json(store: &Store, q: &Message) -> serde_json::Value {
+        wsp_view::flag::item_json(&item_of(store, q))
+    }
+
+    /// A closed question as `yours --json`'s `closed` prints it.
+    fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
+        wsp_view::flag::closed_json(&wsp_view::flag::Closed { item: item_of(store, q), closed })
+    }
 
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(&format!("ans-{tag}"))
