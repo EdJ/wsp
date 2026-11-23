@@ -248,6 +248,11 @@ pub fn isolated(name: &str) -> Isolated {
     for key in ["WSP_SEAT_KIND", "WSP_EXIT", "WSP_VERDICT"] {
         std::env::remove_var(key);
     }
+    // wsp-307: `WSP_JOBS` is the default (`manager`) in a test unless the test
+    // sets it. A tree outside the manager's root runs the suite only with
+    // `WSP_JOBS=inproc` set, and a test that asks for the default was reading
+    // that instead (`check::tests::a_host_with_no_manager_stays_in_process…`).
+    std::env::remove_var("WSP_JOBS");
     // wsp-029: `WSP_HOST` unset is the manager, which a test reaches only
     // when it says so (and stands one up); otherwise the host runs here.
     std::env::set_var("WSP_HOST", "inproc");
