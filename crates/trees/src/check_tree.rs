@@ -746,6 +746,12 @@ pub fn finished_trees(lsof: &str, finished: &dyn Fn(&str) -> bool, keep: &[u32])
 /// binary) and the sweep TERMed all of it at 11:52:22Z, then the row was sent
 /// back for want of that drive. An orphan beside it is still stopped.
 ///
+/// **Nor what it detached.** 061's drive was `nohup npx vite … &` from a shell
+/// that exited at once, so `npm exec vite` was adopted by `systemd --user`
+/// and descended from no seat. A process in the row's tree whose environment
+/// names, by [`seat_ids`], a verifier seat of the row still in `census` is
+/// the verifier's too. One naming the ended member's seat, or none, is not.
+///
 /// `None` when no backend answered: a census that failed says nothing about
 /// which rows have a seat, so the caller signals and names nothing.
 pub fn left_in_finished(
@@ -823,6 +829,16 @@ pub fn left_in_finished(
         }
     }
     found.retain(|l| !l.pids.is_empty());
+    // What the row's verifier started and detached (`nohup … &`), adopted by
+    // a subreaper and under no seat now: by the seat id its environment kept.
+    for l in &mut found {
+        let standing: Vec<String> = verifiers(&l.row).into_iter().filter(|v| seats.contains_key(v)).collect();
+        if !standing.is_empty() {
+            let ids = seat_ids(&l.pids);
+            l.pids.retain(|p| !ids.get(p).is_some_and(|s| standing.contains(s)));
+        }
+    }
+    found.retain(|l| !l.pids.is_empty());
     // The executables are read only for processes there are to sort (`wsp-480`).
     if found.is_empty() {
         return Some(found);
@@ -875,6 +891,46 @@ pub fn descendants(seat: &[u32], table: &[(u32, u32, String)]) -> Vec<u32> {
         layer = next;
     }
     out
+}
+
+/// The seat id ([`crate::base::seat::SEAT_ENV`]) in the environment of each
+/// of `pids` that carries one (`wsp-453`). A process a seat's agent started
+/// keeps it through `nohup … &` after its shell exits and it is reparented, so
+/// it still says whose it is when the process tree no longer does. A process
+/// whose environment is not ours to read carries none.
+pub fn seat_ids(pids: &[u32]) -> BTreeMap<u32, String> {
+    if pids.is_empty() {
+        return BTreeMap::new();
+    }
+    if cfg!(target_os = "linux") {
+        return pids
+            .iter()
+            .filter_map(|p| Some((*p, seat_in_environ(&std::fs::read(format!("/proc/{p}/environ")).ok()?)?)))
+            .collect();
+    }
+    // `ps -E` appends the environment to the command, `KEY=value` words.
+    let key = format!("{}=", crate::base::seat::SEAT_ENV);
+    LOCAL
+        .table("pid=,command=", true)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            let id = it.filter_map(|w| w.strip_prefix(key.as_str())).next_back()?;
+            (pids.contains(&pid) && !id.is_empty()).then(|| (pid, id.to_string()))
+        })
+        .collect()
+}
+
+/// The seat id out of a NUL-separated `/proc/<pid>/environ`.
+fn seat_in_environ(environ: &[u8]) -> Option<String> {
+    let key = format!("{}=", crate::base::seat::SEAT_ENV);
+    environ
+        .split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(key.as_bytes()))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
 }
 
 /// A plain shell, the kind an agent runs a command in the background under.
@@ -1543,6 +1599,14 @@ mod tests {
     /// `wsp-453`: what a verifier seat runs is all under its agent, however
     /// deep, and never down through the carrier above it, whose other child
     /// is another seat's.
+    #[test]
+    fn a_seat_id_is_read_from_an_environ_and_only_whole() {
+        assert_eq!(seat_in_environ(b"A=1\0WSP_SEAT_ID=cpd-474\0WSP_SEAT_KIND=verifier\0"), Some("cpd-474".into()));
+        assert_eq!(seat_in_environ(b"XWSP_SEAT_ID=cpd-474\0"), None);
+        assert_eq!(seat_in_environ(b"WSP_SEAT_ID=\0"), None);
+        assert_eq!(seat_in_environ(b"PATH=/bin\0"), None);
+    }
+
     #[test]
     fn a_verifier_seats_descendants_are_all_under_its_agent_and_not_its_carriers_other_children() {
         let table = vec![

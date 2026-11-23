@@ -2967,6 +2967,90 @@ mod tests {
         assert!(log.contains(&format!("{yes} `")) && !log.contains(&format!("{} `", drive[0])), "{log}");
     }
 
+    /// `wsp-453` as 061 really ran: the verifier's drive was started by
+    /// `probe/dev.sh` as `nohup npx vite … &`, the shell exited at once, and
+    /// `npm exec vite` was adopted by `systemd --user`, so it descends from no
+    /// seat. What still says whose it is is the environment it kept:
+    /// `WSP_SEAT_ID` of the verifier's seat. Here the verifier (known by its
+    /// standing pass, its record listing only its agent) detaches an `npm` the
+    /// same way. The ended member's seat id is on another detached `npm`, and
+    /// a `yes` carries none. The tick fires: the verifier's npm survives, and
+    /// the other two are stopped.
+    #[test]
+    fn a_verifiers_detached_drive_survives_the_review_sweep_by_its_seat_id_and_the_members_does_not() {
+        let env = util::isolated("ending-453-detached");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let row = format!("y-453d-{}", std::process::id());
+        let mut t = Task::new(&row, &row);
+        t.set_status(Status::Review);
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.at = "2026-11-23T11:48:53Z".into();
+        p.pane = Some("cpd-474".into());
+        p.state = crate::verification::State::Running;
+        crate::verification::write(&mut t, &[p]);
+        store.save_task(&t).unwrap();
+        let (root, tree) = own_tree(&row);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
+        let npm = bin.join("npm");
+        std::fs::copy(sleep, &npm).unwrap();
+        let mut agent = agent_in(&tree);
+        // `nohup npm 60 &` from a shell that exits at once, as `probe/dev.sh`.
+        let detached = |seat: &str| -> u32 {
+            let out = wsp_base::calls::Command::new("sh")
+                .args(["-c", "nohup \"$0\" 60 >/dev/null 2>&1 </dev/null & echo $!", &npm.display().to_string()])
+                .env(crate::base::seat::SEAT_ENV, seat)
+                .current_dir(&tree)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+        let drive = detached("cpd-474");
+        let members = detached("cpd-473");
+        let is_npm = |p: u32| crate::check_tree::exes().iter().any(|(q, _, exe)| *q == p && exe.ends_with("npm"));
+        for _ in 0..250 {
+            if is_npm(drive) && is_npm(members) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(is_npm(drive) && is_npm(members), "the detached npms never ran: {drive} {members}");
+        let table = crate::check_tree::exes();
+        let ppid = table.iter().find(|(p, _, _)| *p == drive).map(|r| r.1).unwrap();
+        assert!(!crate::check_tree::descendants(&[agent.id()], &table).contains(&drive), "detached from the seat ({ppid})");
+        let yes = wsp_base::calls::Command::new("sh")
+            .args(["-c", "yes >/dev/null 2>&1 </dev/null & echo $!"])
+            .env_remove(crate::base::seat::SEAT_ENV)
+            .current_dir(&tree)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let yes: u32 = String::from_utf8_lossy(&yes.stdout).trim().parse().unwrap();
+        let mut f = Fake::default();
+        f.state.insert("cpd-474".into(), State::Idle);
+        f.typed.insert("cpd-474".into(), false);
+        f.pids.insert("cpd-474".into(), vec![agent.id()]);
+        f.census = Some(vec![("cpd-474".into(), format!("{row} · verifying"))]);
+        SCANS.with(|c| c.set(true));
+        tick(&store, &f);
+        SCANS.with(|c| c.set(false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (drive_alive, members_alive, yes_alive) = (alive(&[drive]), alive(&[members]), alive(&[yes]));
+        crate::host::Host::signal(&crate::host::LOCAL, &[drive, members, yes], "KILL");
+        crate::host::Host::signal(&crate::host::LOCAL, &children_of(agent.id()), "KILL");
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&root);
+        let log = log_of(&store, &row);
+        assert_eq!(drive_alive, vec![drive], "the verifier's detached npm survives the sweep: {log}");
+        assert!(members_alive.is_empty(), "the ended member's detached npm {members} was stopped: {log}");
+        assert!(yes_alive.is_empty(), "the orphaned yes {yes} was stopped: {log}");
+        assert!(!log.contains(&format!("{drive} `")), "{log}");
+    }
+
     /// `wsp-444`: under `WSP_JOBS=inproc` the daemon runs a ready row's check
     /// in its own process, each step a job on `wsp-host`'s runner: no `wsp
     /// check` and no manager job above the step's `npm`, which stands in the
