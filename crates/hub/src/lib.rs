@@ -1,6 +1,8 @@
-//! The hub's store (wsp-460; the multiplayer design's "Version 1"): objects,
-//! refs and leases for the `wsp-hub` binary, which hosts no agents, runs no
-//! builds and holds no worktree.
+//! The hub (wsp-460; the multiplayer design's "Version 1"): objects, refs and
+//! leases for the `wsp-hub` binary, which hosts no agents, runs no builds and
+//! holds no worktree. [`serve`] puts the store on wsp-server's carrier
+//! ([`Config`] is the file `wsp-hub serve --config` reads); [`HubStore`] is
+//! what it serves, whose event log announces each move as `ref.moved`.
 //!
 //! A data directory holds two things:
 //!
@@ -27,7 +29,10 @@
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
 //! `ok` answer, not an `err`.
 
+mod config;
 mod objects;
+pub mod serve;
+mod store;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,21 +43,29 @@ use wsp_api::{
 };
 use wsp_store_contract::{
     Command, Domain, Draft, Error, Event, LeaseName, Leases, Principal, Refusal, Result, Rev,
-    RowId, State, Texts, Token,
+    RowId, State, Subject, Texts, Token,
 };
 use wsp_store_sqlite::SqliteStore;
 
+pub use config::{Config, DEFAULT_PORT};
 pub use objects::ObjectDir;
+pub use store::HubStore;
 
 /// The section of a workspace's refs text.
 const HEADS: &str = "heads";
+
+/// The row prefix of a workspace's announcements: one section per moved
+/// subject (its JSON), written empty after each move, so that the store's
+/// `text.set` for it says which subject moved ([`HubStore`] reads it as a
+/// `ref.moved`).
+pub(crate) const MOVED_PREFIX: &str = "hub-moved:";
 
 /// The hub's store on one data directory.
 #[derive(Debug)]
 pub struct Hub {
     dir: PathBuf,
     objects: ObjectDir,
-    db: SqliteStore,
+    pub(crate) db: SqliteStore,
 }
 
 /// The domain of the hub's SQLite: it takes no commands, and the events the
@@ -183,10 +196,32 @@ impl Hub {
             refs.set(mv.subject.clone(), mv.to);
             let body = serde_json::to_string(&refs).map_err(backend)?;
             match self.db.set_text(&row, HEADS, body, rev) {
-                Ok(_) => return Ok(Move::Moved { head: mv.to }),
+                Ok(_) => {
+                    self.announce(&mv.workspace, &mv.subject);
+                    return Ok(Move::Moved { head: mv.to });
+                }
                 // Another move wrote these refs since they were read: read again.
                 Err(Error::Refused(Refusal::Conflict { .. })) => continue,
                 Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Writes the announcement of a move: the store's `text.set` for the
+    /// workspace's announcement row, in the section named by the subject. It
+    /// follows the move's own write and is no part of it, so a crash between
+    /// the two loses the announcement and keeps the move: the refs are the
+    /// truth, an announcement a hint to fetch them, and a subscriber that
+    /// reconnects syncs from them whatever it heard.
+    fn announce(&self, workspace: &WorkspaceId, subject: &Subject) {
+        let Ok(section) = serde_json::to_string(subject) else { return };
+        let row = RowId(format!("{MOVED_PREFIX}{}", workspace.0));
+        // Another announcement of this row may land first: write on the revision found.
+        for _ in 0..64 {
+            let Ok((_, rev)) = self.db.text(&row, &section) else { return };
+            match self.db.set_text(&row, &section, String::new(), rev) {
+                Err(Error::Refused(Refusal::Conflict { .. })) => continue,
+                _ => return,
             }
         }
     }

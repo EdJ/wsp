@@ -222,8 +222,14 @@ impl Client<'_> {
             Call::Verb(Verb::Subscribe(sub)) => return self.subscribe(id, sub),
             Call::Verb(verb) => read(self.shared, verb),
             Call::Command(cmd) => return self.command(id, req.key, cmd),
-            // The sync verbs are the hub's (wsp-460); this server keeps no objects.
-            Call::Sync(call) => Err(failure(Code::Unsupported, format!("{} is a hub's verb, not this server's", call.verb()))),
+            // The sync verbs are the hub's (wsp-460): answered by what it handed in, else not this server's.
+            Call::Sync(call) => match &self.shared.cfg.sync {
+                Some(sync) => match sync.answer(&self.hello.by, call) {
+                    Outcome::Ok(a) => Ok(a),
+                    Outcome::Err(f) => Err(f),
+                },
+                None => Err(failure(Code::Unsupported, format!("{} is a hub's verb, not this server's", call.verb()))),
+            },
             Call::Unknown { verb, .. } => {
                 if READ_VERBS.contains(&verb.as_str())
                     || COMMAND_VERBS.contains(&verb.as_str())

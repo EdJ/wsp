@@ -171,6 +171,11 @@ pub enum EventKind {
     HubWorkspaceAdded,
     #[serde(rename = "hub.member.set")]
     HubMemberSet,
+    // The hub's refs (wsp-460): a subject's head moved in a workspace. The
+    // subject is the one moved, the workspace the event's, the payload
+    // `{"workspace", "subject", "to"}`.
+    #[serde(rename = "ref.moved")]
+    RefMoved,
     // Text (2.5).
     #[serde(rename = "text.set")]
     TextSet,

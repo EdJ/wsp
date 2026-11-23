@@ -38,19 +38,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use wsp_api::{
-    ApiToken, Code, Connection, Failure, Frame, Hello, Listen, Principal, LISTEN_FILE, PROTOCOL, TOKEN_FILE,
-    TOKEN_MODE,
+    ApiToken, Code, Connection, Failure, Frame, Hello, Listen, Outcome, Principal, SyncCall, LISTEN_FILE, PROTOCOL,
+    TOKEN_FILE, TOKEN_MODE,
 };
 use wsp_store_contract::{At, Store};
 
 mod conn;
 pub mod domain;
 pub mod mirror;
+pub mod ranges;
 mod subscribe;
 pub mod tcp;
 
 pub use domain::{Composed, Mode, OWNED};
 pub use mirror::Mirror;
+pub use ranges::Ranges;
 
 /// The store a server serves: any backend, shared with its threads.
 pub type SharedStore = Arc<dyn Store + Send + Sync>;
@@ -87,6 +89,22 @@ impl std::fmt::Debug for dyn Views {
     }
 }
 
+/// What answers the sync verbs (wsp-459: `sync.heads`, `sync.have`, `sync.put`,
+/// `sync.get`, `refs.move`), which the hub (wsp-460) serves and a state core
+/// does not. Like [`Views`], it is handed in, since what holds the objects is
+/// no `dyn Store`: the server passes the call and the connection's principal in
+/// and the outcome back whole, on the asking connection's thread, after the
+/// hello and the request's `by` were checked.
+pub trait SyncVerbs: Send + Sync {
+    fn answer(&self, by: &Principal, call: SyncCall) -> Outcome;
+}
+
+impl std::fmt::Debug for dyn SyncVerbs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SyncVerbs(..)")
+    }
+}
+
 /// What a server is started with.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -103,6 +121,11 @@ pub struct Config {
     pub beat: Duration,
     /// What answers the view verbs; none answers each `unsupported`.
     pub views: Option<Arc<dyn Views>>,
+    /// What answers the sync verbs; none answers each `unsupported`.
+    pub sync: Option<Arc<dyn SyncVerbs>>,
+    /// The ranges a peer must be in, and an address to bind (loopback aside,
+    /// which is always bound): none keeps [`allowed`]'s loopback and tailnet.
+    pub peers: Option<Ranges>,
 }
 
 impl Config {
@@ -116,6 +139,17 @@ impl Config {
             instance: "wsp".into(),
             beat: Duration::from_secs(wsp_api::BEAT_SECS),
             views: None,
+            sync: None,
+            peers: None,
+        }
+    }
+
+    /// Whether a peer at `ip` may connect, or the server bind it: [`Config::peers`]
+    /// when it names ranges, else [`allowed`].
+    pub fn admits(&self, ip: &IpAddr) -> bool {
+        match &self.peers {
+            Some(ranges) => ranges.contains(ip),
+            None => allowed(ip),
         }
     }
 }
@@ -134,7 +168,7 @@ pub enum StartError {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartError::Address(ip) => write!(f, "{ip} is neither loopback nor the tailnet"),
+            StartError::Address(ip) => write!(f, "{ip} is outside the ranges this server admits (loopback and the tailnet unless configured)"),
             StartError::Answered { addr, who } => write!(f, "{who} answers at {addr}"),
             StartError::Io(why) => f.write_str(why),
         }
@@ -242,7 +276,7 @@ impl Server {
     /// answers the port, bind loopback and `cfg.addrs`, write `api.json`, and
     /// accept.
     pub fn start(store: SharedStore, cfg: Config) -> Result<Server, StartError> {
-        if let Some(bad) = cfg.addrs.iter().find(|ip| !allowed(ip)) {
+        if let Some(bad) = cfg.addrs.iter().find(|ip| !cfg.admits(ip)) {
             return Err(StartError::Address(*bad));
         }
         let mut ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
@@ -393,8 +427,8 @@ fn accept(shared: Arc<Shared>, listener: TcpListener) {
     while !shared.stopping() {
         match listener.accept() {
             Ok((stream, peer)) => {
-                if !allowed(&peer.ip()) {
-                    shared.log.line(&format!("{peer}: refused, neither loopback nor the tailnet"));
+                if !shared.cfg.admits(&peer.ip()) {
+                    shared.log.line(&format!("{peer}: refused, outside the ranges this server admits"));
                     drop(stream);
                     continue;
                 }

@@ -378,9 +378,12 @@ dependencies = [
 name = "wsp-hub"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "wsp-api",
+ "wsp-client",
  "wsp-objects",
+ "wsp-server",
  "wsp-store-contract",
  "wsp-store-sqlite",
 ]
