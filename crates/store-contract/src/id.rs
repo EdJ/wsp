@@ -85,6 +85,19 @@ pub struct AskId(pub String);
 #[serde(transparent)]
 pub struct MachineName(pub String);
 
+/// A hub user's name (`ed`). Any string is a name here: nothing parses or
+/// checks one, and the text form is the string itself.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserName(pub String);
+
+/// A token record's id on the hub. Not the token: the token is never in a
+/// command, event or entity, only its hash is ([`Credential::hash`](crate::Credential::hash)).
+/// Any string is an id here, and the text form is the string itself.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenId(pub String);
+
 /// A lease's name: `tick`, `barrier:<list>/<g>`, `sweep:<kind>`,
 /// `deliver:<seat>`, `claim:<row>`, `verify:<row>` (2.1). A claim is the lease
 /// `claim:<row>`.

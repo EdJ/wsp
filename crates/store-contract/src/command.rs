@@ -232,6 +232,21 @@ pub enum Command {
         #[serde(default)]
         facts: BTreeMap<String, String>,
     },
+    /// Add a hub user; a second user of one name is `invalid`.
+    #[serde(rename = "hub.user.add")]
+    HubUserAdd {
+        name: UserName,
+        #[serde(default)]
+        admin: bool,
+    },
+    #[serde(rename = "hub.user.revoke")]
+    HubUserRevoke { name: UserName },
+    /// Record a token for a user, by the hex SHA-256 of the token (never the token).
+    #[serde(rename = "hub.token.issue")]
+    HubTokenIssue { id: TokenId, user: UserName, hash: String },
+    /// Revoke a token record; revoking a revoked one is an empty decision.
+    #[serde(rename = "hub.token.revoke")]
+    HubTokenRevoke { id: TokenId },
     /// Step 1's projection (the module docs): each of `put` is now this, and
     /// each of `gone` is no more. Not fenced; only the mirror domain decides it.
     #[serde(rename = "mirror")]

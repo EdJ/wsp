@@ -69,7 +69,7 @@ fn ed() -> Principal {
     Principal::Person("ed".into())
 }
 
-const COMMANDS: usize = 25;
+const COMMANDS: usize = 29;
 
 fn command(c: &Command) -> (usize, &'static str) {
     match c {
@@ -98,6 +98,10 @@ fn command(c: &Command) -> (usize, &'static str) {
         Command::OrderAcked { .. } => (22, "order.acked"),
         Command::OrderRefused { .. } => (23, "order.refused"),
         Command::OrderDone { .. } => (24, "order.done"),
+        Command::HubUserAdd { .. } => (25, "hub.user.add"),
+        Command::HubUserRevoke { .. } => (26, "hub.user.revoke"),
+        Command::HubTokenIssue { .. } => (27, "hub.token.issue"),
+        Command::HubTokenRevoke { .. } => (28, "hub.token.revoke"),
     }
 }
 
@@ -217,6 +221,21 @@ fn commands() -> Vec<Command> {
         Command::OrderDone {
             order: OrderId("ord-1".into()),
         },
+        Command::HubUserAdd {
+            name: UserName("ann".into()),
+            admin: true,
+        },
+        Command::HubUserRevoke {
+            name: UserName("ann".into()),
+        },
+        Command::HubTokenIssue {
+            id: TokenId("t-1".into()),
+            user: UserName("ann".into()),
+            hash: "ab".repeat(32),
+        },
+        Command::HubTokenRevoke {
+            id: TokenId("t-1".into()),
+        },
     ]
 }
 
@@ -260,7 +279,7 @@ fn every_command_round_trips_under_its_verb() {
     });
 }
 
-const EVENT_KINDS: usize = 48;
+const EVENT_KINDS: usize = 52;
 
 fn event_kind(k: &EventKind) -> (usize, &'static str) {
     use EventKind::*;
@@ -313,6 +332,10 @@ fn event_kind(k: &EventKind) -> (usize, &'static str) {
         MirrorPut => (45, "mirror.put"),
         MirrorGone => (46, "mirror.gone"),
         Unknown => (47, "unknown"),
+        HubUserAdded => (48, "hub.user.added"),
+        HubUserRevoked => (49, "hub.user.revoked"),
+        HubTokenIssued => (50, "hub.token.issued"),
+        HubTokenRevoked => (51, "hub.token.revoked"),
     }
 }
 
@@ -368,6 +391,10 @@ fn every_event_kind_round_trips_under_its_name() {
         MirrorPut,
         MirrorGone,
         Unknown,
+        HubUserAdded,
+        HubUserRevoked,
+        HubTokenIssued,
+        HubTokenRevoked,
     ];
     table(&kinds, EVENT_KINDS, event_kind, as_str);
     // A newer writer's kind reads as Unknown.
@@ -855,10 +882,14 @@ fn the_whole_state_events_and_feed_round_trip() {
         }),
         Subject::Machine(MachineName("mac".into())),
         Subject::Lease(LeaseName("tick".into())),
+        Subject::User(UserName("ann".into())),
+        Subject::Credential(TokenId("t-1".into())),
     ];
     for sub in &subjects {
         trip(sub);
     }
+    assert_eq!(trip(&subjects[11]), json!({"user": "ann"}));
+    assert_eq!(trip(&subjects[12]), json!({"credential": "t-1"}));
     let e = Event {
         id: EventId(12),
         at: At(5),
@@ -1098,4 +1129,73 @@ fn a_split_state_absorbs_back_to_itself_and_each_piece_keeps_to_its_budget() {
     // An entity over the budget is a piece alone.
     assert!(big.clone().split(1).iter().all(|p| p.rows.len() + p.runs.len() + p.lists.len() + p.seats.len()
         + p.claims.len() + p.orders.len() + p.asks.len() + p.machines.len() + p.leases.len() == 1));
+}
+
+/// The hub's identity (wsp-158): both entities round-trip in their wire form,
+/// a field a frame leaves out takes its default, and the token is not in them.
+#[test]
+fn the_hub_entities_round_trip_in_their_wire_form() {
+    let user = User {
+        name: UserName("ann".into()),
+        state: IdentityState::Active,
+        admin: true,
+    };
+    assert_eq!(
+        trip(&user),
+        json!({"name": "ann", "state": "active", "admin": true})
+    );
+    let revoked = User {
+        state: IdentityState::Revoked,
+        ..user
+    };
+    assert_eq!(trip(&revoked)["state"], "revoked");
+    let cred = Credential {
+        id: TokenId("t-1".into()),
+        user: UserName("ann".into()),
+        hash: "ab".repeat(32),
+        state: IdentityState::Revoked,
+        issued: At(1_000),
+        revoked: Some(At(2_000)),
+    };
+    assert_eq!(
+        trip(&cred),
+        json!({
+            "id": "t-1", "user": "ann", "hash": "ab".repeat(32),
+            "state": "revoked", "issued": 1000, "revoked": 2000
+        })
+    );
+    // A frame without `revoked` or `admin` decodes to their defaults.
+    let c: Credential = serde_json::from_value(
+        json!({"id": "t-1", "user": "ann", "hash": "00", "state": "active", "issued": 1}),
+    )
+    .unwrap();
+    assert_eq!(c.revoked, None);
+    let u: User = serde_json::from_value(json!({"name": "bob", "state": "active"})).unwrap();
+    assert!(!u.admin);
+    // The commands carry the hash and no token.
+    let issue = serde_json::to_value(&commands()[27]).unwrap();
+    assert_eq!(issue["verb"], "hub.token.issue");
+    assert_eq!(
+        issue["args"],
+        json!({"id": "t-1", "user": "ann", "hash": "ab".repeat(32)})
+    );
+}
+
+/// The text forms of `UserName` and `TokenId` are total: any string, the empty
+/// one and ones with separators and non-ASCII included, is one, and it is its
+/// own text on the wire.
+#[test]
+fn the_text_forms_of_user_names_and_token_ids_are_total() {
+    for text in ["", "ann", "a b", "person:ed", "a/b:c", "ünï😀", "\"\n\"", "0"] {
+        assert_eq!(trip(&UserName(text.into())), json!(text));
+        assert_eq!(trip(&TokenId(text.into())), json!(text));
+        assert_eq!(
+            serde_json::from_value::<UserName>(json!(text)).unwrap(),
+            UserName(text.into())
+        );
+        assert_eq!(
+            serde_json::from_value::<TokenId>(json!(text)).unwrap(),
+            TokenId(text.into())
+        );
+    }
 }

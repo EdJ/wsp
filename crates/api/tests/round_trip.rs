@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use wsp_api::*;
 use wsp_store_contract::{
     At, Block, Claim, Entity, EventKind, Fence, GroupId, LeaseName, ListState, MachineName,
-    ProjectId, ReleaseTo, RowState, SeatState, Subject, Token, Transport, Verdict,
+    ProjectId, ReleaseTo, RowState, SeatState, Subject, Token, TokenId, Transport, UserName, Verdict,
 };
 
 // ---------------------------------------------------------------- fixtures
@@ -275,7 +275,7 @@ fn every_frame_type_round_trips() {
 
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 17;
-const COMMANDS: usize = 25;
+const COMMANDS: usize = 29;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
@@ -327,6 +327,10 @@ fn command_ordinal(c: &Command) -> (usize, &'static str) {
         Command::OrderAcked { .. } => (22, "order.acked"),
         Command::OrderRefused { .. } => (23, "order.refused"),
         Command::OrderDone { .. } => (24, "order.done"),
+        Command::HubUserAdd { .. } => (25, "hub.user.add"),
+        Command::HubUserRevoke { .. } => (26, "hub.user.revoke"),
+        Command::HubTokenIssue { .. } => (27, "hub.token.issue"),
+        Command::HubTokenRevoke { .. } => (28, "hub.token.revoke"),
     }
 }
 
@@ -503,6 +507,21 @@ fn requests() -> Vec<Frame> {
         },
         Command::OrderDone {
             order: an_order().id,
+        },
+        Command::HubUserAdd {
+            name: UserName("ann".into()),
+            admin: false,
+        },
+        Command::HubUserRevoke {
+            name: UserName("ann".into()),
+        },
+        Command::HubTokenIssue {
+            id: TokenId("t-1".into()),
+            user: UserName("ann".into()),
+            hash: "ab".repeat(32),
+        },
+        Command::HubTokenRevoke {
+            id: TokenId("t-1".into()),
         },
     ];
     let mut out: Vec<Call> = vec![];

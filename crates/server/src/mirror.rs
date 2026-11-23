@@ -107,7 +107,12 @@ fn entity_at(state: &State, subject: &Subject) -> Option<Entity> {
         Subject::Order(id) => state.orders.get(id).cloned().map(Entity::Order),
         Subject::Ask(id) => state.asks.get(id).cloned().map(Entity::Ask),
         Subject::Machine(name) => state.machines.get(name).cloned().map(Entity::Machine),
-        Subject::Project(_) | Subject::Group(_) | Subject::Run(_) | Subject::Lease(_) => None,
+        Subject::Project(_)
+        | Subject::Group(_)
+        | Subject::Run(_)
+        | Subject::Lease(_)
+        | Subject::User(_)
+        | Subject::Credential(_) => None,
     }
 }
 
@@ -173,7 +178,7 @@ fn remove(state: &mut State, subject: &Subject) {
         Subject::Lease(name) => {
             state.leases.remove(name);
         }
-        Subject::Project(_) | Subject::Group(_) | Subject::Run(_) => {}
+        Subject::Project(_) | Subject::Group(_) | Subject::Run(_) | Subject::User(_) | Subject::Credential(_) => {}
     }
 }
 
@@ -211,6 +216,8 @@ fn about(cmd: &Command) -> Subject {
         Command::AskAnswer { ask, .. } | Command::AskAck { ask } => Subject::Ask(ask.clone()),
         Command::AskRaise { about: Some(s), .. } => s.clone(),
         Command::MachineSet { name, .. } => Subject::Machine(name.clone()),
+        Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } => Subject::User(name.clone()),
+        Command::HubTokenIssue { id, .. } | Command::HubTokenRevoke { id } => Subject::Credential(id.clone()),
         Command::SeatSpawn { row: None, .. } | Command::AskRaise { about: None, .. } | Command::Mirror { .. } => {
             Subject::Project(ProjectId(String::new()))
         }
@@ -359,6 +366,28 @@ mod tests {
             assert_eq!(
                 Mirror.decide(&State::default(), &cmd, &ed()),
                 Err(Refusal::Illegal { subject: Subject::Order(o.clone()), state: MIRRORED.into(), verb: verb(&cmd) })
+            );
+        }
+    }
+
+    /// The hub's verbs (wsp-158) are refused `illegal`, state `mirrored`, naming
+    /// the user or the token record.
+    #[test]
+    fn the_hub_verbs_are_refused_mirrored() {
+        use wsp_store_contract::{TokenId, UserName};
+        let (u, t) = (UserName("ann".into()), TokenId("t-1".into()));
+        for (cmd, subject) in [
+            (Command::HubUserAdd { name: u.clone(), admin: false }, Subject::User(u.clone())),
+            (Command::HubUserRevoke { name: u.clone() }, Subject::User(u.clone())),
+            (
+                Command::HubTokenIssue { id: t.clone(), user: u.clone(), hash: "ab".repeat(32) },
+                Subject::Credential(t.clone()),
+            ),
+            (Command::HubTokenRevoke { id: t.clone() }, Subject::Credential(t.clone())),
+        ] {
+            assert_eq!(
+                Mirror.decide(&State::default(), &cmd, &ed()),
+                Err(Refusal::Illegal { subject, state: MIRRORED.into(), verb: verb(&cmd) })
             );
         }
     }

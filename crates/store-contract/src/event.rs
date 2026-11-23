@@ -46,6 +46,8 @@ pub enum Subject {
     Run(RunKey),
     Machine(MachineName),
     Lease(LeaseName),
+    User(UserName),
+    Credential(TokenId),
 }
 
 /// The kinds of event the machines write (section 3), by their wire names.
@@ -148,6 +150,15 @@ pub enum EventKind {
     MachineSet,
     #[serde(rename = "machine.beat")]
     MachineBeat,
+    // The hub's identity (multiplayer v1).
+    #[serde(rename = "hub.user.added")]
+    HubUserAdded,
+    #[serde(rename = "hub.user.revoked")]
+    HubUserRevoked,
+    #[serde(rename = "hub.token.issued")]
+    HubTokenIssued,
+    #[serde(rename = "hub.token.revoked")]
+    HubTokenRevoked,
     // Text (2.5).
     #[serde(rename = "text.set")]
     TextSet,

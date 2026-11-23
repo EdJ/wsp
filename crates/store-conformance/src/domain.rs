@@ -29,6 +29,7 @@
 //! | `order.send` | to a seat not `ending` or `gone` | `illegal`, `not_found` |
 //! | `order.cancel` | `queued`, `typed` | `illegal` |
 //! | `order.deliver`, `order.delivered`, `order.acked`, `order.refused`, `order.done` | never: this domain stops an order at `queued` (wsp-117) | `illegal` |
+//! | `hub.user.add`, `hub.user.revoke`, `hub.token.issue`, `hub.token.revoke` | never: the hub's identity is wsp-159's domain (wsp-158) | `illegal` |
 //! | `mirror` | never: it is step 1's, and only the server's mirror domain decides it | `illegal` |
 //!
 //! `row.add` and `seat.spawn` are always legal (a second `seat.spawn` with the
@@ -43,7 +44,9 @@
 //!
 //! The orders machine's verbs past `order.send` (wsp-117) are refused the same
 //! way: `illegal`, naming the order, with its state's wire name, or `""` when
-//! the state has no such order. `order.send`'s `first` is kept on the [`Order`].
+//! the state has no such order. The hub's four verbs are refused `illegal` the
+//! same way, naming the user or the token record, with the state `""` (this
+//! domain holds none). `order.send`'s `first` is kept on the [`Order`].
 
 use serde_json::{json, Value};
 use wsp_store_contract::*;
@@ -318,6 +321,20 @@ impl Domain for TestDomain {
                 let state = state.orders.get(order).map(|o| wire!(&o.state)).unwrap_or_default();
                 return Err(Refusal::Illegal { subject: Subject::Order(order.clone()), state, verb: verb(cmd) });
             }
+            Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } => {
+                return Err(Refusal::Illegal {
+                    subject: Subject::User(name.clone()),
+                    state: String::new(),
+                    verb: verb(cmd),
+                });
+            }
+            Command::HubTokenIssue { id, .. } | Command::HubTokenRevoke { id } => {
+                return Err(Refusal::Illegal {
+                    subject: Subject::Credential(id.clone()),
+                    state: String::new(),
+                    verb: verb(cmd),
+                });
+            }
             Command::ListGo { .. }
             | Command::ListHold { .. }
             | Command::ListRelease { .. }
@@ -490,6 +507,39 @@ mod tests {
                     Err(Refusal::Illegal { subject: Subject::Order(o.clone()), state: word.into(), verb: verb(cmd) })
                 );
             }
+        }
+    }
+
+    /// The hub's four verbs (wsp-158) are refused `illegal`, naming the user or
+    /// the token record: only the hub's domain decides them.
+    #[test]
+    fn the_hub_verbs_are_refused_as_illegal() {
+        let ed = Principal::Person("ed".into());
+        let user = UserName("ann".into());
+        let token = TokenId("t-1".into());
+        let users = [
+            Command::HubUserAdd { name: user.clone(), admin: true },
+            Command::HubUserRevoke { name: user.clone() },
+        ];
+        let tokens = [
+            Command::HubTokenIssue { id: token.clone(), user: user.clone(), hash: "ab".repeat(32) },
+            Command::HubTokenRevoke { id: token.clone() },
+        ];
+        for cmd in &users {
+            assert_eq!(
+                TestDomain.decide(&State::default(), cmd, &ed),
+                Err(Refusal::Illegal { subject: Subject::User(user.clone()), state: "".into(), verb: verb(cmd) })
+            );
+        }
+        for cmd in &tokens {
+            assert_eq!(
+                TestDomain.decide(&State::default(), cmd, &ed),
+                Err(Refusal::Illegal {
+                    subject: Subject::Credential(token.clone()),
+                    state: "".into(),
+                    verb: verb(cmd)
+                })
+            );
         }
     }
 }

@@ -11,14 +11,14 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
   unchanged; the modules below, re-exported at the root
 - `src/id.rs` — 2.1's keys and 2.2's values: `EventId` (monotonic), `IdempotencyKey`, `Token` (per lease name),
   `Rev`, `At` (Unix ms), the ids (`RowId`, `ListId`, `GroupId`, `SeatId`, `OrderId`, `AskId`, `MachineName`,
-  `LeaseName`, with `LeaseName::deliver(&SeatId)` naming `deliver:<seat>`, `ProjectId`, `RunKey`), and `Principal` (person, seat, manager, executor, `wsp:<instance>`)
+  `LeaseName`, with `LeaseName::deliver(&SeatId)` naming `deliver:<seat>`, `ProjectId`, `RunKey`, and the hub's `UserName` and `TokenId`: any string, text form the string itself), and `Principal` (person, seat, manager, executor, `wsp:<instance>`)
 - `src/entity.rs` — 2.1's entities with section 3's states as enums: `Row`/`RowState` (3.3), `List`, `Group` and
   their shared `ListState` (3.4), `Seat`/`SeatState` (3.2), `Order`/`OrderState` (3.1), `Claim`, `Ask` (kind
-  ask/note/flag), `Run`, `Machine`/`Transport`, `Lease`; `State`, the whole domain as `snapshot()` returns it;
+  ask/note/flag), `Run`, `Machine`/`Transport`, `Lease`, and the hub's `User` and `Credential` with `IdentityState` (wsp-158); `State`, the whole domain as `snapshot()` returns it;
   `Entity`, one of row, list, seat, claim, order, ask, machine, whole, as `mirror` puts it (wsp-070). `Row`,
   `List`, `Group`, `Seat` and `Ask` carry `fields` (name → value), `Machine` its `facts`
 - `src/event.rs` — `Event` (2.1: id, at, principal, kind, subject, payload), `EventKind` (the kinds section 3's
-  machines write, by wire name: `seat.started`, `order.acknowledged`, ...), `Subject`, and `Draft` (an event
+  machines write, by wire name: `seat.started`, `order.acknowledged`, ...), `Subject` (with `User` and `Credential`), the hub's four `hub.*` kinds, and `Draft` (an event
   before the backend stamps its id and moment); `mirror.put` and `mirror.gone` (step 1's, below)
 - `src/command.rs` — `Command`, one variant per command verb of 4.2, tagged `verb` with `args` as 4.1's envelope
   carries them, `Mirror { put, gone }` (wire `mirror`, step 1's), and step 2's orders verbs (below); `Fence { lease, token }` (2.2) and `FENCED_VERBS`; `Applied` (the new events' ids); `Block`,
@@ -98,6 +98,22 @@ none can say "this entity is now X"; `Command::Mirror { put: Vec<Entity>, gone: 
   (the seat was busy). Not fenced.
 - **Who refuses them today**: `TestDomain` (`illegal`, naming the order, with its state) and the server's
   `mirror::Mirror` (`illegal`, state `mirrored`, as every verb but `mirror`).
+
+## The hub's identity (wsp-158)
+
+Multiplayer v1's users and tokens, as types only (R2); wsp-159's domain decides them, and nothing in the root crate
+names them yet. Groups, roles and stewards are Later.
+
+- **Commands**: `hub.user.add { name, admin }`, `hub.user.revoke { name }`, `hub.token.issue { id, user, hash }`,
+  `hub.token.revoke { id }`. Events: `hub.user.added`, `hub.user.revoked`, `hub.token.issued`, `hub.token.revoked`.
+  Subjects `User(UserName)` and `Credential(TokenId)`.
+- **Entities**: `User { name, state, admin }` and `Credential { id, user, hash, state, issued, revoked }`, with
+  `IdentityState` `active` or `revoked`. `hash` is the hex SHA-256 of the token; the token itself is never in a
+  command, event or entity. They are not in `Entity` or `State` yet: wsp-159 puts them where its domain keeps them.
+- **No new refusals**: a second user of one name is `invalid`, and revoking a revoked token is an empty decision;
+  both are wsp-159's to decide.
+- **Who refuses them today**: `TestDomain` (`illegal`, naming the user or the token record, state `""`) and the
+  server's `mirror::Mirror` (`illegal`, state `mirrored`).
 
 ## What a backend and a domain must agree on (wsp-065)
 

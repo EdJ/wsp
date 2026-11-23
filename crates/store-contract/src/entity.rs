@@ -109,6 +109,14 @@ pub enum RunVerdict {
     Fail,
 }
 
+/// A hub user's or token record's state: live, or revoked and kept as a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityState {
+    Active,
+    Revoked,
+}
+
 /// How wsp reaches a machine's executor.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,6 +289,28 @@ pub struct Lease {
     pub holder: Principal,
     pub token: Token,
     pub expires: At,
+}
+
+/// A person on the hub (multiplayer v1: users and tokens only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub name: UserName,
+    pub state: IdentityState,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// A token's record on the hub. `hash` is the hex SHA-256 of the token; the
+/// token itself is never in a command, event or entity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credential {
+    pub id: TokenId,
+    pub user: UserName,
+    pub hash: String,
+    pub state: IdentityState,
+    pub issued: At,
+    #[serde(default)]
+    pub revoked: Option<At>,
 }
 
 /// One entity of 2.1, whole, as [`Command::Mirror`](crate::Command::Mirror)
