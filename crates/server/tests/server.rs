@@ -1292,8 +1292,8 @@ impl Domain for Members {
 struct ByMembers;
 
 impl wsp_server::Gate for ByMembers {
-    fn hello(&self, hello: &Hello, _token: &ApiToken) -> std::result::Result<Principal, String> {
-        Ok(hello.by.clone())
+    fn hello(&self, hello: &Hello, _token: &ApiToken) -> std::result::Result<wsp_server::Welcomed, String> {
+        Ok(wsp_server::Welcomed { by: hello.by.clone(), credential: None })
     }
 
     fn admits(&self, _by: &Principal, _call: &Call) -> std::result::Result<(), wsp_api::Failure> {
