@@ -1271,6 +1271,13 @@ mod tests {
     use serde_json::json;
     use wsp_store::message::{Kind, Message};
 
+    #[test]
+    fn a_person_is_mirrored_as_the_engineer_the_record_names_else_as_person() {
+        let text = |p: &Party| wsp_api::principal::text(&principal(p));
+        assert_eq!(text(&Party::engineer("jesper")), "person:jesper");
+        assert_eq!(text(&Party::Human(None)), "person:person");
+    }
+
     fn key(es: &[Entity]) -> BTreeMap<Subject, Entity> {
         es.iter().map(|e| (subject_of(e), e.clone())).collect()
     }
