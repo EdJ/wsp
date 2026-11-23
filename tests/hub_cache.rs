@@ -465,3 +465,168 @@ fn b_offline_across_a_thousand_changes_reconnects_with_one_heads_diff_not_a_thou
     assert!(heads >= 1, "B asked for the hub's heads");
     assert!(rig.b.said().iter().any(|l| l.contains("heads diff")), "the log says the stream skipped ahead: {:?}", rig.b.said());
 }
+
+// ───────────────────────── the offline journal (wsp-469) ─────────────────────────
+
+impl Spoke {
+    fn journal(&self) -> u64 {
+        self.status()["journal"].as_u64().unwrap_or(0)
+    }
+
+    fn side(&self) -> Value {
+        std::fs::read_to_string(self.state().join("hub/side.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
+    }
+}
+
+impl Rig {
+    fn record(&self, id: wsp_api::ObjectId) -> (wsp_store_contract::Row, Option<wsp_api::ObjectId>) {
+        match wsp_objects::decode(&self.hub().get(&[id]).unwrap()[0].bytes).unwrap() {
+            Object::Record { entity: Entity::Row(row), parent, .. } => (row, parent),
+            other => panic!("{id} is no row record: {other:?}"),
+        }
+    }
+
+    fn holder(&self, row: &str) -> Option<(String, u64)> {
+        let l = self.hub().row_lease(&RowId(row.into())).unwrap()?;
+        Some((format!("{:?}", l.holder), l.token.0))
+    }
+
+    fn hub_addr(&self) -> SocketAddr {
+        self.running.as_ref().unwrap().addrs()[0]
+    }
+}
+
+#[test]
+fn ann_loses_the_hub_mid_row_keeps_working_and_her_journal_fast_forwards_the_row_on_reconnect() {
+    let mut rig = Rig::up("j");
+    rig.a.start_daemon();
+    rig.b.start_daemon();
+    rig.a.wait("A's first turn", Duration::from_secs(60), |s| s.turns() >= 1);
+    rig.b.wait("B's first turn", Duration::from_secs(60), |s| s.turns() >= 1);
+
+    // Ann leases a row of hers; Bob sees it as a head.
+    let id = rig.a.add("Started online");
+    rig.a.ok(&["claim", &id, "--pane", "w1:p1"]);
+    rig.a.wait("Ann's lease on the hub", Duration::from_secs(30), |_| rig.holder(&id).is_some_and(|(h, _)| h.contains("ann")));
+    let (_, token) = rig.holder(&id).unwrap();
+    rig.b.wait("the row in Bob's ls", Duration::from_secs(30), |s| s.ls().contains("Started online"));
+    let now = rig.a.turns();
+    rig.a.wait("Ann's claim synced", Duration::from_secs(30), |s| s.turns() >= now + 2 && s.journal() == 0);
+    let before = rig.hub_head(&id).expect("the row is on the hub");
+
+    // The hub goes away mid-row; Ann keeps working.
+    rig.a.proxy.cut();
+    rig.a.wait("A's link down", Duration::from_secs(30), |s| s.status()["link"] == "down");
+    rig.a.ok(&["rename", &id, "Finished offline"]);
+    rig.a.wait("the rename journaled", Duration::from_secs(30), |s| s.journal() >= 1);
+    let journal = std::fs::read_dir(rig.a.state().join("hub/journal")).unwrap().count();
+    assert!(journal >= 1, "one file per object in the journal");
+    assert_eq!(rig.hub_head(&id), Some(before), "nothing reached the hub while it was away");
+    rig.a.ok(&["note", &id, "still going"]);
+    let shown = rig.a.ok(&["show", &id]);
+    assert!(shown.contains("w1:p1"), "the seat keeps the row while its lease is in date: {shown}");
+
+    // Back: the journal fast-forwards the row under the same lease.
+    rig.a.proxy.point_at(Some(rig.hub_addr()));
+    rig.a.wait("the journal pushed", Duration::from_secs(60), |s| s.journal() == 0 && s.status()["link"] == "up");
+    rig.a.wait("the hub's head moved", Duration::from_secs(30), |_| rig.hub_head(&id) != Some(before));
+    let head = rig.hub_head(&id).unwrap();
+    let (row, _) = rig.record(head);
+    assert_eq!(row.title, "Finished offline");
+    // A fast-forward: the hub's line from the head before the outage leads to it.
+    let mut at = Some(head);
+    let mut seen = false;
+    while let Some(i) = at {
+        if i == before {
+            seen = true;
+            break;
+        }
+        at = rig.record(i).1;
+    }
+    assert!(seen, "the pushed line follows the head the hub had before the outage");
+    assert_eq!(rig.holder(&id).map(|(_, t)| t), Some(token), "the lease held: the same token, no take again");
+    rig.b.wait("Bob's cache shows the work", Duration::from_secs(30), |s| s.ls().contains("Finished offline"));
+}
+
+#[test]
+fn ann_offline_past_the_ttl_with_the_row_re_leased_by_bob_lands_her_journal_as_a_side_chain() {
+    let mut rig = Rig::up("s");
+    // Ann's code is a git repo; the row's branch is hers.
+    let repo = rig.a.dir.join("code");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let o = Command::new("git").args(args).current_dir(&repo).env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+        assert!(o.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "master"]);
+    git(&["-c", "user.name=ann", "-c", "user.email=ann@x", "commit", "-q", "--allow-empty", "-m", "trunk"]);
+    rig.a.ok(&["project", "add", "beta", "--name", "Beta", "--root", repo.to_str().unwrap()]);
+    rig.b.ok(&["project", "add", "beta", "--name", "Beta"]);
+    rig.a.start_daemon();
+    rig.b.start_daemon();
+    rig.a.wait("A's first turn", Duration::from_secs(60), |s| s.turns() >= 1);
+    rig.b.wait("B's first turn", Duration::from_secs(60), |s| s.turns() >= 1);
+
+    rig.a.ok(&["add", "Ann's row", "-p", "beta", "--workspace", WORKSPACE]);
+    let id = rig.a.ok(&["ls", "--json"]);
+    let v: Value = serde_json::from_str(&id).unwrap();
+    let rows = v.as_array().cloned().or_else(|| v["rows"].as_array().cloned()).unwrap_or_default();
+    let id = rows.iter().find(|r| r["title"] == "Ann's row").and_then(|r| r["id"].as_str()).unwrap().to_string();
+    rig.a.ok(&["claim", &id, "--pane", "w1:p1"]);
+    rig.a.wait("Ann's lease on the hub", Duration::from_secs(30), |_| rig.holder(&id).is_some_and(|(h, _)| h.contains("ann")));
+    git(&["checkout", "-q", "-b", &id]);
+    git(&["-c", "user.name=ann", "-c", "user.email=ann@x", "commit", "-q", "--allow-empty", "-m", "ann's work"]);
+    let work = git(&["rev-parse", &id]);
+    git(&["checkout", "-q", "master"]);
+    let now = rig.a.turns();
+    rig.a.wait("Ann's claim synced", Duration::from_secs(30), |s| s.turns() >= now + 2 && s.journal() == 0);
+
+    // Ann goes offline, and gives her verdict there.
+    rig.a.proxy.cut();
+    rig.a.wait("A's link down", Duration::from_secs(30), |s| s.status()["link"] == "down");
+    rig.a.ok(&["done", &id, "--force"]);
+    rig.a.wait("the verdict journaled", Duration::from_secs(30), |s| s.journal() >= 1);
+
+    // A week and a day on the hub: Ann's lease runs out and Bob leases the row.
+    rig.hub().clock().advance(Duration::from_secs(8 * 86_400));
+    rig.hub().expire_leases().unwrap();
+    rig.b.wait("the row in Bob's ls", Duration::from_secs(30), |s| s.ls().contains(&id));
+    rig.b.ok(&["claim", &id, "--pane", "w1:p1"]);
+    rig.b.wait("Bob's lease", Duration::from_secs(30), |_| rig.holder(&id).is_some_and(|(h, _)| h.contains("bob")));
+    rig.b.wait("the row whole on Bob", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    rig.b.ok(&["rename", &id, "Bob's take"]);
+    rig.b.wait("Bob's work on the hub", Duration::from_secs(30), |_| rig.hub_head(&id).is_some_and(|h| rig.record(h).0.title == "Bob's take"));
+    let bobs = rig.hub_head(&id).unwrap();
+    let bob_lease = rig.holder(&id).unwrap();
+
+    // Ann back: her journal lands beside the row, not on it.
+    rig.a.proxy.point_at(Some(rig.hub_addr()));
+    rig.a.wait("the side chain on A", Duration::from_secs(60), |s| s.side()["rows"][&id]["mine"] == true);
+    rig.a.wait("A's journal empty", Duration::from_secs(30), |s| s.journal() == 0);
+    let side = rig.a.side()["rows"][&id].clone();
+    assert_eq!(side["holder"], "bob", "{side}");
+    let tip: wsp_api::ObjectId = format!("sha256:{}", side["tip"].as_str().unwrap()).parse().unwrap();
+    let (theirs, _) = rig.record(tip);
+    assert_eq!(theirs.id.0, id, "the side chain is on the hub");
+    assert_ne!(rig.record(bobs).0.state, theirs.state, "the side chain carries Ann's verdict, the row Bob's: {:?}", theirs.state);
+    assert_eq!(rig.hub_head(&id), Some(bobs), "no ref moved for the side chain");
+    assert_eq!(rig.holder(&id), Some(bob_lease), "Bob's lease stands");
+
+    // Ann's verdict is refused: the row follows Bob's line on her spoke, and a new one is refused.
+    rig.a.wait("Ann's file follows Bob's", Duration::from_secs(30), |s| s.ok(&["show", &id]).contains("Bob's take"));
+    let shown = rig.a.ok(&["show", &id]);
+    assert!(shown.contains("side chain"), "show says it: {shown}");
+    let (ok, said) = rig.a.run(&["done", &id, "--force"]);
+    assert!(!ok && said.contains("side chain") && said.contains("bob"), "Ann's verdict is refused: {said}");
+    assert!(!rig.hub_head(&id).is_some_and(|h| h != bobs), "and the hub never took it");
+
+    // Both are told.
+    assert!(rig.a.said().iter().any(|l| l.contains("side chain") && l.contains(&id)), "Ann's log: {:?}", rig.a.said());
+    rig.b.wait("Bob told", Duration::from_secs(30), |s| s.side()["rows"][&id]["old"] == "ann");
+    assert!(rig.b.said().iter().any(|l| l.contains("side chain") && l.contains(&id)), "Bob's log: {:?}", rig.b.said());
+    assert!(rig.b.ok(&["show", &id]).contains("side chain"));
+
+    // Ann's code is still on her branch.
+    assert_eq!(git(&["rev-parse", &id]), work, "the branch still holds Ann's commits");
+}

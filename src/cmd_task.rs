@@ -875,6 +875,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if let Some(line) = crate::hub_cache::show_line(store, &t.id) {
         println!("{} {}", p.dim(&util::pad("hub", 9)), line);
     }
+    // A side chain (wsp-469): this row's offline work went to the hub beside it.
+    if let Some(line) = crate::hub_journal::show_line(store, &t.id) {
+        println!("{} {}", p.dim(&util::pad("hub", 9)), line);
+    }
     // Above the prose rather than after it. Everything below this point reads
     // as a live record — a status, a parent, a log that stops — and a reader
     // who learns at the bottom that none of it is current has already acted on
@@ -1286,6 +1290,11 @@ fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<Stri
 /// names the seat and the command; the row is untouched.
 fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
+        // Another user leased it while this spoke was offline (wsp-469).
+        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "done") {
+            eprintln!("{why}");
+            return 1;
+        }
         let seats = standing_on(store, &t.id, live);
         if !seats.is_empty() {
             eprintln!(
@@ -1790,6 +1799,10 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             eprintln!("{why}");
             return 1;
         }
+        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "review") {
+            eprintln!("{why}");
+            return 1;
+        }
     }
     // Given no account: the one written at the place wsp keeps for it (`wsp-374`,
     // `$WSP_VERDICT`), when it was written in this run of the row.
@@ -1904,6 +1917,10 @@ pub(crate) fn accept(store: &Store, args: &Args, account: &str, said: Option<&st
 fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
     // A row copied to an executor is reviewed only at the tree `verify` ran on.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "submit") {
+            eprintln!("{why}");
+            return 1;
+        }
         if let Some(tree) = crate::cmd_checkout::member_tree(store, &t.id) {
             if let Err(why) = crate::treecopy::review_refusal(store, &t.id, &tree) {
                 eprintln!("wsp: {why}");

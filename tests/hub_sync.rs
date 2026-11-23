@@ -392,7 +392,8 @@ fn with_the_hub_stopped_the_worker_says_so_once_keeps_running_and_syncs_when_it_
 
     rig.start_hub();
     rig.wait("the second row on the hub", Duration::from_secs(60), |r| r.hub_head(&second).is_some());
-    assert_eq!(rig.status()["link"], "up");
+    // The turn that moved the ref writes `sync.json` when it ends.
+    rig.wait("the link up", Duration::from_secs(10), |r| r.status()["link"] == "up");
     let said = rig.said();
     assert_eq!(said.iter().filter(|l| l.contains("unreachable")).count(), 1, "still one line for it: {said:?}");
     assert_eq!(said.iter().filter(|l| l.contains("answers again")).count(), 1, "one line for its return: {said:?}");

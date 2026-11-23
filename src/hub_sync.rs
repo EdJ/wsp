@@ -40,18 +40,26 @@
 //! feed that lost its connection is dropped, not redialled from its last id: the
 //! next turn opens one from the hub's head when it is more than
 //! [`hub_cache::GAP`] events behind, and the heads diff is the catch-up.
+//!
+//! **The offline journal** (wsp-469, [`crate::hub_journal`]). Every record the
+//! worker makes is appended to `$WSP_STATE/hub/journal/` first, then pushed, and
+//! leaves it once the hub has it. A turn that cannot reach the hub still makes
+//! the records of the rows that moved ([`Worker::journal_offline`]); the turn
+//! that reaches it again settles what the journal holds by each row's lease
+//! ([`Worker::settle`]) before anything of it is pushed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use wsp_api::{Answer, Outcome};
+use wsp_api::{Answer, Blob, Move, Outcome, RefMove};
 use wsp_client::{Client, Credential, Feed, Item, ObjectSource, SyncError, SyncReport, HUBS_FILE};
 use wsp_objects::{Object, ObjectId, Refs, WorkspaceId};
-use wsp_store_contract::{At, Entity, EventId, EventKind, Principal, RowId, Subject, UserName};
+use wsp_store_contract::{At, Entity, EventId, EventKind, ListId, Principal, RowId, Subject, Token, UserName};
 
 use crate::door::{user_of, Applied, Door, Heads, Refusal};
 use crate::hub_cache::{self, Cache, Stream};
+use crate::hub_journal::{self, Entry, Journal, Leased, Side, Sides};
 use crate::reconcile::{Lease, Merging, NoLease, Objects};
 use crate::store::Store;
 
@@ -292,6 +300,8 @@ pub(crate) struct Turned {
     pub(crate) reconciled: usize,
     /// Rows of other people's kept as a head (wsp-465).
     pub(crate) heads: usize,
+    /// Rows whose journal went to the hub as a side chain (wsp-469).
+    pub(crate) sided: usize,
 }
 
 /// The sync worker: its connection, where the link stands, and what it said.
@@ -312,6 +322,13 @@ pub(crate) struct Worker {
     feed: Option<Feed>,
     /// Rows to take whole whatever they are (`wsp show --fetch`).
     forced: BTreeSet<Subject>,
+    /// Who the hub last said this connection is: the `by` of a record made offline.
+    by: Option<Principal>,
+    /// Leases taken again on reconnect for a row no claim here holds: given
+    /// back once the row is pushed (wsp-469).
+    release_after: Vec<(RowId, Token)>,
+    /// Rows whose lease the hub would not say this turn: nothing of them pushed.
+    held_back: BTreeSet<Subject>,
 }
 
 impl Worker {
@@ -327,6 +344,9 @@ impl Worker {
             turns: 0,
             feed: None,
             forced: BTreeSet::new(),
+            by: None,
+            release_after: Vec::new(),
+            held_back: BTreeSet::new(),
         }
     }
 
@@ -387,6 +407,8 @@ impl Worker {
                     );
                 }
                 self.link = Link::Down(why.clone());
+                // Work goes on: what moved is journaled for the reconnect.
+                self.journal_offline(store);
                 self.retry_at = Some(Instant::now() + self.backoff);
                 self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
             }
@@ -423,7 +445,8 @@ impl Worker {
             "turns": self.turns,
             "link": self.link.word(),
             "why": match &self.link { Link::Down(w) => Some(w.clone()), _ => None },
-            "last": last.map(|t| serde_json::json!({ "sent": t.sent, "moved": t.moved, "adopted": t.adopted, "reconciled": t.reconciled, "heads": t.heads })),
+            "last": last.map(|t| serde_json::json!({ "sent": t.sent, "moved": t.moved, "adopted": t.adopted, "reconciled": t.reconciled, "heads": t.heads, "sided": t.sided })),
+            "journal": Journal::of(store).len(),
         });
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(format!(".sync.json.{}.tmp", std::process::id()));
@@ -564,6 +587,7 @@ impl Worker {
             }
             c.by().clone()
         };
+        self.by = Some(by.clone());
         for (ws, tasks) in workspaces {
             self.sync_workspace(store, &ws, &tasks, &by, &mut turned)?;
         }
@@ -602,63 +626,13 @@ impl Worker {
             }
         };
         turned.heads += classified.heads;
-        // The rows this spoke syncs whole: its own files (not heads) and the
-        // ones just taken on.
-        let cache = Cache::read(store);
-        let mut included: BTreeSet<Subject> = classified.whole;
+        // What the journal holds from before (an outage, a crash), settled by
+        // each row's lease and put in order, before anything new is pushed.
+        self.settle(store, ws, &hub, by, turned)?;
         let heads = Heads::read(store);
-        let mut local = Refs::new(wid.clone());
-        // What this sync pushes: the record's id and the file it was made of.
-        let mut pushing: BTreeMap<Subject, (ObjectId, Option<ObjectId>)> = BTreeMap::new();
-        for t in tasks.iter().filter(|t| !cache.is_head(&t.id) && store.task(&t.id).is_some()) {
-            let subject = Subject::Row(RowId(t.id.clone()));
-            included.insert(subject.clone());
-            let digest = file_digest(store, &t.id);
-            let synced = heads.head(&subject).copied();
-            if synced.is_some() && heads.file(&subject) == digest {
-                local.set(subject, synced.expect("checked"));
-                continue;
-            }
-            let id = match self.minted.get(&subject) {
-                Some((d, id)) if *d == digest && objects.has(id) => *id,
-                _ => {
-                    let Some(obj) = push_record(store, &subject, wid.clone(), by.clone(), At(now_ms())) else { continue };
-                    let (id, bytes) = wsp_objects::encode(&obj);
-                    if let Err(e) = objects.put(&id, &bytes) {
-                        self.say_once(store, format!("hub-sync: cannot keep {}'s object: {e}", t.id));
-                        continue;
-                    }
-                    self.minted.insert(subject.clone(), (digest, id));
-                    id
-                }
-            };
-            local.set(subject.clone(), id);
-            pushing.insert(subject, (id, digest));
-        }
-        for w in store.worklists().iter().filter(|w| w.workspace.to_string() == ws) {
-            let subject = Subject::List(wsp_store_contract::ListId(w.id.clone()));
-            included.insert(subject.clone());
-            let digest = crate::door::list_digest(store, &w.id);
-            let synced = heads.head(&subject).copied();
-            if synced.is_some() && heads.file(&subject) == digest {
-                local.set(subject, synced.expect("checked"));
-                continue;
-            }
-            let id = match self.minted.get(&subject) {
-                Some((d, id)) if *d == digest && objects.has(id) => *id,
-                _ => {
-                    let Some(obj) = push_list_record(store, &subject, wid.clone(), by.clone(), At(now_ms())) else { continue };
-                    let (id, bytes) = wsp_objects::encode(&obj);
-                    if let Err(e) = objects.put(&id, &bytes) {
-                        self.say_once(store, format!("hub-sync: cannot keep {}'s object: {e}", w.id));
-                        continue;
-                    }
-                    self.minted.insert(subject.clone(), (digest, id));
-                    id
-                }
-            };
-            local.set(subject.clone(), id);
-            pushing.insert(subject, (id, digest));
+        let (mut local, pushing, included) = self.pending(store, ws, tasks, by, &objects, &heads, classified.whole);
+        for (subject, id) in Sides::read(store).notice_heads(ws) {
+            local.set(subject, id);
         }
         let client = self.client()?;
         let report = match client.sync_skipping(&wid, &local, &objects, &|s| matches!(s, Subject::Row(_)) && !included.contains(s)) {
@@ -670,6 +644,351 @@ impl Worker {
             }
         };
         self.keep(store, &objects, &heads, &pushing, &report, by, turned);
+        self.after_push(store, &report)
+    }
+
+    /// The records of `ws`'s rows and lists that moved since their synced
+    /// heads, each made once per file state, journaled, then kept in the
+    /// object dir: the spoke's refs for the sync, what it pushes, and every
+    /// subject it syncs whole. A row with a side chain of this spoke's is the
+    /// holder's until it is leased here again: its synced head stands.
+    #[allow(clippy::too_many_arguments)]
+    fn pending(
+        &mut self,
+        store: &Store,
+        ws: &str,
+        tasks: &[crate::model::Task],
+        by: &Principal,
+        objects: &ObjectDir,
+        heads: &Heads,
+        whole: BTreeSet<Subject>,
+    ) -> (Refs, Pushing, BTreeSet<Subject>) {
+        let wid = WorkspaceId(ws.to_string());
+        let cache = Cache::read(store);
+        let journal = Journal::of(store);
+        let mut tips: BTreeMap<Subject, ObjectId> =
+            journal.by_subject().into_iter().filter_map(|(s, (_, es))| Some((s, es.last()?.id))).collect();
+        let sides = Sides::read(store);
+        let claims = store.claims();
+        let mut leased = Leased::read(store);
+        let leased_was = leased.clone();
+        let mut included = whole;
+        let mut local = Refs::new(wid.clone());
+        let mut pushing: BTreeMap<Subject, (ObjectId, Option<ObjectId>)> = BTreeMap::new();
+        let mut subjects: Vec<(Subject, Option<ObjectId>)> = Vec::new();
+        for t in tasks.iter().filter(|t| !cache.is_head(&t.id) && store.task(&t.id).is_some()) {
+            subjects.push((Subject::Row(RowId(t.id.clone())), file_digest(store, &t.id)));
+        }
+        for w in store.worklists().iter().filter(|w| w.workspace.to_string() == ws) {
+            subjects.push((Subject::List(ListId(w.id.clone())), crate::door::list_digest(store, &w.id)));
+        }
+        for (subject, digest) in subjects {
+            included.insert(subject.clone());
+            let synced = heads.head(&subject).copied();
+            let row = match &subject {
+                Subject::Row(r) => Some(r.0.clone()),
+                _ => None,
+            };
+            // The lease the row is held under here, remembered past the claim.
+            let claimed = row.as_ref().and_then(|r| claims.get(r)).and_then(|c| c.get(crate::hub_lease::TOKEN)).and_then(|t| t.as_u64());
+            if let (Some(r), Some(t)) = (&row, claimed) {
+                leased.insert(r.clone(), t);
+            }
+            let superseded = row.as_ref().and_then(|r| sides.rows.get(r)).is_some_and(|s| s.mine && claimed.is_none());
+            if self.held_back.contains(&subject) || superseded || (synced.is_some() && heads.file(&subject) == digest) {
+                if let Some(h) = synced {
+                    local.set(subject, h);
+                }
+                continue;
+            }
+            let id = match self.minted.get(&subject) {
+                Some((d, id)) if *d == digest && objects.has(id) => *id,
+                _ => {
+                    let at = At(now_ms());
+                    let made = match row {
+                        Some(_) => push_record(store, &subject, wid.clone(), by.clone(), at),
+                        None => push_list_record(store, &subject, wid.clone(), by.clone(), at),
+                    };
+                    let Some(mut obj) = made else { continue };
+                    // After what is journaled and not on the hub yet, so the
+                    // records of an outage are one line, pushed in order.
+                    if let Some(tip) = tips.get(&subject).filter(|t| objects.has(t)) {
+                        set_parent(&mut obj, *tip);
+                    }
+                    let (id, bytes) = wsp_objects::encode(&obj);
+                    let token = row.as_ref().and_then(|r| leased.get(r).copied());
+                    if let Err(e) = journal.append(&id, &bytes, token).and_then(|_| objects.put(&id, &bytes)) {
+                        self.say_once(store, format!("hub-sync: cannot keep {subject:?}'s object: {e}"));
+                        continue;
+                    }
+                    tips.insert(subject.clone(), id);
+                    self.minted.insert(subject.clone(), (digest, id));
+                    id
+                }
+            };
+            local.set(subject.clone(), id);
+            pushing.insert(subject, (id, digest));
+        }
+        if leased != leased_was {
+            Leased::write(store, &leased);
+        }
+        (local, pushing, included)
+    }
+
+    /// A turn the hub did not answer: the records of every shared row and
+    /// list that moved are journaled all the same (wsp-469), so the work done
+    /// offline is on its way the moment the hub is back.
+    pub(crate) fn journal_offline(&mut self, store: &Store) {
+        let Some(by) = self.by.clone().or_else(|| login_principal(&self.home)) else { return };
+        let objects = ObjectDir::of(store);
+        let heads = Heads::read(store);
+        let mut workspaces: BTreeMap<String, Vec<crate::model::Task>> =
+            crate::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
+        for w in store.worklists().iter().filter(|w| !w.workspace.is_private()) {
+            workspaces.entry(w.workspace.to_string()).or_default();
+        }
+        for (ws, tasks) in workspaces {
+            let _ = self.pending(store, &ws, &tasks, &by, &objects, &heads, BTreeSet::new());
+        }
+    }
+
+    /// What the journal holds of `ws` from before this turn, row by row by the
+    /// lease it was made under (wsp-469, the design's "Leases and offline sync"):
+    ///
+    /// - renewed under its token: still held, and it fast-forwards as usual;
+    /// - refused: the claim here is released as wsp-411 releases an expired
+    ///   one ([`crate::hub_lease::follow_expired`]), then the lease is taken
+    ///   again: granted (a new token, stamped on a claim still here, else
+    ///   given back after the push), it is pushed; held by another user (or
+    ///   allocated to one), its objects go to the hub as a side chain.
+    ///
+    /// Then every entry of `ws` is put, in the journal's order. A side chain's
+    /// entries leave the journal at once; the rest leave as their refs move.
+    fn settle(&mut self, store: &Store, ws: &str, hub: &Refs, by: &Principal, turned: &mut Turned) -> Result<(), String> {
+        let journal = Journal::of(store);
+        let me = user_of(by);
+        let mut sides = Sides::read(store);
+        let sides_were = sides.clone();
+        // A row leased here again since its side chain is this spoke's again.
+        let claims = store.claims();
+        sides.rows.retain(|row, s| {
+            let now = claims.get(row).and_then(|c| c.get(crate::hub_lease::TOKEN)).and_then(|t| t.as_u64());
+            !(s.mine && now.is_some() && now > s.token)
+        });
+        self.held_back.clear();
+        let left: Vec<(Subject, Vec<Entry>)> =
+            journal.by_subject().into_iter().filter(|(_, (w, _))| w.0 == ws).map(|(s, (_, es))| (s, es)).collect();
+        let wid = WorkspaceId(ws.to_string());
+        let mut aside: Vec<(RowId, String, u64)> = Vec::new();
+        for (subject, es) in &left {
+            let Subject::Row(row) = subject else { continue };
+            let Some(token) = es.iter().rev().find_map(|e| e.token) else { continue };
+            let client = self.client()?;
+            match client.lease_renew(row, Token(token)) {
+                Ok((_, at)) => {
+                    if !store.renew_claim(&row.0, (at.0 / 1000) as i64) {
+                        // No claim holds it here any more (it ended offline):
+                        // the lease goes back once the row is pushed.
+                        self.release_after.push((row.clone(), Token(token)));
+                    }
+                    continue;
+                }
+                Err(e) if unreachable(&e) => return Err(e.to_string()),
+                Err(wsp_client::Error::Refused(_)) => {}
+                Err(e) => {
+                    self.say_once(store, format!("hub-sync: the lease of {} was not read: {e}; it waits", row.0));
+                    self.held_back.insert(subject.clone());
+                    continue;
+                }
+            }
+            // Offline past the lease: released here first, as wsp-411 does.
+            crate::hub_lease::follow_expired(store, &serde_json::json!({ "row": row.0, "token": token }));
+            let client = self.client()?;
+            match client.lease_take(&wid, row) {
+                Ok((taken, at)) => {
+                    let held = crate::hub_lease::Held { token: taken, expires: (at.0 / 1000) as i64 };
+                    match store.claims().get(&row.0).cloned() {
+                        Some(mut claim) if claim.get(crate::hub_lease::TOKEN).and_then(|t| t.as_u64()) == Some(token) => {
+                            crate::hub_lease::stamp(&mut claim, &held);
+                            store.set_claim(&row.0, claim);
+                        }
+                        _ => self.release_after.push((row.clone(), taken)),
+                    }
+                    crate::store::log_line(
+                        store,
+                        &format!("hub-sync: {}'s lease ran out while the hub was away; taken again (token {}) and pushed", row.0, taken.0),
+                    );
+                }
+                Err(wsp_client::Error::Refused(wsp_store_contract::Refusal::Held { holder, .. })) => {
+                    aside.push((row.clone(), user_of(&holder), token));
+                }
+                Err(wsp_client::Error::Refused(wsp_store_contract::Refusal::Forbidden { .. })) => {
+                    let holder = hub_cache::Cache::read(store).get(&row.0).and_then(|h| h.allocation.clone());
+                    aside.push((row.clone(), holder.unwrap_or_else(|| "another user".into()), token));
+                }
+                Err(e) if unreachable(&e) => return Err(e.to_string()),
+                Err(e) => {
+                    self.say_once(store, format!("hub-sync: the lease of {} was not taken again: {e}; it waits", row.0));
+                    self.held_back.insert(subject.clone());
+                }
+            }
+        }
+        // The journal of `ws` to the hub, in order; a put is idempotent by hash.
+        let mut entries: Vec<Entry> = left.iter().flat_map(|(_, es)| es.iter().cloned()).collect();
+        entries.sort_by_key(|e| e.seq);
+        if !entries.is_empty() {
+            let client = self.client()?;
+            match journal.replay(&entries, &mut |blobs| client.sync_put(blobs)) {
+                Ok(n) => turned.sent += n,
+                Err(e) if unreachable(&e) => return Err(e.to_string()),
+                Err(e) => {
+                    self.say_once(store, format!("hub-sync: the journal of {ws} was not put: {e}"));
+                    return Ok(());
+                }
+            }
+        }
+        // Side chains: on the hub now, under no ref. The file here follows the
+        // holder's line from the synced head, which the sync then adopts, so
+        // the old holder's verdict and landing go no further.
+        for (row, holder, token) in aside {
+            let subject = Subject::Row(row.clone());
+            let Some((_, es)) = left.iter().find(|(s, _)| *s == subject) else { continue };
+            let Some(tip) = es.last().map(|e| e.id) else { continue };
+            let side = Side {
+                workspace: ws.to_string(),
+                row: row.0.clone(),
+                tip: tip.hex(),
+                holder,
+                old: me.clone(),
+                mine: true,
+                token: Some(token),
+                at: crate::util::iso_at(crate::util::epoch_secs()),
+            };
+            match self.move_notice(store, &wid, hub, &side, by) {
+                Ok(Some(id)) => {
+                    sides.notices.entry(ws.to_string()).or_default().insert(row.0.clone(), id.hex());
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+            let mut heads = Heads::read(store);
+            if let Some(synced) = heads.head(&subject).copied() {
+                heads.set(&subject, synced, file_digest(store, &row.0));
+                if let Err(e) = heads.write(store) {
+                    self.say_once(store, format!("hub-sync: cannot write the synced heads: {e}"));
+                }
+            }
+            self.minted.remove(&subject);
+            for e in es {
+                journal.remove(e);
+            }
+            Leased::forget(store, &row.0);
+            let words = hub_journal::said(&side);
+            crate::store::log_line(store, &format!("hub-sync: side chain: {words}"));
+            crate::verification::tell_governor(store, &row.0, &words);
+            sides.rows.insert(row.0.clone(), side);
+            turned.sided += 1;
+        }
+        if sides != sides_were {
+            if let Err(e) = sides.write(store) {
+                self.say_once(store, format!("hub-sync: cannot write side.json: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The notice of a side chain, journaled, put and moved under its own
+    /// subject: the holder's spoke takes it on its next sync. Its id where the
+    /// hub moved to it; `None` where another notice moved first (said once).
+    fn move_notice(&mut self, store: &Store, wid: &WorkspaceId, hub: &Refs, side: &Side, by: &Principal) -> Result<Option<ObjectId>, String> {
+        let subject = hub_journal::notice_subject(&side.row);
+        let parent = hub.get(&subject).copied();
+        let obj = hub_journal::notice(side, parent, by.clone(), At(now_ms()));
+        let (id, bytes) = wsp_objects::encode(&obj);
+        let journal = Journal::of(store);
+        let _ = journal.append(&id, &bytes, None);
+        let _ = ObjectDir::of(store).put(&id, &bytes);
+        let client = self.client()?;
+        let put = client.sync_put(vec![Blob { id, bytes }]).and_then(|_| {
+            client.refs_move(RefMove { workspace: wid.clone(), subject: subject.clone(), from: parent, to: id })
+        });
+        let out = match put {
+            Ok(Move::Moved { .. }) => Some(id),
+            Ok(Move::Stale { .. }) => {
+                self.say_once(store, format!("hub-sync: the notice of {}'s side chain met another; the flag here stands", side.row));
+                None
+            }
+            Err(e) if unreachable(&e) => return Err(e.to_string()),
+            Err(e) => {
+                self.say_once(store, format!("hub-sync: the notice of {}'s side chain was not sent: {e}", side.row));
+                None
+            }
+        };
+        if let Some(e) = journal.entries().into_iter().find(|e| e.id == id) {
+            journal.remove(&e);
+        }
+        Ok(out)
+    }
+
+    /// A notice the hub holds for `row`: kept as taken, and where this spoke's
+    /// user holds the row (or wrote the side chain), the flag, a line in the
+    /// log and a tell to the row's governor, once per side chain.
+    #[allow(clippy::too_many_arguments)]
+    fn take_notice(&mut self, store: &Store, objects: &ObjectDir, sides: &mut Sides, ws: &str, row: &str, head: ObjectId, by: &Principal) {
+        let Some(obj) = Objects::object(objects, &head) else { return };
+        sides.notices.entry(ws.to_string()).or_default().insert(row.to_string(), head.hex());
+        let me = user_of(by);
+        let Some(side) = hub_journal::side_of_notice(&obj, &me) else { return };
+        if side.holder != me && !side.mine {
+            return;
+        }
+        if sides.rows.get(row).is_some_and(|s| s.tip == side.tip) {
+            return;
+        }
+        let words = hub_journal::said(&side);
+        crate::store::log_line(store, &format!("hub-sync: side chain: {words}"));
+        crate::verification::tell_governor(store, row, &words);
+        sides.rows.insert(row.to_string(), side);
+    }
+
+    /// After a sync: what the hub took leaves the journal (a move, or a stale
+    /// or diverged head whose objects are put before reconcile writes the
+    /// merge), and a lease taken only to push goes back.
+    fn after_push(&mut self, store: &Store, report: &SyncReport) -> Result<(), String> {
+        let journal = Journal::of(store);
+        let by_subject = journal.by_subject();
+        let mut unput: Vec<Entry> = Vec::new();
+        for s in report.moved.iter().chain(report.stale.iter().map(|st| &st.subject)).chain(&report.diverged) {
+            let Some((_, es)) = by_subject.get(s) else { continue };
+            if report.diverged.contains(s) {
+                unput.extend(es.iter().cloned());
+            }
+            for e in es {
+                if !report.diverged.contains(s) {
+                    journal.remove(e);
+                }
+            }
+        }
+        if !unput.is_empty() {
+            unput.sort_by_key(|e| e.seq);
+            let client = self.client()?;
+            match journal.replay(&unput, &mut |blobs| client.sync_put(blobs)) {
+                Ok(_) => unput.iter().for_each(|e| journal.remove(e)),
+                Err(e) if unreachable(&e) => return Err(e.to_string()),
+                Err(e) => self.say_once(store, format!("hub-sync: diverged objects were not put: {e}")),
+            }
+        }
+        for (row, token) in std::mem::take(&mut self.release_after) {
+            let client = self.client()?;
+            match client.lease_release(&row, token) {
+                Ok(()) => Leased::forget(store, &row.0),
+                Err(e) if unreachable(&e) => {
+                    self.release_after.push((row, token));
+                    return Err(e.to_string());
+                }
+                Err(_) => Leased::forget(store, &row.0),
+            }
+        }
         Ok(())
     }
 
@@ -722,8 +1041,15 @@ impl Worker {
         }
         let merging = Merging { objects, lease: &NoLease };
         let door = Door::new(store, &merging);
+        let mut sides = Sides::read(store);
+        let sides_were = sides.clone();
         for s in &report.adopted {
             let Some(head) = report.refs.get(s).copied() else { continue };
+            // A side chain's notice (wsp-469): a flag here, never a file.
+            if let Some(row) = hub_journal::notice_row(s) {
+                self.take_notice(store, objects, &mut sides, &report.refs.workspace.0, row, head, by);
+                continue;
+            }
             // The hub's line from the head this spoke synced, oldest first, so
             // each import follows the one before it.
             let mut line = Vec::new();
@@ -746,6 +1072,11 @@ impl Worker {
                 }
             }
         }
+        if sides != sides_were {
+            if let Err(e) = sides.write(store) {
+                self.say_once(store, format!("hub-sync: cannot write side.json: {e}"));
+            }
+        }
         // A move refused `stale`, and a head both sides wrote: the hub's head
         // through reconcile, which writes the merge; the next turn pushes it.
         let mut stale: Vec<wsp_client::Stale> = report.stale.clone();
@@ -762,6 +1093,23 @@ impl Worker {
             }
         }
     }
+}
+
+/// What a sync pushes: per subject, the record's id and the file digest it was made of.
+type Pushing = BTreeMap<Subject, (ObjectId, Option<ObjectId>)>;
+
+/// Makes `obj` follow `to`.
+fn set_parent(obj: &mut Object, to: ObjectId) {
+    match obj {
+        Object::Record { parent, .. } | Object::Event { parent, .. } => *parent = Some(to),
+    }
+}
+
+/// The principal the login names, for a record made before the hub ever said
+/// who this connection is.
+fn login_principal(home: &std::path::Path) -> Option<Principal> {
+    let login = wsp_client::hub_login_in(home).ok().flatten()?;
+    (!login.user.is_empty()).then(|| Principal::Person(login.user.as_str().into()))
 }
 
 /// The hub's head for `subject` among what a sync fetched: its object that no
