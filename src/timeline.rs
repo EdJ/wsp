@@ -94,6 +94,10 @@ pub(crate) struct Inputs {
     /// what `standing_seats` reads), 0 where none is read. A hold written while
     /// the seat was still open starts at that stop (`wsp-090`).
     pub check_ends: Vec<(usize, i64, i64)>,
+    /// The row's decisions still in force (none superseded them), `(instant,
+    /// id, text)`, oldest first: one that says the row holds for the person
+    /// names the stretch after a review as a person's step, not rework (`wsp-311`).
+    pub decisions: Vec<(i64, String, String)>,
 }
 
 /// One park of a list, from its park event to the resume that took it back.
@@ -420,6 +424,62 @@ pub(crate) const CHECK_WAIT_CAUSE: &str = "the row's check timed out and waited 
 /// The cause of the stretch from an attempt's review to the next attempt: the
 /// row was sent back and reopened. The row's `rework` block books the attempt.
 pub(crate) const REWORK_CAUSE: &str = "rework: the row sent back after review and reopened";
+/// The cause of a stretch after a review where the row held for something only
+/// the person could do (`wsp-311`): a decision in force on the row that says it
+/// holds for the person, or a question the seat put to the person and had no
+/// answer to. Not rework: no verdict asked the seat to change anything.
+pub(crate) const PERSON_STEP_CAUSE: &str = "the row waits for a person's step";
+
+/// Whether a decision says the row holds for the person: it names the person
+/// and says `hold`, or that it waits until the person or for the person
+/// (`wsp-303`'s d5: "hold until the person detaches").
+fn holds_for_person(text: &str) -> bool {
+    let t = text.to_lowercase();
+    if !t.contains("person") {
+        return false;
+    }
+    t.split(|c: char| !c.is_alphanumeric()).any(|w| w == "hold")
+        || ["until the person", "waits on the person", "waiting on the person", "waits for the person", "waiting for the person"].iter().any(|p| t.contains(p))
+}
+
+/// The person's step inside the stretch `from..to` after a review, `(start, end,
+/// words)` (`wsp-311`). `since` is the claim of the attempt that was reviewed: a
+/// decision taken in its seat counts. A decision in force that says the row
+/// holds for the person holds it from the first such decision to the next seat,
+/// named by the latest one (the person's step, done, is what lets the row be
+/// seated again). Else a question the seat put to the person, unanswered when
+/// the review was typed, holds it from the question to its answer or the next
+/// seat. `None` where neither says so: the stretch is rework.
+fn person_step(i: &Inputs, since: i64, from: i64, to: i64) -> Option<(i64, i64, String)> {
+    let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+    let holds: Vec<&(i64, String, String)> = i.decisions.iter().filter(|(t, _, x)| *t >= since && *t < to && holds_for_person(x)).collect();
+    if let (Some(first), Some(last)) = (holds.first(), holds.last()) {
+        let text: String = last.2.trim().chars().take(160).collect();
+        let more = if last.2.trim().chars().count() > 160 { "…" } else { "" };
+        let id = if last.1.is_empty() { "a decision".to_string() } else { format!("decision {}", last.1) };
+        let words = format!("{id} at {}: {text}{more}, until the next seat was claimed at {}", at(last.0), at(to));
+        return (first.0.max(from) < to).then(|| (first.0.max(from), to, words));
+    }
+    let id = i.id.as_str();
+    let msgs: Vec<&(i64, String, Value)> = i.events.iter().filter(|(_, k, d)| k == "message-raised" && d["about"]["task"] == id).collect();
+    for (t, _, d) in msgs.iter().filter(|(t, _, d)| *t >= since && *t < to && d["shape"] == "question" && d["for"] == "person" && d["from"]["pane"].is_string()) {
+        let Some(mid) = d["id"].as_str() else { continue };
+        let answer = msgs.iter().filter(|(a, _, r)| *a > *t && r["reply_to"] == mid).map(|(a, _, _)| *a).min();
+        if answer.is_some_and(|a| a <= from) {
+            continue;
+        }
+        let (start, end) = ((*t).max(from), answer.unwrap_or(to).min(to));
+        if start >= end {
+            continue;
+        }
+        let until = match answer.filter(|a| *a < to) {
+            Some(a) => format!("until the person answered at {}", at(a)),
+            None => format!("unanswered when the next seat was claimed at {}", at(to)),
+        };
+        return Some((start, end, format!("question {mid} to the person, asked at {}, {until}", at(*t))));
+    }
+    None
+}
 
 /// The attempts of a row's seat, in order. A release counts as the end of one
 /// only when the row was claimed again afterwards and before its last passing
@@ -632,7 +692,21 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         let prev = &seated[k - 1];
         let Some(from) = prev.review.or(prev.end) else { continue };
         let (label, why) = between_attempts(i, prev, a.claim);
-        out.extend(between_phases(i, from, a.begin(), label, why));
+        // A stretch after a review that held for the person is the person's step
+        // (`wsp-311`): only what lies outside it stays rework.
+        match person_step(i, prev.claim, from, a.begin()).filter(|_| why.starts_with(REWORK_CAUSE)) {
+            Some((s, e, words)) => {
+                let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
+                if s > from {
+                    out.push(Phase::gap(label.clone(), from, s, why.clone()));
+                }
+                out.push(Phase::gap(format!("held for a person's step from {} → {}", at(s), if e < a.begin() { "answered" } else { "seat started again" }), s, e, format!("{PERSON_STEP_CAUSE} — {words}")));
+                if e < a.begin() {
+                    out.push(Phase::gap(format!("the person answered at {} → seat started again", at(e)), e, a.begin(), why));
+                }
+            }
+            None => out.extend(between_phases(i, from, a.begin(), label, why)),
+        }
         if let Some(s) = a.spawn {
             out.push(Phase::work(format!("spawn requested → seat claimed{}", of(k + 1)), s, a.claim));
         }
@@ -1236,6 +1310,14 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
         }
     }
     if let Some(t) = store.find_task(id) {
+        let all = crate::model::decisions_of(&t.body);
+        let gone = crate::model::supersessions(&all);
+        i.decisions = all
+            .into_iter()
+            .zip(gone)
+            .filter(|(d, g)| g.is_none() && d.at.contains('T'))
+            .map(|(d, _)| (util::epoch_of(&d.at), d.id, d.text))
+            .collect();
         i.legs = crate::legs::legs(&t)
             .into_iter()
             .map(|l| LegIn { skipped: l.skipped.is_some(), after: l.after.clone().unwrap_or_default(), name: l.name })
@@ -2045,7 +2127,7 @@ pub(crate) fn figures_of(phases: &[Phase], seat: &SeatReport) -> RowFigures {
             f.shared_gap += p.seconds();
             *f.shared_waits.entry(why.clone()).or_insert(0) += p.seconds();
         }
-        if !p.shared && (why.starts_with(PARKED_CAUSE) || why.starts_with(REWORK_CAUSE)) {
+        if !p.shared && (why.starts_with(PARKED_CAUSE) || why.starts_with(REWORK_CAUSE) || why.starts_with(PERSON_STEP_CAUSE)) {
             f.between_attempts += p.seconds();
         }
         *f.waits.entry(why).or_insert(0) += p.seconds();
@@ -3106,6 +3188,92 @@ mod tests {
         assert!(!ph.iter().any(|p| p.label.starts_with("the row's own check")), "{ph:?}");
         let f = figures_of(&ph, &SeatReport::default());
         assert_eq!(f.between_attempts, 1790);
+    }
+
+    /// wsp-303's records (`wsp-311`): the seat reviewed at 22:57, a decision
+    /// in force "hold until the person detaches" (d5, with d1 and d2 before it
+    /// saying hold), the person's step done at 06:04 and the next seat claimed
+    /// then. The 25652 s between are the person's step, named with d5, and none
+    /// of it rework; it is still the stretch between attempts, and the wall's
+    /// waiting_by books it under the person's step and sums to the wall.
+    fn wsp_303(decisions: bool) -> Inputs {
+        let e = |s: &str| util::epoch_of(s);
+        let id = "wsp-303";
+        let events = vec![
+            ev(e("2026-11-19T22:44:12Z"), "task-claimed", json!({"id": id, "pane": "cpd-1"})),
+            ev(e("2026-11-19T22:57:22Z"), "task-review", json!({"id": id})),
+            ev(e("2026-11-19T23:00:30Z"), "task-released", json!({"id": id})),
+            ev(e("2026-11-20T06:04:54Z"), "task-claimed", json!({"id": id, "pane": "cpd-2"})),
+            ev(e("2026-11-20T06:06:46Z"), "task-review", json!({"id": id})),
+            ev(e("2026-11-20T06:07:35Z"), "task-verified", json!({"id": id, "verdict": "holds"})),
+        ];
+        let mut i = Inputs { id: id.into(), events, ..Default::default() };
+        if decisions {
+            i.decisions = vec![
+                (e("2026-11-19T22:46:10Z"), "d1".into(), "answering m-1: wsp mv denied: The person does it. Then hold, don't land.".into()),
+                (e("2026-11-19T22:55:39Z"), "d2".into(), "answering m-2: I've asked the person to run the detach. Hold until then.".into()),
+                (e("2026-11-19T22:55:56Z"), "d3".into(), "Lead, overnight on Jesper's authority: leave the 86 rows parented for now, then submit wsp-303 for review.".into()),
+                (e("2026-11-19T22:59:17Z"), "d5".into(), "Superseded. The lead's later answer is: hold until the person detaches, and don't change the checks.".into()),
+                (e("2026-11-20T06:04:54Z"), "d6".into(), "Detached: the person ran wsp mv --parent none for the 86 ids in ids.txt.".into()),
+            ];
+        }
+        i
+    }
+
+    #[test]
+    fn a_row_held_for_a_persons_step_after_its_review_is_the_persons_step_not_rework() {
+        let i = wsp_303(true);
+        let ph = build(&i);
+        let (rv, next) = (util::epoch_of("2026-11-19T22:57:22Z"), util::epoch_of("2026-11-20T06:04:54Z"));
+        assert!(!ph.iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(REWORK_CAUSE))), "{ph:?}");
+        let step: Vec<&Phase> = ph.iter().filter(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(PERSON_STEP_CAUSE))).collect();
+        assert_eq!(step.len(), 1, "{ph:?}");
+        assert_eq!((step[0].start, step[0].end, step[0].seconds()), (rv, next, 25652));
+        let why = step[0].waiting_for.as_deref().unwrap();
+        assert!(why.contains("decision d5 at 22:59") && why.contains("hold until the person detaches") && why.contains("claimed at 06:04"), "{why}");
+        let f = figures_of(&ph, &SeatReport::default());
+        assert_eq!(f.between_attempts, 25652);
+        let member = crate::wallbuckets::MemberIn { id: i.id.clone(), spans: f.spans.clone(), measured: false, ..Default::default() };
+        let w = crate::wallbuckets::group_wall(&[member], None, None).unwrap();
+        let wall = w.close - w.open;
+        assert_eq!(crate::wallbuckets::BUCKETS.iter().map(|b| w.seconds(b)).sum::<i64>(), wall);
+        assert_eq!(w.waits.values().sum::<i64>(), w.seconds("waiting"));
+        let person: i64 = w.waits.iter().filter(|((_, c), _)| c.contains(PERSON_STEP_CAUSE)).map(|(_, s)| *s).sum();
+        assert_eq!(person, 25652, "{:?}", w.waits);
+        assert!(!w.waits.keys().any(|(_, c)| c.contains(REWORK_CAUSE)), "{:?}", w.waits);
+    }
+
+    /// The same row with no decision owing the person anything is still rework:
+    /// a verdict sent it back and a seat was asked to change something.
+    #[test]
+    fn a_row_reopened_after_a_verdict_with_no_person_owed_is_still_rework() {
+        let ph = build(&wsp_303(false));
+        assert!(!ph.iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(PERSON_STEP_CAUSE))), "{ph:?}");
+        let gap = ph.iter().find(|p| p.gap && p.waiting_for.as_deref().is_some_and(|w| w.starts_with(REWORK_CAUSE))).expect("rework named");
+        assert_eq!(gap.seconds(), 25652);
+        // A decision that names the person but holds nothing does not make it one.
+        let mut i = two_seatings(false);
+        i.decisions = vec![(150, "d1".into(), "the person may detach them later; until it's run, wsp done needs --force".into())];
+        assert!(build(&i).iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.starts_with(REWORK_CAUSE))));
+        assert!(!holds_for_person("Detached: the person ran wsp mv --parent none"));
+    }
+
+    /// A question the seat put to the person, unanswered at the review, is the
+    /// person's step from the review to its answer; what follows the answer is
+    /// the send-back's own wait again.
+    #[test]
+    fn a_question_to_the_person_unanswered_at_the_review_is_the_persons_step_until_its_answer() {
+        let mut i = two_seatings(false);
+        i.events.push(ev(180, "message-raised", json!({"id": "m-p", "about": {"task": "r-1"}, "for": "person", "from": {"pane": "p1"}, "shape": "question"})));
+        i.events.push(ev(1500, "message-raised", json!({"id": "m-a", "about": {"task": "r-1"}, "for": null, "from": {"human": true}, "reply_to": "m-p", "shape": "notification"})));
+        let ph = build(&i);
+        let gaps: Vec<(i64, i64, &str)> = ph.iter().filter(|p| p.gap && p.start >= 200 && p.end <= 1990).map(|p| (p.start, p.end, p.waiting_for.as_deref().unwrap())).collect();
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert_eq!((gaps[0].0, gaps[0].1), (200, 1500));
+        assert!(gaps[0].2.starts_with(PERSON_STEP_CAUSE) && gaps[0].2.contains("question m-p") && gaps[0].2.contains("answered at"), "{gaps:?}");
+        assert_eq!((gaps[1].0, gaps[1].1), (1500, 1990));
+        assert!(gaps[1].2.starts_with(REWORK_CAUSE), "{gaps:?}");
+        assert_eq!(figures_of(&ph, &SeatReport::default()).between_attempts, 1790);
     }
 
     /// wsp-635's 65m (`wsp-645`): a stretch no park explains still names its row.
