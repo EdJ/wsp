@@ -2379,8 +2379,7 @@ fn rebase_in_progress(dir: &Path) -> bool {
 /// stdout, which `git_ok` does not return, so they are read from the index
 /// while the stopped rebase is still there (before any abort).
 fn with_conflicts(dir: &Path, why: String) -> String {
-    let files = git(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-    let files: Vec<&str> = files.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let files = conflicted(dir);
     if files.is_empty() {
         why
     } else {
@@ -2471,12 +2470,47 @@ fn stop_rebase(dir: &Path) {
 /// apply (`wsp-328`): put back, so the tree is as the member left it and not
 /// stopped mid-rebase for whoever opens it next. Nobody is in the tree to
 /// resolve it, so the refusal goes to the person.
+///
+/// **The conflicting paths first, and what to run** (`wsp-338`). git's stderr
+/// carries whatever the repository's hooks print during the rebase, ahead of
+/// the conflict: on retro-8 the refusal read "deps: compound -> /mnt/…
+/// (unchanged; a sibling of the main checkout …)", cut there, and named neither
+/// the file nor a verb. The paths are read before the abort clears them, and
+/// git's own lines (`CONFLICT`, `error:`, `fatal:`) are kept after, the hooks'
+/// left out.
 fn abort_rebase(dir: &Path, onto: &str, why: &str) -> String {
+    let paths = conflicted(dir);
     stop_rebase(dir);
-    format!(
-        "the rebase onto {onto} does not apply cleanly: {why}\nwsp: the rebase was aborted and {} is as it was",
-        util::contract(dir)
-    )
+    let d = util::contract(dir);
+    let git_said: Vec<&str> = why
+        .lines()
+        .filter_map(|l| ["CONFLICT", "error:", "fatal:"].iter().find_map(|k| l.find(k)).map(|at| l[at..].trim()))
+        .collect();
+    let git_said = if git_said.is_empty() { why.trim().to_string() } else { git_said.join("\n") };
+    match paths.is_empty() {
+        true => format!(
+            "the rebase onto {onto} does not apply cleanly\nwsp: the rebase was aborted and {d} is as it was. \
+             To clear it, in {d}: `git rebase {onto}`, fix what git names, `git rebase --continue`\ngit said: {git_said}"
+        ),
+        false => {
+            let p = paths.join(", ");
+            format!(
+                "the rebase onto {onto} does not apply cleanly: conflict in {p}\nwsp: the rebase was aborted and {d} is as it was. \
+                 To clear it, in {d}: `git rebase {onto}`, resolve {p}, `git rebase --continue`\ngit said: {git_said}"
+            )
+        }
+    }
+}
+
+/// The paths a stopped rebase left unmerged in `dir`.
+fn conflicted(dir: &Path) -> Vec<String> {
+    git(dir, &["diff", "--name-only", "--diff-filter=U"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// What reached the trunk.
@@ -3030,6 +3064,34 @@ mod tests {
         assert!(!git(&wt, &["status"]).unwrap().contains("rebase in progress"), "left mid-rebase");
         assert!(!dirty(&wt), "the tree is clean again");
         assert_eq!(ahead(&dir, "master", "t-7").len(), 1, "and its commit is still its own");
+    }
+
+    /// `wsp-338`, compound-react-040 on retro-8: the refusal a person read was
+    /// a hook's "deps: compound -> …" line, cut short — no file, no verb. A
+    /// conflict in `deps` behind that chatter leads with the path and what to run.
+    #[test]
+    fn a_rebase_the_run_could_not_finish_names_the_conflicting_path_and_the_verbs_not_the_hooks_chatter() {
+        let (_env, dir) = scratch("forrundeps");
+        repo(&dir);
+        std::fs::write(dir.join("deps"), "compound -> ../compound\n").unwrap();
+        run(&dir, &["add", "deps"]);
+        run(&dir, &["commit", "--quiet", "-m", "deps"]);
+        let wt = checkout_dir(&dir, "t-8");
+        ensure(&dir, &wt, "t-8", "master").unwrap();
+        std::fs::write(wt.join("deps"), "compound -> /mnt/data/src/private/compound\n").unwrap();
+        run(&wt, &["commit", "--quiet", "-am", "mine"]);
+        std::fs::write(dir.join("deps"), "compound -> ../../compound\n").unwrap();
+        run(&dir, &["commit", "--quiet", "-am", "theirs"]);
+
+        let e = git_ok(&wt, &["rebase", "master"]).unwrap_err();
+        let chatter = format!("deps: compound -> /mnt/data/src/private/compound (unchanged; a sibling of the main checkout)\n{e}");
+        let said = abort_rebase(&wt, "master", &chatter);
+        let head = said.lines().next().unwrap_or_default();
+        assert!(head.contains("does not apply cleanly: conflict in deps"), "the path first: {said}");
+        assert!(said.contains("`git rebase master`") && said.contains("resolve deps") && said.contains("`git rebase --continue`"), "the verbs: {said}");
+        assert!(said.contains("is as it was"), "{said}");
+        assert!(!said.contains("a sibling of the main checkout"), "not the hook's line: {said}");
+        assert!(!git(&wt, &["status"]).unwrap().contains("rebase in progress"), "left mid-rebase");
     }
 
     /// `wsp-571`: an `index.lock` held for a moment is waited out, not a
