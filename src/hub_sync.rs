@@ -711,6 +711,18 @@ impl Worker {
                         None => push_list_record(store, &subject, wid.clone(), by.clone(), at),
                     };
                     let Some(mut obj) = made else { continue };
+                    // A journaled record of this very state (a restart lost
+                    // `minted`) is the row's id still: no twin on top of it.
+                    if let Some((tip, bytes)) = journal.tip_of_entity(&subject, &obj) {
+                        if let Err(e) = objects.put(&tip, &bytes) {
+                            self.say_once(store, format!("hub-sync: cannot keep {subject:?}'s object: {e}"));
+                            continue;
+                        }
+                        self.minted.insert(subject.clone(), (digest, tip));
+                        local.set(subject.clone(), tip);
+                        pushing.insert(subject, (tip, digest));
+                        continue;
+                    }
                     // After what is journaled and not on the hub yet, so the
                     // records of an outage are one line, pushed in order.
                     if let Some(tip) = tips.get(&subject).filter(|t| objects.has(t)) {
@@ -1142,3 +1154,102 @@ fn hub_head_in(received: &[wsp_api::Blob], subject: &Subject) -> Option<ObjectId
     of.iter().map(|(id, _)| *id).find(|id| !parents.contains(id))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use wsp_store_contract::{Command as Cmd, IdempotencyKey, SharedName, TokenId};
+
+    /// wsp-484: a worker that lost `minted` (the daemon restarted with the
+    /// journal not yet pushed) takes the journaled record for the unchanged
+    /// row as the row's id; it makes no twin of it.
+    #[test]
+    fn a_restarted_worker_reuses_the_journaled_record_of_an_unchanged_row() {
+        let env = crate::util::isolated("hub-sync-restart");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let dir = std::env::temp_dir().join(format!("wsp-484-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let data = dir.join("hub");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // The hub: ann a member of `mp`, with a token.
+        let token = {
+            let hub = wsp_hub::Hub::open(&data).unwrap();
+            let apply = |cmd: Cmd, by: &Principal| {
+                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
+            };
+            let root = Principal::Person("root".into());
+            let mp = SharedName("mp".into());
+            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
+            apply(Cmd::HubWorkspaceAdd { name: mp.clone() }, &root);
+            let (secret, hash) = wsp_machines::token::mint();
+            apply(Cmd::HubUserAdd { name: UserName("ann".into()), admin: false }, &root);
+            apply(Cmd::HubMemberSet { workspace: mp, user: UserName("ann".into()), member: true }, &root);
+            apply(Cmd::HubTokenIssue { id: TokenId("t-ann".into()), user: UserName("ann".into()), hash }, &root);
+            secret
+        };
+        let login = |addr: std::net::SocketAddr| {
+            let hubs = home.join(HUBS_FILE);
+            std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
+            let v = serde_json::json!({ "url": format!("tcp://{addr}"), "token": token, "user": "ann", "at": "2026-11-23T00:00:00Z" });
+            std::fs::write(&hubs, v.to_string()).unwrap();
+            std::fs::set_permissions(&hubs, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        };
+
+        // A shared row, and the hub away: a port nobody listens on.
+        let mut t = crate::model::Task::new("a shared row", "wsp-484-r1");
+        t.project = Some("wsp".into());
+        t.workspace = "shared:mp".parse().unwrap();
+        store.save_task(&t).unwrap();
+        let subject = Subject::Row(RowId(t.id.clone()));
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        login(gone);
+
+        let mut first = Worker::new(home.clone());
+        assert!(first.turn(&store).is_err(), "the hub is away");
+        let journal = Journal::of(&store);
+        let held = |j: &Journal| j.by_subject().get(&subject).map_or(0, |(_, es)| es.len());
+        assert_eq!(held(&journal), 1, "the outage journals the row's record once");
+        let id = journal.by_subject()[&subject].1[0].id;
+        drop(first);
+
+        // The daemon restarts; the hub is back; the file has not changed.
+        let cfg = wsp_hub::Config {
+            data_dir: data.clone(),
+            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            port: 0,
+            peers: vec!["127.0.0.0/8".into()],
+            tls: None,
+            name: "wsp-hub".into(),
+            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
+        };
+        let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
+        login(running.addrs()[0]);
+        let mut second = Worker::new(home.clone());
+        assert!(second.minted.is_empty(), "a fresh worker remembers nothing");
+        second.turn(&store).expect("the hub answers");
+
+        // The hub's line for the row: one new record, the journaled one.
+        let hub = running.hub();
+        let head = hub.heads(&wsp_api::WorkspaceId("shared:mp".into())).unwrap().get(&subject).copied();
+        assert_eq!(head, Some(id), "the hub's head is the journaled record");
+        let mut records = 0;
+        let mut stack = vec![hub.objects().root().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                if e.path().is_dir() {
+                    stack.push(e.path());
+                } else if let Some(o) = std::fs::read(e.path()).ok().and_then(|b| wsp_objects::decode(&b).ok()) {
+                    records += usize::from(o.subject() == &subject);
+                }
+            }
+        }
+        assert_eq!(records, 1, "the row's line has one record, not two");
+        assert!(held(&journal) <= 1 && journal.by_subject().get(&subject).is_none_or(|(_, es)| es.iter().all(|e| e.id == id)), "no twin in the journal");
+        running.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -145,6 +145,20 @@ impl Journal {
         self.by_subject().remove(subject).and_then(|(_, es)| es.last().map(|e| e.id))
     }
 
+    /// The last entry of `subject` and its bytes, where it is a record whose
+    /// entity is `made`'s: the object a worker that lost its memory of what it
+    /// minted takes again instead of making a twin of it (wsp-484).
+    pub(crate) fn tip_of_entity(&self, subject: &Subject, made: &Object) -> Option<(ObjectId, Vec<u8>)> {
+        let Object::Record { entity, .. } = made else { return None };
+        let (_, entries) = self.by_subject().remove(subject)?;
+        let tip = entries.last()?;
+        let bytes = self.bytes(tip)?;
+        match wsp_objects::decode(&bytes).ok()? {
+            Object::Record { entity: held, .. } if held == *entity => Some((tip.id, bytes)),
+            _ => None,
+        }
+    }
+
     /// Puts `entries` through `put`, in order, in chunks under the client's
     /// put size. The hub keeps an object once whatever is put again, so a
     /// replay after a crash sends what was sent and keeps no duplicate.
