@@ -1776,6 +1776,72 @@ mod tests {
         assert!(log_of(&store, "m-1").contains("left running"));
     }
 
+    /// `wsp-333`'s third item: retro-8's cycle.log is already written and
+    /// cannot be rebuilt, so this replays its two cases through the new code.
+    /// compound-react-040 (seat cpd-115) stood 6h44m past its verdict and
+    /// wsp-309 (seat cpd-157) 2h21m, each "verification holds and the agent is
+    /// left running" because its backend could not say whether anybody had
+    /// typed to it. The conditions are theirs: a retro row whose verifier
+    /// holds, a seat at rest, and ticks every five minutes from a minute after
+    /// the verdict across the whole window each stood. With the seat unable to
+    /// say, it is ended on the first tick; with a turn begun at it after the
+    /// verdict, it is kept with the time named, once, and ended on the first
+    /// tick past that time. In neither is a "left running" line written.
+    #[test]
+    fn retro_8s_two_seats_replayed_across_their_windows_are_ended_or_kept_with_a_named_end_and_never_left_running() {
+        for (row, window) in [("compound-react-040", 6 * 3600 + 44 * 60), ("wsp-309", 2 * 3600 + 21 * 60)] {
+            for typed in [None, Some(true)] {
+                // The env lock `verified` holds is what makes the clock below
+                // this test's alone; the guard puts it back however it ends.
+                let (_env, store) = verified(&format!("replay-{row}-{typed:?}"));
+                retro(&store, 0);
+                let verdict = util::epoch_secs();
+                struct Clock;
+                impl Drop for Clock {
+                    fn drop(&mut self) {
+                        std::env::remove_var("WSP_TEST_NOW");
+                    }
+                }
+                let _clock = Clock;
+                let mut seats = Fake::at_rest();
+                match typed {
+                    None => drop(seats.typed.remove("cpd-1")),
+                    Some(t) => drop(seats.typed.insert("cpd-1".into(), t)),
+                }
+                drain(&SAID);
+                drain(&TOLD);
+                let mut said = Vec::new();
+                let mut ended_at = None;
+                for ago in std::iter::once(60).chain((300..=window).step_by(300)) {
+                    // The verdict stands where it was; the run's clock moves on.
+                    std::env::set_var("WSP_TEST_NOW", (verdict + ago).to_string());
+                    pass(&store, &seats);
+                    said.extend(drain(&SAID));
+                    if member_ended() {
+                        assert!(ended_at.is_none(), "{row}: ended once");
+                        ended_at = Some(ago);
+                    }
+                }
+                let case = format!("{row}, typed {typed:?}");
+                let ended_at = ended_at.unwrap_or_else(|| panic!("{case}: the seat is ended inside the window: {said:#?}"));
+                match typed {
+                    None => assert_eq!(ended_at, 60, "{case}: ended on the first tick after the hold"),
+                    Some(_) => {
+                        assert!(ended_at >= RETRO_KEPT_SECS && ended_at < RETRO_KEPT_SECS + 300, "{case}: kept until the time named, then ended: {ended_at}s");
+                        let kept: Vec<_> = said.iter().filter(|l| l.contains("is kept")).collect();
+                        assert_eq!(kept.len(), 1, "{case}: the keep said once: {said:#?}");
+                        let until = util::iso_at(verdict + RETRO_KEPT_SECS);
+                        assert!(kept[0].contains(&format!("kept for whoever is using it until {until}")), "{case}: names its end: {}", kept[0]);
+                    }
+                }
+                assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended") && l.contains("retro row")), "{case}: {said:#?}");
+                assert!(!said.iter().any(|l| l.contains("left running")), "{case}: no left-running line in cycle.log: {said:#?}");
+                assert!(!log_of(&store, "m-1").contains(LEFT), "{case}: none on the row");
+                assert!(!drain(&TOLD).iter().any(|t| t.contains("left running")), "{case}: none to the governor");
+            }
+        }
+    }
+
     /// `m-1`'s pass decided `ago` seconds before now, its tags left alone.
     fn retro_decided(store: &Store, ago: i64) {
         let mut m = store.find_task("m-1").unwrap();
