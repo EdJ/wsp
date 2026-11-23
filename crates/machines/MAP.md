@@ -2,7 +2,8 @@
 
 The state core's machines (`docs/state-core.md` section 3), each a pure `Domain` (`decide`, `evolve`) over the
 contract's types: section 6's crate. Depends on `wsp-store-contract` and `serde_json` (an event's payload), nothing
-else (plus `sha2` for `token::hash`), and its domains do no IO and reads no clock (`tests/layering.rs`). Step 2 brings the orders machine (wsp-118); seats,
+else (plus `sha2` for `token::hash`), and its domains do no IO and reads no clock; only `token::mint` reads
+`/dev/urandom`, and `tests/layering.rs` lets `src/token.rs` name `std::fs`, `std::io` and `File::` and nothing else. Step 2 brings the orders machine (wsp-118); seats,
 rows and lists come with steps 3 and 4. Nothing outside this crate names it yet: wsp-server composes `Orders` with
 its `Mirror` at group 3 (wsp-121).
 
@@ -29,7 +30,7 @@ its `Mirror` at group 3 (wsp-121).
 
 - **Pure.** `decide` reads only the `State`, the command and the principal; `evolve` only the state and the
   event. A refusal drafts nothing. No `std::fs`, `std::net`, `std::process`, `std::time` or the like
-  (`tests/layering.rs`).
+  (`tests/layering.rs`), bar `token::mint`'s read of `/dev/urandom`, which is no part of a `Domain`.
 - **The contract's refusals only** (R5: a new code is a contract row). 3.1's "no seat" is `not_found { seat }` or
   `illegal { seat, "gone", verb }`; "busy" and "not ready" are `illegal { seat, <its state>, "order.deliver" }`;
   every other illegal transition is `illegal { order, <its state>, verb }`. `order.deliver`'s fence is checked

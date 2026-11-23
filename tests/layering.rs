@@ -833,8 +833,13 @@ fn the_view_links_the_contract_alone_and_does_no_io() {
 /// `wsp-machines`, section 6's machines (wsp-118), is pure: it links `wsp-store-contract` and
 /// nothing else of the workspace, directly or through it, its own tests included, so a machine is
 /// tested as two functions over a `State` with no store behind it. Its only other dependency is
-/// `serde_json` (an event's payload), and its source names no IO of the standard library and reads
-/// no clock: `decide` and `evolve` see only the state, the command and the event they are handed.
+/// `serde_json` (an event's payload) and `sha2` (wsp-159: `token::hash` is the hex SHA-256 of a
+/// token), and its source names no IO of the standard library and reads no clock: `decide` and
+/// `evolve` see only the state, the command and the event they are handed.
+///
+/// One exception, on purpose (wsp-159): `src/token.rs` makes a token, so `mint` reads
+/// `/dev/urandom`. That file may name `std::fs`, `std::io` and `File::` and nothing else of the
+/// list; tokens are made and hashed there while `decide` and `evolve` stay pure.
 #[test]
 fn the_machines_link_the_contract_alone_and_do_no_io() {
     const MAY: &[&str] = &["wsp-store-contract"];
@@ -844,8 +849,8 @@ fn the_machines_link_the_contract_alone_and_do_no_io() {
 
     let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
     let extra: Vec<&String> =
-        named.iter().filter(|d| !["serde_json", "wsp-store-contract", "wsp-machines"].contains(&d.as_str())).collect();
-    assert!(extra.is_empty(), "wsp-machines depends on serde_json and the contract alone, not {extra:?}");
+        named.iter().filter(|d| !["serde_json", "sha2", "wsp-store-contract", "wsp-machines"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-machines depends on serde_json, sha2 and the contract alone, not {extra:?}");
 
     const IO: &[&str] = &[
         "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "std::time",
@@ -863,7 +868,10 @@ fn the_machines_link_the_contract_alone_and_do_no_io() {
             }
             files += 1;
             let code = strip(&fs::read_to_string(&p).unwrap());
-            for io in IO.iter().filter(|io| code.contains(*io)) {
+            // `token::mint` reads the system's randomness (wsp-159); nothing else there does IO.
+            let randomness: &[&str] =
+                if p.file_name().is_some_and(|n| n == "token.rs") { &["std::fs", "std::io", "File::"] } else { &[] };
+            for io in IO.iter().filter(|io| code.contains(*io) && !randomness.contains(io)) {
                 found.push(format!("{}: {io}", p.strip_prefix(root()).unwrap().display()));
             }
         }
