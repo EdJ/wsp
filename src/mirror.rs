@@ -188,8 +188,9 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 /// A row at review that is finished (`wsp-105`: verified, not reverted, no
 /// held barrier still judging it) carries `attention` = `needs-you`,
 /// `attention_text`, and `action` (`wsp done <id>`, Mark done), as groups and
-/// asks do. Where several are, each also carries [`ATTENTION_GROUP`] and
-/// `group_text`, and the first by id `group_action`: the one item
+/// asks do. Where several are, each also carries [`ATTENTION_GROUP`], and
+/// the first by id alone `group_text` and `group_action` (wsp-755: a count
+/// that moves re-puts one row, not every member): the one item
 /// [`crate::classify::finished`] makes of them, Mark all done and its items.
 pub fn rows(
     tasks: &[Task],
@@ -228,8 +229,11 @@ pub fn rows(
                 }
                 if let Some(g) = &group {
                     put(&mut f, ATTENTION_GROUP, "finished");
-                    put(&mut f, "group_text", &g.text);
+                    // `wsp-755`: the group's text and act change with its
+                    // count, so they ride on one row; on every member a new
+                    // finished row re-put each of them.
                     if finished.keys().next() == Some(&t.id) {
+                        put(&mut f, "group_text", &g.text);
                         if let Some(act) = &g.action {
                             put(&mut f, "group_action", &act.json().to_string());
                         }
@@ -465,8 +469,8 @@ pub(crate) fn finished_item(finished: &BTreeMap<String, crate::classify::Attenti
 }
 
 /// A finished row's key for the item it folds into, where there are several:
-/// `finished`. Beside it `group_text` ("N finished rows to close"), and
-/// `group_action`, the group's act as JSON, on **one** row only: the lowest id
+/// `finished`. Beside it `group_text` ("N finished rows to close") and
+/// `group_action`, the group's act as JSON, both on **one** row only: the lowest id
 /// among the rows in the group, which is after both exclusions (a reverted
 /// row or one a held barrier judges is never it), not among all at review
 /// (`wsp-105`).
@@ -1924,8 +1928,9 @@ mod tests {
             let action: serde_json::Value = serde_json::from_str(&r["action"]).unwrap();
             assert_eq!(action, done(id));
             assert_eq!(r.get(ATTENTION_GROUP).map(String::as_str), Some("finished"));
-            assert_eq!(r.get("group_text").map(String::as_str), Some("2 finished rows to close"));
         }
+        assert_eq!(f("wsp-11").get("group_text").map(String::as_str), Some("2 finished rows to close"));
+        assert!(!f("wsp-12").contains_key("group_text"), "the text rides on the first row alone");
         let all: serde_json::Value = serde_json::from_str(&f("wsp-11")["group_action"]).unwrap();
         assert_eq!(all["verb"], "group");
         assert_eq!(all["buttons"][0]["each"], json!([["wsp-11"], ["wsp-12"]]));
@@ -1945,5 +1950,38 @@ mod tests {
         let alone = row_of(&read(&s), "wsp-11").fields;
         assert_eq!(alone.get("attention").map(String::as_str), Some("needs-you"));
         assert!(!alone.contains_key(ATTENTION_GROUP) && !alone.contains_key("group_action"), "one shows alone: {alone:?}");
+    }
+
+    /// `wsp-755`: a group's count moving (a third row finishing) changes the
+    /// row that carries the group and the row that joined, and no other
+    /// member: `group_text` and `group_action` are off every row but one.
+    #[test]
+    fn a_finished_row_joining_the_group_changes_only_the_carrier_and_itself() {
+        use crate::verification::{record, State as V};
+        let s = store("mirror-finished-churn");
+        for id in ["wsp-20", "wsp-21", "wsp-22", "wsp-23"] {
+            let mut t = Task::new(&format!("title of {id}"), id);
+            t.project = Some("wsp".into());
+            t.status_raw = "review".into();
+            s.save_task(&t).unwrap();
+        }
+        for id in ["wsp-20", "wsp-21", "wsp-22"] {
+            record(&s, id, V::Holds, "it holds", None, None).unwrap();
+        }
+        let read = |s: &Store| {
+            let tasks = s.tasks();
+            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks), &BTreeMap::new())
+        };
+        let before = read(&s);
+        assert_eq!(row_of(&before, "wsp-20").fields.get("group_text").map(String::as_str), Some("3 finished rows to close"));
+        record(&s, "wsp-23", V::Holds, "it holds", None, None).unwrap();
+        let after = read(&s);
+        assert_eq!(row_of(&after, "wsp-20").fields.get("group_text").map(String::as_str), Some("4 finished rows to close"));
+        let changed: Vec<String> = ["wsp-20", "wsp-21", "wsp-22", "wsp-23"]
+            .iter()
+            .filter(|id| row_of(&before, id).fields != row_of(&after, id).fields)
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(changed, vec!["wsp-20", "wsp-23"]);
     }
 }
