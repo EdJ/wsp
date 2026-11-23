@@ -129,13 +129,25 @@ fn add_kind(store: &Store, args: &Args, kind: &str) -> i32 {
     if let Some(status) = args.get("status") {
         p.status = status;
     }
+    let mut parent_ws = None;
     if let Some(parent) = args.get("parent") {
         match index.find(&parent) {
-            Some(found) => p.parent = Some(found.id.clone()),
+            Some(found) => {
+                p.parent = Some(found.id.clone());
+                parent_ws = Some(found.workspace.clone());
+            }
             None => {
                 eprintln!("wsp: no such parent project `{parent}`");
                 return 1;
             }
+        }
+    }
+    // Private unless said otherwise; a child project is where its parent is (wsp-172).
+    match crate::record_workspace::of_new(args, parent_ws.as_ref()) {
+        Ok(w) => p.workspace = w,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
         }
     }
 
@@ -1057,6 +1069,11 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Projects,
                 order: 20,
                 text: r##"  wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Projects,
+                order: 25,
+                text: r##"  wsp project add <slug> --workspace shared:<name>   …in a shared workspace, as `wsp add`"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Projects,

@@ -128,6 +128,16 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         }
     }
 
+    // Private unless said otherwise; a sub-task is where its parent is (wsp-172).
+    // Before an id exists, so a refusal leaves nothing reserved.
+    let workspace = match crate::record_workspace::of_new(args, parent.as_ref().map(|p| &p.workspace)) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    };
+
     let id = match store.alloc_task_id(project.as_deref()) {
         Ok(id) => id,
         Err(e) => {
@@ -164,6 +174,7 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     }
     t.parent = parent.as_ref().map(|p| p.id.clone());
     t.after = after;
+    t.workspace = workspace;
 
     if let Err(e) = store.save_task(&t) {
         eprintln!("wsp: write failed: {e}");
@@ -3691,6 +3702,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Tasks,
                 order: 40,
                 text: r##"  wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 45,
+                text: r##"  wsp add "title" --workspace shared:<name>   …filed in a shared workspace (needs a login;
+                                    `$WSP_WORKSPACE` is the default); private unless said,
+                                    and a sub-task is where its parent is"##,
             },
         ],
     },

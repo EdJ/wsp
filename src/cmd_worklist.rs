@@ -411,7 +411,16 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         None => None,
     };
 
+    let workspace = match crate::record_workspace::of_new(args, None) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    };
+
     let mut w = Worklist::new(&slug, &title);
+    w.workspace = workspace;
     w.caption = caption;
     w.project = project;
     w.made_in = made_in;
@@ -2931,7 +2940,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     -p <project> is where it stands, whose
                                     governor its seat answers to — unsaid,
                                     the project its members share;
-                                    --initiative init-N links it as it's made"##,
+                                    --initiative init-N links it as it's made;
+                                    --workspace shared:<name> files it shared, as `wsp add`"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 mod address;
+mod record_workspace;
 mod duplicate;
 mod tell_log;
 mod affected;
