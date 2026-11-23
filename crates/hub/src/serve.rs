@@ -10,10 +10,16 @@
 //!
 //! **TLS** (wsp-461). With `tls` in the config every connection is inside a TLS
 //! session, and an address that is not loopback is refused without it.
+//!
+//! **Leases** (wsp-466). The hub's leases run the config's `lease_days`, and a
+//! thread sweeps for expired ones every [`crate::leases::SWEEP`], releasing
+//! each and announcing `lease.expired`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use wsp_api::{Outcome, Principal, SyncCall, TOKEN_FILE};
 use wsp_server::{SyncVerbs, Server, SharedStore};
@@ -33,6 +39,23 @@ pub struct Running {
     hub: Arc<Hub>,
     token_path: PathBuf,
     tls: bool,
+    /// Dropped to stop the sweeper, which is then joined.
+    sweeper: Option<(Sender<()>, JoinHandle<()>)>,
+}
+
+/// Sweeps `hub` for expired leases every `every` until its sender is dropped.
+fn sweeper(hub: Arc<Hub>, every: std::time::Duration) -> (Sender<()>, JoinHandle<()>) {
+    let (stop, stopped) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || loop {
+        match stopped.recv_timeout(every) {
+            Err(RecvTimeoutError::Timeout) => {
+                // A failed sweep is tried again at the next; a take of an expired lease expires it anyway.
+                let _ = hub.expire_leases();
+            }
+            _ => return,
+        }
+    });
+    (stop, thread)
 }
 
 /// Opens the hub's data directory and starts listening as `cfg` says.
@@ -43,7 +66,8 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
         Some(files) => Some(wsp_server::tls::server_config(&files.cert, &files.key)?),
         None => None,
     };
-    let hub = Arc::new(Hub::open(&cfg.data_dir).map_err(|e| format!("opening {}: {e:?}", cfg.data_dir.display()))?);
+    let hub = Hub::open(&cfg.data_dir).map_err(|e| format!("opening {}: {e:?}", cfg.data_dir.display()))?;
+    let hub = Arc::new(hub.with_lease_ttl(cfg.lease_ttl()));
     let store: SharedStore = Arc::new(HubStore::new(hub.clone()));
     let mut server_cfg = wsp_server::Config::new(&cfg.data_dir);
     server_cfg.addrs = cfg.bind.clone();
@@ -55,7 +79,8 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
     let secure = tls.is_some();
     server_cfg.tls = tls;
     let server = Server::start(store, server_cfg).map_err(|e| e.to_string())?;
-    Ok(Running { server, hub, token_path: cfg.data_dir.join(TOKEN_FILE), tls: secure })
+    let sweeper = Some(sweeper(hub.clone(), crate::leases::SWEEP));
+    Ok(Running { server, hub, token_path: cfg.data_dir.join(TOKEN_FILE), tls: secure, sweeper })
 }
 
 impl Running {
@@ -79,7 +104,11 @@ impl Running {
     }
 
     /// Stops accepting and closes every client; the data stays for the next start.
-    pub fn stop(self) {
+    pub fn stop(mut self) {
+        if let Some((stop, thread)) = self.sweeper.take() {
+            drop(stop);
+            let _ = thread.join();
+        }
         self.server.stop();
     }
 }

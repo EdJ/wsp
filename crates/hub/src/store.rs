@@ -3,7 +3,10 @@
 //! says only that some workspace's refs changed; the hub's own announcement
 //! row (see [`crate::Hub::move_ref`]) is read here as what it means, a
 //! `ref.moved { workspace, subject, to }` (the multiplayer design's "a head
-//! moved"), so a subscriber hears which subject to fetch.
+//! moved"), so a subscriber hears which subject to fetch. An expiry's
+//! announcement row (see [`crate::leases`]) is read as `lease.expired
+//! { workspace, row, holder, token }`, so the holder's spoke hears it lost
+//! the lease.
 //!
 //! Event ids are the store's own and are kept: the events are rewritten in
 //! place, one for one, so a cursor, a replay from `from` and the head all mean
@@ -21,6 +24,7 @@ use wsp_store_contract::{
     Readings, Reads, Result, Rev, Row, RowFilter, RowId, Seat, SeatFilter, SeatId, State, Subject, Texts, Token,
 };
 
+use crate::leases::{lease_name, Expired, EXPIRED_PREFIX};
 use crate::{Hub, MOVED_PREFIX};
 
 /// The hub as a store: every call is the SQLite's, except that
@@ -38,6 +42,9 @@ impl HubStore {
         let (EventKind::TextSet, Subject::Row(row)) = (event.kind, &event.subject) else {
             return event;
         };
+        if row.0.starts_with(EXPIRED_PREFIX) {
+            return expired(event);
+        }
         let Some(workspace) = row.0.strip_prefix(MOVED_PREFIX) else {
             return event;
         };
@@ -64,6 +71,19 @@ impl HubStore {
     /// `workspace`'s refs, for a test of the stream.
     pub fn heads(&self, workspace: &SyncWorkspace) -> Result<Refs> {
         self.0.heads(workspace)
+    }
+}
+
+/// An expiry announcement's `text.set` as the `lease.expired` it means.
+fn expired(event: Event) -> Event {
+    let section = event.payload.get("section").and_then(|s| s.as_str());
+    let Some(expired) = section.and_then(|s| serde_json::from_str::<Expired>(s).ok()) else { return event };
+    Event {
+        kind: EventKind::LeaseExpired,
+        workspace: expired.workspace.0.parse().unwrap_or_default(),
+        subject: Subject::Lease(lease_name(&expired.row)),
+        payload: json!(expired),
+        ..event
     }
 }
 

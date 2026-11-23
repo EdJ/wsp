@@ -174,6 +174,7 @@ fn a_published_list_and_its_three_rows_reach_the_other_member_under_hub_ids() {
         peers: vec!["127.0.0.0/8".into()],
         tls: None,
         name: "wsp-hub".into(),
+        lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
     };
     let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
     let url = format!("tcp://{}", running.addrs()[0]);

@@ -13,8 +13,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
-use wsp_api::{Answer, Blob, Call, IdsAlloc, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId};
-use wsp_store_contract::Subject;
+use wsp_api::{
+    Answer, Blob, Call, IdsAlloc, LeaseHold, LeaseTake, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId,
+};
+use wsp_store_contract::{At, RowId, Subject, Token};
 
 use crate::{orders, Client, Error};
 
@@ -244,6 +246,35 @@ impl Client {
         match self.sync_call(SyncCall::Alloc(ask))? {
             Answer::Ids(ids) => Ok(ids),
             other => Err(Error::Unexpected(format!("ids.alloc was answered {other:?}"))),
+        }
+    }
+
+    /// `lease.take` (wsp-466): the hub's lease on `row` in `workspace`, its
+    /// fencing token and when it expires. Refused `held` (naming the holder)
+    /// while another user holds it, `forbidden` when it is allocated to
+    /// another user or the caller is no member of `workspace`.
+    pub fn lease_take(&mut self, workspace: &WorkspaceId, row: &RowId) -> Result<(Token, At), Error> {
+        let ask = LeaseTake { workspace: workspace.clone(), row: row.clone() };
+        match self.sync_call(SyncCall::LeaseTake(ask))? {
+            Answer::Lease { token, expires } => Ok((token, expires)),
+            other => Err(Error::Unexpected(format!("lease.take was answered {other:?}"))),
+        }
+    }
+
+    /// `lease.renew`: the caller's lease on `row` under `token` runs the TTL
+    /// again; refused `stale` once it has expired.
+    pub fn lease_renew(&mut self, row: &RowId, token: Token) -> Result<(Token, At), Error> {
+        match self.sync_call(SyncCall::LeaseRenew(LeaseHold { row: row.clone(), token }))? {
+            Answer::Lease { token, expires } => Ok((token, expires)),
+            other => Err(Error::Unexpected(format!("lease.renew was answered {other:?}"))),
+        }
+    }
+
+    /// `lease.release`: lets the caller's lease on `row` under `token` go.
+    pub fn lease_release(&mut self, row: &RowId, token: Token) -> Result<(), Error> {
+        match self.sync_call(SyncCall::LeaseRelease(LeaseHold { row: row.clone(), token }))? {
+            Answer::Released => Ok(()),
+            other => Err(Error::Unexpected(format!("lease.release was answered {other:?}"))),
         }
     }
 

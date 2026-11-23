@@ -35,6 +35,7 @@ impl Served {
             peers: vec!["127.0.0.0/8".into()],
             tls: None,
             name: "hub-t".into(),
+            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
         };
         let running = serve::start(&cfg).expect("the hub starts");
         Served { dir, running: Some(running) }

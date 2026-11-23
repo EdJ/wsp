@@ -176,6 +176,11 @@ pub enum EventKind {
     // `{"workspace", "subject", "to"}`.
     #[serde(rename = "ref.moved")]
     RefMoved,
+    // The hub's leases (wsp-466): a shared row's lease ran past its TTL and the
+    // hub released it. The subject is the lease, the workspace the row's, the
+    // payload `{"workspace", "row", "holder", "token"}`.
+    #[serde(rename = "lease.expired")]
+    LeaseExpired,
     // Text (2.5).
     #[serde(rename = "text.set")]
     TextSet,

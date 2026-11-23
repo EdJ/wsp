@@ -531,6 +531,7 @@ mod tests {
                 peers: vec!["127.0.0.0/8".into()],
                 tls: Some(wsp_hub::TlsFiles { cert: pki.cert.clone(), key: pki.key.clone() }),
                 name: "wsp-hub".into(),
+                lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
             };
             let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
             let port = running.addrs()[0].port();

@@ -71,6 +71,12 @@ impl MemHub {
                     Outcome::Ok(Answer::Ids(ids))
                 }
             },
+            // The hub's leases (wsp-466) are the real hub's alone.
+            call @ (SyncCall::LeaseTake(_) | SyncCall::LeaseRenew(_) | SyncCall::LeaseRelease(_)) => Outcome::Err(Failure {
+                code: Code::Unsupported,
+                text: format!("{}: MemHub keeps no leases", call.verb()),
+                refusal: None,
+            }),
         }
     }
 

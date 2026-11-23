@@ -34,6 +34,11 @@
 //! again and allocates past the winner, so the ids two spokes get are
 //! disjoint, and none is ever handed out again.
 //!
+//! **Leases** (wsp-466). `lease.take`, `lease.renew` and `lease.release` lease a
+//! shared row to one user's spoke for the config's TTL (7 days), with the
+//! store's fencing token, and the hub releases an expired lease and announces
+//! `lease.expired`; see [`leases`].
+//!
 //! [`Hub::answer`] (scope.rs: a caller reads and writes only the shared
 //! workspaces it is a member of, wsp-173) gives each of wsp-459's sync verbs the meaning wsp-client's
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
@@ -42,6 +47,7 @@
 pub mod admin;
 pub mod auth;
 mod config;
+pub mod leases;
 mod objects;
 pub mod scope;
 pub mod serve;
@@ -56,12 +62,13 @@ use wsp_api::{
 };
 use wsp_machines::Identity;
 use wsp_store_contract::{
-    Applied, Command, Commands, Domain, Draft, Error, Event, IdempotencyKey, LeaseName, Leases,
-    Principal, Reads, Refusal, Result, Rev, RowId, State, Subject, Texts, Token,
+    Applied, Command, Commands, Domain, Draft, Error, Event, EventKind, IdempotencyKey, Lease, LeaseName,
+    Leases, Principal, Reads, Refusal, Result, Rev, RowId, State, Subject, Texts, Token,
 };
 use wsp_store_sqlite::SqliteStore;
 
-pub use config::{Config, TlsFiles, DEFAULT_PORT};
+pub use config::{Config, TlsFiles, DEFAULT_LEASE_DAYS, DEFAULT_PORT};
+pub use leases::{Clock, Expired, Held};
 pub use objects::ObjectDir;
 pub use store::HubStore;
 
@@ -80,13 +87,15 @@ pub struct Hub {
     dir: PathBuf,
     objects: ObjectDir,
     pub(crate) db: SqliteStore,
+    pub(crate) desk: leases::LeaseDesk,
 }
 
 /// The domain of the hub's SQLite: the identity machine's commands (the
 /// `hub.user.*` and `hub.token.*` verbs, shared workspaces and members),
 /// decided and folded by [`Identity`]; no other command. The events the store
-/// writes itself (`lease.*`, `text.set`) change no state, since the rest of
-/// the hub's state is its refs and leases, not wsp's rows.
+/// writes itself change no state but the leases it holds (`lease.taken` and
+/// `lease.released`, folded as the mirror folds them, so the hub can sweep
+/// them for expiry); the rest of the hub's state is its refs, not wsp's rows.
 struct HubDomain;
 
 impl Domain for HubDomain {
@@ -105,7 +114,19 @@ impl Domain for HubDomain {
     }
 
     fn evolve(&self, state: State, event: &Event) -> State {
-        Identity.evolve(state, event)
+        let mut state = Identity.evolve(state, event);
+        match (event.kind, &event.subject) {
+            (EventKind::LeaseTaken, _) => {
+                if let Ok(l) = serde_json::from_value::<Lease>(event.payload.clone()) {
+                    state.leases.insert(l.name.clone(), l);
+                }
+            }
+            (EventKind::LeaseReleased, Subject::Lease(name)) => {
+                state.leases.remove(name);
+            }
+            _ => {}
+        }
+        state
     }
 }
 
@@ -134,7 +155,7 @@ impl Hub {
             .map_err(|e| backend(format!("creating {}: {e}", dir.display())))?;
         let objects = ObjectDir::open(dir.join("objects"))?;
         let db = SqliteStore::open(dir.join("hub.db"), Arc::new(HubDomain))?;
-        Ok(Hub { dir, objects, db })
+        Ok(Hub { dir, objects, db, desk: leases::LeaseDesk::default() })
     }
 
     /// The data directory.
@@ -339,24 +360,44 @@ impl Hub {
             SyncCall::Get { ids } => self.get(&ids).map(Answer::Objects),
             SyncCall::Move(mv) => self.move_ref(&mv).map(Answer::Move),
             SyncCall::Alloc(ask) => self.alloc_ids(&ask).map(Answer::Ids),
+            // A lease verb is the caller's: `Hub::answer` runs it with who asks.
+            call @ (SyncCall::LeaseTake(_) | SyncCall::LeaseRenew(_) | SyncCall::LeaseRelease(_)) => {
+                Err(Error::Refused(Refusal::Invalid { reason: format!("{} needs a caller", call.verb()) }))
+            }
         };
-        match answered {
-            Ok(answer) => Outcome::Ok(answer),
-            Err(Error::Refused(Refusal::Invalid { reason })) => Outcome::Err(Failure {
-                code: Code::Invalid,
-                text: reason,
-                refusal: None,
-            }),
-            Err(Error::Refused(refusal)) => Outcome::Err(Failure {
-                code: Code::Invalid,
-                text: format!("{refusal:?}"),
-                refusal: Some(refusal),
-            }),
-            Err(Error::Backend { reason }) => Outcome::Err(Failure {
-                code: Code::Backend,
-                text: reason,
-                refusal: None,
-            }),
+        outcome(answered)
+    }
+}
+
+/// An answer, or the failure an error is on the wire. A lease's refusals keep
+/// their own code (`held`, `forbidden`, `stale`, `not_found`), so a spoke
+/// reads why without the text.
+pub(crate) fn outcome(answered: Result<Answer>) -> Outcome {
+    match answered {
+        Ok(answer) => Outcome::Ok(answer),
+        Err(Error::Refused(Refusal::Invalid { reason })) => Outcome::Err(Failure {
+            code: Code::Invalid,
+            text: reason,
+            refusal: None,
+        }),
+        Err(Error::Refused(refusal)) => {
+            let (code, text) = match &refusal {
+                Refusal::Held { lease, holder } => {
+                    (Code::Held, format!("{} is held by {}", lease.0, wsp_api::principal::text(holder)))
+                }
+                Refusal::Forbidden { by } => (Code::Forbidden, format!("{}: forbidden", wsp_api::principal::text(by))),
+                Refusal::Stale { lease, current } => {
+                    (Code::Stale, format!("{} is no longer held under that token (current {})", lease.0, current.0))
+                }
+                Refusal::NotFound { subject } => (Code::NotFound, format!("{subject:?} is not held")),
+                other => (Code::Invalid, format!("{other:?}")),
+            };
+            Outcome::Err(Failure { code, text, refusal: Some(refusal) })
         }
+        Err(Error::Backend { reason }) => Outcome::Err(Failure {
+            code: Code::Backend,
+            text: reason,
+            refusal: None,
+        }),
     }
 }

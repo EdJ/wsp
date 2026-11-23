@@ -183,6 +183,7 @@ impl Rig {
             peers: vec!["127.0.0.0/8".into()],
             tls: None,
             name: "wsp-hub".into(),
+            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
         };
         let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
         self.proxy.point_at(Some(running.addrs()[0]));

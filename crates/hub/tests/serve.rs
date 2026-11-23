@@ -425,6 +425,7 @@ fn the_hub_refuses_to_start_on_a_non_loopback_bind_without_a_certificate() {
         peers: vec!["0.0.0.0/0".into()],
         tls: None,
         name: "wsp-hub".into(),
+        lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
     };
     match wsp_hub::serve::start(&cfg) {
         Err(why) => assert!(why.contains("tls"), "{why}"),

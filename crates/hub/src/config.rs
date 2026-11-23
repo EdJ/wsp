@@ -7,7 +7,8 @@
 //!   "port": 7489,
 //!   "peers": ["0.0.0.0/0", "::/0"],
 //!   "tls": { "cert": "/etc/wsp-hub/fullchain.pem", "key": "/etc/wsp-hub/privkey.pem" },
-//!   "name": "wsp-hub"
+//!   "name": "wsp-hub",
+//!   "lease_days": 7
 //! }
 //! ```
 //!
@@ -29,6 +30,8 @@
 //!   A relative path is read from the config file's own directory. A client
 //!   dials such a hub with a `tls://host:port` URL.
 //! - `name`: the instance `welcome` names. Default `wsp-hub`.
+//! - `lease_days`: how long a lease on a shared row runs from its take or its
+//!   last renewal (wsp-466). Default 7; at least 1.
 //!
 //! A key this file does not know is an error, so a misspelt `peers` does not
 //! quietly leave the default.
@@ -42,6 +45,10 @@ use wsp_server::Ranges;
 /// The port the hub listens on unless told otherwise: the one after the state
 /// core server's (7488).
 pub const DEFAULT_PORT: u16 = 7489;
+
+/// How many days a lease on a shared row runs unless the config says
+/// otherwise (wsp-466; decided 2026-11-23).
+pub const DEFAULT_LEASE_DAYS: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +64,8 @@ pub struct Config {
     pub tls: Option<TlsFiles>,
     #[serde(default = "default_name")]
     pub name: String,
+    #[serde(default = "default_lease_days")]
+    pub lease_days: u32,
 }
 
 /// The certificate chain and private key of the listener, both PEM.
@@ -79,6 +88,10 @@ fn default_name() -> String {
     "wsp-hub".into()
 }
 
+fn default_lease_days() -> u32 {
+    DEFAULT_LEASE_DAYS
+}
+
 impl Config {
     /// The config at `path`.
     pub fn load(path: &Path) -> Result<Config, String> {
@@ -98,7 +111,15 @@ impl Config {
         }
         cfg.ranges()?;
         cfg.tls_required()?;
+        if cfg.lease_days == 0 {
+            return Err(format!("{}: lease_days: 0, so every lease would expire as it is taken", path.display()));
+        }
         Ok(cfg)
+    }
+
+    /// A lease's TTL: `lease_days` days.
+    pub fn lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.lease_days) * 24 * 3600)
     }
 
     /// An address to bind that is not loopback is refused without `tls`: the
@@ -140,6 +161,8 @@ mod tests {
     fn a_config_of_a_data_dir_alone_is_loopback_on_the_default_port() {
         let cfg = load(r#"{"data_dir": "d"}"#).unwrap();
         assert_eq!((cfg.port, cfg.name.as_str()), (DEFAULT_PORT, "wsp-hub"));
+        assert_eq!(cfg.lease_ttl(), std::time::Duration::from_secs(7 * 24 * 3600), "a week's lease by default");
+        assert_eq!(load(r#"{"data_dir": "d", "lease_days": 2}"#).unwrap().lease_days, 2);
         assert!(cfg.bind.is_empty());
         assert!(cfg.ranges().unwrap().contains(&"127.0.0.1".parse().unwrap()));
         assert!(!cfg.ranges().unwrap().contains(&"8.8.8.8".parse().unwrap()));
@@ -176,6 +199,7 @@ mod tests {
             r#"{"data_dir": "d", "peers": []}"#,
             r#"{"data_dir": "d", "bind": ["not an ip"]}"#,
             r#"{"data_dir": "d", "tls": {"cert": "c.pem"}}"#,
+            r#"{"data_dir": "d", "lease_days": 0}"#,
             r#"{"data_dir": "d", "tls": {"cert": "c.pem", "key": "k.pem", "ca": "x"}}"#,
             r#"not json"#,
         ] {

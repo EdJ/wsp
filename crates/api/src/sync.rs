@@ -29,6 +29,25 @@
 //!   out before. The caller must be a member of `workspace`, the shared
 //!   workspace it publishes into.
 //!
+//! - `lease.take { workspace, row }` answers [`Answer::Lease`] (wsp-466): the
+//!   hub's lease on a shared row, `{ token, expires }`, for the hub's TTL (7
+//!   days by default). The token is the row's fencing token: every take of
+//!   the row after a release or an expiry is higher than any before it. The
+//!   holder taking it again keeps its token and is renewed. Refused `held {
+//!   holder }` while another user holds it unexpired, and `forbidden` when the
+//!   caller is no member of `workspace` or the row (or its list) is allocated
+//!   to another user (its `for` field, wsp-414).
+//! - `lease.renew { row, token }` answers [`Answer::Lease`]: the holder's lease
+//!   runs the TTL again from now. Refused `stale` once the lease has expired or
+//!   the token is not the current one, `held` when another user holds it,
+//!   `not_found` when no one does.
+//! - `lease.release { row, token }` answers [`Answer::Released`]: the lease is
+//!   let go; one already released or retaken (another token) is answered the
+//!   same, as the store's release is.
+//!
+//! An expired lease is released by the hub, which announces `lease.expired
+//! { workspace, row, holder, token }` on its stream.
+//!
 //! None of them carries an idempotency key: a put is idempotent by its hash
 //! and a move by its `from`, so a retry after a lost reply is harmless. An
 //! `ids.alloc` retried after a lost reply allocates again; the ids lost are
@@ -38,7 +57,7 @@
 //! the wire's.
 
 use serde::{Deserialize, Serialize};
-use wsp_store_contract::Subject;
+use wsp_store_contract::{RowId, Subject, Token};
 
 pub use wsp_objects::{ObjectId, Refs, WorkspaceId};
 
@@ -46,7 +65,17 @@ pub use wsp_objects::{ObjectId, Refs, WorkspaceId};
 use crate::Answer;
 
 /// The sync verbs, as [`SyncCall`] names them on the wire.
-pub const SYNC_VERBS: &[&str] = &["sync.heads", "sync.have", "sync.put", "sync.get", "refs.move", "ids.alloc"];
+pub const SYNC_VERBS: &[&str] = &[
+    "sync.heads",
+    "sync.have",
+    "sync.put",
+    "sync.get",
+    "refs.move",
+    "ids.alloc",
+    "lease.take",
+    "lease.renew",
+    "lease.release",
+];
 
 /// The most ids one `ids.alloc` hands out; more is refused `invalid`.
 pub const MAX_IDS: u32 = 1000;
@@ -74,6 +103,15 @@ pub enum SyncCall {
     /// Row ids for a project from the hub's counter. Answered [`Answer::Ids`].
     #[serde(rename = "ids.alloc")]
     Alloc(IdsAlloc),
+    /// Lease a shared row. Answered [`Answer::Lease`].
+    #[serde(rename = "lease.take")]
+    LeaseTake(LeaseTake),
+    /// Renew the caller's lease. Answered [`Answer::Lease`].
+    #[serde(rename = "lease.renew")]
+    LeaseRenew(LeaseHold),
+    /// Let the caller's lease go. Answered [`Answer::Released`].
+    #[serde(rename = "lease.release")]
+    LeaseRelease(LeaseHold),
 }
 
 impl SyncCall {
@@ -86,6 +124,9 @@ impl SyncCall {
             SyncCall::Get { .. } => "sync.get",
             SyncCall::Move(_) => "refs.move",
             SyncCall::Alloc(_) => "ids.alloc",
+            SyncCall::LeaseTake(_) => "lease.take",
+            SyncCall::LeaseRenew(_) => "lease.renew",
+            SyncCall::LeaseRelease(_) => "lease.release",
         }
     }
 }
@@ -139,6 +180,22 @@ impl IdsAlloc {
         }
         None
     }
+}
+
+/// `lease.take`'s `args`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseTake {
+    /// The shared workspace the row is in; the caller must be its member.
+    pub workspace: WorkspaceId,
+    pub row: RowId,
+}
+
+/// `lease.renew`'s and `lease.release`'s `args`: the row and the token its
+/// `lease.take` answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseHold {
+    pub row: RowId,
+    pub token: Token,
 }
 
 /// The id numbered `n` under `project`, as a store names it (`wsp-007`).

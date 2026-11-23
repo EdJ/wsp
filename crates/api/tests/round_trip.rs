@@ -282,7 +282,7 @@ fn every_frame_type_round_trips() {
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 18;
 const COMMANDS: usize = 31;
-const SYNCS: usize = 6;
+const SYNCS: usize = 9;
 const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
 
 fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
@@ -293,6 +293,9 @@ fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
         SyncCall::Get { .. } => (3, "sync.get"),
         SyncCall::Move(_) => (4, "refs.move"),
         SyncCall::Alloc(_) => (5, "ids.alloc"),
+        SyncCall::LeaseTake(_) => (6, "lease.take"),
+        SyncCall::LeaseRenew(_) => (7, "lease.renew"),
+        SyncCall::LeaseRelease(_) => (8, "lease.release"),
     }
 }
 
@@ -577,7 +580,10 @@ fn requests() -> Vec<Frame> {
             SyncCall::Put { objects: vec![a_blob()] },
             SyncCall::Get { ids: vec![an_id(1)] },
             SyncCall::Move(RefMove { workspace: workspace.clone(), subject: Subject::Row(row_id()), from: None, to: an_id(1) }),
-            SyncCall::Alloc(IdsAlloc { workspace, project: "wsp".into(), n: 3, past: Some(184) }),
+            SyncCall::Alloc(IdsAlloc { workspace: workspace.clone(), project: "wsp".into(), n: 3, past: Some(184) }),
+            SyncCall::LeaseTake(LeaseTake { workspace, row: row_id() }),
+            SyncCall::LeaseRenew(LeaseHold { row: row_id(), token: Token(3) }),
+            SyncCall::LeaseRelease(LeaseHold { row: row_id(), token: Token(3) }),
         ]
         .into_iter()
         .map(Call::Sync),
@@ -629,7 +635,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 25;
+const ANSWERS: usize = 27;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -665,6 +671,8 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Move(_) => (22, "move"),
         Answer::Whoami { .. } => (23, "whoami"),
         Answer::Ids(_) => (24, "ids"),
+        Answer::Lease { .. } => (25, "lease"),
+        Answer::Released => (26, "released"),
     }
 }
 
@@ -744,6 +752,8 @@ fn answers() -> Vec<Frame> {
         ok(24, Answer::Move(Move::Moved { head: an_id(2) }), vec![]),
         ok(25, Answer::Whoami { by: Principal::Person("jesper".into()), server: "core".into() }, vec![]),
         ok(26, Answer::Ids(vec!["wsp-185".into(), "wsp-186".into()]), vec![]),
+        ok(27, Answer::Lease { token: Token(4), expires: At(1_800_000_000_000) }, vec![]),
+        ok(28, Answer::Released, vec![]),
     ]
 }
 

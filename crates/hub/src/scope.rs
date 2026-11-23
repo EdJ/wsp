@@ -15,6 +15,10 @@
 //!   missing and `sync.get` leaves it out, and a `sync.get` that serves nothing
 //!   is `not_found`, whether or not the hub holds what was asked for.
 //!
+//! - `lease.take` names a workspace, which the caller must be a member of;
+//!   `lease.renew` and `lease.release` act only for the lease's holder (see
+//!   [`crate::leases`]).
+//!
 //! [`Hub::answer`] is the verbs through this scope; the unscoped methods of
 //! [`Hub`] are the host's own, with no caller.
 
@@ -111,6 +115,23 @@ impl Hub {
                 Err(failure) => Outcome::Err(failure),
             };
         }
+        match call {
+            SyncCall::LeaseTake(ask) => {
+                if let Err(failure) = self.member_of(by, &scope, &ask.workspace) {
+                    return Outcome::Err(failure);
+                }
+                let held = self.take_row_lease(by, &ask);
+                return crate::outcome(held.map(|h| Answer::Lease { token: h.token, expires: h.expires }));
+            }
+            SyncCall::LeaseRenew(hold) => {
+                let held = self.renew_row_lease(by, &hold);
+                return crate::outcome(held.map(|h| Answer::Lease { token: h.token, expires: h.expires }));
+            }
+            SyncCall::LeaseRelease(hold) => {
+                return crate::outcome(self.release_row_lease(by, &hold).map(|()| Answer::Released));
+            }
+            _ => {}
+        }
         match self.scoped(by, &scope, call) {
             Ok(call) => self.run(call),
             Err(failure) => Outcome::Err(failure),
@@ -152,6 +173,7 @@ impl Hub {
                 Ok(SyncCall::Put { objects })
             }
             SyncCall::Have { ids } => Ok(SyncCall::Have { ids }),
+            call @ (SyncCall::LeaseTake(_) | SyncCall::LeaseRenew(_) | SyncCall::LeaseRelease(_)) => Ok(call),
             SyncCall::Get { ids } => {
                 let served = self.served(scope, &ids)?;
                 let kept: Vec<ObjectId> = ids.iter().filter(|id| served.contains(id)).copied().collect();
