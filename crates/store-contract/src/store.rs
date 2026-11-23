@@ -81,6 +81,56 @@ pub struct RowFilter {
     pub list: Option<ListId>,
     #[serde(default)]
     pub seat: Option<SeatId>,
+    /// Each row as its head, without the [`WIP_BODIES`] fields (wsp-743): what
+    /// `ls` draws, under one line where the rows whole are not. Not a filter:
+    /// it cuts what each row carries, never which rows. Left out of the wire
+    /// when false, so a filter without it is the frame it always was.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub heads: bool,
+}
+
+/// What `lists` returns (wsp-743): every list, each whole unless `heads`.
+/// Read from `{}`, `null` or no `args` at all, as `NoArgs` was before it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ListFilter {
+    /// Each list without its [`WIP_BODIES`] fields, its groups whole. Left
+    /// out of the wire when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub heads: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for ListFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Given {
+            #[serde(default)]
+            heads: bool,
+        }
+        // Through `Option`, so that `null` and `args` left out read as the default.
+        Ok(Option::<Given>::deserialize(d)?.map(|g| ListFilter { heads: g.heads }).unwrap_or_default())
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One reading (wsp-743): a value the daemon works out from what it reads and
+/// no entity carries (the throttle's readings, what `spend` sums, `wip`'s
+/// whole census), as JSON text, and when it was written. Its shape is the
+/// reader's to know by its name (`wsp-view`'s `reading` module); the store
+/// keeps the text and the time and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Reading {
+    /// The JSON text, as written.
+    pub json: String,
+    /// When it was written, by the store's clock.
+    pub at: At,
+}
+
+/// Removes the [`WIP_BODIES`] fields: a row or a list as its head.
+pub fn heads_only(fields: &mut std::collections::BTreeMap<String, String>) {
+    WIP_BODIES.iter().for_each(|k| drop(fields.remove(*k)));
 }
 
 /// Which seats `seats` returns; an empty field does not filter.
@@ -118,6 +168,43 @@ pub trait Reads {
     /// are left empty. It is `snapshot()` with exactly that taken out, nothing
     /// else changed.
     fn wip_snapshot(&self) -> Result<(State, EventId)>;
+    /// Every list in id order, each whole, or without its [`WIP_BODIES`]
+    /// fields where `filter.heads` (wsp-743); its groups whole either way.
+    /// The default cuts [`snapshot`](Reads::snapshot); a backend whose state
+    /// is large cuts it where it is kept.
+    fn lists(&self, filter: &ListFilter) -> Result<Vec<List>> {
+        let (state, _) = self.snapshot()?;
+        Ok(state
+            .lists
+            .into_values()
+            .map(|mut l| {
+                if filter.heads {
+                    heads_only(&mut l.fields);
+                }
+                l
+            })
+            .collect())
+    }
+}
+
+/// Readings (wsp-743): named values kept beside the state, not in it. A write
+/// replaces the value and its time, and writes no event: a reading is a
+/// reader's convenience that its writer takes again on a period, not a change
+/// to the domain, so `snapshot()` and the log never hold one, and subscribers
+/// are not woken by one. A backend that keeps none answers every read empty
+/// and refuses a write as `Backend`.
+pub trait Readings {
+    /// The readings named, or every one when `names` is empty; a name with no
+    /// reading is absent from the map.
+    fn readings(&self, names: &[String]) -> Result<std::collections::BTreeMap<String, Reading>> {
+        let _ = names;
+        Ok(Default::default())
+    }
+    /// Replaces `name`'s reading with `json`, stamped now.
+    fn set_reading(&self, name: &str, json: String) -> Result<()> {
+        let _ = (name, json);
+        Err(crate::Error::Backend { reason: "this store keeps no readings".into() })
+    }
 }
 
 /// The event log.
@@ -197,6 +284,6 @@ pub trait Texts {
 }
 
 /// The whole family: what the conformance suite is generic over.
-pub trait Store: Reads + Events + Commands + Leases + Claims + Texts {}
+pub trait Store: Reads + Events + Commands + Leases + Claims + Texts + Readings {}
 
-impl<T: Reads + Events + Commands + Leases + Claims + Texts> Store for T {}
+impl<T: Reads + Events + Commands + Leases + Claims + Texts + Readings> Store for T {}

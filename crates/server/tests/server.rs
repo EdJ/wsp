@@ -322,7 +322,7 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
     }
     let s1 = ListId("s1".into());
     assert_eq!(c.read(Verb::List { list: s1.clone() }), Answer::List(store.list(&s1).unwrap()));
-    assert_eq!(c.read(Verb::Lists(NoArgs {})), Answer::Lists(state.lists.values().cloned().collect()));
+    assert_eq!(c.read(Verb::Lists(ListFilter::default())), Answer::Lists(state.lists.values().cloned().collect()));
     let cpd1 = SeatId("cpd-1".into());
     assert_eq!(c.read(Verb::Seat { seat: cpd1.clone() }), Answer::Seat(store.seat(&cpd1).unwrap()));
     let on_pi = SeatFilter { machine: Some(MachineName("pi".into())), ..Default::default() };
@@ -822,6 +822,7 @@ impl Claims for Retained {
     }
 }
 
+impl Readings for Retained {}
 impl Texts for Retained {
     fn text(&self, row: &RowId, section: &str) -> Result<(String, Rev)> {
         self.inner.text(row, section)

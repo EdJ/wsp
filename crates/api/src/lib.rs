@@ -47,9 +47,9 @@ pub use conn::{pair, Memory};
 pub use conn::{ConnError, Connection, MAX_LINE};
 
 pub use wsp_store_contract::{
-    Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListId,
-    Machine, Order, OrderState, Principal, Refusal, Row, RowFilter, RowId, Seat, SeatFilter,
-    SeatId, State, Subscribe, BEAT_SECS, MISSED_BEATS,
+    Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListFilter,
+    ListId, Machine, Order, OrderState, Principal, Reading, Refusal, Row, RowFilter, RowId, Seat,
+    SeatFilter, SeatId, State, Subscribe, BEAT_SECS, MISSED_BEATS,
 };
 
 /// The protocol's version: the envelope's `v` and both sides' `protocol` in
@@ -87,6 +87,7 @@ pub const READ_VERBS: &[&str] = &[
     "events",
     "subscribe",
     "wip",
+    "readings",
 ];
 
 /// The command verbs, as the contract's [`Command`] names them on the wire: the
@@ -254,11 +255,15 @@ pub enum Verb {
     Row {
         row: RowId,
     },
+    /// Rows the filter keeps; each as its head, without its text, where
+    /// `heads` (wsp-743).
     Rows(#[serde(default)] RowFilter),
     List {
         list: ListId,
     },
-    Lists(#[serde(default)] NoArgs),
+    /// Every list; each without its text where `heads` (wsp-743). `args` may
+    /// be left out, `null` or `{}`, as before the filter.
+    Lists(#[serde(default)] ListFilter),
     Seat {
         seat: SeatId,
     },
@@ -297,6 +302,13 @@ pub enum Verb {
     /// raised asks, the seats and claims; small enough
     /// for one line under [`MAX_LINE`] where `state`'s whole domain is not.
     Wip(#[serde(default)] NoArgs),
+    /// The readings named, every one when `names` is empty (wsp-743): what
+    /// the daemon works out and no entity carries, by name, as the store's
+    /// `Readings` keeps them. Answered [`Answer::Readings`].
+    Readings {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        names: Vec<String>,
+    },
 }
 
 /// The `args` of a verb that takes none: written `{}`, and read from `{}`,
@@ -395,6 +407,8 @@ pub enum Answer {
         state: State,
         at: EventId,
     },
+    /// `readings`: each reading asked for that there is, by name.
+    Readings(std::collections::BTreeMap<String, Reading>),
 }
 
 /// What `err` carries: `{ code, text }` (4.1), and the contract's refusal

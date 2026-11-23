@@ -829,7 +829,18 @@ fn the_whole_state_events_and_feed_round_trip() {
         states: vec![RowState::Todo],
         list: Some(list()),
         seat: None,
+        heads: true,
     });
+    trip(&ListFilter { heads: true });
+    trip(&Reading {
+        json: "{}".into(),
+        at: At(7),
+    });
+    // `lists` read `NoArgs` before its filter: absent and `null` still read.
+    for v in [json!(null), json!({}), json!({"newer": 1})] {
+        assert_eq!(serde_json::from_value::<ListFilter>(v).unwrap(), ListFilter::default());
+    }
+    assert_eq!(serde_json::to_value(RowFilter::default()).unwrap(), json!({"project": null, "states": [], "list": null, "seat": null}));
     trip(&SeatFilter {
         machine: Some(MachineName("mac".into())),
         states: vec![SeatState::Idle],
@@ -924,6 +935,7 @@ impl Claims for Nothing {
     }
 }
 
+impl Readings for Nothing {}
 impl Texts for Nothing {
     fn text(&self, _: &RowId, _: &str) -> Result<(String, Rev)> {
         Ok((String::new(), Rev("0".into())))

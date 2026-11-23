@@ -4,6 +4,9 @@
 //! keeps the rest, only
 //! raised asks come back, seats and claims are whole, and the rest is empty. `snapshot()` is
 //! unchanged beside it, and the in-memory store cuts the same state to the same reply.
+//!
+//! And wsp-743's reads over the same seed: `rows` and `lists` as heads (each less its text,
+//! cut in SQL), and readings, kept beside the state with no event.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -260,4 +263,107 @@ fn the_sql_cut_and_the_memory_cut_agree() {
 fn an_empty_store_cuts_to_the_empty_state() {
     let s = sqlite("empty");
     assert_eq!(s.wip_snapshot().unwrap(), (State::default(), EventId(0)));
+}
+
+// ---------------------------------------------------------------- wsp-743: heads and readings
+
+/// The fields `heads` keeps: everything but the text.
+fn head_of(mut f: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    WIP_BODIES.iter().for_each(|k| drop(f.remove(*k)));
+    f
+}
+
+/// `rows {heads: true}` is every row `rows {}` gives, in its order, each less its
+/// `WIP_BODIES` fields and nothing else (its `head` key, claim and scalars stay); the filters
+/// still pick the rows; and `rows {}` is the snapshot's rows, whole, as before.
+#[test]
+fn rows_as_heads_are_the_rows_less_their_text_and_rows_whole_are_unchanged() {
+    let s = sqlite("row-heads");
+    seeded(&s);
+    let (whole, _) = s.snapshot().unwrap();
+    let all = s.rows(&RowFilter::default()).unwrap();
+    assert_eq!(all, whole.rows.values().cloned().collect::<Vec<_>>(), "rows {{}} is the snapshot's rows, whole");
+
+    let heads = s.rows(&RowFilter { heads: true, ..Default::default() }).unwrap();
+    assert_eq!(heads.iter().map(|r| &r.id).collect::<Vec<_>>(), all.iter().map(|r| &r.id).collect::<Vec<_>>());
+    for (h, w) in heads.iter().zip(&all) {
+        assert_eq!(h, &Row { fields: head_of(w.fields.clone()), ..w.clone() }, "{}: the row less its text", h.id.0);
+    }
+    let open = heads.iter().find(|r| r.id.0 == "open").unwrap();
+    assert!(!open.fields.contains_key("body") && !open.fields.contains_key("prose"), "an open row is cut too");
+    assert_eq!(open.fields["claim"], "{\"agent_id\":\"cpd-1\"}");
+    let done_head = heads.iter().find(|r| r.id.0 == "done-head").unwrap();
+    assert_eq!(done_head.fields["head"], "{\"id\":\"done-head\"}", "the head key stays");
+    assert_eq!(done_head.fields["updated"], "2026-11-20");
+
+    let doing = RowFilter { states: vec![RowState::Doing], heads: true, ..Default::default() };
+    let picked: Vec<_> = s.rows(&doing).unwrap().into_iter().map(|r| r.id.0).collect();
+    assert_eq!(picked, ["open", "open-Doing"], "heads cuts what each row carries, never which rows");
+}
+
+/// `lists {}` is the snapshot's lists whole; `lists {heads: true}` each less its text, its
+/// groups whole, a finished list a seat sits on cut too (unlike `wip`'s cut).
+#[test]
+fn lists_whole_are_the_snapshots_and_as_heads_lose_their_text_alone() {
+    let s = sqlite("list-heads");
+    seeded(&s);
+    let (whole, _) = s.snapshot().unwrap();
+    assert_eq!(s.lists(&ListFilter::default()).unwrap(), whole.lists.values().cloned().collect::<Vec<_>>());
+    let heads = s.lists(&ListFilter { heads: true }).unwrap();
+    assert_eq!(heads.len(), whole.lists.len());
+    for (h, w) in heads.iter().zip(whole.lists.values()) {
+        assert_eq!(h, &List { fields: head_of(w.fields.clone()), ..w.clone() }, "{}", h.id.0);
+        assert!(!h.fields.contains_key("body"));
+    }
+    assert_eq!(heads[2].fields, fields(&[("title", "read api"), ("status", "running")]));
+    assert_eq!(heads[1].fields, fields(&[("status", "done"), (WIP_SEATED, "true")]));
+}
+
+/// A reading is kept beside the state: set, read back by name or all, replaced with a later
+/// `at`; and neither the state nor the log moves for it.
+#[test]
+fn a_reading_is_kept_beside_the_state_and_writes_no_event() {
+    let s = sqlite("readings");
+    seeded(&s);
+    let (before, head) = s.snapshot().unwrap();
+    assert!(s.readings(&[]).unwrap().is_empty(), "none before the first write");
+
+    s.set_reading("throttle", r#"{"mode":"auto"}"#.into()).unwrap();
+    s.set_reading("spend", r#"{"lines":[]}"#.into()).unwrap();
+    let all = s.readings(&[]).unwrap();
+    assert_eq!(all.keys().map(String::as_str).collect::<Vec<_>>(), ["spend", "throttle"]);
+    assert_eq!(all["throttle"].json, r#"{"mode":"auto"}"#);
+    assert!(all["throttle"].at.0 > 0, "stamped by the store's clock");
+
+    let named = s.readings(&["throttle".into(), "nothing".into()]).unwrap();
+    assert_eq!(named.keys().map(String::as_str).collect::<Vec<_>>(), ["throttle"], "an unwritten name is absent");
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    s.set_reading("throttle", r#"{"mode":"off"}"#.into()).unwrap();
+    let again = &s.readings(&["throttle".into()]).unwrap()["throttle"];
+    assert_eq!(again.json, r#"{"mode":"off"}"#);
+    assert!(again.at > all["throttle"].at, "a write replaces the time too");
+
+    assert_eq!(s.snapshot().unwrap(), (before, head), "no reading is in the state, and none wrote an event");
+    assert_eq!(s.head().unwrap(), head);
+}
+
+/// The in-memory store gives the same heads and keeps readings alike.
+#[test]
+fn the_memory_store_cuts_heads_and_keeps_readings_alike() {
+    let s = sqlite("heads-agree");
+    let m = MemStore::with_domain(Arc::new(Mirror));
+    seeded(&s);
+    seeded(&m);
+    for f in [RowFilter::default(), RowFilter { heads: true, ..Default::default() }] {
+        assert_eq!(s.rows(&f).unwrap(), m.rows(&f).unwrap(), "{f:?}");
+    }
+    for f in [ListFilter::default(), ListFilter { heads: true }] {
+        assert_eq!(s.lists(&f).unwrap(), m.lists(&f).unwrap(), "{f:?}");
+    }
+    for st in [&s as &dyn Store, &m] {
+        st.set_reading("wip", "{}".into()).unwrap();
+        let r = st.readings(&[]).unwrap();
+        assert_eq!((r.len(), r["wip"].json.as_str()), (1, "{}"));
+    }
 }

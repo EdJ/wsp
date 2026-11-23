@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS text (
     rev     INTEGER NOT NULL,
     PRIMARY KEY (row, section)
 );
+CREATE TABLE IF NOT EXISTS reading (
+    name TEXT PRIMARY KEY,
+    json TEXT NOT NULL,
+    at   INTEGER NOT NULL
+);
 ";
 
 /// Opens the pragmas every handle runs under: a busy wait of 10 s (so a second writer's

@@ -502,6 +502,7 @@ mod tests {
         fn claim(&self, _: &RowId, _: &SeatId, _: Duration, _: Option<&Fence>) -> Result<Token> { never!() }
         fn release(&self, _: &RowId, _: Token) -> Result<()> { never!() }
     }
+    impl Readings for NoStore {}
     impl Texts for NoStore {
         fn text(&self, _: &RowId, _: &str) -> Result<(String, Rev)> { never!() }
         fn set_text(&self, _: &RowId, _: &str, _: String, _: Rev) -> Result<Rev> { never!() }

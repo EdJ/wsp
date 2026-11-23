@@ -800,7 +800,8 @@ fn the_api_links_the_contract_alone_and_does_no_io() {
 /// `wsp-view`, the CLI's `--json` projections (wsp-305), is pure: it links `wsp-store-contract`
 /// and nothing else of the workspace, directly or through it, its own tests included, so
 /// web-chrome can link it and draw what the CLI prints from its own fold. Its only other
-/// dependency is `serde_json`, and its source names no IO of the standard library: what it
+/// dependencies are `serde_json` and `serde` (wsp-743: a reading carries
+/// these inputs as JSON, `reading`), and its source names no IO of the standard library: what it
 /// projects (the records, the live readings, the clock) is handed in by the caller.
 #[test]
 fn the_view_links_the_contract_alone_and_does_no_io() {
@@ -811,8 +812,8 @@ fn the_view_links_the_contract_alone_and_does_no_io() {
 
     let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
     let extra: Vec<&String> =
-        named.iter().filter(|d| !["serde_json", "wsp-store-contract", "wsp-view"].contains(&d.as_str())).collect();
-    assert!(extra.is_empty(), "wsp-view depends on serde_json and the contract alone, not {extra:?}");
+        named.iter().filter(|d| !["serde", "serde_json", "wsp-store-contract", "wsp-view"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-view depends on serde, serde_json and the contract alone, not {extra:?}");
 
     const IO: &[&str] = &[
         "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "std::time",

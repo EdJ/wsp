@@ -28,3 +28,5 @@ pub mod machine;
 pub mod throttle;
 /// `spend --json`.
 pub mod spend;
+/// The readings: the inputs above the CLI works out, by name, as JSON (wsp-743).
+pub mod reading;

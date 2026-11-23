@@ -13,7 +13,8 @@ use crate::common::task_json;
 
 /// A stage's caption (`wsp-242`): the word wsp derives and the tail, as the
 /// `stage` key prints them. A pass's `caption` is the same shape.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Told {
     pub word: String,
     pub tail: Option<String>,
@@ -38,7 +39,8 @@ impl Told {
 }
 
 /// One step of a task's timeline: the stage word it entered, and when.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Step {
     pub word: String,
     /// Empty where nothing dated it.
@@ -60,7 +62,8 @@ impl Step {
 }
 
 /// Where a task is and how it got there: the stage now and the steps before.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Stage {
     pub now: Told,
     pub steps: Vec<Step>,

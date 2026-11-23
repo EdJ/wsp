@@ -791,6 +791,7 @@ impl Claims for Retained {
     }
 }
 
+impl Readings for Retained {}
 impl Texts for Retained {
     fn text(&self, row: &RowId, section: &str) -> Result<(String, Rev)> {
         self.inner.text(row, section)
