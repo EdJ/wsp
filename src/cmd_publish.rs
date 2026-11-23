@@ -129,7 +129,7 @@ pub(crate) fn plan(store: &Store, target: &str) -> Result<Plan, String> {
 
 /// The highest number under `code` this store has used: a row live or archived,
 /// the project's counter, and an id `ids.json` knows.
-fn highest_local(store: &Store, code: &str) -> u64 {
+pub(crate) fn highest_local(store: &Store, code: &str) -> u64 {
     let prefix = format!("{code}-");
     let num = |id: &str| id.strip_prefix(&prefix).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).and_then(|n| n.parse::<u64>().ok());
     let mut top = store.projects().iter().filter(|p| p.code() == code).map(|p| p.seq as u64).max().unwrap_or(0);

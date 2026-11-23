@@ -118,6 +118,7 @@ impl<'a> Door<'a> {
         let (id, _) = wsp_objects::encode(obj);
         let caller = Caller::hub(&user_of(by));
         let mut heads = Heads::read(self.store);
+        self.make_way(&row.id.0)?;
         let local = self.store.task(&row.id.0);
         let mut t = task_of_record(row).ok_or_else(|| Refusal::Unreadable(row.id.clone()))?;
         // The file is still the one the synced head left: no local write since.
@@ -148,6 +149,48 @@ impl<'a> Door<'a> {
         heads.set(subject, id, file_digest(self.store, &row.id.0));
         heads.write(self.store).map_err(|e| Refusal::Write(e.to_string()))?;
         Ok(applied)
+    }
+
+    /// A private row of this spoke already holding the id a shared row arrives
+    /// under (wsp-481, wsp-185 d1): two spokes number as highest-seen plus one,
+    /// so a private wsp-480 here and a published wsp-480 there meet. The shared
+    /// id wins. The private row, its pieces (`<row>-<n>`) and every reference to
+    /// them (sub-tasks' `parent:`, list members, legs, state) are renumbered to
+    /// the next free id by [`Store::rename_tasks`]; `ids.json` keeps the old id
+    /// findable. The row stays private: nothing of it is pushed.
+    fn make_way(&self, id: &str) -> Result<(), Refusal> {
+        let Some(mine) = self.store.task(id) else { return Ok(()) };
+        if !mine.workspace.is_private() || crate::store::split_piece_id(id).is_some() {
+            return Ok(());
+        }
+        let Some((code, _)) = id.rsplit_once('-') else { return Ok(()) };
+        let ids = self.store.renamed_ids();
+        let mut n = crate::cmd_publish::highest_local(self.store, code) + 1;
+        let fresh = loop {
+            let cand = format!("{code}-{n:03}");
+            if !self.store.task_path(&cand).exists() && !ids.contains_key(&cand) && !self.store.archived_tasks().iter().any(|t| t.id == cand) {
+                break cand;
+            }
+            n += 1;
+        };
+        let mut map = BTreeMap::new();
+        for t in self.store.tasks() {
+            if let Some((row, n)) = crate::store::split_piece_id(&t.id) {
+                if row == id {
+                    map.insert(t.id.clone(), format!("{fresh}-{n}"));
+                }
+            }
+        }
+        map.insert(id.to_string(), fresh.clone());
+        self.store.rename_tasks(&map).map_err(|e| Refusal::Write(e.to_string()))?;
+        if let Some(mut p) = self.store.projects().into_iter().find(|p| p.code() == code) {
+            let num = fresh.rsplit_once('-').and_then(|(_, n)| n.parse::<usize>().ok()).unwrap_or(0);
+            if p.seq < num {
+                p.seq = num;
+                let _ = self.store.save_project(&p);
+            }
+        }
+        Ok(())
     }
 
     /// A list record: its `body` is the list file. Created where the spoke has
@@ -452,6 +495,45 @@ mod tests {
         assert_eq!(Door::new(&store, &rec).import(&theirs, &ann()), Ok(Applied::Reconciled("recorded".into())));
         assert_eq!(rec.0.borrow()[0].1, None);
         assert_eq!(store.task("wsp-903").unwrap().title, "mine");
+    }
+
+    #[test]
+    fn a_shared_row_arriving_on_a_private_row_renumbers_the_private_one() {
+        let store = crate::testkit::store("door-collide");
+        let mut mine = Task::new("my private row", "wsp-480");
+        mine.project = Some("wsp".into());
+        store.save_task(&mine).unwrap();
+        let mut piece = Task::new("its piece", "wsp-480-1");
+        piece.project = Some("wsp".into());
+        store.save_task(&piece).unwrap();
+        let mut sub = Task::new("its sub-task", "wsp-470");
+        sub.project = Some("wsp".into());
+        sub.parent = Some("wsp-480".into());
+        store.save_task(&sub).unwrap();
+        let mut list = crate::model::Worklist::new("l", "a list");
+        list.set_groups(&[crate::model::Group { members: vec!["wsp-480".into()], ..Default::default() }]);
+        store.save_worklist(&list).unwrap();
+
+        let theirs = record("wsp-480", "their shared row", "todo", "## Overview\ntheirs\n", None);
+        assert_eq!(Door::new(&store, &Unreconciled).import(&theirs, &ann()), Ok(Applied::Created(RowId("wsp-480".into()))));
+
+        let shared_row = store.task("wsp-480").unwrap();
+        assert_eq!(shared_row.title, "their shared row");
+        assert_eq!(shared_row.workspace, shared());
+        let new = store.renamed_ids().get("wsp-480").cloned().expect("ids.json keeps the old id");
+        assert_ne!(new, "wsp-480");
+        let kept = store.task(&new).expect("the private row is at its new id");
+        assert_eq!(kept.title, "my private row");
+        assert!(kept.workspace.is_private());
+        assert_eq!(store.task(&format!("{new}-1")).unwrap().title, "its piece");
+        assert!(store.task("wsp-480-1").is_none());
+        assert_eq!(store.task("wsp-470").unwrap().parent.as_deref(), Some(new.as_str()));
+        let members: Vec<String> = store.worklist("l").unwrap().groups().iter().flat_map(|g| g.members.clone()).collect();
+        assert_eq!(members, vec![new.clone()]);
+        // Nothing of the private row is for the hub: only the shared row has a head.
+        assert_eq!(Heads::read(&store).head(theirs.subject()), Some(&wsp_objects::encode(&theirs).0));
+        assert!(pending(&store).is_empty(), "{:?}", pending(&store));
+        assert!(!Heads::read(&store).head(&Subject::Row(RowId(new))).is_some());
     }
 
     #[test]
