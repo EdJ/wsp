@@ -72,6 +72,38 @@ pub(crate) fn push_record(store: &Store, subject: &Subject, workspace: Workspace
     Some(Object::Record { workspace, subject: subject.clone(), entity: Entity::Row(row), parent, by, at })
 }
 
+/// The record a push sends for a shared list: its file whole as `body`, with
+/// the synced head as parent. `None` for a list this spoke has no file for or
+/// one that is private.
+pub(crate) fn push_list_record(store: &Store, subject: &Subject, workspace: WorkspaceId, by: Principal, at: At) -> Option<Object> {
+    let Subject::List(id) = subject else { return None };
+    let w = store.worklist(&id.0)?;
+    if w.workspace.is_private() {
+        return None;
+    }
+    let lists = [w];
+    let texts = crate::mirror::list_texts_of(store, &lists);
+    let entity = crate::mirror::lists(&lists, &store.tasks(), &texts, &BTreeMap::new())
+        .into_iter()
+        .find(|e| matches!(e, Entity::List(l) if l.id == *id))?;
+    let parent = Heads::read(store).head(subject).copied();
+    Some(Object::Record { workspace, subject: subject.clone(), entity, parent, by, at })
+}
+
+/// The shared workspaces the login's user is a member of, as the hub serves
+/// them: the first item of a scoped subscription is a snapshot that holds
+/// only the caller's workspaces (wsp-174), and its `workspaces` are the names.
+/// Empty where the hub does not answer in time.
+fn member_workspaces(client: &Client) -> Vec<WorkspaceId> {
+    let mut feed = client.subscribe(None);
+    match feed.next_within(DIAL_WAIT) {
+        Some(wsp_client::Item::State { state, .. }) => {
+            state.workspaces.keys().map(|n| WorkspaceId(format!("shared:{}", n.0))).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A push refused `stale`: the hub's head for the subject, read from
 /// `objects` (what the sync fetched), merged into the file by the door.
 pub(crate) fn after_stale(
@@ -481,8 +513,21 @@ impl Worker {
         for w in Stream::read(store).workspaces {
             workspaces.entry(w).or_default();
         }
+        for w in store.worklists().iter().filter(|w| !w.workspace.is_private()) {
+            workspaces.entry(w.workspace.to_string()).or_default();
+        }
         let mut turned = Turned::default();
-        let by = self.client()?.by().clone();
+        // Every shared workspace the login's user belongs to, too: a member
+        // with nothing of its own there still takes what the others pushed.
+        let by = {
+            let c = self.client()?;
+            for w in member_workspaces(c) {
+                if w.0.starts_with("shared:") {
+                    workspaces.entry(w.0).or_default();
+                }
+            }
+            c.by().clone()
+        };
         for (ws, tasks) in workspaces {
             self.sync_workspace(store, &ws, &tasks, &by, &mut turned)?;
         }
@@ -545,6 +590,31 @@ impl Worker {
                     let (id, bytes) = wsp_objects::encode(&obj);
                     if let Err(e) = objects.put(&id, &bytes) {
                         self.say_once(store, format!("hub-sync: cannot keep {}'s object: {e}", t.id));
+                        continue;
+                    }
+                    self.minted.insert(subject.clone(), (digest, id));
+                    id
+                }
+            };
+            local.set(subject.clone(), id);
+            pushing.insert(subject, (id, digest));
+        }
+        for w in store.worklists().iter().filter(|w| w.workspace.to_string() == ws) {
+            let subject = Subject::List(wsp_store_contract::ListId(w.id.clone()));
+            included.insert(subject.clone());
+            let digest = crate::door::list_digest(store, &w.id);
+            let synced = heads.head(&subject).copied();
+            if synced.is_some() && heads.file(&subject) == digest {
+                local.set(subject, synced.expect("checked"));
+                continue;
+            }
+            let id = match self.minted.get(&subject) {
+                Some((d, id)) if *d == digest && objects.has(id) => *id,
+                _ => {
+                    let Some(obj) = push_list_record(store, &subject, wid.clone(), by.clone(), At(now_ms())) else { continue };
+                    let (id, bytes) = wsp_objects::encode(&obj);
+                    if let Err(e) = objects.put(&id, &bytes) {
+                        self.say_once(store, format!("hub-sync: cannot keep {}'s object: {e}", w.id));
                         continue;
                     }
                     self.minted.insert(subject.clone(), (digest, id));

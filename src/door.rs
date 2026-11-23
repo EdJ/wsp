@@ -42,6 +42,10 @@ pub(crate) enum Applied {
     Created(RowId),
     /// The record followed the local head; the file is now that record.
     Updated(RowId),
+    /// A list the spoke had no file for; now it has.
+    ListCreated(String),
+    /// A list record that followed the local head; the file is now that record.
+    ListUpdated(String),
     /// [`Reconcile`] took it, and says what it did.
     Reconciled(String),
 }
@@ -102,6 +106,7 @@ impl<'a> Door<'a> {
         };
         let row = match entity {
             Entity::Row(r) => r,
+            Entity::List(l) => return self.import_list(obj, l),
             other => return Err(Refusal::NotYet(format!("a {} record", entity_kind(other)))),
         };
         if *subject != Subject::Row(row.id.clone()) {
@@ -141,6 +146,38 @@ impl<'a> Door<'a> {
             }
         };
         heads.set(subject, id, file_digest(self.store, &row.id.0));
+        heads.write(self.store).map_err(|e| Refusal::Write(e.to_string()))?;
+        Ok(applied)
+    }
+
+    /// A list record: its `body` is the list file. Created where the spoke has
+    /// none, replaced where the record follows the local head on a file that
+    /// has not moved since; any other is [`Refusal::Diverged`] (lists have no
+    /// merge yet: the local file stays, and the line is said once by the worker).
+    fn import_list(&self, obj: &Object, list: &wsp_store_contract::List) -> Result<Applied, Refusal> {
+        let Object::Record { subject, parent, .. } = obj else { return Err(Refusal::NotYet("an event".into())) };
+        let row = RowId(list.id.0.clone());
+        if *subject != Subject::List(list.id.clone()) {
+            return Err(Refusal::Mismatch { subject: format!("{subject:?}"), entity: list.id.0.clone() });
+        }
+        if list.workspace.is_private() {
+            return Err(Refusal::Private(row));
+        }
+        let body = list.fields.get(crate::mirror::BODY).ok_or_else(|| Refusal::Unreadable(row.clone()))?;
+        let (id, _) = wsp_objects::encode(obj);
+        let path = self.store.worklist_path(&list.id.0);
+        let mut heads = Heads::read(self.store);
+        let applied = if !path.exists() {
+            Applied::ListCreated(list.id.0.clone())
+        } else if parent.is_some() && heads.head(subject) == parent.as_ref() && heads.file(subject) == list_digest(self.store, &list.id.0) {
+            Applied::ListUpdated(list.id.0.clone())
+        } else {
+            return Err(Refusal::Diverged { row, local: heads.head(subject).copied(), parent: parent.as_ref().copied() });
+        };
+        std::fs::create_dir_all(self.store.worklists_dir()).map_err(|e| Refusal::Write(e.to_string()))?;
+        crate::store::write_atomic(&path, body).map_err(|e| Refusal::Write(e.to_string()))?;
+        self.store.wrote(path);
+        heads.set(subject, id, list_digest(self.store, &list.id.0));
         heads.write(self.store).map_err(|e| Refusal::Write(e.to_string()))?;
         Ok(applied)
     }
@@ -185,6 +222,11 @@ fn entity_kind(e: &Entity) -> &'static str {
 /// The SHA-256 of a row's file as it is now; `None` for no file.
 fn file_digest(store: &Store, id: &str) -> Option<ObjectId> {
     std::fs::read(store.task_path(id)).ok().map(|b| ObjectId::of(&b))
+}
+
+/// The SHA-256 of a list's file as it is now; `None` for no file.
+pub(crate) fn list_digest(store: &Store, id: &str) -> Option<ObjectId> {
+    std::fs::read(store.worklist_path(id)).ok().map(|b| ObjectId::of(&b))
 }
 
 /// Per subject, the head the spoke last synced and the digest of the file it
