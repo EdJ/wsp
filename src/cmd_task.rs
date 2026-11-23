@@ -3538,16 +3538,6 @@ fn rows_json(store: &Store, tasks: &[Task]) -> String {
     wsp_view::task::ls_rows(&state, &picked, util::epoch_secs())
 }
 
-/// `wsp state --json` (wsp-308): the contract `State` the files make, by the
-/// mirror's own projections (`mirror::state_of`), pretty. What the `--json`
-/// paths hand `wsp-view`, printed so `tests/view_state.rs` can hand the same
-/// `State` to `wsp-view` itself and compare.
-fn state(store: &Store, _args: &Args) -> i32 {
-    let s = crate::mirror::state_of(store, crate::mirror::LOCAL);
-    println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
-    0
-}
-
 /// The contract row a task is, as the mirror projects it, for `wsp-view`.
 fn row_of(t: &Task, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> wsp_store_contract::Row {
     crate::mirror::rows(std::slice::from_ref(t), claims, &[], &Default::default(), &Default::default())
@@ -3598,18 +3588,6 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Tasks,
                 order: 50,
                 text: r##"  wsp ls [-p proj] [-t tag] [-s status] [--all]"##,
-            },
-        ],
-    },
-    crate::verbs::Verb {
-        names: &["state"],
-        run: state,
-        help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Tasks,
-                order: 55,
-                text: r##"  wsp state --json                  the contract State the files make, as the
-                                    mirror projects it: what the --json views read"##,
             },
         ],
     },

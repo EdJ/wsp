@@ -4010,7 +4010,7 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     picked_up.extend(silent_lines(store));
     match args.json() {
         true => {
-            let mut v = wip_json(&w);
+            let mut v = wsp_view::wip::of_state(&state_with_wip(store, &w), util::epoch_secs());
             if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
                 o.insert("waiting_at_cap".into(), serde_json::json!(cap_waits));
             }
@@ -5535,7 +5535,7 @@ fn wip_attention(w: &Wip, rows: &[WipRow]) -> serde_json::Value {
     json!({ "needs_you": needs_you, "follow_up": follow_up })
 }
 
-fn wip_json(w: &Wip) -> serde_json::Value {
+fn wip_parts(w: &Wip) -> (Vec<wsp_view::wip::Agent>, wsp_view::wip::Head) {
     let rows = wip_rows(w);
     let (blocked, in_review, inbox) = wip_queues(w);
     let agents: Vec<wsp_view::wip::Agent> = rows
@@ -5589,7 +5589,68 @@ fn wip_json(w: &Wip) -> serde_json::Value {
         review: in_review.iter().map(|t| t.json()).collect(),
         inbox,
     };
+    (agents, head)
+}
+
+fn wip_json(w: &Wip) -> serde_json::Value {
+    let (agents, head) = wip_parts(w);
     wsp_view::wip::wip_json(&agents, &head)
+}
+
+/// The seat and machine fields `wip --json` needs and the contract `State` does
+/// not carry (wsp-308), written onto `state` from what `w` read: each seat's
+/// object under `wip_view::key::AGENT` (and `OWED`), and this host's machine
+/// lines under `HEAD`. [`wsp_view::wip::of_state`] prints from them.
+pub(crate) fn wip_overlay(w: &Wip, state: &mut wsp_store_contract::State) {
+    use wsp_store_contract as c;
+    use wsp_view::wip::key;
+    let (agents, head) = wip_parts(w);
+    for a in &agents {
+        let id = c::SeatId(a.pane.clone());
+        let seat = state.seats.entry(id.clone()).or_insert_with(|| c::Seat {
+            id,
+            machine: c::MachineName(crate::mirror::LOCAL.to_string()),
+            kind: "claude".into(),
+            model: None,
+            state: c::SeatState::Started,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: None,
+            fields: Default::default(),
+        });
+        seat.fields.insert(key::AGENT.into(), wsp_view::wip::agent_json(a).to_string());
+        seat.fields.insert(key::OWED.into(), a.owed.to_string());
+    }
+    let lines = json!({
+        "attention": head.attention, "daemon": head.daemon, "unreachable": head.unreachable,
+        "disk": head.disk, "load": head.load, "throttle": head.throttle, "idle_memory": head.idle_memory,
+    });
+    let name = c::MachineName(crate::mirror::LOCAL.to_string());
+    let m = state.machines.entry(name.clone()).or_insert_with(|| c::Machine {
+        name,
+        transport: c::Transport::Local,
+        beat: None,
+        facts: Default::default(),
+    });
+    m.facts.insert(key::HEAD.into(), lines.to_string());
+}
+
+/// `wsp state --json`'s State with the `wip` overlay: what `wip --json` prints from.
+pub(crate) fn state_with_wip(store: &Store, w: &Wip) -> wsp_store_contract::State {
+    let mut s = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    wip_overlay(w, &mut s);
+    s
+}
+
+/// `wsp state --json` (wsp-308): the contract `State` the files make, by the
+/// mirror's own projections (`mirror::state_of`) and `wip`'s overlay, pretty. What the `--json`
+/// paths hand `wsp-view`, printed so `tests/view_state.rs` can hand the same
+/// `State` to `wsp-view` itself and compare.
+fn state_verb(store: &Store, _args: &Args) -> i32 {
+    let s = state_with_wip(store, &Wip::from_managers(store));
+    println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
+    0
 }
 
 /// What the `REVIEW` line says to do about a row at `review` (`wsp-323`).
@@ -7232,6 +7293,18 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 order: 500,
                 text: r##"  wsp agent pi-extension            the pi extension this binary carries, which
                                     `wsp install` writes into pi's extensions"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["state"],
+        run: state_verb,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 55,
+                text: r##"  wsp state --json                  the contract State the files make, as the
+                                    mirror projects it: what the --json views read"##,
             },
         ],
     },

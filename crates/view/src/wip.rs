@@ -110,3 +110,62 @@ pub fn wip_json(rows: &[Agent], head: &Head) -> Value {
         "inbox": head.inbox,
     })
 }
+
+/// `wip --json` keys the CLI's mirror writes (wsp-308), beside `common::key`.
+pub mod key {
+    /// On a seat: the seat's object as [`super::agent_json`] prints it, JSON
+    /// text. Present only on a seat `wip` draws.
+    pub const AGENT: &str = "wip";
+    /// On a seat: `"true"` when its `waiting` is owed (counted in the heading).
+    pub const OWED: &str = "wip_owed";
+    /// On this host's machine: the document's machine lines — `attention`,
+    /// `daemon`, `unreachable`, `disk`, `load`, `throttle`, `idle_memory` —
+    /// as one JSON object text.
+    pub const HEAD: &str = "wip_head";
+}
+
+/// `wip --json` over `State` alone: the seats that carry [`key::AGENT`]
+/// (sorted by project then pane, as the CLI draws them), the host machine's
+/// [`key::HEAD`], and the queues derived from the rows. `_now` is the clock the
+/// fold hands every projection; the seats' ages were worked out producer-side.
+pub fn of_state(state: &wsp_store_contract::State, _now: i64) -> Value {
+    use crate::common;
+    let mut seats: Vec<(String, String, Value, bool)> = state
+        .seats
+        .values()
+        .filter_map(|s| {
+            let v: Value = serde_json::from_str(s.fields.get(key::AGENT)?).ok()?;
+            let owed = s.fields.get(key::OWED).is_some_and(|o| o == "true");
+            let text = |n: &str| v.get(n).and_then(Value::as_str).unwrap_or_default().to_string();
+            Some((text("project"), text("pane"), v, owed))
+        })
+        .collect();
+    seats.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let head: Value = state
+        .machines
+        .values()
+        .filter_map(|m| serde_json::from_str::<Value>(m.facts.get(key::HEAD)?).ok())
+        .next()
+        .unwrap_or(Value::Null);
+    let h = |n: &str| head.get(n).cloned().unwrap_or(Value::Null);
+    let count = |n: &str| seats.iter().filter(|s| s.2.get(n).and_then(Value::as_bool) == Some(true)).count();
+    let queue = |word: &str| -> Vec<Value> {
+        state.rows.values().filter(|r| common::status(r) == word).map(common::task_json).collect()
+    };
+    json!({
+        "attention": h("attention"),
+        "agents": seats.iter().map(|s| s.2.clone()).collect::<Vec<_>>(),
+        "turning": count("turning"),
+        "needs_you": count("needs_you"),
+        "waiting": seats.iter().filter(|s| s.3).count(),
+        "daemon": h("daemon"),
+        "unreachable": h("unreachable"),
+        "disk": h("disk"),
+        "load": h("load"),
+        "throttle": h("throttle"),
+        "idle_memory": h("idle_memory"),
+        "blocked": queue("blocked"),
+        "review": queue("review"),
+        "inbox": state.rows.values().filter(|r| common::project(r).is_none() && common::is_open(common::status(r))).count(),
+    })
+}

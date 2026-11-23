@@ -22,7 +22,18 @@ use wsp_store_contract::State;
 /// the `wsp-view` fn that prints it (without the newline `println!` adds).
 type Projection = (&'static str, &'static [&'static str], fn(&State, i64) -> String);
 
-const PROJECTIONS: &[Projection] = &[("ls-all", &["ls", "--all", "--json"], wsp_view::task::ls_all)];
+const PROJECTIONS: &[Projection] = &[
+    ("ls-all", &["ls", "--all", "--json"], wsp_view::task::ls_all),
+    ("wip", &["wip", "--json"], wip),
+];
+
+/// Recordings `view_golden` already fails at HEAD (the fake manager gives an agent no
+/// `since` and no cpu clock: wsp-322): the CLI comparison holds for them, the recording's does not yet.
+const STALE_RECORDING: &[&str] = &["wip"];
+
+fn wip(state: &State, now: i64) -> String {
+    serde_json::to_string_pretty(&wsp_view::wip::of_state(state, now)).unwrap()
+}
 
 #[test]
 fn each_projection_over_state_prints_the_clis_bytes_and_the_recording() {
@@ -43,7 +54,7 @@ fn each_projection_over_state_prints_the_clis_bytes_and_the_recording() {
         let was = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e} (view_golden records it)", path.display()));
         if drawn != cli {
             moved.push(format!("── {name}: wsp-view over State ≠ wsp {} ──\nview:\n{drawn}\ncli:\n{cli}", args.join(" ")));
-        } else if drawn != was {
+        } else if drawn != was && !STALE_RECORDING.contains(name) {
             moved.push(format!("── {name}: wsp-view over State ≠ tests/fixtures/view/{name}.json ──\n{drawn}"));
         }
     }
