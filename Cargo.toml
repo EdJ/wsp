@@ -32,6 +32,7 @@ wsp-machines = { path = "crates/machines" }
 wsp-manager = { path = "crates/manager" }
 wsp-testkit = { path = "crates/testkit" }
 wsp-base = { path = "crates/base", features = ["test-support"] }
+wsp-client = { path = "crates/client", features = ["test-support"] }
 wsp-store = { path = "crates/store", features = ["test-support"] }
 wsp-wire = { path = "crates/wire", features = ["test-support"] }
 wsp-trees = { path = "crates/trees", features = ["test-support"] }

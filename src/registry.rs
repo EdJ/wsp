@@ -24,6 +24,7 @@ pub const ALL: &[&[crate::verbs::Verb]] = &[
     crate::cmd_message::VERBS,
     crate::cmd_migrate::VERBS,
     crate::cmd_project::VERBS,
+    crate::cmd_publish::VERBS,
     crate::cmd_initiative::VERBS,
     crate::cmd_resume::VERBS,
     crate::cmd_role::VERBS,

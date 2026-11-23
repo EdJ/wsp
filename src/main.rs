@@ -58,6 +58,7 @@ mod cmd_role;
 mod cmd_govern;
 mod cmd_install;
 mod cmd_login;
+mod cmd_publish;
 mod cmd_machine;
 mod cmd_hub;
 mod cmd_mandate;

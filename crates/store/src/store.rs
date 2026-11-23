@@ -1822,6 +1822,44 @@ impl Store {
         Ok((files, refs))
     }
 
+    /// Renumber `map` and file what it renamed in `workspace` (wsp-185, the
+    /// last step of `wsp publish`): [`Store::rename_tasks`], then `workspace:`
+    /// stamped on every row the map made, and on each list in `lists`.
+    ///
+    /// Parents first. `save_task` refuses a child whose parent is in another
+    /// workspace, so a sub-task or a piece is stamped only after its row; the
+    /// order is by depth, a piece counting as a child of its row.
+    pub fn renumber_into(&self, map: &BTreeMap<String, String>, workspace: &WorkspaceId, lists: &[String]) -> std::io::Result<(usize, usize)> {
+        let done = self.rename_tasks(map)?;
+        let mut made: Vec<Task> = map.values().filter_map(|id| self.task(id)).collect();
+        let depth = |t: &Task| {
+            let (mut d, mut at) = (0usize, t.clone());
+            while d < 64 {
+                let up = at.parent.clone().filter(|p| !p.is_empty()).or_else(|| split_piece_id(&at.id).map(|(r, _)| r.to_string()));
+                match up.and_then(|p| self.task(&p)) {
+                    Some(p) => {
+                        d += 1;
+                        at = p;
+                    }
+                    None => break,
+                }
+            }
+            d
+        };
+        made.sort_by_key(|t| (depth(t), t.id.clone()));
+        for mut t in made {
+            t.workspace = workspace.clone();
+            self.save_task(&t)?;
+        }
+        for id in lists {
+            if let Some(mut w) = self.worklist(id) {
+                w.workspace = workspace.clone();
+                self.save_worklist(&w)?;
+            }
+        }
+        Ok(done)
+    }
+
     /// Whether a code is already spoken for — by a project, by the inbox, or by
     /// ids that have already been handed out under it.
     ///
@@ -4200,6 +4238,39 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// `wsp-185`: a renumbering into a workspace stamps a row and its sub-task
+    /// and piece, parents first, and the old ids still resolve.
+    #[test]
+    fn renumber_into_files_the_renamed_rows_in_the_workspace() {
+        let store = scratch("renumber-into");
+        proj(&store, "wsp", "");
+        let ws: WorkspaceId = "shared:core".parse().unwrap();
+        let mut row = Task::new("the row", "wsp-001");
+        row.project = Some("wsp".into());
+        store.save_task(&row).unwrap();
+        let mut sub = Task::new("the sub", "wsp-002");
+        sub.project = Some("wsp".into());
+        sub.parent = Some("wsp-001".into());
+        store.save_task(&sub).unwrap();
+        let mut piece = Task::new("the piece", "wsp-001-1");
+        piece.project = Some("wsp".into());
+        store.save_task(&piece).unwrap();
+
+        let map = BTreeMap::from([
+            ("wsp-001".to_string(), "wsp-101".to_string()),
+            ("wsp-002".to_string(), "wsp-102".to_string()),
+            ("wsp-001-1".to_string(), "wsp-101-1".to_string()),
+        ]);
+        store.renumber_into(&map, &ws, &[]).unwrap();
+
+        for id in ["wsp-101", "wsp-102", "wsp-101-1"] {
+            assert_eq!(store.task(id).unwrap().workspace, ws, "{id}");
+        }
+        assert!(store.task("wsp-001").is_none());
+        assert_eq!(store.task("wsp-102").unwrap().parent.as_deref(), Some("wsp-101"));
+        assert_eq!(store.find_task("wsp-001").unwrap().id, "wsp-101", "the old id still resolves");
     }
 
     /// `wsp-409`: a claim carries when it expires, `off` writes none, and a
