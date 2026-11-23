@@ -1,0 +1,25 @@
+{
+  "agents": [],
+  "attention": {
+    "follow_up": [],
+    "needs_you": []
+  },
+  "blocked": [],
+  "daemon": null,
+  "disk": null,
+  "idle_memory": {
+    "over": false,
+    "panes": [],
+    "total_kb": 0,
+    "unread": 0,
+    "warn_kb": 2097152
+  },
+  "inbox": 0,
+  "load": null,
+  "needs_you": 0,
+  "review": [],
+  "throttle": "throttle: auto — in force, idle time unreadable so assuming the person is here · cpu clock 100% · check slots 0/4",
+  "turning": 0,
+  "unreachable": "unreachable: this machine's manager (WSP_HOST=manager and no manager record at <dir>/state/sandbox/wsp-alone/state/manager/local.json — `wsp install` writes it, or WSP_HOST=inproc runs the host in this process) — its seats are not read, not gone",
+  "waiting": 0
+}
