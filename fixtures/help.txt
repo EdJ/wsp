@@ -555,6 +555,12 @@ MACHINES
   wsp machine retire <name>         it is not coming back: retire it and list
                                     every row held on it (none is released)
   wsp machine rm <name> --force     remove the record entirely
+  wsp login <hub-url> [--ca FILE]   store your token for a hub, tls://host:port:
+                                    read from the prompt or stdin, never the
+                                    command line. One hub per wsp: a second login
+                                    replaces the first. --ca pins a private CA
+  wsp logout                        forget the hub's token; a sync worker stops
+  wsp hub status [--json]           the hub you are logged in to, and as whom
 
 WORKLISTS
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,

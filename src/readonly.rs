@@ -43,11 +43,11 @@ pub const ACTIONS: &[&str] = &[
     "attend", "claim", "release", "pin", "unpin", "agent", "doctor", "say", "tell", "flag", "reconcile",
     "attempts", "leg", "install", "daemon", "brief", "commit-help", "machine", "migrate", "code", "retro", "packet", "sandbox",
     "mandate", "cold", "after", "scratch", "artefact", "done", "stuck", "verifications", "panel", "init",
-    "project", "product", "initiative", "resume", "govern", "view", "kanban", "checkout", "land", "verify", "report", "throttle", "submit",
+    "project", "product", "initiative", "resume", "govern", "view", "kanban", "checkout", "land", "verify", "report", "throttle", "submit", "login", "logout",
 ];
 
 /// Verbs that write except for the listed sub-verbs.
-pub const MIXED: &[(&str, &[&str])] = &[("worklist", &["ls", "show"]), ("piece", &["show"])];
+pub const MIXED: &[(&str, &[&str])] = &[("worklist", &["ls", "show"]), ("piece", &["show"]), ("hub", &["status"])];
 
 /// The name the registry lists first for a word (`wl` → `worklist`).
 fn canonical(word: &str) -> &str {

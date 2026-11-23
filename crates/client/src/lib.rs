@@ -51,7 +51,7 @@ mod tls;
 pub mod testing;
 
 pub use credential::{
-    hub_ca, hub_ca_in, hub_url, hub_url_in, Credential, Target, HUBS_FILE, HUB_CA_ENV, HUB_TOKEN_ENV, HUB_URL_ENV,
+    hub_ca, hub_ca_in, hub_login_in, hub_url, hub_url_in, Credential, HubLogin, Target, HUBS_FILE, HUB_CA_ENV, HUB_TOKEN_ENV, HUB_URL_ENV,
     HUB_USER_ENV,
 };
 pub use dial::Silent;
@@ -224,6 +224,13 @@ impl Client {
     /// The instance the server named in its `welcome` (the first one's).
     pub fn server(&self) -> &str {
         &self.server
+    }
+
+    /// Who this connection is: the principal the server's `welcome` named
+    /// (a hub names it from the token, wsp-161), else the one the dial said.
+    /// `wsp login` stores its name as the login's `user` (wsp-462).
+    pub fn by(&self) -> &Principal {
+        &self.target.by
     }
 
     /// The head the server's `welcome` named when this client dialled.

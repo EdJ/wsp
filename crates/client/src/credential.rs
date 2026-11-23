@@ -8,8 +8,12 @@
 //! `~/.config/wsp/hubs.json`, a file only its owner may read (0600: a wider one
 //! is refused, naming it). The hub's URL is `$WSP_HUB_URL`, else the file's
 //! `url`. No host is a literal here: both come from the environment or the file.
-//! The file is one login, `{"url": "...", "token": "..."}`, and a `ca` (a PEM file) when
-//! the hub's certificate is a private CA's (wsp-461; `$WSP_HUB_CA`, `--ca <file>`); its `user`, if any, is not read (the hello's hint is `$WSP_HUB_USER`, else `$USER`).
+//! The file is one login, `{"url", "token", "user", "at"}`, and a `ca` (a PEM file) when
+//! the hub's certificate is a private CA's (wsp-461; `$WSP_HUB_CA`, `--ca <file>`). `wsp login`
+//! (wsp-462) writes it: `user` is the name the hub's `welcome` gave the token, `at` when. The
+//! dial never reads `user`: the hello's hint is `$WSP_HUB_USER`, else `$USER`, and every request
+//! is made as the principal the `welcome` names. [`hub_login_in`] reads the rest of the file
+//! without the token, for what prints a login.
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +117,33 @@ struct Login {
     url: Option<String>,
     token: Option<String>,
     ca: Option<String>,
+    user: Option<String>,
+    at: Option<String>,
+}
+
+/// What `hubs.json` says of a login, the token left out: for `wsp hub status`
+/// and for `wsp login` saying what it replaces. There is nowhere in it a token
+/// could be printed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubLogin {
+    pub url: String,
+    /// The name the hub gave the token at login; empty in a file written by hand.
+    pub user: String,
+    /// When the login was made, as the file says.
+    pub at: String,
+    /// The pinned CA file, if the login names one.
+    pub ca: Option<String>,
+}
+
+/// The login under `home`, without its token; None when there is no file.
+/// [`Silent::BadHubsFile`] for a file wider than 0600, unreadable or not a
+/// login, and for one that names no url.
+pub fn hub_login_in(home: &Path) -> Result<Option<HubLogin>, Silent> {
+    let Some(l) = read_login(home)? else { return Ok(None) };
+    let Some(url) = l.url.filter(|u| !u.is_empty()) else {
+        return Err(Silent::BadHubsFile(format!("{} names no url", home.join(HUBS_FILE).display())));
+    };
+    Ok(Some(HubLogin { url, user: l.user.unwrap_or_default(), at: l.at.unwrap_or_default(), ca: l.ca.filter(|c| !c.is_empty()) }))
 }
 
 fn home() -> PathBuf {
@@ -146,7 +177,7 @@ fn read_login(home: &Path) -> Result<Option<Login>, Silent> {
     if !v.is_object() {
         return Err(Silent::BadHubsFile(format!("{} is not a login: not an object", path.display())));
     }
-    Ok(Some(Login { url: field("url"), token: field("token"), ca: field("ca") }))
+    Ok(Some(Login { url: field("url"), token: field("token"), ca: field("ca"), user: field("user"), at: field("at") }))
 }
 
 /// The `host:port` a hub's URL names, and whether it is dialled over TLS:
@@ -248,6 +279,19 @@ mod tests {
         assert!(hub_addr("https://hub.invalid:7000").is_err());
         assert!(hub_addr("tls://hub.invalid").is_err());
         assert!(hub_addr("hub.invalid").is_err());
+    }
+
+    #[test]
+    fn a_login_is_read_without_its_token() {
+        let h = home("login", 0o600, r#"{"url":"tls://hub.invalid:7000","token":"sekrit-token","user":"ed","at":"2026-11-23T10:00:00Z"}"#);
+        let l = hub_login_in(&h).unwrap().unwrap();
+        assert_eq!((l.url.as_str(), l.user.as_str(), l.at.as_str(), l.ca.as_deref()), ("tls://hub.invalid:7000", "ed", "2026-11-23T10:00:00Z", None));
+        assert!(!format!("{l:?}").contains("sekrit-token"));
+        assert_eq!(hub_login_in(&std::env::temp_dir().join("wsp-no-such-home")).unwrap(), None);
+        let wide = home("login-wide", 0o644, LOGIN);
+        assert!(matches!(hub_login_in(&wide), Err(Silent::BadHubsFile(_))));
+        let no_url = home("login-nourl", 0o600, r#"{"token":"t"}"#);
+        assert!(matches!(hub_login_in(&no_url), Err(Silent::BadHubsFile(_))));
     }
 
     #[test]

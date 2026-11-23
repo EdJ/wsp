@@ -39,7 +39,9 @@ dependencies to hold this.
   `Credential::for_hub()` is `$WSP_HUB_TOKEN`, else `token` in `~/.config/wsp/hubs.json` (a file wider than 0600 is
   `Silent::BadHubsFile`, naming it; none is `NotLoggedIn`); `hub_url()` is `$WSP_HUB_URL`, else its `url`. The
   `_in` forms take the env value and home as arguments. The hello's `by` is a hint (`$WSP_HUB_USER`, else `$USER`).
-  The file's shape is this crate's reading of wsp-462's: `{"url", "token"}`.
+  The file is written by `wsp login` (wsp-462, `src/cmd_login.rs`): `{"url", "token", "user", "at"}` and `ca` when pinned; `user` is the
+  name `welcome` gave the token (`Client::by()`), which the dial never reads. `hub_login_in(home)` reads the file *without*
+  its token (`HubLogin`), for `wsp hub status` and for login saying what it replaces.
 - `src/sync.rs` (wsp-459): `Client::sync(workspace, local: &Refs, source: &impl ObjectSource) -> SyncReport`:
   `sync.heads` and `wsp_objects::diff`; fetch every object behind a hub head the spoke lacks, back to one it holds
   (`sync.get`, a round per generation, each held to its id with `verify`); per differing subject push (the spoke's

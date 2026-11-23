@@ -56,6 +56,7 @@ mod cmd_report;
 mod cmd_role;
 mod cmd_govern;
 mod cmd_install;
+mod cmd_login;
 mod cmd_machine;
 mod cmd_mandate;
 mod cmd_message;
@@ -532,7 +533,7 @@ fn documents(help: &str, verb: &str, word: &str) -> bool {
 }
 
 fn needs_store(args: &Args) -> bool {
-    if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle" | "calls") {
+    if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle" | "calls" | "login" | "logout" | "hub") {
         return false;
     }
     if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension")) {

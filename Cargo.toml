@@ -36,6 +36,10 @@ wsp-trees = { path = "crates/trees", features = ["test-support"] }
 wsp-host-api = { path = "crates/host-api" }
 # repair's reseat test posts its played hook's turn to the manager, as a real hook does.
 wsp-host = { path = "crates/host" }
+# The login tests (wsp-462) log in to a real hub over TLS: its library, a user and token made as its host makes them, and a generated CA.
+wsp-hub = { path = "crates/hub" }
+wsp-machines = { path = "crates/machines" }
+wsp-server = { path = "crates/server", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

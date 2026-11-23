@@ -808,6 +808,8 @@ dependencies = [
  "wsp-client",
  "wsp-host",
  "wsp-host-api",
+ "wsp-hub",
+ "wsp-machines",
  "wsp-manager",
  "wsp-objects",
  "wsp-server",
