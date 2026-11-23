@@ -1755,6 +1755,10 @@ pub struct Engine {
     pub rerun: fn(&Store, &str, &Path, &str, &str, &[String], &[String]) -> Rerun,
     /// The task this pane holds, when it holds one (`cmd_agent::locate`'s `task`).
     pub held: fn(&Store) -> Option<String>,
+    /// Why a land of the row is refused, when it is: another user leased it while
+    /// this spoke was offline and the work went to the hub as a side chain
+    /// (`hub_journal::refusal`). Asked before any git move.
+    pub refused: fn(&Store, &str) -> Option<String>,
 }
 
 /// How a rerun after a rebase onto a moved trunk ended.
@@ -1779,7 +1783,7 @@ pub fn install_engine(e: Engine) {
 
 /// The installed answers; before any is installed (a unit test) nothing is passed and nothing is poked.
 fn engine() -> &'static Engine {
-    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false, after_land: |_, _| {}, rerun: |_, _, _, _, _, _, _| Rerun::Nothing, held: |_| None };
+    static NONE: Engine = Engine { passed: |_| Default::default(), poke_task: |_, _, _| {}, runs: |_, _| false, after_land: |_, _| {}, rerun: |_, _, _, _, _, _, _| Rerun::Nothing, held: |_| None, refused: |_, _| None };
     ENGINE.get().unwrap_or(&NONE)
 }
 
@@ -2769,6 +2773,11 @@ pub fn land(store: &Store, args: &Args) -> i32 {
             return 2;
         }
     };
+    // Another user leased the row while this spoke was offline: nothing moves.
+    if let Some(why) = (engine().refused)(store, &w.task) {
+        eprintln!("{why}");
+        return 1;
+    }
 
     if !w.dir.join(".git").exists() {
         eprintln!("wsp: no tree for {} under {} — nothing to land", w.task, w.searched());
@@ -2928,6 +2937,9 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
     let Ok(w) = pick(candidates(store, Path::new("/"), task), task) else { return Verdict::Nothing };
     if !w.dir.join(".git").exists() {
         return Verdict::Nothing;
+    }
+    if let Some(why) = (engine().refused)(store, &w.task) {
+        return Verdict::Blocked(why);
     }
     let tree = util::contract(&w.dir);
     let moved = |w: &Where| git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err();

@@ -978,6 +978,7 @@ pub(crate) mod tests {
             after_land: crate::check::after_land,
             rerun: crate::check::rerun,
             held: |_| None,
+            refused: |store, row| crate::hub_journal::refusal(store, row, "land"),
         });
     }
 

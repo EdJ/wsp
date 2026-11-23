@@ -7618,6 +7618,7 @@ fn only_a_working_screen_is_ever_overruled() {
             after_land: crate::check::after_land,
             rerun: crate::check::rerun,
             held: |_| None,
+            refused: |store, row| crate::hub_journal::refusal(store, row, "land"),
         });
         let (env, store, tree, w) = ready_tree(tag, member_file, trunk_file);
         let ran = env.path("ran.log");

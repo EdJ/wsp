@@ -566,6 +566,7 @@ fn main() {
         after_land: check::after_land,
         rerun: check::rerun,
         held: |store| cmd_agent::locate(&cmd_agent::Whereabouts::live(store)).task.map(|t| t.id),
+        refused: |store, row| hub_journal::refusal(store, row, "land"),
     });
 
     place::install_above(place::Above {
