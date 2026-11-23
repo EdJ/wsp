@@ -242,6 +242,32 @@ pub fn is_primary(scope: &str) -> bool {
     scope == PRIMARY
 }
 
+/// The prefix of a user's primary, `primary:<user>` (`wsp-417`). Reserved in the
+/// scope key space beside [`PRIMARY`]: no project, list or slug may start with it.
+pub const USER_PRIMARY_PREFIX: &str = "primary:";
+
+/// The name a user's primary goes by: `primary:<user>`.
+///
+/// On a spoke the local primary *is* its user's primary, so this is an address
+/// and not a second slot in `governors.json`; [`is_primary`] stays true for the
+/// bare `primary` only, which is what its readers meant by it.
+pub fn primary_of(user: &str) -> String {
+    format!("{USER_PRIMARY_PREFIX}{}", user.trim())
+}
+
+/// The user a `primary:<user>` names, or `None` for any other scope — the bare
+/// `primary` included, and an empty user.
+pub fn user_of_primary(scope: &str) -> Option<&str> {
+    let user = scope.strip_prefix(USER_PRIMARY_PREFIX)?.trim();
+    (!user.is_empty()).then_some(user)
+}
+
+/// Whether a scope is in the reserved `primary` space: the bare word, or
+/// anything under `primary:`. What the key space refuses a project or a list.
+pub fn is_primary_key(scope: &str) -> bool {
+    is_primary(scope) || scope.starts_with(USER_PRIMARY_PREFIX)
+}
+
 /// When a person stood this seat down, if they did.
 ///
 /// **The marker that makes `--clear` mean something to the reconciler, and it is
@@ -381,5 +407,28 @@ impl Vacancy {
     /// one run.
     pub fn overdue(&self, n: u64) -> bool {
         self.unseated >= n
+    }
+}
+
+#[cfg(test)]
+mod user_primary_tests {
+    use super::*;
+
+    #[test]
+    fn a_user_primary_round_trips_and_is_not_the_bare_primary() {
+        assert_eq!(primary_of("ed"), "primary:ed");
+        assert_eq!(user_of_primary("primary:ed"), Some("ed"));
+        assert_eq!(user_of_primary(&primary_of("jesper")), Some("jesper"));
+        assert_eq!(user_of_primary("primary"), None);
+        assert_eq!(user_of_primary("primary:"), None);
+        assert_eq!(user_of_primary("wsp"), None);
+    }
+
+    #[test]
+    fn is_primary_stays_the_bare_word_and_the_key_space_reserves_both() {
+        assert!(is_primary("primary"));
+        assert!(!is_primary("primary:ed"), "its 18 readers meant the bare primary");
+        assert!(is_primary_key("primary") && is_primary_key("primary:ed"));
+        assert!(!is_primary_key("primaryx") && !is_primary_key("wsp"));
     }
 }

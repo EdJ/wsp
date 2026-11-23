@@ -140,7 +140,7 @@ pub fn reading(word: &str, book: &Book) -> Reading {
         _ => {}
     }
     let panes = match &addr {
-        Some(a) => address::resolve(a, book).map(|v| v.into_iter().map(|n| n.pane).collect()).unwrap_or_default(),
+        Some(a) => address::resolve(a, book).map(|v| v.into_iter().filter(|n| !n.remote).map(|n| n.pane).collect()).unwrap_or_default(),
         None => vec![],
     };
     labels.sort();

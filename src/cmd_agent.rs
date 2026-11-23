@@ -1838,6 +1838,9 @@ fn addressed_seat(store: &Store, addr: &crate::address::Address) -> Result<(Stri
         return Err(format!("names {} seats and a tell goes to one — tell each: {}", found.len(), seats.join(", ")));
     }
     let n = found.remove(0);
+    if n.remote {
+        return Err(format!("{} is on another machine — reaching it is routed through the hub, which this `tell` does not do yet", n.what));
+    }
     Ok((n.pane, n.what))
 }
 

@@ -110,6 +110,10 @@ fn add_kind(store: &Store, args: &Args, kind: &str) -> i32 {
         eprintln!("wsp: `{slug}` is not free: the primary interface's seat is keyed on it");
         return 1;
     }
+    if crate::governors::is_primary_key(&slug) {
+        eprintln!("wsp: `{slug}` is not free: `primary:<user>` names a user's primary and is reserved");
+        return 1;
+    }
 
     let index = Index::new(store.projects());
     let mut p = Project::new(&slug);
