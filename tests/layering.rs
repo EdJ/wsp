@@ -763,13 +763,14 @@ fn deps_named(manifest: &str) -> BTreeSet<String> {
 }
 
 /// `wsp-api`, the API's wire types, is a contract crate (R2, R5): it depends on
-/// `wsp-store-contract` and on nothing else of the workspace, directly or through it, its own
-/// tests included (`docs/state-core.md` section 6; wsp-071). Its only other dependencies are
-/// `serde` and `serde_json`, so no IO crate, and its source names no IO of the standard library:
-/// a carrier is `wsp-server`'s or `wsp-client`'s.
+/// `wsp-store-contract` and, since the sync verbs (wsp-459), `wsp-objects` (pure: the ids, refs
+/// and workspaces they carry), and on nothing else of the workspace, directly or through them,
+/// its own tests included (`docs/state-core.md` section 6; wsp-071). Its only other dependencies
+/// are `serde` and `serde_json`, so no IO crate, and its source names no IO of the standard
+/// library: a carrier is `wsp-server`'s or `wsp-client`'s.
 #[test]
 fn the_api_links_the_contract_alone_and_does_no_io() {
-    const MAY: &[&str] = &["wsp-store-contract"];
+    const MAY: &[&str] = &["wsp-store-contract", "wsp-objects"];
     let dir = root().join("crates/api");
     let bad = beyond(&reached_from(&dir, "wsp-api"), MAY);
     assert!(
@@ -779,8 +780,8 @@ fn the_api_links_the_contract_alone_and_does_no_io() {
 
     let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
     let extra: Vec<&String> =
-        named.iter().filter(|d| !["serde", "serde_json", "wsp-store-contract", "wsp-api"].contains(&d.as_str())).collect();
-    assert!(extra.is_empty(), "wsp-api depends on serde, serde_json and the contract alone, not {extra:?}");
+        named.iter().filter(|d| !["serde", "serde_json", "wsp-store-contract", "wsp-objects", "wsp-api"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-api depends on serde, serde_json, the contract and the objects alone, not {extra:?}");
 
     const IO: &[&str] = &[
         "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "File::", "TcpStream",
@@ -897,7 +898,8 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
         "wsp-server's normal dependencies are the api, the machines and the contract"
     );
 
-    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-machines", "wsp-store-conformance"];
+    // `wsp-objects` comes with the api's sync verbs (wsp-459), never as a dependency of its own.
+    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-machines", "wsp-store-conformance", "wsp-objects"];
     let bad = beyond(&reached_from(&dir, "wsp-server"), MAY);
     assert!(
         bad.is_empty(),
@@ -915,8 +917,9 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
 }
 
 /// `wsp-client`, the state core's client, speaks the protocol and nothing else: its normal
-/// dependencies are `wsp-api` and `wsp-store-contract`, so that web-chrome, which links it by path,
-/// links no more of wsp than that (`docs/state-core.md` section 6; wsp-074). Its tests may also
+/// dependencies are `wsp-api`, `wsp-store-contract` and, since the sync verbs (wsp-459),
+/// `wsp-objects` (pure: the ids it holds objects to and the refs it diffs), so that web-chrome,
+/// which links it by path, links no more of wsp than that (`docs/state-core.md` section 6; wsp-074). Its tests may also
 /// reach `wsp-server` and `wsp-store-conformance` (a loopback server over `MemStore`), never the
 /// store, the wire, the host, the manager or the sqlite crate. Its one external dependency is
 /// `serde_json`.
@@ -924,10 +927,15 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
 fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone() {
     let dir = root().join("crates/client");
     let normal: Vec<String> = path_deps(&dir.join("Cargo.toml"), false).into_keys().collect();
-    assert_eq!(normal, ["wsp-api", "wsp-store-contract"], "wsp-client's normal dependencies are the api and the contract");
+    assert_eq!(
+        normal,
+        ["wsp-api", "wsp-objects", "wsp-store-contract"],
+        "wsp-client's normal dependencies are the api, the objects and the contract"
+    );
 
     // `wsp-machines` comes with the server its tests start (wsp-121), never as a dependency of its own.
-    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-server", "wsp-machines", "wsp-store-conformance"];
+    const MAY: &[&str] =
+        &["wsp-api", "wsp-store-contract", "wsp-objects", "wsp-server", "wsp-machines", "wsp-store-conformance"];
     let bad = beyond(&reached_from(&dir, "wsp-client"), MAY);
     assert!(
         bad.is_empty(),
@@ -937,9 +945,12 @@ fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone(
     let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
     let extra: Vec<&String> = named
         .iter()
-        .filter(|d| !["serde_json", "wsp-api", "wsp-store-contract", "wsp-server", "wsp-store-conformance"].contains(&d.as_str()))
+        .filter(|d| {
+            !["serde_json", "wsp-api", "wsp-store-contract", "wsp-objects", "wsp-client", "wsp-server", "wsp-store-conformance"]
+                .contains(&d.as_str())
+        })
         .collect();
-    assert!(extra.is_empty(), "wsp-client depends on serde_json, the api and the contract alone, not {extra:?}");
+    assert!(extra.is_empty(), "wsp-client depends on serde_json, the api, the objects and the contract alone, not {extra:?}");
 
     // The server is a dev-dependency: a normal dependency would link it into web-chrome.
     let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();

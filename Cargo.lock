@@ -333,6 +333,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wsp-api",
+ "wsp-objects",
  "wsp-store-contract",
 ]
 
@@ -349,6 +350,8 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wsp-api",
+ "wsp-client",
+ "wsp-objects",
  "wsp-server",
  "wsp-store-conformance",
  "wsp-store-contract",

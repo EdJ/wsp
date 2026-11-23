@@ -281,7 +281,26 @@ fn every_frame_type_round_trips() {
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 17;
 const COMMANDS: usize = 31;
-const CALLS: usize = VERBS + COMMANDS + 1;
+const SYNCS: usize = 5;
+const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
+
+fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
+    match c {
+        SyncCall::Heads { .. } => (0, "sync.heads"),
+        SyncCall::Have { .. } => (1, "sync.have"),
+        SyncCall::Put { .. } => (2, "sync.put"),
+        SyncCall::Get { .. } => (3, "sync.get"),
+        SyncCall::Move(_) => (4, "refs.move"),
+    }
+}
+
+fn an_id(n: u8) -> ObjectId {
+    ObjectId::of(&[n])
+}
+
+fn a_blob() -> Blob {
+    Blob { id: ObjectId::of(b"{}"), bytes: b"{}".to_vec() }
+}
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
     match v {
@@ -355,7 +374,11 @@ fn call_ordinal(f: &Frame) -> (usize, &'static str) {
             let (n, name) = command_ordinal(c);
             (VERBS + n, name)
         }
-        Call::Unknown { .. } => (VERBS + COMMANDS, "seat.teleport"),
+        Call::Sync(c) => {
+            let (n, name) = sync_ordinal(c);
+            (VERBS + COMMANDS + n, name)
+        }
+        Call::Unknown { .. } => (VERBS + COMMANDS + SYNCS, "seat.teleport"),
     }
 }
 
@@ -542,6 +565,18 @@ fn requests() -> Vec<Frame> {
     let mut out: Vec<Call> = vec![];
     out.extend(verbs.into_iter().map(Call::Verb));
     out.extend(commands.into_iter().map(Call::Command));
+    let workspace = WorkspaceId("shared:mp".into());
+    out.extend(
+        [
+            SyncCall::Heads { workspace: workspace.clone() },
+            SyncCall::Have { ids: vec![an_id(1), an_id(2)] },
+            SyncCall::Put { objects: vec![a_blob()] },
+            SyncCall::Get { ids: vec![an_id(1)] },
+            SyncCall::Move(RefMove { workspace, subject: Subject::Row(row_id()), from: None, to: an_id(1) }),
+        ]
+        .into_iter()
+        .map(Call::Sync),
+    );
     out.push(Call::Unknown {
         verb: "seat.teleport".into(),
         args: json!({"seat": "cpd-3698", "to": "moon"}),
@@ -563,13 +598,19 @@ fn every_request_verb_round_trips() {
 fn the_verb_tables_are_the_variants() {
     let mut reads = vec![];
     let mut commands = vec![];
+    let mut syncs = vec![];
     for f in requests() {
         match call_of(&f) {
             Call::Verb(v) => reads.push(verb_ordinal(v).1),
             Call::Command(c) => commands.push(command_ordinal(c).1),
+            Call::Sync(c) => {
+                assert_eq!(c.verb(), sync_ordinal(c).1);
+                syncs.push(c.verb());
+            }
             Call::Unknown { verb, .. } => {
                 assert!(!READ_VERBS.contains(&verb.as_str()));
                 assert!(!COMMAND_VERBS.contains(&verb.as_str()));
+                assert!(!SYNC_VERBS.contains(&verb.as_str()));
             }
         }
     }
@@ -577,11 +618,13 @@ fn the_verb_tables_are_the_variants() {
     assert_eq!(commands, COMMAND_VERBS);
     assert_eq!(READ_VERBS.len(), VERBS);
     assert_eq!(COMMAND_VERBS.len(), COMMANDS);
+    assert_eq!(syncs, SYNC_VERBS);
+    assert_eq!(SYNC_VERBS.len(), SYNCS);
 }
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 18;
+const ANSWERS: usize = 23;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -610,6 +653,11 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Spend(_) => (15, "spend"),
         Answer::Show(_) => (16, "show"),
         Answer::Readings(_) => (17, "readings"),
+        Answer::Heads(_) => (18, "heads"),
+        Answer::Missing(_) => (19, "missing"),
+        Answer::Stored { .. } => (20, "stored"),
+        Answer::Objects(_) => (21, "objects"),
+        Answer::Move(_) => (22, "move"),
     }
 }
 
@@ -673,6 +721,20 @@ fn answers() -> Vec<Frame> {
             )])),
             vec![],
         ),
+        ok(
+            19,
+            Answer::Heads({
+                let mut refs = Refs::new(WorkspaceId("shared:mp".into()));
+                refs.set(Subject::Row(row_id()), an_id(1));
+                refs
+            }),
+            vec![],
+        ),
+        ok(20, Answer::Missing(vec![an_id(2)]), vec![]),
+        ok(21, Answer::Stored { stored: 1 }, vec![]),
+        ok(22, Answer::Objects(vec![a_blob()]), vec![]),
+        ok(23, Answer::Move(Move::Stale { head: Some(an_id(1)) }), vec![]),
+        ok(24, Answer::Move(Move::Moved { head: an_id(2) }), vec![]),
     ]
 }
 
@@ -1314,4 +1376,35 @@ fn a_feed_event_carries_the_contracts_event_whole() {
     };
     let entity: Entity = serde_json::from_value(e.payload.clone()).unwrap();
     assert_eq!(entity, Entity::Seat(a_seat()));
+}
+
+/// The sync verbs' spelling (wsp-459): ids in their `sha256:` text form, an
+/// object's bytes as base64, a move's `from` as `null` for a subject with no
+/// head, and a stale move answered with the head there is.
+#[test]
+fn the_sync_verbs_spelling_is_pinned() {
+    let blob = a_blob();
+    let put = request(1, Call::Sync(SyncCall::Put { objects: vec![blob.clone()] }));
+    assert_eq!(
+        serde_json::to_value(&put).unwrap(),
+        json!({
+            "type": "request", "v": 1, "id": 1, "by": "seat:cpd-3698", "verb": "sync.put",
+            "args": {"objects": [{"id": blob.id.to_string(), "bytes": "e30="}]}
+        })
+    );
+    let to = an_id(1);
+    let mv = RefMove { workspace: WorkspaceId("shared:mp".into()), subject: Subject::Row(row_id()), from: None, to };
+    let mv = serde_json::to_value(request(2, Call::Sync(SyncCall::Move(mv)))).unwrap();
+    assert_eq!(mv["verb"], "refs.move");
+    assert_eq!(
+        mv["args"],
+        json!({"workspace": "shared:mp", "subject": {"row": "wsp-071"}, "from": null, "to": to.to_string()})
+    );
+    assert_eq!(
+        serde_json::to_value(ok(3, Answer::Move(Move::Stale { head: Some(to) }), vec![])).unwrap()["ok"],
+        json!({"move": {"stale": {"head": to.to_string()}}})
+    );
+    // A sync verb whose args do not fit is an unknown call, as any verb's are.
+    let line = r#"{"type":"request","v":1,"id":4,"by":"seat:cpd-3698","verb":"sync.have","args":{"ids":["md5:x"]}}"#;
+    assert!(matches!(call_of(&decode(line)), Call::Unknown { verb, .. } if verb == "sync.have"));
 }

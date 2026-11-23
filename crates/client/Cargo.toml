@@ -12,8 +12,16 @@ path = "src/lib.rs"
 serde_json = "1"
 wsp-api = { path = "../api" }
 wsp-store-contract = { path = "../store-contract" }
+# The sync verbs' ids and refs, and `verify` and `diff` (wsp-459); pure, no IO.
+wsp-objects = { path = "../objects" }
+
+[features]
+# `testing`: an in-memory hub that answers the sync verbs, for the tests of whatever syncs.
+test-support = []
 
 [dev-dependencies]
+# The tests use `testing`, which is behind `test-support`.
+wsp-client = { path = ".", features = ["test-support"] }
 # The tests' loopback server and its in-memory store; never a normal dependency, so that
 # web-chrome links no more of wsp than the protocol (tests/layering.rs).
 wsp-server = { path = "../server" }

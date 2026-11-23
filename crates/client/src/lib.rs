@@ -23,9 +23,13 @@
 //!   `wsp-view` projection takes, typed.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
+//! - [`Client::sync`] syncs one workspace with a hub by hash (wsp-459): the
+//!   objects each side lacks, then one `refs.move` per subject from the head
+//!   it saw; a stale move is reported, never retried. [`testing`] (behind
+//!   `test-support`) holds an in-memory hub that answers the sync verbs.
 //!
-//! It links `wsp-api` and `wsp-store-contract` alone (the server only in
-//! tests), so web-chrome links no more of wsp than the protocol.
+//! It links `wsp-api`, `wsp-store-contract` and `wsp-objects` alone (the
+//! server only in tests), so web-chrome links no more of wsp than the protocol.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -41,11 +45,15 @@ mod credential;
 mod dial;
 mod orders;
 mod subscribe;
+mod sync;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 pub use credential::{hub_url, hub_url_in, Credential, Target, HUBS_FILE, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV};
 pub use dial::Silent;
 pub use orders::APPLY_ATTEMPTS;
 pub use subscribe::{Feed, Item};
+pub use sync::{ObjectSource, Stale, SyncError, SyncReport, IDS_PER_REQUEST, PUT_BYTES};
 
 /// How long [`Client::request`] waits for a reply unless [`Client::set_timeout`]
 /// says otherwise (or the dial's `wait` is longer).

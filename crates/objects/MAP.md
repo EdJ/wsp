@@ -2,8 +2,9 @@
 
 The hub's object format (wsp-458; the multiplayer design's "Hash-based sync, and why it scales", decisions d5
 and d6). Pure: no IO, no clock. Depends on `wsp-store-contract` (the entities, subjects, kinds and principals an
-object carries), `sha2`, `serde` and `serde_json`, nothing else in the workspace. Nothing uses it yet: the hub's
-object and ref store is wsp-460, a spoke's wsp-464 and wsp-469.
+object carries), `sha2`, `serde` and `serde_json`, nothing else in the workspace. `wsp-api`'s sync verbs carry its
+ids, refs and workspaces, and `wsp-client`'s sync verifies and diffs with it (wsp-459); the hub's object and ref
+store is wsp-460, a spoke's wsp-464 and wsp-469.
 
 ## Holds
 

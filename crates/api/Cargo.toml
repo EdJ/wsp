@@ -12,6 +12,8 @@ serde = { version = "1", features = ["derive"] }
 # A reply's payloads and the in-memory pair's framing.
 serde_json = "1"
 wsp-store-contract = { path = "../store-contract" }
+# The sync verbs carry its ids, refs and workspaces (wsp-459); pure, no IO.
+wsp-objects = { path = "../objects" }
 
 [features]
 # The in-memory `Connection` pair, for the tests of whatever speaks the protocol.
