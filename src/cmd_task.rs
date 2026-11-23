@@ -130,7 +130,7 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
 
     // Private unless said otherwise; a sub-task is where its parent is (wsp-172).
     // Before an id exists, so a refusal leaves nothing reserved.
-    let workspace = match crate::record_workspace::of_new(args, parent.as_ref().map(|p| &p.workspace)) {
+    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), parent.as_ref().map(|p| &p.workspace)) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("wsp: {why}");

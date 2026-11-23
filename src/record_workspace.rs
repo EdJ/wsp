@@ -16,14 +16,12 @@ pub const ENV: &str = "WSP_WORKSPACE";
 
 /// The workspace a new record is filed in. `parent` is the workspace of the
 /// record's parent, when it has one: it decides, and the flag is not read.
-pub fn of_new(args: &crate::Args, parent: Option<&WorkspaceId>) -> Result<WorkspaceId, String> {
-    // Read first, so a flag a child's parent overrules is not reported as unknown.
-    let flag = args.get("workspace");
+pub fn of_new(flag: Option<&str>, parent: Option<&WorkspaceId>) -> Result<WorkspaceId, String> {
     if let Some(p) = parent {
         return Ok(p.clone());
     }
     let env = std::env::var(ENV).ok();
-    resolve(flag.as_deref(), env.as_deref(), || wsp_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string()))
+    resolve(flag, env.as_deref(), || wsp_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string()))
 }
 
 /// [`of_new`] without a parent, with the flag, the environment's value and the
@@ -91,9 +89,7 @@ mod tests {
     #[test]
     fn a_child_takes_its_parents_workspace_whatever_the_flag_says() {
         let shared: WorkspaceId = "shared:core".parse().unwrap();
-        let loud = crate::Args::synth("add", &["t"], &[("workspace", "private")]);
-        assert_eq!(of_new(&loud, Some(&shared)), Ok(shared.clone()));
-        let from_private = crate::Args::synth("add", &["t"], &[("workspace", "shared:core")]);
-        assert_eq!(of_new(&from_private, Some(&WorkspaceId::Private)), Ok(WorkspaceId::Private));
+        assert_eq!(of_new(Some("private"), Some(&shared)), Ok(shared.clone()));
+        assert_eq!(of_new(Some("shared:core"), Some(&WorkspaceId::Private)), Ok(WorkspaceId::Private));
     }
 }

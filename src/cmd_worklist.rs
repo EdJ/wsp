@@ -411,7 +411,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         None => None,
     };
 
-    let workspace = match crate::record_workspace::of_new(args, None) {
+    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), None) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("wsp: {why}");
