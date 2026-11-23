@@ -145,6 +145,12 @@ pub(crate) struct MemberIn {
 pub(crate) const SEAT_IDLE: &str = "the seat idle (in neither a model call nor a tool)";
 /// The reason where the log says nothing at that moment.
 pub(crate) const NONE_RECORDED: &str = "none recorded";
+/// The reason in place of [`NONE_RECORDED`] where the seat's tokens are the
+/// cost table's because no transcript of it was found: its calls are not timed,
+/// so its idle is not known to be idle (`wsp-313`).
+pub(crate) const NO_TRANSCRIPT: &str = "no call timing: the seat's transcript was not found (no session recorded for it); its tokens are the cost table's";
+/// The same where the transcript was read and its model calls carry no time.
+pub(crate) const NO_TIMESTAMPS: &str = "no call timing: the seat's transcript has no timestamps on its model calls";
 
 /// The reason for a seat idle on a shell of its own.
 pub(crate) const OWN_SHELLS: &str = "the seat waiting on shells of its own (wakes when they end)";

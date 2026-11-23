@@ -98,6 +98,12 @@ pub(crate) struct Inputs {
     /// id, text)`, oldest first: one that says the row holds for the person
     /// names the stretch after a review as a person's step, not rework (`wsp-311`).
     pub decisions: Vec<(i64, String, String)>,
+    /// The row's own seat's transcripts found where no `session-learned` names
+    /// one, `(first stamp, transcript path or session id)`: from the burn ledger
+    /// of the panes that claimed the row and from Claude Code's directory for
+    /// the row's tree (`wsp-313`: a store with no `session-learned` read every
+    /// seat as reading nothing, model 0 and tools none).
+    pub found: Vec<(i64, String)>,
 }
 
 /// One park of a list, from its park event to the resume that took it back.
@@ -1397,6 +1403,9 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
         .collect();
     let mine: Vec<&String> = learned.iter().filter(|(t, _)| first_review.is_none_or(|r| *t <= r)).map(|(_, s)| s).collect();
     i.seat_first = mine.first().and_then(|s| transcript(s)).as_deref().and_then(first_stamp);
+    if learned.is_empty() {
+        i.found = found_transcripts(store, &i);
+    }
     // The verifier seats' own first lines and test seconds, which wsp wrote on
     // each pass when it ended the seat (the binding that names the session is
     // gone after the despawn).
@@ -1446,6 +1455,9 @@ pub(crate) struct SeatReport {
     /// When the seat was in a model call or a tool, from the transcripts read
     /// (not merged): what the wall-time buckets call a member working.
     pub active: Vec<(i64, i64)>,
+    /// Sessions read whose transcript has model calls and no time on them: what
+    /// they hold is not timed, and the seat idle says so (`wsp-313`).
+    pub untimed: Vec<String>,
 }
 
 /// One model call, once per requestId.
@@ -1521,6 +1533,12 @@ fn read_transcript(text: &str) -> (Vec<Call>, Vec<(i64, String, i64)>) {
         prev = Some(t);
     }
     (calls, tools)
+}
+
+/// A transcript with a model call on a line that carries no time: its calls
+/// cannot be timed (`wsp-313`).
+fn untimed_calls(text: &str) -> bool {
+    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).any(|v| v["type"] == "assistant" && v["timestamp"].as_str().map(util::epoch_of).is_none_or(|t| t <= 0))
 }
 
 /// A session's test and build seconds and the time of its first line, as
@@ -1636,7 +1654,76 @@ fn seat_sessions(i: &Inputs, windows: &[(i64, i64)]) -> Vec<String> {
             out.push(s.to_string());
         }
     }
+    if out.is_empty() {
+        // No session learned for the seat (`wsp-313`): a transcript found for it
+        // is the seat's where it began inside one of the row's own seated spans,
+        // a claim (less a spawn's start) to the review or release after it, and
+        // not inside a leg.
+        let ends: Vec<i64> = i.events.iter().filter(|(_, k, d)| d["id"] == i.id.as_str() && (k == "task-review" || k == "task-released")).map(|(t, _, _)| *t).collect();
+        let spans: Vec<(i64, i64)> = i
+            .kind("task-claimed", &i.id)
+            .into_iter()
+            .map(|(c, _)| (c - FOUND_SLACK, ends.iter().copied().filter(|e| *e >= c).min().unwrap_or(i64::MAX)))
+            .collect();
+        for (first, r) in &i.found {
+            let seated = spans.iter().any(|(a, b)| first >= a && first < b);
+            let in_leg = windows.iter().any(|(a, b)| first >= a && first <= b);
+            if seated && !in_leg && !out.contains(r) {
+                out.push(r.clone());
+            }
+        }
+    }
     out
+}
+
+/// How long before its claim a found transcript may begin and still be the
+/// seat's: the spawn's start, which is before the seat claims.
+const FOUND_SLACK: i64 = 120;
+
+/// The transcripts that may be the row's own seat's where no `session-learned`
+/// names one (`wsp-313`), each with its first stamp: the burn ledger's and live
+/// record's for every pane that claimed the row (a path, else a session id), and
+/// every transcript in Claude Code's directory for the row's tree, which keeps
+/// its name after the tree is gone. [`seat_sessions`] keeps those that began
+/// inside the seat's own span; a verifier reading the same tree began after the
+/// review and is not kept.
+fn found_transcripts(store: &Store, i: &Inputs) -> Vec<(i64, String)> {
+    let mut refs: Vec<String> = Vec::new();
+    let mut add = |r: String| {
+        if !r.is_empty() && !refs.contains(&r) {
+            refs.push(r);
+        }
+    };
+    for (_, d) in i.kind("task-claimed", &i.id) {
+        let Some(pane) = d["pane"].as_str().filter(|p| !p.is_empty()) else { continue };
+        let mut lines = crate::cmd_burn::ledger_lines(&store.state, pane);
+        lines.extend(crate::cmd_burn::reading_in(&store.state, pane));
+        for l in lines {
+            let path = l["transcript"].as_str().filter(|t| t.starts_with('/')).map(String::from);
+            let by_id = || l["session_id"].as_str().and_then(|s| crate::host::LOCAL.transcript_of(s, "")).map(|p| p.to_string_lossy().to_string());
+            if let Some(r) = path.or_else(by_id) {
+                add(r);
+            }
+        }
+    }
+    let tail = crate::host::mangle(&format!("/{}/{}", crate::cmd_checkout::WORKTREES, i.id));
+    let projects = util::home().join(".claude").join("projects");
+    for dir in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+        if !dir.file_name().to_string_lossy().ends_with(&tail) {
+            continue;
+        }
+        for f in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+            if f.path().extension().is_some_and(|x| x == "jsonl") {
+                add(f.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    refs.into_iter().filter_map(|r| first_act(&r).map(|t| (t, r))).collect()
+}
+
+/// A transcript named by its path or by its session id, whole.
+fn transcript_ref(r: &str) -> Option<String> {
+    if r.starts_with('/') { transcript_at(std::path::Path::new(r)) } else { transcript(r) }
 }
 
 /// One leg's span: `(name, start, end)`.
@@ -1768,6 +1855,9 @@ pub(crate) fn seat_report(i: &Inputs, phases: &[Phase], run_legs: &[Span], load:
             continue;
         };
         let (calls, tools) = read_transcript(&text);
+        if calls.is_empty() && untimed_calls(&text) {
+            r.untimed.push(s.clone());
+        }
         r.active.extend(calls.iter().filter(|c| c.end > c.start).map(|c| (c.start, c.end)));
         r.active.extend(tools.iter().filter(|(_, _, secs)| *secs > 0).map(|(at, _, secs)| (*at, at + secs)));
         for c in calls {
@@ -1830,6 +1920,9 @@ fn render_seat(r: &SeatReport) -> String {
     for m in &r.missing {
         s.push_str(&format!("transcript not found for session {m}; its calls are not counted\n"));
     }
+    for u in &r.untimed {
+        s.push_str(&format!("transcript of session {u} has no timestamps on its model calls; they are not timed\n"));
+    }
     s
 }
 
@@ -1840,6 +1933,7 @@ fn seat_json(r: &SeatReport) -> Value {
         "utc": true,
         "sessions": r.sessions,
         "missing": r.missing,
+        "untimed": r.untimed,
         "note": if r.sessions.is_empty() { json!("no session recorded for this row") } else if all_missing { json!(format!("transcript not found for session {}", r.missing.join(", "))) } else { Value::Null },
         "phases": if all_missing { Vec::new() } else { r.phases.iter().map(|p| {
             let mut tools = serde_json::Map::new();
@@ -1898,6 +1992,8 @@ pub(crate) struct RowFigures {
     pub tools: std::collections::BTreeMap<String, i64>,
     /// Sessions whose transcript was not found: their calls are not counted.
     pub missing: usize,
+    /// Sessions read whose model calls carry no time (`wsp-313`).
+    pub untimed: usize,
     pub sessions: usize,
     /// The barrier phases (the group's, one run for all its members): their
     /// seconds, the gap among them, and that gap by what it waited for. They
@@ -2149,7 +2245,7 @@ pub(crate) fn row_figures(store: &Store, id: &str) -> RowFigures {
     let i = gather(store, id);
     let phases = build(&i);
     let run = run_legs_for(&i, &phases, None);
-    let seat = seat_report(&i, &phases, &run, &transcript);
+    let seat = seat_report(&i, &phases, &run, &transcript_ref);
     let mut f = figures_of(&phases, &seat);
     f.blocked = blocked_spans(&i, f.end);
     f.markers = idle_markers(&i);
@@ -2184,6 +2280,7 @@ pub(crate) fn figures_of(phases: &[Phase], seat: &SeatReport) -> RowFigures {
     }
     f.sessions = seat.sessions.len();
     f.missing = seat.missing.len();
+    f.untimed = seat.untimed.len();
     f.measured = f.missing == 0 && f.sessions > 0;
     f.active = crate::wallbuckets::merge(&seat.active);
     f.spans = phases.iter().map(crate::wallbuckets::Span::of).collect();
@@ -2217,7 +2314,7 @@ pub fn timeline(store: &Store, args: &Args) -> i32 {
     let i = gather(store, &t.id);
     let phases = build(&i);
     let seat_run_legs = run_legs_for(&i, &phases, args.get("legs"));
-    let seat = seat_report(&i, &phases, &seat_run_legs, &transcript);
+    let seat = seat_report(&i, &phases, &seat_run_legs, &transcript_ref);
     if args.json() {
         let mut v = to_json(&i, &phases);
         v["utc"] = json!(true);
@@ -3105,6 +3202,57 @@ mod tests {
             assert_eq!(f.tools.get(*k).copied().unwrap_or(0), want, "tool kind {k}");
         }
         assert!(f.model_secs > 0 && f.tools.values().sum::<i64>() > 0, "the transcript was read: {f:?}");
+    }
+
+    /// `wsp-313`: a store with no `session-learned` read every seat as reading
+    /// nothing. A transcript found for the seat (the ledger's, the row's tree's)
+    /// is read when it began inside the seat's span; a verifier's in the same
+    /// tree, begun after the review, is not.
+    #[test]
+    fn a_seat_with_no_session_learned_is_read_from_a_transcript_found_for_it() {
+        let id = "r-1";
+        let mut i = Inputs {
+            id: id.into(),
+            events: vec![ev(110, "task-claimed", json!({"id": id, "pane": "cpd-1"})), ev(460, "task-review", json!({"id": id}))],
+            cycle: vec![(100, "starting r-1 on claude (new)".into())],
+            ..Default::default()
+        };
+        let ph = build(&i);
+        let text = [
+            line(105, json!({"type": "user", "message": {"content": "go"}})),
+            asst(130, "q1", (10, 100, 13060), Some(("t1", "Bash"))),
+            result(190, "t1"),
+            asst(400, "q2", (1, 2, 3), None),
+        ]
+        .join("\n");
+        let load = |s: &str| (s == "/p/seat.jsonl" || s == "/p/verifier.jsonl").then(|| text.clone());
+        let none = seat_report(&i, &ph, &[], &load);
+        assert!(none.sessions.is_empty(), "nothing found, nothing read: {none:?}");
+        i.found = vec![(105, "/p/seat.jsonl".into()), (470, "/p/verifier.jsonl".into())];
+        let r = seat_report(&i, &ph, &[], &load);
+        assert_eq!(r.sessions, vec!["/p/seat.jsonl".to_string()], "the verifier began after the review");
+        let f = figures_of(&ph, &r);
+        assert!(f.measured && f.tokens_out == 13063, "{f:?}");
+        assert!(f.model_secs > 0, "a seat with output tokens and a transcript has model time: {f:?}");
+        assert_eq!((f.model_secs, f.tools.get("Bash").copied()), (25 + 210, Some(60)));
+        assert_eq!(f.untimed, 0);
+    }
+
+    #[test]
+    fn a_transcript_whose_calls_carry_no_time_is_named_untimed() {
+        let i = two_legs();
+        let ph = build(&i);
+        let text = [
+            json!({"type": "assistant", "requestId": "q1", "message": {"content": [], "usage": {"input_tokens": 1, "output_tokens": 500}}}).to_string(),
+            json!({"type": "assistant", "requestId": "q2", "message": {"content": [], "usage": {"input_tokens": 1, "output_tokens": 700}}}).to_string(),
+        ]
+        .join("\n");
+        let r = seat_report(&i, &ph, &[], &|s| (s == "s").then(|| text.clone()));
+        assert_eq!(r.untimed, vec!["s".to_string()]);
+        let f = figures_of(&ph, &r);
+        assert_eq!((f.untimed, f.model_secs, f.calls), (1, 0, 0));
+        assert!(render_seat(&r).contains("transcript of session s has no timestamps"), "{}", render_seat(&r));
+        assert_eq!(seat_json(&r)["untimed"], json!(["s"]));
     }
 
     #[test]
