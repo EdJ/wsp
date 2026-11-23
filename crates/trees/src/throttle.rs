@@ -1264,6 +1264,12 @@ fn is_shim(p: &Path) -> bool {
     String::from_utf8_lossy(&head[..n]).starts_with("#!/bin/sh\n") && String::from_utf8_lossy(&head[..n]).contains(SHIM_MARK)
 }
 
+/// `path` with every directory whose `tool` is a wsp shim left out: what a
+/// child is given that must run the real tool, not send it to a manager again.
+pub fn without_shims(tool: &str, path: &str) -> String {
+    path.split(':').filter(|d| !is_shim(&Path::new(d).join(tool))).collect::<Vec<_>>().join(":")
+}
+
 /// The first `tool` on `path` that is not one of ours.
 pub fn real_tool(tool: &str, path: &str, shims: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -3276,6 +3282,20 @@ mod tests {
         assert_eq!(real_tool("cargo", &path, &mine), Some(rig.bin.join("cargo")));
         let only = format!("{}:/usr/bin", foreign.display());
         assert_eq!(real_tool("cargo", &only, &mine).filter(|p| p.starts_with(&foreign)), None);
+    }
+
+    /// wsp-395: a child that must run the real cargo is given the PATH with
+    /// every shim directory out, whichever state dir wrote it, and the rest
+    /// kept in order.
+    #[test]
+    fn a_path_without_shims_keeps_every_other_directory_in_order() {
+        let rig = rig("throttle-without-shims");
+        let mine = ensure_shims(&rig.state, &Settings::load(&rig.state));
+        let other = rig.state.join("other-state");
+        let foreign = ensure_shims(&other, &Settings::load(&other));
+        let path = format!("{}:{}:{}:/usr/bin", mine.display(), rig.bin.display(), foreign.display());
+        assert_eq!(without_shims("cargo", &path), format!("{}:/usr/bin", rig.bin.display()));
+        assert_eq!(real_tool("cargo", &without_shims("cargo", &path), Path::new("")), Some(rig.bin.join("cargo")));
     }
 
     #[test]

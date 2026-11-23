@@ -264,6 +264,12 @@ struct Jobs<'a> {
     run: sharing::Run,
     /// Jobs sent so far, so each key is unique per run (wsp-040).
     sent: std::sync::atomic::AtomicU32,
+    /// A `PATH` every job of this run is given, ahead of the call's own env;
+    /// `None` (every run wsp makes) leaves the job the host's. A test's
+    /// manager runs in the test, so its jobs inherit the seat's `PATH`, shim
+    /// first, and a `cargo` there would go to the seat's manager as a second
+    /// job and be refused for a tree outside its root (wsp-395).
+    path: Option<String>,
 }
 
 /// The longest a build may run as a job. `job.run` needs a bound and the
@@ -273,7 +279,7 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 impl<'a> Jobs<'a> {
     fn new(host: &'a dyn wsp_wire::host::Host, run: sharing::Run) -> Jobs<'a> {
-        Jobs { host, run, sent: std::sync::atomic::AtomicU32::new(0) }
+        Jobs { host, run, sent: std::sync::atomic::AtomicU32::new(0), path: None }
     }
 
     /// The next job's key, `verify:<what>:<n>@<mark>`.
@@ -322,6 +328,7 @@ impl<'a> Jobs<'a> {
         // `env -u K -- K=V … cmd`: the values wsp mints cross on the argv
         // (host-api `JobRun`), and the caller's private index does not.
         let mut full: Vec<String> = vec!["env".into(), "-u".into(), "GIT_INDEX_FILE".into(), "--".into()];
+        full.extend(self.path.iter().map(|p| format!("PATH={p}")));
         full.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
         full.extend(argv);
         let run = wsp_wire::host::JobRun {
@@ -2647,6 +2654,17 @@ mod jobs_tests {
         host_of(Whose::Row("any"))
     }
 
+    /// A verify's jobs on `host`, as [`Jobs::new`] makes them, but whose
+    /// children run the real tools: the manager here is this test's, its jobs
+    /// inherit the seat's `PATH` with wsp's shim first, and a `cargo` through
+    /// the shim is sent to the seat's manager, which refuses this test's tree
+    /// as outside its root (wsp-395).
+    fn jobs_for(host: &dyn Host, run: sharing::Run) -> Jobs<'_> {
+        let mut jobs = Jobs::new(host, run);
+        jobs.path = Some(crate::throttle::without_shims("cargo", &std::env::var("PATH").unwrap_or_default()));
+        jobs
+    }
+
     /// Jobs placed under this test's tree root, on this thread.
     fn rooted(place: &Place) {
         crate::job_place::set_tree_root(Some(place.root.clone()));
@@ -2772,7 +2790,7 @@ mod jobs_tests {
         }
         let me = run("wsp-054", "p1");
         assert_eq!(me.host, p.host(), "the run's locks are read from the host its jobs run on");
-        let jobs = Jobs::new(&tcp, me);
+        let jobs = jobs_for(&tcp, me);
         let (ended, out) = jobs
             .run("pwd", JobClass::Check, &place.tree(), &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {})
             .unwrap();
@@ -2800,7 +2818,7 @@ mod jobs_tests {
         std::fs::write(tree.join("src/lib.rs"), "").unwrap();
         let (m, tcp) = manager(&place);
         let me = run("wsp-054", "c1");
-        let runs = Jobs::new(&tcp, me.clone());
+        let runs = jobs_for(&tcp, me.clone());
         let share = sharing::unregistered();
         let target = place.root.join("w").join("target");
         let (ok, text) =
@@ -2839,7 +2857,7 @@ mod jobs_tests {
     fn echo_flow(place: &Place, tcp: &Tcp) {
         rooted(place);
         let me = run("wsp-054", "e1");
-        let jobs = Jobs::new(tcp, me.clone());
+        let jobs = jobs_for(tcp, me.clone());
         let go = place.tree().join("go");
         let script = "echo first; i=0; while [ ! -e go ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; [ -e go ] && echo second";
         let mut heard = Vec::new();
@@ -2873,8 +2891,8 @@ mod jobs_tests {
         let repo = place.top.join("repo");
         let a = run("wsp-054", "a1");
         let b = run("wsp-099", "b1");
-        let jobs_a = Jobs::new(tcp, a.clone());
-        let jobs_b = Jobs::new(tcp, b.clone());
+        let jobs_a = jobs_for(tcp, a.clone());
+        let jobs_b = jobs_for(tcp, b.clone());
         let table_a = |h: &str| jobs_a.table(h);
         let table_b = |h: &str| jobs_b.table(h);
         let live_a = sharing::Live { me: &a, table: &table_a };
@@ -2924,7 +2942,7 @@ mod jobs_tests {
     fn alone_flow(place: &Place, tcp: &Tcp) {
         rooted(place);
         let me = run("wsp-054", "al1");
-        let runs = Jobs::new(tcp, me.clone());
+        let runs = jobs_for(tcp, me.clone());
         let tree = place.tree();
         let bin = place.root.join("w").join("target");
         let lists = bin.join("lists");
