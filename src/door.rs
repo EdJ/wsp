@@ -8,10 +8,12 @@
 //! [`Caller`] naming the hub's user where a verb reads the pane.
 //!
 //! **Which write.** A record for a subject the spoke has no file for creates
-//! it. One whose `parent` is the subject's local head updates it. Any other (a
-//! file the spoke never synced, or a parent that is not the head) is the two
-//! sides having moved apart, and goes to [`Reconcile`] (wsp-176), which writes
-//! what it decides; the door writes nothing of its own for it.
+//! it. One whose `parent` is the subject's local head, on a file that is still
+//! the one that head left, updates it. Any other (a file the spoke never
+//! synced, a parent that is not the head, or a local write since the head not
+//! yet pushed) is the two sides having moved apart, and goes to [`Reconcile`]
+//! (wsp-176), which writes what it decides; the door writes nothing of its own
+//! for it.
 //!
 //! **Not pushed back.** The spoke keeps, per subject, the head it last synced
 //! and the digest of the file that head left ([`Heads`], in the state
@@ -112,12 +114,14 @@ impl<'a> Door<'a> {
         let mut heads = Heads::read(self.store);
         let local = self.store.task(&row.id.0);
         let mut t = task_of_record(row).ok_or_else(|| Refusal::Unreadable(row.id.clone()))?;
+        // The file is still the one the synced head left: no local write since.
+        let unmoved = |heads: &Heads, subject: &Subject| heads.file(subject) == file_digest(self.store, &row.id.0);
         let applied = match local {
             None => {
                 cmd_task::file_new(self.store, &mut t, &caller).map_err(|e| Refusal::Write(e.to_string()))?;
                 Applied::Created(row.id.clone())
             }
-            Some(was) if parent.is_some() && heads.head(subject) == parent.as_ref() => {
+            Some(was) if parent.is_some() && heads.head(subject) == parent.as_ref() && unmoved(&heads, subject) => {
                 let want = t.status();
                 t.status_raw = was.status_raw.clone();
                 let verb = if want != was.status() {
@@ -362,6 +366,31 @@ mod tests {
         // And with nothing to reconcile it yet, it is refused, still unwritten.
         assert!(matches!(Door::new(&store, &Unreconciled).import(&stranger, &ann()), Err(Refusal::Diverged { .. })));
         assert_eq!(std::fs::read_to_string(store.task_path("wsp-902")).unwrap(), before);
+    }
+
+    #[test]
+    fn a_child_of_the_head_over_a_local_edit_not_yet_pushed_goes_to_reconcile() {
+        let store = crate::testkit::store("door-pending");
+        let first = record("wsp-905", "a shared row", "todo", "## Overview\nfirst\n", None);
+        Door::new(&store, &Unreconciled).import(&first, &ann()).unwrap();
+
+        // The person edits it on the spoke through a verb's write: it is pending.
+        let mut t = store.task("wsp-905").unwrap();
+        t.title = "edited here".into();
+        t.log(&format!("edited {}", Caller::hub("bob").byline()));
+        cmd_task::write_task(&store, &t, "edit", &Caller::hub("bob")).unwrap();
+        assert_eq!(pending(&store), vec![Subject::Row(RowId("wsp-905".into()))]);
+        let before = std::fs::read_to_string(store.task_path("wsp-905")).unwrap();
+        let heads_before = std::fs::read_to_string(store.state_file(Heads::FILE)).unwrap();
+
+        let head = wsp_objects::encode(&first).0;
+        let child = record("wsp-905", "edited there", "doing", "## Overview\nsecond\n", Some(head));
+        let rec = Recording::default();
+        assert_eq!(Door::new(&store, &rec).import(&child, &ann()), Ok(Applied::Reconciled("recorded".into())));
+        assert_eq!(*rec.0.borrow(), vec![(wsp_objects::encode(&child).0, Some(head))]);
+        assert_eq!(std::fs::read_to_string(store.task_path("wsp-905")).unwrap(), before, "the local edit stands");
+        assert_eq!(std::fs::read_to_string(store.state_file(Heads::FILE)).unwrap(), heads_before, "nor moved the head");
+        assert_eq!(pending(&store), vec![Subject::Row(RowId("wsp-905".into()))], "still the spoke's to push");
     }
 
     #[test]
