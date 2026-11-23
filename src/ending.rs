@@ -132,6 +132,10 @@ const NOT_ENDED: &str = "wsp: could not end";
 /// reason that will not pass by itself.
 const LEFT: &str = "wsp: verification holds and the agent is left running —";
 
+/// The line on a retro row saying its agent is kept, until a set time, for
+/// whoever typed to it after the verdict. Not [`LEFT`]: it has an end.
+const KEPT: &str = "wsp: verification holds and the agent is kept —";
+
 /// The line on a member's row saying its verifier's pane is left running.
 const VERIFIER_LEFT: &str = "wsp: the verifier is left running —";
 
@@ -157,6 +161,17 @@ pub(crate) const HANDED_OVER: &str = "ended: handed to its verifier at";
 /// How long a landed member with no verifier owed is left before its agent is
 /// ended: the person's chance to type to it first.
 const SETTLE_GRACE_SECS: i64 = if cfg!(test) { 0 } else { 300 };
+
+/// The tag of a retro row: its seat's one job is a `wsp retro done`, and the
+/// verifier's hold closes it, so nobody is owed anything at it afterwards.
+const RETRO_TAG: &str = "retro";
+
+/// How long after its verdict a retro row's seat that a turn began at is kept
+/// for whoever is using it, before it is ended all the same (`wsp-333`).
+/// compound-react-040's seat (cpd-115) stood 6h44m past its verdict, and
+/// wsp-309's (cpd-157) 2h21m, because "cannot say whether anybody has typed
+/// to it" held them with no end.
+pub(crate) const RETRO_KEPT_SECS: i64 = 60 * 60;
 
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
@@ -668,19 +683,40 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     // group signalled, and that kills the shell, which is the point. A question
     // it asked, a prompt, a turn and a person typing still hold it below.
     let shells = Default::default();
+    // **A retro row's seat is never left without an end** (`wsp-333`): nobody
+    // types to it after its verdict, so a backend that cannot say whether
+    // anybody did does not hold it, and one a turn began at is kept
+    // [`RETRO_KEPT_SECS`] past the verdict — the line says until when — and
+    // then ended, by the guards that still stand: never mid-turn, never behind
+    // a prompt or its own ask, never a governor seat.
+    let retro = store.find_task(member).is_some_and(|t| t.tags.iter().any(|g| g == RETRO_TAG));
+    let until = h.at + RETRO_KEPT_SECS;
+    let due = retro && util::epoch_secs() >= until;
+    let typed = match (retro, due) {
+        (true, true) => Some(false),
+        (true, false) => seats.turn_began_since(store, seat, h.at).or(Some(false)),
+        (false, _) => seats.turn_began_since(store, seat, h.at),
+    };
     let reading = Reading {
         state,
         wait: crate::waiting::reading(state, asks, &shells, seat, member),
         governs: crate::place::governs(&store.governors(), &crate::place::Seat::new(seat)),
-        typed: seats.turn_began_since(store, seat, h.at),
+        typed,
         pids: seats.pids(seat),
     };
     let by = w.map_or(member, |w| w.id.as_str());
-    if let Some(why) = left(&reading) {
-        if !why.passes() {
-            say_left(store, w, member, seat, &why, h);
+    match left(&reading) {
+        Some(Left::Typed) if retro => {
+            say_kept(store, w, member, seat, h, until);
+            return false;
         }
-        return false;
+        Some(why) => {
+            if !why.passes() {
+                say_left(store, w, member, seat, &why, h);
+            }
+            return false;
+        }
+        None => {}
     }
     let pids = reading.pids.unwrap_or_default();
     let claimed = store.claims().contains_key(member);
@@ -692,7 +728,12 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     };
     match ending.and_then(|()| confirm_gone(seats, &pids)) {
         Ok(()) => {
-            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}, and no pid of it is running", h.because()));
+            let kept = match (retro, due) {
+                (true, true) => format!(", a retro row's seat kept until {} for whoever was using it and ended then", util::iso_at(until)),
+                (true, false) => ", a retro row's seat, which nobody types to after its verdict".to_string(),
+                (false, _) => String::new(),
+            };
+            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}{kept}, and no pid of it is running", h.because()));
             true
         }
         Err(why) => {
@@ -942,6 +983,28 @@ fn say_left(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, why: 
             "{member}: {}, and its agent ({seat}) is left running: {}.",
             h.because(),
             why.sentence()
+        ));
+    }
+}
+
+/// A retro row's seat a turn began at since its verdict, kept for whoever is
+/// using it until `until` and ended then: said once per verdict, on the row, in
+/// `cycle.log` and to the run's governor, with the time.
+fn say_kept(store: &Store, w: Option<&Worklist>, member: &str, seat: &str, h: &Holds, until: i64) {
+    let line = format!(
+        "{KEPT} {member} ({seat}) at {}: a turn began at its seat after the verdict, so it is kept for whoever is using it until {}, and ended then",
+        h.commit,
+        util::iso_at(until)
+    );
+    if !once(store, member, &line) {
+        return;
+    }
+    crate::store::log_line(store, &format!("{} {member}: {}", w.map_or(member, |w| w.id.as_str()), line.trim_start_matches("wsp: ")));
+    if let Some(w) = w {
+        crate::cycle::tell(store, w, &format!(
+            "{member}: {}, and its agent ({seat}) is kept until {}: a turn began at it after the verdict.",
+            h.because(),
+            util::iso_at(until)
         ));
     }
 }
@@ -1640,6 +1703,86 @@ mod tests {
         seats.typed.remove("cpd-1");
         tick(&store, &seats);
         assert!(!member_ended(), "holding costs a pane, guessing costs a conversation");
+    }
+
+    /// `m-1` made a retro row, its pass decided `ago` seconds before now.
+    fn retro(store: &Store, ago: i64) {
+        let mut m = store.find_task("m-1").unwrap();
+        m.tags.push(RETRO_TAG.into());
+        store.save_task(&m).unwrap();
+        retro_decided(store, ago);
+    }
+
+    /// `wsp-333`: compound-react-040's seat (cpd-115) stood 6h44m past its
+    /// verdict as "left running" because its backend could not say whether
+    /// anybody had typed to it. A retro row's seat is nobody's after its
+    /// verdict: the next tick after the hold ends it, and `cycle.log` says so.
+    #[test]
+    fn a_retro_row_whose_verifier_holds_has_its_seat_ended_on_the_next_tick() {
+        let (_env, store) = verified("retro-untold");
+        retro(&store, 30);
+        let mut seats = Fake::at_rest();
+        seats.typed.remove("cpd-1");
+        drain(&SAID);
+        pass(&store, &seats);
+        assert!(member_ended(), "a retro row's seat is not held by a doubt nobody will resolve");
+        let said = drain(&SAID);
+        assert!(
+            said.iter().any(|l| l.contains("m-1 (cpd-1) ended — verification holds at abc1234") && l.contains("retro row")),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|l| l.contains("left running")), "{said:?}");
+        let log = log_of(&store, "m-1");
+        assert!(log.contains("ended: verification holds at abc1234") && !log.contains("left running"), "{log}");
+    }
+
+    /// A retro row's seat somebody typed to after the verdict is theirs for
+    /// [`RETRO_KEPT_SECS`], said once with the time it ends — and ended then.
+    #[test]
+    fn a_retro_seat_typed_to_after_its_verdict_is_kept_until_a_time_it_names_and_ended_then() {
+        let (_env, store) = verified("retro-typed");
+        retro(&store, 60);
+        let mut seats = Fake::at_rest();
+        seats.typed.insert("cpd-1".into(), true);
+        drain(&SAID);
+        pass(&store, &seats);
+        drain(&DESPAWNED);
+        pass(&store, &seats);
+        assert!(!drain(&DESPAWNED).contains(&"m-1".to_string()), "kept for whoever is using it");
+        let decided = util::epoch_of(crate::verification::passes(&store.find_task("m-1").unwrap())[0].decided.as_deref().unwrap());
+        let until = util::iso_at(decided + RETRO_KEPT_SECS);
+        let said = drain(&SAID);
+        let kept: Vec<_> = said.iter().filter(|l| l.contains("is kept")).collect();
+        assert_eq!(kept.len(), 1, "said once: {said:?}");
+        assert!(kept[0].contains(&format!("until {until}")) && !kept[0].contains("left running"), "{}", kept[0]);
+        assert!(drain(&TOLD).iter().any(|t| t.contains(&until)));
+
+        // Past the time it named, the same typed-to seat is ended.
+        retro_decided(&store, RETRO_KEPT_SECS + 60);
+        pass(&store, &seats);
+        assert!(member_ended(), "kept until a set time, not never");
+        let said = drain(&SAID);
+        assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended") && l.contains("kept until")), "{said:?}");
+    }
+
+    /// A row that is no retro keeps the old rule: a seat that cannot say is left.
+    #[test]
+    fn a_member_that_is_no_retro_row_is_still_left_when_its_seat_cannot_say() {
+        let (_env, store) = verified("not-retro");
+        let mut seats = Fake::at_rest();
+        seats.typed.remove("cpd-1");
+        pass(&store, &seats);
+        assert!(!member_ended());
+        assert!(log_of(&store, "m-1").contains("left running"));
+    }
+
+    /// `m-1`'s pass decided `ago` seconds before now, its tags left alone.
+    fn retro_decided(store: &Store, ago: i64) {
+        let mut m = store.find_task("m-1").unwrap();
+        let mut ps = crate::verification::passes(&m);
+        ps[0].decided = Some(util::iso_at(util::epoch_secs() - ago));
+        crate::verification::write(&mut m, &ps);
+        store.save_task(&m).unwrap();
     }
 
     #[test]
