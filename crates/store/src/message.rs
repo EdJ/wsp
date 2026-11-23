@@ -2277,8 +2277,8 @@ pub fn about_task(store: &Store, task: &str) -> Vec<Message> {
 /// interruption is read from is a decision about a panel and not about a
 /// record.
 pub fn raised(store: &Store) -> Vec<Message> {
-    let mut out: Vec<Message> =
-        store.messages().into_values().filter(Message::needs_attention).collect();
+    // Shared, and only what wants somebody cloned out of it (wsp-741).
+    let mut out: Vec<Message> = store.messages_shared().values().filter(|m| m.needs_attention()).cloned().collect();
     out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
     out
 }

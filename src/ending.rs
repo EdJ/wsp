@@ -587,12 +587,16 @@ fn released_seats(
     let mut ended = Vec::new();
     let Some(census) = seats.census() else { return ended };
     let held = store.held_seats();
+    // Read once for the census; a pane's label is an id wsp wrote, so it is found
+    // by `task_now`, which guesses nothing, and not by `find_task`, whose miss
+    // for a pane that is no row's reads every task (wsp-741).
+    let renamed = store.renamed_ids();
     for (seat, label) in census {
         let id = label.split(" · ").next().unwrap_or_default().trim_start_matches('(').to_string();
         if held.contains(&seat) || seated.contains(&id) {
             continue;
         }
-        let Some(m) = store.find_task(&id) else { continue };
+        let Some(m) = store.task_now(&renamed, &id) else { continue };
         if !released_from(&m, &seat) {
             continue;
         }

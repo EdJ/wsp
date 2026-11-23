@@ -212,6 +212,9 @@ pub(crate) struct Records {
     /// The seats of accepted exits not yet ended (`wsp-615`): closing, so not
     /// counted, seen working or not.
     pub exited: BTreeSet<String>,
+    /// What an open list says of each member's weight, read off the lists once
+    /// ([`Records::weight_of`]); filled by the first asking.
+    said: std::cell::OnceCell<std::collections::HashMap<String, Option<bool>>>,
 }
 
 /// The panes and tasks waiting on a person's answer for longer than `after`
@@ -242,15 +245,41 @@ impl Records {
             governors: store.governors(),
             lights: lights_of(&store.projects()),
             exited: crate::ending::exited_seats(store),
+            said: Default::default(),
         }
     }
 
     /// What `id` counts as under the cap: the list's line for it, its group's,
     /// then its project's `light:` tags; a row with none of these is whole.
     pub(crate) fn weight_of(&self, id: &str) -> usize {
-        let said = crate::worklist::open_list_of(&self.lists, id)
-            .and_then(|w| w.groups().into_iter().find(|g| g.members.iter().any(|m| m == id)))
-            .and_then(|g| g.light_for(id));
+        // The first open list that has the row, then its first group that has it,
+        // as `open_list_of` finds it — but read off every list once. A lookup
+        // per call cloned each list's groups: with a verifier row each, that was
+        // the second a `worklist ls --json` spent here, twice (wsp-741).
+        let said = self
+            .said
+            .get_or_init(|| {
+                let mut out = std::collections::HashMap::new();
+                for w in self.lists.iter().filter(|w| {
+                    matches!(
+                        w.status(),
+                        crate::model::WorklistStatus::Running | crate::model::WorklistStatus::Held | crate::model::WorklistStatus::Parked
+                    )
+                }) {
+                    for g in w.groups() {
+                        for m in &g.members {
+                            // The first list and the first group to hold a row speak for it.
+                            if !out.contains_key(m) {
+                                out.insert(m.clone(), g.light_for(m));
+                            }
+                        }
+                    }
+                }
+                out
+            })
+            .get(id)
+            .copied()
+            .flatten();
         let light = said.unwrap_or_else(|| {
             self.tasks.iter().find(|t| t.id == id).is_some_and(|t| {
                 t.project.as_ref().and_then(|p| self.lights.get(p)).is_some_and(|tags| t.tags.iter().any(|x| tags.contains(x)))
@@ -647,7 +676,33 @@ mod tests {
             held_asks: BTreeSet::new(),
             lights: BTreeMap::new(),
             exited: BTreeSet::new(),
+            said: Default::default(),
         }
+    }
+
+    fn list(id: &str, status: crate::model::WorklistStatus, groups: &str) -> crate::model::Worklist {
+        let mut w = crate::model::Worklist::new(id, id);
+        w.status_raw = status.as_str().into();
+        w.body = format!("## Groups\n{groups}");
+        w
+    }
+
+    /// wsp-741: the weight a row counts as is the first open list's, then its
+    /// first group's, as `open_list_of` found it; the map built once says the same.
+    #[test]
+    fn a_rows_weight_is_the_first_open_lists_first_groups() {
+        use crate::model::WorklistStatus::{Draft, Running};
+        let mut r = records(vec![task("a-1", Status::Doing), task("a-2", Status::Doing), task("b-1", Status::Doing)], &[]);
+        r.lists = vec![
+            // A draft holds nobody: its line for b-1 is not read.
+            list("draft", Draft, "- 1  b-1\n  weight: light\n"),
+            list("first", Running, "- 1  a-1  a-2\n  weight: light\n  weight a-2: heavy\n- 2  a-1\n  weight: heavy\n"),
+            list("second", Running, "- 1  a-1\n  weight: heavy\n"),
+        ];
+        assert_eq!(r.weight_of("a-1"), LIGHT, "the first list's first group");
+        assert_eq!(r.weight_of("a-2"), WHOLE, "a member's own line beats its group's");
+        assert_eq!(r.weight_of("b-1"), WHOLE, "a draft is nobody's");
+        assert_eq!(r.weight_of("nobody"), WHOLE);
     }
 
     fn counted(r: &Records, looks: &[(&str, Look)]) -> Vec<String> {
