@@ -75,3 +75,21 @@ pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Principal, D::Erro
     let s = String::deserialize(d)?;
     parse(&s).map_err(serde::de::Error::custom)
 }
+
+/// `#[serde(with = "wsp_api::principal::optional")]`: an `Option<Principal>`
+/// in the text form (with `default` and `skip_serializing_if` for absence).
+pub mod optional {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use wsp_store_contract::Principal;
+
+    pub fn serialize<S: Serializer>(p: &Option<Principal>, s: S) -> Result<S::Ok, S::Error> {
+        match p {
+            Some(p) => s.serialize_some(&super::text(p)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Principal>, D::Error> {
+        Option::<String>::deserialize(d)?.map(|s| super::parse(&s).map_err(serde::de::Error::custom)).transpose()
+    }
+}

@@ -199,7 +199,7 @@ pub struct Hello {
     pub protocol: u32,
 }
 
-/// `welcome { server, protocol, head }`.
+/// `welcome { server, protocol, head, by }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
     /// The instance the server serves (the name in `wsp:<instance>`).
@@ -208,6 +208,12 @@ pub struct Welcome {
     pub protocol: u32,
     /// The id of the last committed event.
     pub head: EventId,
+    /// Who the connection is, in the text form: every request's `by` must be
+    /// it. The hello's `by` on a server that trusts it; on the hub (wsp-161)
+    /// the principal the hello's token names, whatever `by` the hello sent.
+    /// Absent from a server older than it (an additive field).
+    #[serde(default, with = "principal::optional", skip_serializing_if = "Option::is_none")]
+    pub by: Option<Principal>,
 }
 
 /// `refused { code, text }`: the answer to a hello the server will not take

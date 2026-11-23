@@ -257,6 +257,7 @@ fn frames() -> Vec<Frame> {
             server: "main".into(),
             protocol: PROTOCOL,
             head: EventId(411),
+            by: Some(Principal::Person("ed".into())),
         }),
         Frame::Refused(Refused {
             code: Code::Unauthorised,
@@ -1032,8 +1033,11 @@ fn wire_spelling_is_pinned() {
     );
     assert_eq!(
         serde_json::to_value(&frames()[1]).unwrap(),
-        json!({"type": "welcome", "server": "main", "protocol": 1, "head": 411})
+        json!({"type": "welcome", "server": "main", "protocol": 1, "head": 411, "by": "person:ed"})
     );
+    // A welcome from a server older than its `by` still reads, naming nobody.
+    let old: Frame = serde_json::from_value(json!({"type": "welcome", "server": "main", "protocol": 1, "head": 411})).unwrap();
+    assert!(matches!(old, Frame::Welcome(Welcome { by: None, .. })));
     assert_eq!(
         serde_json::to_value(&frames()[2]).unwrap(),
         json!({"type": "refused", "code": "unauthorised", "text": "wrong token"})

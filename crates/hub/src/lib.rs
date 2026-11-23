@@ -10,8 +10,9 @@
 //!   hash, written through a temp file and a rename, never rewritten.
 //! - `hub.db`, one small SQLite opened as a [`SqliteStore`], so the hub's
 //!   leases are wsp-store-sqlite's own (its `Leases`, and the fencing tokens
-//!   that come with them), not a copy. Identity and the message queue join it
-//!   in later rows.
+//!   that come with them), not a copy. Its domain is wsp-159's [`Identity`],
+//!   so the hub's users and token records live there too, and [`auth`] reads
+//!   them to say who a hello is (wsp-161). The message queue joins it later.
 //!
 //! Refs are kept in that file too, one workspace's [`Refs`] to a revisioned
 //! text (row `hub-refs:<workspace>`, section `heads`). `rusqlite` is
@@ -29,6 +30,7 @@
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
 //! `ok` answer, not an `err`.
 
+pub mod auth;
 mod config;
 mod objects;
 pub mod serve;
@@ -41,9 +43,10 @@ use std::time::Duration;
 use wsp_api::{
     Answer, Blob, Code, Failure, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId,
 };
+use wsp_machines::Identity;
 use wsp_store_contract::{
-    Command, Domain, Draft, Error, Event, LeaseName, Leases, Principal, Refusal, Result, Rev,
-    RowId, State, Subject, Texts, Token,
+    Applied, Command, Commands, Domain, Draft, Error, Event, IdempotencyKey, LeaseName, Leases,
+    Principal, Reads, Refusal, Result, Rev, RowId, State, Subject, Texts, Token,
 };
 use wsp_store_sqlite::SqliteStore;
 
@@ -68,25 +71,30 @@ pub struct Hub {
     pub(crate) db: SqliteStore,
 }
 
-/// The domain of the hub's SQLite: it takes no commands, and the events the
-/// store writes itself (`lease.*`, `text.set`) change no state, since the
-/// hub's state is its refs and leases, not wsp's rows.
+/// The domain of the hub's SQLite: the identity machine's commands (the
+/// `hub.user.*` and `hub.token.*` verbs, shared workspaces and members),
+/// decided and folded by [`Identity`]; no other command. The events the store
+/// writes itself (`lease.*`, `text.set`) change no state, since the rest of
+/// the hub's state is its refs and leases, not wsp's rows.
 struct HubDomain;
 
 impl Domain for HubDomain {
     fn decide(
         &self,
-        _: &State,
-        _: &Command,
-        _: &Principal,
+        state: &State,
+        cmd: &Command,
+        by: &Principal,
     ) -> std::result::Result<Vec<Draft>, Refusal> {
+        if Identity::owns(cmd) {
+            return Identity.decide(state, cmd, by);
+        }
         Err(Refusal::Invalid {
-            reason: "the hub's store takes no commands".into(),
+            reason: "the hub's store takes only the identity machine's commands".into(),
         })
     }
 
-    fn evolve(&self, state: State, _: &Event) -> State {
-        state
+    fn evolve(&self, state: State, event: &Event) -> State {
+        Identity.evolve(state, event)
     }
 }
 
@@ -119,6 +127,21 @@ impl Hub {
     /// The object directory.
     pub fn objects(&self) -> &ObjectDir {
         &self.objects
+    }
+
+    // Identity.
+
+    /// Applies an identity command in process as `by`, under `key`: what the
+    /// hub's host does without a connection (the first admin's token, which
+    /// no connection can issue before that admin has one). The identity
+    /// machine decides it as it decides one sent over the API.
+    pub fn apply(&self, cmd: Command, key: IdempotencyKey, by: Principal) -> Result<Applied> {
+        self.db.apply(cmd, key, by)
+    }
+
+    /// The hub's state: its users, token records, shared workspaces and members.
+    pub fn state(&self) -> Result<State> {
+        Ok(self.db.snapshot()?.0)
     }
 
     // Objects.

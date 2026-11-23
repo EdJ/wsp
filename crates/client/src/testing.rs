@@ -204,7 +204,7 @@ fn serve(stream: TcpStream, token: &ApiToken, hub: &Mutex<MemHub>) {
     let mut lines = BufReader::new(stream).lines();
     match lines.next().and_then(Result::ok).map(|l| serde_json::from_str::<Frame>(&l)) {
         Some(Ok(Frame::Hello(hello))) if hello.token == *token => {
-            let welcome = Welcome { server: "fake-hub".into(), protocol: PROTOCOL, head: EventId(0) };
+            let welcome = Welcome { server: "fake-hub".into(), protocol: PROTOCOL, head: EventId(0), by: Some(hello.by.clone()) };
             if !write(&mut out, &Frame::Welcome(welcome)) {
                 return;
             }

@@ -4,8 +4,9 @@
 //! store whose event log announces `ref.moved`, what answers the sync verbs,
 //! and the peer ranges the config names.
 //!
-//! The hello's token is the hub's admin token, `api.token` in the data
-//! directory (per-user identity is wsp-161).
+//! Who a hello is, is [`crate::auth`]'s: a user's token names that user, and
+//! the bootstrap token, `api.token` in the data directory, names the hub
+//! itself only to make the first admin (wsp-161).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use wsp_api::{Outcome, Principal, SyncCall, TOKEN_FILE};
 use wsp_server::{SyncVerbs, Server, SharedStore};
 
+use crate::auth::Auth;
 use crate::{Config, Hub, HubStore};
 
 impl SyncVerbs for Hub {
@@ -39,6 +41,7 @@ pub fn start(cfg: &Config) -> Result<Running, String> {
     server_cfg.port = cfg.port;
     server_cfg.instance = cfg.name.clone();
     server_cfg.sync = Some(hub.clone());
+    server_cfg.gate = Some(Arc::new(Auth::new(hub.clone(), cfg.name.clone())));
     server_cfg.peers = Some(peers);
     let server = Server::start(store, server_cfg).map_err(|e| e.to_string())?;
     Ok(Running { server, hub, token_path: cfg.data_dir.join(TOKEN_FILE) })
@@ -50,7 +53,7 @@ impl Running {
         self.server.addrs()
     }
 
-    /// Where the admin token is.
+    /// Where the bootstrap token is.
     pub fn token_path(&self) -> &std::path::Path {
         &self.token_path
     }

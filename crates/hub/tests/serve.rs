@@ -1,6 +1,7 @@
 //! `wsp-hub serve` as a process: wsp-459's convergence case through it with
 //! two clients, across a kill and a restart; the stream's `ref.moved`; the
-//! hello's token; and the peer ranges the config names.
+//! hello's token; and the peer ranges the config names. Each client dials with
+//! its user's own token, made in the data directory before the hub starts.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -10,8 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wsp_api::{ApiToken, Blob, EventId, ObjectId, Refs, WorkspaceId};
 use wsp_client::{Client, Item, Silent, SyncReport};
+use wsp_hub::Hub;
+use wsp_machines::token;
 use wsp_objects::{encode, Object};
-use wsp_store_contract::{At, Entity, EventKind, Principal, ProjectId, Row, RowId, RowState, Subject};
+use wsp_store_contract::{
+    At, Command as Cmd, Entity, EventKind, IdempotencyKey, Principal, ProjectId, Row, RowId, RowState, Subject, TokenId,
+    UserName,
+};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -87,8 +93,35 @@ fn subject(row: &str) -> Subject {
     Subject::Row(RowId(row.into()))
 }
 
-fn dial(data: &Path, who: &str) -> Client {
-    Client::dial(data, Principal::Person(who.into()), WAIT).expect("the hub answers a hello with its token")
+/// Users and their tokens, made in `data` before the hub starts, as the hub's
+/// host does in process: the first admin by the hub itself, then each user and
+/// a token for it by that admin.
+fn seed(data: &Path, users: &[&str]) -> BTreeMap<String, String> {
+    let hub = Hub::open(data).unwrap();
+    let apply = |cmd: Cmd, by: &Principal| {
+        let key = IdempotencyKey(format!("{cmd:?}"));
+        hub.apply(cmd, key, by.clone()).expect("the identity machine takes it");
+    };
+    let root = Principal::Person("root".into());
+    apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
+    let mut tokens = BTreeMap::new();
+    for user in users {
+        let (secret, hash) = token::mint();
+        apply(Cmd::HubUserAdd { name: UserName(user.to_string()), admin: false }, &root);
+        apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.to_string()), hash }, &root);
+        tokens.insert(user.to_string(), secret);
+    }
+    tokens
+}
+
+fn addrs(data: &Path) -> Vec<String> {
+    let listen = std::fs::read_to_string(data.join("api.json")).unwrap();
+    serde_json::from_str::<wsp_api::Listen>(&listen).unwrap().addrs
+}
+
+fn dial(data: &Path, tokens: &BTreeMap<String, String>, who: &str) -> Client {
+    Client::dial_at(addrs(data), ApiToken(tokens[who].clone()), Principal::Person(who.into()), WAIT)
+        .expect("the hub answers a hello with its user's token")
 }
 
 /// One spoke: its heads and every object behind them, and the clock it stamps its writes with.
@@ -146,6 +179,7 @@ impl Spoke {
 fn two_clients_converge_through_a_served_hub_and_it_keeps_it_all_across_a_restart() {
     let dir = Scratch::new("converge");
     let config = dir.config("");
+    let tokens = seed(&dir.data(), &["ann", "bo", "cy"]);
     let hub = Hubd::start(&config);
     let (mut a, mut b) = (Spoke::new("ann"), Spoke::new("bo"));
     a.write("wsp-1", "first");
@@ -153,7 +187,7 @@ fn two_clients_converge_through_a_served_hub_and_it_keeps_it_all_across_a_restar
     a.write("wsp-2", "second, edited");
     b.write("wsp-3", "third");
     b.write("wsp-4", "fourth");
-    let (mut ca, mut cb) = (dial(&dir.data(), "ann"), dial(&dir.data(), "bo"));
+    let (mut ca, mut cb) = (dial(&dir.data(), &tokens, "ann"), dial(&dir.data(), &tokens, "bo"));
 
     let ra = a.sync(&mut ca);
     assert_eq!((ra.sent, ra.received.len()), (3, 0), "ann sends her three objects: {ra:?}");
@@ -173,7 +207,7 @@ fn two_clients_converge_through_a_served_hub_and_it_keeps_it_all_across_a_restar
     drop((ca, cb));
     hub.kill();
     let hub = Hubd::start(&config);
-    let (mut ca, mut cb) = (dial(&dir.data(), "ann"), dial(&dir.data(), "bo"));
+    let (mut ca, mut cb) = (dial(&dir.data(), &tokens, "ann"), dial(&dir.data(), &tokens, "bo"));
     assert!(ca.sync_have(all.clone()).unwrap().is_empty(), "every object is still held");
     assert_eq!(ca.sync_heads(&ws()).unwrap(), a.refs, "and every head is still where it was");
     for blob in cb.sync_get(all.clone()).unwrap() {
@@ -182,7 +216,7 @@ fn two_clients_converge_through_a_served_hub_and_it_keeps_it_all_across_a_restar
 
     // A third spoke that never met the hub before takes the lot.
     let mut c = Spoke::new("cy");
-    let mut cc = dial(&dir.data(), "cy");
+    let mut cc = dial(&dir.data(), &tokens, "cy");
     let rc = c.sync(&mut cc);
     assert_eq!((rc.sent, rc.received.len()), (0, 5), "{rc:?}");
     assert_eq!(c.refs, a.refs);
@@ -204,9 +238,10 @@ fn two_clients_converge_through_a_served_hub_and_it_keeps_it_all_across_a_restar
 fn the_stream_announces_each_move_and_a_replay_after_a_restart_still_does() {
     let dir = Scratch::new("stream");
     let config = dir.config("");
+    let tokens = seed(&dir.data(), &["ann", "watcher", "late"]);
     let hub = Hubd::start(&config);
-    let mut ann = dial(&dir.data(), "ann");
-    let mut feed = dial(&dir.data(), "watcher").subscribe(None);
+    let mut ann = dial(&dir.data(), &tokens, "ann");
+    let mut feed = dial(&dir.data(), &tokens, "watcher").subscribe(None);
     assert!(matches!(feed.next_within(WAIT), Some(Item::State { .. })), "a subscription opens with the snapshot");
 
     let mut a = Spoke::new("ann");
@@ -249,7 +284,7 @@ fn the_stream_announces_each_move_and_a_replay_after_a_restart_still_does() {
     drop((feed, ann));
     hub.kill();
     let _hub = Hubd::start(&config);
-    let mut replay = dial(&dir.data(), "late").subscribe(Some(EventId(0)));
+    let mut replay = dial(&dir.data(), &tokens, "late").subscribe(Some(EventId(0)));
     let mut told: BTreeMap<Subject, ObjectId> = BTreeMap::new();
     while told.len() < 2 {
         match replay.next_within(WAIT) {
@@ -264,21 +299,19 @@ fn the_stream_announces_each_move_and_a_replay_after_a_restart_still_does() {
 }
 
 #[test]
-fn the_hello_needs_the_admin_token_and_the_peer_ranges_are_the_configs() {
+fn the_hello_needs_a_token_the_hub_knows_and_the_peer_ranges_are_the_configs() {
     let dir = Scratch::new("hello");
     let _hub = Hubd::start(&dir.config(""));
     let token = std::fs::read_to_string(dir.data().join("api.token")).unwrap();
-    assert_eq!(token.trim().len(), 64, "the admin token is made on first start");
-    let addrs = {
-        let listen = std::fs::read_to_string(dir.data().join("api.json")).unwrap();
-        serde_json::from_str::<wsp_api::Listen>(&listen).unwrap().addrs
-    };
+    assert_eq!(token.trim().len(), 64, "the bootstrap token is made on first start");
+    let addrs = addrs(&dir.data());
     let by = Principal::Person("mal".into());
     match Client::dial_at(addrs.clone(), ApiToken("not-the-token".into()), by.clone(), WAIT) {
         Err(Silent::Refused(_)) => {}
         other => panic!("a wrong token is refused: {:?}", other.map(|c| c.server().to_string())),
     }
-    let ok = Client::dial_at(addrs, ApiToken(token.trim().into()), by, WAIT).expect("the right token");
+    let me = Principal::Wsp("wsp-hub".into());
+    let ok = Client::dial_at(addrs, ApiToken(token.trim().into()), me, WAIT).expect("the bootstrap token, before an admin");
     assert_eq!(ok.server(), "wsp-hub");
 
     // A config whose ranges leave loopback out admits nobody from it.

@@ -38,7 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use wsp_api::{
-    ApiToken, Code, Connection, Failure, Frame, Hello, Listen, Outcome, Principal, SyncCall, LISTEN_FILE, PROTOCOL,
+    ApiToken, Call, Code, Command, Connection, Failure, Frame, Hello, Listen, Outcome, Principal, SyncCall, LISTEN_FILE,
+    PROTOCOL,
     TOKEN_FILE, TOKEN_MODE,
 };
 use wsp_store_contract::{At, Store};
@@ -105,6 +106,32 @@ impl std::fmt::Debug for dyn SyncVerbs {
     }
 }
 
+/// Who a connection is, where the hello's token decides it rather than its
+/// `by` (the hub, wsp-161). Without one a server keeps the state core's rule:
+/// the hello's token must be the instance's, and its `by` is trusted. Like
+/// [`SyncVerbs`] it is handed in, and the server holds nothing of what it
+/// decides from.
+pub trait Gate: Send + Sync {
+    /// The principal `hello`'s token names, which replaces the hello's `by` for
+    /// the connection's life (and is what `welcome` names); `Err` is refused
+    /// `unauthorised` with its text. `token` is the instance's own
+    /// (`api.token`), for a gate that gives it a meaning.
+    fn hello(&self, hello: &Hello, token: &ApiToken) -> Result<Principal, String>;
+    /// Whether the connection's principal `by` may make `call`, asked after
+    /// the request's `by` was found to be `by`; `Err` is the reply's `err`.
+    fn admits(&self, by: &Principal, call: &Call) -> Result<(), Failure>;
+    /// The commands applied through the store beside the orders machine's
+    /// (with a key, under the connection's principal), whose domain decides
+    /// who may send them.
+    fn owns(&self, cmd: &Command) -> bool;
+}
+
+impl std::fmt::Debug for dyn Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gate(..)")
+    }
+}
+
 /// What a server is started with.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -123,6 +150,8 @@ pub struct Config {
     pub views: Option<Arc<dyn Views>>,
     /// What answers the sync verbs; none answers each `unsupported`.
     pub sync: Option<Arc<dyn SyncVerbs>>,
+    /// Who a hello is; none trusts the hello's `by` behind the instance's token.
+    pub gate: Option<Arc<dyn Gate>>,
     /// The ranges a peer must be in, and an address to bind (loopback aside,
     /// which is always bound): none keeps [`allowed`]'s loopback and tailnet.
     pub peers: Option<Ranges>,
@@ -140,6 +169,7 @@ impl Config {
             beat: Duration::from_secs(wsp_api::BEAT_SECS),
             views: None,
             sync: None,
+            gate: None,
             peers: None,
         }
     }

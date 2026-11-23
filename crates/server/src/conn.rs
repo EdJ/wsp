@@ -27,8 +27,13 @@
 //!   `unsupported`; a known verb whose `args` did not fit, `malformed`.
 //! - A line that does not decode is answered `malformed` and the connection
 //!   stays up: as a reply to its `id` when it has one, else as `refused`.
-//! - A request whose `by` is not the hello's is `forbidden`; one whose `v` is
-//!   not [`PROTOCOL`], `protocol`.
+//! - A request whose `by` is not the connection's is `forbidden`; one whose
+//!   `v` is not [`PROTOCOL`], `protocol`. The connection is the hello's `by`,
+//!   behind the instance's token; with a [`crate::Gate`] (the hub, wsp-161)
+//!   it is the principal the gate says the hello's token names, whatever `by`
+//!   the hello sent, and each request is then put to the gate's `admits`, and
+//!   a command the gate `owns` is applied like the orders machine's, its
+//!   domain deciding who may. Either way `welcome` names it.
 //! - A client silent for [`MISSED_BEATS`] beats is dropped. Any frame counts,
 //!   a malformed line included; a subscriber with nothing to ask keeps its
 //!   connection with a cheap read (`events { from: <its last>, limit: 0 }`).
@@ -95,10 +100,20 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
         }
         Err(_) => return conn.shutdown(),
     };
-    if !same(&hello.token.0, &shared.token.0) {
-        shared.log.line(&format!("{peer}: refused, a wrong token ({})", hello.client));
-        return refuse(&mut conn, Code::Unauthorised, "the token is not this instance's");
-    }
+    let by = match &shared.cfg.gate {
+        Some(gate) => match gate.hello(&hello, &shared.token) {
+            Ok(by) => by,
+            Err(why) => {
+                shared.log.line(&format!("{peer}: refused, {why} ({})", hello.client));
+                return refuse(&mut conn, Code::Unauthorised, &why);
+            }
+        },
+        None if same(&hello.token.0, &shared.token.0) => hello.by.clone(),
+        None => {
+            shared.log.line(&format!("{peer}: refused, a wrong token ({})", hello.client));
+            return refuse(&mut conn, Code::Unauthorised, "the token is not this instance's");
+        }
+    };
     if hello.protocol != PROTOCOL {
         return refuse(
             &mut conn,
@@ -110,7 +125,7 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
         Ok(h) => h,
         Err(e) => return refuse(&mut conn, Code::Backend, &format!("the store did not answer: {e:?}")),
     };
-    let welcome = Welcome { server: shared.cfg.instance.clone(), protocol: PROTOCOL, head };
+    let welcome = Welcome { server: shared.cfg.instance.clone(), protocol: PROTOCOL, head, by: Some(by.clone()) };
     if conn.send(&Frame::Welcome(welcome)).is_err() {
         return conn.shutdown();
     }
@@ -121,7 +136,7 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
     shared.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(n, handle);
     let mut c = Client {
         shared: &shared,
-        hello: &hello,
+        by,
         writer: Arc::new(Mutex::new(writer)),
         closed: Arc::new(AtomicBool::new(false)),
         feed: None,
@@ -141,7 +156,8 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
 /// A welcomed connection.
 struct Client<'a> {
     shared: &'a Arc<Shared>,
-    hello: &'a Hello,
+    /// Who the connection is: the hello's `by`, or what the gate resolved.
+    by: Principal,
     writer: crate::conn::Writer,
     /// Set by either half when the connection is done.
     closed: Arc<AtomicBool>,
@@ -209,14 +225,19 @@ impl Client<'_> {
             let text = format!("this server speaks v {PROTOCOL}, not {}", req.v);
             return send(&self.writer, &reply(id, Err(failure(Code::Protocol, text))));
         }
-        if req.by != self.hello.by {
+        if req.by != self.by {
             let text = format!(
                 "this connection is {}, not {}",
-                wsp_api::principal::text(&self.hello.by),
+                wsp_api::principal::text(&self.by),
                 wsp_api::principal::text(&req.by)
             );
             let f = Failure { code: Code::Forbidden, text, refusal: Some(Refusal::Forbidden { by: req.by }) };
             return send(&self.writer, &reply(id, Err(f)));
+        }
+        if let Some(gate) = &self.shared.cfg.gate {
+            if let Err(f) = gate.admits(&self.by, &req.call) {
+                return send(&self.writer, &reply(id, Err(f)));
+            }
         }
         let outcome = match req.call {
             Call::Verb(Verb::Subscribe(sub)) => return self.subscribe(id, sub),
@@ -224,7 +245,7 @@ impl Client<'_> {
             Call::Command(cmd) => return self.command(id, req.key, cmd),
             // The sync verbs are the hub's (wsp-460): answered by what it handed in, else not this server's.
             Call::Sync(call) => match &self.shared.cfg.sync {
-                Some(sync) => match sync.answer(&self.hello.by, call) {
+                Some(sync) => match sync.answer(&self.by, call) {
                     Outcome::Ok(a) => Ok(a),
                     Outcome::Err(f) => Err(f),
                 },
@@ -248,12 +269,13 @@ impl Client<'_> {
     /// with a key, applied; every other `unsupported`.
     fn command(&mut self, id: ReqId, key: Option<IdempotencyKey>, cmd: Command) -> bool {
         let verb = verb_of(&cmd);
-        if !Orders::owns(&cmd) {
+        let gated = self.shared.cfg.gate.as_ref().is_some_and(|g| g.owns(&cmd));
+        if !gated && !Orders::owns(&cmd) {
             let text = format!("{verb} is a command this server does not run over the API");
             return send(&self.writer, &reply(id, Err(failure(Code::Unsupported, text))));
         }
-        let by = &self.hello.by;
-        if !may_command(&self.shared.cfg.instance, by, &cmd) {
+        let by = &self.by;
+        if !gated && !may_command(&self.shared.cfg.instance, by, &cmd) {
             let text = if matches!(cmd, Command::OrderSend { .. } | Command::OrderCancel { .. }) {
                 format!("{verb} is sent by a person or a seat, not {}", wsp_api::principal::text(by))
             } else {

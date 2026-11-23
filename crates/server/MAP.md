@@ -12,9 +12,11 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
 
 ## Holds
 
-- `src/lib.rs`: `Server::start(store, Config { addrs, state_dir, port, instance, beat, views })`, `Views` (the
+- `src/lib.rs`: `Server::start(store, Config { addrs, state_dir, port, instance, beat, views, sync, gate, peers })`, `Views` (the
   view verbs' documents, handed in by whatever starts the server: the daemon passes the CLI's own functions,
-  wsp-307), `Server::{addrs,
+  wsp-307), `SyncVerbs` (the hub's sync verbs), `Gate` (who a hello is, where its token decides it: the hub's
+  `auth`, wsp-161; `hello` resolves the principal, `admits` vets each request, `owns` names commands applied
+  beside the orders machine's), `Server::{addrs,
   token, clients, log_path, stop}`, `StartError`. Also `allowed` (the peer and bind rule: `127.0.0.0/8`, `::1`,
   `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, copied from the manager), `ensure_token` (`api.token`: 32 random bytes as
   hex, 0600, narrowed back and logged when widened), `DEFAULT_PORT` (7488, one past the manager's), `LOG_FILE`
@@ -23,13 +25,14 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   wsp server with this token (instance …, head …)", "a wsp server with another token", "something that is not a
   wsp server"). Accepting is non-blocking with a 25 ms poll, so `stop` needs no self-connect. A peer outside
   `allowed` is closed before it is read.
-- `src/conn.rs`: one connection. `hello` comes first: a wrong token is `refused unauthorised`, another protocol
+- `src/conn.rs`: one connection. `hello` comes first: a wrong token is `refused unauthorised` (with a `Gate`, a
+  token the gate names nobody with; the principal it names replaces the hello's `by`), another protocol
   is `refused protocol`, and any other first frame is `refused malformed`. Each of these closes the connection. A
-  good hello gets `welcome { server, protocol, head }`. After that, each request gets one reply by id. A read verb
+  good hello gets `welcome { server, protocol, head, by }`, `by` the connection's principal. After that, each request gets one reply by id. A read verb
   is one store call. `lists`, `asks`, `machines`, and `orders` with no seat have no `Reads` verb, so they read the
   one `snapshot`. A command verb is `unsupported`, an unknown verb is `unsupported`, and a known verb with bad
   `args` is `malformed`. `throttle`, `spend` and `show` are answered by `Config::views` whole (its `Err` as the
-  reply's `err`), `unsupported` without one. A request whose `by` is not the hello's is `forbidden`, and one whose `v` is not 1 is
+  reply's `err`), `unsupported` without one. A request whose `by` is not the connection's is `forbidden`, and one whose `v` is not 1 is
   `protocol`. A line that does not decode is answered `malformed` and the connection stays up. If an `id` can be
   read from the line, the answer is a reply to that id; otherwise it is `refused`. A client silent for
   `MISSED_BEATS` beats is dropped.

@@ -10,7 +10,7 @@
 //! }
 //! ```
 //!
-//! - `data_dir` (required): where the objects, `hub.db`, the admin token
+//! - `data_dir` (required): where the objects, `hub.db`, the bootstrap token
 //!   (`api.token`, made on first start at mode 0600), `api.json` and the log
 //!   (`api.log`) live. A relative path is read from the config file's own
 //!   directory.
