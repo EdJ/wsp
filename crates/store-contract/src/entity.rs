@@ -353,4 +353,10 @@ pub struct State {
     pub machines: BTreeMap<MachineName, Machine>,
     #[serde(default)]
     pub leases: BTreeMap<LeaseName, Lease>,
+    /// The hub's users (wsp-159's identity domain folds them).
+    #[serde(default)]
+    pub users: BTreeMap<UserName, User>,
+    /// The hub's token records, by id.
+    #[serde(default)]
+    pub credentials: BTreeMap<TokenId, Credential>,
 }

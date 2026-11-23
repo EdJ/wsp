@@ -109,7 +109,7 @@ names them yet. Groups, roles and stewards are Later.
   Subjects `User(UserName)` and `Credential(TokenId)`.
 - **Entities**: `User { name, state, admin }` and `Credential { id, user, hash, state, issued, revoked }`, with
   `IdentityState` `active` or `revoked`. `hash` is the hex SHA-256 of the token; the token itself is never in a
-  command, event or entity. They are not in `Entity` or `State` yet: wsp-159 puts them where its domain keeps them.
+  command, event or entity. `State` holds them as `users` and `credentials` (wsp-159); they are not in `Entity`.
 - **No new refusals**: a second user of one name is `invalid`, and revoking a revoked token is an empty decision;
   both are wsp-159's to decide.
 - **Who refuses them today**: `TestDomain` (`illegal`, naming the user or the token record, state `""`) and the

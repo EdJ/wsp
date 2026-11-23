@@ -5,8 +5,12 @@
 //! backend's `apply` runs it. See `MAP.md`.
 //!
 //! Step 2 brings the orders machine ([`orders::Orders`], 3.1). The seats, rows
-//! and lists machines come with steps 3 and 4.
+//! and lists machines come with steps 3 and 4. [`identity::Identity`] (wsp-159) decides the hub's users and
+//! tokens; [`token`] makes and hashes them.
 
+pub mod identity;
 pub mod orders;
+pub mod token;
 
+pub use identity::Identity;
 pub use orders::{Orders, ATTEMPTS};
