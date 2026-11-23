@@ -72,6 +72,11 @@ mod cmd_task;
 // The import door (wsp-175): its caller is the spoke's sync worker (wsp-464, wsp-469), which is not built yet.
 #[allow(dead_code)]
 mod door;
+// After a `stale` (wsp-176): the merge, and the push and stale glue; called by the sync worker (wsp-464, wsp-469).
+#[allow(dead_code)]
+mod hub_sync;
+#[allow(dead_code)]
+mod reconcile;
 mod cmd_submit;
 mod cmd_verifications;
 mod leg_seat;

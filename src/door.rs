@@ -13,7 +13,7 @@
 //! synced, a parent that is not the head, or a local write since the head not
 //! yet pushed) is the two sides having moved apart, and goes to [`Reconcile`]
 //! (wsp-176), which writes what it decides; the door writes nothing of its own
-//! for it.
+//! for it. [`crate::reconcile::Merging`] is the one that merges.
 //!
 //! **Not pushed back.** The spoke keeps, per subject, the head it last synced
 //! and the digest of the file that head left ([`Heads`], in the state
@@ -70,7 +70,8 @@ pub(crate) trait Reconcile {
     fn reconcile(&self, store: &Store, obj: &Object, id: ObjectId, local: Option<ObjectId>) -> Result<Applied, Refusal>;
 }
 
-/// Until wsp-176: every divergence is refused, and nothing is written.
+/// Every divergence refused, and nothing written: for a door that must not
+/// merge (a read-only spoke, a test of the door alone).
 pub(crate) struct Unreconciled;
 
 impl Reconcile for Unreconciled {
@@ -148,7 +149,7 @@ impl<'a> Door<'a> {
 /// The task a row record is: its file's text where it carries one (as the
 /// mirror writes `body`), else its head with `prose` as the body; under the
 /// record's id, title and workspace whichever it was.
-fn task_of_record(row: &wsp_store_contract::Row) -> Option<Task> {
+pub(crate) fn task_of_record(row: &wsp_store_contract::Row) -> Option<Task> {
     let mut t = crate::mirror::task_of(row)?;
     if !row.fields.contains_key(crate::mirror::BODY) {
         t.body = row.fields.get(wsp_view::common::key::PROSE).cloned().unwrap_or_default();
@@ -216,15 +217,15 @@ impl Heads {
         self.by_subject.get(&key(subject)).map(|(_, h, _)| h)
     }
 
-    fn file(&self, subject: &Subject) -> Option<ObjectId> {
+    pub(crate) fn file(&self, subject: &Subject) -> Option<ObjectId> {
         self.by_subject.get(&key(subject)).and_then(|(_, _, f)| *f)
     }
 
-    fn set(&mut self, subject: &Subject, head: ObjectId, file: Option<ObjectId>) {
+    pub(crate) fn set(&mut self, subject: &Subject, head: ObjectId, file: Option<ObjectId>) {
         self.by_subject.insert(key(subject), (subject.clone(), head, file));
     }
 
-    fn write(&self, store: &Store) -> std::io::Result<()> {
+    pub(crate) fn write(&self, store: &Store) -> std::io::Result<()> {
         let list: Vec<Value> = self
             .by_subject
             .values()
