@@ -47,7 +47,10 @@ pub mod sync;
 #[cfg(any(test, feature = "test-support"))]
 pub use conn::{pair, Memory};
 pub use conn::{ConnError, Connection, MAX_LINE};
-pub use sync::{fence_subject, fenced_by, fenced_event, row_id, Blob, IdsAlloc, LeaseHold, LeaseTake, Move, ObjectId, RefMove, Refs, SyncCall, WorkspaceId, FENCE_TOKEN, MAX_IDS, SYNC_VERBS};
+pub use sync::{
+    fence_subject, fenced_by, fenced_event, msg_subject, row_id, Blob, HubMessage, IdsAlloc, LeaseHold, LeaseTake, Move, MsgSend,
+    ObjectId, RefMove, Refs, SyncCall, WorkspaceId, FENCE_TOKEN, MAX_IDS, SYNC_VERBS,
+};
 
 pub use wsp_store_contract::{
     Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListFilter,
@@ -487,6 +490,12 @@ pub enum Answer {
     },
     /// `lease.release`: the lease is not the caller's any more.
     Released,
+    /// `msg.send`: the message's id on the hub and the user it was routed to.
+    Queued { id: String, user: String },
+    /// `msg.take`: the messages queued for the caller, oldest first.
+    Messages(Vec<HubMessage>),
+    /// `msg.ack`: how many of the ids left the caller's queue.
+    Acked { acked: u32 },
 }
 
 /// What `err` carries: `{ code, text }` (4.1), and the contract's refusal

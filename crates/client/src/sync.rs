@@ -14,7 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 use wsp_api::{
-    Answer, Blob, Call, IdsAlloc, LeaseHold, LeaseTake, Move, ObjectId, Outcome, RefMove, Refs, SyncCall, WorkspaceId,
+    Answer, Blob, Call, HubMessage, IdsAlloc, LeaseHold, LeaseTake, Move, MsgSend, NoArgs, ObjectId, Outcome, RefMove, Refs,
+    SyncCall, WorkspaceId,
 };
 use wsp_store_contract::{At, RowId, Subject, Token};
 
@@ -275,6 +276,33 @@ impl Client {
         match self.sync_call(SyncCall::LeaseRelease(LeaseHold { row: row.clone(), token }))? {
             Answer::Released => Ok(()),
             other => Err(Error::Unexpected(format!("lease.release was answered {other:?}"))),
+        }
+    }
+
+    /// `msg.send` (wsp-470): a tell to an address another user's spoke holds,
+    /// queued on the hub. Answers the hub's id for it and the user it was
+    /// routed to; refused `not_found` when the hub cannot say whose it is.
+    pub fn msg_send(&mut self, msg: MsgSend) -> Result<(String, String), Error> {
+        match self.sync_call(SyncCall::MsgSend(msg))? {
+            Answer::Queued { id, user } => Ok((id, user)),
+            other => Err(Error::Unexpected(format!("msg.send was answered {other:?}"))),
+        }
+    }
+
+    /// `msg.take`: the messages queued for this connection's user and not yet
+    /// acknowledged, oldest first.
+    pub fn msg_take(&mut self) -> Result<Vec<HubMessage>, Error> {
+        match self.sync_call(SyncCall::MsgTake(NoArgs {}))? {
+            Answer::Messages(m) => Ok(m),
+            other => Err(Error::Unexpected(format!("msg.take was answered {other:?}"))),
+        }
+    }
+
+    /// `msg.ack`: those messages are handled, and never handed out again.
+    pub fn msg_ack(&mut self, ids: &[String]) -> Result<u32, Error> {
+        match self.sync_call(SyncCall::MsgAck { ids: ids.to_vec() })? {
+            Answer::Acked { acked } => Ok(acked),
+            other => Err(Error::Unexpected(format!("msg.ack was answered {other:?}"))),
         }
     }
 

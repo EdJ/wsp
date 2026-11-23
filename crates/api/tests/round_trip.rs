@@ -282,7 +282,7 @@ fn every_frame_type_round_trips() {
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 18;
 const COMMANDS: usize = 31;
-const SYNCS: usize = 9;
+const SYNCS: usize = 12;
 const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
 
 fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
@@ -296,6 +296,9 @@ fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
         SyncCall::LeaseTake(_) => (6, "lease.take"),
         SyncCall::LeaseRenew(_) => (7, "lease.renew"),
         SyncCall::LeaseRelease(_) => (8, "lease.release"),
+        SyncCall::MsgSend(_) => (9, "msg.send"),
+        SyncCall::MsgTake(_) => (10, "msg.take"),
+        SyncCall::MsgAck { .. } => (11, "msg.ack"),
     }
 }
 
@@ -584,6 +587,15 @@ fn requests() -> Vec<Frame> {
             SyncCall::LeaseTake(LeaseTake { workspace, row: row_id() }),
             SyncCall::LeaseRenew(LeaseHold { row: row_id(), token: Token(3) }),
             SyncCall::LeaseRelease(LeaseHold { row: row_id(), token: Token(3) }),
+            SyncCall::MsgSend(MsgSend {
+                to: "seat:wsp-071".into(),
+                from: "seat:wsp-470".into(),
+                seat: Some("cpd-3698".into()),
+                text: "is it landed?".into(),
+                re: Some("m-1".into()),
+            }),
+            SyncCall::MsgTake(NoArgs {}),
+            SyncCall::MsgAck { ids: vec!["m-1".into()] },
         ]
         .into_iter()
         .map(Call::Sync),
@@ -635,7 +647,7 @@ fn the_verb_tables_are_the_variants() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 27;
+const ANSWERS: usize = 30;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply {
@@ -673,6 +685,9 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Ids(_) => (24, "ids"),
         Answer::Lease { .. } => (25, "lease"),
         Answer::Released => (26, "released"),
+        Answer::Queued { .. } => (27, "queued"),
+        Answer::Messages(_) => (28, "messages"),
+        Answer::Acked { .. } => (29, "acked"),
     }
 }
 
@@ -754,6 +769,23 @@ fn answers() -> Vec<Frame> {
         ok(26, Answer::Ids(vec!["wsp-185".into(), "wsp-186".into()]), vec![]),
         ok(27, Answer::Lease { token: Token(4), expires: At(1_800_000_000_000) }, vec![]),
         ok(28, Answer::Released, vec![]),
+        ok(29, Answer::Queued { id: "m-1".into(), user: "jesper".into() }, vec![]),
+        ok(
+            30,
+            Answer::Messages(vec![HubMessage {
+                id: "m-1".into(),
+                to: "seat:wsp-071".into(),
+                user: "jesper".into(),
+                from_user: "ed".into(),
+                from: "seat:wsp-470".into(),
+                seat: Some("cpd-3698".into()),
+                text: "is it landed?".into(),
+                re: None,
+                at: At(1_800_000_000_000),
+            }]),
+            vec![],
+        ),
+        ok(31, Answer::Acked { acked: 1 }, vec![]),
     ]
 }
 

@@ -47,6 +47,16 @@
 //! the records of the rows that moved ([`Worker::journal_offline`]); the turn
 //! that reaches it again settles what the journal holds by each row's lease
 //! ([`Worker::settle`]) before anything of it is pushed.
+//!
+//! **Messages** (wsp-470, the design's "Message routing and the user
+//! primary"). Each turn that reaches the hub also takes the messages the hub
+//! queued for this user ([`Worker::take_messages`]): each is handed to the
+//! orders machine as a tell to the seat its address names here, from the
+//! sending seat named with its user (or `person:<user>`), and acknowledged, so
+//! the hub never hands it out again. An `order.queued` for this user on the
+//! stream is a turn at once. [`crate::cmd_message`] keeps what was received
+//! (`$WSP_STATE/hub/inbox.json`), so a message taken again after a lost ack
+//! is acknowledged and not told twice.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -192,6 +202,36 @@ pub(crate) fn fetch(store: &Store, id: &str) -> Result<(), String> {
         return Err("not logged in to a hub: `wsp login <url>`".into());
     }
     Worker::new(home).fetch(store, id)
+}
+
+/// A connection to the hub the login in `home` names (the environment's
+/// `WSP_HUB_*` before it), as the worker dials it and a `wsp tell` through the
+/// hub does (wsp-470).
+pub(crate) fn dial(home: &std::path::Path) -> Result<Client, String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let url = wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home).map_err(|e| e.to_string())?;
+    let cred = Credential::for_hub_in(env(wsp_client::HUB_TOKEN_ENV), home).map_err(|e| e.to_string())?;
+    let ca = wsp_client::hub_ca_in(env(wsp_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
+    Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| e.to_string())
+}
+
+/// How a message the hub delivered is handed to a seat here: to `seat`, the
+/// dressed `text`, from `from`, under the idempotency `key`; the order's id, or
+/// why not.
+pub(crate) type Hand<'a> = dyn Fn(&wsp_store_contract::SeatId, &str, &Principal, &str) -> Result<String, String> + 'a;
+
+/// The daemon's [`Hand`]: an order through the orders machine under
+/// `WSP_ORDERS=store`; else the seat's held-tell spool, typed at its next idle.
+pub(crate) fn hand_to_orders(store: &Store) -> impl Fn(&wsp_store_contract::SeatId, &str, &Principal, &str) -> Result<String, String> + '_ {
+    move |seat, text, from, key| match crate::orders::mode() {
+        crate::orders::Mode::Store => {
+            crate::orders::send_keyed(store, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+        }
+        crate::orders::Mode::Files => {
+            crate::wake::hold_tell(store, &seat.0, text);
+            Ok(format!("held for {}", seat.0))
+        }
+    }
 }
 
 /// Where the hub stands for this spoke.
@@ -390,6 +430,10 @@ impl Worker {
                     self.link = Link::Up;
                 }
                 self.renew_leases(store);
+                let hand = hand_to_orders(store);
+                if let Err(why) = self.take_messages(store, &hand) {
+                    self.say_once(store, format!("hub-sync: the messages queued for this spoke were not taken: {why}"));
+                }
                 self.backoff = BACKOFF_MIN;
                 self.retry_at = None;
             }
@@ -460,14 +504,33 @@ impl Worker {
     /// each time, so a new `wsp login` is the next dial's.
     fn client(&mut self) -> Result<&mut Client, String> {
         if self.client.is_none() {
-            let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-            let url = wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), &self.home).map_err(|e| e.to_string())?;
-            let cred = Credential::for_hub_in(env(wsp_client::HUB_TOKEN_ENV), &self.home).map_err(|e| e.to_string())?;
-            let ca = wsp_client::hub_ca_in(env(wsp_client::HUB_CA_ENV), &self.home).map_err(|e| e.to_string())?;
-            let c = Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| e.to_string())?;
-            self.client = Some(c);
+            self.client = Some(dial(&self.home)?);
         }
         Ok(self.client.as_mut().expect("dialled above"))
+    }
+
+    /// The messages the hub queued for this user, each handed to its seat
+    /// here through `hand` ([`crate::cmd_message::receive`]) and then
+    /// acknowledged; how many were told. One whose seat is not here now is
+    /// left queued, said once, and tried again next turn; one told before (an
+    /// ack that was lost) is acknowledged and not told again.
+    pub(crate) fn take_messages(&mut self, store: &Store, hand: &Hand) -> Result<usize, String> {
+        let mail = self.client()?.msg_take().map_err(|e| e.to_string())?;
+        let mut done = Vec::new();
+        let mut told = 0;
+        for m in &mail {
+            match crate::cmd_message::receive(store, m, hand) {
+                Ok(fresh) => {
+                    told += usize::from(fresh);
+                    done.push(m.id.clone());
+                }
+                Err(why) => self.say_once(store, format!("hub-sync: {} from {} is not told yet: {why}", m.id, m.from_user)),
+            }
+        }
+        if !done.is_empty() {
+            self.client()?.msg_ack(&done).map_err(|e| e.to_string())?;
+        }
+        Ok(told)
     }
 
     /// The user this connection is, the hub's event head now, and the shared
@@ -514,6 +577,7 @@ impl Worker {
     /// Hear the stream for up to `wait`; whether a ref moved. The position and
     /// the workspaces heard of are kept in `stream.json`.
     fn listen(&mut self, store: &Store, wait: Duration) -> bool {
+        let me = self.by.as_ref().map(user_of);
         let Some(feed) = self.feed.as_mut() else {
             std::thread::sleep(wait);
             return false;
@@ -536,6 +600,10 @@ impl Worker {
                 Some(Item::Event(e)) => {
                     if e.kind == EventKind::LeaseExpired {
                         crate::hub_lease::follow_expired(store, &e.payload);
+                    }
+                    // A message queued for this user (wsp-470): take it now.
+                    if e.kind == EventKind::OrderQueued && me.is_some() && e.payload.get("user").and_then(|u| u.as_str()) == me.as_deref() {
+                        woke = true;
                     }
                     if e.kind == EventKind::RefMoved {
                         woke = true;
@@ -1250,6 +1318,239 @@ mod tests {
         assert_eq!(records, 1, "the row's line has one record, not two");
         assert!(held(&journal) <= 1 && journal.by_subject().get(&subject).is_none_or(|(_, es)| es.iter().all(|e| e.id == id)), "no twin in the journal");
         running.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- messages through the hub (wsp-470) ----
+
+    /// A served hub whose users `ed` and `jesper` are members of `mp`; their tokens.
+    fn message_hub(dir: &std::path::Path) -> (wsp_hub::serve::Running, BTreeMap<String, String>) {
+        let data = dir.join("hub");
+        let mut tokens = BTreeMap::new();
+        {
+            let hub = wsp_hub::Hub::open(&data).unwrap();
+            let apply = |cmd: Cmd, by: &Principal| {
+                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
+            };
+            let root = Principal::Person("root".into());
+            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
+            apply(Cmd::HubWorkspaceAdd { name: SharedName("mp".into()) }, &root);
+            for user in ["ed", "jesper"] {
+                let (secret, hash) = wsp_machines::token::mint();
+                apply(Cmd::HubUserAdd { name: UserName(user.into()), admin: false }, &root);
+                apply(Cmd::HubMemberSet { workspace: SharedName("mp".into()), user: UserName(user.into()), member: true }, &root);
+                apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.into()), hash }, &root);
+                tokens.insert(user.to_string(), secret);
+            }
+        }
+        let cfg = wsp_hub::Config {
+            data_dir: data,
+            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            port: 0,
+            peers: vec!["127.0.0.0/8".into()],
+            tls: None,
+            name: "wsp-hub".into(),
+            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
+        };
+        (wsp_hub::serve::start(&cfg).expect("the hub starts"), tokens)
+    }
+
+    /// `home` logged in to the hub at `addr` as `user`, as `wsp login` writes it.
+    fn log_in(home: &std::path::Path, addr: std::net::SocketAddr, token: &str, user: &str) {
+        let hubs = home.join(HUBS_FILE);
+        std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
+        let v = serde_json::json!({ "url": format!("tcp://{addr}"), "token": token, "user": user, "at": "2026-11-23T00:00:00Z" });
+        std::fs::write(&hubs, v.to_string()).unwrap();
+        std::fs::set_permissions(&hubs, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    }
+
+    /// A store at `dir` with row `row` in `shared:mp`, claimed, and seat `pane` bound to it.
+    fn spoke_with_seat(dir: &std::path::Path, row: &str, pane: &str) -> Store {
+        let store = Store::at(dir.join("wsp"), dir.join("state"));
+        store.ensure_dirs().unwrap();
+        let mut t = crate::model::Task::new(&format!("row {row}"), row);
+        t.project = Some("wsp".into());
+        t.workspace = "shared:mp".parse().unwrap();
+        store.save_task(&t).unwrap();
+        store.set_claim(row, serde_json::json!({ "workspace_id": "w1" }));
+        store.set_binding(pane, serde_json::json!({ "task_id": row, "pane_id": pane }));
+        store
+    }
+
+    /// The orders a seat has in `db`, as (from, text).
+    fn orders_of(db: &wsp_server::SharedStore, seat: &str) -> Vec<(Principal, String)> {
+        db.orders_for(&wsp_store_contract::SeatId(seat.into()), &[]).unwrap().into_iter().map(|o| (o.from, o.text)).collect()
+    }
+
+    /// wsp-470's two spokes: a seat on Ed's spoke tells `seat:j-1`, a row
+    /// Jesper's spoke holds the hub lease of; Jesper's worker takes it and
+    /// hands it to his orders machine as a tell to the seat on j-1 from Ed's
+    /// seat named with its user; that seat's reply, `--re` the hub's id, goes
+    /// back through the hub and Ed's worker tells it to the seat on e-9.
+    #[test]
+    fn a_tell_to_a_row_another_users_spoke_holds_is_told_there_and_its_reply_comes_back() {
+        let env = crate::util::isolated("hub-msg-two-spokes");
+        let dir = env.home().parent().unwrap().join("two-spokes");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (running, tokens) = message_hub(&dir);
+        let addr = running.addrs()[0];
+
+        // Jesper's spoke: the seat cpd-j1 on j-1, whose hub lease is his.
+        let jesper = spoke_with_seat(&dir.join("jesper"), "j-1", "cpd-j1");
+        let jesper_home = dir.join("jesper/home");
+        log_in(&jesper_home, addr, &tokens["jesper"], "jesper");
+        dial(&jesper_home).unwrap().lease_take(&WorkspaceId("shared:mp".into()), &RowId("j-1".into())).unwrap();
+        let jesper_db = crate::orders::tests::db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&jesper_db, "cpd-j1", wsp_store_contract::SeatState::Idle);
+
+        // Ed's spoke: the seat cpd-e1 on e-9; the hub said j-1 is another user's.
+        let ed = spoke_with_seat(&dir.join("ed"), "e-9", "cpd-e1");
+        let ed_home = dir.join("ed/home");
+        log_in(&ed_home, addr, &tokens["ed"], "ed");
+        crate::hub_lease::Book::edit(&ed, |b| b.elsewhere.insert("j-1".into(), "jesper".into()));
+        let ed_db = crate::orders::tests::db(&dir.join("ed/orders"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&ed_db, "cpd-e1", wsp_store_contract::SeatState::Idle);
+
+        // Ed's seat tells seat:j-1.
+        let book = crate::address::Book::read(&ed);
+        let sent = crate::cmd_message::hub_tell(&ed, &ed_home, &book, "seat:j-1", "is j-1 landed?", None, "seat:e-9", Some("cpd-e1".into()));
+        let (id, user, to) = sent.expect("j-1 is another user's: through the hub").expect("the hub takes it");
+        assert_eq!((user.as_str(), to.as_str()), ("jesper", "seat:j-1"));
+
+        // Jesper's worker takes it: a tell to the seat on j-1, from Ed's seat named with Ed.
+        let hand_j = |seat: &wsp_store_contract::SeatId, text: &str, from: &Principal, key: &str| {
+            crate::orders::send_keyed_in(&jesper_db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+        };
+        let mut jesper_worker = Worker::new(jesper_home.clone());
+        assert_eq!(jesper_worker.take_messages(&jesper, &hand_j).unwrap(), 1);
+        let told = orders_of(&jesper_db, "cpd-j1");
+        assert_eq!(told.len(), 1, "one order: {told:?}");
+        assert_eq!(told[0].0, Principal::Seat(wsp_store_contract::SeatId("cpd-e1@ed".into())), "from the sending seat, named with its user");
+        assert!(told[0].1.starts_with("seat:e-9@ed says: is j-1 landed?"), "{}", told[0].1);
+        assert!(told[0].1.ends_with(&format!("reply: wsp tell seat:e-9 --re {id} -]")), "{}", told[0].1);
+        assert_eq!(jesper_worker.take_messages(&jesper, &hand_j).unwrap(), 0, "acknowledged: not handed out again");
+        assert_eq!(orders_of(&jesper_db, "cpd-j1").len(), 1);
+
+        // The seat there replies as its footer says: seat:e-9 is nothing on Jesper's spoke; the --re routes it.
+        let book = crate::address::Book::read(&jesper);
+        assert!(crate::address::resolve(&crate::address::parse("seat:e-9").unwrap(), &book).is_err(), "no e-9 here");
+        let back = crate::cmd_message::hub_tell(&jesper, &jesper_home, &book, "seat:e-9", "landed at abc123", Some(&id), "seat:j-1", Some("cpd-j1".into()));
+        let (_, user, _) = back.expect("a reply to a hub message: through the hub").expect("the hub takes it");
+        assert_eq!(user, "ed");
+
+        let hand_e = |seat: &wsp_store_contract::SeatId, text: &str, from: &Principal, key: &str| {
+            crate::orders::send_keyed_in(&ed_db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+        };
+        assert_eq!(Worker::new(ed_home.clone()).take_messages(&ed, &hand_e).unwrap(), 1);
+        let replies = orders_of(&ed_db, "cpd-e1");
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].0, Principal::Seat(wsp_store_contract::SeatId("cpd-j1@jesper".into())));
+        assert!(replies[0].1.starts_with("seat:j-1@jesper says: landed at abc123"), "{}", replies[0].1);
+        running.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-470: a message queued while the receiving spoke is away is told
+    /// once it reaches the hub again, exactly once: a turn that took it and
+    /// lost its ack tells it no second time, and a worker after a restart takes
+    /// nothing.
+    #[test]
+    fn a_message_to_an_offline_spoke_is_told_on_reconnect_exactly_once() {
+        let env = crate::util::isolated("hub-msg-offline");
+        let dir = env.home().parent().unwrap().join("offline");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (running, tokens) = message_hub(&dir);
+        let addr = running.addrs()[0];
+        let jesper = spoke_with_seat(&dir.join("jesper"), "j-1", "cpd-j1");
+        let jesper_home = dir.join("jesper/home");
+        // Jesper's spoke is away: his login points at a port nobody listens on.
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        log_in(&jesper_home, gone, &tokens["jesper"], "jesper");
+        let db = crate::orders::tests::db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&db, "cpd-j1", wsp_store_contract::SeatState::Idle);
+        let hand = |seat: &wsp_store_contract::SeatId, text: &str, from: &Principal, key: &str| {
+            crate::orders::send_keyed_in(&db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+        };
+        let mut worker = Worker::new(jesper_home.clone());
+        assert!(worker.take_messages(&jesper, &hand).is_err(), "the hub is out of reach");
+
+        // Meanwhile Ed tells Jesper's primary through the hub, from a shell.
+        let ed_home = dir.join("ed/home");
+        log_in(&ed_home, addr, &tokens["ed"], "ed");
+        let ed = Store::at(dir.join("ed/wsp"), dir.join("ed/state"));
+        ed.ensure_dirs().unwrap();
+        let book = crate::address::Book { login: Some("ed".into()), ..crate::address::Book::default() };
+        let sent = crate::cmd_message::hub_tell(&ed, &ed_home, &book, "primary:jesper", "call me", None, "person:ed", None);
+        let (id, ..) = sent.expect("another user's primary").expect("queued while Jesper is away");
+
+        // Jesper's primary is the seat cpd-j1 here; Jesper reconnects.
+        crate::cmd_message::tests_govern(&jesper, "primary", "cpd-j1");
+        log_in(&jesper_home, addr, &tokens["jesper"], "jesper");
+        let mut worker = Worker::new(jesper_home.clone());
+        // The first take tells it, and its ack is lost: the hub hands it out again.
+        let mail = dial(&jesper_home).unwrap().msg_take().unwrap();
+        assert_eq!(mail.len(), 1);
+        assert!(crate::cmd_message::receive(&jesper, &mail[0], &hand).unwrap(), "told on reconnect");
+        assert_eq!(worker.take_messages(&jesper, &hand).unwrap(), 0, "taken again after the lost ack, not told again");
+        let told = orders_of(&db, "cpd-j1");
+        assert_eq!(told.len(), 1, "exactly once: {told:?}");
+        assert_eq!(told[0].0, Principal::Person("ed".into()), "from a shell: the user");
+        assert!(told[0].1.contains(&format!("reply: wsp tell primary:ed --re {id} -]")), "{}", told[0].1);
+        assert!(Worker::new(jesper_home.clone()).take_messages(&jesper, &hand).unwrap() == 0);
+        assert!(dial(&jesper_home).unwrap().msg_take().unwrap().is_empty(), "acknowledged on the hub");
+        assert_eq!(orders_of(&db, "cpd-j1").len(), 1);
+        running.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-470: an address this spoke resolves itself never reaches the hub:
+    /// with a login, `seat:`, `governor:`, `primary`, `primary:<me>` and a
+    /// failed local address dial nothing, and not a byte reaches the hub's
+    /// address; a remote one does dial it.
+    #[test]
+    fn a_local_address_never_reaches_the_hub() {
+        use std::io::Read;
+        let env = crate::util::isolated("hub-msg-local");
+        let dir = env.home().parent().unwrap().join("local");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = spoke_with_seat(&dir.join("ed"), "e-9", "cpd-e1");
+        crate::cmd_message::tests_govern(&store, "primary", "cpd-p");
+        let home = dir.join("ed/home");
+        // The "hub": a listener that keeps every byte sent to it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        log_in(&home, listener.local_addr().unwrap(), "secret", "ed");
+        let wire = std::sync::Arc::new(std::sync::Mutex::new((0usize, Vec::<u8>::new())));
+        let w = wire.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut c) = conn else { continue };
+                c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+                let mut buf = [0u8; 4096];
+                let n = c.read(&mut buf).unwrap_or(0);
+                let mut w = w.lock().unwrap();
+                w.0 += 1;
+                w.1.extend_from_slice(&buf[..n]);
+            }
+        });
+        let mut book = crate::address::Book::read(&store);
+        book.login = Some("ed".into());
+        book.remote_rows.insert("j-1".into());
+        for local in ["seat:e-9", "primary", "primary:ed", "seat:nope", "governor:nobody", "cpd-e1"] {
+            let sent = crate::cmd_message::hub_tell(&store, &home, &book, local, "hello", None, "seat:e-9", None);
+            assert!(sent.is_none(), "{local} is this spoke's");
+        }
+        // A `--re` naming no message the hub delivered here is no reason to dial it.
+        assert!(crate::cmd_message::hub_tell(&store, &home, &book, "seat:e-9", "hi", Some("m-0123"), "seat:e-9", None).is_none());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(wire.lock().unwrap().0, 0, "no connection, no frame");
+
+        // The control: another user's row dials the hub's address.
+        let sent = crate::cmd_message::hub_tell(&store, &home, &book, "seat:j-1", "hello", None, "seat:e-9", None);
+        assert!(sent.is_some_and(|r| r.is_err()), "through the hub, which this listener is not");
+        let w = wire.lock().unwrap();
+        assert_eq!(w.0, 1, "one connection");
+        assert!(String::from_utf8_lossy(&w.1).contains("\"type\":\"hello\""), "a hello frame: {}", String::from_utf8_lossy(&w.1));
+        drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

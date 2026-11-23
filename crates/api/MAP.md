@@ -21,7 +21,10 @@ Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the 
   `sync.put { objects }`, `sync.get { ids }`, `refs.move { workspace, subject, from, to }` (`RefMove`); `Blob` (an
   id and its bytes, base64 on the wire); `Move` (`moved { head }` or `stale { head }`); `SYNC_VERBS`; the `base64`
   codec (RFC 4648, padded; no crate for it); `ObjectId`, `Refs` and `WorkspaceId` re-exported from `wsp-objects`.
-  Their answers are `Answer::Heads`, `Missing`, `Stored { stored }`, `Objects` and `Move`
+  Their answers are `Answer::Heads`, `Missing`, `Stored { stored }`, `Objects` and `Move`. The message verbs
+  (wsp-470): `msg.send` (`MsgSend { to, from, seat?, text, re? }`) answered `Queued { id, user }`, `msg.take`
+  answered `Messages` (`HubMessage`s), `msg.ack { ids }` answered `Acked { acked }`; `msg_subject` names the
+  `order.queued` announcement
 - `src/principal.rs` — `Principal`'s text form (`person:ed`, `seat:cpd-3698`, `manager:<host>`,
   `executor:<machine>`, `wsp:<instance>`): `text`, `parse` (a `Malformed` error, never a panic), `KINDS`, and the
   `#[serde(with = "principal")]` helpers the envelope's `by` uses

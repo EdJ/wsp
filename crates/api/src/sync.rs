@@ -57,6 +57,29 @@
 //! An expired lease is released by the hub, which announces `lease.expired
 //! { workspace, row, holder, token }` on its stream.
 //!
+//! **Messages** (wsp-470; the design's "Message routing and the user
+//! primary"). A `wsp tell` to an address the spoke cannot resolve on its own
+//! machine goes to the hub as a [`MsgSend`]:
+//!
+//! - `msg.send { to, from, seat?, text, re? }` answers [`Answer::Queued`]: the
+//!   hub resolves `to` to a user, `seat:<row>` to the holder of the row's
+//!   lease, `governor:<list>` to the holder of the list's drive lease
+//!   (`drive:<list>`), `primary:<user>` to that user, and queues the message
+//!   for that user's spokes, announcing it on the stream as `order.queued`
+//!   on the subject `user <user>` ([`msg_subject`]), in a shared workspace the
+//!   user is a member of, with `{ user, id }` and never the text. A message
+//!   whose `re` names one the hub delivered to the caller goes back to that
+//!   one's sender whatever `to` resolves to, so a reply needs no lease. An
+//!   address the hub cannot resolve is refused `not_found`; one in no
+//!   workspace the caller is a member of, `forbidden`.
+//! - `msg.take {}` answers [`Answer::Messages`]: every [`HubMessage`] queued
+//!   for the caller's user and not yet acknowledged, oldest first. The first
+//!   spoke of the user to take and acknowledge one has it: the hub keys a
+//!   lease on its holder's user (wsp-466), so a user is what it routes to.
+//! - `msg.ack { ids }` answers [`Answer::Acked`]: those messages leave the
+//!   caller's queue, and no later `msg.take` hands them out again. An id not
+//!   queued for the caller is no error and acks nothing.
+//!
 //! None of them carries an idempotency key: a put is idempotent by its hash
 //! and a move by its `from`, so a retry after a lost reply is harmless. An
 //! `ids.alloc` retried after a lost reply allocates again; the ids lost are
@@ -86,6 +109,9 @@ pub const SYNC_VERBS: &[&str] = &[
     "lease.take",
     "lease.renew",
     "lease.release",
+    "msg.send",
+    "msg.take",
+    "msg.ack",
 ];
 
 /// The most ids one `ids.alloc` hands out; more is refused `invalid`.
@@ -123,6 +149,15 @@ pub enum SyncCall {
     /// Let the caller's lease go. Answered [`Answer::Released`].
     #[serde(rename = "lease.release")]
     LeaseRelease(LeaseHold),
+    /// Route a tell to another user's spoke. Answered [`Answer::Queued`].
+    #[serde(rename = "msg.send")]
+    MsgSend(MsgSend),
+    /// The messages queued for the caller. Answered [`Answer::Messages`].
+    #[serde(rename = "msg.take")]
+    MsgTake(#[serde(default)] crate::NoArgs),
+    /// Messages handled: never handed out again. Answered [`Answer::Acked`].
+    #[serde(rename = "msg.ack")]
+    MsgAck { ids: Vec<String> },
 }
 
 impl SyncCall {
@@ -138,6 +173,9 @@ impl SyncCall {
             SyncCall::LeaseTake(_) => "lease.take",
             SyncCall::LeaseRenew(_) => "lease.renew",
             SyncCall::LeaseRelease(_) => "lease.release",
+            SyncCall::MsgSend(_) => "msg.send",
+            SyncCall::MsgTake(_) => "msg.take",
+            SyncCall::MsgAck { .. } => "msg.ack",
         }
     }
 }
@@ -207,6 +245,55 @@ pub struct LeaseTake {
 pub struct LeaseHold {
     pub row: RowId,
     pub token: Token,
+}
+
+/// `msg.send`'s `args`: a tell to an address the sending spoke does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgSend {
+    /// The address as the sender wrote it: `seat:<row>`, `governor:<list>`,
+    /// `primary:<user>`.
+    pub to: String,
+    /// The sender as an address its own spoke resolves (`seat:<row>`,
+    /// `governor:<list>`, `primary`), or `person` from a shell: what a reply
+    /// names.
+    pub from: String,
+    /// The sending seat's pane, where a seat sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    pub text: String,
+    /// The message this one answers, by the hub's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<String>,
+}
+
+/// One message the hub routes: what `msg.take` hands a spoke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubMessage {
+    /// The hub's id for it (`hm-<n>`), unique on the hub.
+    pub id: String,
+    /// The address it was sent to, which the receiving spoke resolves to a seat.
+    pub to: String,
+    /// The user it was routed to.
+    pub user: String,
+    /// The user who sent it.
+    pub from_user: String,
+    /// The sender as an address on the sender's spoke ([`MsgSend::from`]).
+    pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<String>,
+    /// When the hub queued it.
+    pub at: At,
+}
+
+/// The subject a queued message is announced on: the user it is queued for.
+/// A user is no record a subscriber holds, so the announcement goes out as it
+/// is to every subscriber of its workspace, and names only the user and the
+/// message's id.
+pub fn msg_subject(user: &str) -> Subject {
+    Subject::User(wsp_store_contract::UserName(user.to_string()))
 }
 
 /// The payload field a verdict's or landing's lease token is in.

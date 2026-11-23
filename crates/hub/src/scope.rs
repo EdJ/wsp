@@ -23,6 +23,10 @@
 //!   `lease.renew` and `lease.release` act only for the lease's holder (see
 //!   [`crate::leases`]).
 //!
+//! - `msg.send` reaches only a holder in a workspace the caller is a member
+//!   of, or a primary the caller shares a workspace with; `msg.take` and
+//!   `msg.ack` are the caller's own queue (see [`crate::messages`]).
+//!
 //! [`Hub::answer`] is the verbs through this scope; the unscoped methods of
 //! [`Hub`] are the host's own, with no caller.
 
@@ -134,6 +138,9 @@ impl Hub {
             SyncCall::LeaseRelease(hold) => {
                 return crate::outcome(self.release_row_lease(by, &hold).map(|()| Answer::Released));
             }
+            call @ (SyncCall::MsgSend(_) | SyncCall::MsgTake(_) | SyncCall::MsgAck { .. }) => {
+                return self.answer_message(by, &scope, call);
+            }
             _ => {}
         }
         match self.scoped(by, &scope, call) {
@@ -213,7 +220,12 @@ impl Hub {
                 Ok(SyncCall::Put { objects })
             }
             SyncCall::Have { ids } => Ok(SyncCall::Have { ids }),
-            call @ (SyncCall::LeaseTake(_) | SyncCall::LeaseRenew(_) | SyncCall::LeaseRelease(_)) => Ok(call),
+            call @ (SyncCall::LeaseTake(_)
+            | SyncCall::LeaseRenew(_)
+            | SyncCall::LeaseRelease(_)
+            | SyncCall::MsgSend(_)
+            | SyncCall::MsgTake(_)
+            | SyncCall::MsgAck { .. }) => Ok(call),
             SyncCall::Get { ids } => {
                 let served = self.served(scope, &ids)?;
                 let kept: Vec<ObjectId> = ids.iter().filter(|id| served.contains(id)).copied().collect();

@@ -2642,6 +2642,201 @@ pub(crate) fn say_to_governor(store: &Store, scope: &str, q: &Message) {
     let _ = crate::wake::say(store, scope, &for_a_governor(q), Some(&q.id));
 }
 
+// ---------------------------------------------------------------- tells through the hub (wsp-470)
+//
+// A `wsp tell` to an address this spoke cannot deliver itself — `seat:<row>` of
+// a row another user's spoke holds, `governor:<list>` of a list driven
+// elsewhere, `primary:<user>` of another user ([`crate::address`]'s remote
+// form) — goes to the hub as a message ([`tell_via_hub`]). So does a reply:
+// `--re` naming a message the hub delivered here sends it back through the hub
+// whatever its address reads as here, and the hub routes it to that message's
+// sender. An address resolved here never reaches the hub.
+//
+// The receiving spoke's sync worker takes what the hub queued for its user and
+// hands each to the seat its address names here ([`receive`]), as a tell from
+// the sending seat named with its user (`seat:wsp-9@ed`), or `person:<user>`
+// from a shell, through the orders machine. What was received is kept in
+// `$WSP_STATE/hub/inbox.json` by the hub's id, so a message taken again after
+// a lost ack is not told twice, and a reply's `--re` is known.
+
+fn inbox_path(store: &Store) -> std::path::PathBuf {
+    store.state.join("hub").join("inbox.json")
+}
+
+fn inbox(store: &Store) -> serde_json::Map<String, serde_json::Value> {
+    let text = std::fs::read_to_string(inbox_path(store)).unwrap_or_default();
+    match serde_json::from_str(&text) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// The record of a message the hub delivered here, by the hub's id.
+pub(crate) fn received(store: &Store, id: &str) -> Option<serde_json::Value> {
+    inbox(store).remove(id)
+}
+
+fn note_received(store: &Store, id: &str, record: serde_json::Value) -> std::io::Result<()> {
+    store.locked(|| {
+        let mut all = inbox(store);
+        all.insert(id.to_string(), record);
+        let path = inbox_path(store);
+        let dir = path.parent().expect("under the state dir");
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(".inbox.json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::Value::Object(all).to_string())?;
+        std::fs::rename(&tmp, &path)
+    })
+}
+
+/// Who a message from another user's spoke is from, as the receiving seat reads
+/// it: the sender's address named with its user (`seat:wsp-9@ed`).
+pub(crate) fn hub_speaker(m: &wsp_api::HubMessage) -> String {
+    format!("{}@{}", m.from.trim(), m.from_user)
+}
+
+/// The address a reply to `m` names: the sender's own address where it is one
+/// that names a post, else the sender's user's primary (a shell, a bare pane).
+/// The hub routes the reply by its `--re` either way; this is what the sender's
+/// spoke resolves it to.
+pub(crate) fn reply_address(m: &wsp_api::HubMessage) -> String {
+    match crate::address::parse(&m.from) {
+        Some(crate::address::Address::Primary) | Some(crate::address::Address::List(_)) | None => {
+            crate::governors::primary_of(&m.from_user)
+        }
+        Some(_) => m.from.trim().to_string(),
+    }
+}
+
+/// `m` as the seat reads it: who says it, the words, and the reply footer
+/// naming the address and the hub's id.
+pub(crate) fn hub_dressed(m: &wsp_api::HubMessage) -> String {
+    let who = hub_speaker(m);
+    format!("{who} says: {} [from {who} · reply: wsp tell {} --re {} -]", m.text.trim_end(), reply_address(m), m.id)
+}
+
+/// The principal a delivered message is from: the sending seat named with its
+/// user, or the user for a message sent from a shell.
+pub(crate) fn hub_sender(m: &wsp_api::HubMessage) -> wsp_store_contract::Principal {
+    match m.seat.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pane) => wsp_store_contract::Principal::Seat(wsp_store_contract::SeatId(format!("{pane}@{}", m.from_user))),
+        None => wsp_store_contract::Principal::Person(m.from_user.clone()),
+    }
+}
+
+/// Hand a message the hub delivered to the seat its address names here,
+/// through `hand`. `Ok(true)` when told now, `Ok(false)` when it was told
+/// before (so it is only acknowledged), `Err` when no one seat here answers to
+/// its address now (the hub keeps it queued).
+pub(crate) fn receive(store: &Store, m: &wsp_api::HubMessage, hand: &crate::hub_sync::Hand) -> Result<bool, String> {
+    if received(store, &m.id).is_some() {
+        return Ok(false);
+    }
+    let addr = crate::address::parse(&m.to).ok_or_else(|| format!("`{}` is no address", m.to))?;
+    // The hub routed it to `m.user`, the user this spoke's connection is: what
+    // `primary:<user>` is read against, whatever `hubs.json` says now.
+    let book = crate::address::Book { login: Some(m.user.clone()), ..crate::address::Book::read(store) };
+    let found = crate::address::resolve(&addr, &book)?;
+    let n = match found.as_slice() {
+        [n] if !n.remote => n,
+        [n] => return Err(format!("{} is not on this machine either", n.what)),
+        many => return Err(format!("`{}` names {} seats here", m.to, many.len())),
+    };
+    let text = hub_dressed(m);
+    let order = hand(&wsp_store_contract::SeatId(n.pane.clone()), &text, &hub_sender(m), &format!("hub:{}", m.id))?;
+    let who = hub_speaker(m);
+    let record = serde_json::json!({
+        "from_user": m.from_user, "from": m.from, "seat": m.seat, "to": m.to, "pane": n.pane,
+        "order": order, "re": m.re, "at": crate::util::epoch_secs(),
+    });
+    note_received(store, &m.id, record).map_err(|e| format!("the inbox was not written: {e}"))?;
+    store.log_event(
+        "agent-told",
+        serde_json::json!({
+            "target": m.to, "pane": n.pane, "chars": m.text.len(), "id": m.id, "from": who, "re": m.re,
+            "text": m.text, "via": "hub", "order": order, "at": crate::util::epoch_secs(), "turn": false,
+        }),
+    );
+    crate::store::log_line(store, &format!("told {}: from {who} through the hub ({}), {order}", n.what, m.id));
+    Ok(true)
+}
+
+/// The address a tell sends to the hub, or `None` for one delivered here: a
+/// reply (`re`) to a message the hub delivered here goes back through it; an
+/// address that resolves to its remote form is routed by it; anything else,
+/// an address that resolves here or a refusal, is this spoke's.
+pub(crate) fn hub_bound(book: &crate::address::Book, needle: &str, re: Option<&str>, received: &dyn Fn(&str) -> bool) -> Option<String> {
+    if re.is_some_and(received) && crate::address::parse(needle).is_some() {
+        return Some(needle.trim().to_string());
+    }
+    let addr = crate::address::parse(needle)?;
+    match crate::address::resolve(&addr, book) {
+        Ok(found) if found.len() == 1 && found[0].remote => Some(found[0].pane.clone()),
+        _ => None,
+    }
+}
+
+/// [`hub_bound`]'s message sent to the hub the login in `home` names: `None`
+/// for a tell delivered here (nothing is dialled), else the hub's id for it,
+/// the user it was routed to and the address, or why it did not take it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hub_tell(
+    store: &Store,
+    home: &std::path::Path,
+    book: &crate::address::Book,
+    needle: &str,
+    text: &str,
+    re: Option<&str>,
+    from: &str,
+    seat: Option<String>,
+) -> Option<Result<(String, String, String), String>> {
+    let to = hub_bound(book, needle, re, &|id| received(store, id).is_some())?;
+    let msg = wsp_api::MsgSend { to: to.clone(), from: from.to_string(), seat, text: text.to_string(), re: re.map(str::to_string) };
+    let sent = crate::hub_sync::dial(home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()));
+    Some(sent.map(|(id, user)| (id, user, to)))
+}
+
+/// `wsp tell <address>` through the hub, when the address is another user's
+/// spoke's or the tell replies to a message the hub delivered: the exit code,
+/// or `None` to deliver it here as before. Without a hub login nothing goes
+/// to the hub.
+pub(crate) fn tell_via_hub(store: &Store, args: &Args, needle: &str, text: &str, re: Option<&str>, from: &str) -> Option<i32> {
+    crate::address::parse(needle)?;
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    if !home.join(wsp_client::HUBS_FILE).exists() {
+        return None;
+    }
+    let seat = crate::place::seat_from_env().map(|s| s.to_string());
+    let book = crate::address::Book::read(store);
+    match hub_tell(store, &home, &book, needle, text, re, from, seat)? {
+        Ok((id, user, to)) => {
+            store.log_event(
+                "agent-told",
+                serde_json::json!({
+                    "target": to, "pane": "", "chars": text.len(), "id": id, "from": from, "re": re, "text": text,
+                    "via": "hub", "user": user, "at": crate::util::epoch_secs(), "turn": false,
+                }),
+            );
+            crate::store::log_line(store, &format!("told {to} through the hub: queued for {user} ({id}), from {from}"));
+            match args.json() {
+                true => println!("{}", serde_json::json!({ "target": to, "id": id, "user": user, "via": "hub", "queued": true, "re": re })),
+                false => println!("{}", Paint::new().dim(&format!("→ {to} · through the hub, queued for {user} · {id}"))),
+            }
+            Some(0)
+        }
+        Err(why) => {
+            eprintln!("wsp: `{needle}` is another user's, and the hub did not take it: {why}");
+            Some(1)
+        }
+    }
+}
+
+/// A governor record putting `pane` in `scope`'s seat, for another module's test.
+#[cfg(test)]
+pub(crate) fn tests_govern(store: &Store, scope: &str, pane: &str) {
+    store.set_governor(scope, serde_json::json!({ "workspace": "w9", "pane": pane, "since": "2026-11-23" }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

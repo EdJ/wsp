@@ -6,7 +6,9 @@
 //! moved"), so a subscriber hears which subject to fetch. An expiry's
 //! announcement row (see [`crate::leases`]) is read as `lease.expired
 //! { workspace, row, holder, token }`, so the holder's spoke hears it lost
-//! the lease.
+//! the lease. A queued message's announcement row (see [`crate::messages`]) is
+//! read as `order.queued { user, id }` on the subject `user <user>`, so the
+//! recipient's spoke hears it has mail, and no one hears its text.
 //!
 //! Event ids are the store's own and are kept: the events are rewritten in
 //! place, one for one, so a cursor, a replay from `from` and the head all mean
@@ -25,6 +27,7 @@ use wsp_store_contract::{
 };
 
 use crate::leases::{lease_name, Expired, EXPIRED_PREFIX};
+use crate::messages::{Queued, QUEUED_PREFIX};
 use crate::{Hub, MOVED_PREFIX};
 
 /// The hub as a store: every call is the SQLite's, except that
@@ -44,6 +47,17 @@ impl HubStore {
         };
         if row.0.starts_with(EXPIRED_PREFIX) {
             return expired(event);
+        }
+        if row.0.starts_with(QUEUED_PREFIX) {
+            let section = event.payload.get("section").and_then(|s| s.as_str());
+            let Some(q) = section.and_then(|s| serde_json::from_str::<Queued>(s).ok()) else { return event };
+            return Event {
+                kind: EventKind::OrderQueued,
+                workspace: q.workspace.0.parse().unwrap_or_default(),
+                subject: wsp_api::msg_subject(&q.user),
+                payload: json!({ "user": q.user, "id": q.id }),
+                ..event
+            };
         }
         let Some(workspace) = row.0.strip_prefix(MOVED_PREFIX) else {
             return event;

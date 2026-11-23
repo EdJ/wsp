@@ -72,9 +72,15 @@ impl MemHub {
                 }
             },
             // The hub's leases (wsp-466) are the real hub's alone.
-            call @ (SyncCall::LeaseTake(_) | SyncCall::LeaseRenew(_) | SyncCall::LeaseRelease(_)) => Outcome::Err(Failure {
+            // And its message queue (wsp-470).
+            call @ (SyncCall::LeaseTake(_)
+            | SyncCall::LeaseRenew(_)
+            | SyncCall::LeaseRelease(_)
+            | SyncCall::MsgSend(_)
+            | SyncCall::MsgTake(_)
+            | SyncCall::MsgAck { .. }) => Outcome::Err(Failure {
                 code: Code::Unsupported,
-                text: format!("{}: MemHub keeps no leases", call.verb()),
+                text: format!("{}: MemHub keeps no leases and routes no messages", call.verb()),
                 refusal: None,
             }),
         }

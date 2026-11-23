@@ -9,8 +9,12 @@
 //! - `primary`: the primary interface's seat
 //! - `primary:<user>`: that user's primary: on a spoke logged in as them, the local
 //!   `primary` seat; for anyone else, a remote the hub routes (`wsp-417`)
-//! - `governor:<list>` and `governor:<project>`: that scope's governor
-//! - `seat:<row>`: whoever holds the row's claim
+//! - `governor:<list>` and `governor:<project>`: that scope's governor; for a
+//!   shared list another user's spoke drives and nobody governs here, the
+//!   remote form the hub routes (`wsp-470`)
+//! - `seat:<row>`: whoever holds the row's claim; for a row another user's spoke
+//!   holds (its hub lease is theirs, or it is kept here only as the hub's head),
+//!   the remote form the hub routes (`wsp-470`)
 //! - `verifier:<row>`: the seat a standing verification pass on the row is in
 //! - `check:<list>`: the seat of the list's running barrier check
 //! - `list:<name>`: every live seat on the list, members and governor
@@ -28,7 +32,7 @@
 //! A single-seat address that finds more than one seat is refused and names
 //! them: only `list:` fans out.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -95,10 +99,22 @@ pub struct Book {
     /// The user this machine is logged in as (`hubs.json`), if any: what
     /// `primary:<user>` is read against. Empty for a login written by hand.
     pub login: Option<String>,
+    /// Rows another user's spoke holds (`wsp-470`): the hub said their lease is
+    /// another user's (`drive.json`'s `elsewhere`), or the row is kept here
+    /// only as the hub's head. `seat:` of one goes through the hub.
+    pub remote_rows: BTreeSet<String>,
+    /// Shared lists another user's spoke drives (`drive.json`'s `driven_by`).
+    pub remote_lists: BTreeSet<String>,
 }
 
 impl Book {
     pub fn read(store: &Store) -> Book {
+        let login = logged_in_user();
+        let drive = crate::hub_lease::Book::read(store);
+        let mut remote_rows: BTreeSet<String> = drive.elsewhere.keys().cloned().collect();
+        remote_rows.extend(crate::hub_cache::Cache::read(store).rows().map(|(r, _)| r.clone()));
+        let me = login.as_deref().map(str::trim).unwrap_or_default();
+        let remote_lists = drive.driven_by.iter().filter(|(_, u)| u.trim() != me).map(|(l, _)| l.clone()).collect();
         Book {
             governors: store.governors(),
             claims: store.claims(),
@@ -107,7 +123,9 @@ impl Book {
             lists: store.worklists(),
             tasks: store.tasks(),
             projects: store.projects().into_iter().map(|p| p.id).collect(),
-            login: logged_in_user(),
+            login,
+            remote_rows,
+            remote_lists,
         }
     }
 
@@ -153,6 +171,11 @@ fn named(pane: &str, what: impl Into<String>) -> Named {
     Named { pane: pane.to_string(), what: what.into(), remote: false }
 }
 
+/// The remote form of an address: `address` itself, for the hub to route.
+fn remote(address: String, what: impl Into<String>) -> Named {
+    Named { pane: address, what: what.into(), remote: true }
+}
+
 /// The user `hubs.json` says this machine is logged in as. A login that cannot
 /// be read is no login here; `wsp login` is what the refusal names either way.
 pub(crate) fn logged_in_user() -> Option<String> {
@@ -195,6 +218,9 @@ pub fn resolve(addr: &Address, book: &Book) -> Result<Vec<Named>, String> {
     let found = match addr {
         Address::Primary => governor(book, crate::governors::PRIMARY, "the primary")?,
         Address::UserPrimary(user) => user_primary(book, user)?,
+        Address::Governor(scope) if book.governor_pane(scope).is_none() && book.remote_lists.contains(scope) => {
+            vec![remote(format!("governor:{scope}"), format!("the {scope} governor, through the hub"))]
+        }
         Address::Governor(scope) => {
             if book.list(scope).is_none() && !book.projects.contains(scope) && !book.governors.contains_key(scope) {
                 return Err(format!(
@@ -251,6 +277,10 @@ pub(crate) fn claim_holder(
 }
 
 fn seat(book: &Book, row: &str) -> Result<Vec<Named>, String> {
+    // Another user's spoke holds it, and nobody here does: the hub says whose seat it is.
+    if book.remote_rows.contains(row) && !book.claims.contains_key(row) {
+        return Ok(vec![remote(format!("seat:{row}"), format!("the seat on {row}, through the hub"))]);
+    }
     if !book.tasks.iter().any(|t| t.id == row) {
         return Err(format!("no row `{row}` — `wsp ls` lists them"));
     }
@@ -457,6 +487,27 @@ mod tests {
         let found = at("seat:m-1", &b).unwrap();
         assert_eq!(panes(Ok(found.clone())), vec!["cpd-2"]);
         assert!(found[0].what.contains("holds its claim"), "{}", found[0].what);
+    }
+
+    /// `wsp-470`: a row another user's spoke holds, and a list another user's
+    /// spoke drives, are the remote form the hub routes; held here, they are
+    /// the seat here.
+    #[test]
+    fn a_row_or_list_held_by_another_users_spoke_is_the_remote_form() {
+        let mut b = logged_in("ed");
+        b.remote_rows.insert("j-1".into());
+        b.remote_lists.insert("theirs".into());
+        let found = at("seat:j-1", &b).unwrap();
+        assert_eq!((found[0].pane.as_str(), found[0].remote), ("seat:j-1", true));
+        assert!(found[0].what.contains("through the hub"), "{}", found[0].what);
+        let found = at("governor:theirs", &b).unwrap();
+        assert_eq!((found[0].pane.as_str(), found[0].remote), ("governor:theirs", true));
+        // Held here after all: the local seat wins.
+        b.remote_rows.insert("m-1".into());
+        b.remote_lists.insert("run".into());
+        assert_eq!(panes(at("seat:m-1", &b)), vec!["cpd-1"]);
+        assert_eq!(panes(at("governor:run", &b)), vec!["cpd-102"]);
+        assert!(!at("seat:m-1", &b).unwrap()[0].remote);
     }
 
     #[test]

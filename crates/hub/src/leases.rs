@@ -321,6 +321,12 @@ impl Hub {
         }
     }
 
+    /// The workspace `row`'s lease was last taken in, if the hub recorded one.
+    pub fn lease_workspace(&self, row: &RowId) -> Result<Option<WorkspaceId>> {
+        let (workspace, _) = self.db.text(&leased_row(row), WORKSPACE)?;
+        Ok(Some(workspace).filter(|w| !w.is_empty()).map(WorkspaceId))
+    }
+
     /// Records that `row`'s lease is `workspace`'s, for its expiry's announcement.
     fn record_workspace(&self, row: &RowId, workspace: &WorkspaceId) -> Result<()> {
         let at = leased_row(row);

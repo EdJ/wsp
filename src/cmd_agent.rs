@@ -1307,6 +1307,11 @@ pub fn tell(store: &Store, args: &Args) -> i32 {
     if needle.trim() == "person" {
         return tell_the_person(store, args, &text, re.as_deref());
     }
+    // Another user's seat, or a reply to a message the hub delivered here:
+    // through the hub (wsp-470). An address this spoke holds never goes there.
+    if let Some(code) = crate::cmd_message::tell_via_hub(store, args, &needle, &text, re.as_deref(), &from) {
+        return code;
+    }
 
     // Not `peek_target`, and the difference is worth a line rather than the
     // reuse. That resolver's whole value is that it also finds the panel, the
@@ -1839,7 +1844,7 @@ fn addressed_seat(store: &Store, addr: &crate::address::Address) -> Result<(Stri
     }
     let n = found.remove(0);
     if n.remote {
-        return Err(format!("{} is on another machine — reaching it is routed through the hub, which this `tell` does not do yet", n.what));
+        return Err(format!("{} is on another machine — reaching it goes through the hub, and this machine has no hub login (`wsp login`)", n.what));
     }
     Ok((n.pane, n.what))
 }

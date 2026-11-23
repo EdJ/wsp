@@ -12,7 +12,8 @@
 //!   leases are wsp-store-sqlite's own (its `Leases`, and the fencing tokens
 //!   that come with them), not a copy. Its domain is wsp-159's [`Identity`],
 //!   so the hub's users and token records live there too, and [`auth`] reads
-//!   them to say who a hello is (wsp-161). The message queue joins it later.
+//!   them to say who a hello is (wsp-161). The message queue is there too
+//!   (wsp-470, [`messages`]).
 //!
 //! Refs are kept in that file too, one workspace's [`Refs`] to a revisioned
 //! text (row `hub-refs:<workspace>`, section `heads`). `rusqlite` is
@@ -39,6 +40,11 @@
 //! store's fencing token, and the hub releases an expired lease and announces
 //! `lease.expired`; see [`leases`].
 //!
+//! **Messages** (wsp-470). `msg.send`, `msg.take` and `msg.ack` route a tell
+//! to the user holding the row's lease, the list's drive lease or the primary
+//! named, queued until that user's spoke takes and acknowledges it; see
+//! [`messages`].
+//!
 //! [`Hub::answer`] (scope.rs: a caller reads and writes only the shared
 //! workspaces it is a member of, wsp-173) gives each of wsp-459's sync verbs the meaning wsp-client's
 //! `MemHub` gives it (crates/client/src/testing.rs), stale moves included: an
@@ -48,6 +54,7 @@ pub mod admin;
 pub mod auth;
 mod config;
 pub mod leases;
+pub mod messages;
 mod objects;
 pub mod scope;
 pub mod serve;
@@ -361,7 +368,13 @@ impl Hub {
             SyncCall::Move(mv) => self.move_ref(&mv).map(Answer::Move),
             SyncCall::Alloc(ask) => self.alloc_ids(&ask).map(Answer::Ids),
             // A lease verb is the caller's: `Hub::answer` runs it with who asks.
-            call @ (SyncCall::LeaseTake(_) | SyncCall::LeaseRenew(_) | SyncCall::LeaseRelease(_)) => {
+            // So is a message verb.
+            call @ (SyncCall::LeaseTake(_)
+            | SyncCall::LeaseRenew(_)
+            | SyncCall::LeaseRelease(_)
+            | SyncCall::MsgSend(_)
+            | SyncCall::MsgTake(_)
+            | SyncCall::MsgAck { .. }) => {
                 Err(Error::Refused(Refusal::Invalid { reason: format!("{} needs a caller", call.verb()) }))
             }
         };
