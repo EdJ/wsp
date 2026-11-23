@@ -112,7 +112,7 @@ fn put(m: &mut BTreeMap<String, String>, k: &str, v: &str) {
 }
 
 /// The seat a claim record names: the workspace's label, else its id, else the
-/// agent's. The files carry no token or expiry, so a claim's are 0.
+/// agent's. The files carry no token, so a claim's is 0.
 fn claim_seat(v: &serde_json::Value) -> Option<String> {
     ["workspace_label", "workspace_id", "workspace", "agent_id"]
         .iter()
@@ -121,7 +121,9 @@ fn claim_seat(v: &serde_json::Value) -> Option<String> {
 }
 
 /// `claims.json` → `Entity::Claim`s: the row, the seat the record names, token
-/// and expiry 0 (the files have neither).
+/// 0 (the files have none) and the expiry the record carries (`wsp-409`) in
+/// milliseconds, as the contract's `At` is; a record without one, which never
+/// expires, is `At(0)`.
 pub fn claims(claims: &BTreeMap<String, serde_json::Value>) -> Vec<Entity> {
     claims
         .iter()
@@ -130,7 +132,7 @@ pub fn claims(claims: &BTreeMap<String, serde_json::Value>) -> Vec<Entity> {
                 row: RowId(row.clone()),
                 seat: SeatId(claim_seat(v)?),
                 token: Token(0),
-                expires: At(0),
+                expires: At(wsp_store::store::record_expires(v).map_or(0, |s| s as u64 * 1000)),
             }))
         })
         .collect()
@@ -1320,6 +1322,25 @@ mod tests {
         }
         let Entity::Row(r1) = &r[&Subject::Row(RowId("wsp-1".into()))] else { panic!() };
         assert_eq!((r1.seat.clone(), r1.group.clone()), (None, None));
+    }
+
+    /// `wsp-409`: a record's `expires` mirrors as a moment (ms, the contract's
+    /// `At`); a record from before it, which never expires, stays `At(0)`.
+    #[test]
+    fn a_claims_expiry_mirrors_and_an_old_record_has_none() {
+        let mut m = BTreeMap::new();
+        m.insert("new".to_string(), json!({ "workspace": "w", "expires": "2026-11-30T10:00:00Z" }));
+        m.insert("old".to_string(), json!({ "workspace": "w" }));
+        let got: BTreeMap<String, u64> = claims(&m)
+            .into_iter()
+            .map(|e| match e {
+                Entity::Claim(c) => (c.row.0, c.expires.0),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(got["new"], wsp_base::util::epoch_of("2026-11-30T10:00:00Z") as u64 * 1000);
+        assert_ne!(got["new"], 0);
+        assert_eq!(got["old"], 0);
     }
 
     #[test]

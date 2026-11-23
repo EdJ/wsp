@@ -3078,6 +3078,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         if let Some(k) = &kind {
             claim["agent_kind"] = json!(k);
         }
+        wsp_store::store::stamp_claim_expiry(&mut claim);
         store.set_claim(&t.id, claim);
 
         // A hand raised about this task has been answered by somebody taking

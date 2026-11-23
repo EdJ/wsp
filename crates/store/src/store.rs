@@ -3001,6 +3001,14 @@ impl Store {
         });
     }
 
+    /// When the claim on `task` expires, in epoch seconds. `None` for a record
+    /// with no `expires` — every record written before `wsp-409`, and any
+    /// written under `WSP_CLAIM_TTL=off` — which never expires; and for a task
+    /// nobody holds.
+    pub fn claim_expires(&self, task: &str) -> Option<i64> {
+        record_expires(self.claims().get(task)?)
+    }
+
     pub fn clear_claim(&self, task: &str) -> bool {
         let mut removed = false;
         self.update_json("claims.json", |c| removed = c.remove(task).is_some());
@@ -3864,6 +3872,60 @@ pub const GIT_EMAIL: &str = "wsp@wsp.invalid";
 /// Repo-local identity keys filled when git has no identity to commit as.
 const IDENTITY_SETTINGS: [(&str, &str); 2] = [("user.name", GIT_NAME), ("user.email", GIT_EMAIL)];
 
+/// How long a claim lives, in seconds (`wsp-409`): `$WSP_CLAIM_TTL` as a
+/// duration (`7d`, `36h`, `90m`, `5s`; a bare number is seconds), 7 days when
+/// unset or unreadable, and `off` for no expiry at all — what every claim was
+/// before this, and the rollback. `None` is "never expires".
+pub fn claim_ttl() -> Option<i64> {
+    claim_ttl_of(std::env::var("WSP_CLAIM_TTL").ok().as_deref())
+}
+
+const DEFAULT_CLAIM_TTL_S: i64 = 7 * 86_400;
+
+fn claim_ttl_of(v: Option<&str>) -> Option<i64> {
+    let v = v.map(str::trim).filter(|v| !v.is_empty());
+    let Some(v) = v else { return Some(DEFAULT_CLAIM_TTL_S) };
+    if v.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let (num, unit) = match v.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => v.split_at(i),
+        None => (v, "s"),
+    };
+    let mult = match unit.trim().to_ascii_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        _ => return Some(DEFAULT_CLAIM_TTL_S),
+    };
+    match num.parse::<i64>() {
+        Ok(n) if n > 0 => Some(n.saturating_mul(mult)),
+        _ => Some(DEFAULT_CLAIM_TTL_S),
+    }
+}
+
+/// Put `expires` (claimed_at + ttl, RFC 3339) and `ttl_s` on a claim record
+/// about to be written, from its own `claimed_at`. Under `WSP_CLAIM_TTL=off`
+/// neither is written. Only a fresh claim goes through this: a record
+/// rewritten to add a session keeps the `expires` it was given.
+pub fn stamp_claim_expiry(claim: &mut Value) {
+    let Some(ttl) = claim_ttl() else { return };
+    let at = claim.get("claimed_at").and_then(|c| c.as_str()).map(util::epoch_of).filter(|s| *s > 0);
+    let at = at.unwrap_or_else(util::epoch_secs);
+    if let Some(o) = claim.as_object_mut() {
+        o.insert("expires".into(), json!(util::iso_at(at + ttl)));
+        o.insert("ttl_s".into(), json!(ttl));
+    }
+}
+
+/// The expiry a claim record carries, in epoch seconds; `None` when it has
+/// none (a record from before `wsp-409`) or it cannot be read.
+pub fn record_expires(rec: &Value) -> Option<i64> {
+    rec.get("expires").and_then(|e| e.as_str()).map(util::epoch_of).filter(|s| *s > 0)
+}
+
 /// Whether a failed `git commit` said it was for want of an identity.
 fn identity_refused(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
@@ -4059,6 +4121,46 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// `wsp-409`: a claim carries when it expires, `off` writes none, and a
+    /// record from before this never expires.
+    #[test]
+    fn a_claim_records_when_it_expires() {
+        assert_eq!(claim_ttl_of(None), Some(7 * 86_400));
+        assert_eq!(claim_ttl_of(Some("36h")), Some(36 * 3600));
+        assert_eq!(claim_ttl_of(Some("5s")), Some(5));
+        assert_eq!(claim_ttl_of(Some("7d")), Some(7 * 86_400));
+        assert_eq!(claim_ttl_of(Some("off")), None);
+        assert_eq!(claim_ttl_of(Some("nonsense")), Some(7 * 86_400));
+
+        let d = lock_dir("claim-ttl");
+        let store = Store::at(d.join("root"), d.join("state"));
+        let claim = || json!({ "workspace": "w", "claimed_at": "2026-11-23T10:00:00Z" });
+
+        std::env::set_var("WSP_CLAIM_TTL", "36h");
+        let mut c = claim();
+        stamp_claim_expiry(&mut c);
+        store.set_claim("t-1", c);
+        let rec = store.claims()["t-1"].clone();
+        assert_eq!(rec["expires"], "2026-11-24T22:00:00Z");
+        assert_eq!(rec["ttl_s"], 36 * 3600);
+        assert_eq!(
+            store.claim_expires("t-1"),
+            Some(util::epoch_of("2026-11-23T10:00:00Z") + 36 * 3600)
+        );
+
+        std::env::set_var("WSP_CLAIM_TTL", "off");
+        let mut c = claim();
+        stamp_claim_expiry(&mut c);
+        store.set_claim("t-2", c);
+        assert!(store.claims()["t-2"].get("expires").is_none());
+        assert_eq!(store.claim_expires("t-2"), None);
+        std::env::remove_var("WSP_CLAIM_TTL");
+
+        store.set_claim("t-3", json!({ "workspace": "w" }));
+        assert_eq!(store.claim_expires("t-3"), None, "an old record never expires");
+        assert_eq!(store.claim_expires("nobody"), None);
     }
 
     /// `wsp-663`: outside a step a busy lock is carried on past; inside one
