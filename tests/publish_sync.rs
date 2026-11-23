@@ -115,8 +115,11 @@ impl Spoke {
         rows.iter().find(|r| r["title"].as_str() == Some(title)).and_then(|r| r["id"].as_str()).unwrap().to_string()
     }
 
+    /// The row is here: whole, or (rows another member owns, wsp-465) as a
+    /// head in the synced cache.
     fn has_task(&self, id: &str) -> bool {
         self.store().join("tasks").join(format!("{id}.md")).exists()
+            || std::fs::read_to_string(self.state().join("hub/heads.json")).is_ok_and(|t| t.contains(&format!("\"{id}\"")))
     }
 }
 

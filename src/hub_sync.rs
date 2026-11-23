@@ -625,7 +625,7 @@ impl Worker {
             pushing.insert(subject, (id, digest));
         }
         let client = self.client()?;
-        let report = match client.sync_skipping(&wid, &local, &objects, &|s| !included.contains(s)) {
+        let report = match client.sync_skipping(&wid, &local, &objects, &|s| matches!(s, Subject::Row(_)) && !included.contains(s)) {
             Ok(r) => r,
             Err(SyncError::Request(e)) if unreachable(&e) => return Err(e.to_string()),
             Err(e) => {
