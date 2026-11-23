@@ -8,6 +8,10 @@
 //!   caller holds (another machine's API, its token fetched over ssh).
 //! - [`Client::request`] sends one verb and returns the reply with its id.
 //! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
+//! - [`Client::rows`], [`Client::lists`], [`Client::asks`] and
+//!   [`Client::readings`] read what web-chrome's census draws (wsp-743): rows
+//!   and lists as heads, the asks, and the daemon's readings, each the input a
+//!   `wsp-view` projection takes, typed.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
 //!
@@ -22,7 +26,7 @@ use wsp_api::{
     Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
     Request, Verb, PROTOCOL,
 };
-use wsp_store_contract::{Principal, State};
+use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Row, RowFilter, State};
 
 mod dial;
 mod subscribe;
@@ -46,7 +50,8 @@ pub enum Error {
     Silent(Silent),
     /// `args` do not fit the verb, so the request could not be made.
     Args(String),
-    /// A typed read ([`Client::wip`]) was answered `err`; the failure whole.
+    /// A typed read ([`Client::wip`], [`Client::rows`], ...) was answered
+    /// `err`; the failure whole.
     Refused(Failure),
 }
 
@@ -158,6 +163,56 @@ impl Client {
         match reply.outcome {
             Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
             Outcome::Ok(_) => Err(Error::Lost(ConnError::Malformed("`wip` answered with another verb's answer".into()))),
+            Outcome::Err(f) => Err(Error::Refused(f)),
+        }
+    }
+
+    /// The `rows` verb: the rows `filter` keeps, each as its head when
+    /// `filter.heads` (no `body` or `prose`), which is what keeps every row of
+    /// a full store under `MAX_LINE`.
+    pub fn rows(&mut self, filter: RowFilter) -> Result<Vec<Row>, Error> {
+        self.read(Verb::Rows(filter), "rows", |a| match a {
+            Answer::Rows(rows) => Ok(rows),
+            other => Err(other),
+        })
+    }
+
+    /// The `lists` verb: every list, each without its text when `filter.heads`.
+    pub fn lists(&mut self, filter: ListFilter) -> Result<Vec<List>, Error> {
+        self.read(Verb::Lists(filter), "lists", |a| match a {
+            Answer::Lists(lists) => Ok(lists),
+            other => Err(other),
+        })
+    }
+
+    /// The `asks` verb: asks, notes and flags of any of `kinds` in any of
+    /// `states`, all when either is empty.
+    pub fn asks(&mut self, kinds: Vec<AskKind>, states: Vec<AskState>) -> Result<Vec<Ask>, Error> {
+        self.read(Verb::Asks { kinds, states }, "asks", |a| match a {
+            Answer::Asks(asks) => Ok(asks),
+            other => Err(other),
+        })
+    }
+
+    /// The `readings` verb: each of `names` there is a reading of (every one
+    /// when `names` is empty), by name. A reading's `json` is the text of the
+    /// `wsp-view` input `wsp_view::reading` names, decoded with
+    /// `wsp_view::reading::of`.
+    pub fn readings(&mut self, names: &[&str]) -> Result<std::collections::BTreeMap<String, Reading>, Error> {
+        let names = names.iter().map(|n| n.to_string()).collect();
+        self.read(Verb::Readings { names }, "readings", |a| match a {
+            Answer::Readings(readings) => Ok(readings),
+            other => Err(other),
+        })
+    }
+
+    /// One typed read: `verb`'s reply, taken by `want`; another verb's answer
+    /// is a malformed reply, and `err` is [`Error::Refused`].
+    fn read<T>(&mut self, verb: Verb, name: &str, want: impl FnOnce(Answer) -> Result<T, Answer>) -> Result<T, Error> {
+        let reply = self.send_call(Call::Verb(verb), None)?;
+        match reply.outcome {
+            Outcome::Ok(a) => want(a)
+                .map_err(|_| Error::Lost(ConnError::Malformed(format!("`{name}` answered with another verb's answer")))),
             Outcome::Err(f) => Err(Error::Refused(f)),
         }
     }

@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use wsp_client::{Client, Item};
 use wsp_manager::{Config, Manager, TOKEN_FILE};
-use wsp_store_contract::Principal;
+use wsp_store_contract::{AskState, ListFilter, Principal, RowFilter};
+use wsp_view::reading;
 use wsp_wire::host::{Host, Spawn, Tcp, LOCAL};
 use wsp_wire::manager::{install_record, Local};
 
@@ -238,8 +239,12 @@ fn snapshot_with(client: &Client, ready: impl Fn(&Value) -> bool) -> Value {
 /// so their values may move between two calls. Each is checked present and well-formed
 /// and masked in the text; every other byte is compared.
 fn masked(out: &Output) -> String {
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let json: Value = serde_json::from_str(&text).unwrap();
+    masked_text(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// [`masked`] over `wip --json`'s text.
+fn masked_text(text: &str) -> String {
+    let json: Value = serde_json::from_str(text).unwrap();
     let load = &json["load"];
     assert!(json.get("load").is_some(), "no load key: {json}");
     assert!(load.is_null() || load.as_str().is_some_and(is_warning_line), "load is not a warning line: {load}");
@@ -377,11 +382,41 @@ fn same_both_ways(sb: &Sandbox, mode: &str) {
     }
 }
 
-#[test]
-fn wip_reads_the_same_through_the_api_and_the_files() {
+/// A seeded sandbox with a daemon serving it, a loopback manager running one
+/// seat on the doing row, and a client to the daemon's API, once the mirror
+/// holds all of it: what `wip_reads_the_same_through_the_api_and_the_files`
+/// and the census reads (wsp-743) each start from. Dropping it ends what it
+/// started.
+///
+/// One at a time: nine sandboxes, each with a daemon and a manager, started
+/// at once left the manager's spawn unanswered past its 1 s on this machine,
+/// so each holds [`ONE_SEEDED`] until it is dropped, after all it started.
+struct Seeded {
+    sb: Sandbox,
+    client: Client,
+    session: u32,
+    manager: Option<Manager>,
+    _one: std::sync::MutexGuard<'static, ()>,
+}
+
+static ONE_SEEDED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl Drop for Seeded {
+    fn drop(&mut self) {
+        self.sb.wsp(&["despawn", SEAT]);
+        LOCAL.signal_group(self.session, "KILL");
+        if let Some(m) = self.manager.take() {
+            m.stop();
+        }
+    }
+}
+
+fn seeded(tag: &str) -> Seeded {
     use wsp_store::model::{self, Status, Worklist, WorklistStatus};
 
-    let mut sb = Sandbox::up("wip");
+    // A test that failed holding it poisons it; the next one still runs.
+    let one = ONE_SEEDED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sb = Sandbox::up(tag);
     let store = sb.store();
 
     // A row in each state.
@@ -417,6 +452,30 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
 
     // An open ask, from the seat below, which waits on it.
     store.save_message(&ask_message("m-1", "may I?", SEAT, &doing)).unwrap();
+    // For the census's flags (wsp-743): a question only the person may close,
+    // and a note to the person from the same seat.
+    let mut theirs = ask_message("m-2", "which way?", SEAT, &doing);
+    theirs.for_person = true;
+    store.save_message(&theirs).unwrap();
+    let mut note = wsp_store::message::Message::new(
+        wsp_store::message::Party::Pane { pane: SEAT.into(), workspace: SEAT.into() },
+        wsp_store::message::Kind::Note,
+        "the build is green",
+    );
+    note.id = "m-3".into();
+    store.save_message(&note).unwrap();
+    // For spend: one seat's banked burn, ended now, as `bank_burn` writes it.
+    let burn = serde_json::json!({
+        "seat": SEAT, "ended": wsp_base::util::now_iso(), "session_id": "s", "transcript": "", "model": "claude-opus-5-5",
+        "turns": 3, "input": 10, "output": 20, "cache_read": 30, "cache_write": 40, "cost": 1_250_000,
+    });
+    std::fs::write(sb.state.join("spent.jsonl"), format!("{burn}\n")).unwrap();
+    // For ls's legs: the todo row runs as two.
+    let order = sb.dir.join("order.md");
+    std::fs::write(&order, "look first\n").unwrap();
+    for leg in ["scout", "finish"] {
+        sb.wsp(&["leg", "add", &ids[1], leg, "--order", &order.display().to_string()]);
+    }
 
     // A live build holder in a slot, as every shimmed cargo build leaves one:
     // this test's own pid. No `since`, so its line does not tick between reads.
@@ -475,17 +534,24 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
         let n = |k: &str| v[k].as_object().map_or(0, |o| o.len());
         n("rows") == n_rows
             && n("lists") == 1
-            && v["asks"].get("m-1").is_some()
+            && ["m-1", "m-2", "m-3"].iter().all(|m| v["asks"].get(m).is_some())
             && v["seats"].get(SEAT).is_some()
             && v["claims"].get(&doing).is_some()
     });
 
+    Seeded { sb, client, session: session.pid, manager: Some(manager), _one: one }
+}
+
+#[test]
+fn wip_reads_the_same_through_the_api_and_the_files() {
+    let mut seed = seeded("wip");
     // 1 and 2, with the throttle on (neither path reads the idle time) and
     // on its default auto (both do, from ioreg and from the beat).
     for mode in ["on", "auto"] {
-        std::fs::write(sb.state.join("throttle.json"), serde_json::json!({ "mode": mode }).to_string()).unwrap();
-        same_both_ways(&sb, mode);
+        std::fs::write(seed.sb.state.join("throttle.json"), serde_json::json!({ "mode": mode }).to_string()).unwrap();
+        same_both_ways(&seed.sb, mode);
     }
+    let sb = &mut seed.sb;
     // The seat as wip draws it under api.
     let (api, _, _) = sb.wip("api");
     let json: Value = serde_json::from_slice(&api.stdout).unwrap();
@@ -523,9 +589,210 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     sb.wip("api");
     std::thread::sleep(Duration::from_millis(200));
     assert!(accepted.load(Ordering::SeqCst) >= 1, "the counting listener counted nothing under api");
+}
 
-    // End what this test started.
-    sb.wsp(&["despawn", SEAT]);
-    LOCAL.signal_group(session.pid, "KILL");
-    manager.stop();
+// ------------------------------------------------- the census reads (wsp-743)
+//
+// web-chrome's census reads tasks, flags, agents, worklists, machines,
+// throttle, spend and wip with no `wsp` child: through wsp-client, each reply
+// fed through the wsp-view function the CLI prints with. Each test below pins
+// one read: on the seeded store, what the client's reply draws is the JSON the
+// CLI's `--json` prints. The daemon takes each reading again on its period
+// (10 s, tasks 30 s, spend 60 s), so each polls until the two agree or its
+// minute is up, and then compares. Moments the CLI reads live at its call
+// (load, idle time, memory, clocks) are masked, as in `masked` above.
+
+/// The CLI's `--json` for `args`, parsed.
+fn cli_json(sb: &Sandbox, args: &[&str]) -> Value {
+    let out = sb.cmd(args).output().expect("wsp runs");
+    assert!(out.status.success(), "wsp {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("wsp {args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+/// One reading's shape, from the API; `None` until the daemon has written it.
+/// A macro, as this crate names no `serde`: the shape is the one its use takes.
+macro_rules! reading_of {
+    ($client:expr, $name:expr) => {{
+        let got = $client.readings(&[$name]).expect("the readings verb answers");
+        got.get($name).and_then(|r| reading::of(&r.json))
+    }};
+}
+
+/// Polls until `drawn` (from the API) equals `cli` (the CLI's `--json`), or a
+/// minute passes, and then compares the two.
+fn draws_what_the_cli_prints<T: PartialEq + std::fmt::Debug>(what: &str, mut drawn: impl FnMut() -> Option<T>, mut cli: impl FnMut() -> T) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let c = cli();
+        let d = drawn();
+        if d.as_ref() == Some(&c) || Instant::now() > deadline {
+            assert_eq!(d, Some(c), "{what}: drawn from the API (left) and the CLI's --json (right)");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// `value` with each of `keys` (at the top) replaced by its kind: a moment
+/// the CLI reads at its own call, kept present and of the same type.
+fn moments_masked(mut value: Value, keys: &[&str]) -> Value {
+    for k in keys {
+        if let Some(v) = value.get_mut(*k) {
+            let kind = match v {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            *v = Value::String(format!("<{kind}>"));
+        }
+    }
+    value
+}
+
+/// tasks: `rows {heads: true}` and the `tasks` reading, drawn by
+/// `task::ls_json_row` in the reading's order, are `ls --json --all`.
+#[test]
+fn the_census_tasks_through_the_api_are_ls_json_all() {
+    let mut seed = seeded("tasks");
+    let Seeded { sb, client, .. } = &mut seed;
+    let mut heads_seen = Vec::new();
+    draws_what_the_cli_prints(
+        "tasks",
+        || {
+            let heads = client.rows(RowFilter { heads: true, ..Default::default() }).expect("rows answers");
+            let t: reading::Tasks = reading_of!(client, reading::TASKS)?;
+            let by: BTreeMap<String, _> = heads.iter().map(|r| (r.id.0.clone(), r)).collect();
+            heads_seen = heads.clone();
+            let rows = t.order.iter().map(|id| {
+                let record = wsp_view::common::task_json(by.get(id)?);
+                Some(wsp_view::task::ls_json_row(record, t.stages.get(id), t.legs.get(id).map(Vec::as_slice)))
+            });
+            Some(Value::Array(rows.collect::<Option<Vec<_>>>()?))
+        },
+        || cli_json(sb, &["ls", "--json", "--all"]),
+    );
+    assert!(heads_seen.iter().all(|r| !r.fields.contains_key("body") && !r.fields.contains_key("prose")), "heads carry no text");
+    let ls = cli_json(sb, &["ls", "--json", "--all"]);
+    assert_eq!(ls.as_array().map(Vec::len), Some(7), "every seeded row: {ls}");
+    assert!(ls.as_array().unwrap().iter().any(|r| r["legs"].as_array().is_some_and(|l| l.len() == 2)), "a row with legs: {ls}");
+}
+
+/// agents and wip (attention): the `wip` reading, drawn by
+/// `wip::census_json`, is `wip --json`, its moments masked as `masked` does.
+#[test]
+fn the_census_agents_and_wip_through_the_api_are_wip_json() {
+    let mut seed = seeded("agents");
+    let Seeded { sb, client, .. } = &mut seed;
+    draws_what_the_cli_prints(
+        "agents and wip",
+        || {
+            let c: wsp_view::wip::Census = reading_of!(client, reading::WIP)?;
+            Some(masked_text(&serde_json::to_string_pretty(&wsp_view::wip::census_json(&c)).unwrap()))
+        },
+        || {
+            let out = sb.cmd(&["wip", "--json"]).output().expect("wsp runs");
+            masked_text(&String::from_utf8_lossy(&out.stdout))
+        },
+    );
+    let wip = cli_json(sb, &["wip", "--json"]);
+    assert!(wip["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["pane"] == SEAT)), "the seat is an agent: {wip}");
+}
+
+/// worklists: the `worklists` reading, drawn by `worklist::list_json`, is
+/// `worklist ls --json` (host-core's worklists read). `list ls --json`, which
+/// web-chrome's feed.rs names beside it, is `ls --json` in this build.
+#[test]
+fn the_census_worklists_through_the_api_are_worklist_ls_json() {
+    let mut seed = seeded("lists");
+    let Seeded { sb, client, .. } = &mut seed;
+    draws_what_the_cli_prints(
+        "worklists",
+        || Some(wsp_view::worklist::list_json(&reading_of!(client, reading::WORKLISTS).map(|v: Vec<wsp_view::worklist::Listing>| v)?)),
+        || cli_json(sb, &["worklist", "ls", "--json"]),
+    );
+    let ls = cli_json(sb, &["worklist", "ls", "--json"]);
+    assert!(ls.to_string().contains("list-a"), "the running list: {ls}");
+    // Lists as heads beside it: each without its text.
+    let heads = client.lists(ListFilter { heads: true }).unwrap();
+    assert!(heads.len() == 1 && !heads[0].fields.contains_key("body"), "{heads:?}");
+}
+
+/// machines: the `machines` reading, drawn by `machine::list_json`, is
+/// `machine ls --json`.
+#[test]
+fn the_census_machines_through_the_api_are_machine_ls_json() {
+    let mut seed = seeded("machines");
+    let Seeded { sb, client, .. } = &mut seed;
+    draws_what_the_cli_prints(
+        "machines",
+        || Some(wsp_view::machine::list_json(&reading_of!(client, reading::MACHINES)?)),
+        || cli_json(sb, &["machine", "ls", "--json"]),
+    );
+}
+
+/// The throttle's moments: what the machine reads at the call (load, idle,
+/// memory, clock) and what follows from them. The rest (mode, cores, the
+/// slot and job settings, builds, agents) is compared.
+const THROTTLE_MOMENTS: [&str; 10] =
+    ["idle_secs", "in_force", "load", "load_warning", "memory", "cpu_speed_limit", "thermally_limited", "suggested_agents", "slots", "jobs"];
+
+/// throttle: the `throttle` reading, drawn by `throttle::json`, is
+/// `throttle --json`, its moments masked.
+#[test]
+fn the_census_throttle_through_the_api_is_throttle_json() {
+    let mut seed = seeded("throttle");
+    let Seeded { sb, client, .. } = &mut seed;
+    draws_what_the_cli_prints(
+        "throttle",
+        || Some(moments_masked(wsp_view::throttle::json(&reading_of!(client, reading::THROTTLE)?), &THROTTLE_MOMENTS)),
+        || moments_masked(cli_json(sb, &["throttle", "--json"]), &THROTTLE_MOMENTS),
+    );
+}
+
+/// spend: the `spend` reading, drawn by `spend::report` at the reader's clock,
+/// is `spend --json` at the CLI's.
+#[test]
+fn the_census_spend_through_the_api_is_spend_json() {
+    let mut seed = seeded("spend");
+    let Seeded { sb, client, .. } = &mut seed;
+    // The CLI's clock at its call, which the reader draws at: `cli` runs first.
+    let now = std::cell::Cell::new(0);
+    draws_what_the_cli_prints(
+        "spend",
+        || {
+            let s: reading::Spend = reading_of!(client, reading::SPEND)?;
+            Some(wsp_view::spend::report(&s.lines, &s.places(), s.landed, now.get()))
+        },
+        || {
+            now.set(wsp_base::util::epoch_secs());
+            cli_json(sb, &["spend", "--json"])
+        },
+    );
+    let spend = cli_json(sb, &["spend", "--json"]);
+    assert_eq!(spend["totals"]["today"]["turns"], 3, "the banked burn is counted: {spend}");
+}
+
+/// flags: host-core's flags read is `flag --person --json` (the hands) and
+/// `yours --json` (the questions). No wsp-view function draws either, so this
+/// pins coverage, not bytes: every id the two list is a raised ask in the
+/// API's `asks` reply, with its text.
+#[test]
+fn the_census_flags_are_raised_asks_through_the_api() {
+    let mut seed = seeded("flags");
+    let Seeded { sb, client, .. } = &mut seed;
+    let hands = cli_json(sb, &["flag", "--person", "--json"]);
+    let yours = cli_json(sb, &["yours", "--json"]);
+    let listed: Vec<&Value> = hands.as_array().into_iter().flatten().chain(yours["items"].as_array().into_iter().flatten()).collect();
+    let ids: Vec<&str> = listed.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"m-2") && ids.contains(&"m-3"), "the person's question and note: hands {hands} yours {yours}");
+    let asks = client.asks(vec![], vec![AskState::Raised]).expect("asks answers");
+    for m in listed {
+        let id = m["id"].as_str().unwrap();
+        let ask = asks.iter().find(|a| a.id.0 == id).unwrap_or_else(|| panic!("{id} is not a raised ask: {asks:?}"));
+        let text = m.get("text").or_else(|| m.get("asked")).and_then(Value::as_str).unwrap_or_default();
+        assert_eq!(ask.text, text, "{id}'s text");
+    }
 }

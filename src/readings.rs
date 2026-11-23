@@ -250,6 +250,73 @@ mod tests {
         assert!(v.get("waiting_at_cap").is_none() && v.get("planned_started").is_none(), "the CLI's keys stay absent: {v}");
     }
 
+    /// wsp-743's measure: each reply the census takes, built in-process on the
+    /// live store and sized as the frame the server writes, against `MAX_LINE`.
+    /// The SQL replies come from a read-only open of `state.db`; each reading is
+    /// [`take`]n with the CLI's own builder over the live files (the read paths
+    /// `wsp ls`, `wip`, `worklist ls`, `machine ls`, `throttle` and `spend`
+    /// run), and one `readings` reply carries all six. It writes nothing. Not
+    /// run with the suite; the `wip` builder opens the store by its env, which
+    /// a test must name, so on that one command:
+    /// `WSP_HOME=~/wsp WSP_STATE=~/.local/state/wsp cargo test --bin wsp readings::tests::the_census_replies_on_the_live_store -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads the live store, to measure"]
+    fn the_census_replies_on_the_live_store() {
+        use wsp_api::{Answer, Frame, Outcome, Reply, ReqId, MAX_LINE};
+        use wsp_store_contract::{AskState, Reading, Reads, ListFilter, RowFilter};
+
+        // `Store::open` refuses the live store in a test, on purpose; this reads it and writes nothing.
+        let store = Store::at(wsp_base::util::home().join("wsp"), Store::default_state());
+        let db = wsp_store_sqlite::SqliteStore::open_read_only(store.state.join("state.db")).expect("state.db opens read-only");
+        let size = |answer: Answer| {
+            let frame = Frame::Reply(Reply { id: ReqId(1), outcome: Outcome::Ok(answer), events: vec![] });
+            serde_json::to_string(&frame).unwrap().len() + 1
+        };
+        let line = |what: &str, bytes: usize, took: Duration| {
+            eprintln!("{what:<34} {bytes:>12} B  {:>6.2}% of MAX_LINE  {:>6} ms", bytes as f64 * 100.0 / MAX_LINE as f64, took.as_millis());
+            assert!(bytes < MAX_LINE, "{what} is {bytes} B, past MAX_LINE");
+        };
+        let machine = crate::throttle::view(&store);
+        eprintln!("load (1m 5m 15m) {:?} on {} cores", machine.load, machine.cores);
+        eprintln!("MAX_LINE {MAX_LINE} B");
+
+        let timed = |f: &dyn Fn() -> Answer| {
+            let began = Instant::now();
+            let a = f();
+            (size(a), began.elapsed())
+        };
+        let (b, t) = timed(&|| Answer::Rows(db.rows(&RowFilter { heads: true, ..Default::default() }).unwrap()));
+        line("rows {heads: true}", b, t);
+        let (b, t) = timed(&|| Answer::Lists(db.lists(&ListFilter { heads: true }).unwrap()));
+        line("lists {heads: true}", b, t);
+        let (b, t) = timed(&|| Answer::Lists(db.lists(&ListFilter::default()).unwrap()));
+        line("lists {} (unchanged)", b, t);
+        let asks = |states: Vec<AskState>| {
+            let (st, _) = db.snapshot().unwrap();
+            Answer::Asks(st.asks.into_values().filter(|a| states.is_empty() || states.contains(&a.state)).collect())
+        };
+        let (b, t) = timed(&|| asks(vec![AskState::Raised]));
+        line("asks {states: [raised]} (flags)", b, t);
+        let (b, t) = timed(&|| asks(vec![]));
+        line("asks {}", b, t);
+        let (b, t) = timed(&|| {
+            let (state, at) = db.wip_snapshot().unwrap();
+            Answer::Wip { state, at }
+        });
+        line("wip (unchanged)", b, t);
+
+        let mut all = std::collections::BTreeMap::new();
+        for name in r::ALL {
+            let began = Instant::now();
+            let json = take(&store, name).expect("every name is taken");
+            let took = began.elapsed();
+            let one = Reading { json, at: wsp_store_contract::At(wsp_base::util::epoch_secs() as u64) };
+            line(&format!("readings {{names: [{name}]}}"), size(Answer::Readings([(name.to_string(), one.clone())].into())), took);
+            all.insert(name.to_string(), one);
+        }
+        line("readings {} (all six)", size(Answer::Readings(all)), Duration::ZERO);
+    }
+
     /// Every name `wsp-view` lists is one this module takes, with a period.
     #[test]
     fn every_reading_is_taken_on_a_period() {

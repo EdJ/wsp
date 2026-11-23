@@ -165,3 +165,49 @@ each reply by building it in-process over a read-only open of the live store, as
 is `crate::readings::take(&store, name)` for each name in `wsp_view::reading::ALL`, plus their sum for one
 `readings` reply. It states that the live API serves the readings only after the land's reinstall.
 compounding-851 waits on that.
+
+## What wire-and-measure did
+
+Client (`crates/client/src/lib.rs`): `rows(RowFilter)`, `lists(ListFilter)`, `asks(kinds, states)` and
+`readings(&[name])`, typed as `wip()` is; `crates/client/tests/client.rs` pins them over a loopback server.
+
+Equality against the CLI (`tests/wip_api.rs`, one test per census read, on the seeded `wsp sandbox --fake` with a
+daemon and a loopback manager running one seat; the fixtures run one at a time, as nine at once timed the
+manager's spawn out). Each reply, fed through the wsp-view function the CLI prints with, is the CLI's `--json`:
+
+| census read | client call | drawn by | CLI | masked |
+|---|---|---|---|---|
+| tasks | `rows {heads}` + `readings [tasks]` | `ls_json_row(task_json(head), stage, legs)` in `order` | `ls --json --all` | nothing |
+| agents, wip | `readings [wip]` | `wip::census_json` | `wip --json` | `masked`'s moments (load, idle_memory, held, wait line, idle seconds) |
+| worklists | `readings [worklists]` | `worklist::list_json` | `worklist ls --json` | nothing |
+| machines | `readings [machines]` | `machine::list_json` | `machine ls --json` | nothing |
+| throttle | `readings [throttle]` | `throttle::json` | `throttle --json` | idle, load, memory, clock and what follows from them |
+| spend | `readings [spend]` | `spend::report(.., now)` | `spend --json` | nothing (now is the CLI's clock) |
+| flags | `asks {states: [raised]}` | none | `flag --person --json` + `yours --json` | coverage: every id raised, same text |
+
+Flags are host-core's `fetch_flags` (`flag --person --json` and `yours --json`), which no wsp-view function draws,
+so that test pins coverage, not bytes. `list ls --json` (web-chrome feed.rs's worklists line) is `ls --json` in this
+build; the worklists read is `worklist ls --json`.
+
+Measured 2026-11-23 04:03 on the live store, read-only (`readings::tests::the_census_replies_on_the_live_store`,
+ignored; state.db opened read-only, each reading taken by the CLI's builder), each the reply frame's bytes. Load
+2.9 / 3.4 / 3.5 on 8 cores (the fleet's own; nothing added):
+
+| reply | bytes | of MAX_LINE 16,777,216 |
+|---|---|---|
+| `rows {heads: true}` | 3,128,606 | 18.65% |
+| `lists {heads: true}` | 1,730,140 | 10.31% |
+| `lists {}` (unchanged) | 8,082,444 | 48.18% |
+| `asks {states: [raised]}` | 542,198 | 3.23% |
+| `asks {}` | 3,158,940 | 18.83% |
+| `wip` (unchanged) | 14,840,469 | 88.46% |
+| `readings [tasks]` | 3,186,960 | 19.00% |
+| `readings [wip]` | 190,243 | 1.13% |
+| `readings [worklists]` | 157,991 | 0.94% |
+| `readings [machines]` | 1,314 | 0.01% |
+| `readings [throttle]` | 772 | 0.00% |
+| `readings [spend]` | 1,153,335 | 6.87% |
+| `readings {}` (all six) | 4,690,335 | 27.96% |
+
+The live daemon serves none of the readings until the land's reinstall: the running daemon predates
+`src/readings.rs`, and its state.db has no `reading` table yet.
