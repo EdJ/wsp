@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::fm;
 use crate::message::{self, Message, Refused};
-use crate::model::{Machine, Project, Task, TaskHead, Worklist};
+use crate::model::{Machine, Project, Task, TaskHead, Worklist, WorkspaceId};
 use crate::util;
 
 thread_local! {
@@ -786,6 +786,7 @@ impl Store {
     }
 
     pub fn save_project(&self, p: &Project) -> std::io::Result<()> {
+        self.same_workspace_as_parent("project", &p.id, &p.workspace, p.parent.as_deref())?;
         fs::create_dir_all(self.projects_dir())?;
         let path = self.projects_dir().join(format!("{}.md", p.id));
         write_atomic(&path, &p.render())?;
@@ -1563,7 +1564,57 @@ impl Store {
         }
     }
 
+    /// The workspace the record `id` lives in, or `None` where nothing is
+    /// called that: a row, a list, a project, or a piece of a row (`<row>-<n>`),
+    /// which lives where its row does (wsp-169). A record with no `workspace:`
+    /// is `Private`.
+    ///
+    /// What the sync worker and publish ask to decide where a record goes, and
+    /// what the guards ask before they let one write touch another's.
+    pub fn workspace_of(&self, id: &str) -> Option<WorkspaceId> {
+        if let Some(t) = self.task(id) {
+            return Some(t.workspace);
+        }
+        if let Some(w) = self.worklist(id) {
+            return Some(w.workspace);
+        }
+        if let Some(p) = self.project(id) {
+            return Some(p.workspace);
+        }
+        let (row, _) = split_piece_id(id)?;
+        self.task(row).map(|t| t.workspace)
+    }
+
+    /// Refuses a record that names a parent living in another workspace: a
+    /// sub-task, a leg and a piece live in their parent's, so a save that says
+    /// otherwise names both and writes nothing. No such parent is no refusal;
+    /// that is the parent's absence, which other checks own.
+    fn same_workspace_as_parent(&self, what: &str, id: &str, own: &WorkspaceId, parent: Option<&str>) -> std::io::Result<()> {
+        let Some(parent) = parent.filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let theirs = match what {
+            "project" => self.project(parent).map(|p| p.workspace),
+            _ => self.task(parent).map(|p| p.workspace),
+        };
+        match theirs {
+            Some(theirs) if theirs != *own => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{what} {id} is in workspace {own} but its parent {parent} is in {theirs}: \
+                     a sub-task, a leg and a piece live in their parent's workspace"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub fn save_task(&self, t: &Task) -> std::io::Result<()> {
+        self.same_workspace_as_parent("task", &t.id, &t.workspace, t.parent.as_deref())?;
+        // A piece id (`<row>-<n>`) names its row, which it lives with.
+        if self.task(&t.id).is_none() {
+            self.same_workspace_as_parent("task", &t.id, &t.workspace, split_piece_id(&t.id).map(|(row, _)| row))?;
+        }
         fs::create_dir_all(self.tasks_dir())?;
         let path = self.task_path(&t.id);
         // Read before the write, and only for a status that finishes the row:
@@ -5789,6 +5840,87 @@ mod tests {
         assert!(tasks[0].body.contains("## Verification"), "the body asked for was not read");
         assert!(tasks[1].body.is_empty(), "a body not asked for was read");
         assert_eq!(tasks[1].project.as_deref(), Some("p"), "and its front matter is all there");
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    fn shared(name: &str) -> WorkspaceId {
+        format!("shared:{name}").parse().unwrap()
+    }
+
+    /// wsp-169: `workspace: shared:<name>` is written on a shared record and
+    /// read back; a private one is written without the key, byte for byte as
+    /// before, and reads private.
+    #[test]
+    fn a_shared_task_round_trips_and_a_private_one_is_unchanged() {
+        let store = crate::testkit::store("ws-roundtrip");
+        let mut t = Task::new("shared work", "core-001");
+        t.workspace = shared("core");
+        store.save_task(&t).unwrap();
+        let text = fs::read_to_string(store.task_path("core-001")).unwrap();
+        assert!(text.contains("workspace: shared:core\n"), "{text}");
+        assert_eq!(store.task("core-001").unwrap().workspace, shared("core"));
+        assert_eq!(store.workspace_of("core-001"), Some(shared("core")));
+
+        let mut p = Task::new("mine", "core-002");
+        p.created = t.created.clone();
+        p.updated = t.updated.clone();
+        store.save_task(&p).unwrap();
+        let text = fs::read_to_string(store.task_path("core-002")).unwrap();
+        assert!(!text.contains("workspace"), "{text}");
+        // The bytes are what the task rendered to before the field existed.
+        let mut d = p.to_doc();
+        assert_eq!(text, fm::emit(&d));
+        d.set_str("workspace", "private");
+        assert_ne!(text, fm::emit(&d));
+        assert_eq!(store.task("core-002").unwrap().workspace, WorkspaceId::Private);
+        assert_eq!(store.workspace_of("core-002"), Some(WorkspaceId::Private));
+        assert_eq!(store.workspace_of("nothing-009"), None);
+
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// wsp-169: a sub-task, a piece and a sub-project live in their parent's
+    /// workspace; a save that says otherwise is refused naming both.
+    #[test]
+    fn a_child_in_another_workspace_than_its_parent_is_refused() {
+        let store = crate::testkit::store("ws-parent");
+        let mut parent = Task::new("parent", "core-001");
+        parent.workspace = shared("core");
+        store.save_task(&parent).unwrap();
+
+        let mut child = Task::new("child", "core-002");
+        child.parent = Some("core-001".into());
+        let err = store.save_task(&child).unwrap_err().to_string();
+        assert!(err.contains("core-002") && err.contains("core-001"), "{err}");
+        assert!(err.contains("private") && err.contains("shared:core"), "{err}");
+        assert!(!store.task_path("core-002").exists());
+
+        child.workspace = shared("other");
+        assert!(store.save_task(&child).is_err());
+        child.workspace = shared("core");
+        store.save_task(&child).unwrap();
+
+        // A piece of the row is in the row's workspace, and its id says so.
+        assert_eq!(store.workspace_of("core-001-3"), Some(shared("core")));
+        let piece = Task::new("piece", "core-001-1");
+        let err = store.save_task(&piece).unwrap_err().to_string();
+        assert!(err.contains("core-001-1") && err.contains("core-001"), "{err}");
+
+        let mut proj = Project::new("acme");
+        proj.workspace = shared("core");
+        store.save_project(&proj).unwrap();
+        let mut sub = Project::new("acme-web");
+        sub.parent = Some("acme".into());
+        assert!(store.save_project(&sub).is_err());
+        sub.workspace = shared("core");
+        store.save_project(&sub).unwrap();
+
+        let mut w = Worklist::new("l1", "a list");
+        w.workspace = shared("core");
+        store.save_worklist(&w).unwrap();
+        assert_eq!(store.worklist("l1").unwrap().workspace, shared("core"));
+        assert_eq!(store.workspace_of("l1"), Some(shared("core")));
 
         let _ = fs::remove_dir_all(&store.root);
     }

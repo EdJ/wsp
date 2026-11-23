@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use crate::agent_kind;
 use crate::fm::{self, Doc, Val};
 use crate::util;
+pub use wsp_store_contract::WorkspaceId;
 pub use wsp_store_contract::{
     DEFAULT_LEASE, DEFAULT_POLICY, LINK_REQUIRED, MANUAL, PROJECT_PROSE, PROSE, SCHEMA, SECTIONS, WORKLIST_PROSE,
     WORKLIST_SECTIONS,
@@ -157,6 +158,21 @@ impl Priority {
     }
 }
 
+/// The workspace a record's front matter names: `shared:<name>`, and private
+/// for a missing key or one that is not a workspace (nothing stored before
+/// workspaces has the key).
+fn workspace_of_doc(doc: &Doc) -> WorkspaceId {
+    doc.opt("workspace").and_then(|w| w.trim().parse().ok()).unwrap_or_default()
+}
+
+/// Writes `workspace:` only for a shared record, so a private one renders as it
+/// always has.
+fn set_workspace(d: &mut Doc, w: &WorkspaceId) {
+    if !w.is_private() {
+        d.set_str("workspace", &w.to_string());
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Project {
     pub id: String,
@@ -201,6 +217,10 @@ pub struct Project {
     /// is the whole reason it can live here, in a file two machines might both
     /// be writing, rather than under a lock.
     pub seq: usize,
+    /// `workspace:` — `shared:<name>` where the record lives in a shared
+    /// workspace (wsp-169); absent is private, and a private record is written
+    /// without the key, so nothing stored before workspaces changes a byte.
+    pub workspace: WorkspaceId,
     pub body: String,
 }
 
@@ -247,6 +267,7 @@ impl Project {
             light: doc.opt("light").unwrap_or_default(),
             kind: doc.opt("kind").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
+            workspace: workspace_of_doc(doc),
             body: doc.body.clone(),
         }
     }
@@ -278,6 +299,7 @@ impl Project {
             d.set_str("kind", &self.kind);
         }
         d.set_str("seq", &self.seq.to_string());
+        set_workspace(&mut d, &self.workspace);
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -949,6 +971,10 @@ pub struct Task {
     /// `to_doc` writes the fields it knows; `wsp install` after the land is
     /// what keeps an authored caption.
     pub caption: Option<String>,
+    /// `workspace:` — `shared:<name>` where the record lives in a shared
+    /// workspace (wsp-169); absent is private, and a private record is written
+    /// without the key, so nothing stored before workspaces changes a byte.
+    pub workspace: WorkspaceId,
     pub body: String,
 }
 
@@ -976,6 +1002,8 @@ pub struct TaskHead {
     pub updated: String,
     pub refs: Vec<String>,
     pub caption: Option<String>,
+    /// As [`Task::workspace`].
+    pub workspace: WorkspaceId,
     /// The body's `## ` headings, in order, so a reader can tell which tasks
     /// carry a `## Verification` or a `## Legs` without opening any of them.
     pub sections: Vec<String>,
@@ -996,6 +1024,7 @@ impl TaskHead {
             updated: t.updated.clone(),
             refs: t.refs.clone(),
             caption: t.caption.clone(),
+            workspace: t.workspace.clone(),
             sections: t
                 .body
                 .lines()
@@ -1039,18 +1068,25 @@ impl TaskHead {
             updated: self.updated.clone(),
             refs: self.refs.clone(),
             caption: self.caption.clone(),
+            workspace: self.workspace.clone(),
             body: String::new(),
         }
     }
 
     /// The form the persisted index keeps it in.
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "id": self.id, "title": self.title, "project": self.project, "tags": self.tags,
             "status": self.status_raw, "priority": self.priority_raw, "parent": self.parent,
             "after": self.after, "created": self.created, "updated": self.updated,
             "refs": self.refs, "caption": self.caption, "sections": self.sections,
-        })
+        });
+        // Only where shared, as the file does: an entry written before
+        // workspaces reads the same as one written after for a private row.
+        if !self.workspace.is_private() {
+            v["workspace"] = serde_json::Value::String(self.workspace.to_string());
+        }
+        v
     }
 
     /// Read back from [`TaskHead::to_json`]; `None` for anything that is not
@@ -1080,6 +1116,7 @@ impl TaskHead {
             updated: s("updated")?,
             refs: list("refs")?,
             caption: opt("caption")?,
+            workspace: s("workspace").and_then(|w| w.parse().ok()).unwrap_or_default(),
             sections: list("sections")?,
         })
     }
@@ -1259,6 +1296,7 @@ impl Task {
             updated: doc.str("updated"),
             refs: doc.list("refs"),
             caption: doc.opt("caption"),
+            workspace: workspace_of_doc(doc),
             body: doc.body.clone(),
         }
     }
@@ -1285,6 +1323,7 @@ impl Task {
         if let Some(c) = self.caption.as_deref().filter(|c| !c.trim().is_empty()) {
             d.set_str("caption", c);
         }
+        set_workspace(&mut d, &self.workspace);
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
@@ -2517,6 +2556,10 @@ pub struct Worklist {
     /// `held_for:` — while the list is held, the person's act that is owed once
     /// the time and the rows above have come, in words (`wsp-095`). `hold --for`.
     pub held_for: Option<String>,
+    /// `workspace:` — `shared:<name>` where the record lives in a shared
+    /// workspace (wsp-169); absent is private, and a private record is written
+    /// without the key, so nothing stored before workspaces changes a byte.
+    pub workspace: WorkspaceId,
     pub body: String,
 }
 
@@ -2529,6 +2572,7 @@ impl Worklist {
             status_raw: WorklistStatus::Draft.as_str().to_string(),
             created: util::now_iso(),
             groups_made: 0,
+            workspace: WorkspaceId::Private,
             project: None,
             made_in: None,
             outputs: None,
@@ -2622,6 +2666,7 @@ impl Worklist {
             held_until: doc.opt("held_until").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
             held_on: doc.list("held_on"),
             held_for: doc.opt("held_for").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
+            workspace: workspace_of_doc(doc),
             body: doc.body.clone(),
         }
     }
@@ -2675,6 +2720,7 @@ impl Worklist {
         if let Some(f) = &self.held_for {
             d.set_str("held_for", f);
         }
+        set_workspace(&mut d, &self.workspace);
         d.set_str("schema", SCHEMA);
         d.body = self.body.clone();
         d
