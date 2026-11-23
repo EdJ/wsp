@@ -852,14 +852,19 @@ fn told_unlanded(store: &Store, w: &Worklist, t: &Task) {
     if s.owes_a_verifier() || !s.settlement.settled() {
         return;
     }
-    tell(store, w, &format!("In the {} run, {}", w.id, unlanded(&s.id, &s.note())));
+    tell(store, w, &format!("In the {} run, {}", w.id, unlanded(&s.id, &s.settlement, &s.note())));
 }
 
 /// The sentence for a reviewed member that has not landed, in the log and
 /// to the seat alike.
-fn unlanded(id: &str, note: &str) -> String {
+///
+/// **The status it has, not `review` always** (`wsp-338`): compound-react-040
+/// was at `done`, and this said "at review" on the line above the repair's "at
+/// done" every minute — one row, two states.
+fn unlanded(id: &str, at: &Settlement, note: &str) -> String {
     format!(
-        "{id} is at review with {note}, so it has no verifier yet. {}",
+        "{id} is at {} with {note}, so it has no verifier yet. {}",
+        at.word(),
         crate::cmd_checkout::Flow::Verified.owes(id)
     )
 }
@@ -1061,9 +1066,18 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     // log has to say: tokenhub-003 went to review with its commit still on
     // its branch, this started nothing and wrote nothing, and its governor
     // went looking for the cause in the wrong record (`wsp-142`).
+    //
+    // **Once per reason** (`wsp-338`), by a marker on the member: every pass
+    // used to write it, so a member whose seat had been released was ordered
+    // to commit and review again once a minute until a person stepped in. A
+    // changed reason — fewer commits, a new status, a new wait — is said again.
     if all && !barrier_only {
         for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
-            log_line(store, &format!("{} group {at}: {}", w.id, unlanded(&s.id, &s.note())));
+            let line = unlanded(&s.id, &s.settlement, &s.note());
+            let kind = format!("{} {} is at ", crate::repair::LOGGED_WHY, s.id);
+            if crate::repair::said_once_per_reason(store, &s.id, &kind, &format!("{} {line}", crate::repair::LOGGED_WHY)) {
+                log_line(store, &format!("{} group {at}: {line}", w.id));
+            }
         }
     }
 
@@ -5407,6 +5421,19 @@ pub(crate) fn tell(store: &Store, w: &Worklist, text: &str) {
         return;
     }
     log_line(store, &format!("tell {}: {}", w.id, util::truncate(text, 120)));
+    tell_now(store, w, text);
+}
+
+/// [`tell`], for a sentence whose fact the caller has already written to
+/// `cycle.log` on its own line: the delivery without a second line saying it
+/// (`wsp-338`). A repair's stamp followed by `tell <list>: <the same fact>`
+/// was two lines a minute for one member in the file a governor reads.
+pub(crate) fn tell_logged(store: &Store, w: &Worklist, text: &str) {
+    if cfg!(test) {
+        #[cfg(test)]
+        tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
+        return;
+    }
     tell_now(store, w, text);
 }
 
