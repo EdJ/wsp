@@ -176,12 +176,10 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     t.after = after;
     t.workspace = workspace;
 
-    if let Err(e) = store.save_task(&t) {
+    if let Err(e) = file_new(store, &mut t, &crate::cmd_message::Caller::here(store)) {
         eprintln!("wsp: write failed: {e}");
         return 1;
     }
-    store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title }));
-    store.git_commit(&format!("wsp: add {} — {}", t.id, t.title));
 
     if args.json() {
         // In full: `json` carries what the index does not.
@@ -208,6 +206,19 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         }
     }
     0
+}
+
+/// The write `add` ends in, for a task already made: its file, the event and
+/// the commit, for `caller`. A caller from the hub (wsp-175) also has the row's
+/// log say so, `added by <user> via the hub`; one here writes what it always has.
+pub(crate) fn file_new(store: &Store, t: &mut Task, caller: &crate::cmd_message::Caller) -> std::io::Result<()> {
+    if caller.via_hub {
+        t.log(&format!("added {}", caller.byline()));
+    }
+    store.save_task(t)?;
+    store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title, "by": caller.by }));
+    store.git_commit(&format!("wsp: add {} — {}", t.id, t.title));
+    Ok(())
 }
 
 /// One of `add`'s own flags, with its value, on the end of a title.
@@ -1167,18 +1178,9 @@ where
     };
     f(&mut t);
     t.touch();
-    if let Err(e) = store.save_task(&t) {
+    if let Err(e) = write_task(store, &t, verb, &crate::cmd_message::Caller::here(store)) {
         eprintln!("wsp: write failed: {e}");
         return 1;
-    }
-    store.log_event(
-        &format!("task-{verb}"),
-        json!({ "id": t.id, "project": t.project, "status": t.status().as_str(), "title": t.title }),
-    );
-    store.git_commit(&format!("wsp: {verb} {} — {}", t.id, t.title));
-    // `wsp-134`: a review or a block may be the step a run was waiting on.
-    if matches!(verb, "review" | "blocked") {
-        crate::cycle::poke_task(store, &t.id, verb);
     }
 
     if args.json() {
@@ -1200,12 +1202,36 @@ where
     0
 }
 
+/// The write a verb that changes a task ends in, for `caller`: the file, the
+/// event, the commit, and the poke a review or a block owes a run.
+pub(crate) fn write_task(store: &Store, t: &Task, verb: &str, caller: &crate::cmd_message::Caller) -> std::io::Result<()> {
+    store.save_task(t)?;
+    store.log_event(
+        &format!("task-{verb}"),
+        json!({ "id": t.id, "project": t.project, "status": t.status().as_str(), "title": t.title, "by": caller.by }),
+    );
+    store.git_commit(&format!("wsp: {verb} {} — {}", t.id, t.title));
+    // `wsp-134`: a review or a block may be the step a run was waiting on.
+    if matches!(verb, "review" | "blocked") {
+        crate::cycle::poke_task(store, &t.id, verb);
+    }
+    Ok(())
+}
+
+/// A status move, logged: `→ <status>`, and for a caller from the hub
+/// `→ <status> · by <user> via the hub`.
+pub(crate) fn move_status(t: &mut Task, status: Status, caller: &crate::cmd_message::Caller) {
+    t.set_status(status);
+    match caller.via_hub {
+        true => t.log(&format!("→ {} · {}", status.as_str(), caller.byline())),
+        false => t.log(&format!("→ {}", status.as_str())),
+    }
+}
+
 pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
     let verb = status.as_str().to_string();
-    mutate(store, args, &verb, |t| {
-        t.set_status(status);
-        t.log(&format!("→ {}", status.as_str()));
-    })
+    let caller = crate::cmd_message::Caller::here(store);
+    mutate(store, args, &verb, |t| move_status(t, status, &caller))
 }
 
 pub fn done(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {

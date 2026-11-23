@@ -316,6 +316,7 @@ dependencies = [
  "wsp-host",
  "wsp-host-api",
  "wsp-manager",
+ "wsp-objects",
  "wsp-server",
  "wsp-store",
  "wsp-store-contract",

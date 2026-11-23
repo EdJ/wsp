@@ -68,6 +68,9 @@ mod local_trust;
 mod cmd_spawn;
 mod cmd_stamp;
 mod cmd_task;
+// The import door (wsp-175): its caller is the spoke's sync worker (wsp-464, wsp-469), which is not built yet.
+#[allow(dead_code)]
+mod door;
 mod cmd_submit;
 mod cmd_verifications;
 mod leg_seat;

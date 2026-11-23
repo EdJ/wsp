@@ -19,6 +19,7 @@ wsp-wire = { path = "crates/wire" }
 wsp-trees = { path = "crates/trees" }
 wsp-host-api = { path = "crates/host-api" }
 wsp-store-contract = { path = "crates/store-contract" }
+wsp-objects = { path = "crates/objects" }
 wsp-server = { path = "crates/server" }
 wsp-store-sqlite = { path = "crates/store-sqlite" }
 wsp-api = { path = "crates/api" }

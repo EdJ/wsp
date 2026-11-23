@@ -942,7 +942,7 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
         }
     };
     let (me, pane) = whoami(store);
-    let caller = Caller {
+    let caller = Answerer {
         seat: me.scope().is_some(),
         agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
         as_person: args.has("as-person"),
@@ -1146,7 +1146,7 @@ fn close_set(store: &Store, args: &Args, q: &Message, me: &Party, routed: bool, 
 /// person's own words after it when they gave some.
 fn cancel(store: &Store, args: &Args) -> i32 {
     let (me, pane) = whoami(store);
-    let caller = Caller {
+    let caller = Answerer {
         seat: me.scope().is_some(),
         agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
         as_person: args.has("as-person"),
@@ -1156,9 +1156,9 @@ fn cancel(store: &Store, args: &Args) -> i32 {
 
 /// [`cancel`] with the caller read already, which is the one thing about it
 /// that comes out of the environment — passed in for the reason [`the_person`]
-/// takes a [`Caller`], so a test reaches the refusal without exporting a
+/// takes a [`Answerer`], so a test reaches the refusal without exporting a
 /// process-wide variable every other test can see.
-fn cancel_as(store: &Store, args: &Args, caller: &Caller) -> i32 {
+fn cancel_as(store: &Store, args: &Args, caller: &Answerer) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
         eprintln!("usage: wsp ask --cancel <message-id> [\"why\"]");
         return 2;
@@ -1217,7 +1217,7 @@ const CANCELLED: &str = "cancelled by the person";
 
 /// Who is running `wsp answer` on a person's item, as far as wsp can tell.
 #[derive(Debug, Clone, Copy, Default)]
-struct Caller {
+struct Answerer {
     /// The pane holds a governor seat.
     seat: bool,
     /// The pane holds an agent wsp started, or work it is bound to.
@@ -1236,7 +1236,7 @@ struct Caller {
 /// typing `! wsp answer …` into an agent's own pane, which inherits that pane's
 /// environment, and it is a statement an agent would have to make falsely
 /// rather than a default it fell into.
-fn the_person(c: &Caller) -> Result<(), String> {
+fn the_person(c: &Answerer) -> Result<(), String> {
     match (c.seat || c.agent, c.as_person) {
         (false, _) | (true, true) => Ok(()),
         (true, false) => Err(format!(
@@ -1260,7 +1260,7 @@ fn the_person(c: &Caller) -> Result<(), String> {
 /// it, as itself, the way it answers a raised hand. A question the route gives
 /// to the person — no seat above the row, or a dialog a hook holds — stays the
 /// person's, and the primary (which governs nothing) still says `--as-person`.
-fn closer(store: &Store, q: &Message, me: Party, caller: &Caller) -> Result<Party, String> {
+fn closer(store: &Store, q: &Message, me: Party, caller: &Answerer) -> Result<Party, String> {
     if !q.for_person {
         return Ok(me);
     }
@@ -2360,11 +2360,43 @@ pub(crate) fn whoami(store: &Store) -> (Party, Option<String>) {
 /// through it: building its backends opens the default store, which a verb
 /// writing one log line has no other reason to touch.
 pub(crate) fn caller(store: &Store) -> String {
-    let pane = crate::place::seat_from_env()
-        .map(|s| s.to_string());
-    match pane {
-        Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
-        None => "person".into(),
+    Caller::here(store).by
+}
+
+/// Who a write is made for, given explicitly rather than read off this
+/// process's environment (wsp-175): a verb run here is [`Caller::here`], and a
+/// record that arrived from the hub is [`Caller::hub`], written by the same
+/// functions with the hub's user named instead of the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Caller {
+    /// The token a record's `by` names: a post, a pane, `person`, or the hub's user.
+    pub(crate) by: String,
+    /// The write came in over the hub, not from a verb run here.
+    pub(crate) via_hub: bool,
+}
+
+impl Caller {
+    /// This process: the post its seat holds, else the pane, else `person`.
+    pub(crate) fn here(store: &Store) -> Caller {
+        let pane = crate::place::seat_from_env().map(|s| s.to_string());
+        let by = match pane {
+            Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
+            None => "person".into(),
+        };
+        Caller { by, via_hub: false }
+    }
+
+    /// `user`, whose write the hub delivered.
+    pub(crate) fn hub(user: &str) -> Caller {
+        Caller { by: user.to_string(), via_hub: true }
+    }
+
+    /// `by <who>`, and ` via the hub` for a write that came in over it.
+    pub(crate) fn byline(&self) -> String {
+        match self.via_hub {
+            true => format!("by {} via the hub", self.by),
+            false => format!("by {}", self.by),
+        }
     }
 }
 
@@ -3115,7 +3147,7 @@ mod tests {
     /// agent would have to choose falsely.
     #[test]
     fn only_a_caller_that_is_no_seat_and_no_agent_or_says_it_is_the_person_may_answer() {
-        let c = |seat, agent, as_person| Caller { seat, agent, as_person };
+        let c = |seat, agent, as_person| Answerer { seat, agent, as_person };
         assert!(the_person(&c(false, false, false)).is_ok(), "a person at a shell");
         assert!(the_person(&c(true, false, false)).unwrap_err().contains("governor seat"));
         assert!(the_person(&c(false, true, false)).unwrap_err().contains("agent's pane"));
@@ -4061,7 +4093,7 @@ mod tests {
         let _env = util::isolated("cancel-kinds");
         let store = scratch("cancel-kinds");
         task(&store, "lone-1");
-        let person = Caller { seat: false, agent: false, as_person: false };
+        let person = Answerer { seat: false, agent: false, as_person: false };
         for (why, said) in [(&[][..], "cancelled by the person"), (&["no longer needed"][..], "cancelled by the person: no longer needed")] {
             for (kind, q) in every_kind(&store) {
                 assert_eq!(cancel_as(&store, &ask_cancel(&q.id, why, false), &person), 0, "{kind}");
@@ -4088,7 +4120,7 @@ mod tests {
         task(&store, "lone-1");
         let n = Message::new(Party::pane("cpd-893", ""), Kind::Note, "heads up").about(About::Task("lone-1".into()));
         message::raise(&store, &n).unwrap();
-        let person = Caller { seat: false, agent: false, as_person: false };
+        let person = Answerer { seat: false, agent: false, as_person: false };
         assert_eq!(cancel_as(&store, &ask_cancel(&n.id, &[], false), &person), 0);
         let c = store.message(&n.id).unwrap().closed_json().unwrap();
         assert_eq!((c["kind"].as_str(), c["by"].as_str(), c["reason"].as_str()), (Some("cancelled"), Some("person"), Some("cancelled by the person")));
@@ -4105,7 +4137,7 @@ mod tests {
         let store = scratch("cancel-refused");
         task(&store, "lone-1");
         for (kind, q) in every_kind(&store) {
-            for caller in [Caller { seat: false, agent: true, as_person: false }, Caller { seat: true, agent: false, as_person: false }] {
+            for caller in [Answerer { seat: false, agent: true, as_person: false }, Answerer { seat: true, agent: false, as_person: false }] {
                 assert_eq!(cancel_as(&store, &ask_cancel(&q.id, &["never mind"], false), &caller), 1, "{kind} {caller:?}");
                 assert!(store.message(&q.id).unwrap().is_open(), "{kind}: still open");
             }
@@ -4116,10 +4148,10 @@ mod tests {
                     assert!(matches!(message::abandon(&store, &q.id, &by, "x"), Err(message::Refused::NotThePersons(_))), "{kind} {by:?}");
                 }
             }
-            let typing = Caller { seat: false, agent: true, as_person: true };
+            let typing = Answerer { seat: false, agent: true, as_person: true };
             assert_eq!(cancel_as(&store, &ask_cancel(&q.id, &[], true), &typing), 0, "{kind}: the person in the pane");
         }
-        assert_eq!(cancel_as(&store, &ask_cancel("m-nope", &[], false), &Caller::default()), 1, "no such message");
+        assert_eq!(cancel_as(&store, &ask_cancel("m-nope", &[], false), &Answerer::default()), 1, "no such message");
     }
 
     /// **A `--wait` is not left blocked** by any of the endings that are not an
@@ -4147,7 +4179,7 @@ mod tests {
                 }
                 "agent closed" => assert!(store.clear_binding("cpd-893")),
                 _ => assert_eq!(
-                    cancel_as(&store, &ask_cancel(&q.id, &["not now"], false), &Caller::default()),
+                    cancel_as(&store, &ask_cancel(&q.id, &["not now"], false), &Answerer::default()),
                     0
                 ),
             });
