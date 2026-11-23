@@ -2,6 +2,7 @@
 PROJECTS
   wsp init                          create the store at ~/wsp
   wsp project add <slug> [--name N] [--parent P] [--tag T]… [--root PATH]…
+  wsp project add <slug> --workspace shared:<name>   …in a shared workspace, as `wsp add`
   wsp product add <slug> [--name N] [--brief …] | ls | show <slug>  a grouping of
                                     projects (move one in: wsp project set <p> parent=<product>)
   wsp initiative add "title" --product P [-p proj]… | ls [--product P] | show <id>
@@ -34,6 +35,9 @@ TASKS
                                     (`--anyway` files it, unrun)
   wsp add "title" --caption "…"     …with the line a glance reads, under 60
   wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`
+  wsp add "title" --workspace shared:<name>   …filed in a shared workspace (needs a login;
+                                    `$WSP_WORKSPACE` is the default); private unless said,
+                                    and a sub-task is where its parent is
   wsp ls [-p proj] [-t tag] [-s status] [--all]
   wsp state --json                  the contract State the files make, as the
                                     mirror projects it: what the --json views read
@@ -560,7 +564,8 @@ WORKLISTS
                                     -p <project> is where it stands, whose
                                     governor its seat answers to — unsaid,
                                     the project its members share;
-                                    --initiative init-N links it as it's made
+                                    --initiative init-N links it as it's made;
+                                    --workspace shared:<name> files it shared, as `wsp add`
   wsp worklist add <slug> <task>…   one call, one group; its members run at
                                     the same time. --group N joins a group
                                     that exists instead of making one;
