@@ -5,6 +5,45 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
+use wsp_store_contract::{Machine, State, DEFAULT_LEASE};
+
+/// `Machine::facts` keys, as `src/mirror.rs`'s `machines` writes them (wsp-308).
+/// A record's fact is absent when the file leaves it empty; the live ones are
+/// written only while the daemon has a record of the machine, so `reachable`
+/// present is what says `live` is an object and not null.
+pub mod key {
+    pub const SSH: &str = "ssh";
+    pub const OS: &str = "os";
+    pub const ARCH: &str = "arch";
+    pub const BACKEND_AT: &str = "backend_at";
+    pub const EXEC_DIR: &str = "exec_dir";
+    pub const SUP_AT: &str = "sup_at";
+    pub const AGENTS: &str = "agents";
+    pub const LEASE: &str = "lease";
+    pub const STATUS: &str = "status";
+    pub const ADDED: &str = "added";
+    pub const REACHABLE: &str = "reachable";
+    pub const LAST_SEEN: &str = "last_seen";
+    pub const HEARD: &str = "heard";
+    /// JSON object, seat -> stamp.
+    pub const LEASES: &str = "leases";
+    pub const TUNNEL: &str = "tunnel";
+    pub const SOCKET: &str = "socket";
+    pub const WIRE: &str = "wire";
+    pub const WIRE_OLDEST: &str = "wire_oldest";
+    pub const READY: &str = "ready";
+    pub const CHECKED: &str = "checked";
+    pub const CHECK_ERROR: &str = "check_error";
+    pub const SHIM_WARNING: &str = "shim_warning";
+    pub const ERROR: &str = "error";
+    pub const TICK_SECS: &str = "tick_secs";
+    pub const BEAT_AT: &str = "beat_at";
+    /// On the machine the mirror names `local` only: this seat's hostname,
+    /// its cap (absent for none) and the agents counted against it (JSON array).
+    pub const SEAT: &str = "seat";
+    pub const SEAT_CAP: &str = "seat_cap";
+    pub const SEAT_WORKING: &str = "seat_working";
+}
 
 /// The contract's `link` word, as every machine object carries it.
 pub use wsp_store_contract::LINK_REQUIRED as LINK;
@@ -143,6 +182,72 @@ pub fn list_json(f: &Fleet) -> Value {
         "machines": rows,
         "seat_agents": agents_json(&agents_on(&f.agents, "")),
     })
+}
+
+fn fact<'a>(m: &'a Machine, k: &str) -> &'a str {
+    m.facts.get(k).map(String::as_str).unwrap_or("")
+}
+
+fn num<T: std::str::FromStr>(m: &Machine, k: &str) -> Option<T> {
+    fact(m, k).parse().ok()
+}
+
+fn record_of(m: &Machine) -> Record {
+    Record {
+        name: m.name.0.clone(),
+        ssh: fact(m, key::SSH).to_string(),
+        os: fact(m, key::OS).to_string(),
+        arch: fact(m, key::ARCH).to_string(),
+        backend_at: fact(m, key::BACKEND_AT).to_string(),
+        exec_dir: fact(m, key::EXEC_DIR).to_string(),
+        sup_at: fact(m, key::SUP_AT).to_string(),
+        agents: num(m, key::AGENTS),
+        lease: num(m, key::LEASE).unwrap_or(DEFAULT_LEASE),
+        status: fact(m, key::STATUS).to_string(),
+        added: fact(m, key::ADDED).to_string(),
+    }
+}
+
+/// The live facts of a machine, `None` when the daemon has no record of it.
+fn live_of(m: &Machine) -> Option<Live> {
+    m.facts.get(key::REACHABLE)?;
+    Some(Live {
+        reachable: fact(m, key::REACHABLE) == "true",
+        last_seen: fact(m, key::LAST_SEEN).to_string(),
+        heard: fact(m, key::HEARD).to_string(),
+        leases: serde_json::from_str(fact(m, key::LEASES)).unwrap_or_default(),
+        tunnel: fact(m, key::TUNNEL).to_string(),
+        socket: fact(m, key::SOCKET).to_string(),
+        wire: num(m, key::WIRE),
+        wire_oldest: num(m, key::WIRE_OLDEST),
+        ready: fact(m, key::READY) == "true",
+        checked: fact(m, key::CHECKED).to_string(),
+        check_error: fact(m, key::CHECK_ERROR).to_string(),
+        shim_warning: fact(m, key::SHIM_WARNING).to_string(),
+        error: fact(m, key::ERROR).to_string(),
+        tick_secs: num(m, key::TICK_SECS).unwrap_or(0),
+        beat_at: fact(m, key::BEAT_AT).to_string(),
+    })
+}
+
+/// `machine ls --json` over `State` alone: the machines that are records (they
+/// carry `ssh`), by name, and the seat's line from the machine the mirror names
+/// `local`. No agents are listed: nothing fills them in the CLI either.
+pub fn ls_of_state(state: &State, _now: i64) -> Value {
+    let seat = state.machines.values().find(|m| m.facts.contains_key(key::SEAT));
+    let f = Fleet {
+        machines: state
+            .machines
+            .values()
+            .filter(|m| m.facts.contains_key(key::SSH))
+            .map(|m| (record_of(m), live_of(m)))
+            .collect(),
+        agents: Vec::new(),
+        seat: seat.map(|m| fact(m, key::SEAT).to_string()).unwrap_or_default(),
+        seat_cap: seat.and_then(|m| num(m, key::SEAT_CAP)),
+        seat_working: seat.and_then(|m| serde_json::from_str(fact(m, key::SEAT_WORKING)).ok()).unwrap_or_default(),
+    };
+    list_json(&f)
 }
 
 #[cfg(test)]

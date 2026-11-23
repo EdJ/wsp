@@ -625,22 +625,45 @@ pub fn machines(files: &[MachineFile], live: &BTreeMap<String, MachineLive>, loc
     files
         .iter()
         .map(|m| {
+            use wsp_view::machine::key as k;
             let mut f = BTreeMap::new();
-            put(&mut f, "os", &m.os);
-            put(&mut f, "arch", &m.arch);
-            put(&mut f, "status", &m.status);
-            put(&mut f, "agents", &m.agents.map(|n| n.to_string()).unwrap_or_default());
-            put(&mut f, "lease", &m.lease.map(|n| n.to_string()).unwrap_or_default());
-            put(&mut f, "exec_dir", &m.exec_dir);
+            // The record, as `machine ls --json` draws it (wsp-308). `ssh` is
+            // always there: it marks a fact set that is a record.
+            f.insert(k::SSH.into(), m.ssh.clone());
+            put(&mut f, k::OS, &m.os);
+            put(&mut f, k::ARCH, &m.arch);
+            put(&mut f, k::BACKEND_AT, &m.backend_at);
+            put(&mut f, k::SUP_AT, &m.sup_at);
+            put(&mut f, k::ADDED, &m.added);
+            put(&mut f, k::STATUS, &m.status);
+            put(&mut f, k::AGENTS, &m.agents.map(|n| n.to_string()).unwrap_or_default());
+            put(&mut f, k::LEASE, &m.lease.map(|n| n.to_string()).unwrap_or_default());
+            put(&mut f, k::EXEC_DIR, &m.exec_dir);
             let mut beat = None;
             if let Some(l) = live.get(&m.name) {
-                f.insert("reachable".into(), l.reachable.to_string());
-                f.insert("ready".into(), l.ready.to_string());
+                f.insert(k::REACHABLE.into(), l.reachable.to_string());
+                f.insert(k::READY.into(), l.ready.to_string());
                 if l.tick_secs != 0 {
-                    f.insert("tick_secs".into(), l.tick_secs.to_string());
+                    f.insert(k::TICK_SECS.into(), l.tick_secs.to_string());
                 }
-                put(&mut f, "last_seen", &l.last_seen);
-                put(&mut f, "error", &l.error);
+                put(&mut f, k::LAST_SEEN, &l.last_seen);
+                put(&mut f, k::ERROR, &l.error);
+                put(&mut f, k::HEARD, &l.heard);
+                put(&mut f, k::BEAT_AT, &l.beat_at);
+                put(&mut f, k::TUNNEL, &l.tunnel);
+                put(&mut f, k::SOCKET, &l.socket);
+                put(&mut f, k::CHECKED, &l.checked);
+                put(&mut f, k::CHECK_ERROR, &l.check_error);
+                put(&mut f, k::SHIM_WARNING, &l.shim_warning);
+                if !l.leases.is_empty() {
+                    f.insert(k::LEASES.into(), serde_json::json!(l.leases).to_string());
+                }
+                if let Some(n) = l.wire {
+                    f.insert(k::WIRE.into(), n.to_string());
+                }
+                if let Some(n) = l.wire_oldest {
+                    f.insert(k::WIRE_OLDEST.into(), n.to_string());
+                }
                 let secs = wsp_base::util::epoch_of(&l.beat_at);
                 if secs > 0 {
                     beat = Some(At(secs as u64 * 1000));
@@ -785,7 +808,36 @@ pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     list_facts(store, worklists.clone(), &mut ls);
     out.extend(ls);
     out.extend(machines(&store.machines(), &store.machines_live(), local));
+    seat_machine(store, &mut out, local);
     out
+}
+
+/// The agents counted against the seat's cap, named. Installed by `main`
+/// (`cmd_machine` is above the mirror); unset, none are.
+pub static SEAT_WORKING: std::sync::OnceLock<fn(&Store) -> Vec<String>> = std::sync::OnceLock::new();
+
+/// This seat's own line of `machine ls`: it has no machine record, so its
+/// hostname, cap and the agents counted against it ride on the machine named
+/// `local` (wsp-308; keys in [`wsp_view::machine::key`]). A record named
+/// `local` takes the facts too.
+fn seat_machine(store: &Store, out: &mut Vec<Entity>, local: &str) {
+    use wsp_view::machine::key as k;
+    let cap = store.seat_cap();
+    let mut f = BTreeMap::new();
+    f.insert(k::SEAT.to_string(), wsp_base::util::hostname());
+    if let Some(n) = cap {
+        f.insert(k::SEAT_CAP.to_string(), n.to_string());
+        f.insert(k::SEAT_WORKING.to_string(), serde_json::json!(SEAT_WORKING.get().map(|f| f(store)).unwrap_or_default()).to_string());
+    }
+    for e in out.iter_mut() {
+        if let Entity::Machine(m) = e {
+            if m.name.0 == local {
+                m.facts.extend(f);
+                return;
+            }
+        }
+    }
+    out.push(Entity::Machine(c::Machine { name: MachineName(local.to_string()), transport: Transport::Local, beat: None, facts: f }));
 }
 
 /// What `worklist ls --json` reads that the files alone do not say, written

@@ -69,6 +69,12 @@ pub fn subject_of(entity: &Entity) -> Subject {
 /// `status`, `error`, ...) is not here: a change in one is a change.
 pub const LIVENESS: &[&str] = &[
     "last_seen",
+    // What `machine ls` shows of a far seat's beat (wsp-308): each answered
+    // beat moves them.
+    "heard",
+    "leases",
+    "beat_at",
+    "tick_secs",
     "load_centi",
     "load5_centi",
     "load15_centi",

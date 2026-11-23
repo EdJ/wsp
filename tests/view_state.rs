@@ -26,6 +26,7 @@ const PROJECTIONS: &[Projection] = &[
     ("ls-all", &["ls", "--all", "--json"], wsp_view::task::ls_all),
     ("wip", &["wip", "--json"], wip),
     ("worklist-ls", &["worklist", "ls", "--json"], worklist_ls),
+    ("machine-ls", &["machine", "ls", "--json"], machine_ls),
 ];
 
 /// Recordings `view_golden` already fails at HEAD (the fake manager gives an agent no
@@ -38,6 +39,10 @@ fn wip(state: &State, now: i64) -> String {
 
 fn worklist_ls(state: &State, now: i64) -> String {
     serde_json::to_string_pretty(&wsp_view::worklist::ls_of_state(state, now)).unwrap()
+}
+
+fn machine_ls(state: &State, now: i64) -> String {
+    wsp_view::machine::ls_of_state(state, now).to_string()
 }
 
 #[test]

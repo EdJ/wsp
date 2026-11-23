@@ -201,7 +201,7 @@ impl Fleet {
 /// The working agents the seat's cap is held against, named. Empty with no
 /// cap: nothing counts against a number nobody set, and the reading asks
 /// every seat's backend.
-fn seat_working(store: &Store) -> Vec<String> {
+pub(crate) fn seat_working(store: &Store) -> Vec<String> {
     match store.seat_cap() {
         None => Vec::new(),
         Some(_) => crate::room::Gate::new(store, &crate::cycle::Fleet).working().iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
@@ -288,11 +288,10 @@ fn standing(f: &Fleet) -> Vec<Standing> {
 /// wants the same three states and the same partition; this is the half that
 /// does not need the panel to hold still to be written. See wsp-054.
 pub fn list(store: &Store, args: &Args) -> i32 {
-    let f = Fleet::live(store);
     match args.json() {
-        true => println!("{}", list_json(&f)),
+        true => println!("{}", wsp_view::machine::ls_of_state(&crate::mirror::state_of(store, crate::mirror::LOCAL), util::epoch_secs())),
         false => {
-            for l in list_lines(&f, &Paint::new()) {
+            for l in list_lines(&Fleet::live(store), &Paint::new()) {
                 println!("{l}");
             }
         }
@@ -303,20 +302,6 @@ pub fn list(store: &Store, args: &Args) -> i32 {
 /// Partition the agents by machine. `""` is this seat.
 fn agents_on<'a>(here: &'a [Standing], name: &str) -> Vec<&'a Standing> {
     here.iter().filter(|s| s.machine == name).collect()
-}
-
-/// `machine ls --json`: the fleet's reads handed to `wsp-view` as plain values.
-fn list_json(f: &Fleet) -> Value {
-    wsp_view::machine::list_json(&wsp_view::machine::Fleet {
-        machines: f.machines.iter().map(|m| (record_of(m), f.live.get(&m.name).map(live_of))).collect(),
-        agents: standing(f)
-            .into_iter()
-            .map(|s| wsp_view::machine::Standing { machine: s.machine, pane: s.pane, agent: s.agent, state: s.state, holding: s.holding })
-            .collect(),
-        seat: f.seat.clone(),
-        seat_cap: f.seat_cap,
-        seat_working: f.seat_working.clone(),
-    })
 }
 
 /// The list as text, one line per element and nothing printed.
@@ -1347,7 +1332,6 @@ mod tests {
         f.seat_working = vec!["m-1 in w0:p6".into(), "m-2 starting".into()];
         let text = list_lines(&f, &plain()).join("\n");
         assert!(text.contains("seat  seat-under-test  4 agents at once · 2 working"), "{text}");
-        assert_eq!(list_json(&f)["seat_cap"], 4);
     }
 
 }
