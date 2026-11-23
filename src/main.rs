@@ -76,6 +76,7 @@ mod cmd_task;
 mod door;
 // After a `stale` (wsp-176): the merge, and the push and stale glue; called by the sync worker (wsp-464, wsp-469).
 #[allow(dead_code)]
+mod hub_cache;
 mod hub_sync;
 #[allow(dead_code)]
 mod reconcile;

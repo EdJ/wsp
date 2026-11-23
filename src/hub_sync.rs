@@ -30,16 +30,28 @@
 //! it changes, and another try after a wait that doubles from [`BACKOFF_MIN`]
 //! to [`BACKOFF_MAX`]. `$WSP_STATE/hub/sync.json` says how many turns ran and
 //! where the link stands.
+//!
+//! **The synced cache** (wsp-465, [`crate::hub_cache`]). The worker also holds
+//! a subscription to the hub's stream: a `ref.moved` is a turn at once, and
+//! `$WSP_STATE/hub/stream.json` keeps its position. Each turn reads the hub's
+//! heads of every workspace the user is a member of and sorts them: a row that
+//! is this spoke's own is synced whole as above; any other is kept as a head
+//! (title, status, holder, allocation) and listed as a stub nothing pushes. A
+//! feed that lost its connection is dropped, not redialled from its last id: the
+//! next turn opens one from the hub's head when it is more than
+//! [`hub_cache::GAP`] events behind, and the heads diff is the catch-up.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use wsp_client::{Client, Credential, ObjectSource, SyncError, SyncReport, HUBS_FILE};
+use wsp_api::{Answer, Outcome};
+use wsp_client::{Client, Credential, Feed, Item, ObjectSource, SyncError, SyncReport, HUBS_FILE};
 use wsp_objects::{Object, ObjectId, Refs, WorkspaceId};
-use wsp_store_contract::{At, Entity, Principal, RowId, Subject};
+use wsp_store_contract::{At, Entity, EventId, EventKind, Principal, RowId, Subject, UserName};
 
-use crate::door::{Applied, Door, Heads, Refusal};
+use crate::door::{user_of, Applied, Door, Heads, Refusal};
+use crate::hub_cache::{self, Cache, Stream};
 use crate::reconcile::{Lease, Merging, NoLease, Objects};
 use crate::store::Store;
 
@@ -49,7 +61,9 @@ use crate::store::Store;
 pub(crate) fn push_record(store: &Store, subject: &Subject, workspace: WorkspaceId, by: Principal, at: At) -> Option<Object> {
     let Subject::Row(id) = subject else { return None };
     let t = store.task(&id.0)?;
-    if t.workspace.is_private() {
+    // A private row never leaves; a row kept as a head only (wsp-465) is the
+    // hub's, and its stub is nothing to send back.
+    if t.workspace.is_private() || hub_cache::is_head(store, &id.0) {
         return None;
     }
     let text = std::fs::read_to_string(store.task_path(&id.0)).ok()?;
@@ -108,6 +122,15 @@ pub(crate) fn start(store: &Store) -> Option<std::thread::JoinHandle<()>> {
             Worker::new(home).run(&store, turn)
         })
         .ok()
+}
+
+/// Take the row `id`, kept as a head only, whole from the hub (`wsp show --fetch`).
+pub(crate) fn fetch(store: &Store, id: &str) -> Result<(), String> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME")?);
+    if !home.join(HUBS_FILE).exists() {
+        return Err("not logged in to a hub: `wsp login <url>`".into());
+    }
+    Worker::new(home).fetch(store, id)
 }
 
 /// Where the hub stands for this spoke.
@@ -214,6 +237,8 @@ pub(crate) struct Turned {
     pub(crate) adopted: usize,
     /// Moves refused `stale` and heads that diverged, handed to reconcile.
     pub(crate) reconciled: usize,
+    /// Rows of other people's kept as a head (wsp-465).
+    pub(crate) heads: usize,
 }
 
 /// The sync worker: its connection, where the link stands, and what it said.
@@ -229,6 +254,11 @@ pub(crate) struct Worker {
     /// Lines already in the log, so a refusal that repeats each turn is said once.
     said: BTreeSet<String>,
     pub(crate) turns: u64,
+    /// The hub's stream for this spoke's workspaces (wsp-465): a wake-up for
+    /// the turn, and the position `stream.json` keeps.
+    feed: Option<Feed>,
+    /// Rows to take whole whatever they are (`wsp show --fetch`).
+    forced: BTreeSet<Subject>,
 }
 
 impl Worker {
@@ -242,6 +272,8 @@ impl Worker {
             minted: BTreeMap::new(),
             said: BTreeSet::new(),
             turns: 0,
+            feed: None,
+            forced: BTreeSet::new(),
         }
     }
 
@@ -261,7 +293,10 @@ impl Worker {
                 let _ = self.turn(store);
                 due = Instant::now() + turn;
             }
-            std::thread::sleep(POLL);
+            // Between turns: the hub's stream; a moved ref is a turn at once.
+            if self.listen(store, POLL) {
+                due = Instant::now();
+            }
         }
     }
 
@@ -323,7 +358,7 @@ impl Worker {
             "turns": self.turns,
             "link": self.link.word(),
             "why": match &self.link { Link::Down(w) => Some(w.clone()), _ => None },
-            "last": last.map(|t| serde_json::json!({ "sent": t.sent, "moved": t.moved, "adopted": t.adopted, "reconciled": t.reconciled })),
+            "last": last.map(|t| serde_json::json!({ "sent": t.sent, "moved": t.moved, "adopted": t.adopted, "reconciled": t.reconciled, "heads": t.heads })),
         });
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(format!(".sync.json.{}.tmp", std::process::id()));
@@ -346,58 +381,205 @@ impl Worker {
         Ok(self.client.as_mut().expect("dialled above"))
     }
 
+    /// The user this connection is, the hub's event head now, and the shared
+    /// workspaces the user is a member of (`state`'s identity domain). A hub
+    /// that will not say leaves the workspaces to the stream's.
+    fn members(&mut self) -> Result<(Vec<String>, u64), String> {
+        let client = self.client()?;
+        let head = client.head().0;
+        let me = user_of(client.by());
+        let reply = client.request("state", serde_json::json!({})).map_err(|e| e.to_string())?;
+        let Outcome::Ok(Answer::State { state, at }) = reply.outcome else { return Ok((Vec::new(), head)) };
+        let user = UserName(me);
+        let names = state
+            .members
+            .iter()
+            .filter(|(w, users)| users.contains(&user) && state.workspaces.contains_key(*w))
+            .map(|(w, _)| format!("shared:{}", w.0))
+            .collect();
+        Ok((names, at.0))
+    }
+
+    /// Subscribe to the hub's stream where there is no feed: from the position
+    /// `stream.json` holds when it is within [`hub_cache::GAP`] of the hub's
+    /// head, else from the head (the turn's heads diff stands in for what was
+    /// skipped, one frame and not an event per change).
+    fn open_feed(&mut self, store: &Store) -> Result<(), String> {
+        if self.feed.is_some() {
+            return Ok(());
+        }
+        let (names, head) = self.members()?;
+        let mut stream = Stream::read(store);
+        stream.workspaces.extend(names);
+        let (from, gap) = hub_cache::resume(stream.position, head);
+        stream.position = Some(from);
+        let _ = stream.write(store);
+        if gap {
+            crate::store::log_line(store, &format!("hub-sync: the stream resumes at {from}, a heads diff in place of the events missed"));
+        }
+        let feed = self.client()?.subscribe(Some(EventId(from)));
+        self.feed = Some(feed);
+        Ok(())
+    }
+
+    /// Hear the stream for up to `wait`; whether a ref moved. The position and
+    /// the workspaces heard of are kept in `stream.json`.
+    fn listen(&mut self, store: &Store, wait: Duration) -> bool {
+        let Some(feed) = self.feed.as_mut() else {
+            std::thread::sleep(wait);
+            return false;
+        };
+        // A feed that lost its connection would dial again and ask for every
+        // event since its last: not the way back from an outage. It is dropped,
+        // and the turn that follows opens one through `hub_cache::resume`.
+        if feed.why_silent().is_some() || feed.reconnects() > 0 {
+            self.feed = None;
+            std::thread::sleep(wait);
+            return false;
+        }
+        let end = Instant::now() + wait;
+        let mut stream = Stream::read(store);
+        let before = stream.clone();
+        let mut woke = false;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            match feed.next_within(left) {
+                Some(Item::Event(e)) => {
+                    if e.kind == EventKind::RefMoved {
+                        woke = true;
+                        if let Some(w) = e.payload.get("workspace").and_then(|w| w.as_str()) {
+                            stream.workspaces.insert(w.to_string());
+                        }
+                    }
+                }
+                Some(Item::State { .. } | Item::Resync { .. } | Item::Resumed { .. }) => woke = true,
+                Some(Item::Gone { .. }) => {}
+                None => break,
+            }
+            if Instant::now() >= end || feed.why_silent().is_some() {
+                break;
+            }
+        }
+        if let Some(last) = feed.last_id() {
+            stream.position = Some(last.0);
+        }
+        if feed.refused().is_some() {
+            self.feed = None;
+        }
+        if stream != before {
+            let _ = stream.write(store);
+        }
+        woke
+    }
+
     /// Every shared workspace once. `Err` is the hub not answering; a
     /// workspace it refuses is said in the log once and the rest go on.
     fn sync_all(&mut self, store: &Store) -> Result<Turned, String> {
-        let workspaces = crate::mirror::by_shared_workspace(store.tasks());
-        let mut turned = Turned::default();
-        if workspaces.is_empty() {
-            return Ok(turned);
+        self.open_feed(store)?;
+        let mut workspaces: BTreeMap<String, Vec<crate::model::Task>> =
+            crate::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
+        for w in Stream::read(store).workspaces {
+            workspaces.entry(w).or_default();
         }
+        let mut turned = Turned::default();
         let by = self.client()?.by().clone();
-        let objects = ObjectDir::of(store);
         for (ws, tasks) in workspaces {
-            let wid = WorkspaceId(ws.to_string());
-            let heads = Heads::read(store);
-            let mut local = Refs::new(wid.clone());
-            // What this sync pushes: the record's id and the file it was made of.
-            let mut pushing: BTreeMap<Subject, (ObjectId, Option<ObjectId>)> = BTreeMap::new();
-            for t in &tasks {
-                let subject = Subject::Row(RowId(t.id.clone()));
-                let digest = file_digest(store, &t.id);
-                let synced = heads.head(&subject).copied();
-                if synced.is_some() && heads.file(&subject) == digest {
-                    local.set(subject, synced.expect("checked"));
-                    continue;
-                }
-                let id = match self.minted.get(&subject) {
-                    Some((d, id)) if *d == digest && objects.has(id) => *id,
-                    _ => {
-                        let Some(obj) = push_record(store, &subject, wid.clone(), by.clone(), At(now_ms())) else { continue };
-                        let (id, bytes) = wsp_objects::encode(&obj);
-                        if let Err(e) = objects.put(&id, &bytes) {
-                            self.say_once(store, format!("hub-sync: cannot keep {}'s object: {e}", t.id));
-                            continue;
-                        }
-                        self.minted.insert(subject.clone(), (digest, id));
-                        id
-                    }
-                };
-                local.set(subject.clone(), id);
-                pushing.insert(subject, (id, digest));
-            }
-            let client = self.client()?;
-            let report = match client.sync(&wid, &local, &objects) {
-                Ok(r) => r,
-                Err(SyncError::Request(e)) if unreachable(&e) => return Err(e.to_string()),
-                Err(e) => {
-                    self.say_once(store, format!("hub-sync: {ws} did not sync: {e}"));
-                    continue;
-                }
-            };
-            self.keep(store, &objects, &heads, &pushing, &report, &by, &mut turned);
+            self.sync_workspace(store, &ws, &tasks, &by, &mut turned)?;
         }
         Ok(turned)
+    }
+
+    /// One shared workspace: the hub's heads sorted into the rows kept whole
+    /// and the heads of the rest ([`hub_cache::classify`]), then the sync of the
+    /// whole ones.
+    fn sync_workspace(
+        &mut self,
+        store: &Store,
+        ws: &str,
+        tasks: &[crate::model::Task],
+        by: &Principal,
+        turned: &mut Turned,
+    ) -> Result<(), String> {
+        let wid = WorkspaceId(ws.to_string());
+        let objects = ObjectDir::of(store);
+        let me = user_of(by);
+        let forced = self.forced.clone();
+        let client = self.client()?;
+        let hub = match client.sync_heads(&wid) {
+            Ok(r) => r,
+            Err(e) if unreachable(&e) => return Err(e.to_string()),
+            Err(e) => {
+                self.say_once(store, format!("hub-sync: {ws} did not sync: {e}"));
+                return Ok(());
+            }
+        };
+        let classified = match hub_cache::classify(store, client, ws, &hub, &me, by, &forced) {
+            Ok(c) => c,
+            Err(why) => {
+                self.say_once(store, format!("hub-sync: the heads of {ws} were not read: {why}"));
+                return Ok(());
+            }
+        };
+        turned.heads += classified.heads;
+        // The rows this spoke syncs whole: its own files (not heads) and the
+        // ones just taken on.
+        let cache = Cache::read(store);
+        let mut included: BTreeSet<Subject> = classified.whole;
+        let heads = Heads::read(store);
+        let mut local = Refs::new(wid.clone());
+        // What this sync pushes: the record's id and the file it was made of.
+        let mut pushing: BTreeMap<Subject, (ObjectId, Option<ObjectId>)> = BTreeMap::new();
+        for t in tasks.iter().filter(|t| !cache.is_head(&t.id) && store.task(&t.id).is_some()) {
+            let subject = Subject::Row(RowId(t.id.clone()));
+            included.insert(subject.clone());
+            let digest = file_digest(store, &t.id);
+            let synced = heads.head(&subject).copied();
+            if synced.is_some() && heads.file(&subject) == digest {
+                local.set(subject, synced.expect("checked"));
+                continue;
+            }
+            let id = match self.minted.get(&subject) {
+                Some((d, id)) if *d == digest && objects.has(id) => *id,
+                _ => {
+                    let Some(obj) = push_record(store, &subject, wid.clone(), by.clone(), At(now_ms())) else { continue };
+                    let (id, bytes) = wsp_objects::encode(&obj);
+                    if let Err(e) = objects.put(&id, &bytes) {
+                        self.say_once(store, format!("hub-sync: cannot keep {}'s object: {e}", t.id));
+                        continue;
+                    }
+                    self.minted.insert(subject.clone(), (digest, id));
+                    id
+                }
+            };
+            local.set(subject.clone(), id);
+            pushing.insert(subject, (id, digest));
+        }
+        let client = self.client()?;
+        let report = match client.sync_skipping(&wid, &local, &objects, &|s| !included.contains(s)) {
+            Ok(r) => r,
+            Err(SyncError::Request(e)) if unreachable(&e) => return Err(e.to_string()),
+            Err(e) => {
+                self.say_once(store, format!("hub-sync: {ws} did not sync: {e}"));
+                return Ok(());
+            }
+        };
+        self.keep(store, &objects, &heads, &pushing, &report, by, turned);
+        Ok(())
+    }
+
+    /// `wsp show <id> --fetch` (wsp-465): take a row kept as a head whole, now.
+    pub(crate) fn fetch(&mut self, store: &Store, id: &str) -> Result<(), String> {
+        let cache = Cache::read(store);
+        let head = cache.get(id).ok_or_else(|| format!("{id} is not kept as a head only"))?;
+        let ws = head.workspace.clone();
+        self.forced.insert(Subject::Row(RowId(id.to_string())));
+        let by = self.client()?.by().clone();
+        let tasks: Vec<crate::model::Task> = store.tasks().into_iter().filter(|t| t.workspace.to_string() == ws).collect();
+        self.sync_workspace(store, &ws, &tasks, &by, &mut Turned::default())?;
+        match hub_cache::is_head(store, id) || store.task(id).is_none() {
+            true => Err(format!("{id} was not fetched; the hub's answer is in `cycle.log`")),
+            false => Ok(()),
+        }
     }
 
     /// What a sync's report leaves in the store: the moved heads synced, the

@@ -161,7 +161,7 @@ pub(crate) fn task_of_record(row: &wsp_store_contract::Row) -> Option<Task> {
 }
 
 /// The name a principal's write is logged under.
-fn user_of(by: &Principal) -> String {
+pub(crate) fn user_of(by: &Principal) -> String {
     match by {
         Principal::Person(n) => n.clone(),
         Principal::Seat(s) => s.0.clone(),
@@ -223,6 +223,11 @@ impl Heads {
 
     pub(crate) fn set(&mut self, subject: &Subject, head: ObjectId, file: Option<ObjectId>) {
         self.by_subject.insert(key(subject), (subject.clone(), head, file));
+    }
+
+    /// Forget `subject`'s synced head: the next import of it is a new file's.
+    pub(crate) fn remove(&mut self, subject: &Subject) {
+        self.by_subject.remove(&key(subject));
     }
 
     pub(crate) fn write(&self, store: &Store) -> std::io::Result<()> {

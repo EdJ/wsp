@@ -800,7 +800,7 @@ fn show_piece(a: &crate::pieces::Addressed) -> i32 {
 
 pub fn show(store: &Store, args: &Args) -> i32 {
     let Some(needle) = args.rest.first().cloned() else {
-        eprintln!("usage: wsp show <id> [--log]");
+        eprintln!("usage: wsp show <id> [--log] [--fetch]");
         return 2;
     };
     // The one reader that opts in to an archived record rather than settling
@@ -832,7 +832,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     }
-    let (t, archived) = match store.resolve_task(&needle) {
+    let (mut t, archived) = match store.resolve_task(&needle) {
         crate::store::Found::One(t) => (*t, None),
         crate::store::Found::Archived(t, path) => (*t, Some(path)),
         other => {
@@ -840,6 +840,16 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // A row the synced cache keeps as a head only (wsp-465), brought whole.
+    if args.has("fetch") && crate::hub_cache::is_head(store, &t.id) {
+        if let Err(why) = crate::hub_sync::fetch(store, &t.id) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+        if let Some(whole) = store.task(&t.id) {
+            t = whole;
+        }
+    }
 
     let p = Paint::new();
     let index = Index::new(store.projects());
@@ -861,6 +871,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     println!("{} {}", p.dim(&util::pad("created", 9)), t.created);
     println!("{} {}", p.dim(&util::pad("updated", 9)), t.updated);
+    // A head says so, above everything it does not have.
+    if let Some(line) = crate::hub_cache::show_line(store, &t.id) {
+        println!("{} {}", p.dim(&util::pad("hub", 9)), line);
+    }
     // Above the prose rather than after it. Everything below this point reads
     // as a live record — a status, a parent, a log that stops — and a reader
     // who learns at the bottom that none of it is current has already acted on

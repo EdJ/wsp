@@ -264,11 +264,28 @@ impl Client {
         local: &Refs,
         source: &impl ObjectSource,
     ) -> Result<SyncReport, SyncError> {
+        self.sync_skipping(workspace, local, source, &|_| false)
+    }
+
+    /// [`Client::sync`] over the subjects `skip` does not name: one it names is
+    /// left out of the diff, so nothing of it is fetched, adopted or pushed
+    /// (the spoke's synced cache keeps only the head of a row that is not its
+    /// own, wsp-465).
+    pub fn sync_skipping(
+        &mut self,
+        workspace: &WorkspaceId,
+        local: &Refs,
+        source: &impl ObjectSource,
+        skip: &dyn Fn(&Subject) -> bool,
+    ) -> Result<SyncReport, SyncError> {
         if local.workspace != *workspace {
             return Err(SyncError::Workspace { asked: workspace.clone(), refs: local.workspace.clone() });
         }
         let theirs = self.sync_heads(workspace)?;
-        let diff = wsp_objects::diff(local, &theirs).map_err(|_| SyncError::HubWorkspace(theirs.workspace.clone()))?;
+        let mut diff = wsp_objects::diff(local, &theirs).map_err(|_| SyncError::HubWorkspace(theirs.workspace.clone()))?;
+        diff.we_lack.retain(|s| !skip(s));
+        diff.they_lack.retain(|s| !skip(s));
+        diff.differ.retain(|s| !skip(s));
         let mut held = Held { source, fetched: BTreeMap::new() };
 
         // 2. Fetch, generation by generation, children before parents.
