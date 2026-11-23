@@ -1422,3 +1422,76 @@ fn a_member_added_mid_stream_is_sent_a_resync_and_then_that_workspaces_events() 
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
+
+fn unmember(store: &MemStore, workspace: &str, user: &str, key: &str) {
+    let cmd = Command::HubMemberSet { workspace: SharedName(workspace.into()), user: UserName(user.into()), member: false };
+    store.apply(cmd, IdempotencyKey(key.into()), Principal::Person("admin".into())).unwrap();
+}
+
+/// What ed's resubscribe from `last` is answered with: the first frame and the rows in it.
+fn resubscribe_rows(d: &Path, last: EventId, head: EventId) -> Vec<String> {
+    let mut c = connect(d);
+    c.subscribe(Some(last));
+    match c.next_feed() {
+        Feed::Resync { state, at } => {
+            assert_eq!(at, head, "the resync is at the head");
+            let mut rows: Vec<String> = state.rows.keys().map(|r| r.0.clone()).collect();
+            rows.sort();
+            rows
+        }
+        other => panic!("expected a resync, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_scope_change_while_the_subscriber_is_away_is_a_resync_on_resubscribe_from_its_last_id() {
+    let d = dir("scoped-redial");
+    let store = MemStore::with_domain(Arc::new(Members));
+    member(&store, "core", "ed", "m1");
+    member(&store, "other", "ed", "m2");
+    apply(
+        &store,
+        vec![row_in("c-1", shared("core")), row_in("o-1", shared("other")), row_in("p-1", WorkspaceId::Private)],
+        vec![],
+        "seed",
+    );
+    let server = start_scoped(Arc::new(store.handle()), &d);
+    let mut last = store.head().unwrap();
+
+    // Away, only events of core: the replay is the events, as for an unscoped subscriber.
+    let c2 = apply(&store, vec![row_in("c-2", shared("core"))], vec![], "c2");
+    let mut c = connect(&d);
+    c.subscribe(Some(last));
+    assert_eq!(next_event(&mut c).id, c2.events[0]);
+    last = c2.events[0];
+    drop(c);
+
+    // Away, a held record moves out: a resync without it, not a bare event or silence.
+    apply(&store, vec![row_in("c-2", WorkspaceId::Private)], vec![], "c2-out");
+    assert_eq!(resubscribe_rows(&d, last, store.head().unwrap()), ["c-1", "o-1"]);
+    last = store.head().unwrap();
+
+    // Away, a record moves in and out again: the resync has neither the move nor the record.
+    apply(&store, vec![row_in("p-1", shared("core"))], vec![], "p1-in");
+    apply(&store, vec![row_in("p-1", WorkspaceId::Private)], vec![], "p1-out");
+    assert_eq!(resubscribe_rows(&d, last, store.head().unwrap()), ["c-1", "o-1"]);
+    last = store.head().unwrap();
+
+    // Away, ed leaves other: the resync drops its records, which the client held.
+    unmember(&store, "other", "ed", "m3");
+    assert_eq!(resubscribe_rows(&d, last, store.head().unwrap()), ["c-1"]);
+    last = store.head().unwrap();
+
+    // Away, ed is added to other: the resync has its earlier records.
+    member(&store, "other", "ed", "m4");
+    assert_eq!(resubscribe_rows(&d, last, store.head().unwrap()), ["c-1", "o-1"]);
+
+    // After a resync the feed is live and scoped as it was.
+    let mut c = connect(&d);
+    c.subscribe(Some(store.head().unwrap()));
+    apply(&store, vec![row_in("x", WorkspaceId::Private)], vec![], "x");
+    let o2 = apply(&store, vec![row_in("o-2", shared("other"))], vec![], "o2");
+    assert_eq!(next_event(&mut c).id, o2.events[0]);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}

@@ -59,6 +59,11 @@ struct Watch {
     sight: Option<BTreeSet<SharedName>>,
     /// The records the subscriber holds, by subject (rows, lists, orders, asks).
     seen: BTreeSet<Subject>,
+    /// The head the scope was read at. An event at or before it is a replay
+    /// (`subscribe {from}`): the scope the subscriber had at `from` is not
+    /// kept, so an event that could have changed it is answered with a
+    /// [`Feed::Resync`] at the head instead of being replayed.
+    replay_to: EventId,
 }
 
 /// What the events read so far leave to send.
@@ -75,16 +80,17 @@ pub(crate) fn open(shared: &Shared, sub: &Subscribe, by: &Principal) -> Result<O
         None => {
             let (state, at) = store.snapshot().map_err(store_failure)?;
             let sight = gate.and_then(|g| g.readable(by, &state));
-            let mut watch = Watch { by: by.clone(), sight, seen: BTreeSet::new() };
+            let mut watch = Watch { by: by.clone(), sight, seen: BTreeSet::new(), replay_to: EventId(0) };
             let state = watch.scope(state);
             Ok(Opened { first: snapshot_frames(state, at), cursor: at, watch })
         }
         Some(from) => {
             let events = store.events_after(from, MAX_EVENTS as usize).map_err(store_failure)?;
-            let mut watch = Watch { by: by.clone(), sight: None, seen: BTreeSet::new() };
+            let mut watch = Watch { by: by.clone(), sight: None, seen: BTreeSet::new(), replay_to: EventId(0) };
             if let Some(gate) = gate {
-                let (state, _) = store.snapshot().map_err(store_failure)?;
+                let (state, at) = store.snapshot().map_err(store_failure)?;
                 watch.sight = gate.readable(by, &state);
+                watch.replay_to = at;
                 watch.scope(state);
             }
             let cursor = events.last().map_or(from, |e| e.id);
@@ -129,6 +135,9 @@ impl Watch {
     /// the resync is at the head, which has what the rest of it held.
     fn read(&mut self, shared: &Shared, events: Vec<Event>, cursor: EventId) -> Result<Sent, Error> {
         let mut sent = Sent { frames: Vec::new(), cursor };
+        // A replay that could not be told from the scope it left: the fresh
+        // snapshot, sent last (the client drops what is at or before it).
+        let mut resync: Option<(Vec<Feed>, EventId)> = None;
         for e in events {
             let id = e.id;
             if self.sight.is_none() {
@@ -136,28 +145,60 @@ impl Watch {
                 sent.cursor = id;
                 continue;
             }
-            if matches!(e.subject, Subject::Member { .. } | Subject::Workspace(_)) {
-                if let Some((frames, at)) = self.rescope(shared)? {
-                    sent.frames.extend(frames);
-                    sent.cursor = at;
-                    break;
+            if resync.as_ref().is_some_and(|(_, at)| id > *at) {
+                break;
+            }
+            let identity = matches!(e.subject, Subject::Member { .. } | Subject::Workspace(_));
+            // A replay cannot say what the scope was at `from`: an identity
+            // event, or a held record's event outside the scope the head
+            // gives (it may have just left), is a resync at the head.
+            let replaying = id <= self.replay_to;
+            let unknown = replaying && (identity || (self.is_held(&e) && !self.reads(&e)));
+            if resync.is_none() && (identity || unknown) {
+                if let Some((frames, at)) = self.rescope(shared, unknown)? {
+                    if !replaying {
+                        // The resync is the head, which has what the frames before it said.
+                        sent.frames = frames;
+                        sent.cursor = at;
+                        return Ok(sent);
+                    }
+                    // What is not a held record's (a ref moving, a lease) is not in
+                    // the snapshot: it is still sent, before it.
+                    sent.frames.retain(|f| !self.is_held_frame(f));
+                    resync = Some((frames, at));
                 }
             }
             sent.cursor = id;
+            if resync.is_some() && (identity || self.is_held(&e)) {
+                continue;
+            }
             if let Some(frame) = self.admit(shared, e)? {
                 sent.frames.push(frame);
             }
         }
+        if let Some((frames, at)) = resync {
+            sent.frames.extend(frames);
+            sent.cursor = at;
+        }
         Ok(sent)
+    }
+
+    /// Whether `f` says something of a record the subscriber holds.
+    fn is_held_frame(&self, f: &Feed) -> bool {
+        match f {
+            Feed::Gone { .. } => true,
+            Feed::Event(e) => self.is_held(e),
+            _ => false,
+        }
     }
 
     /// The fresh snapshot, and the id it is at, when the principal's
     /// workspaces are not what they were.
-    fn rescope(&mut self, shared: &Shared) -> Result<Option<(Vec<Feed>, EventId)>, Error> {
+    fn rescope(&mut self, shared: &Shared, force: bool) -> Result<Option<(Vec<Feed>, EventId)>, Error> {
         let Some(gate) = &shared.cfg.gate else { return Ok(None) };
         let (state, at) = shared.store.snapshot()?;
         let now = gate.readable(&self.by, &state);
-        if now == self.sight {
+        if now == self.sight && !force {
             return Ok(None);
         }
         self.sight = now;
@@ -169,12 +210,24 @@ impl Watch {
         Ok(Some((frames, at)))
     }
 
+    /// Whether `e` is in a workspace this subscription may read.
+    fn reads(&self, e: &Event) -> bool {
+        matches!((&self.sight, &e.workspace), (Some(sight), WorkspaceId::Shared(n)) if sight.contains(n))
+    }
+
+    /// Whether `e` is an event of a record the subscriber holds whole.
+    fn is_held(&self, e: &Event) -> bool {
+        matches!(e.subject, Subject::Row(_) | Subject::List(_) | Subject::Order(_) | Subject::Ask(_))
+            && e.kind != EventKind::RefMoved
+    }
+
     /// What `e` is to this subscription: itself, a `gone`, the record whole, or nothing.
     fn admit(&mut self, shared: &Shared, e: Event) -> Result<Option<Feed>, Error> {
-        let Some(sight) = &self.sight else { return Ok(Some(Feed::Event(e))) };
-        let inside = matches!(&e.workspace, WorkspaceId::Shared(n) if sight.contains(n));
-        let held = matches!(e.subject, Subject::Row(_) | Subject::List(_) | Subject::Order(_) | Subject::Ask(_))
-            && e.kind != EventKind::RefMoved;
+        if self.sight.is_none() {
+            return Ok(Some(Feed::Event(e)));
+        }
+        let inside = self.reads(&e);
+        let held = self.is_held(&e);
         Ok(match (inside, held) {
             (true, false) => Some(Feed::Event(e)),
             (true, true) => {
