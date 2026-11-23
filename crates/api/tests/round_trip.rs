@@ -764,7 +764,7 @@ fn every_answer_round_trips() {
 
 // ---------------------------------------------------------------- codes
 
-const CODES: usize = 14;
+const CODES: usize = 15;
 
 fn code_ordinal(c: Code) -> (usize, &'static str) {
     match c {
@@ -781,7 +781,8 @@ fn code_ordinal(c: Code) -> (usize, &'static str) {
         Code::Protocol => (10, "protocol"),
         Code::Unsupported => (11, "unsupported"),
         Code::Backend => (12, "backend"),
-        Code::Unknown => (13, "unknown"),
+        Code::Fenced => (13, "fenced"),
+        Code::Unknown => (14, "unknown"),
     }
 }
 
@@ -880,7 +881,8 @@ fn errors() -> Vec<Frame> {
         }),
         err(12, Code::Unsupported, None),
         err(13, Code::Backend, None),
-        err(14, Code::Unknown, None),
+        err(14, Code::Fenced, None),
+        err(15, Code::Unknown, None),
     ]
 }
 

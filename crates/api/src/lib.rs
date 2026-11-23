@@ -47,7 +47,7 @@ pub mod sync;
 #[cfg(any(test, feature = "test-support"))]
 pub use conn::{pair, Memory};
 pub use conn::{ConnError, Connection, MAX_LINE};
-pub use sync::{row_id, Blob, IdsAlloc, LeaseHold, LeaseTake, Move, ObjectId, RefMove, Refs, SyncCall, WorkspaceId, MAX_IDS, SYNC_VERBS};
+pub use sync::{fence_subject, fenced_by, fenced_event, row_id, Blob, IdsAlloc, LeaseHold, LeaseTake, Move, ObjectId, RefMove, Refs, SyncCall, WorkspaceId, FENCE_TOKEN, MAX_IDS, SYNC_VERBS};
 
 pub use wsp_store_contract::{
     Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListFilter,
@@ -527,6 +527,11 @@ pub enum Code {
     Unsupported,
     /// The store failed (the contract's `Error::Backend`); a retry may pass.
     Backend,
+    /// A verdict or a landing pushed under a lease token that is not the row's
+    /// current one (wsp-468): the writer lost its lease, or never held it, and
+    /// has not noticed. Carries no contract refusal; the text names the current
+    /// token. Nothing was written.
+    Fenced,
     /// A code this build does not know, from a newer peer.
     #[serde(other)]
     Unknown,

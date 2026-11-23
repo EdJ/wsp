@@ -2007,6 +2007,12 @@ pub(crate) fn landed(t: &Task) -> Option<String> {
     newest_commit(t, &[LANDED, READING])
 }
 
+/// The commit of the member's newest `wsp: landed` line (wsp-468: what a shared
+/// row's landing object names).
+pub(crate) fn landed_line(t: &Task) -> Option<String> {
+    commits_of(t, LANDED).pop()
+}
+
 /// The commit the member's newest ready line names, unless a landed line for
 /// that same commit has since put it on the trunk. `None` for a row that was
 /// never reviewed ready, and for one that has landed.

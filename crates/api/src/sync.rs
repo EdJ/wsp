@@ -45,6 +45,15 @@
 //!   let go; one already released or retaken (another token) is answered the
 //!   same, as the store's release is.
 //!
+//! **Verdicts and landings** (wsp-468). A shared row's verdict (`row.reviewed`)
+//! and landing (`row.landed`) are pushed as `Event` objects ([`fenced_event`])
+//! on the subject `lease:row:<row>`, each carrying the row's lease token in its
+//! payload's `token`. A `sync.put` of one, or a `refs.move` to one, is refused
+//! `fenced` ([`Code::Fenced`](crate::Code::Fenced)) when that token is not the
+//! row's current one (the lease expired, or was taken by another user since),
+//! or the caller is not its holder; nothing is written, so the row stays as its
+//! current holder left it. An object with no `token` is refused the same.
+//!
 //! An expired lease is released by the hub, which announces `lease.expired
 //! { workspace, row, holder, token }` on its stream.
 //!
@@ -57,7 +66,9 @@
 //! the wire's.
 
 use serde::{Deserialize, Serialize};
-use wsp_store_contract::{RowId, Subject, Token};
+use serde_json::{json, Value};
+use wsp_objects::Object;
+use wsp_store_contract::{At, EventKind, LeaseName, Principal, RowId, Subject, Token};
 
 pub use wsp_objects::{ObjectId, Refs, WorkspaceId};
 
@@ -196,6 +207,53 @@ pub struct LeaseTake {
 pub struct LeaseHold {
     pub row: RowId,
     pub token: Token,
+}
+
+/// The payload field a verdict's or landing's lease token is in.
+pub const FENCE_TOKEN: &str = "token";
+
+/// The subject a row's verdicts and landings are chained on: the row's lease.
+pub fn fence_subject(row: &RowId) -> Subject {
+    Subject::Lease(LeaseName(format!("row:{}", row.0)))
+}
+
+/// A verdict (`row.reviewed`) or a landing (`row.landed`) of `row` as an
+/// object under the lease `token`: `payload`'s fields (the verdict, the commit
+/// on the remote) with the token added. `parent` is the head of
+/// [`fence_subject`] the writer saw.
+pub fn fenced_event(
+    workspace: WorkspaceId,
+    row: &RowId,
+    kind: EventKind,
+    payload: Value,
+    token: Token,
+    parent: Option<ObjectId>,
+    by: Principal,
+    at: At,
+) -> Object {
+    let mut payload = match payload {
+        Value::Object(o) => Value::Object(o),
+        Value::Null => json!({}),
+        other => json!({ "value": other }),
+    };
+    payload[FENCE_TOKEN] = json!(token.0);
+    Object::Event { workspace, subject: fence_subject(row), kind, payload, parent, by, at }
+}
+
+/// The row an object is a verdict or a landing of, and the token it carries
+/// (none when it names none): `Some` for a `row.reviewed` or `row.landed` event
+/// on a row or on its lease, which the hub holds to the row's current token.
+pub fn fenced_by(object: &Object) -> Option<(RowId, Option<Token>)> {
+    let Object::Event { subject, kind, payload, .. } = object else { return None };
+    if !matches!(kind, EventKind::RowReviewed | EventKind::RowLanded) {
+        return None;
+    }
+    let row = match subject {
+        Subject::Row(row) => row.clone(),
+        Subject::Lease(name) => RowId(name.0.strip_prefix("row:")?.to_string()),
+        _ => return None,
+    };
+    Some((row, payload.get(FENCE_TOKEN).and_then(Value::as_u64).map(Token)))
 }
 
 /// The id numbered `n` under `project`, as a store names it (`wsp-007`).

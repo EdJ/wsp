@@ -29,6 +29,11 @@
 //! workspace) says `for: <user>` in its fields, or which is in a list that
 //! does, is refused `forbidden` to any other user.
 //!
+//! **Fencing** (wsp-468). A verdict or a landing pushed for a row carries the
+//! row's lease token ([`wsp_api::fenced_by`]); [`Hub::check_fence`] refuses
+//! `fenced` one that is not the current token of an unexpired lease the caller
+//! holds. The check and the write it guards happen under the one lock.
+//!
 //! The hub is one process; one lock orders every lease change in it, so a
 //! take, a renew and the sweep never interleave.
 
@@ -37,7 +42,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use wsp_api::{LeaseHold, LeaseTake, WorkspaceId};
+use wsp_api::{Code, Failure, LeaseHold, LeaseTake, WorkspaceId};
 use wsp_objects::Object;
 use wsp_store_contract::{
     At, Entity, Error, LeaseName, Leases, Principal, Reads, Refusal, Result, RowId, Subject, Texts, Token,
@@ -159,7 +164,7 @@ impl Hub {
         self.desk.ttl + Duration::from_millis(self.desk.clock.advanced())
     }
 
-    fn locked(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn locked(&self) -> std::sync::MutexGuard<'_, ()> {
         self.desk.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -228,6 +233,32 @@ impl Hub {
             Some(cur) if cur.token == hold.token => Leases::release(&self.db, &name, cur.token),
             _ => Ok(()),
         }
+    }
+
+    /// Whether `by` may push a verdict or a landing of `row` under `token`: it
+    /// holds `row`'s lease, unexpired, and `token` is its current token.
+    /// Refused `fenced` otherwise, naming the current token; the caller holds
+    /// [`Hub::locked`]'s guard across this and the write.
+    pub(crate) fn check_fence(&self, by: &Principal, row: &RowId, token: Option<Token>) -> std::result::Result<(), Failure> {
+        let fenced = |text: String| Failure { code: Code::Fenced, text, refusal: None };
+        let name = lease_name(row);
+        let cur = match self.db.lease(&name) {
+            Ok(cur) => cur,
+            Err(e) => return Err(Failure { code: Code::Backend, text: format!("{e:?}"), refusal: None }),
+        };
+        let Some(cur) = cur.filter(|l| l.expires > self.clock().now()) else {
+            return Err(fenced(format!("{} is not leased: a verdict or a landing needs the lease", row.0)));
+        };
+        let Some(token) = token else {
+            return Err(fenced(format!("{}: the object carries no lease token (current {})", row.0, cur.token.0)));
+        };
+        if token != cur.token {
+            return Err(fenced(format!("{}: token {} is not the current one ({})", row.0, token.0, cur.token.0)));
+        }
+        if cur.holder != *by {
+            return Err(fenced(format!("{} is leased to another user", row.0)));
+        }
+        Ok(())
     }
 
     /// Releases every row lease past its `expires` on the hub's clock and

@@ -17,6 +17,16 @@
 //! way `wsp despawn --lost` does (`cmd_spawn::release_lost`, lent by the daemon), the
 //! checkpoint kept in the tree. A renewal the hub refuses as gone is the same.
 //!
+//! **Verdicts and landings** (wsp-468). A shared row's verdict (its ready line)
+//! and its landing (its `wsp: landed` line) go to the hub as `row.reviewed` and
+//! `row.landed` event objects on the row's lease subject, each carrying the
+//! claim's `hub_token` ([`push_verdict`], run each turn by [`push_all`]). The
+//! hub refuses `fenced` one under a token that is no longer the row's current
+//! one (the lease expired or was taken since): the spoke then lets go of the
+//! claim as for a lost lease, and the row stays as its new holder left it. What
+//! was pushed is kept in the claim (`hub_pushed`, `<kind>:<commit>`), so a turn
+//! sends each once.
+//!
 //! A spoke that is not logged in to a hub has no lease to take, and a private
 //! row has none either: both are the standalone case and change nothing.
 //!
@@ -38,9 +48,10 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
+use wsp_api::{Blob, Code, Move, RefMove};
 use wsp_client::{Client, Error as HubError};
 use wsp_objects::WorkspaceId as HubWorkspace;
-use wsp_store_contract::{Principal, Refusal, RowId, Token};
+use wsp_store_contract::{At, EventKind, Principal, Refusal, RowId, Token};
 
 use crate::store::Store;
 use crate::util;
@@ -204,6 +215,100 @@ pub(crate) fn renew_due(store: &Store, client: &mut Client, now: i64, alive: &mu
             }
             // The hub not answering is not the lease gone: try again next turn.
             Err(_) => {}
+        }
+    }
+    out
+}
+
+/// The claim record's field holding what was last pushed for the row.
+pub(crate) const PUSHED: &str = "hub_pushed";
+
+/// Why a verdict or a landing did not reach the hub.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PushError {
+    /// The hub refused it `fenced`: the lease token is no longer the row's.
+    Fenced(String),
+    /// The hub did not take it, or did not answer: try again next turn.
+    Failed(String),
+}
+
+fn failed(e: HubError) -> PushError {
+    match e {
+        HubError::Failed(f) if f.code == Code::Fenced => PushError::Fenced(f.text),
+        other => PushError::Failed(other.to_string()),
+    }
+}
+
+/// Pushes the verdict (`RowReviewed`) or the landing (`RowLanded`) of `row`,
+/// naming `commit`, under `token`: the object, then the move of the row's
+/// lease subject from the head the hub has (a stale move is read again, three
+/// times at most).
+pub(crate) fn push_verdict(
+    client: &mut Client,
+    workspace: &str,
+    row: &str,
+    kind: EventKind,
+    commit: &str,
+    token: Token,
+) -> Result<(), PushError> {
+    let (wid, id) = (HubWorkspace(workspace.to_string()), RowId(row.to_string()));
+    let subject = wsp_api::fence_subject(&id);
+    for _ in 0..3 {
+        let from = client.sync_heads(&wid).map_err(failed)?.get(&subject).copied();
+        let at = At((util::epoch_secs().max(0) as u64) * 1000);
+        let object = wsp_api::fenced_event(wid.clone(), &id, kind, json!({ "commit": commit }), token, from, client.by().clone(), at);
+        let (to, bytes) = wsp_objects::encode(&object);
+        client.sync_put(vec![Blob { id: to, bytes }]).map_err(failed)?;
+        match client.refs_move(RefMove { workspace: wid.clone(), subject: subject.clone(), from, to }).map_err(failed)? {
+            Move::Moved { .. } => return Ok(()),
+            Move::Stale { .. } => continue,
+        }
+    }
+    Err(PushError::Failed(format!("{row}: the hub's head kept moving")))
+}
+
+/// What a pass of [`push_all`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Pushed {
+    /// Verdicts and landings the hub took.
+    pub(crate) sent: usize,
+    /// Rows whose token the hub refused `fenced`, and which were released.
+    pub(crate) fenced: Vec<String>,
+}
+
+/// The verdict or landing each claim with a hub lease is owed to the hub, and
+/// has not had: a landed line names the landing, else a ready line the verdict.
+pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
+    let mut out = Pushed::default();
+    for (row, claim) in store.claims() {
+        let Some(token) = token_of(&claim) else { continue };
+        let Some(t) = store.task(&row).filter(|t| !t.workspace.is_private()) else { continue };
+        let (kind, commit) = match (crate::repair::landed_line(&t), crate::repair::ready(&t)) {
+            (Some(sha), _) => (EventKind::RowLanded, sha),
+            (None, Some(sha)) => (EventKind::RowReviewed, sha),
+            (None, None) => continue,
+        };
+        let key = format!("{}:{commit}", if kind == EventKind::RowLanded { "landed" } else { "reviewed" });
+        if claim.get(PUSHED).and_then(|p| p.as_str()) == Some(key.as_str()) {
+            continue;
+        }
+        match push_verdict(client, &t.workspace.to_string(), &row, kind, &commit, token) {
+            Ok(()) => {
+                // The claim as it is now, in case it moved while the hub answered.
+                if let Some(mut now) = store.claims().get(&row).cloned().filter(|c| token_of(c) == Some(token)) {
+                    now[PUSHED] = json!(key);
+                    store.set_claim(&row, now);
+                }
+                out.sent += 1;
+            }
+            Err(PushError::Fenced(text)) => {
+                let why = format!("hub lease lost: a {} was refused fenced ({text})", key.split(':').next().unwrap_or("verdict"));
+                if drop_claim(store, &row, token, &why) {
+                    out.fenced.push(row);
+                }
+            }
+            // The hub not answering is not a verdict lost: try again next turn.
+            Err(PushError::Failed(why)) => wsp_store::store::log_line(store, &format!("hub lease: {row}: {why}")),
         }
     }
     out
@@ -662,6 +767,75 @@ pub(crate) mod tests {
         // B takes it with a higher token.
         let theirs = take(&mut bo, "shared:team", "wsp-1").unwrap();
         assert!(theirs.token > held.token, "{theirs:?} after {held:?}");
+
+        running.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-468: A's ready line and landing line reach the hub as objects under
+    /// her token, once each; her lease runs out and B takes the row; A's next
+    /// landing is refused `fenced`, her spoke lets go of the claim, and the
+    /// hub's head for the row is what B left.
+    #[test]
+    fn hub_fence_a_verdict_and_a_landing_go_under_the_token_and_a_stale_one_is_refused_fenced() {
+        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        let _env = crate::util::isolated("hub-fence");
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let dir = std::env::temp_dir().join(format!("wsp-468-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (running, tokens) = serve(&dir);
+        let (mut ann, mut bo) = (dial(&running, &tokens, "ann"), dial(&running, &tokens, "bo"));
+
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        shared_row(&store, "wsp-1");
+        let held = take(&mut ann, "shared:team", "wsp-1").unwrap();
+        let mut claim = json!({ "workspace_id": "cpd-a", "claimed_at": util::now_iso() });
+        stamp(&mut claim, &held);
+        store.set_claim("wsp-1", claim);
+        let say = |line: String| {
+            let mut t = store.task("wsp-1").unwrap();
+            t.log(&line);
+            store.save_task(&t).unwrap();
+        };
+        let subject = wsp_api::fence_subject(&RowId("wsp-1".into()));
+        let head = |c: &mut Client| c.sync_heads(&HubWorkspace("shared:team".into())).unwrap().get(&subject).copied();
+        let body_of = |c: &mut Client, id| {
+            let blob = c.sync_get(vec![id]).unwrap().remove(0);
+            wsp_objects::decode(&blob.bytes).unwrap()
+        };
+
+        // Nothing to say yet; then a ready line is a verdict, sent once.
+        assert_eq!(push_all(&store, &mut ann), Pushed::default());
+        say(format!("{} abc1234 on m-1", crate::repair::READY));
+        assert_eq!(push_all(&store, &mut ann).sent, 1);
+        assert_eq!(push_all(&store, &mut ann).sent, 0, "once");
+        let reviewed = head(&mut ann).expect("the verdict moved the row's head");
+        match body_of(&mut ann, reviewed) {
+            wsp_objects::Object::Event { kind, payload, .. } => {
+                assert_eq!(kind, EventKind::RowReviewed);
+                assert_eq!((payload["token"].as_u64(), payload["commit"].as_str()), (Some(held.token.0), Some("abc1234")));
+            }
+            other => panic!("not a verdict: {other:?}"),
+        }
+
+        // The lease runs out and B takes the row, and pushes what B has.
+        running.hub().clock().advance(8 * DAY);
+        assert_eq!(running.hub().expire_leases().unwrap().len(), 1);
+        let theirs = take(&mut bo, "shared:team", "wsp-1").unwrap();
+        push_verdict(&mut bo, "shared:team", "wsp-1", EventKind::RowReviewed, "bbbbbbb", theirs.token).unwrap();
+        let left = head(&mut bo).unwrap();
+        assert_ne!(left, reviewed);
+
+        // A lands under her old token: refused fenced, released, and the head is B's.
+        say(format!("{} ccccccc on m-1", wsp_store::log::LANDED));
+        let pushed = push_all(&store, &mut ann);
+        assert_eq!((pushed.sent, pushed.fenced.as_slice()), (0, ["wsp-1".to_string()].as_slice()), "{pushed:?}");
+        assert!(!store.claims().contains_key("wsp-1"), "A's claim is let go");
+        assert_eq!(head(&mut bo), Some(left), "the row stays as its new holder left it");
+        let again = push_verdict(&mut ann, "shared:team", "wsp-1", EventKind::RowLanded, "ccccccc", held.token);
+        assert!(matches!(again, Err(PushError::Fenced(_))), "{again:?}");
 
         running.stop();
         let _ = std::fs::remove_dir_all(&dir);

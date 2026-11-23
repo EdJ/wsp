@@ -15,6 +15,10 @@
 //!   missing and `sync.get` leaves it out, and a `sync.get` that serves nothing
 //!   is `not_found`, whether or not the hub holds what was asked for.
 //!
+//! - A verdict or a landing (`row.reviewed`, `row.landed` events), put or moved
+//!   to, is held to its row's lease token and refused `fenced` otherwise
+//!   ([`Hub::check_fence`], wsp-468).
+//!
 //! - `lease.take` names a workspace, which the caller must be a member of;
 //!   `lease.renew` and `lease.release` act only for the lease's holder (see
 //!   [`crate::leases`]).
@@ -25,7 +29,7 @@
 use std::collections::BTreeSet;
 
 use wsp_api::{Answer, Code, Failure, ObjectId, Outcome, SyncCall, WorkspaceId};
-use wsp_store_contract::{Error, Principal, Refusal, SharedName, State, UserName};
+use wsp_store_contract::{Error, Principal, Refusal, RowId, SharedName, State, Subject, Token, UserName};
 
 use crate::Hub;
 
@@ -133,8 +137,44 @@ impl Hub {
             _ => {}
         }
         match self.scoped(by, &scope, call) {
-            Ok(call) => self.run(call),
+            Ok(call) => {
+                // A verdict or a landing is held to the row's lease, and the check and
+                // the write are one step under the lease lock (wsp-468).
+                // A move of a row's lease subject, where verdicts and landings are chained, to an
+                // object the hub does not hold could not be checked: put it first.
+                if let SyncCall::Move(mv) = &call {
+                    if matches!(&mv.subject, Subject::Lease(name) if name.0.starts_with("row:")) && !self.objects().has(&mv.to) {
+                        return Outcome::Err(Failure {
+                            code: Code::Invalid,
+                            text: format!("{} is not held: put the verdict before moving its ref", mv.to),
+                            refusal: None,
+                        });
+                    }
+                }
+                let fences = self.fences_of(&call);
+                let _guard = (!fences.is_empty()).then(|| self.locked());
+                for (row, token) in fences {
+                    if let Err(failure) = self.check_fence(by, &row, token) {
+                        return Outcome::Err(failure);
+                    }
+                }
+                self.run(call)
+            }
             Err(failure) => Outcome::Err(failure),
+        }
+    }
+
+    /// The verdicts and landings `call` would write: the rows they are of and
+    /// the tokens they carry. A put's objects, or the object a move moves to.
+    fn fences_of(&self, call: &SyncCall) -> Vec<(RowId, Option<Token>)> {
+        let of = |bytes: &[u8]| wsp_objects::decode(bytes).ok().and_then(|o| wsp_api::fenced_by(&o));
+        match call {
+            SyncCall::Put { objects } => objects.iter().filter_map(|b| of(&b.bytes)).collect(),
+            SyncCall::Move(mv) => match self.objects().get(&mv.to) {
+                Ok(Some(bytes)) => of(&bytes).into_iter().collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
         }
     }
 

@@ -426,6 +426,7 @@ impl Worker {
         crate::hub_lease::renew_all(store, client, now);
         // And the drive leases of the shared lists this spoke drives (wsp-467).
         crate::hub_lease::renew_drives(store, client, now);
+        crate::hub_lease::push_all(store, client);
     }
 
     fn url(&self) -> String {
