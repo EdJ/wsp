@@ -104,6 +104,21 @@ pub(crate) struct Inputs {
     /// the row's tree (`wsp-313`: a store with no `session-learned` read every
     /// seat as reading nothing, model 0 and tools none).
     pub found: Vec<(i64, String)>,
+    /// The row's leg seats as its own log has them, `leg X started by pane P`
+    /// to `leg X ended after N` (`wsp-335`): the record that a seat came up for
+    /// a leg where no `session-learned` was written for it.
+    pub leg_seats: Vec<LegSeat>,
+}
+
+/// One seat a leg ran in, off the row's log (`wsp-335`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LegSeat {
+    pub leg: String,
+    pub pane: String,
+    /// The `started by pane` line.
+    pub start: i64,
+    /// The `ended after` line; `None` while the entry reads running.
+    pub end: Option<i64>,
 }
 
 /// One park of a list, from its park event to the resume that took it back.
@@ -300,6 +315,14 @@ fn seat_ended_after(i: &Inputs, up: i64) -> Option<(String, i64)> {
         (l == &ended || l.starts_with(&format!("{ended},"))).then_some(*t)
     })?;
     Some((pane, at))
+}
+
+/// The seat the row's log names for leg `name` started at `s` and closed at
+/// `f`: the last one started before the close whose end, if it has one, is
+/// not before the start. A seat that ended before the leg started was an
+/// earlier run of it.
+fn leg_seat<'a>(i: &'a Inputs, name: &str, s: i64, f: i64) -> Option<&'a LegSeat> {
+    i.leg_seats.iter().filter(|l| l.leg == name && !l.pane.is_empty() && l.start <= f && l.end.is_none_or(|e| e >= s)).last()
 }
 
 /// The first reopen of the row at the leg cap inside `from..to`: the reopen,
@@ -774,6 +797,27 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
         // A seat that came up only after the leg had ended is not this leg's.
         let up = i.first_learned_after(s).filter(|u| finished.is_none_or(|f| *u <= f));
+        // No `session-learned`, but the leg's own entry names the seat that ran
+        // it (`wsp-335`: wsp-030's six legs, 1614 s booked as no seat): the leg
+        // is work until that seat ended, and only the rest is the gap.
+        if let Some((f, seat)) = finished.filter(|_| up.is_none()).and_then(|f| leg_seat(i, &leg.name, s, f).map(|l| (f, l))) {
+            let label = format!("leg {} (seat {}, from its entry)", leg.name, seat.pane);
+            match seat.end.filter(|e| *e < f) {
+                Some(e) => {
+                    out.push(Phase::work(label, s, e.max(s)));
+                    out.push(Phase::gap(
+                        format!("leg {}: its seat {} ended at {}, the leg not closed", leg.name, seat.pane, clock(e)),
+                        e.max(s),
+                        f,
+                        format!("{LEG_SEAT_ENDED} — {} ended at {} (not work)", seat.pane, util::iso_at(e)),
+                    ));
+                }
+                None => out.push(Phase::work(label, s, f)),
+            }
+            done.push((leg.name.clone(), f));
+            last_end = Some(last_end.map_or(f, |e| e.max(f)));
+            continue;
+        }
         if let (None, Some(f)) = (up, finished) {
             // No seat ever came up for the leg: the stretch is not work.
             out.push(Phase::gap(format!("leg {} (no seat came up)", leg.name), s, f, format!("leg {}: no seat came up (not work)", leg.name)));
@@ -1275,6 +1319,21 @@ fn first_request(session: &str) -> Option<i64> {
     None
 }
 
+/// The leg seats a row's log names (`wsp-335`). A start that never took
+/// (`Dropped`) ran nothing; any other end is the seat's.
+fn leg_seats_of(t: &crate::model::Task) -> Vec<LegSeat> {
+    crate::cmd_attempts::attempts_of(t)
+        .into_iter()
+        .filter(|a| a.leg.as_deref().is_some_and(|l| !l.starts_with("piece ")) && !a.pane.is_empty() && a.outcome != crate::cmd_attempts::Outcome::Dropped)
+        .map(|a| LegSeat {
+            leg: a.leg.unwrap_or_default(),
+            pane: a.pane,
+            start: util::epoch_of(&a.at),
+            end: Some(util::epoch_of(&a.until)).filter(|t| !a.until.is_empty() && *t > 0),
+        })
+        .collect()
+}
+
 pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
     let mut i = Inputs { id: id.to_string(), ..Default::default() };
     let group = store.worklists().into_iter().find_map(|w| {
@@ -1324,6 +1383,7 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .filter(|(d, g)| g.is_none() && d.at.contains('T'))
             .map(|(d, _)| (util::epoch_of(&d.at), d.id, d.text))
             .collect();
+        i.leg_seats = leg_seats_of(&t);
         i.legs = crate::legs::legs(&t)
             .into_iter()
             .map(|l| LegIn { skipped: l.skipped.is_some(), after: l.after.clone().unwrap_or_default(), name: l.name })
@@ -2664,6 +2724,47 @@ mod tests {
         let leg = ph.iter().find(|p| p.label.starts_with("leg a (no seat")).expect("the leg is named");
         assert!(leg.gap && leg.seconds() > 0, "{leg:?}");
         assert!(!ph.iter().any(|p| !p.gap && p.label.starts_with("leg a")), "{ph:?}");
+    }
+
+    /// `wsp-335`: a leg with no `session-learned` whose entry names its pane
+    /// and ends `ended after 47s` (wsp-030's `finish`, cpd-169) is 47 s of the
+    /// leg's own work, not "no seat came up"; the entry is read off the log.
+    #[test]
+    fn a_leg_whose_entry_names_its_seat_is_work_not_no_seat() {
+        let mut t = crate::model::Task::new("a task", "r-1");
+        t.body = "## Log\n- 1970-01-01T00:03:10Z leg a started by pane cpd-169 · spawned at opus/high\n- 1970-01-01T00:03:57Z leg a ended after 47s · 3 turns\n".into();
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k != "session-learned");
+        for e in i.events.iter_mut().filter(|e| e.1 == "leg-done") {
+            e.0 = 237;
+        }
+        i.leg_seats = leg_seats_of(&t);
+        assert_eq!(i.leg_seats, vec![LegSeat { leg: "a".into(), pane: "cpd-169".into(), start: 190, end: Some(237) }]);
+        let ph = build(&i);
+        let leg = ph.iter().find(|p| p.label.starts_with("leg a")).expect("the leg is there");
+        assert!(!leg.gap && leg.seconds() == 47, "{ph:?}");
+        assert!(!ph.iter().any(|p| p.waiting_for.as_deref().is_some_and(|w| w.contains("no seat came up"))), "{ph:?}");
+    }
+
+    /// `wsp-335` keeps `wsp-016`'s case: the seat the entry names ended and the
+    /// entry read running 60 min more: 47 s of work, the 60 min a gap.
+    #[test]
+    fn a_leg_whose_named_seat_ended_long_before_the_close_is_a_gap_after_it() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k != "session-learned");
+        for e in i.events.iter_mut() {
+            match e.1.as_str() {
+                "leg-done" => e.0 = 237 + 3600,
+                "task-review" => e.0 = 237 + 3605,
+                "task-verified" => e.0 = 237 + 3680,
+                _ => {}
+            }
+        }
+        i.leg_seats = vec![LegSeat { leg: "a".into(), pane: "cpd-169".into(), start: 190, end: Some(237) }];
+        let ph = build(&i);
+        let work: Vec<&Phase> = ph.iter().filter(|p| p.label.starts_with("leg a")).collect();
+        assert!(work.len() == 2 && !work[0].gap && work[0].seconds() == 47, "{ph:?}");
+        assert!(work[1].gap && work[1].seconds() == 3600 && work[1].waiting_for.as_deref().is_some_and(|w| w.starts_with(LEG_SEAT_ENDED)), "{ph:?}");
     }
 
     /// A leg whose seat came up, worked and ended before the leg was closed
