@@ -572,7 +572,7 @@ taken with `wsp calls` over a day before and a day after, and its incident count
 |---|---|---|---|
 | **M0. herdr out, seam named** | wsp-120 (4.4). `host-api` holds the types of 3.2. Every OS-touching call outside tree work goes through one `Host` trait (`crates/wire/src/host.rs`, its methods grouped by the messages of 3.2). Its only implementation is **in-process** (`host::InProcess`): today's code, behind the trait. The seat operations of place_compound.rs and place_super.rs are behind it first (wsp-005), then the transcript and hook-log reads, grouped as `seat.did` and `turn` (wsp-007), and the host facts (wsp-006): `df`/`du`, per-seat memory and running shells (`ps`), the throttle's `sysctl`, `pmset`, `vm_stat`, `memory_pressure` and `ioreg`, pid liveness and a check run's `lstart`. Layers below wire (base, store) ask nothing themselves: their callers pass the host's answer in. `wsp calls --incidents`. | `grep` finds no `ps`, `lsof`, `kill`, render, transcript or fact probe outside the in-process host (tree work excepted). Spawn p50 ≤ 9.4 s, `wip` CPU no worse, tick no slower. Herdr references → 0. | Revert. It is a pure move plus deletions, behind the same tests. |
 | **M1. The manager on the Mac** | The in-process host becomes the `wsp-manager` process under launchd. wsp dials it on TCP (3.4). Hooks report to it, and the journal and subscription are in use. The daemon folds events. `wip` reads `seats`. compound's host keeps polling `wip --json`, which is now cheap. | **ps** per tick 37.5 → ≤ 1. **renders** per tick 59.5 → 0. **`df`** 24.6 → 0. **lsof** in `wip` → 0. `wip` < 0.2 CPU-s per call (from 2.9). Host polling CPU-s per day 25,268 → under 2,500. Spawn p50 no worse than 9.4 s. wsp-411-kind incidents → 0 over a week. A manager kill -9 mid-turn loses no seat and no order (a scripted proof, 10×). | `WSP_HOST=inproc`: the same code linked into wsp, as at M0. Seats started by the manager stay alive (compound-sup is durable), and the in-process host adopts them by socket. `WSP_HOST` is `manager` when unset (wsp-029); a manager's start adopts the seats the in-process host started, from compound's run directory. |
-| **M2. The i5 under its own manager** | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
+| **M2. The i5 under its own manager** (the Mac since wsp-314; see "M2's breakdown") | The same binary on the i5. wsp dials it over the tailnet. The beat becomes the heartbeat. Per-seat forwards and tunnel.rs's masters go, and the far half of the copy moves into the manager. | **ssh** runs per day 147 → install and tree bytes only. A far seat working through a slowed tick never reads unreachable (a wsp-639 sandbox reproduction plus a week live). The far manifest of compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s). `spawn --on` p50 no worse. | A machine field `transport: ssh`, which keeps the v1 path compiled until a fortnight passes on `manager`. |
 | **M3. Tree jobs under the manager** | `throttle run`, `check`, `verify`'s checks and barrier runs become `job.run` on the tree's host (the Mac). The throttle admits by the manager's facts. check_tree's sweep, the slot probes and leaked_agents go. | **lsof** → 0 and **ps** → 0 on the wsp side. Every `kill` is by a manager, on a pgid it started. wsp-478-kind incidents → 0 over a week. `throttle run`'s wall per build no worse. | Jobs fall back to wsp running them in-process behind a flag (`WSP_JOBS=inproc`; the default is `manager` since wsp-056). The sweep is restored with them. |
 | **M4. Trees placed (T2, Ed 2026-11-18; see "M3 under T2")** | `tree.checkout` and `tree.land` on every host's manager, a fenced push to the trunk, per-host warm targets, and the barrier's host named. | A list runs with members on two hosts and no copy-up or copy-back. Land conflicts are refused by the push and never overwritten. Cold-build cost on the i5 is measured against remote-agents' early proof. | Rows placed on the Mac only (T1), which is the state at M3. |
 
@@ -1586,6 +1586,128 @@ affected rows among wsp-052..058 are amended to match:
 for every row. So `place_of` makes check, verify and barrier trees on the Mac in-process, and every job is named by
 `(row, host)`. No row in groups 5-8 lands. Land stays today's local fast-forward until M4's fenced push. So no verb is
 pulled into M3.
+
+#### M2's breakdown (wsp-314, 2026-11-23)
+
+M2 was written for a fleet that has since moved. Its row in 6.2 says "the i5": a far Mac mini dialled by wsp on the
+person's Mac. Today wsp, its daemon, its API and the only manager run on **omarchy** (Linux, systemd). No far
+machine is registered (`wsp machine ls`: "no machines — this seat only"), and the i5 is gone. The person's **Mac**
+runs web-chrome with `--target omarchy`. It reaches omarchy through an ssh tunnel to the API port, and through
+`wsp-remote` for the verbs, with ssh polling as web-chrome's fallback (compound-react-022's overview).
+
+**Which machine.** M2's far manager runs on **the Mac**, named `mac` in the machine records. This is the recommended answer to the person's ask m-dn2ee6lcbnb6-p385f80 (which machine, and the Mac's ssh alias and Tailscale). It was put on 2026-11-23 and was unanswered when the lists were filed. It stands until the person answers, and m2-agent-manager's group 3 stop is where the answer is first needed. Another machine changes only the name in the stops' commands. It is the
+only second machine in the fleet, it already speaks to omarchy, and `wsp install` already writes a manager's
+LaunchAgent on macOS (`manager_agent`, src/cmd_install.rs). So M2 is the reverse of the plan as written. Section 5
+still holds line for line, with "the i5" read as "the Mac" and "the Mac" read as "omarchy". The far machine is now
+the macOS one, so the GUI-session note (the keychain token) applies to it as written.
+
+M2 is five lists, all at status init, chained with `wsp worklist after`: `m2-agent-manager` → `m2-manager-path` →
+`m2-default` → `m2-result` → `m2-contract`. Each list ends at a step only the person can take (wsp-091), so the days
+the person spends on an install, a live day or a live week are not counted as standing time at a list's own
+barrier. M1's and M3's lists kept such steps partway through, but they were planned before that rule. The lists
+follow wsp-018's three rules, as M1 and M3 did:
+- expand, then contract. `transport: manager` arrives beside `ssh` per machine, and the v1 path is deleted only
+  after a fortnight on `manager`;
+- a removal that cannot be staged is one row run as legs;
+- every row's checks build the workspace and test every crate it touches.
+
+No row is filed with `--parent`: list membership runs them (wsp-154's rows; wsp-303 and wsp-310 show what a parent
+link cost). Each row's overview names its files and its done-when. The members of one group touch disjoint files
+(wsp-068): wsp-403 and wsp-404 both write crates/wire/src/host_tcp.rs, so wsp-404 runs a group after wsp-403 and
+rests on it.
+
+`m2-agent-manager`, `wsp worklist after m1-agent-manager`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | contract | wsp-398 | host-api, additively: `WspHello.lease_secs`, `Beat.held`/`released` on a daemon's beat, a `check` request and reply, `HostFacts.display_asleep`. `PROTOCOL` unchanged. | host-api's tests green at the barrier |
+| 2 | components, wiring | wsp-399, wsp-400 | The manager serves `gate: required` and writes the gate's lease from the daemon's beat on its own timer, failing closed, and serves `check`. Beside it, the machine record gains `transport: ssh\|manager` (`ssh` when absent) and a far manager record in M1's `Local` shape, with its token 0600 in `<state>/manager/<machine>.secret`, plus `Tcp::for_machine`. | the manager's gate tests, including the wsp-639 reproduction, green at the barrier |
+| 3 | wiring | wsp-401 | `wsp install --manager-only` (the manager and its launcher, no daemon) and `wsp machine install <m>`, run over the ssh door: build at the far checkout, install, read back the token and the tailnet address, dial `hello`. | **The person, ending the list:** Tailscale up on both machines, then on omarchy `wsp install`, `wsp machine add mac mac`, `wsp machine install mac` and `wsp machine check mac`. Then a live day of `wsp spawn <row> --on mac` work on `transport: ssh` (v1), with the Mac's manager installed and unused. |
+
+`m2-manager-path`, `wsp worklist after m2-agent-manager`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | insitu, wiring | wsp-402, wsp-403 | **M2's before**, from m2-agent-manager's v1 day (below), beside the daemon's one connection per manager machine: `hello` with the lease, `subscribe {from}`, folding into the same files, and a 10 s beat on its own thread carrying held and released claims. Silence is three missed beats past the lease. Disjoint files: wsp-402 writes this doc alone, and wsp-403 writes code alone (src/daemon.rs, src/fold.rs, host_tcp.rs, far.rs). | the before is written in this section, and wsp-403's sandbox tests are green at the barrier |
+| 2 | wiring | wsp-404 | `wip`, the census, overlap and verify's sweep read every manager machine. After wsp-403, on host_tcp.rs. | wsp-404's tests green at the barrier |
+| 3 | wiring | wsp-405 | `spawn --on`, `despawn`, `tell` and `machine check` go to the far manager, gated, waiting by subscription. | **The person, ending the list:** `wsp install` on omarchy, `wsp machine install mac` again (an upgrade), `wsp machine set mac transport=manager`, `wsp machine check mac`, then a live day with `mac` seats on `manager`. Once compound-react-022 has landed (in `mp0-reach`), the ssh tunnel to omarchy's API port is ended on the Mac. |
+
+`m2-default`, `wsp worklist after m2-manager-path`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | contract | wsp-406 | `transport` defaults to `manager` for a machine with a far record. `transport=ssh` is the rollback. `wsp doctor` prints a line per machine. | **The person, ending the list:** `wsp install` on omarchy and `wsp machine install mac`, then **a live week** (M2's "a week live" for the flap). The fortnight m2-contract waits on starts at this install, and its date goes in the verdict. |
+
+`m2-result`, `wsp worklist after m2-default`:
+
+| group | kind | rows | what | stop (the person's steps are planned here) |
+|---|---|---|---|---|
+| 1 | insitu | wsp-407 | **M2's result**, against the before. | **The person, ending the list,** reads M2's result: M2 holds, or `wsp machine set mac transport=ssh` on omarchy is the rollback. |
+
+`m2-contract`, `wsp worklist after m2-result`. Its overview says what must be true before group 1: the person's
+read "M2 holds", a fortnight on `manager` since m2-default's install, and no `transport=ssh` written.
+
+| group | kind | rows | what | stop |
+|---|---|---|---|---|
+| 1 | contract | wsp-408 | As legs: delete tunnel.rs's masters and forwards, far.rs's ssh probes and the far beat (`holdings_command` and `DISPLAY_PROBE` with them, so host-seam-allowed.txt loses far.rs's two lines), wait_ready's 150 ms loop and submit's poll for far seats, and the `ssh` word. Kept: the install door, the tree copy (M4's) and the shim's ssh (Q8). | **The person:** `wsp install` on omarchy, `wsp machine install mac` and `wsp machine check mac`, then a live day |
+
+**What the plan keeps from M2's row, and what it changes.**
+- *Reused, not rebuilt.*
+  - host-api's messages, `hello` and its token (3.3), and `Connection`.
+  - The manager's TCP listener, which already binds loopback and `tailscale ip` (crates/manager/src/main.rs).
+  - M1's manager record: `Local {host, addr, port, exec_dir}` plus a secret, written per far machine as it is for
+    this host.
+  - The census, which already folds one `Census::heard` per host name and has only ever been given this host
+    (crates/wire/src/host_tcp.rs).
+  - The store contract's `Transport::Tcp { addr }`, which a `manager` machine mirrors to, so the contract does not
+    change.
+- *The machine `transport` field is new in the record.* remote-agents section 4 named it, but the committed
+  `Machine` (crates/store/src/model.rs) never got one. wsp-400 adds it. `ssh` is the default until wsp-406, and it stays the
+  rollback until m2-contract.
+- *The gate.* Today the manager refuses `gate: required` (seats.rs, d1 Q12). wsp-399 lifts that for far seats only. Local
+  seats stay ungated, as d1 Q12 answered.
+- *The far half of the copy does not move into the manager.* 6.2's M2 row moved it because trees stayed on the
+  store's host (T1). Under T2 (Ed, 2026-11-18, "M3 under T2") trees live with the agents, and M4 retires the copy
+  (treecopy.rs) for `tree.checkout`. Moving the manifest into the manager now would build a part that M4 deletes. So
+  M2 keeps the rsync copy over ssh as tree bytes, and its manifest measure becomes "no worse".
+- *The agent's own `wsp` calls* (the shim, `wsp-remote` on the Mac) keep their ssh, as Q8 recommended. State-core
+  step 1's API now exists (crates/api, with a token, on loopback and the tailnet), so moving the shim onto it is the
+  next step for that ssh. It is not M2's: it needs the agent verbs on the API, which is state-core's work.
+- *The Mac's jobs.* Under M3 a row on a host without a manager kept its builds in-process there. M2 does not move a
+  `mac` row's builds to the Mac's manager. Trees and their jobs on each host are M4's (`place_of`, `tree.checkout`).
+
+**Relations.**
+- *m1-agent-manager.* M2 rests on it, and its first list says so with `wsp worklist after`. M1's group 7 left
+  `tunnels`, far.rs's two ssh lines, wait_ready's loop and submit's poll for far seats to M2. wsp-405 stops using them
+  under `manager`, and wsp-408 deletes them.
+- *m3-agent-manager.* M3 assumed nothing of M2, and M2 assumes nothing of M3 beyond what has landed. M3's
+  `WSP_JOBS=manager` and its job table stay on omarchy. M3's figures owed (wsp-360) and M1's (wsp-323) are not M2's.
+  Taking M2's before on a manager built from the trunk needs wsp-324's fix to hold, and wsp-401's install always rebuilds
+  for that reason. **M4 needs a second manager to measure**, and M2 delivers one. M4 is broken down after M2's
+  result, as d1 Q14 says for every step.
+- *web-chrome's target mode and the tunnel.* compound-react-027 (done) stopped `--target` from dialling the local
+  API. compound-react-022 (todo, after 027) makes it subscribe to the target's API over the tailnet. It is not a
+  member here: it is already in `mp0-reach`'s group 1 (planned, after s2-state-core-2), and a row is run by one list.
+  The tunnel to the API port is what 022 replaces. So the tunnel's end waits on 022, not on M2's code. m2-manager-path's
+  last stop has the person end the tunnel once 022 has landed, and wsp-407 counts the tunnel's sessions until then. The
+  far manager needs no tunnel at any point: wsp dials it over the tailnet. M2's ssh measure counts the Mac's sessions to omarchy, so a tunnel left running shows up in it.
+- *The tailnet* is a precondition of both 022 and the far manager (3.4). The manager serves loopback alone without
+  one, and `wsp machine install` refuses with that step named. Installing Tailscale is the person's step at m2-agent-manager's last stop.
+
+**M2's measures, restated against today's topology.** 6.1's figures were the Mac's daemon dialling the i5, on a
+store and a fleet that no longer exist. Each of M2's four measures is restated here. Where the old baseline no longer
+applies, the new before is taken by wsp-402 from the day of m2-agent-manager's last stop: the Mac registered on `transport: ssh`, from
+omarchy.
+
+| measure | 6.2 asked | what applies now | before | M2 asks |
+|---|---|---|---|---|
+| ssh runs per day | 147 → install and tree bytes only | 147 was the Mac's daemon to the i5. omarchy's wsp makes no far ssh today, because it has no far machine. The ssh that exists runs the other way: the Mac's poll and verbs into omarchy's sshd. The day before M1's install counted compound's polls over ssh at 5,711 and 658 CPU-s (M1's result). | wsp-402: omarchy's ssh per day by phase with `mac` on `ssh`, and the Mac's sessions into omarchy | omarchy → Mac: install and tree bytes only, 0 per tick. Mac → omarchy: web-chrome's polls 0 with 022 live and the tunnel ended. The shim's verbs are counted, not judged. |
+| the wsp-639 flap | a far seat working through a slowed tick never reads unreachable: a sandbox reproduction plus a week live | Unchanged in meaning. The reproduction is now two tests, the manager's (wsp-399) and the daemon's in a sandbox (wsp-403): a 78 s tick against a 60 s lease, with beats every 10 s on their own timer. | wsp-402: `unreachable` readings of live `mac` seats on the v1 day | 0, in 10 runs of each test and in m2-default's live week |
+| the far manifest | compounding's 8,788 files < 15 s (wsp-638's 4 min 25 s) | Under T2, M4 retires the copy, and M2 does not move it. compounding's tree may not be on this fleet. The figure is taken on the largest tree copied up on the before day, with its file count. | wsp-402 | no worse than the before |
+| `spawn --on` p50 | no worse | There is no far spawn today, so there is no baseline. The local rail stands: 0.93 s p50 and 2.71 s p95 over 147 spawns, the day before M1's install, against the 9.4 s ceiling. | wsp-402: `spawn --on mac` p50 and p95 on v1, with the agent. If v1 refuses a Linux seat's spawn on a Mac, that refusal is the before. | no worse than the before, or no worse than local p50 and under 9.4 s where v1 refused |
+
+The rollback is as 6.2 names it: `transport: ssh` per machine. It keeps the v1 path compiled until a fortnight
+passes on `manager`, which is m2-contract's start. wsp-407 proves it in a sandbox, switching to `ssh` and back.
 
 ### 6.3 How this reorders state-core section 7
 

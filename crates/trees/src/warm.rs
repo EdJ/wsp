@@ -63,10 +63,59 @@ pub fn clone_from(parent: &Path, child: &Path) -> Vec<String> {
     found.into_iter().map(|(rel, dir)| one(parent, child, &rel, dir)).collect()
 }
 
+/// The dependency directories `tree` lacks (`compound-react-045`): each one
+/// beside a lockfile of the tree's own with nothing there, relative to the
+/// tree. A barrier or verifier tree is made by `git worktree add`, so a web
+/// project's `node_modules/` is one of these until it is cloned or installed,
+/// and every step that needs it is red for the tree, not the row.
+pub fn missing(tree: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    walk(tree, Path::new(""), 0, &mut found, &|here, dir| !here.join(dir).exists());
+    found.sort();
+    found.into_iter().map(|(rel, _)| rel).collect()
+}
+
+/// The lockfile a `node_modules/` was last made for, as wsp keeps it inside.
+const STAMP: &str = ".wsp-package-lock.json";
+
+/// Say that the `node_modules/` at `rel` in `tree` answers for the lockfile
+/// beside it now: wsp cloned it from a parent whose lockfile matched, or ran
+/// `npm ci` in it.
+pub fn stamp(tree: &Path, rel: &Path) {
+    let dir = tree.join(rel);
+    if let Some(at) = dir.parent() {
+        let _ = std::fs::copy(at.join("package-lock.json"), dir.join(STAMP));
+    }
+}
+
+/// The `node_modules/` of `tree` wsp made for another lockfile than the one
+/// beside them now ([`stamp`]). A warm tree keeps its ignored `node_modules/`
+/// across checkouts, so a commit that moved `package-lock.json` would be checked
+/// against the install of the commit before. One wsp never stamped (made by
+/// hand, or before stamps) is left as it is.
+pub fn stale(tree: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    walk(tree, Path::new(""), 0, &mut found, &|here, dir| {
+        dir == "node_modules"
+            && match (std::fs::read(here.join("package-lock.json")), std::fs::read(here.join(dir).join(STAMP))) {
+                (Ok(lock), Ok(made_for)) => lock != made_for,
+                _ => false,
+            }
+    });
+    found.sort();
+    found.into_iter().map(|(rel, _)| rel).collect()
+}
+
 fn lockfiles(root: &Path, rel: &Path, depth: usize, out: &mut Vec<(PathBuf, &'static str)>) {
+    walk(root, rel, depth, out, &|here, dir| here.join(dir).is_dir());
+}
+
+/// Every lockfile under `root` whose dependency directory `wanted` holds of,
+/// as (the directory relative to `root`, its lockfile).
+fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<(PathBuf, &'static str)>, wanted: &dyn Fn(&Path, &str) -> bool) {
     let here = root.join(rel);
     for (lock, dir) in KINDS {
-        if here.join(lock).is_file() && here.join(dir).is_dir() {
+        if here.join(lock).is_file() && wanted(&here, dir) {
             out.push((rel.join(dir), lock));
         }
     }
@@ -82,7 +131,7 @@ fn lockfiles(root: &Path, rel: &Path, depth: usize, out: &mut Vec<(PathBuf, &'st
         }
         // Not through a symlink: a linked directory is somebody else's tree.
         if e.file_type().is_ok_and(|t| t.is_dir()) {
-            lockfiles(root, &rel.join(&*name), depth + 1, out);
+            walk(root, &rel.join(&*name), depth + 1, out, wanted);
         }
     }
 }
@@ -535,6 +584,36 @@ mod tests {
         write(&parent.join("package-lock.json"), "{1}");
         write(&child.join("package-lock.json"), "{1}");
         assert!(clone_from(&parent, &child).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_tree_lacks_the_dependency_directory_beside_each_of_its_own_lockfiles() {
+        let d = scratch("missing");
+        write(&d.join("Cargo.lock"), "lock");
+        write(&d.join("target/debug/x"), "bin");
+        write(&d.join("spikes/web-chrome/package-lock.json"), "{1}");
+        write(&d.join("web/package-lock.json"), "{1}");
+        write(&d.join("web/node_modules/a"), "a");
+        write(&d.join("node_modules/x/package-lock.json"), "{1}");
+        assert_eq!(missing(&d), vec![PathBuf::from("spikes/web-chrome/node_modules")]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_node_modules_made_for_another_lockfile_is_stale_and_one_never_stamped_is_left() {
+        let d = scratch("stale");
+        write(&d.join("web/package-lock.json"), "{1}");
+        write(&d.join("web/node_modules/a"), "a");
+        stamp(&d, Path::new("web/node_modules"));
+        write(&d.join("app/package-lock.json"), "{1}");
+        write(&d.join("app/node_modules/a"), "a");
+        stamp(&d, Path::new("app/node_modules"));
+        write(&d.join("bare/package-lock.json"), "{1}");
+        write(&d.join("bare/node_modules/a"), "a");
+        assert!(stale(&d).is_empty());
+        write(&d.join("web/package-lock.json"), "{2}");
+        assert_eq!(stale(&d), vec![PathBuf::from("web/node_modules")]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

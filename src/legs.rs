@@ -1221,7 +1221,16 @@ fn another_rows_seat(store: &Store, row: &str, pane: Option<&str>) -> Option<Str
     let pane = pane?;
     let target = store.task_or_why(row).ok()?.id;
     let bound = store.bindings().get(pane)?.get("task_id")?.as_str()?.to_string();
-    (bound != target).then(|| format!("{pane} is the seat of {bound}, and legs are given by a row's own seat, a planner or the primary seat — not by another row's: `wsp ask` a planner to add them to {target}"))
+    (bound != target).then(|| format!("{pane} is the seat of {bound}, and {GIVEN_BY}: {}", ask_a_planner(&target)))
+}
+
+/// Who gives a row legs, as [`another_rows_seat`] refuses and a packet lists it
+/// (`crate::split::Refused::LegAdd`).
+pub(crate) const GIVEN_BY: &str = "legs are given by a row's own seat, a planner or the primary seat — not by another row's";
+
+/// What a seat does instead of giving `target` legs it may not give.
+pub(crate) fn ask_a_planner(target: &str) -> String {
+    format!("`wsp ask` a planner to add them to {target}")
 }
 
 fn cmd_add(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
