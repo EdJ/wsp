@@ -41,7 +41,10 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   wsp-702) or the first page after `from`. `follow` then runs on a thread of its own and writes through the
   connection's shared writer. It follows the head with `wait_for` (at most 200 ms per wait), reads with
   `events_after` from the last id sent, and sends a `Feed::Beat` every beat. It ends with the connection, and
-  closes the connection when a write or the store fails.
+  closes the connection when a write or the store fails. With a `Gate` whose `readable` names workspaces (the hub's),
+  a `Watch` scopes the subscription (wsp-174): the snapshot to those workspaces, each event by its `workspace`, a
+  record that left them as `Feed::Gone`, one that moved in as a whole `mirror.put`, and a change of the principal's
+  workspaces (a `Member` or `Workspace` event) as a `Feed::Resync` at the head.
 - `src/tcp.rs`: `Tcp`, the carrier. It is newline JSON over a `TcpStream` and implements `wsp_api::Connection`, with
   `dial`, `recv_line`, `send_line`, `try_clone`, `shutdown` and the 16 MB line cap. It is `pub` for wsp-client's
   tests. It copies `wsp-host`'s carrier, because that one is typed to the manager's `Frame`.

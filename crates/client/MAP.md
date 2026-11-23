@@ -74,7 +74,9 @@ dependencies to hold this.
   line it cannot read, say) waits a backoff first, as a failed dial does: 25 ms doubling to 1 s, reset by a
   delivery. `why_silent()` says why it cannot connect (wsp-702). A
   snapshot sent as `Feed::Part`s and a closing `Feed::State` is held until the `State` comes and handed out as one
-  `Item::State`; the parts of a lost connection are dropped.
+  `Item::State`; the parts of a lost connection are dropped. On a scoped subscription (wsp-174) ids have gaps, which
+  nothing here minds; `Item::Gone { subject, at }` drops a record that left the subscriber's sight, and
+  `Item::Resync { state, at }` is a fresh snapshot after a change of scope, folded as the first `State`.
   The server drops a connection it hears nothing on for `MISSED_BEATS` beats, so once a beat the feed sends the cheap
   read `events { from: <its last>, limit: 0 }` and reads its reply past. `set_beat` tells the feed the server's beat period (`BEAT_SECS` unless a test sets it).
 

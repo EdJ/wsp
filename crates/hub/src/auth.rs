@@ -19,12 +19,13 @@
 //! A hello is resolved against the state as it is then; a connection keeps the
 //! principal it was welcomed as until it closes.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use wsp_api::{ApiToken, Call, Code, Failure, Hello};
 use wsp_machines::{token, Identity};
 use wsp_server::{Gate, Welcomed};
-use wsp_store_contract::{Command, IdentityState, Principal, Refusal, State};
+use wsp_store_contract::{Command, IdentityState, Principal, Refusal, SharedName, State};
 
 use crate::Hub;
 
@@ -119,5 +120,11 @@ impl Gate for Auth {
 
     fn owns(&self, cmd: &Command) -> bool {
         Identity::owns(cmd)
+    }
+
+    /// A subscription reads what the sync verbs serve (wsp-173): the shared
+    /// workspaces its person is a member of, and for anyone else none.
+    fn readable(&self, by: &Principal, state: &State) -> Option<BTreeSet<SharedName>> {
+        Some(crate::scope::Scope::of(state, by).names().iter().cloned().collect())
     }
 }

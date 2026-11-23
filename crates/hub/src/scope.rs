@@ -46,6 +46,11 @@ impl Scope {
         Scope { names }
     }
 
+    /// The member workspaces' names.
+    pub fn names(&self) -> &[SharedName] {
+        &self.names
+    }
+
     /// The member workspaces, as the sync verbs name them (`shared:<name>`).
     pub fn workspaces(&self) -> impl Iterator<Item = WorkspaceId> + '_ {
         self.names.iter().map(|n| WorkspaceId(format!("shared:{}", n.0)))

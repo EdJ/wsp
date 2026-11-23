@@ -10,6 +10,12 @@
 //! to re-read. A `too_old` answer leads to `subscribe {}` and a fresh
 //! [`Item::State`]. Ids at or before the last handed out are dropped.
 //!
+//! On a scoped subscription (wsp-174) ids have gaps: the server sends only
+//! the events of the workspaces the subscriber may read, and nothing here
+//! assumes the ids are contiguous, only that they grow. A [`Item::Gone`]
+//! drops a record that left the subscriber's sight; an [`Item::Resync`] is a
+//! fresh snapshot after a change of scope, folded as the first one.
+//!
 //! A snapshot too large for one line comes as `Feed::Part`s closed by a
 //! `Feed::State` (wsp-702); the feed puts them back together and hands out
 //! one [`Item::State`], as for a snapshot that came whole. A connection lost
@@ -29,6 +35,7 @@ use wsp_api::{
     Answer, Call, Code, ConnError, Connection, Event, EventId, Feed as Frames, Frame, Outcome, ReqId, Request, State,
     Subscribe, Verb, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
+use wsp_store_contract::Subject;
 
 use crate::dial::{self, Silent, Tcp};
 use crate::Dial;
@@ -39,6 +46,13 @@ pub enum Item {
     /// The snapshot, and the id it is consistent at: the first item of
     /// `subscribe(None)`, and the one after a `too_old`.
     State { state: State, at: EventId },
+    /// A fresh snapshot of a live subscription (wsp-174): the subscriber's
+    /// scope changed, so what it may read is sent again at the head. Fold it
+    /// as the first [`Item::State`]: what was held is replaced.
+    Resync { state: State, at: EventId },
+    /// A record left the subscriber's sight (wsp-174): drop `subject`. `at` is
+    /// the id of the event that moved it.
+    Gone { subject: Subject, at: EventId },
     /// One event, in commit order; no id is handed out twice.
     Event(Event),
     /// The feed lost its connection and has a new one, subscribed from `from`
@@ -239,6 +253,29 @@ impl Feed {
                 self.last = Some(at);
                 self.delivered = true;
                 self.pending.push_back(Item::State { state, at });
+            }
+            Frames::Resync { state, at } => {
+                let state = match self.parts.take() {
+                    Some((mut held, held_at)) if held_at == at => {
+                        held.absorb(state);
+                        held
+                    }
+                    _ => state,
+                };
+                // A snapshot is not an event: it is handed out whatever the
+                // last id was, which scoped feeds leave with gaps.
+                self.last = Some(at);
+                self.delivered = true;
+                self.pending.push_back(Item::Resync { state, at });
+            }
+            Frames::Gone { subject, at } => {
+                self.delivered = true;
+                if self.last.is_some_and(|last| at <= last) {
+                    self.dropped += 1;
+                } else {
+                    self.last = Some(at);
+                    self.pending.push_back(Item::Gone { subject, at });
+                }
             }
             Frames::Event(e) => {
                 self.delivered = true;

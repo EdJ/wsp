@@ -1411,3 +1411,78 @@ fn a_feed_refused_unauthorised_after_the_welcome_ends_and_does_not_dial_again() 
     assert_eq!(f.reconnects(), 0, "no redial");
     assert_eq!(f.by_ref().next(), None, "the iterator ends");
 }
+
+#[test]
+fn a_scoped_feed_with_gaps_in_its_ids_hands_out_a_gone_and_a_resync_in_order() {
+    // A server of our own that sends what a scoped subscription does: events with gaps in their
+    // ids, a record gone, a fresh snapshot, and an event after it.
+    use std::io::{BufRead, BufReader, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let d = dir("gaps");
+    fs::create_dir_all(&d).unwrap();
+    let listen = Listen { addrs: vec![l.local_addr().unwrap().to_string()] };
+    fs::write(d.join(LISTEN_FILE), serde_json::to_string(&listen).unwrap()).unwrap();
+    fs::write(d.join(TOKEN_FILE), "t").unwrap();
+    let store = mirror_store();
+    rows(&store, 0, 1);
+    let mut e = store.events_after(EventId(0), 10).unwrap().remove(0);
+    let (state, _) = store.snapshot().unwrap();
+    fn line(f: wsp_api::Feed) -> String {
+        format!("{}\n", serde_json::to_string(&wsp_api::Frame::Feed(f)).unwrap())
+    }
+    let mut frames = vec![];
+    for id in [2, 5] {
+        e.id = EventId(id);
+        frames.push(line(wsp_api::Feed::Event(e.clone())));
+    }
+    frames.push(line(wsp_api::Feed::Gone { subject: Subject::Row(RowId("r-0".into())), at: EventId(7) }));
+    // The same id again: dropped, as an event's is.
+    frames.push(line(wsp_api::Feed::Gone { subject: Subject::Row(RowId("r-0".into())), at: EventId(7) }));
+    frames.push(line(wsp_api::Feed::Resync { state: state.clone(), at: EventId(9) }));
+    e.id = EventId(11);
+    frames.push(line(wsp_api::Feed::Event(e.clone())));
+    let accepts = std::thread::spawn(move || {
+        let mut threads = vec![];
+        for stream in l.incoming().take(2) {
+            let (mut s, frames) = (stream.unwrap(), frames.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut text = String::new();
+                r.read_line(&mut text).unwrap();
+                writeln!(s, "{}", r#"{"type":"welcome","server":"fake","protocol":1,"head":11}"#).unwrap();
+                text.clear();
+                if r.read_line(&mut text).unwrap() == 0 {
+                    return;
+                }
+                let id = serde_json::from_str::<Value>(&text).unwrap()["id"].clone();
+                writeln!(s, "{}", json!({"type":"reply","id":id,"ok":"subscribed","events":[]})).unwrap();
+                for f in &frames {
+                    s.write_all(f.as_bytes()).unwrap();
+                }
+                loop {
+                    text.clear();
+                    if r.read_line(&mut text).unwrap_or(0) == 0 {
+                        return;
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+    });
+    let c = Client::dial(&d, ed(), WAIT).unwrap();
+    let mut f = c.subscribe(Some(EventId(0)));
+    let got: Vec<Item> = (0..5).filter_map(|_| f.next_within(WAIT)).collect();
+    assert!(matches!(&got[0], Item::Event(e) if e.id == EventId(2)), "{got:?}");
+    assert!(matches!(&got[1], Item::Event(e) if e.id == EventId(5)), "{got:?}: no contiguity is assumed");
+    assert_eq!(got[2], Item::Gone { subject: Subject::Row(RowId("r-0".into())), at: EventId(7) });
+    assert_eq!(got[3], Item::Resync { state, at: EventId(9) });
+    assert!(matches!(&got[4], Item::Event(e) if e.id == EventId(11)), "{got:?}");
+    assert_eq!(f.duplicates(), 1);
+    assert_eq!(f.last_id(), Some(EventId(11)));
+    drop(f);
+    drop(c);
+    let _ = accepts.join();
+    let _ = fs::remove_dir_all(&d);
+}

@@ -908,7 +908,7 @@ fn the_contract_codes_are_its_refusals_codes() {
 
 // ---------------------------------------------------------------- feed
 
-const FEEDS: usize = 4;
+const FEEDS: usize = 6;
 
 fn feed_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Feed(feed) = f else {
@@ -919,6 +919,8 @@ fn feed_ordinal(f: &Frame) -> (usize, &'static str) {
         Feed::Event(_) => (1, "event"),
         Feed::Beat { .. } => (2, "beat"),
         Feed::Part { .. } => (3, "part"),
+        Feed::Resync { .. } => (4, "resync"),
+        Feed::Gone { .. } => (5, "gone"),
     }
 }
 
@@ -936,6 +938,14 @@ fn feeds() -> Vec<Frame> {
         Frame::Feed(Feed::Part {
             part: a_state(),
             at: EventId(411),
+        }),
+        Frame::Feed(Feed::Resync {
+            state: a_state(),
+            at: EventId(413),
+        }),
+        Frame::Feed(Feed::Gone {
+            subject: Subject::Row(RowId("wsp-1".into())),
+            at: EventId(414),
         }),
     ]
 }

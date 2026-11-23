@@ -1254,3 +1254,171 @@ fn a_revoked_user_loses_every_connection_it_held() {
     server.stop();
     let _ = fs::remove_dir_all(&d);
 }
+
+// ---------------------------------------------------------------- scoped subscribe (wsp-174)
+
+/// The mirror domain, and `hub.member.set` folding into `state.members`, so
+/// that a test moves a person's scope with an event.
+struct Members;
+
+impl Domain for Members {
+    fn decide(&self, state: &State, cmd: &Command, by: &Principal) -> std::result::Result<Vec<Draft>, Refusal> {
+        match cmd {
+            Command::HubMemberSet { workspace, user, member } => std::result::Result::Ok(vec![Draft {
+                kind: EventKind::HubMemberSet,
+                subject: Subject::Member { workspace: workspace.clone(), user: user.clone() },
+                workspace: Default::default(),
+                payload: json!({ "member": member }),
+            }]),
+            other => Mirror.decide(state, other, by),
+        }
+    }
+
+    fn evolve(&self, mut state: State, event: &Event) -> State {
+        if let (EventKind::HubMemberSet, Subject::Member { workspace, user }) = (event.kind, &event.subject) {
+            let members = state.members.entry(workspace.clone()).or_default();
+            if event.payload["member"] == json!(true) {
+                members.insert(user.clone());
+            } else {
+                members.remove(user);
+            }
+            return state;
+        }
+        Mirror.evolve(state, event)
+    }
+}
+
+/// A gate that trusts the hello and reads a person's workspaces off `state.members`.
+struct ByMembers;
+
+impl wsp_server::Gate for ByMembers {
+    fn hello(&self, hello: &Hello, _token: &ApiToken) -> std::result::Result<Principal, String> {
+        Ok(hello.by.clone())
+    }
+
+    fn admits(&self, _by: &Principal, _call: &Call) -> std::result::Result<(), wsp_api::Failure> {
+        Ok(())
+    }
+
+    fn owns(&self, _cmd: &Command) -> bool {
+        false
+    }
+
+    fn readable(&self, by: &Principal, state: &State) -> Option<std::collections::BTreeSet<SharedName>> {
+        let Principal::Person(user) = by else { return None };
+        let user = UserName(user.clone());
+        Some(state.members.iter().filter(|(_, who)| who.contains(&user)).map(|(w, _)| w.clone()).collect())
+    }
+}
+
+fn shared(name: &str) -> WorkspaceId {
+    WorkspaceId::Shared(SharedName(name.into()))
+}
+
+fn row_in(id: &str, workspace: WorkspaceId) -> Entity {
+    Entity::Row(Row { workspace, ..row(id, "x") })
+}
+
+fn member(store: &MemStore, workspace: &str, user: &str, key: &str) {
+    let cmd = Command::HubMemberSet { workspace: SharedName(workspace.into()), user: UserName(user.into()), member: true };
+    store.apply(cmd, IdempotencyKey(key.into()), Principal::Person("admin".into())).unwrap();
+}
+
+fn start_scoped(store: SharedStore, dir: &Path) -> Server {
+    let mut cfg = Config::new(dir);
+    cfg.port = 0;
+    cfg.beat = Duration::from_secs(10);
+    cfg.gate = Some(Arc::new(ByMembers));
+    Server::start(store, cfg).unwrap()
+}
+
+fn next_event(c: &mut Client) -> Event {
+    match c.next_feed() {
+        Feed::Event(e) => e,
+        other => panic!("expected an event, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_scoped_subscriber_is_sent_a_record_whole_when_it_moves_in_and_a_gone_when_it_moves_out() {
+    let d = dir("scoped-moves");
+    let store = MemStore::with_domain(Arc::new(Members));
+    member(&store, "core", "ed", "m1");
+    apply(&store, vec![row_in("held", shared("core")), row_in("hidden", WorkspaceId::Private)], vec![], "seed");
+    let server = start_scoped(Arc::new(store.handle()), &d);
+    let mut ed_c = connect(&d);
+    ed_c.subscribe(None);
+    match ed_c.next_feed() {
+        Feed::State { state, at } => {
+            assert_eq!(at, store.head().unwrap());
+            assert_eq!(state.rows.keys().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["held"], "only what ed may read");
+        }
+        other => panic!("expected the snapshot, got {other:?}"),
+    }
+
+    // jesper adds a private row: ed's feed has nothing of it (the next frame is the marker after it).
+    apply(&store, vec![row_in("mine", WorkspaceId::Private)], vec![], "private");
+    let marker = apply(&store, vec![row_in("marker", shared("core"))], vec![], "marker");
+    let e = next_event(&mut ed_c);
+    assert_eq!((e.id, &e.subject), (marker.events[0], &Subject::Row(RowId("marker".into()))), "the private row is not sent");
+
+    // It moves to a workspace ed reads: ed is sent the whole record.
+    let moved = row_in("mine", shared("core"));
+    let into = apply(&store, vec![moved.clone()], vec![], "in");
+    let e = next_event(&mut ed_c);
+    assert_eq!((e.id, e.kind, &e.subject), (into.events[0], EventKind::MirrorPut, &Subject::Row(RowId("mine".into()))));
+    assert_eq!(serde_json::from_value::<Entity>(e.payload).unwrap(), moved, "the whole entity");
+
+    // And back: ed is told it is gone, and then hears nothing of it.
+    let out = apply(&store, vec![row_in("mine", WorkspaceId::Private)], vec![], "out");
+    assert_eq!(ed_c.next_feed(), Feed::Gone { subject: Subject::Row(RowId("mine".into())), at: out.events[0] });
+    apply(&store, vec![row_in("mine", WorkspaceId::Private)], vec![], "quiet");
+    let after = apply(&store, vec![row_in("after", shared("core"))], vec![], "after");
+    assert_eq!(next_event(&mut ed_c).id, after.events[0], "a private edit of a record that left is not sent");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_member_added_mid_stream_is_sent_a_resync_and_then_that_workspaces_events() {
+    let d = dir("scoped-resync");
+    let store = MemStore::with_domain(Arc::new(Members));
+    member(&store, "core", "ed", "m1");
+    apply(
+        &store,
+        vec![row_in("c-1", shared("core")), row_in("o-1", shared("other")), row_in("p-1", WorkspaceId::Private)],
+        vec![],
+        "seed",
+    );
+    let server = start_scoped(Arc::new(store.handle()), &d);
+    let mut ed_c = connect(&d);
+    ed_c.subscribe(None);
+    assert!(matches!(ed_c.next_feed(), Feed::State { .. }));
+    let mut other = connect_as(&d, Principal::Person("zed".into()));
+    other.subscribe(None);
+    assert!(matches!(other.next_feed(), Feed::State { .. }));
+
+    // An event of a workspace ed is not in is not sent; the one after it, of core, is.
+    apply(&store, vec![row_in("o-2", shared("other"))], vec![], "o2");
+    let c2 = apply(&store, vec![row_in("c-2", shared("core"))], vec![], "c2");
+    assert_eq!(next_event(&mut ed_c).id, c2.events[0]);
+
+    member(&store, "other", "ed", "m2");
+    let head = store.head().unwrap();
+    match ed_c.next_feed() {
+        Feed::Resync { state, at } => {
+            assert_eq!(at, head, "the fresh snapshot is at the head");
+            let mut rows: Vec<&str> = state.rows.keys().map(|r| r.0.as_str()).collect();
+            rows.sort();
+            assert_eq!(rows, ["c-1", "c-2", "o-1", "o-2"], "both workspaces, and no private row");
+        }
+        other => panic!("expected a resync, got {other:?}"),
+    }
+    let o3 = apply(&store, vec![row_in("o-3", shared("other"))], vec![], "o3");
+    assert_eq!(next_event(&mut ed_c).id, o3.events[0], "that workspace's events follow");
+
+    // A subscriber who is no member of anything reads none of it.
+    assert!(other.feed.iter().all(|f| matches!(f, Feed::Beat { .. })), "{:?}", other.feed);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}

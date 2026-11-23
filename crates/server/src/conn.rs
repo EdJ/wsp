@@ -332,7 +332,7 @@ impl Client<'_> {
             let f = failure(Code::Invalid, "this connection is subscribed already; it holds one subscription".into());
             return send(&self.writer, &reply(id, Err(f)));
         }
-        let opened = match subscribe::open(self.shared, &sub) {
+        let opened = match subscribe::open(self.shared, &sub, &self.by) {
             Ok(o) => o,
             Err(f) => return send(&self.writer, &reply(id, Err(f))),
         };

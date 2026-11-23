@@ -437,7 +437,16 @@ itself.
   `hub.token.revoked` (or `hub.user.revoked`), closes every open connection whose hello resolved to that credential
   (or user). A subscriber gets a last `refused { code: unauthorised }` first, and its client treats that, after a
   welcome, as final: it dials no more and its feed ends.
-- **Not in v1** (named only as later options): per-view or filtered subscriptions, patches or diffs, server-side
+- **Scoped subscriptions (wsp-174, on a server with a gate: the hub).** The server filters a subscription by
+  *workspace*, which is authorisation and not a view: it knows its domain's workspaces and never a client's
+  selectors. The snapshot holds only the records of the shared workspaces the connection's principal may read.
+  An event is sent when its `workspace` is one of them, so ids have gaps and the client assumes no contiguity. An
+  event that puts a record the subscriber holds outside them is sent as `{ "gone": { "subject": …, "at": id } }`,
+  and the client drops the record; one that puts a record the subscriber never saw inside them arrives as a
+  `mirror.put` of the whole entity. An event of the identity (a member or a workspace) that changes the
+  principal's workspaces is answered with `{ "resync": { "state": …, "at": head } }` (after `part`s, as a
+  snapshot is), which a client folds as a first snapshot. A server with no gate reads everything, as before.
+- **Not in v1** (named only as later options): per-view subscriptions, patches or diffs, server-side
   projections, fan-out to browsers. Each one would make the server aware of a client's shape, which Ed ruled out
   for v1.
 - "Subscribe from event id N" sits on the contract's `events_after` and `wait_for` (section 2.2). It is the same

@@ -98,7 +98,7 @@ pub fn beat_only(held: &Machine, now: &Machine) -> bool {
 
 /// What `state` holds at `subject`, as an entity; `None` when nothing, or when
 /// the subject is not one an entity is put under (a lease, a project, ...).
-fn entity_at(state: &State, subject: &Subject) -> Option<Entity> {
+pub(crate) fn entity_at(state: &State, subject: &Subject) -> Option<Entity> {
     match subject {
         Subject::Row(id) => state.rows.get(id).cloned().map(Entity::Row),
         Subject::List(id) => state.lists.get(id).cloned().map(Entity::List),

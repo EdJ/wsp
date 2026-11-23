@@ -30,6 +30,7 @@
 //! It goes through `Store` only, and links `wsp-api`, `wsp-store-contract` and
 //! `wsp-machines` alone of the workspace (never the sqlite crate: section 6).
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -46,7 +47,7 @@ use wsp_api::{
     PROTOCOL,
     TOKEN_FILE, TOKEN_MODE,
 };
-use wsp_store_contract::{At, Store};
+use wsp_store_contract::{At, SharedName, State, Store};
 
 mod conn;
 pub mod domain;
@@ -142,6 +143,13 @@ pub trait Gate: Send + Sync {
     /// (with a key, under the connection's principal), whose domain decides
     /// who may send them.
     fn owns(&self, cmd: &Command) -> bool;
+    /// The shared workspaces `by` may read in `state` (wsp-174): a subscription
+    /// holds only what is in them. `None`, the default, reads everything: the
+    /// state core's own rule. The server knows its domain's workspaces and
+    /// never the client's selectors, so this is authorisation, not a view.
+    fn readable(&self, _by: &Principal, _state: &State) -> Option<BTreeSet<SharedName>> {
+        None
+    }
 }
 
 impl std::fmt::Debug for dyn Gate {

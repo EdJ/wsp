@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::entity::State;
-use crate::event::Event;
+use crate::event::{Event, Subject};
 use crate::id::*;
 
 /// Seconds between heartbeats.
@@ -40,6 +40,16 @@ pub enum Feed {
     /// A piece of a snapshot that a [`Feed::State`] closes (wsp-702). Pieces
     /// are disjoint: each entity is in one of them.
     Part { part: State, at: EventId },
+    /// A fresh snapshot on a live subscription (wsp-174): the subscriber's
+    /// scope changed (it was added to a workspace, or removed from one), so
+    /// the state it may read is sent again at the current head. Like
+    /// [`Feed::State`] it may be preceded by [`Feed::Part`]s, and a client
+    /// folds it as it folds a first snapshot: what it held is replaced.
+    Resync { state: State, at: EventId },
+    /// A record left the subscriber's sight (wsp-174): the event `at` moved
+    /// `subject` out of every workspace the subscriber may read, so its fold
+    /// drops it. `at` is the event's id, so a gap in ids stays a gap.
+    Gone { subject: Subject, at: EventId },
     /// One event, in commit order.
     Event(Event),
     /// The heartbeat: the head's id, and when.
