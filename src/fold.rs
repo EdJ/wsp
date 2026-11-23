@@ -587,7 +587,8 @@ fn mirror_of(store: &Store, db: &SharedStore, host: &str, msg: &Message) -> Opti
 fn order_entity(db: &SharedStore, host: &str, order: &str, seat: &str, state: OrderState) -> Entity {
     let held = db.snapshot().ok().and_then(|(s, _)| s.orders.get(&c::OrderId(order.to_string())).cloned());
     Entity::Order(c::Order {
-        workspace: Default::default(),
+        // A held order keeps its workspace; one the store has not seen reads private.
+        workspace: held.as_ref().map(|h| h.workspace.clone()).unwrap_or_default(),
         id: c::OrderId(order.to_string()),
         from: held.as_ref().map(|h| h.from.clone()).unwrap_or(Principal::Manager(MachineName(host.to_string()))),
         to: SeatId(seat.to_string()),
