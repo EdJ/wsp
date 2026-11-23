@@ -19,6 +19,21 @@
 //!
 //! A spoke that is not logged in to a hub has no lease to take, and a private
 //! row has none either: both are the standalone case and change nothing.
+//!
+//! **The drive lease** (wsp-467, decision d5). A shared list is advanced by one
+//! spoke, the one holding the hub lease `drive:<list>` ([`drive`]), which only a
+//! spoke of the list's allocated user, else of its publisher, takes; any other
+//! spoke's run leaves the list as it is. The driver leases each member before it
+//! starts it ([`lease_member`]): one another user's spoke holds is recorded as
+//! running there ([`running_elsewhere`]), and the run neither starts, reseats nor
+//! verifies it, its landing and verdict arriving with the row. The hub-sync
+//! worker renews the drive while the daemon ticks ([`renew_drives`]); on
+//! `lease.expired` it leaves the book and the next step takes it again.
+//! `$WSP_STATE/hub/drive.json` ([`Book`]) keeps all three.
+//!
+//! The hub keys a lease on its holder's user, so two spokes of one user both
+//! read as its holder: the drive is told apart between them only by which one
+//! holds it in its book.
 
 use std::path::Path;
 
@@ -223,11 +238,292 @@ fn drop_claim(store: &Store, row: &str, token: Token, why: &str) -> bool {
 /// where the claim here holds that token it is released. Whether it was.
 pub(crate) fn follow_expired(store: &Store, payload: &Value) -> bool {
     let (Some(row), Some(token)) = (payload["row"].as_str(), payload["token"].as_u64()) else { return false };
+    if let Some(list) = row.strip_prefix(DRIVE) {
+        return drop_drive(store, list, Token(token), &format!("it expired on the hub (token {token})"));
+    }
     drop_claim(store, row, Token(token), &format!("lease expired on the hub: {row}, token {token}"))
 }
 
+// ---- the drive lease (wsp-467) ----------------------------------------------------
+
+/// The hub lease a shared list's driver holds: `drive:<list>`.
+pub(crate) fn drive_row(list: &str) -> String {
+    format!("{DRIVE}{list}")
+}
+
+const DRIVE: &str = "drive:";
+
+/// A drive lease this spoke holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drive {
+    pub(crate) token: Token,
+    /// When the hub said it runs out, in epoch seconds.
+    pub(crate) expires: i64,
+    /// The TTL it was taken or last renewed with, for the renewal's margin.
+    pub(crate) ttl: i64,
+}
+
+/// `$WSP_STATE/hub/drive.json`: the drive leases this spoke holds, the members
+/// the hub said another user's spoke holds, and who this spoke last read as
+/// each shared list's driver (so a change is said once, not every tick).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Book {
+    pub(crate) drives: std::collections::BTreeMap<String, Drive>,
+    /// Row → the user whose spoke holds its lease.
+    pub(crate) elsewhere: std::collections::BTreeMap<String, String>,
+    /// List → the user it was last read as driven by.
+    pub(crate) driven_by: std::collections::BTreeMap<String, String>,
+}
+
+impl Book {
+    fn path(store: &Store) -> std::path::PathBuf {
+        store.state.join("hub").join("drive.json")
+    }
+
+    pub(crate) fn read(store: &Store) -> Book {
+        let text = std::fs::read_to_string(Book::path(store)).unwrap_or_default();
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let strings = |k: &str| {
+            v[k].as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(r, u)| Some((r.clone(), u.as_str()?.to_string())))
+                .collect()
+        };
+        let drives = v["drives"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(l, d)| {
+                Some((l.clone(), Drive { token: Token(d["token"].as_u64()?), expires: d["expires"].as_i64()?, ttl: d["ttl"].as_i64().unwrap_or(0) }))
+            })
+            .collect();
+        Book { drives, elsewhere: strings("elsewhere"), driven_by: strings("driven_by") }
+    }
+
+    fn write(&self, store: &Store) {
+        let drives: serde_json::Map<String, Value> = self
+            .drives
+            .iter()
+            .map(|(l, d)| (l.clone(), json!({ "token": d.token.0, "expires": d.expires, "ttl": d.ttl })))
+            .collect();
+        let v = json!({ "drives": drives, "elsewhere": self.elsewhere, "driven_by": self.driven_by });
+        let path = Book::path(store);
+        let Some(dir) = path.parent() else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let tmp = dir.join(format!(".drive.json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, v.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Read, change and write it back under the store's lock; what `f` answered.
+    pub(crate) fn edit<T>(store: &Store, f: impl FnOnce(&mut Book) -> T) -> T {
+        store.locked(|| {
+            let mut book = Book::read(store);
+            let before = book.clone();
+            let out = f(&mut book);
+            if book != before {
+                book.write(store);
+            }
+            out
+        })
+    }
+}
+
+/// What the gate before advancing a shared list answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Drives {
+    /// Advance it: this spoke holds the drive lease, or the list is private,
+    /// or there is no hub (the standalone case).
+    Here,
+    /// Another user's spoke drives it, or is the one that may.
+    Elsewhere(String),
+    /// Not advanced this turn: the hub did not answer, in words.
+    NotYet(String),
+}
+
+/// The user a shared list's drive lease belongs to: its allocated user, else
+/// its publisher (the first record of it this spoke holds), else `None` (a
+/// list published here and not yet synced is this spoke's user's).
+pub(crate) fn driver_of(store: &Store, w: &crate::model::Worklist) -> Option<String> {
+    w.for_user.clone().or_else(|| crate::hub_sync::publisher(store, &w.id))
+}
+
+/// The gate before the run advances `w` (wsp-467, decision d5): a shared list
+/// moves only on the spoke holding `drive:<list>`, which only a spoke of
+/// [`driver_of`]'s user takes. One held and unexpired here is used as it is
+/// (the hub-sync worker renews it); otherwise it is taken now.
+pub(crate) fn drive(store: &Store, w: &crate::model::Worklist) -> Drives {
+    if w.workspace.is_private() {
+        return Drives::Here;
+    }
+    let Some(home) = home().filter(|h| logged_in(h)) else { return Drives::Here };
+    let Some(me) = crate::address::logged_in_user() else { return Drives::Here };
+    let driver = driver_of(store, w).unwrap_or_else(|| me.clone());
+    if driver != me {
+        return Drives::Elsewhere(driver);
+    }
+    let now = util::epoch_secs();
+    if Book::read(store).drives.get(&w.id).is_some_and(|d| d.expires > now) {
+        return Drives::Here;
+    }
+    let mut client = match crate::cmd_publish::dial(&home) {
+        Ok(c) => c,
+        Err(e) => return Drives::NotYet(e),
+    };
+    let row = drive_row(&w.id);
+    match client.lease_take(&HubWorkspace(w.workspace.to_string()), &RowId(row.clone())) {
+        Ok((token, at)) => {
+            let expires = (at.0 / 1000) as i64;
+            Book::edit(store, |b| {
+                b.drives.insert(w.id.clone(), Drive { token, expires, ttl: (expires - now).max(0) });
+            });
+            Drives::Here
+        }
+        Err(HubError::Refused(Refusal::Held { holder, .. })) => Drives::Elsewhere(who(&holder)),
+        Err(HubError::Refused(Refusal::Forbidden { .. })) => Drives::Elsewhere(driver),
+        Err(e) => Drives::NotYet(format!("the hub would not lease {row}: {e}")),
+    }
+}
+
+/// What the run does about one member of a list it drives, before it starts it.
+#[derive(Debug)]
+pub(crate) enum Member {
+    /// No lease to take: a private row, or no hub.
+    Free,
+    /// The hub leased it to this spoke's user; the spawn's claim takes it again
+    /// (the same holder keeps its token).
+    Leased(Held),
+    /// Another user's spoke holds it: it runs there, and the barrier waits for
+    /// its landing as for any member.
+    Elsewhere(String),
+    /// The hub did not answer, in words: not started this turn.
+    NotYet(String),
+}
+
+/// The driver leases `row` before spawning it (wsp-467). A refusal `held`
+/// records the holder, so the run neither starts, reseats nor verifies the
+/// member here ([`running_elsewhere`]).
+pub(crate) fn lease_member(store: &Store, row: &str) -> Member {
+    let Some(t) = store.task(row) else { return Member::Free };
+    if t.workspace.is_private() {
+        return Member::Free;
+    }
+    let Some(home) = home().filter(|h| logged_in(h)) else { return Member::Free };
+    let mut client = match crate::cmd_publish::dial(&home) {
+        Ok(c) => c,
+        Err(e) => return Member::NotYet(e),
+    };
+    match client.lease_take(&HubWorkspace(t.workspace.to_string()), &RowId(row.to_string())) {
+        Ok((token, at)) => {
+            Book::edit(store, |b| b.elsewhere.remove(row));
+            Member::Leased(Held { token, expires: (at.0 / 1000) as i64 })
+        }
+        Err(HubError::Refused(Refusal::Held { holder, .. })) => {
+            let user = who(&holder);
+            Book::edit(store, |b| b.elsewhere.insert(row.to_string(), user.clone()));
+            Member::Elsewhere(user)
+        }
+        Err(HubError::Refused(Refusal::Forbidden { .. })) => {
+            Member::Elsewhere(crate::cmd_allocate::allocated_to(store, row).unwrap_or_else(|| "another user".into()))
+        }
+        Err(e) => Member::NotYet(say(row, e)),
+    }
+}
+
+/// A member lease the run took and did not use (no start, or a start that
+/// made no claim) goes back to the hub at once, not in a week.
+pub(crate) fn unused(store: &Store, row: &str, held: &Held) {
+    if store.claims().contains_key(row) {
+        return;
+    }
+    let Some(home) = home().filter(|h| logged_in(h)) else { return };
+    let Ok(mut client) = crate::cmd_publish::dial(&home) else { return };
+    let _ = client.lease_release(&RowId(row.to_string()), held.token);
+}
+
+/// The user whose spoke the hub last said holds `row`, when it is not yet
+/// landed: the member-held branch of the run, and `worklist show`'s
+/// `running on <user>'s wsp`.
+pub(crate) fn running_elsewhere(store: &Store, row: &str) -> Option<String> {
+    let user = Book::read(store).elsewhere.get(row).cloned()?;
+    let done = store.find_task(row).is_none_or(|t| t.status() == crate::model::Status::Done);
+    (!done).then_some(user)
+}
+
+/// Who `worklist show` says drives `w`: the user this spoke last read it as
+/// driven by, else the one whose spoke may. `None` for a private list.
+pub(crate) fn driven_by(store: &Store, w: &crate::model::Worklist) -> Option<String> {
+    if w.workspace.is_private() {
+        return None;
+    }
+    Book::read(store)
+        .driven_by
+        .get(&w.id)
+        .cloned()
+        .or_else(|| driver_of(store, w))
+        .or_else(crate::address::logged_in_user)
+}
+
+/// The drive leases this spoke holds, renewed while the daemon ticks: each on
+/// [`renew_due`]'s margin. A list no longer running here (done, gone, made
+/// private) lets its lease go; one the hub refuses is dropped from the book,
+/// so the next step takes it again or reads who has it.
+pub(crate) fn renew_drives(store: &Store, client: &mut Client, now: i64) -> usize {
+    let mut renewed = 0;
+    for (list, d) in Book::read(store).drives {
+        let row = RowId(drive_row(&list));
+        let running = store
+            .worklist(&list)
+            .is_some_and(|w| !w.workspace.is_private() && w.status() != crate::model::WorklistStatus::Done);
+        if !running {
+            let _ = client.lease_release(&row, d.token);
+            Book::edit(store, |b| b.drives.remove(&list));
+            continue;
+        }
+        let margin = d.ttl.min(3600).min(d.ttl / 2).max(0);
+        if d.ttl <= 0 || d.expires - now >= d.ttl - margin {
+            continue;
+        }
+        match client.lease_renew(&row, d.token) {
+            Ok((_, at)) => {
+                let expires = (at.0 / 1000) as i64;
+                Book::edit(store, |b| {
+                    if let Some(x) = b.drives.get_mut(&list).filter(|x| x.token == d.token) {
+                        x.expires = expires;
+                        x.ttl = (expires - now).max(0);
+                    }
+                });
+                renewed += 1;
+            }
+            Err(HubError::Refused(r)) => {
+                drop_drive(store, &list, d.token, &format!("renewing it was refused ({r:?})"));
+            }
+            Err(_) => {}
+        }
+    }
+    renewed
+}
+
+/// The drive lease on `list` with `token` is gone: out of the book, said once.
+fn drop_drive(store: &Store, list: &str, token: Token, why: &str) -> bool {
+    let dropped = Book::edit(store, |b| match b.drives.get(list) {
+        Some(d) if d.token == token => {
+            b.drives.remove(list);
+            b.driven_by.remove(list);
+            true
+        }
+        _ => false,
+    });
+    if dropped {
+        wsp_store::store::log_line(store, &format!("{list}: the drive lease is gone: {why}; another spoke of its user may take it"));
+    }
+    dropped
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -247,6 +543,11 @@ mod tests {
 
     /// A served hub (no TLS, loopback) with `ann`, `bo` members of `shared:team`.
     fn serve(dir: &Path) -> (wsp_hub::serve::Running, BTreeMap<String, String>) {
+        serve_users(dir, &["ann", "bo"])
+    }
+
+    /// A served hub with `users` members of `shared:team`, and their tokens.
+    pub(crate) fn serve_users(dir: &Path, users: &[&str]) -> (wsp_hub::serve::Running, BTreeMap<String, String>) {
         let data = dir.join("hub-data");
         let mut tokens = BTreeMap::new();
         {
@@ -257,7 +558,7 @@ mod tests {
             let root = person("root");
             apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
             apply(Cmd::HubWorkspaceAdd { name: SharedName("team".into()) }, &root);
-            for user in ["ann", "bo"] {
+            for user in users.iter().copied() {
                 apply(Cmd::HubUserAdd { name: UserName(user.into()), admin: false }, &root);
                 apply(Cmd::HubMemberSet { workspace: SharedName("team".into()), user: UserName(user.into()), member: true }, &root);
                 let (secret, hash) = wsp_machines::token::mint();
@@ -277,7 +578,7 @@ mod tests {
         (wsp_hub::serve::start(&cfg).expect("the hub starts"), tokens)
     }
 
-    fn dial(running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> Client {
+    pub(crate) fn dial(running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> Client {
         Client::dial_at(vec![running.addrs()[0].to_string()], ApiToken(tokens[who].clone()), person(who), WAIT).expect("the hub answers")
     }
 
@@ -409,7 +710,7 @@ mod tests {
     }
 
     /// A spoke's home logged in to the served hub as `who`.
-    fn login(dir: &Path, running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> std::path::PathBuf {
+    pub(crate) fn login(dir: &Path, running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let home = dir.join(format!("home-{who}"));
         let file = home.join(".config/wsp/hubs.json");

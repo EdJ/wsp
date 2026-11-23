@@ -90,6 +90,27 @@ pub(crate) fn push_list_record(store: &Store, subject: &Subject, workspace: Work
     Some(Object::Record { workspace, subject: subject.clone(), entity, parent, by, at })
 }
 
+/// The user who published shared list `list`: the `by` of the first record in
+/// the chain behind its synced head, as far back as this spoke holds objects
+/// (wsp-467: a list nobody is allocated is driven by a spoke of its publisher).
+/// `None` for a list never synced.
+pub(crate) fn publisher(store: &Store, list: &str) -> Option<String> {
+    let subject = Subject::List(wsp_store_contract::ListId(list.to_string()));
+    let mut at = *Heads::read(store).head(&subject)?;
+    let objects = ObjectDir::of(store);
+    let mut by = None;
+    let mut seen = BTreeSet::new();
+    while seen.insert(at) {
+        let Some(Object::Record { by: b, parent, .. }) = Objects::object(&objects, &at) else { break };
+        by = Some(user_of(&b));
+        match parent {
+            Some(p) => at = p,
+            None => break,
+        }
+    }
+    by
+}
+
 /// The shared workspaces the login's user is a member of, as the hub serves
 /// them: the first item of a scoped subscription is a snapshot that holds
 /// only the caller's workspaces (wsp-174), and its `workspaces` are the names.
@@ -375,10 +396,14 @@ impl Worker {
     }
 
     /// The hub leases of the claims here whose seats are alive, renewed at most
-    /// hourly each (wsp-466, [`crate::hub_lease::renew_due`]).
+    /// hourly each (wsp-466, [`crate::hub_lease::renew_due`]), and the drive
+    /// leases of the lists this spoke drives (wsp-467).
     fn renew_leases(&mut self, store: &Store) {
         let Some(client) = self.client.as_mut() else { return };
-        crate::hub_lease::renew_all(store, client, crate::util::epoch_secs());
+        let now = crate::util::epoch_secs();
+        crate::hub_lease::renew_all(store, client, now);
+        // And the drive leases of the shared lists this spoke drives (wsp-467).
+        crate::hub_lease::renew_drives(store, client, now);
     }
 
     fn url(&self) -> String {
