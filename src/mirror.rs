@@ -253,7 +253,7 @@ pub fn rows(
                 None => drop(f.insert(key::PROSE.into(), t.body.clone())),
             }
             Entity::Row(c::Row {
-                workspace: Default::default(),
+                workspace: t.workspace.clone(),
                 id: RowId(t.id.clone()),
                 project: ProjectId(model::project_of(t).unwrap_or_default()),
                 title: t.title.clone(),
@@ -514,7 +514,7 @@ fn lists_with(
             if status == WorklistStatus::Done && seated(w, governed) {
                 f.insert(c::WIP_SEATED.into(), "true".into());
             }
-            Entity::List(c::List { workspace: Default::default(), id: ListId(w.id.clone()), state: list_state(status), groups, fields: f })
+            Entity::List(c::List { workspace: w.workspace.clone(), id: ListId(w.id.clone()), state: list_state(status), groups, fields: f })
         })
         .collect()
 }
@@ -1325,6 +1325,31 @@ mod tests {
         }
         let Entity::Row(r1) = &r[&Subject::Row(RowId("wsp-1".into()))] else { panic!() };
         assert_eq!((r1.seat.clone(), r1.group.clone()), (None, None));
+    }
+
+    /// `wsp-171`: a task's and a worklist's `workspace:` is the row's and the list's; a private
+    /// record has none, and a move to another workspace is a different entity (a put).
+    #[test]
+    fn a_rows_and_a_lists_workspace_is_the_files() {
+        let s = seed("mirror-workspace");
+        let core: c::WorkspaceId = "shared:core".parse().unwrap();
+        let ws = |s: &Store| {
+            let es = read_rows_etc(s, "here");
+            let of = |sub: Subject| match key(&es).remove(&sub).unwrap() {
+                Entity::Row(r) => r.workspace,
+                Entity::List(l) => l.workspace,
+                _ => panic!(),
+            };
+            (of(Subject::Row(RowId("wsp-1".into()))), of(Subject::List(ListId("list-a".into()))))
+        };
+        assert_eq!(ws(&s), (Default::default(), Default::default()));
+        let mut t = s.find_task("wsp-1").unwrap();
+        t.workspace = core.clone();
+        s.save_task(&t).unwrap();
+        let mut w = s.worklists().into_iter().find(|w| w.id == "list-a").unwrap();
+        w.workspace = core.clone();
+        s.save_worklist(&w).unwrap();
+        assert_eq!(ws(&s), (core.clone(), core));
     }
 
     /// `wsp-409`: a record's `expires` mirrors as a moment (ms, the contract's

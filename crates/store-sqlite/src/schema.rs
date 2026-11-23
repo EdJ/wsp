@@ -9,7 +9,7 @@ use crate::be;
 use wsp_store_contract::Result;
 
 /// The schema version this build writes and reads (`PRAGMA user_version`).
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 
 const DDL: &str = "
 CREATE TABLE IF NOT EXISTS event (
@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS event (
     principal TEXT NOT NULL,
     kind      TEXT NOT NULL,
     subject   TEXT NOT NULL,
-    payload   TEXT NOT NULL
+    payload   TEXT NOT NULL,
+    workspace TEXT NOT NULL DEFAULT 'private'
 );
 CREATE TABLE IF NOT EXISTS command (
     key    TEXT PRIMARY KEY,
@@ -66,6 +67,14 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         return Err(be(format!("the store file is schema {version}; this build reads {VERSION}")));
     }
     conn.execute_batch(DDL).map_err(be)?;
+    // A file from schema 1 has no workspace column: add it, and what it holds reads private.
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('event') WHERE name = 'workspace'")
+        .and_then(|mut s| s.exists([]))
+        .map_err(be)?;
+    if !has {
+        conn.execute_batch("ALTER TABLE event ADD COLUMN workspace TEXT NOT NULL DEFAULT 'private'").map_err(be)?;
+    }
     if version < VERSION {
         conn.pragma_update(None, "user_version", VERSION).map_err(be)?;
     }

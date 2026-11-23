@@ -70,13 +70,13 @@ pub(crate) fn check_fence(c: &Connection, fence: &Fence) -> Result<()> {
 pub(crate) fn insert_drafts(c: &Connection, drafts: Vec<Draft>, by: &Principal, at: At) -> Result<Vec<Event>> {
     let mut next = head_of(c)?;
     let mut stmt = c
-        .prepare_cached("INSERT INTO event (id, at, principal, kind, subject, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+        .prepare_cached("INSERT INTO event (id, at, principal, kind, subject, payload, workspace) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
         .map_err(be)?;
     let mut out = Vec::with_capacity(drafts.len());
     for d in drafts {
         next += 1;
         let e = Event { id: EventId(next), at, principal: by.clone(), kind: d.kind, subject: d.subject, workspace: d.workspace, payload: d.payload };
-        stmt.execute(params![next as i64, at.0 as i64, to_json!(&e.principal)?, to_json!(&e.kind)?, to_json!(&e.subject)?, to_json!(&e.payload)?])
+        stmt.execute(params![next as i64, at.0 as i64, to_json!(&e.principal)?, to_json!(&e.kind)?, to_json!(&e.subject)?, to_json!(&e.payload)?, e.workspace.to_string()])
             .map_err(be)?;
         out.push(e);
     }

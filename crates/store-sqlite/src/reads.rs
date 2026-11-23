@@ -188,25 +188,25 @@ impl Events for SqliteStore {
         self.with_conn(|c| {
             let mut stmt = c
                 .prepare_cached(
-                    "SELECT id, at, principal, kind, subject, payload FROM event WHERE id > ?1 ORDER BY id LIMIT ?2",
+                    "SELECT id, at, principal, kind, subject, payload, workspace FROM event WHERE id > ?1 ORDER BY id LIMIT ?2",
                 )
                 .map_err(be)?;
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             let rows = stmt
                 .query_map(params![after.0 as i64, limit], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?))
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?))
                 })
                 .map_err(be)?;
             let mut out = vec![];
             for row in rows {
-                let (id, at, principal, kind, subject, payload) = row.map_err(be)?;
+                let (id, at, principal, kind, subject, payload, workspace) = row.map_err(be)?;
                 out.push(Event {
                     id: EventId(id as u64),
                     at: At(at as u64),
                     principal: from_json!(&principal)?,
                     kind: from_json!(&kind)?,
                     subject: from_json!(&subject)?,
-                    workspace: Default::default(),
+                    workspace: workspace.parse().map_err(be)?,
                     payload: from_json!(&payload)?,
                 });
             }

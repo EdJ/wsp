@@ -336,6 +336,48 @@ fn an_edit_and_a_block_each_reach_the_subscriber_then_quiet() {
     }
 }
 
+/// wsp-171: a row in a shared workspace is mirrored with it, and its events carry it;
+/// a hand edit that moves it to another is a put with the new one (a private record
+/// is mirrored with none, so a store from before workspaces reads as it did).
+#[test]
+fn a_rows_workspace_is_mirrored_and_a_move_is_a_put_with_the_new_one() {
+    use wsp_store::model::{Task, WorkspaceId};
+    let shared = |n: &str| format!("shared:{n}").parse::<WorkspaceId>().unwrap();
+    let mut sb = Sandbox::up("ws");
+    let store = files_of(&sb);
+    for (id, ws) in [("ws-1", shared("jesper")), ("ws-2", WorkspaceId::Private)] {
+        let mut t = Task::new(&format!("title of {id}"), id);
+        t.project = Some("wsp".into());
+        t.status_raw = "todo".into();
+        t.workspace = ws;
+        store.save_task(&t).unwrap();
+    }
+    sb.start_daemon(free_port(), false);
+    let client = sb.client(BUDGET);
+    let (state, mut feed) = feed_from_snapshot_with(&client, |v| v["rows"].as_object().map_or(0, |o| o.len()) == 2);
+    assert_eq!(state["rows"]["ws-1"]["workspace"], "shared:jesper");
+    assert!(state["rows"]["ws-2"].get("workspace").is_none(), "a private row is mirrored without one");
+
+    let mut t = store.task("ws-1").unwrap();
+    t.workspace = shared("core");
+    store.save_task(&t).unwrap();
+    let end = Instant::now() + BUDGET;
+    let mut moved = None;
+    while Instant::now() < end && moved.is_none() {
+        if let Some(Item::Event(e)) = feed.next_within(Duration::from_millis(100)) {
+            let v = serde_json::to_value(&e).unwrap();
+            if v["kind"] == "mirror.put" && v["subject"].to_string().contains("ws-1") {
+                moved = Some(v);
+            }
+        }
+    }
+    let moved = moved.expect("the move did not reach the subscriber as a put");
+    assert_eq!(moved["workspace"], "shared:core", "{moved}");
+    assert_eq!(moved["payload"]["row"]["workspace"], "shared:core", "{moved}");
+    let state = snapshot_with(&client, |v| v["rows"]["ws-1"]["workspace"] == "shared:core");
+    assert_eq!(state["rows"]["ws-1"]["workspace"], "shared:core");
+}
+
 #[test]
 fn wsp_api_off_starts_nothing() {
     let mut sb = Sandbox::up("off");

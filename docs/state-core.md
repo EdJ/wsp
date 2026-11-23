@@ -281,7 +281,8 @@ CREATE TABLE event (
   at        TEXT NOT NULL, principal TEXT NOT NULL,
   kind      TEXT NOT NULL,                    -- 'seat.started', 'order.acknowledged', …
   subject   TEXT NOT NULL,                    -- 'seat:cpd-3698', 'row:wsp-483'
-  payload   TEXT NOT NULL                     -- JSON
+  payload   TEXT NOT NULL,                    -- JSON
+  workspace TEXT NOT NULL DEFAULT 'private'   -- 'private' or 'shared:<name>' (schema 2; an older event reads private)
 );
 CREATE INDEX event_subject ON event(subject, id);
 CREATE TABLE command (key TEXT PRIMARY KEY, principal TEXT, at TEXT, result TEXT);   -- idempotency
