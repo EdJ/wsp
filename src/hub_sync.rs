@@ -1063,6 +1063,22 @@ impl Worker {
                 at = obj.parent().copied();
                 line.push(obj);
             }
+            // A row's verdicts and landings (wsp-468) write no file: a landing
+            // fetches the remote it was pushed to, and the head is kept so the
+            // next turn walks only what is new.
+            if matches!(s, Subject::Lease(_)) {
+                for obj in line.iter().rev() {
+                    if let Object::Event { kind: EventKind::RowLanded, payload, .. } = obj {
+                        crate::hub_lease::fetch_landed(store, payload);
+                    }
+                }
+                let mut heads = Heads::read(store);
+                heads.set(s, head, None);
+                if let Err(e) = heads.write(store) {
+                    self.say_once(store, format!("hub-sync: cannot write the synced heads: {e}"));
+                }
+                continue;
+            }
             for obj in line.iter().rev() {
                 match door.import(obj, by) {
                     Ok(_) => turned.adopted += 1,

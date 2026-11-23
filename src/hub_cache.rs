@@ -102,13 +102,15 @@ pub(crate) struct Head {
     pub(crate) holder: Option<String>,
     /// The user it is allocated to.
     pub(crate) allocation: Option<String>,
+    /// The commit its newest landed line names, where it has landed (wsp-468).
+    pub(crate) landed: Option<String>,
 }
 
 impl Head {
     fn to_json(&self) -> Value {
         json!({
             "workspace": self.workspace, "head": self.head, "title": self.title, "status": self.status,
-            "holder": self.holder, "allocation": self.allocation,
+            "holder": self.holder, "allocation": self.allocation, "landed": self.landed,
         })
     }
 
@@ -121,6 +123,7 @@ impl Head {
             status: text("status")?,
             holder: text("holder"),
             allocation: text("allocation"),
+            landed: text("landed"),
         })
     }
 }
@@ -177,6 +180,7 @@ pub(crate) fn head_of(row: &Row, workspace: &str, to: &ObjectId) -> Option<Head>
         status: t.status().as_str().to_string(),
         holder: row.seat.as_ref().map(|s| s.0.clone()),
         allocation: t.for_user.clone(),
+        landed: crate::repair::landed_line(&t),
     })
 }
 

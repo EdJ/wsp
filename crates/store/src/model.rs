@@ -234,8 +234,15 @@ pub struct Project {
     /// workspace (wsp-169); absent is private, and a private record is written
     /// without the key, so nothing stored before workspaces changes a byte.
     pub workspace: WorkspaceId,
+    /// `remote:` — the git remote a shared row's landing pushes the trunk to
+    /// (wsp-468), a name in the project's clone and never a URL; empty is
+    /// [`DEFAULT_REMOTE`]. A private row lands on the local trunk only.
+    pub remote_raw: String,
     pub body: String,
 }
+
+/// The remote a shared row lands through when the project names none.
+pub const DEFAULT_REMOTE: &str = "origin";
 
 impl Project {
     pub fn new(id: &str) -> Project {
@@ -281,7 +288,17 @@ impl Project {
             kind: doc.opt("kind").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             workspace: workspace_of_doc(doc),
+            remote_raw: doc.opt("remote").unwrap_or_default(),
             body: doc.body.clone(),
+        }
+    }
+
+    /// The git remote a shared row's landing pushes to: `remote:`, or
+    /// [`DEFAULT_REMOTE`].
+    pub fn remote(&self) -> &str {
+        match self.remote_raw.trim() {
+            "" => DEFAULT_REMOTE,
+            r => r,
         }
     }
 
@@ -310,6 +327,9 @@ impl Project {
         }
         if !self.kind.trim().is_empty() {
             d.set_str("kind", &self.kind);
+        }
+        if !self.remote_raw.trim().is_empty() {
+            d.set_str("remote", &self.remote_raw);
         }
         d.set_str("seq", &self.seq.to_string());
         set_workspace(&mut d, &self.workspace);

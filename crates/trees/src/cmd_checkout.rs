@@ -2534,12 +2534,25 @@ pub enum Refusal {
     NotFastForward(String),
     /// The branch is already in the trunk: not a failure.
     Nothing(String),
+    /// A shared row's push lost the race: the remote's trunk moved since, the
+    /// push was refused, and the local trunk was brought level with the remote
+    /// (wsp-468). Nothing landed; a rebase onto it and another try is owed.
+    Raced(String),
+    /// A shared row's push failed for another reason (no such remote, nobody
+    /// answering): nothing landed, here or there.
+    Unpushed(String),
 }
 
 impl Refusal {
     pub fn text(&self) -> &str {
         match self {
-            Refusal::Dirty(s) | Refusal::Detached(s) | Refusal::RebaseConflict(s) | Refusal::NotFastForward(s) | Refusal::Nothing(s) => s,
+            Refusal::Dirty(s)
+            | Refusal::Detached(s)
+            | Refusal::RebaseConflict(s)
+            | Refusal::NotFastForward(s)
+            | Refusal::Nothing(s)
+            | Refusal::Raced(s)
+            | Refusal::Unpushed(s) => s,
         }
     }
 }
@@ -2556,8 +2569,60 @@ enum Mode {
     FastForward,
 }
 
+/// The remote a shared row's landing pushes the trunk to (wsp-468): the
+/// project's `remote:`, `origin` where it names none. `None` for a private
+/// row, which lands on the local trunk only, exactly as it always has.
+fn shared_remote(store: &Store, task: &str) -> Option<String> {
+    let t = store.find_task(task)?;
+    if t.workspace.is_private() {
+        return None;
+    }
+    let project = crate::model::project_of(&t).and_then(|p| store.project(&p));
+    Some(project.map_or_else(|| crate::model::DEFAULT_REMOTE.to_string(), |p| p.remote().to_string()))
+}
+
+/// Whether git's refusal of a push is the remote having moved (a lost race)
+/// rather than the push failing.
+fn push_rejected(said: &str) -> bool {
+    ["[rejected]", "non-fast-forward", "fetch first"].iter().any(|w| said.contains(w))
+}
+
+/// Pushes `on` to `remote`'s `branch`, fast-forward only (no force: the remote
+/// refuses anything else). A refusal because the remote moved fetches it and
+/// brings the local trunk level with it, so the rebase that follows is onto
+/// what the remote holds: [`Refusal::Raced`]. wsp writes no URL; the remote is
+/// the clone's own.
+fn push_trunk(trunk: &Path, remote: &str, on: &str, branch: &str) -> Result<(), Refusal> {
+    let Err(said) = git_ok(trunk, &["push", "--quiet", remote, &format!("{on}:refs/heads/{branch}")]) else { return Ok(()) };
+    if !push_rejected(&said) {
+        return Err(Refusal::Unpushed(format!(
+            "the push of {on} to {remote}/{branch} failed: {said}\nwsp: nothing was landed, here or on {remote}"
+        )));
+    }
+    let tracking = format!("refs/remotes/{remote}/{branch}");
+    if let Err(e) = git_ok(trunk, &["fetch", "--quiet", remote, &format!("+refs/heads/{branch}:{tracking}")]) {
+        return Err(Refusal::Unpushed(format!(
+            "{remote}/{branch} moved since this landing began and refused the push, and fetching it failed: {e}\nwsp: nothing was landed"
+        )));
+    }
+    if let Err(e) = git_ok(trunk, &["merge", "--ff-only", "--quiet", &tracking]) {
+        return Err(Refusal::NotFastForward(format!(
+            "{remote}/{branch} moved since this landing began and refused the push, and {} would not follow it: {e}\nwsp: nothing was landed",
+            util::contract(trunk)
+        )));
+    }
+    Err(Refusal::Raced(format!(
+        "the push to {remote}/{branch} lost a race: {remote} moved since this landing began, so it was refused; {branch} here is level with {remote} now, and nothing landed until a rebase onto it does"
+    )))
+}
+
 /// The land, on a task's tree: the part of `wsp land` that is not printing.
 /// Writes the `wsp: landed` line and nothing else on the row.
+///
+/// A shared row (wsp-468) lands through the project's shared remote: the
+/// branch is pushed to the remote's trunk, fast-forward only, before the local
+/// trunk moves, so a push that loses the race leaves both as they were apart
+/// from the fetch ([`push_trunk`]); the landed line says `pushed to <remote>`.
 fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
     // Committing is the agent's act and stays the agent's act: what is
     // uncommitted here is a decision nobody else can make, and landing around
@@ -2596,6 +2661,7 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
         return Err(Refusal::Nothing(format!("{on} is already in {}", w.branch)));
     }
 
+    let remote = shared_remote(store, &w.task);
     let result = landing(store, || {
         // Rebase first, so what reaches the trunk is a fast-forward and the
         // trunk can never gain a merge commit from here. This is also where two
@@ -2617,6 +2683,15 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
             }
         }
         let landed = ahead(&w.repo, &w.branch, &on);
+        if let Some(remote) = &remote {
+            // What the merge below would refuse, said before anything reaches the remote.
+            if git_ok(&w.repo, &["merge-base", "--is-ancestor", &w.branch, &on]).is_err() {
+                return Ok(Err(Refusal::NotFastForward(format!("{on} is not on top of {}: it would not fast-forward", w.branch))));
+            }
+            if let Err(r) = push_trunk(&w.trunk, remote, &on, &w.branch) {
+                return Ok(Err(r));
+            }
+        }
         // `--ff-only` in the trunk rather than a push: the trunk is a checked-out
         // working tree, and this is the one form of update that refuses rather
         // than silently overwriting a file somebody has open there.
@@ -2675,7 +2750,8 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
             let line = format!("{} {sha} on {on}", crate::log::LANDED);
             if !t.section("Log").is_some_and(|l| l.contains(&line)) {
                 let since = base.as_ref().map(|b| format!(" · since {b}")).unwrap_or_default();
-                t.log(&format!("{line}{since}"));
+                let pushed = remote.as_ref().map(|r| format!(" · {PUSHED_TO} {r}")).unwrap_or_default();
+                t.log(&format!("{line}{since}{pushed}"));
                 t.touch();
                 let _ = store.save_task(&t);
             }
@@ -2841,6 +2917,9 @@ pub fn dirty_submit_refusal(tree: &str, row: &str, files: &[(String, String)]) -
 
 const ROUNDS: usize = 3;
 
+/// What a shared row's landed line says after its commit: `pushed to <remote>`.
+pub const PUSHED_TO: &str = "pushed to";
+
 /// The land a hold performs, in the member's own tree. The trunk is landed
 /// on only by a fast-forward of exactly what was checked: when it moved since,
 /// the branch is rebased onto it and only the checks the rebase can have
@@ -2854,11 +2933,25 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
     let moved = |w: &Where| git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err();
     let mut reran: Vec<String> = Vec::new();
     let mut rebases = 0;
+    let mut races = 0;
     loop {
         if !moved(&w) {
             return match land_task(store, &w, Mode::FastForward) {
                 Ok(landed) => Verdict::Landed { landed, reran },
                 Err(Refusal::Nothing(_)) => Verdict::Nothing,
+                // A shared row's push lost the race (wsp-468): the trunk here
+                // is level with the remote now, so the rebase onto it and the
+                // rerun of what it can affect follow, then another push — at
+                // most ROUNDS more, then the row is blocked naming the race.
+                Err(Refusal::Raced(_)) if races < ROUNDS => {
+                    races += 1;
+                    continue;
+                }
+                Err(Refusal::Raced(said)) => Verdict::Blocked(format!(
+                    "wsp: the hold could not land {task}: it lost the race to the shared remote {} times — {said}; nothing was landed, \
+                     `wsp review` again when the remote settles",
+                    races + 1
+                )),
                 Err(Refusal::NotFastForward(_)) if moved(&w) => continue,
                 // Only the index disagrees: `git reset` is the whole fix, and the land is owed as for any dirty tree.
                 Err(Refusal::Dirty(t)) if t.contains("nothing uncommitted") => Verdict::Dirty(format!("wsp: the hold could not land {task}: {t}")),

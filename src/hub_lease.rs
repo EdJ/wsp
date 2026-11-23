@@ -27,6 +27,17 @@
 //! was pushed is kept in the claim (`hub_pushed`, `<kind>:<commit>`), so a turn
 //! sends each once.
 //!
+//! **The landing is a push** (wsp-468). A shared row lands through the
+//! project's shared git remote (`remote:`, `origin` by default): the hold's
+//! land pushes the trunk there fast-forward only, and a push that loses the
+//! race fetches, rebases, reruns what the rebase can affect and tries again,
+//! at most three more times, before the row is blocked naming the race
+//! (`cmd_checkout::land_verdict`). The landed line then says `pushed to
+//! <remote>`, and the landing object carries the commit on the remote
+//! (`remote_commit`, beside `remote` and `project`). A spoke that imports a
+//! `row.landed` object fetches its own clone's remote ([`fetch_landed`]), so
+//! the commit it names is there to read.
+//!
 //! A spoke that is not logged in to a hub has no lease to take, and a private
 //! row has none either: both are the standalone case and change nothing.
 //!
@@ -240,7 +251,7 @@ fn failed(e: HubError) -> PushError {
 }
 
 /// Pushes the verdict (`RowReviewed`) or the landing (`RowLanded`) of `row`,
-/// naming `commit`, under `token`: the object, then the move of the row's
+/// `payload` its fields (`commit`, and for a pushed landing the remote's), under `token`: the object, then the move of the row's
 /// lease subject from the head the hub has (a stale move is read again, three
 /// times at most).
 pub(crate) fn push_verdict(
@@ -248,7 +259,7 @@ pub(crate) fn push_verdict(
     workspace: &str,
     row: &str,
     kind: EventKind,
-    commit: &str,
+    payload: &Value,
     token: Token,
 ) -> Result<(), PushError> {
     let (wid, id) = (HubWorkspace(workspace.to_string()), RowId(row.to_string()));
@@ -256,7 +267,7 @@ pub(crate) fn push_verdict(
     for _ in 0..3 {
         let from = client.sync_heads(&wid).map_err(failed)?.get(&subject).copied();
         let at = At((util::epoch_secs().max(0) as u64) * 1000);
-        let object = wsp_api::fenced_event(wid.clone(), &id, kind, json!({ "commit": commit }), token, from, client.by().clone(), at);
+        let object = wsp_api::fenced_event(wid.clone(), &id, kind, payload.clone(), token, from, client.by().clone(), at);
         let (to, bytes) = wsp_objects::encode(&object);
         client.sync_put(vec![Blob { id: to, bytes }]).map_err(failed)?;
         match client.refs_move(RefMove { workspace: wid.clone(), subject: subject.clone(), from, to }).map_err(failed)? {
@@ -292,7 +303,7 @@ pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
         if claim.get(PUSHED).and_then(|p| p.as_str()) == Some(key.as_str()) {
             continue;
         }
-        match push_verdict(client, &t.workspace.to_string(), &row, kind, &commit, token) {
+        match push_verdict(client, &t.workspace.to_string(), &row, kind, &payload_of(&t, kind, &commit), token) {
             Ok(()) => {
                 // The claim as it is now, in case it moved while the hub answered.
                 if let Some(mut now) = store.claims().get(&row).cloned().filter(|c| token_of(c) == Some(token)) {
@@ -312,6 +323,58 @@ pub(crate) fn push_all(store: &Store, client: &mut Client) -> Pushed {
         }
     }
     out
+}
+
+/// What a verdict or landing object of `t` says: the `commit`; for a landing,
+/// the row's `project`, and where the landed line says it was pushed, the
+/// `remote` and the commit on it (`remote_commit`, the same commit: the push
+/// is fast-forward only).
+fn payload_of(t: &crate::model::Task, kind: EventKind, commit: &str) -> Value {
+    let mut payload = json!({ "commit": commit });
+    if kind != EventKind::RowLanded {
+        return payload;
+    }
+    if let Some(project) = crate::model::project_of(t) {
+        payload["project"] = json!(project);
+    }
+    if let Some(remote) = pushed_to(t) {
+        payload["remote"] = json!(remote);
+        payload["remote_commit"] = json!(commit);
+    }
+    payload
+}
+
+/// The remote the newest landed line of `t` names (`· pushed to <remote>`).
+fn pushed_to(t: &crate::model::Task) -> Option<String> {
+    let log = t.section("Log")?;
+    let line = log.lines().filter(|l| l.contains(wsp_store::log::LANDED)).last()?;
+    let (_, after) = line.split_once(&format!(" · {} ", crate::cmd_checkout::PUSHED_TO))?;
+    after.split_whitespace().next().map(str::to_string)
+}
+
+/// A `row.landed` object this spoke imports, `payload` its fields: where the
+/// landing was pushed (it names a `remote_commit`), each root of the row's
+/// project here fetches the project's own remote, as its clone names it. The
+/// root that fetched, or `None` (a landing never pushed, a project this spoke
+/// does not have, a fetch that failed: said in `cycle.log`).
+pub(crate) fn fetch_landed(store: &Store, payload: &Value) -> Option<std::path::PathBuf> {
+    let commit = payload.get("remote_commit")?.as_str()?;
+    let project = payload.get("project").and_then(Value::as_str).and_then(|p| store.project(p))?;
+    let remote = project.remote().to_string();
+    for root in &project.roots {
+        let dir = util::expand(root);
+        if !dir.join(".git").exists() {
+            continue;
+        }
+        match crate::cmd_verify::git_ok(&dir, &["fetch", "--quiet", &remote]) {
+            Ok(()) => return Some(dir),
+            Err(e) => wsp_store::store::log_line(
+                store,
+                &format!("hub-sync: a landing of {commit} came in and {} did not fetch {remote}: {e}", util::contract(&dir)),
+            ),
+        }
+    }
+    None
 }
 
 /// The spoke that held a lease lets go of its claim: what `wsp despawn --lost`
@@ -824,7 +887,7 @@ pub(crate) mod tests {
         running.hub().clock().advance(8 * DAY);
         assert_eq!(running.hub().expire_leases().unwrap().len(), 1);
         let theirs = take(&mut bo, "shared:team", "wsp-1").unwrap();
-        push_verdict(&mut bo, "shared:team", "wsp-1", EventKind::RowReviewed, "bbbbbbb", theirs.token).unwrap();
+        push_verdict(&mut bo, "shared:team", "wsp-1", EventKind::RowReviewed, &json!({ "commit": "bbbbbbb" }), theirs.token).unwrap();
         let left = head(&mut bo).unwrap();
         assert_ne!(left, reviewed);
 
@@ -834,11 +897,255 @@ pub(crate) mod tests {
         assert_eq!((pushed.sent, pushed.fenced.as_slice()), (0, ["wsp-1".to_string()].as_slice()), "{pushed:?}");
         assert!(!store.claims().contains_key("wsp-1"), "A's claim is let go");
         assert_eq!(head(&mut bo), Some(left), "the row stays as its new holder left it");
-        let again = push_verdict(&mut ann, "shared:team", "wsp-1", EventKind::RowLanded, "ccccccc", held.token);
+        let again = push_verdict(&mut ann, "shared:team", "wsp-1", EventKind::RowLanded, &json!({ "commit": "ccccccc" }), held.token);
         assert!(matches!(again, Err(PushError::Fenced(_))), "{again:?}");
 
         running.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- wsp-468 push: a shared row's landing is a push to the shared remote ----
+
+    /// git in `dir` with an identity, its output trimmed; a failure fails the test.
+    fn git_t(dir: &Path, args: &[&str]) -> String {
+        let out = wsp_base::calls::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A bare repository with one commit on `master`: the shared remote.
+    fn bare_remote(at: &Path) {
+        let seed = at.with_extension("seed");
+        crate::testkit::repo_at(&seed, &[("base.txt", "base\n")], "base");
+        git_t(at.parent().unwrap(), &["init", "--quiet", "--bare", "-b", "master", &at.display().to_string()]);
+        git_t(&seed, &["push", "--quiet", &at.display().to_string(), "master"]);
+    }
+
+    /// A clone of `remote` at `at`, its remote named `origin`.
+    fn clone_of(remote: &Path, at: &Path) {
+        git_t(remote.parent().unwrap(), &["clone", "--quiet", &remote.display().to_string(), &at.display().to_string()]);
+    }
+
+    /// Puts `file` in a commit on the clone `at` and pushes it: the remote moves.
+    fn move_remote(at: &Path, file: &str) -> String {
+        std::fs::write(at.join(file), "theirs\n").unwrap();
+        git_t(at, &["add", file]);
+        git_t(at, &["commit", "--quiet", "-m", "theirs"]);
+        git_t(at, &["push", "--quiet", "origin", "master"]);
+        git_t(at, &["rev-parse", "HEAD"])
+    }
+
+    /// In `store`: project `p` rooted at the clone `repo` with `checks`, and row
+    /// `row` in `workspace` (empty: private) ready at review in a tree of its own
+    /// holding a commit of `file`. The ready commit.
+    fn ready_row(store: &Store, repo: &Path, row: &str, workspace: &str, file: &str, checks: &str) -> String {
+        let tree = repo.join(".worktrees").join(row);
+        git_t(repo, &["worktree", "add", "-q", "-b", row, &tree.display().to_string()]);
+        std::fs::write(tree.join(file), "mine\n").unwrap();
+        git_t(&tree, &["add", file]);
+        git_t(&tree, &["commit", "--quiet", "-m", "the work"]);
+        let ready = git_t(&tree, &["rev-parse", "HEAD"]);
+        let mut p = store.project("p").unwrap_or_else(|| crate::model::Project::new("p"));
+        p.roots = vec![repo.display().to_string()];
+        p.body = format!("## Checks\n{checks}\n");
+        store.save_project(&p).unwrap();
+        let mut t = wsp_store::model::Task::new(row, row);
+        t.project = Some("p".into());
+        t.status_raw = "review".into();
+        if !workspace.is_empty() {
+            t.workspace = workspace.parse().unwrap();
+        }
+        t.log(&format!("{} {ready} on {row}", crate::repair::READY));
+        store.save_task(&t).unwrap();
+        ready
+    }
+
+    fn engine() {
+        crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
+            passed: |_| Default::default(),
+            poke_task: |_, _, _| {},
+            runs: |_, _| false,
+            after_land: crate::check::after_land,
+            rerun: crate::check::rerun,
+            held: |_| None,
+        });
+    }
+
+    fn landed(v: crate::cmd_checkout::Verdict) -> (crate::cmd_checkout::Landed, Vec<String>) {
+        match v {
+            crate::cmd_checkout::Verdict::Landed { landed, reran } => (landed, reran),
+            crate::cmd_checkout::Verdict::Blocked(why) => panic!("blocked: {why}"),
+            crate::cmd_checkout::Verdict::Dirty(why) => panic!("dirty: {why}"),
+            crate::cmd_checkout::Verdict::Nothing => panic!("nothing landed"),
+        }
+    }
+
+    /// Done-when 3: the remote moved since the row was checked, so its first
+    /// push is refused; the spoke fetches, rebases, reruns the checks the rebase
+    /// can affect and lands on the second try, on the remote and on its trunk.
+    #[test]
+    fn hub_push_a_landing_that_loses_the_race_reverifies_and_lands_on_the_second_try() {
+        engine();
+        let env = crate::util::isolated("hub-push-race");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let (remote, mine, theirs, ran) = (env.path("remote.git"), env.path("mine"), env.path("theirs"), env.path("ran.log"));
+        bare_remote(&remote);
+        clone_of(&remote, &mine);
+        clone_of(&remote, &theirs);
+        let ready = ready_row(&store, &mine, "wsp-1", "shared:team", "m.txt", &format!("- always: echo always >> {}", ran.display()));
+        let their = move_remote(&theirs, "t.txt");
+
+        let (l, reran) = landed(crate::cmd_checkout::land_verdict(&store, "wsp-1"));
+        assert_eq!(reran, vec!["always".to_string()], "the checks were rerun after the rebase");
+        assert_eq!(std::fs::read_to_string(&ran).unwrap(), "always\n");
+        assert_ne!(l.sha, ready, "the rebase made a new commit");
+        assert_eq!(git_t(&remote, &["rev-parse", "master"]), l.sha, "the remote's trunk is the landed commit");
+        assert_eq!(git_t(&mine, &["rev-parse", "master"]), l.sha, "and so is the local trunk");
+        assert_eq!(git_t(&remote, &["rev-parse", &format!("{}~1", l.sha)]), their, "on top of the commit that won the race");
+        let t = store.task("wsp-1").unwrap();
+        let log = t.section("Log").unwrap();
+        assert!(log.contains(&format!("{} {} on wsp-1 · since {their} · pushed to origin", wsp_store::log::LANDED, l.sha)), "{log}");
+        assert_eq!(pushed_to(&t).as_deref(), Some("origin"));
+        let payload = payload_of(&t, EventKind::RowLanded, &l.sha);
+        assert_eq!(payload, json!({ "commit": l.sha, "project": "p", "remote": "origin", "remote_commit": l.sha }));
+    }
+
+    /// The race lost every time (a check that moves the remote as it runs): three
+    /// more tries, then the row is blocked naming the race and nothing landed.
+    #[test]
+    fn hub_push_a_landing_that_keeps_losing_the_race_blocks_naming_it() {
+        engine();
+        let env = crate::util::isolated("hub-push-blocks");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let (remote, mine, theirs) = (env.path("remote.git"), env.path("mine"), env.path("theirs"));
+        bare_remote(&remote);
+        clone_of(&remote, &mine);
+        clone_of(&remote, &theirs);
+        let push = format!(
+            "- always: echo again >> {d}/again.txt && git -C {d} add again.txt && git -C {d} -c user.name=t -c user.email=t@t commit -q -m again && git -C {d} push -q origin master",
+            d = theirs.display()
+        );
+        ready_row(&store, &mine, "wsp-1", "shared:team", "m.txt", &push);
+        move_remote(&theirs, "t.txt");
+
+        let why = match crate::cmd_checkout::land_verdict(&store, "wsp-1") {
+            crate::cmd_checkout::Verdict::Blocked(why) => why,
+            crate::cmd_checkout::Verdict::Landed { reran, .. } => panic!("not blocked: landed after rerunning {reran:?}"),
+            _ => panic!("not blocked"),
+        };
+        assert!(why.contains("lost the race to the shared remote 4 times") && why.contains("origin/master"), "{why}");
+        assert_eq!(git_t(&theirs, &["rev-list", "--count", "master"]), "5", "the base, the first move and three reruns");
+        assert_eq!(git_t(&remote, &["rev-parse", "master"]), git_t(&theirs, &["rev-parse", "master"]), "nothing of the row reached the remote");
+        assert!(crate::repair::landed_line(&store.task("wsp-1").unwrap()).is_none(), "no landed line");
+    }
+
+    /// A private row lands exactly as today: the local trunk only, no push, no
+    /// `pushed to` in its landed line.
+    #[test]
+    fn hub_push_a_private_row_lands_on_the_local_trunk_only() {
+        engine();
+        let env = crate::util::isolated("hub-push-private");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let (remote, mine) = (env.path("remote.git"), env.path("mine"));
+        bare_remote(&remote);
+        clone_of(&remote, &mine);
+        let before = git_t(&remote, &["rev-parse", "master"]);
+        ready_row(&store, &mine, "t-1", "", "m.txt", "");
+        let (l, _) = landed(crate::cmd_checkout::land_verdict(&store, "t-1"));
+        assert_eq!(git_t(&mine, &["rev-parse", "master"]), l.sha);
+        assert_eq!(git_t(&remote, &["rev-parse", "master"]), before, "nothing was pushed");
+        let t = store.task("t-1").unwrap();
+        assert!(!t.section("Log").unwrap().contains("pushed to"));
+        assert_eq!(pushed_to(&t), None);
+    }
+
+    /// Done-when 1: two spokes over a served hub and one bare remote. Each lands
+    /// a row of its own (the second losing the race to the first and landing on
+    /// its second try); both commits are on the remote's trunk; each spoke's sync
+    /// carries its landing to the hub, the other imports it and fetches, and both
+    /// caches show both rows landed.
+    #[test]
+    fn hub_push_two_spokes_land_through_one_bare_remote_and_both_see_both_landed() {
+        engine();
+        let env = crate::util::isolated("hub-push-two");
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let dir = env.path("hub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (running, tokens) = serve(&dir);
+        let remote = env.path("remote.git");
+        bare_remote(&remote);
+
+        // Two spokes: a store, a login, a clone, a shared row leased and ready.
+        let spoke = |who: &str, row: &str, file: &str| {
+            let store = Store::at(env.path(&format!("{who}/wsp")), env.path(&format!("{who}/state")));
+            store.ensure_dirs().unwrap();
+            let repo = env.path(&format!("{who}/repo"));
+            clone_of(&remote, &repo);
+            ready_row(&store, &repo, row, "shared:team", file, "");
+            let held = take(&mut dial(&running, &tokens, who), "shared:team", row).unwrap();
+            let mut claim = json!({ "workspace_id": format!("cpd-{who}"), "claimed_at": util::now_iso() });
+            stamp(&mut claim, &held);
+            store.set_claim(row, claim);
+            (store, repo, login(&dir, &running, &tokens, who))
+        };
+        let (ann, ann_repo, ann_home) = spoke("ann", "wsp-1", "a.txt");
+        let (bo, bo_repo, bo_home) = spoke("bo", "wsp-2", "b.txt");
+
+        let (a, _) = landed(crate::cmd_checkout::land_verdict(&ann, "wsp-1"));
+        let (b, _) = landed(crate::cmd_checkout::land_verdict(&bo, "wsp-2"));
+        assert_eq!(git_t(&remote, &["rev-parse", "master"]), b.sha, "bo's landing is the remote's tip");
+        assert_eq!(git_t(&remote, &["rev-parse", "master~1"]), a.sha, "on top of ann's");
+        assert_eq!(git_t(&ann_repo, &["rev-parse", "origin/master"]), a.sha, "ann has not fetched since");
+
+        // The syncs: each spoke sends its row and its landing, and takes the other's.
+        let (mut ann_sync, mut bo_sync) = (crate::hub_sync::Worker::new(ann_home), crate::hub_sync::Worker::new(bo_home));
+        for (who, w, s) in [("ann", &mut ann_sync, &ann), ("bo", &mut bo_sync, &bo)] {
+            w.turn(s).unwrap_or_else(|e| panic!("{who}: {e}"));
+        }
+        ann_sync.turn(&ann).unwrap();
+        bo_sync.turn(&bo).unwrap();
+
+        // The hub holds both landings, each naming its commit on the remote.
+        let mut c = dial(&running, &tokens, "ann");
+        let heads = c.sync_heads(&HubWorkspace("shared:team".into())).unwrap();
+        for (row, l) in [("wsp-1", &a), ("wsp-2", &b)] {
+            let id = *heads.get(&wsp_api::fence_subject(&RowId(row.into()))).unwrap_or_else(|| panic!("{row}: no landing on the hub"));
+            let blob = c.sync_get(vec![id]).unwrap().remove(0);
+            match wsp_objects::decode(&blob.bytes).unwrap() {
+                wsp_objects::Object::Event { kind, payload, .. } => {
+                    assert_eq!(kind, EventKind::RowLanded, "{row}");
+                    assert_eq!((payload["remote"].as_str(), payload["remote_commit"].as_str()), (Some("origin"), Some(l.sha.as_str())), "{row}");
+                }
+                other => panic!("{row}: not a landing: {other:?}"),
+            }
+        }
+
+        // Ann imported bo's landing and fetched: her clone has his commit.
+        assert_eq!(git_t(&ann_repo, &["rev-parse", "origin/master"]), b.sha, "the import fetched the remote");
+        assert_eq!(git_t(&bo_repo, &["rev-parse", "origin/master"]), b.sha);
+
+        // Both caches show both rows landed: the own row's file, the other's head.
+        for (who, s, own, other, (o, t)) in [("ann", &ann, "wsp-1", "wsp-2", (&a, &b)), ("bo", &bo, "wsp-2", "wsp-1", (&b, &a))] {
+            assert_eq!(crate::repair::landed_line(&s.task(own).unwrap()).as_deref(), Some(o.sha.as_str()), "{who}: {own}");
+            let cache = crate::hub_cache::Cache::read(s);
+            let head = cache.get(other).unwrap_or_else(|| panic!("{who}: {other} is not in the cache"));
+            assert_eq!(head.landed.as_deref(), Some(t.sha.as_str()), "{who}: {other}");
+        }
+
+        running.stop();
     }
 
     /// Done-when 2 (wsp-466): a row allocated to user A is refused to B's spoke
