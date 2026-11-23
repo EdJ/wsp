@@ -1155,6 +1155,15 @@ fn gone_member(store: &Store, seats: &dyn Seats, w: &Worklist, at: usize, pos: &
             ));
             continue;
         };
+        // **A leg's seat is no member's** (`wsp-334`), nor is any seat on a row
+        // that has handed itself to its legs. The leg's own paths end it:
+        // `cycle::legs_finished` once it is done, `closing::tick` once it
+        // stops without closing. Read here, wsp-030's legs were told "finish,
+        // land and review" (a member's rule), ended as members, and the person
+        // was flagged "needs a person" for a row whose finish leg submits.
+        if crate::leg_seat::handed_to_legs(&t) || crate::leg_seat::a_parts_seat(store, &t, &seat) {
+            continue;
+        }
         let state = match seats.state(&seat) {
             Some(s) => s,
             None => continue,

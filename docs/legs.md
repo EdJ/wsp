@@ -465,6 +465,26 @@ anything.
   ends a verifier, and records the outcome on the leg's entry. Ending a
   sibling's seat runs from `/`, as `cycle::despawn_seat` does for a check, so
   the tree is not kept because the ending process is standing in it.
+  **Which tick** (`wsp-334`): the first one that reads the leg `done` with
+  no turn in flight in its seat (`cycle::legs_finished`, in the repair
+  tick). The next leg does not wait for that tick. `wsp leg done` pokes the
+  run, the poke's step opens the ready leg at once, and a done leg's seat
+  holds no place under the cap unless it is seen working. A tick whose
+  ending frees a place steps the run again in the same tick, so a leg the
+  cap held starts in that tick and not the one after. A boundary costs a
+  hand-off, not a tick.
+- **A leg's seat is never a member's** (`wsp-334`). A leg claims nothing,
+  and that includes the manager host's fold of a seat's start: it writes no
+  claim for a seat a leg or piece entry names, or one whose binding says
+  `leg`. A claim already in a leg seat's name goes when the tick ends that
+  seat. The member's idle repair (`repair::gone_member`) leaves alone both a
+  leg's seat and every seat on a row that has handed itself to its legs, so
+  a leg is never told "finish, land and review", never ended and restarted
+  as a member, and its row never flags the person "open and not closing".
+  The run reads the legs, not a member's verdict. On wsp-030 (2026-11-20)
+  each leg's seat was claimed that way. The claim kept the next leg from
+  opening (a row someone holds whole opens no leg), and each of the five
+  boundaries waited two ticks for the member's repair to end the seat.
 - **Outside a list.** A row someone staged and spawned by hand has no run to
   step it. `wsp leg done` launches the ready legs itself, detached, as `poke`
   does, through the same gate: a launch is the run, not a person asking, so it

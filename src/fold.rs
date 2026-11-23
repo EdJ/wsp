@@ -611,7 +611,14 @@ fn apply(store: &Store, host: &str, msg: &Message) {
                         }
                         Some(_) => {}
                     }
-                    if !store.claims().contains_key(row) {
+                    // **Never for a leg's or a piece's seat** (`wsp-334`): a part
+                    // claims nothing. The claim this wrote for each of wsp-030's
+                    // legs kept the next leg from opening (a row someone holds
+                    // whole opens no leg). It also made the run read the leg's seat
+                    // as the member's, so the seat was told to finish, the
+                    // person was flagged, and each boundary cost two ticks.
+                    let part = store.find_task(row).is_some_and(|t| crate::leg_seat::a_parts_seat(store, &t, seat));
+                    if !part && !store.claims().contains_key(row) {
                         store.set_claim(row, json!({ "workspace_id": seat, "host": host, "epoch": s.epoch.0, "claimed_at": util::now_iso() }));
                     }
                 });
@@ -1049,6 +1056,40 @@ mod tests {
         assert_eq!((&s["epoch"], &s["pid"]), (&json!(2), &json!(4343)), "the new start is recorded: {s}");
         assert_eq!(spawned["cpd-a2"]["started"]["row"], "", "{spawned:?}");
         assert_eq!(spawned["cpd-a3"]["started"]["row"], "", "{spawned:?}");
+    }
+
+    /// `wsp-334`: a leg's seat starting claims nothing, found by the entry the
+    /// spawn seated or by the binding it wrote with `leg`. A member's seat on
+    /// another row is still claimed as before.
+    #[test]
+    fn a_legs_seat_start_claims_no_row() {
+        let _env = util::isolated("fold-leg");
+        let store = Store::open();
+        let mut t = crate::model::Task::new("legged", "wsp-200");
+        t.status_raw = "doing".into();
+        let mut leg = crate::legs::Leg::pending("build", "do it");
+        leg.state = crate::legs::State::Running;
+        leg.pane = Some("cpd-l1".into());
+        crate::legs::write(&mut t, &[leg]);
+        store.save_task(&t).unwrap();
+        let mut plain = crate::model::Task::new("plain", "wsp-201");
+        plain.status_raw = "doing".into();
+        store.save_task(&plain).unwrap();
+        store.set_binding("cpd-l2", json!({ "task_id": "wsp-202", "pane_id": "cpd-l2", "leg": "verbs" }));
+        let mut bound = crate::model::Task::new("bound", "wsp-202");
+        bound.status_raw = "doing".into();
+        store.save_task(&bound).unwrap();
+        let started = |id: u64, seat: &str, row: &str| Frame {
+            id: Some(EventId(id)),
+            req: None,
+            msg: Message::SeatStarted(SeatStarted { key: Key { row: RowId(row.into()), attempt: 1 }, seat: SeatId(seat.into()), epoch: Epoch(1), pid: 1, sockets: vec![] }),
+        };
+        assert!(fold(&store, HOST, &started(1, "cpd-l1", "wsp-200")));
+        assert!(fold(&store, HOST, &started(2, "cpd-l2", "wsp-202")));
+        assert!(fold(&store, HOST, &started(3, "cpd-m1", "wsp-201")));
+        let claims = store.claims();
+        assert!(!claims.contains_key("wsp-200") && !claims.contains_key("wsp-202"), "{claims:?}");
+        assert_eq!(claims["wsp-201"]["workspace_id"], "cpd-m1", "a member's seat is claimed as before");
     }
 
     /// A seat's start makes its entry, a `turn` edge and an `order.acked` date
