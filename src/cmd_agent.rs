@@ -3945,10 +3945,15 @@ pub fn agent(_store: &Store, args: &Args) -> i32 {
             print!("{}", crate::place_super::PI_EXTENSION);
             0
         }
+        // The seat hook, claude-code/wsp-session.sh, the same way (wsp-428).
+        Some("seat-hook") => {
+            print!("{}", crate::place_super::SEAT_HOOK);
+            0
+        }
         other => {
             match other {
                 Some(w) => eprintln!("wsp agent: unknown subcommand `{w}`"),
-                None => eprintln!("wsp agent: usage: wsp agent kinds [--json] | wsp agent pi-extension"),
+                None => eprintln!("wsp agent: usage: wsp agent kinds [--json] | wsp agent pi-extension | wsp agent seat-hook"),
             }
             2
         }
@@ -7157,6 +7162,9 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     crate::place_super::hook_snippet_health(&mut problems, &mut notes);
     // And pi's half of the same thing: the extension that is its hooks.
     crate::place_super::pi_extension_health(&mut problems, &mut notes);
+    // And the seat hook every seat's settings run the Bash kill guard from:
+    // missing, it is a failed hook on every Bash call and no guard (wsp-428).
+    crate::place_super::seat_hook_health(&mut problems, &mut notes);
     // And whether the compound wire agrees with itself: wsp's own hand-copied
     // WIRE_VERSION against what the installed compound-sup actually speaks,
     // and the host binary beside it against a build that only touched one of
@@ -7409,6 +7417,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 order: 500,
                 text: r##"  wsp agent pi-extension            the pi extension this binary carries, which
                                     `wsp install` writes into pi's extensions"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Agents,
+                order: 501,
+                text: r##"  wsp agent seat-hook               the seat hook (claude-code/wsp-session.sh) this
+                                    binary carries, which `wsp install` writes to
+                                    ~/.claude/hooks for every seat's kill guard"##,
             },
         ],
     },

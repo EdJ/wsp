@@ -1,6 +1,6 @@
 {
   "_comment": "Passed to a retro seat's Claude Code with --settings (compounding-614). The retro packet tells the seat to search every project's rows; auto mode's classifier denied it the read-only verbs that do it (\"Unauthorized Access\" on `wsp show` of another project's row) although ~/.claude/settings.json already allowed them as permission rules, so the allow list alone is not enough: autoMode.allow is the classifier's own rule.",
-  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command finds the script in the checkout or, on an executor, in ~/.claude/hooks; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
+  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command runs the script from ~/.claude/hooks, where `wsp install` writes the copy the binary carries (wsp-428), wherever the checkout is; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
   "permissions": {
     "allow": [
       "Bash(wsp ls:*)",
@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=\"$HOME/claude/wsp/claude-code/wsp-session.sh\"; [ -f \"$f\" ] || f=\"$HOME/.claude/hooks/wsp-session.sh\"; exec sh \"$f\" PreToolUse",
+            "command": "exec sh \"$HOME/.claude/hooks/wsp-session.sh\" PreToolUse",
             "timeout": 5
           }
         ]

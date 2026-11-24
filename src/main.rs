@@ -547,7 +547,7 @@ fn needs_store(args: &Args) -> bool {
     if matches!(args.cmd.as_str(), "init" | "doctor" | "throttle" | "calls" | "login" | "logout" | "hub") {
         return false;
     }
-    if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension")) {
+    if args.cmd == "agent" && matches!(args.rest.first().map(String::as_str), Some("kinds" | "pi-extension" | "seat-hook")) {
         return false;
     }
     !(args.cmd == "panel" && args.rest.first().map(String::as_str) == Some("storyboard"))
@@ -1624,6 +1624,7 @@ mod tests {
         assert!(!needs_store(&super::Args::synth("init", &[], &[])));
         assert!(!needs_store(&super::Args::synth("doctor", &[], &[])));
         assert!(!needs_store(&super::Args::synth("agent", &["pi-extension"], &[])));
+        assert!(!needs_store(&super::Args::synth("agent", &["seat-hook"], &[])));
 
         // The exemption is that one subcommand and no more of `panel`: the
         // live panel reads the store on its first frame, and letting it start

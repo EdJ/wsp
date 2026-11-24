@@ -1280,13 +1280,14 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
         }
         let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, dry, json_out, &p);
         let pi = pi_extension(&dst, &dst, dry, json_out, &p);
+        let hook = seat_hook(&dst, &dst, dry, json_out, &p);
         if json_out {
             println!(
                 "{}",
                 json!({"ok": true, "installed": false, "reason": "already live",
                        "source": util::contract(&src), "dest": util::contract(&dst),
                        "commit": ours.commit, "commit_from": ours.commit_from(),
-                       "daemon": agent, "pi_extension": pi})
+                       "daemon": agent, "pi_extension": pi, "seat_hook": hook})
             );
         }
         // The daemon is loaded even when the copy was a no-op. `wsp install`
@@ -1329,6 +1330,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
         let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, true, json_out, &p);
         // Asked of the build that would be installed, since nothing has been.
         let pi = pi_extension(&src, &dst, true, json_out, &p);
+        let hook = seat_hook(&src, &dst, true, json_out, &p);
         if json_out {
             println!(
                 "{}",
@@ -1337,7 +1339,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
                        "commit": ours.commit, "commit_from": ours.commit_from(),
                        "dirty": ours.dirty, "dirty_files": ours.dirty_files,
                        "stale": ours.left_behind(),
-                       "daemon": agent, "pi_extension": pi,
+                       "daemon": agent, "pi_extension": pi, "seat_hook": hook,
                        "lock": holder(&lock_path(&dst)).map(|h| h.line())})
             );
         } else {
@@ -1418,6 +1420,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     if json_out {
         let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, false, true, &p);
         let pi = pi_extension(&dst, &dst, false, true, &p);
+        let hook = seat_hook(&dst, &dst, false, true, &p);
         println!(
             "{}",
             json!({
@@ -1437,6 +1440,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
                 "why": why,
                 "daemon": agent,
                 "pi_extension": pi,
+                "seat_hook": hook,
                 // The same answer the printed line gives, for the reader that
                 // is a script. Absent from neither: a caller parsing this is
                 // exactly the caller that will not see a yellow line go past.
@@ -1471,6 +1475,7 @@ fn install_with(store: &Store, args: &Args, sign: &dyn Fn(&Path, &str) -> Result
     keeps_the_old_one(store, &ours, &p);
     let agent = launcher(store, Some(&src), build_tree.as_deref(), &dst, false, json_out, &p);
     pi_extension(&dst, &dst, false, json_out, &p);
+    seat_hook(&dst, &dst, false, json_out, &p);
     exit_for(&agent)
 }
 
@@ -1513,56 +1518,82 @@ fn pi_extension(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Pai
         return json!({"installed": false, "reason": "pi is not set up here"});
     }
     let path = crate::place_super::pi_extension_path();
-    let shown = util::contract(&path);
+    carried(bin, "pi-extension", "pi extension", &path, 0o644, dry, json_out, p)
+}
+
+/// Write the seat hook, `claude-code/wsp-session.sh`, to the one path every
+/// seat's settings run the Bash kill guard from — `~/.claude/hooks/` — as
+/// [`pi_extension`] writes pi's, from the copy `bin` carries (wsp-428). Before
+/// this, only a checkout at `~/claude/wsp` gave a seat its guard; anywhere else
+/// every seat Bash call failed its hook with 127 and nothing refused a broad
+/// kill. A link a person put there by hand is replaced with the file.
+fn seat_hook(bin: &Path, dst: &Path, dry: bool, json_out: bool, p: &util::Paint) -> Value {
+    if dst != default_dest() || crate::launchd::sandboxed() {
+        return json!({"installed": false, "reason": "not this machine's seat hook"});
+    }
+    let path = crate::place_super::seat_hook_path();
+    carried(bin, "seat-hook", "seat hook", &path, 0o755, dry, json_out, p)
+}
+
+/// One file `bin` carries, asked for with `wsp agent <verb>`, written to
+/// `path` with `mode` unless it is already there as is: [`pi_extension`]'s and
+/// [`seat_hook`]'s shared half.
+#[allow(clippy::too_many_arguments)]
+fn carried(bin: &Path, verb: &str, what: &str, path: &Path, mode: u32, dry: bool, json_out: bool, p: &util::Paint) -> Value {
+    let shown = util::contract(path);
     let carried = wsp_base::calls::Command::new(bin)
-        .args(["agent", "pi-extension"])
+        .args(["agent", verb])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success() && !o.stdout.is_empty())
         .map(|o| o.stdout);
     let Some(bytes) = carried else {
-        let why = format!("{} did not hand over a pi extension", util::contract(bin));
+        let why = format!("{} did not hand over a {what}", util::contract(bin));
         if !json_out {
-            println!("{} {}", p.yellow("!"), p.dim(&format!("the pi extension is not installed — {why}")));
+            println!("{} {}", p.yellow("!"), p.dim(&format!("the {what} is not installed — {why}")));
         }
         return json!({"installed": false, "path": shown, "error": why});
     };
-    let unchanged = fs::read(&path).map(|cur| cur == bytes).unwrap_or(false);
+    // A link counts as unchanged only where it is not one: `place` would
+    // replace it, and a link to a checkout moves when the checkout does.
+    let link = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let unchanged = !link && fs::read(path).map(|cur| cur == bytes).unwrap_or(false);
     if dry {
         if !json_out {
             println!(
                 "{} {} · {}",
-                p.dim("pi"),
+                p.dim(what),
                 p.dim(&shown),
                 p.dim(if unchanged { "unchanged" } else { "would write" })
             );
         }
         return json!({"installed": false, "path": shown,
-                      "extension": if unchanged { "unchanged" } else { "would write" }});
+                      "file": if unchanged { "unchanged" } else { "would write" }});
     }
     if unchanged {
         if !json_out {
-            println!("{} {}", p.green("✓"), p.dim(&format!("pi extension {shown}, unchanged")));
+            println!("{} {}", p.green("✓"), p.dim(&format!("{what} {shown}, unchanged")));
         }
-        return json!({"installed": true, "path": shown, "extension": "unchanged"});
+        return json!({"installed": true, "path": shown, "file": "unchanged"});
     }
     // [`place`], for its reason: pi reads its extensions at every launch, and
-    // one starting mid-write would load half a file. It leaves the file
-    // executable, which a script pi imports has no use for.
-    let placed = place(&bytes, &path).map(|()| {
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    // Claude Code runs the hook on every Bash call, so one starting mid-write
+    // would read half a file. It leaves the file 0755; `mode` says what this
+    // one wants.
+    let placed = place(&bytes, path).map(|()| {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
     });
     match placed {
         Ok(()) => {
             if !json_out {
-                println!("{} {}", p.green("✓"), format!("pi extension → {shown}"));
+                println!("{} {}", p.green("✓"), format!("{what} → {shown}"));
             }
-            json!({"installed": true, "path": shown, "extension": "written"})
+            json!({"installed": true, "path": shown, "file": "written"})
         }
         Err(why) => {
             if !json_out {
-                println!("{} {}", p.yellow("!"), p.dim(&format!("the pi extension is not installed — {why}")));
+                println!("{} {}", p.yellow("!"), p.dim(&format!("the {what} is not installed — {why}")));
             }
             json!({"installed": false, "path": shown, "error": why})
         }
@@ -2901,5 +2932,39 @@ mod tests {
             err.ends_with(&util::contract(&warm.join("release/wsp"))),
             "the tree the build actually used went unsaid: {err}"
         );
+    }
+
+    /// wsp-428, the omarchy case: a home whose `~/.claude/hooks/wsp-session.sh`
+    /// is a link to a checkout that is not there. The install step writes the
+    /// copy the binary hands over in its place, executable, and `doctor`'s
+    /// check then reads it as resolving and refusing the broad kill; a second
+    /// install changes nothing.
+    #[test]
+    fn the_install_writes_the_seat_hook_over_a_link_to_nothing_and_it_guards() {
+        let d = scratch("seat-hook");
+        let bin = d.join("wsp");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("claude-code/wsp-session.sh");
+        fs::write(&bin, format!("#!/bin/sh\n[ \"$2\" = seat-hook ] && exec cat '{}'\nexit 2\n", script.display())).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let hook = d.join("home/.claude/hooks/wsp-session.sh");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(d.join("claude/wsp/claude-code/wsp-session.sh"), &hook).unwrap();
+        let p = util::Paint::new();
+
+        let dry = carried(&bin, "seat-hook", "seat hook", &hook, 0o755, true, true, &p);
+        assert_eq!(dry["file"], "would write", "{dry}");
+        let wrote = carried(&bin, "seat-hook", "seat hook", &hook, 0o755, false, true, &p);
+        assert_eq!(wrote["file"], "written", "{wrote}");
+        assert!(!fs::symlink_metadata(&hook).unwrap().file_type().is_symlink());
+        assert_eq!(fs::metadata(&hook).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(fs::read_to_string(&hook).unwrap(), crate::place_super::SEAT_HOOK);
+        let (mut problems, mut notes) = (Vec::new(), Vec::new());
+        crate::place_super::seat_hook_health_at(&hook, &mut problems, &mut notes);
+        assert!(problems.is_empty() && notes.is_empty(), "{problems:?} {notes:?}");
+        let again = carried(&bin, "seat-hook", "seat hook", &hook, 0o755, false, true, &p);
+        assert_eq!(again["file"], "unchanged", "{again}");
+        let none = carried(&bin, "pi-extension", "pi extension", &d.join("x.ts"), 0o644, false, true, &p);
+        assert!(none.get("error").is_some(), "a binary that hands nothing over writes nothing: {none}");
+        let _ = fs::remove_dir_all(&d);
     }
 }

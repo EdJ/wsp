@@ -2583,10 +2583,15 @@ definition in `src/overlap.rs`, so there is no second answer to drift.
 ### Wiring it to Claude Code
 
 ```sh
-chmod +x ~/claude/wsp/claude-code/wsp-session.sh
-# then merge ~/claude/wsp/claude-code/settings.snippet.json
+wsp install   # writes ~/.claude/hooks/wsp-session.sh, the copy the binary carries
+# then merge claude-code/settings.snippet.json (from wherever the checkout is)
 # into ~/.claude/settings.json — by hand, two keys
 ```
+
+Every hook in the snippet, and the Bash kill guard in every seat's settings,
+runs `~/.claude/hooks/wsp-session.sh`, so nothing depends on where the checkout
+lives (wsp-428); `wsp doctor` says so when that file is missing or does not
+refuse `pkill -f yes`.
 
 Two keys, and the snippet is a snippet rather than a file to copy over the top:
 `settings.json` already holds your model, your theme, your plugins and backend's

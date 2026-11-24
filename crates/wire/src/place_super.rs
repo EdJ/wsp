@@ -576,6 +576,83 @@ fn pi_extension_health_in(agent_dir: &Path, problems: &mut Vec<String>, notes: &
     }
 }
 
+/// The seat hook, `claude-code/wsp-session.sh`, carried in the binary
+/// (wsp-428). Every seat's settings run its PreToolUse kill guard from
+/// `~/.claude/hooks/wsp-session.sh` (wsp-691), and `wsp install` writes it
+/// there as it writes [`PI_EXTENSION`] — so a machine whose checkout is not at
+/// `~/claude/wsp` still has a guard, which on omarchy, 2026-11-23, it had not:
+/// every seat Bash call printed exit 127 and nothing refused a broad `pkill`.
+pub const SEAT_HOOK: &str = include_str!("../../../claude-code/wsp-session.sh");
+
+/// Where [`SEAT_HOOK`] goes: the one path every seat's settings name. `$HOME`
+/// and not `CLAUDE_CONFIG_DIR`, because the settings' command expands `$HOME`.
+pub fn seat_hook_path() -> PathBuf {
+    util::expand("~/.claude/hooks/wsp-session.sh")
+}
+
+/// `wsp doctor`'s check that the seat hook resolves and guards: the file every
+/// seat's settings run is there, refuses `pkill -f yes`, and is the copy this
+/// wsp carries. Missing, or not refusing, is a problem — no seat on this
+/// machine has a kill guard; another copy is a note, since it guards still.
+/// Nothing at all where Claude Code has never been set up (no `~/.claude`), as
+/// [`pi_extension_health`] says nothing where pi has not: no Claude seat runs
+/// there to want a guard.
+pub fn seat_hook_health(problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    seat_hook_health_at(&seat_hook_path(), problems, notes)
+}
+
+/// The same check against a path handed in, so a test asks it without a home.
+pub fn seat_hook_health_at(path: &Path, problems: &mut Vec<String>, notes: &mut Vec<String>) {
+    if !path.parent().and_then(Path::parent).is_some_and(Path::is_dir) {
+        return;
+    }
+    let shown = util::contract(path);
+    let Ok(text) = fs::read_to_string(path) else {
+        problems.push(format!(
+            "{shown} is not there (or is a link to nothing) — every seat's settings run the Bash kill guard from it, so no seat here has one and each Bash call prints a failed hook; `wsp install` writes it (wsp-428)"
+        ));
+        return;
+    };
+    if !guard_refuses(path, "pkill -f yes") {
+        problems.push(format!(
+            "{shown} does not refuse `pkill -f yes` — the seats' Bash kill guard is not in force; `wsp install` rewrites it (wsp-428)"
+        ));
+        return;
+    }
+    if text != SEAT_HOOK {
+        notes.push(format!(
+            "{shown} is not the seat hook this wsp carries — it guards, but reports through whatever that copy says; `wsp install` rewrites it"
+        ));
+    }
+}
+
+/// Whether the hook at `path` refuses `command` as Claude Code's PreToolUse
+/// payload for Bash would send it: exit 2, as `claude-code/test-kill-guard.sh`
+/// asserts. Nothing is run; the hook only reads the command.
+fn guard_refuses(path: &Path, command: &str) -> bool {
+    use std::io::Write as _;
+    let payload = json!({
+        "session_id": "doctor",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command, "description": "wsp doctor" },
+    })
+    .to_string();
+    let child = wsp_base::calls::Command::new("sh")
+        .arg(path)
+        .arg("PreToolUse")
+        .env_remove(place::SEAT_ENV)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    child.wait().is_ok_and(|s| s.code() == Some(2))
+}
+
 /// `wsp report <hook>` — an agent saying what it has just done, from inside its
 /// own hook.
 ///
@@ -2401,6 +2478,50 @@ mod tests {
         let (mut problems, mut notes) = (Vec::new(), Vec::new());
         pi_extension_health_in(&dir, &mut problems, &mut notes);
         assert!(problems.is_empty() && notes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-428: the seat hook every seat's settings run, read as `doctor`
+    /// reads it. Missing or a link to nothing (omarchy, 2026-11-23: exit 127 on
+    /// every seat Bash call) is a problem; a file that does not refuse
+    /// `pkill -f yes` is a problem; another copy that guards is a note; this
+    /// binary's own copy is nothing to say.
+    #[test]
+    fn the_seat_hook_is_checked_to_resolve_and_refuse_a_broad_kill() {
+        let dir = std::env::temp_dir().join(format!("wsp-seat-hook-{}-{}", std::process::id(), util::epoch_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join(".claude/hooks/wsp-session.sh");
+        let read = || {
+            let (mut problems, mut notes) = (Vec::new(), Vec::new());
+            seat_hook_health_at(&hook, &mut problems, &mut notes);
+            (problems, notes)
+        };
+
+        let (problems, notes) = read();
+        assert!(problems.is_empty() && notes.is_empty(), "no ~/.claude, no Claude seat, nothing to say: {problems:?}");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let (problems, notes) = read();
+        assert_eq!(problems.len(), 1, "missing is a problem: {problems:?}");
+        assert!(problems[0].contains("wsp install") && notes.is_empty(), "{problems:?}");
+
+        std::os::unix::fs::symlink(dir.join("gone/claude-code/wsp-session.sh"), &hook).unwrap();
+        let (problems, _) = read();
+        assert_eq!(problems.len(), 1, "a link to nothing is a problem: {problems:?}");
+        fs::remove_file(&hook).unwrap();
+
+        fs::write(&hook, "exit 0\n").unwrap();
+        let (problems, _) = read();
+        assert_eq!(problems.len(), 1, "a hook that refuses nothing is a problem: {problems:?}");
+        assert!(problems[0].contains("pkill -f yes"), "{problems:?}");
+
+        fs::write(&hook, format!("{SEAT_HOOK}\n# a local edit\n")).unwrap();
+        let (problems, notes) = read();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(notes.len(), 1, "another copy that guards is a note: {notes:?}");
+
+        fs::write(&hook, SEAT_HOOK).unwrap();
+        let (problems, notes) = read();
+        assert!(problems.is_empty() && notes.is_empty(), "{problems:?} {notes:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

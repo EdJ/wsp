@@ -1,14 +1,14 @@
 {
   "_comment": "The paths are $HOME-relative, so the same text works on macOS and Linux; if your checkout is not at ~/claude/wsp, change the path after $HOME. Merge these two keys into ~/.claude/settings.json by hand. This is a snippet, not a file to copy over the top: settings.json already holds your model, theme, plugins and herdr's own SessionStart entry, and replacing it would take those with it. The hooks array takes a second entry beside herdr's; it is not a replacement for it.",
 
-  "_comment_executor": "On an executor there is no checkout, so wsp-session.sh is copied to ~/.claude/hooks/ beside herdr's own and the command below points there instead. The permissions are not optional over there: nobody is sitting at that machine to answer a prompt, and an agent that stops at one stops until somebody notices in the panel.",
+  "_comment_executor": "Every command below runs wsp-session.sh from ~/.claude/hooks/, beside herdr's own: `wsp install` writes it there (wsp-428), and on an executor, which has no checkout, it is copied there. The permissions are not optional over there: nobody is sitting at that machine to answer a prompt, and an agent that stops at one stops until somebody notices in the panel.",
   "_hooks_comment": "SessionStart is the brief and is owed to every session. The other five are how a headless agent — one `wsp spawn --headless` is hosting, with no terminal at all — says what it is doing: UserPromptSubmit and Stop bracket a turn, PermissionRequest and Elicitation mean a person is needed, SessionEnd means it has gone. They cost one `sh` and exit in a session that is not in a wsp seat, which is every session in a herdr pane, so wiring them all is safe. See src/place_super.rs for what each one is read as.",
 
   "_comment_hold": "The second PermissionRequest entry, with the long timeout, is the held one (wsp-301): it raises an agent's dialog (AskUserQuestion, ExitPlanMode, a tool's permission) as a question for the person and prints their answer. It runs beside the 5-second reporter above it and beside the pane's own dialog, and whatever answers first wins. A timeout falls through to the pane, which is why it must not be set to block on failure. Keep the number after PermissionHold equal to its timeout, in seconds: wsp stops waiting 30 s before Claude Code would kill it. Merge it by hand with the rest, as ever.",
 
   "_comment_close": "PostToolUse is the other half of the held entry (wsp-302): Claude Code does not signal a held hook when the pane's dialog is answered first, so the tool running afterwards is what closes the question as answered in the pane. Stop, StopFailure, UserPromptSubmit and SessionEnd above close it as abandoned. It fires after every tool call, and costs one sh in a session that is not in a wsp seat.",
 
-  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command finds the script in the checkout or, on an executor, in ~/.claude/hooks; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
+  "_comment_guard": "PreToolUse on Bash is the kill guard (wsp-691): wsp-session.sh refuses a pkill, killall or killing pgrep with an option after its first pattern (BSD getopt reads it as one more pattern: on 2026-11-19 `pkill -f \"scripts/check.mjs\" -P 0` ended every Claude session on the machine), one naming a bare common name (claude, node, wsp, compound-sup, compound-render, cargo), or a pkill pattern under 4 characters, and says to kill by pid. The command runs the script from ~/.claude/hooks, where `wsp install` writes the copy the binary carries (wsp-428), wherever the checkout is; the same text is in every seat's settings and in the snippet, so where both hold it the two are one command and agree; a verifier or plain seat, which has no role file, is started with wsp-seat.settings.json, which holds only this hook.",
 
   "hooks": {
     "PreToolUse": [
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=\"$HOME/claude/wsp/claude-code/wsp-session.sh\"; [ -f \"$f\" ] || f=\"$HOME/.claude/hooks/wsp-session.sh\"; exec sh \"$f\" PreToolUse",
+            "command": "exec sh \"$HOME/.claude/hooks/wsp-session.sh\" PreToolUse",
             "timeout": 5
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" SessionStart",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" SessionStart",
             "timeout": 5
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" SessionEnd",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" SessionEnd",
             "timeout": 5
           }
         ]
@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" UserPromptSubmit",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" UserPromptSubmit",
             "timeout": 5
           }
         ]
@@ -65,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" Stop",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" Stop",
             "timeout": 5
           }
         ]
@@ -77,7 +77,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" StopFailure",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" StopFailure",
             "timeout": 5
           }
         ]
@@ -89,7 +89,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" PermissionRequest",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" PermissionRequest",
             "timeout": 5
           }
         ]
@@ -99,7 +99,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" PermissionHold 86400",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" PermissionHold 86400",
             "timeout": 86400
           }
         ]
@@ -111,7 +111,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" PostToolUse",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" PostToolUse",
             "timeout": 5
           }
         ]
@@ -123,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/claude/wsp/claude-code/wsp-session.sh\" Elicitation",
+            "command": "sh \"$HOME/.claude/hooks/wsp-session.sh\" Elicitation",
             "timeout": 5
           }
         ]

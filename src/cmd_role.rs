@@ -1111,6 +1111,9 @@ mod tests {
         let snippet = include_str!("../claude-code/settings.snippet.json");
         let want = guard_of(snippet);
         assert!(want.contains("wsp-session.sh") && want.ends_with("PreToolUse"), "{want}");
+        // wsp-428: the one path `wsp install` writes, and no checkout's.
+        assert!(want.contains("$HOME/.claude/hooks/wsp-session.sh") && !want.contains("claude/wsp/"), "{want}");
+        assert!(!snippet.contains("$HOME/claude/wsp/"), "a snippet hook still names a checkout path");
         for body in [PRIMARY_SETTINGS, GOVERNOR_SETTINGS, RETRO_SETTINGS, MEMBER_SETTINGS] {
             assert_eq!(guard_of(body), want);
         }
