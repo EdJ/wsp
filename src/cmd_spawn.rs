@@ -5936,7 +5936,14 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     /// what [`Seats::state`]'s `None` was.
     fn absent(&self, seat: &str) -> bool {
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).all(|b| matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_))))
+        // `wsp-344`: no backend asked is nobody saying anything, not every
+        // backend saying "not mine" — and a claim is released on this answer.
+        let mut asked = false;
+        let none_has_it = crate::cycle::Fleet::here(seat).all(|b| {
+            asked = true;
+            matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_)))
+        });
+        asked && none_has_it
     }
 
     fn pids(&self, seat: &str) -> Option<Vec<u32>> {

@@ -173,6 +173,14 @@ const RETRO_TAG: &str = "retro";
 /// to it" held them with no end.
 pub(crate) const RETRO_KEPT_SECS: i64 = 60 * 60;
 
+/// How long a verified member's seat that has sat idle since its verdict is
+/// left before it is ended where the backend cannot say whether anybody typed
+/// to it (`wsp-344`): [`crate::repair`]'s `LAND_GRACE`, 5 minutes, for the
+/// same judgement — a person's chance to type first. Without it "cannot say"
+/// held the seat and its claim with no end: compound-react-040 (cpd-115) 6h39m
+/// past its verdict, until a person typed `wsp release` over ssh.
+pub(crate) const FINISHED_GRACE_SECS: i64 = 5 * 60;
+
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
 /// `KILL`, so this is the margin after that, not the whole grace.
@@ -666,7 +674,7 @@ fn seated_rows(store: &Store) -> Vec<String> {
 
 /// The member's seat: its binding, or — where a reaped binding left only the
 /// claim — the seat of the agent the claim names.
-fn seat_of(store: &Store, member: &str) -> Option<String> {
+pub(crate) fn seat_of(store: &Store, member: &str) -> Option<String> {
     let bindings = store.bindings();
     let bound = bindings
         .iter()
@@ -712,10 +720,20 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     let retro = store.find_task(member).is_some_and(|t| t.tags.iter().any(|g| g == RETRO_TAG));
     let until = h.at + RETRO_KEPT_SECS;
     let due = retro && util::epoch_secs() >= until;
+    // **A verified seat idle past the grace is ended though nobody can say
+    // whether a turn began** (`wsp-344`): only on a verdict, only at `Idle`
+    // (the waits and the guards below still hold it), and only once
+    // [`FINISHED_GRACE_SECS`] have gone by since the verdict.
+    let finished = h.verdict && !h.handed && state == Some(State::Idle) && util::epoch_secs() - h.at >= FINISHED_GRACE_SECS;
+    let began = match (retro, due) {
+        (true, true) => None,
+        _ => seats.turn_began_since(store, seat, h.at),
+    };
+    let typed_unknown = !retro && began.is_none();
     let typed = match (retro, due) {
         (true, true) => Some(false),
-        (true, false) => seats.turn_began_since(store, seat, h.at).or(Some(false)),
-        (false, _) => seats.turn_began_since(store, seat, h.at),
+        (true, false) => began.or(Some(false)),
+        (false, _) => began.or(finished.then_some(false)),
     };
     let reading = Reading {
         state,
@@ -730,6 +748,10 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
             say_kept(store, w, member, seat, h, until);
             return false;
         }
+        // Inside the grace a verified seat that cannot say is not "left
+        // running": the grace passes by itself, and the next tick past it ends
+        // it (`wsp-344`).
+        Some(Left::Untold) if h.verdict && !h.handed && state == Some(State::Idle) => return false,
         Some(why) => {
             if !why.passes() {
                 say_left(store, w, member, seat, &why, h);
@@ -740,8 +762,10 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
     }
     let pids = reading.pids.unwrap_or_default();
     let claimed = store.claims().contains_key(member);
-    // A seat handed to its verifier leaves its tree to it.
-    let keep = h.handed;
+    // A seat handed to its verifier leaves its tree to it, and a tree with
+    // commits the trunk has not got is kept (`wsp-344`): `despawn` alone keeps
+    // only uncommitted work.
+    let keep = h.handed || crate::worklist::holds_unlanded(store, member);
     let ending = match claimed {
         true => crate::cycle::despawned_keeping(store, member, keep),
         false => crate::cycle::despawn_seat_keeping(seat, keep),
@@ -751,9 +775,14 @@ fn end_one(store: &Store, seats: &dyn Seats, w: Option<&Worklist>, member: &str,
             let kept = match (retro, due) {
                 (true, true) => format!(", a retro row's seat kept until {} for whoever was using it and ended then", util::iso_at(until)),
                 (true, false) => ", a retro row's seat, which nobody types to after its verdict".to_string(),
+                (false, _) if finished && typed_unknown => format!(
+                    ", idle at its prompt {} min past its verdict where nobody could say whether a turn began",
+                    (util::epoch_secs() - h.at) / 60
+                ),
                 (false, _) => String::new(),
             };
-            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}{kept}, and no pid of it is running", h.because()));
+            let tree = if keep && !h.handed { ", its tree kept: it holds commits the trunk has not got" } else { "" };
+            crate::store::log_line(store, &format!("{by} {member} ({seat}) ended — {}{kept}{tree}, and no pid of it is running", h.because()));
             true
         }
         Err(why) => {
@@ -1716,13 +1745,19 @@ mod tests {
         assert!(told[0].contains("theirs to end"), "{}", told[0]);
     }
 
+    /// `wsp-344`: a seat that cannot say whether it was typed to is held
+    /// through [`FINISHED_GRACE_SECS`] after the verdict, saying nothing — the
+    /// person's chance to type first — and not after it.
     #[test]
-    fn a_seat_that_cannot_say_whether_it_was_typed_to_is_left() {
+    fn a_seat_that_cannot_say_whether_it_was_typed_to_is_left_through_the_grace() {
         let (_env, store) = verified("untold");
+        retro_decided(&store, 60);
         let mut seats = Fake::at_rest();
         seats.typed.remove("cpd-1");
+        drain(&SAID);
         tick(&store, &seats);
-        assert!(!member_ended(), "holding costs a pane, guessing costs a conversation");
+        assert!(!member_ended(), "inside the grace, holding costs a pane and guessing costs a conversation");
+        assert!(!log_of(&store, "m-1").contains("left running"), "the grace passes by itself: {}", log_of(&store, "m-1"));
     }
 
     /// `m-1` made a retro row, its pass decided `ago` seconds before now.
@@ -1785,15 +1820,82 @@ mod tests {
         assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended") && l.contains("kept until")), "{said:?}");
     }
 
-    /// A row that is no retro keeps the old rule: a seat that cannot say is left.
+    /// `wsp-344`: compound-react-040, wsp-309 and wsp-053 each needed a person
+    /// to type `wsp release` before `wsp done` worked. A row that is no retro,
+    /// whose verifier holds and whose seat has sat idle past
+    /// [`FINISHED_GRACE_SECS`] where its backend cannot say whether a turn
+    /// began, has its seat ended — claim released by the despawn — and the
+    /// line says why. A seat in a turn, or behind a prompt, is still held.
     #[test]
-    fn a_member_that_is_no_retro_row_is_still_left_when_its_seat_cannot_say() {
+    fn a_verified_rows_idle_seat_is_ended_after_the_grace_though_it_cannot_say() {
         let (_env, store) = verified("not-retro");
+        retro_decided(&store, FINISHED_GRACE_SECS + 60);
+        let mut working = Fake::at_rest().with("cpd-1", State::Working);
+        working.typed.remove("cpd-1");
+        pass(&store, &working);
+        assert!(!member_ended(), "a turn in progress holds it whatever the grace");
+        let mut blocked = Fake::at_rest().with("cpd-1", State::Blocked);
+        blocked.typed.remove("cpd-1");
+        pass(&store, &blocked);
+        assert!(!member_ended(), "a prompt only a person answers holds it");
+
         let mut seats = Fake::at_rest();
         seats.typed.remove("cpd-1");
+        drain(&SAID);
+        drain(&crate::cycle::tests::KEPT);
         pass(&store, &seats);
-        assert!(!member_ended());
-        assert!(log_of(&store, "m-1").contains("left running"));
+        assert!(member_ended(), "the seat is ended, and its despawn releases the claim");
+        assert!(drain(&crate::cycle::tests::KEPT).is_empty(), "a tree with nothing unlanded is despawn's to take");
+        let said = drain(&SAID);
+        assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended") && l.contains("idle at its prompt")), "{said:?}");
+        assert!(log_of(&store, "m-1").contains("ended: verification holds at abc1234"));
+        assert!(!log_of(&store, "m-1").contains("left running"));
+    }
+
+    /// `wsp-344`: the seat ended after the grace keeps its tree when the row's
+    /// branch holds commits the trunk has not got.
+    #[test]
+    fn a_verified_rows_idle_seat_ended_after_the_grace_keeps_a_tree_with_unlanded_work() {
+        let (env, store) = verified("unlanded");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::testkit::repo(&repo);
+        let git = |args: &[&str]| {
+            let ok = wsp_base::calls::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        git(&["branch", "m-1"]);
+        git(&["checkout", "--quiet", "m-1"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "work the trunk has not got"]);
+        git(&["checkout", "--quiet", "master"]);
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut m = store.find_task("m-1").unwrap();
+        m.project = Some("p".into());
+        store.save_task(&m).unwrap();
+        assert!(crate::worklist::holds_unlanded(&store, "m-1"));
+        retro_decided(&store, FINISHED_GRACE_SECS + 60);
+
+        let mut seats = Fake::at_rest();
+        seats.typed.remove("cpd-1");
+        drain(&SAID);
+        drain(&crate::cycle::tests::KEPT);
+        pass(&store, &seats);
+        assert!(member_ended());
+        assert_eq!(drain(&crate::cycle::tests::KEPT), vec!["m-1".to_string()], "ended with --keep-tree");
+        assert!(drain(&SAID).iter().any(|l| l.contains("its tree kept")));
     }
 
     /// `wsp-333`'s third item: retro-8's cycle.log is already written and

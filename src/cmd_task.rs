@@ -1266,8 +1266,29 @@ pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
     mutate(store, args, &verb, |t| move_status(t, status, &caller))
 }
 
-pub fn done(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
-    done_with(store, args, live)
+pub fn done(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, seats: &dyn crate::cycle::Seats) -> i32 {
+    done_with(store, args, live, seats)
+}
+
+/// What a seat standing on a row is doing, as `wsp done` judges it (`wsp-344`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// At its prompt, or holding no agent: nothing a close takes from it.
+    Idle,
+    /// A turn in progress.
+    Working,
+    /// Anything else — starting, on a prompt only a person answers, unreadable.
+    Unsettled,
+}
+
+fn standing_as(seats: &dyn crate::cycle::Seats, seat: &str) -> Standing {
+    use crate::place::State;
+    match seats.state(seat) {
+        Some(State::Idle | State::Gone | State::Empty) => Standing::Idle,
+        Some(State::Working) => Standing::Working,
+        None if seats.absent(seat) => Standing::Idle,
+        _ => Standing::Unsettled,
+    }
 }
 
 /// The seats still standing on `id`, named: a row's bindings, leaving out a
@@ -1292,7 +1313,14 @@ fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<Stri
 /// gate (the primary seat gives a why and not mid-turn; a governor ends its own
 /// list's) — a close that ended seats would be a way round that. The refusal
 /// names the seat and the command; the row is untouched.
-fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
+///
+/// **Except a verified row whose seats are idle or gone (`wsp-344`).** Its work
+/// is done and agreed, so the close ends each idle seat as `despawn` does
+/// (its gate, a why, the tree kept for the close's own sweep below), releases
+/// the claim and closes the row in the one call. A seat in a turn still
+/// refuses it, and the refusal says a turn is in progress; so does one that
+/// is starting, on a person's prompt, or that nothing can read.
+fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> i32 {
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
         // Another user leased it while this spoke was offline (wsp-469).
         if let Some(why) = crate::hub_journal::refusal(store, &t.id, "done") {
@@ -1300,9 +1328,36 @@ fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool) -> i32 {
             return 1;
         }
         let seats = standing_on(store, &t.id, live);
-        if !seats.is_empty() {
+        let read: Vec<(String, Standing)> = seats.iter().map(|s| (s.clone(), standing_as(reader, s))).collect();
+        let working: Vec<&str> = read.iter().filter(|(_, r)| *r == Standing::Working).map(|(s, _)| s.as_str()).collect();
+        let verified = !seats.is_empty() && crate::verification::verified(&store.tasks(), &t.id);
+        if verified && !working.is_empty() {
             eprintln!(
-                "wsp: {} still has a seat running — {} — so it is NOT done and nothing was closed. \
+                "wsp: {} is verified, but a turn is in progress at {} — so it is NOT done and nothing was closed. \
+                 `wsp done {}` again once the turn ends closes it and ends the seat",
+                t.id,
+                working.join(", "),
+                t.id
+            );
+            return 1;
+        }
+        if verified && read.iter().all(|(_, r)| *r == Standing::Idle) {
+            let why = format!("wsp done {}: its verification holds and the seat is idle", t.id);
+            for (seat, _) in &read {
+                if let Err(e) = crate::cycle::despawn_seat_because(seat, &why) {
+                    eprintln!("wsp: could not end {seat} ({}) — its claim is released and {} closed; `wsp despawn --pane {seat}` ends it", util::truncate(e.trim(), 200), t.id);
+                }
+            }
+            let mut t = t.clone();
+            t.log(&format!("wsp: verification holds and {} sat idle — `wsp done` ended it and released the claim", seats.join(", ")));
+            let _ = store.save_task(&t);
+        } else if !seats.is_empty() {
+            let turn = match working.is_empty() {
+                true => String::new(),
+                false => format!(" (a turn is in progress at {})", working.join(", ")),
+            };
+            eprintln!(
+                "wsp: {} still has a seat running — {}{turn} — so it is NOT done and nothing was closed. \
                  `wsp despawn {}` ends the seat (and says if it kept the tree), then `wsp done {}` again; \
                  a far seat on a machine that is gone is `wsp despawn {} --lost`",
                 t.id,
@@ -5207,9 +5262,9 @@ pub(crate) mod tests {
             trees.push(dir);
         }
 
-        assert_eq!(done(&store, &parse(&["done", "p-001"]), &|_| false), 0);
+        assert_eq!(done(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
         assert!(!trees[0].exists(), "a done row whose work is on the trunk kept its tree");
-        assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"]), &|_| false), 0);
+        assert_eq!(done(&store, &parse(&["done", "p-002", "--keep-tree"]), &|_| false, &Reads(vec![])), 0);
         assert!(trees[1].join(".git").exists(), "--keep-tree did not keep it");
         assert_eq!(store.task("p-002").unwrap().status(), Status::Done);
     }
@@ -5232,15 +5287,97 @@ pub(crate) mod tests {
 
         let alive = |s: &str| s != "cpd-gone";
         assert_eq!(standing_on(&store, "p-001", &alive), vec!["cpd-8@mb".to_string(), "cpd-9".to_string()], "a far seat is named too, a leg's is not");
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &alive), 1);
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &alive, &Reads(vec![("cpd-9", State::Idle), ("cpd-8@mb", State::Idle)])), 1, "not verified: an idle seat still refuses");
         assert_eq!(store.task("p-001").unwrap().status(), Status::Doing, "a refused close closes nothing");
         assert!(store.claims().contains_key("p-001"), "and releases nothing");
         assert!(store.bindings().contains_key("cpd-9") && store.bindings().contains_key("cpd-8@mb"));
 
         // The seats gone: the close goes through as it always did.
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false), 0);
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
         assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
         assert!(!store.claims().contains_key("p-001"));
+    }
+
+    use crate::place::State;
+
+    /// What each seat reads, for `wsp done`'s judgement (`wsp-344`).
+    struct Reads(Vec<(&'static str, State)>);
+
+    impl crate::cycle::Seats for Reads {
+        fn state(&self, seat: &str) -> Option<State> {
+            self.0.iter().find(|(s, _)| *s == seat).map(|(_, st)| *st)
+        }
+    }
+
+    /// A row at `review` whose verifier holds, claimed and bound on `cpd-9`.
+    fn verified_row(store: &Store) {
+        let mut t = Task::new("a row", "p-001");
+        t.set_status(Status::Review);
+        let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
+        p.at = "2026-11-20T09:00:00Z".into();
+        p.pane = Some("cpd-2".into());
+        p.state = crate::verification::State::Holds;
+        p.decided = Some("2026-11-20T09:30:00Z".into());
+        crate::verification::write(&mut t, &[p]);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
+        store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
+        crate::cycle::tests::ENDED.with(|e| e.borrow_mut().clear());
+    }
+
+    /// `wsp-344`: `wsp done` on a verified row whose seat sits idle at its
+    /// prompt ends the seat (tree kept for the close's own sweep), releases the
+    /// claim and closes the row — one call, no `wsp release` first.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_idle_in_one_call() {
+        let _env = util::isolated("done-verified-idle");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+        crate::cycle::tests::KEPT.with(|k| k.borrow_mut().clear());
+
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Reads(vec![("cpd-9", State::Idle)])), 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"), "the claim is released");
+        assert!(!store.bindings().contains_key("cpd-9"));
+        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the idle seat is ended");
+        assert_eq!(crate::cycle::tests::KEPT.with(|k| k.borrow().clone()), vec!["cpd-9".to_string()], "its tree left to done's sweep");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("`wsp done` ended it and released the claim") && log.contains("→ done"), "{log}");
+    }
+
+    /// `wsp-344`: a verified row whose seat is gone — no backend has it — closes
+    /// in one call too, and ends nothing.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_gone_in_one_call() {
+        let _env = util::isolated("done-verified-gone");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"));
+        assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "nothing left to end");
+    }
+
+    /// `wsp-344`: a turn in progress still refuses the close, verified or not,
+    /// and nothing is ended, released or closed.
+    #[test]
+    fn done_still_refuses_a_verified_row_while_a_turn_runs() {
+        let _env = util::isolated("done-verified-working");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        for st in [State::Working, State::Blocked, State::Starting] {
+            assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Reads(vec![("cpd-9", st)])), 1, "{st:?}");
+            assert_eq!(store.task("p-001").unwrap().status(), Status::Review, "{st:?}: nothing closed");
+            assert!(store.claims().contains_key("p-001"), "{st:?}: nothing released");
+            assert!(store.bindings().contains_key("cpd-9"));
+            assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "{st:?}: nothing ended");
+        }
     }
 
     fn scratch_file(name: &str, text: &str) -> String {

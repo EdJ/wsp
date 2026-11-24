@@ -5321,6 +5321,23 @@ pub(crate) fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String>
     }
 }
 
+/// [`despawn_seat_keeping`] with the tree kept and `--why`, for a caller that
+/// may stand in the primary seat, whose despawn gives a why (`wsp-344`'s
+/// `wsp done` on a verified row whose seat sits idle). Its gate is despawn's.
+pub(crate) fn despawn_seat_because(seat: &str, why: &str) -> Result<(), String> {
+    if cfg!(test) {
+        return despawn_seat_keeping(seat, true);
+    }
+    let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
+    let mut argv = despawn_argv(&["--pane", seat], true);
+    argv.extend(["--why".to_string(), why.to_string()]);
+    let out = Command::new(exe).args(argv).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
 /// `wsp despawn <id>`, as a process, for the same reason every other spawn is:
 /// the ending is a verb's whole behaviour and reimplementing it here would be a
 /// second answer that could disagree with it.

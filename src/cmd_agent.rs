@@ -6666,8 +6666,11 @@ fn quiet_note(state: State, status: Status, since: Option<&str>) -> Option<Strin
     Some(match status {
         // Finished, and still in the chair. Nothing is broken and a slot is
         // gone, so the verb is the one that gives it back.
+        // A verified row's idle seat is not said here: the tick ends it
+        // after its grace (`wsp-344`). This is the rest — no verdict yet, or
+        // a seat that cannot be ended for a reason the row's log names.
         Status::Review | Status::Done => {
-            format!("finished {for_} ago and still holding the claim — `wsp release <id>` frees the slot")
+            format!("finished {for_} ago and still holding the claim, with nothing to end it — `wsp release <id>` frees the slot")
         }
         // Waiting on somebody, which is a fact about the work rather than about
         // the agent. Sitting idle is the correct thing for it to be doing.
@@ -6741,7 +6744,11 @@ fn seat_health(
                     .find(|t| t.id == task)
                     .map(|t| t.status())
                     .unwrap_or(Status::Doing);
-                if let Some(why) = quiet_note(state, status, last) {
+                // `wsp-344`: a verified row's idle seat is ended by the tick
+                // after its grace, and `wsp done` closes it in one call, so
+                // the line is for what neither settles.
+                let settles = status == Status::Review && state == State::Idle && crate::verification::verified(tasks, task);
+                if let Some(why) = quiet_note(state, status, last).filter(|_| !settles) {
                     quiet.push(format!("{named} — {why}"));
                 }
             }

@@ -1399,6 +1399,15 @@ impl Repos {
     }
 }
 
+/// Whether `id`'s branch holds commits its trunk has not got (`wsp-344`): the
+/// tree an ending keeps. A row with no branch, no repository or nothing ahead
+/// holds nothing unlanded.
+pub(crate) fn holds_unlanded(store: &Store, id: &str) -> bool {
+    let mut repos = Repos::new(store);
+    let Some(t) = store.task_now(&repos.renamed, id) else { return false };
+    matches!(landing(&mut repos, &t), Landing::Ahead { .. })
+}
+
 /// Whether a member's work is on the trunk.
 fn landing(repos: &mut Repos, t: &Task) -> Landing {
     landing_and_tip(repos, t).0
