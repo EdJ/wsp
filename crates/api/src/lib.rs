@@ -78,6 +78,14 @@ pub const LISTEN_FILE: &str = "api.json";
 /// for no bound, gets this many.
 pub const MAX_EVENTS: u32 = 1000;
 
+/// The most bytes of events one `events` reply carries, counted as each
+/// event's compact JSON: half of [`MAX_LINE`], so the page and its envelope
+/// stay one line a carrier reads. A page stops before the event that would
+/// pass it (wsp-378: 1000 events of today's log were 19.4 MB), but always
+/// carries its first event, so paging moves on; the reply's `through` says
+/// where it stopped.
+pub const MAX_EVENTS_BYTES: usize = MAX_LINE / 2;
+
 /// The read verbs of 4.2 and `subscribe`, as [`Verb`] names them on the wire.
 pub const READ_VERBS: &[&str] = &[
     "state",
@@ -317,7 +325,8 @@ pub enum Verb {
     },
     Machines(#[serde(default)] NoArgs),
     /// Events with ids greater than `from`, in commit order, at most `limit`
-    /// and never more than [`MAX_EVENTS`]. Refused `too_old` when `from` is
+    /// and never more than [`MAX_EVENTS`] nor [`MAX_EVENTS_BYTES`] of them;
+    /// the answer's `through` is where the page stopped. Refused `too_old` when `from` is
     /// before what retention keeps (4.3).
     Events {
         from: EventId,
@@ -443,6 +452,12 @@ pub enum Answer {
     Events {
         events: Vec<Event>,
         head: EventId,
+        /// Where the page stopped: the id of its last event, or the request's
+        /// `from` when it carries none. The next page is asked from it, so a
+        /// page cut by [`MAX_EVENTS_BYTES`] before `limit` loses nothing.
+        /// Absent from an older server, which never cut by bytes: 0.
+        #[serde(default)]
+        through: EventId,
     },
     /// `subscribe`: the feed follows on this connection.
     Subscribed,

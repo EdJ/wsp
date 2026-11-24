@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use wsp_api::{
     Answer, ApiToken, Call, Code, ConnError, Connection, Feed, Frame, Hello, Listen, NoArgs, Outcome, Refused, Reply,
-    ReqId, Request, Subscribe, Verb, LISTEN_FILE, PROTOCOL, TOKEN_FILE,
+    ReqId, Request, Subscribe, Verb, LISTEN_FILE, MAX_EVENTS_BYTES, MAX_LINE, PROTOCOL, TOKEN_FILE,
 };
 use wsp_server::tcp::Tcp;
 use wsp_server::{Composed, Config, Mirror, Mode, Server, SharedStore, StartError, OWNED};
@@ -373,11 +373,11 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
     assert_eq!(c.read(Verb::Machines(NoArgs {})), Answer::Machines(state.machines.values().cloned().collect()));
     assert_eq!(
         c.read(Verb::Events { from: EventId(2), limit: Some(3) }),
-        Answer::Events { events: store.events_after(EventId(2), 3).unwrap(), head: at }
+        Answer::Events { events: store.events_after(EventId(2), 3).unwrap(), head: at, through: EventId(5) }
     );
     assert_eq!(
         c.read(Verb::Events { from: EventId(0), limit: None }),
-        Answer::Events { events: store.events_after(EventId(0), 1000).unwrap(), head: at }
+        Answer::Events { events: store.events_after(EventId(0), 1000).unwrap(), head: at, through: at }
     );
 
     // Every command verb is unsupported, and writes nothing.
@@ -426,6 +426,62 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
 /// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
 /// on rows not done and lists not finished, raised asks only, and `state` beside
 /// it unchanged.
+/// wsp-378: 1000 events of today's log were 19.4 MB, past `MAX_LINE`. A page
+/// stops at `MAX_EVENTS_BYTES` as well, says where in `through`, and paging
+/// from 0 by it reads every event once, each page one line a carrier reads.
+#[test]
+fn events_pages_are_capped_by_bytes_and_paging_by_through_reads_every_event_once() {
+    let d = dir("events-bytes");
+    let store = mirror_store();
+    // 40 rows of 1 MB titles: one event each, 40 MB in all.
+    let big = "x".repeat(1024 * 1024);
+    for i in 0..40 {
+        apply(&store, vec![Entity::Row(row(&format!("big-{i}"), &big))], vec![], &format!("big-{i}"));
+    }
+    rows(&store, 0, 5);
+    let all = store.events_after(EventId(0), 10_000).unwrap();
+    let head = store.head().unwrap();
+    assert_eq!(all.len(), 45);
+    let total: usize = all.iter().map(|e| serde_json::to_vec(e).unwrap().len()).sum();
+    assert!(total > MAX_LINE, "the log is {total} bytes, not past one line");
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+
+    let mut read = Vec::new();
+    let mut from = EventId(0);
+    let mut pages = 0;
+    loop {
+        let id = c.send(Call::Verb(Verb::Events { from, limit: None }));
+        let reply = c.reply(id);
+        let line = serde_json::to_vec(&Frame::Reply(reply.clone())).unwrap();
+        assert!(line.len() < MAX_LINE, "a page from {from:?} is {} bytes", line.len());
+        let Outcome::Ok(Answer::Events { events, head: h, through }) = reply.outcome else {
+            panic!("{:?}", reply.outcome)
+        };
+        assert_eq!(h, head);
+        let bytes: usize = events.iter().map(|e| serde_json::to_vec(e).unwrap().len() + 1).sum();
+        assert!(events.len() == 1 || bytes <= MAX_EVENTS_BYTES, "a page of {bytes} bytes");
+        assert_eq!(through, events.last().map_or(from, |e| e.id), "through is where the page stopped");
+        pages += 1;
+        read.extend(events);
+        if through >= head {
+            break;
+        }
+        assert!(through > from, "a page from {from:?} moved nothing");
+        from = through;
+    }
+    assert!(pages > 1, "40 MB came in one page");
+    assert_eq!(read, all, "every event, once, in order");
+
+    // A page asked past the head carries nothing and stops where it was asked.
+    assert_eq!(
+        c.read(Verb::Events { from: head, limit: None }),
+        Answer::Events { events: vec![], head, through: head }
+    );
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
 #[test]
 fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     let d = dir("wip");

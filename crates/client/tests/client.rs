@@ -311,7 +311,7 @@ fn request_gets_each_read_verbs_answer_matched_by_id() {
     assert_eq!(ask("machines", json!({})), Answer::Machines(state.machines.values().cloned().collect()));
     assert_eq!(
         ask("events", json!({"from": 2, "limit": 3})),
-        Answer::Events { events: store.events_after(EventId(2), 3).unwrap(), head: at }
+        Answer::Events { events: store.events_after(EventId(2), 3).unwrap(), head: at, through: EventId(5) }
     );
 
     // A refusal is a reply with `err`, and a verb the server does not run is unsupported.
@@ -918,7 +918,7 @@ fn orders_server(
     from: Arc<Mutex<Option<u64>>>,
 ) -> Scripted {
     Scripted::start(name, head, move |_, req| match req["verb"].as_str().unwrap() {
-        "events" => says_ok(req, Answer::Events { events: vec![], head: EventId(head) }),
+        "events" => says_ok(req, Answer::Events { events: vec![], head: EventId(head), through: EventId(head) }),
         "orders" => says_ok(req, Answer::Orders(orders.clone())),
         "subscribe" => {
             subscribed.fetch_add(1, Ordering::SeqCst);

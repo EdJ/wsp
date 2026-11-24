@@ -438,12 +438,27 @@ pub fn typed_since(store: &Store, since: wsp_store_contract::At, wait: Duration)
 }
 
 /// The API's `events` read: the events after id `from`, at most `limit`, and the head.
+/// A page the server cut by bytes (wsp-378) is followed from its `through`
+/// until `limit` events are read or the head is reached.
 fn api_events(client: &mut wsp_client::Client, from: u64, limit: usize) -> Result<(Vec<wsp_store_contract::Event>, u64), Error> {
-    let reply = client.request("events", serde_json::json!({ "from": from, "limit": limit })).map_err(from_client)?;
-    match reply.outcome {
-        wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, head }) => Ok((events, head.0)),
-        wsp_api::Outcome::Ok(other) => Err(Error::Failed(format!("events was answered {other:?}"))),
-        wsp_api::Outcome::Err(f) => Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
+    let mut out = Vec::new();
+    let mut at = from;
+    loop {
+        let want = limit - out.len();
+        let reply = client.request("events", serde_json::json!({ "from": at, "limit": want })).map_err(from_client)?;
+        let (events, head, through) = match reply.outcome {
+            wsp_api::Outcome::Ok(wsp_api::Answer::Events { events, head, through }) => (events, head.0, through.0),
+            wsp_api::Outcome::Ok(other) => return Err(Error::Failed(format!("events was answered {other:?}"))),
+            wsp_api::Outcome::Err(f) => return Err(Error::Failed(format!("{:?}: {}", f.code, f.text))),
+        };
+        let got = events.len();
+        out.extend(events);
+        // Done: as many as asked, the head reached, or a page that moved nothing
+        // (an older server's `through` is 0).
+        if got == 0 || got >= want || through <= at || through >= head {
+            return Ok((out, head));
+        }
+        at = through;
     }
 }
 

@@ -6,6 +6,8 @@
 //!   `asks`, `machines`, and `orders` of no seat, which `Reads` has no verb
 //!   for, read the one `snapshot`). `wip` is answered from the server's cut
 //!   cached by event head (the `wip` module), cut again once the head moves.
+//!   An `events` page stops at [`MAX_EVENTS_BYTES`] as well as at `limit`,
+//!   and its `through` says where (wsp-378).
 //! - `throttle`, `spend` and `show` are the CLI's documents, from the
 //!   [`crate::Views`] the server was started with (wsp-307), `unsupported`
 //!   without one.
@@ -48,7 +50,7 @@ use std::time::Instant;
 use serde_json::Value;
 use wsp_api::{
     Answer, Call, Code, ConnError, Connection, Failure, Frame, Hello, Outcome, Refused, Reply, ReqId, Request, Verb,
-    Welcome, COMMAND_VERBS, MAX_EVENTS, MISSED_BEATS, PROTOCOL, READ_VERBS, SYNC_VERBS,
+    Welcome, COMMAND_VERBS, MAX_EVENTS, MAX_EVENTS_BYTES, MISSED_BEATS, PROTOCOL, READ_VERBS, SYNC_VERBS,
 };
 use wsp_machines::Orders;
 use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal};
@@ -418,6 +420,36 @@ pub(crate) fn store_failure(e: Error) -> Failure {
     }
 }
 
+/// Cut an `events` page to [`MAX_EVENTS_BYTES`] of compact JSON: it stops
+/// before the event that would pass it, but keeps its first, so a reader
+/// paging by `through` always moves on.
+fn cut_by_bytes(events: &mut Vec<wsp_store_contract::Event>) {
+    let mut bytes = 0usize;
+    let keep = events
+        .iter()
+        .position(|e| {
+            let mut n = Count(0);
+            let _ = serde_json::to_writer(&mut n, e);
+            bytes += n.0 + 1; // its comma
+            bytes > MAX_EVENTS_BYTES
+        })
+        .map_or(events.len(), |i| i.max(1));
+    events.truncate(keep);
+}
+
+/// A writer that only counts what is written to it.
+struct Count(usize);
+
+impl std::io::Write for Count {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0 += b.len();
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// One read verb, as one call on the store.
 fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
     let s = &shared.store;
@@ -450,7 +482,11 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
         Verb::Machines(_) => s.snapshot().map(|(st, _)| Answer::Machines(st.machines.into_values().collect())),
         Verb::Events { from, limit } => {
             let limit = limit.unwrap_or(MAX_EVENTS).min(MAX_EVENTS) as usize;
-            s.events_after(from, limit).and_then(|events| Ok(Answer::Events { events, head: s.head()? }))
+            s.events_after(from, limit).and_then(|mut events| {
+                cut_by_bytes(&mut events);
+                let through = events.last().map_or(from, |e| e.id);
+                Ok(Answer::Events { events, head: s.head()?, through })
+            })
         }
         Verb::Subscribe(_) => unreachable!("subscribe is answered by its own path"),
         Verb::Throttle(_) | Verb::Spend(_) | Verb::Show { .. } => return view(shared, verb),

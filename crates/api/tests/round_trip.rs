@@ -724,6 +724,7 @@ fn answers() -> Vec<Frame> {
             Answer::Events {
                 events: vec![an_event(401), an_event(402)],
                 head: EventId(411),
+                through: EventId(402),
             },
             vec![],
         ),
