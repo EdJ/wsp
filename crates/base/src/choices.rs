@@ -244,7 +244,7 @@ impl Choices {
     pub fn accept_words(&self, words: &str) -> Result<(Value, String), String> {
         let qs = self.questions();
         if self.kind() == "set" {
-            return Err("a set is answered one question at a time: `--question 'Header' --choice 'Label'`, or ended with `--finish`".into());
+            return Err("a set is answered one question at a time: `--question 'Header' --choice 'Label'` for each; the last one ends the set".into());
         }
         match (self.kind(), qs.as_slice()) {
             ("ask", [q]) => self.accept(&json!({ "answers": { q.question: words.trim() } }), ""),
@@ -358,7 +358,13 @@ impl Choices {
         self.0.get("answers").and_then(Value::as_object).cloned().unwrap_or_default()
     }
 
-    /// How many of a set's questions have an answer saved, and how many it has.
+    /// The headers of a set's questions that have no answer yet.
+    pub fn open_headers(&self) -> Vec<String> {
+        let given = self.answers();
+        self.questions().iter().filter(|q| !given.contains_key(q.header)).map(|q| q.header.to_string()).collect()
+    }
+
+    /// How many of a set's questions have an answer, and how many there are.
     pub fn set_progress(&self) -> (usize, usize) {
         let given = self.answers();
         let qs = self.questions();
@@ -493,8 +499,8 @@ impl Choices {
     fn accept_set(&self, o: &Map<String, Value>, typed: &str) -> Result<(Value, String), String> {
         let finish = o.get("finish").and_then(Value::as_bool).unwrap_or(false);
         let (done, total) = self.set_progress();
-        if done < total && !finish {
-            return Err(format!("{done} of {total} answered — a set ends when every question is, or with `--finish`"));
+        if done < total {
+            return Err(format!("{done} of {total} answered — a set ends when every question is answered"));
         }
         let answers = self.answers();
         let unanswered: Vec<String> = self.set_headers().into_iter().filter(|h| !answers.contains_key(h)).collect();
