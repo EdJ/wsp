@@ -3480,7 +3480,7 @@ mod manager_tests {
     /// stdout; writes its pid and sleeps when told to; exits as told. What it
     /// reads crosses `env -i`, so its knobs are `WSP_` names.
     const FAKE: &str = "#!/bin/sh\n\
-        echo \"built by job: jobs=${CARGO_BUILD_JOBS:-none} held=${WSP_BUILD_HELD:+yes} token=${WSP_TOKEN:-none} other=${OTHER:-none} nice=$(nice) args=$*\"\n\
+        echo \"built by job: jobs=${CARGO_BUILD_JOBS:-none} held=${WSP_BUILD_HELD:+yes} token=${WSP_TOKEN:-none} other=${OTHER:-none} nice=$(ps -o ni= -p $$ | tr -d ' ') args=$*\"\n\
         [ -n \"$WSP_FAKE_PIDFILE\" ] && echo $$ > \"$WSP_FAKE_PIDFILE\"\n\
         [ -n \"$WSP_FAKE_SLEEP\" ] && sleep \"$WSP_FAKE_SLEEP\"\n\
         exit ${WSP_FAKE_EXIT:-0}\n";
@@ -3514,7 +3514,8 @@ mod manager_tests {
         let mut cfg = Config::new(&rig.exec, "test-host");
         cfg.port = 0;
         cfg.tree_root = rig.root.clone();
-        cfg.beat = Duration::from_millis(200);
+        // Not shorter: a shim that starts under load and is not heard for 3 beats is dropped, and its job TERMed (exit 143).
+        cfg.beat = Duration::from_millis(1000);
         let since = Instant::now();
         loop {
             match Manager::start(cfg.clone()) {
@@ -3566,7 +3567,7 @@ mod manager_tests {
 
     /// The niceness this process runs at, which the manager in it hands on.
     fn base_nice() -> i32 {
-        let out = std::process::Command::new("nice").output().unwrap();
+        let out = std::process::Command::new("ps").args(["-o", "ni=", "-p", &std::process::id().to_string()]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
     }
 
