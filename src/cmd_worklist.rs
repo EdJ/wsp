@@ -3513,16 +3513,21 @@ fn show_reads_api() -> bool {
     !std::env::var("WSP_READ").is_ok_and(|v| v.trim() == "files")
 }
 
+/// How long `show --all` waits for the API before it reads the files: `wip`'s
+/// 200 ms (`docs/state-core.md` 4.6 (c)), its own here, as `cmd_agent` is a
+/// layer above this one.
+const SHOW_API_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Every list as the daemon's mirror holds it, in a `State` of its own:
 /// `lists {heads: true}`, each list's fields without its text but with what
 /// `show --json` draws beside its head (`mirror::LIST_SHOW`, the overview
-/// among it), dialled within `wip`'s budget. `Err(None)` where nothing serves
+/// among it), dialled within [`SHOW_API_BUDGET`]. `Err(None)` where nothing serves
 /// this store (no `api.json`), which is the files' read and says nothing;
 /// `Err(Some(why))` where a dial or a request failed.
 fn lists_from_api(store: &Store) -> Result<wsp_store_contract::State, Option<String>> {
     use wsp_store_contract::{ListFilter, Principal, State};
     let by = Principal::Wsp("worklist".into());
-    let mut client = match wsp_client::Client::dial(&store.state, by, crate::cmd_agent::API_BUDGET) {
+    let mut client = match wsp_client::Client::dial(&store.state, by, SHOW_API_BUDGET) {
         Ok(c) => c,
         Err(wsp_client::Silent::NoListenFile(_)) => return Err(None),
         Err(e) => return Err(Some(e.to_string())),

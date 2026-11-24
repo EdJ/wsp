@@ -4797,7 +4797,7 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
 
 /// How long `wip` waits for the API before it reads the files (`docs/state-core.md`
 /// 4.6 (c)).
-pub(crate) const API_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+const API_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Whether `wip` reads through the API: only under `WSP_READ=api`. Unset or
 /// anything else is the files path and never dials, because on a full store the
