@@ -330,3 +330,199 @@ Once:
   fixed in this row.
 - **`WSP_FULL_SUITE`.** The shim refuses `cargo test --workspace` in a seat without a reason; every run above
   was made with the reason "wsp-430: turnaround measure (b) …", as the packet orders.
+
+## The cuts, ranked
+
+Written by wsp-431 on 2026-11-24, from the two sections above and wsp-429's 101 wsp rows (its `stages.json` and
+`rows.json`). This row added three counts from the same rows:
+- the reason each send-back gives in its row's log (`wsp show <row> --log`);
+- the cargo calls in the agent seats' own transcripts (the verifier's seats left out);
+- the tests each barrier's check seat ran, per group.
+
+The scripts are in `~/.local/state/wsp/scratch/wsp-431/`: `sb.py` (send-back reasons), `agent.py` (the seats'
+cargo calls) and `rest.py` (check, verifier, barrier and load).
+
+**The finding.** Building and testing is about 4 of a row's 9.5 minutes, not the 2.2 that wsp-429's stages show.
+The agent's own seats run cargo for 2.0 / 3.3 min (median / p75) of their 6.3 / 10.1 min of work. Most of that
+time is running tests, not compiling. The compile after an edit is the only part phase 2 cuts. It is 9 / 20
+bin-crate builds per row at about 4.4 s each, so 40 / 90 s. **Phase 2 can take at most 0.3 / 0.7 min off a
+row.** Two cuts take more at the median, and neither needs a crate:
+- start the verifier beside the check, not after it: 0.60 / 0.93 min;
+- the barrier's own run working again, so its check seat stops running the suite by hand: 0.35 / 1.56 min. wsp-361's
+  fix has already landed.
+
+wsp-440's gate wants a build under half of the bin crate's 4.4 s, so under 2.2 s. A straight line through wsp-430's
+two figures predicts 2.4 s for an edit in engine, a narrow miss. One crate for engine and seats predicts 3.4 s.
+
+### The ranking
+
+How to read the figures:
+- **Minutes per row** is what the cut would have taken off each of the 101 rows, from the stage it acts on, as median
+  / p75. The mean is in brackets where the median is 0 or the tail carries the cut.
+- **≤** marks an upper bound.
+- **Rank** is by the median, then the p75. Rows 9 and 10 are bounds only, so they are ranked last.
+
+The savings do not add: rows 2 and 6 overlap, and so do rows 9 and 10.
+
+| # | Cut | Stage it saves from | Min per row, median / p75 (mean) | The figure it rests on | Where it stands |
+|---|---|---|---|---|---|
+| 1 | The verifier starts beside the row's `wsp check`, not after it | check + verifier, one after the other | 0.60 / 0.93 (0.79) | The verifier spawns 0 / 1 s after the check result (120 spawns). The check takes 0.7 / 1.0 min and the verifier 1.3 / 2.2 min (wsp-429) | not a row |
+| 2 | The barrier's own run works again, so the check seat stops running the suite by hand (part of the barrier's share) | barrier share | 0.35 / 1.56 (1.21) | The check seat's by-hand builds and tests ÷ the group's members. 27 of 42 groups were in wsp-361's 0-step stretch | wsp-361's fix landed. wsp-442 confirms it |
+| 3 | Phase 2: `engine` and `seats` as two crates (wsp-432 to wsp-441) | the agent's own work | ≤ 0.30 / 0.67 (one crate: ≤ 0.15 / 0.35) | Engine edit predicted at 2.4 s against 4.4 (wsp-430 steps 1a and 2a, scaled by lines), × 9 / 20 bin builds per row | rows on this list |
+| 4 | Narrower check steps (wsp-433) | check, repeat barriers | ≤ 0.1 / 0.1 (≤ 0.6) | Whole-binary row steps (3 rows, 18 min over 30 s). Repeat barrier seats (6 of 41 groups, 32 min) | wsp-433, group 2 |
+| 5 | Thermal and load: the throttle, the check cap | check | 0.07 / 0.11 on omarchy (thermal: 0) | The `help` step takes 5.5 s at load < 4 and 11.5 s at ≥ 4. The clock was not limited | no row |
+| 6 | Shard or split the test binary, apart from the crate split | barrier, the agent's own work | 0.0 / 0.4 (0.3). 0.2 / 1.2 if seats keep running the suite by hand | Full suite 330 s with the binaries run one after another. The bin's unit-test binary is 142 s of it (wsp-430) | not a row |
+| 7 | One feature set across cargo commands | the agent's own work | 0 / ≤ 1.0 (≤ 0.5), low confidence | First `--bin wsp` build after `--workspace` took 34.8 s against 4.4 (wsp-430). Seats switch 0 / 5 times per row | not a row. Measure first |
+| 8 | Limit send-backs: wsp-386 (no headroom), with wsp-364 (a limit judged against a cold check) already landed | send-back rework | 0 / 0 (0.15), less after wsp-364 | 7 of the 91 logged send-backs were for a limit alone, on 6 rows, costing 15.6 min of rework | wsp-386 open, wsp-364 done |
+| 9 | Groups run beside a held barrier (wsp-443) | barrier share (the next group's wait) | ≤ 1.44 / 5.58 (≤ 5.48) | The barrier share. cr-linux-panes group 5 sat about 15 h behind group 4 | needs Ed |
+| 10 | A barrier passes without a check seat when its run is green (the rest of the barrier's share) | barrier share | ≤ 0.56 / 2.21 (≤ 4.24) | The share less the by-hand tests and the barrier's own run | not a row. The person's call |
+
+### Each cut
+
+**1. The verifier beside the check.**
+- How it runs today: the verifier is spawned when the row's check passes, 0 s after the check result at the median
+  and 1 s at p75 (120 verifier spawns). The row waits for the check (0.7 / 1.0 min) and then the verifier (1.3 / 2.2
+  min).
+- The gain: spawned at `wsp review` instead, the verifier saves the shorter of the two. Per row that is 0.60 /
+  0.93 min (mean 0.79).
+- The cost: when the check fails (36 of the 86 send-backs), the early verifier's seat is spent for nothing. Its
+  verdict would also have to wait for the check's result before it can land.
+- Its own checks (0.1 / 0.5 min) re-run what the check ran. Reusing those greens would save at most that.
+- It is below a minute per row, so wsp-442's rule would not file it. It is named here for the governor.
+
+**2. The barrier's own run, working again.**
+- The barrier share is 1.44 / 5.58 min per row (mean 5.48).
+- From s2-state-core group 7 to omarchy-env group 1, the barrier's run read 0 steps. The check seat ran the builds
+  and tests by hand instead. Divided among the members, that is 0.35 / 1.56 min per row (mean 1.21).
+- wsp-361's fix (3d32fc4, landed 2026-11-24; the row's group barrier is still to pass) ended that stretch. omarchy-env
+  group 1, at 09:15Z that day, was its last group. The barrier's run reuses greens: 44 / 72 s where a step
+  ran.
+- The saving holds only if check seats stop running the suite by hand once the run has run it. wsp-442's stage
+  split, on rows landed after the fix, is where that shows.
+
+**3. Phase 2: `engine` and `seats`.**
+- **wsp-430's figures:** a one-line edit, then `cargo test --no-run`, takes 4.4 s in the bin crate (`src/`, 213k
+  lines today) and 0.7 s in `wsp-trees` (18.5k lines).
+- **A straight line through those two:** 0.35 s plus 0.019 s per 1,000 lines. The parts of the 4.4 s that grow with
+  the crate are the macro expansion (redone on every build), the rest of the front end, writing the dep graph and
+  the link. Together they are about 70 % of it (step 3).
+- **docs/components.md's map today:** `engine` is 106k lines with 1,487 `#[test]`s. `seats` is 58k lines with 734
+  (`ended_panes` and `sync` are gone). About 47k lines stay in the bin: timeline 13k, surface 28k and top 5k.
+- **Predicted `cargo test --no-run` after one edit:**
+  - in engine: 2.4 s, 54 % of 4.4;
+  - in seats: 1.5 s;
+  - in what is left of the bin: 1.3 s;
+  - in one engine+seats crate (164k lines): 3.4 s, 77 %.
+
+  wsp-440's gate is under half, 2.2 s. Two crates miss it by 0.2 s, which is within what a straight line from two
+  points can say, so wsp-440's own timing decides. One crate misses it plainly.
+- **Who gets the gain:** only a seat that runs `cargo test -p wsp-engine …`. A `cargo test --bin wsp …` after an
+  engine edit builds engine and then the bin, about 2.4 + 1.3 s, which is near today's 4.4 s.
+- **What phase 2 does not shorten:**
+  - the check's `help` and `readonly` rules: where they fire, they build the root package's test targets, and those
+    rebuild on top of a changed engine;
+  - the verifier's checks;
+  - the suite: the same 4,102 tests run, they only move between binaries.
+- **Per row:**
+  - Agent seats ran 9 / 20 bin-building cargo calls per row (mean 14.8; `agent.py`). At 2.0 s saved per call, that is
+    18 / 40 s, so 0.30 / 0.67 min.
+  - It is an upper bound, because not every call follows an edit.
+  - One crate saves about 1 s per call: ≤ 0.15 / 0.35 min.
+- **The cost:** ten rows, two of them large, with serial cuts and installs between them.
+
+**4. Narrower check steps (wsp-433).**
+- **A row's own check is already narrow.** 417 of the rows' own lines ran, at 3 / 12 s each. Three rows ran a whole
+  binary:
+  - wsp-368's full suite, 333 s;
+  - wsp-307's `cargo test --workspace`, 63 to 195 s, three times;
+  - wsp-163's `--bin wsp -- tests:: readonly`, 119 to 241 s, three times.
+
+  Their time past 30 s is 18.2 min over 101 rows, a mean of 0.18 per row. The median and p75 are 0.
+- **Repeat barriers.** 6 of 41 groups seated a second check seat. The later seats ran 31.8 min of tests by hand:
+  hub-deploy 856 s, cr-events-3 413 s, read-api 411 s and trunk-green 221 s. That is a mean of 0.32 per row. A second
+  barrier that ran only what changed since the first would keep a small part of it.
+- **The `help` and `readonly` rules** build every test target of the root package, which includes the debug binary
+  the 21 integration tests run. Naming `--bin wsp` would build the unit binary alone. Not measured: at most one bin
+  build of about 4 s per check run where they fire, so ≤ 0.1 min per row at 1.7 runs.
+- **Total:** ≤ 0.1 / 0.1 (≤ 0.6).
+- **A trap:** for a `src/` edit, `--affected` runs `crate:wsp` (`cargo test -p wsp`, 242 s; wsp-430 step 4). A row's
+  own module line takes 3 / 12 s. If wsp-433 swapped a row's module lines for the crate step, that row's check would
+  get about 4 minutes slower.
+
+**5. Thermal and load.**
+- **Thermal:** omarchy's clock was not limited (wsp-429, wsp-430), and wsp reads the clock only from `pmset`. The
+  throttle's check cap saves nothing here: 0.
+- **Load:** the `help` step, which pays the bin build, took 5.5 s at the median at load < 4 (78 runs). At load ≥ 4 it
+  took 11.5 s (38 runs).
+  - A row's bin-building check steps are 0.43 / 0.67 min.
+  - A third of them run at twice the time, so holding row checks below load 4 would save about 0.07 / 0.11 min per
+    row.
+- **Ed's Mac:** 96 s per check run against 30 s here, at 1.7 runs per row, is about 1.9 min per row. That can be
+  measured only on that machine.
+
+**6. Sharding or splitting the test binary.**
+- **The suite:** 330 s. Its binaries run one after another (their times sum to 327 s of the 333). The bin crate's
+  unit-test binary is 142 s of it.
+- **The gain per full run:** run side by side (nextest, or one `cargo test --test …` per binary in parallel), the
+  wall falls toward the longest binary, about 142 s. That saves about 3 min. Splitting the 142 s binary itself
+  helps only past that point, and its slowest single test was not timed.
+- **Who runs the full suite:**
+  - The agent seats' own `--workspace` runs: 0 / 39 s per row (mean 32 s). Sharding saves 0 / 0.4 min (mean 0.3).
+  - Check seats by hand: 0.35 / 1.56 per row (cut 2). Sharding saves 0.2 / 0.9 of that, but those by-hand runs go
+    anyway if cut 2 holds.
+  - `wsp check --affected`'s `crate:wsp` step would fall from 242 s to about 142 s.
+
+**7. One feature set across cargo commands.**
+- **The figure:** wsp-430's first `cargo test --bin wsp --no-run` after a `--workspace` build took 34.8 s, against
+  4.4. Cargo resolved features for that command and rebuilt `wsp-api`, `wsp-server`, `wsp-client` and `wsp-hub`.
+- **How often seats hit it:** they switch between `--workspace` and narrower cargo commands 0 / 5 times per row
+  (mean 3.1, in 50 rows).
+- **The estimate:** cargo keeps both builds in `target/`, so the cost is probably paid once per side per tree, not
+  at every switch. That gives ≤ 1 min for a row that switches: 0 / ≤ 1.0 (≤ 0.5).
+- **Not measured:** the dev-dependencies that turn on `test-support` (root `Cargo.toml` lines 34 to 45) are a likely
+  cause, but not a checked one. A timed switch in each direction would settle the figure before anyone files a row.
+
+**8. Limit send-backs (wsp-386, wsp-364).**
+- **The count:** wsp-429's 101 rows logged 91 send-backs. Seven of them, on six rows, were for a limit alone ("took its
+  whole budget", no test failing):
+  - wsp-122, wsp-343, wsp-124 and wsp-127, all 2026-11-20;
+  - wsp-368 and wsp-351 twice, 2026-11-23.
+- **The cost:** 1.0 to 4.3 min of rework each, 15.6 min in all. That is a mean of 0.15 per row; the median and p75
+  are 0. compound-react had 2 of its 69 (compound-react-038 and -060), 1.5 min.
+- **wsp-364** landed as d7d9f99 on 2026-11-23 at 07:53Z. It judges a limit after cargo's `Finished` line, which
+  takes out a cold build (wsp-122's tree was cold) and a warm tree's incremental build. Five of the seven came before
+  it landed. wsp-351's two came after (08:16Z and 08:25Z), and the record does not say whether the daemon ran the new
+  build by then. No row's log has a limit-only send-back after that.
+- **What is left for wsp-386:** ≤ 0.15 per row, and likely less.
+
+**9. Groups beside a held barrier (wsp-443).**
+- **The bound:** at most the share of the held group, ≤ 1.44 / 5.58 per row (mean 5.48). It pays only where the next
+  group has no `after` into the held group and no file in common with it. This row did not count those groups.
+- **Where it pays:** in the mean, not the median. cr-linux-panes group 5 waited 302 min of by-hand checks plus a
+  604 min hold behind group 4, though neither of its members rests on group 4's row.
+- **On turnaround itself** the groups are serial (cut rows wait for installs), so it saves nothing here.
+- **Status:** it needs Ed's answer first.
+
+**10. A barrier without a check seat.**
+- **What is left of the share:** after the by-hand tests and the barrier's own run, the share is 0.56 / 2.21 per row
+  (mean 4.24). That is the check seat's reading plus the waits on follow-ups and decisions.
+- **The design:** a barrier whose run is green, and whose members share no file, could pass without a seat.
+- **Why it is the person's call:** the seat is there to catch members that undid each other. It is not a row.
+
+### The rows behind this group
+
+The barrier applies these lines with a `--why`. This row edits no list.
+
+| Row | Call | Why |
+|---|---|---|
+| wsp-432 | keep | Its one-or-two-crate choice now decides whether phase 2 earns its rows. Two crates predict 2.4 s per engine edit (≤ 0.3 / 0.7 min per row). One crate predicts 3.4 s (≤ 0.15 / 0.35), which fails wsp-440's half gate before any seam is paid for. |
+| wsp-433 | keep | It is the only cut on this list that reaches the barrier (repeat barriers, whole-binary steps), and it does not wait on phase 2. It must keep a row's module lines and not swap in `crate:wsp` (242 s against 3 / 12 s). |
+| wsp-434 | keep | Mechanical and cheap. The 38 `-> main:` edges block every cut, surface and timeline included. |
+| wsp-435 | keep | Its edges run from seats and engine up into top and surface, so they leave either shape of phase 2. |
+| wsp-436 | keep | The same: engine and seats into timeline, under either shape. |
+| wsp-437 | keep under two crates; drop under one | Under one crate its edges are internal. The merged crate's predicted 3.4 s cannot meet wsp-440's gate, so narrowing it buys nothing measurable. |
+| wsp-438 | keep under two crates; drop under one | The same reason as wsp-437. |
+| wsp-439 | keep | `memory` and `disk` must leave the root under either shape. Under one crate, only its `attention -> cmd_watch` edges become internal. |
+| wsp-440 | keep | The predicted 2.4 s against a 2.2 s gate is too close to settle without the cut, so its own timed figure decides. Its hold on missing the gate stands. |
+| wsp-441 | keep under two crates; drop under one | It is predicted at 1.5 s per seats edit once engine is out, and the list already drops it under one crate. |
+| wsp-442 | keep | It re-measures on the same machine. Its re-rank should also carry cuts 1, 2 and 10 here, which neither the hand-off nor its overview names. Cut 2 needs its stage split, on rows landed after wsp-361's fix, to confirm it. |
