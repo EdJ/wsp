@@ -972,6 +972,10 @@ fn job_of(v: &Value) -> Option<JobKey> {
     serde_json::from_value(v.get("job")?.clone()).ok()
 }
 
+/// A hold's mark that its build runs in the shim's own process, outside the
+/// manager's tree root (wsp-361), so its pid, not a job table, says it holds.
+const HERE: &str = "here";
+
 /// How long a hold whose job the manager's table does not hold yet is still
 /// its holder's: the moment between taking the hold and `job.run`, and a run
 /// refused `full` that waits. The holder keeps the file fresh while it waits
@@ -996,6 +1000,11 @@ fn touch(path: &Path) {
 /// with a job holds; a record with no job is nobody's.
 pub(crate) fn live_by(table: Option<Vec<JobRow>>) -> impl Fn(&Path, &Value) -> bool {
     move |path: &Path, v: &Value| match (job_of(v), &table) {
+        // A run outside the tree root runs in its shim's process, in no table
+        // the others read (wsp-361): its hold is its pid's.
+        _ if v.get(HERE).and_then(Value::as_bool) == Some(true) => {
+            v.get("pid").and_then(Value::as_u64).is_some_and(|p| crate::gc::alive(p as u32))
+        }
         (Some(key), Some(t)) => match t.iter().find(|r| r.key == key) {
             Some(r) => r.state == JobState::Running,
             None => age_of(path) < JOB_START_GRACE,
@@ -1364,6 +1373,12 @@ pub struct Jobs<'a> {
     pub on: HostId,
     /// The manager's tree root, which the job's `dir` is relative to.
     pub tree_root: PathBuf,
+    /// Where a run whose cwd is outside `tree_root` goes (wsp-361): `wsp-host`'s
+    /// runner in this process, its root `/`, as on a host with no manager
+    /// (wsp-346's rule for a check). The manager's jobs stay under its root;
+    /// a seat's scratch and the shared check tree, under the state directory,
+    /// run here rather than being refused. `None` refuses such a run, 126.
+    pub outside: Option<&'a dyn crate::host::Host>,
     /// The caller's environment, which the job's is drawn from ([`job_env`]).
     pub env: Vec<(String, String)>,
     /// Where the job's output goes as it comes: the shim's own stdout.
@@ -1479,6 +1494,9 @@ pub fn run_on(ctx: &Ctx, jobs: &Jobs, tool: &str, args: &[String]) -> i32 {
         let tree = tree_of(&ctx.cwd);
         let mut rec = record(&ctx.task, tool, args, &tree);
         rec["job"] = serde_json::to_value(&key).unwrap_or(Value::Null);
+        if runs_here(ctx, jobs) {
+            rec[HERE] = Value::Bool(true);
+        }
         // The tree first and the slot second: a build waiting on its own tree
         // must not be sitting on a slot somebody else could use.
         if tool == "cargo" {
@@ -1541,13 +1559,25 @@ extern "C" fn on_interrupt(_: i32) {
 /// queued, not failed; any other refusal, and a silent manager, run nothing
 /// here instead.
 fn as_job(ctx: &Ctx, j: &Jobs, key: JobKey, class: JobClass, argv: Vec<String>, holds: &[Hold]) -> i32 {
-    let Some(at) = crate::job_place::dir_under(&j.on, &ctx.cwd, &j.tree_root) else {
-        (ctx.say)(&format!(
-            "wsp: {} is not under the manager's tree root {}, so the build cannot run as its job (WSP_JOBS=manager)",
-            ctx.cwd.display(),
-            j.tree_root.display()
-        ));
-        return 126;
+    let (host, at) = match (crate::job_place::dir_under(&j.on, &ctx.cwd, &j.tree_root), j.outside) {
+        (Some(at), _) => (j.host, at),
+        // Outside the root: a job on the runner in this process, the cwd
+        // where it is (wsp-361). Nothing crosses to the manager.
+        (None, Some(here)) => {
+            let Some(at) = crate::job_place::dir_under(&HostId(crate::job_place::trunk_host()), &ctx.cwd, Path::new("/")) else {
+                (ctx.say)(&format!("wsp: {} is not a directory this process can run in; the build was not run", ctx.cwd.display()));
+                return 126;
+            };
+            (here, at)
+        }
+        (None, None) => {
+            (ctx.say)(&format!(
+                "wsp: {} is not under the manager's tree root {}, so the build cannot run as its job (WSP_JOBS=manager)",
+                ctx.cwd.display(),
+                j.tree_root.display()
+            ));
+            return 126;
+        }
     };
     let run = JobRun {
         key: key.clone(),
@@ -1567,7 +1597,6 @@ fn as_job(ctx: &Ctx, j: &Jobs, key: JobKey, class: JobClass, argv: Vec<String>, 
         signal(2, on_interrupt as *const () as usize);
     }
     let out = j.out;
-    let host = j.host;
     let mut said_full = false;
     loop {
         let (ended, stopped) = std::thread::scope(|s| {
@@ -1601,6 +1630,12 @@ fn as_job(ctx: &Ctx, j: &Jobs, key: JobKey, class: JobClass, argv: Vec<String>, 
             }
         };
     }
+}
+
+/// Whether `ctx`'s run goes to [`Jobs::outside`], its cwd outside the
+/// manager's tree root (wsp-361).
+fn runs_here(ctx: &Ctx, j: &Jobs) -> bool {
+    j.outside.is_some() && crate::job_place::dir_under(&j.on, &ctx.cwd, &j.tree_root).is_none()
 }
 
 /// Keep trying until `attempt` is ours, saying who has it at the start and
@@ -1694,7 +1729,7 @@ pub fn run_raw(argv: &[String]) -> i32 {
         let _ = o.write_all(text.as_bytes());
         let _ = o.flush();
     };
-    let jobs = Jobs { host, on: HostId(crate::job_place::trunk_host()), tree_root: PathBuf::from("/"), env: std::env::vars().collect(), out: &out };
+    let jobs = Jobs { host, on: HostId(crate::job_place::trunk_host()), tree_root: PathBuf::from("/"), outside: None, env: std::env::vars().collect(), out: &out };
     run_on(&ctx, &jobs, tool, args)
 }
 
@@ -1786,7 +1821,8 @@ fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, a
         body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
     };
     let tree_root = crate::job_place::installed_tree_root(&store.state);
-    let jobs = Jobs { host, on, tree_root, env: std::env::vars().collect(), out: &out };
+    let outside = Some(inproc_anywhere(&store.state));
+    let jobs = Jobs { host, on, tree_root, outside, env: std::env::vars().collect(), out: &out };
     run_on(&ctx, &jobs, tool, args)
 }
 
@@ -2872,6 +2908,7 @@ mod tests {
             host,
             on: HostId(crate::job_place::trunk_host()),
             tree_root: PathBuf::from("/"),
+            outside: None,
             env: vec![("PATH".into(), ctx.path_var.clone())],
             out: &|_: &str| {},
         };
@@ -3603,7 +3640,7 @@ mod manager_tests {
         let out = |t: &str| got.lock().unwrap().push_str(t);
         let mut env = caller_env();
         env.push(("WSP_FAKE_EXIT".into(), "3".into()));
-        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env, out: &out };
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), outside: None, env, out: &out };
         assert_eq!(run_on(&ctx(&rig, &say), &jobs, "cargo", &s(&["build", "-p", "x"])), 3, "the job's exit is the shim's");
         let text = got.lock().unwrap().clone();
         assert!(text.contains("built by job:") && text.contains("args=build -p x"), "its output reached the caller: {text:?}");
@@ -3628,7 +3665,7 @@ mod manager_tests {
         let said = RefCell::new(Vec::<String>::new());
         let say = |l: &str| said.borrow_mut().push(l.to_string());
         let out = |_: &str| {};
-        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env: caller_env(), out: &out };
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), outside: None, env: caller_env(), out: &out };
         // A run whose job has ended; then its hold left behind, in this
         // process's own name: `kill -0` would call it held for ever.
         assert_eq!(run_on(&ctx(&rig, &say), &jobs, "cargo", &s(&["test"])), 0);
@@ -3696,7 +3733,7 @@ mod manager_tests {
         let say = |_: &str| {};
         let got = Mutex::new(String::new());
         let out = |t: &str| got.lock().unwrap().push_str(t);
-        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), env: caller_env(), out: &out };
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: rig.root.clone(), outside: None, env: caller_env(), out: &out };
         let run = |beat: HostFacts, m: Mode| {
             Settings { mode: m, slots: Some(2), jobs: Some(4), hot_jobs: Some(1), ..Settings::default() }.save(&rig.state).unwrap();
             let read = move || Some(beat.clone());
@@ -3748,11 +3785,16 @@ mod manager_tests {
     /// `wsp throttle run cargo <args>` as its own process, under
     /// `WSP_JOBS=manager` with this host's record naming the loopback manager.
     fn shim(rig: &Rig, m: &Manager, args: &str, extra: &[(&str, &str)]) -> Child {
+        shim_at(rig, m, &rig.tree, args, extra)
+    }
+
+    /// [`shim`] run from `cwd`.
+    fn shim_at(rig: &Rig, m: &Manager, cwd: &Path, args: &str, extra: &[(&str, &str)]) -> Child {
         wsp_wire::manager::install_record(&rig.state, &wsp_wire::manager::Local::new(&rig.exec, m.addrs()[0].port()), Duration::from_secs(5)).unwrap();
         let result = rig.iso.path(&format!("result-{}", args.replace(' ', "_")));
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args(["throttle::manager_tests::run_raw_child", "--exact", "--nocapture", "--test-threads=1"])
-            .current_dir(&rig.tree)
+            .current_dir(cwd)
             .env(CHILD, &result)
             .env("WSP_TEST_ARGV", args)
             .env("WSP_JOBS", "manager")
@@ -3793,6 +3835,55 @@ mod manager_tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0.row.0, "throttle", "no row: the key says throttle");
         m.stop();
+    }
+
+    /// A seat's scratch is under the state directory, outside the manager's
+    /// tree root (wsp-361): `cargo --version` and `cargo build` there run in
+    /// the shim's own process, as on a host with no manager, and exit 0. The
+    /// manager runs no job outside its root; a build in a tree under it is
+    /// still its job.
+    #[test]
+    fn run_raw_under_manager_runs_a_build_outside_the_tree_root_in_this_process() {
+        let rig = rig("throttle-job-outside");
+        mode(&rig, Mode::On, 2);
+        let m = manager(&rig);
+        let scratch = rig.state.join("scratch").join("wsp-9");
+        fs::create_dir_all(&scratch).unwrap();
+        assert!(!scratch.starts_with(&rig.root), "the scratch is outside the tree root");
+        for args in ["--version", "build"] {
+            let (v, text) = finished(shim_at(&rig, &m, &scratch, args, &[]));
+            assert_eq!(v["exit"], 0, "{args}: {text}");
+            assert!(text.contains("built by job:") && text.contains(&format!("args={args}")), "{args}: {text}");
+            assert!(!text.contains("not under the manager's tree root"), "{args}: {text}");
+            if args == "build" {
+                assert!(text.contains("held=yes"), "a heavy run outside the root takes its holds: {text}");
+            }
+        }
+        assert!(m.jobs().is_empty(), "nothing outside the root reached the manager: {:?}", m.jobs());
+        let (v, text) = finished(shim(&rig, &m, "build", &[]));
+        assert_eq!(v["exit"], 0, "{text}");
+        assert_eq!(m.jobs().len(), 1, "under the root the build is the manager's job: {:?}", m.jobs());
+        m.stop();
+    }
+
+    /// A hold of a run in the shim's own process (outside the tree root,
+    /// wsp-361) is its pid's: it holds while the pid lives, whatever the
+    /// manager's table says, and not once the pid is gone.
+    #[test]
+    fn a_hold_of_a_run_outside_the_tree_root_is_its_pids() {
+        let rig = rig("throttle-hold-here");
+        let p = rig.iso.path("hold");
+        fs::write(&p, "{}").unwrap();
+        let mut rec = record("wsp-9", "cargo", &s(&["build"]), &rig.tree);
+        rec["job"] = serde_json::to_value(job_key_now("wsp-9", "cargo", &s(&["build"]))).unwrap();
+        rec[HERE] = Value::Bool(true);
+        assert!(live_by(Some(vec![]))(&p, &rec), "its pid lives, though no table holds its job");
+        assert!(live_by(None)(&p, &rec));
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        rec["pid"] = json!(dead);
+        assert!(!live_by(Some(vec![]))(&p, &rec), "its pid is gone: free, within the job grace or not");
     }
 
     #[test]

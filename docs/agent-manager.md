@@ -1256,7 +1256,7 @@ manager record (the i5 before M2), nothing changes: `run_in` runs the build in t
   the job's. A tool's own signal is the shell's 128+n. A job ended by a stop or its bound exits 143, and one the
   shim's ^C stopped exits 130. The job is not detached, so a shim killed with its agent stops it. A run refused
   `full` waits and asks again under the same key. Any other refusal, and a silent manager, run nothing here
-  instead.
+  instead. A cwd outside the tree root runs in this process instead (wsp-361, below).
 - **^C is `job.stop`.** The job is in its own process group, not the terminal's, so the shim catches SIGINT
   while the job runs and stops it.
 - **Holds carry the job's key and are read from the job table** (`live_by`). A running job holds. An ended job does
@@ -1297,6 +1297,29 @@ or `kill`. SIGINT to that process stops the job (exit 130, the tool gone, the jo
   its jobs in their trees after a rollback.
 - **Doctor** names the capacities in the manager's `hello` ("runs N build and M check jobs at once"). It reports a
   problem when they differ from what `jobs.json` says the install wrote.
+
+#### Work outside the tree root runs in this process (wsp-361, 2026-11-24)
+
+Under group 6's root rule, the state directory is outside the tree root whenever the projects are not under home.
+That covers a seat's `$WSP_SCRATCH`, the shared check tree (`<state>/checks/<project>-<repo>/tree`) and the barrier
+tree. Until this row, `throttle run` exited 126 there with nothing run, and `wsp check` and the barrier said "not
+run". The decision: **a cwd or tree outside the root runs in this process, as on a host with no manager** (wsp-346's
+rule for a check). The root was not widened to cover the state directory, since a root of `/` confines no job. The
+shim also does not stop and say how to proceed, because nothing it could say would let the build run.
+- **The manager's jobs stay under its root.** Nothing outside the root is sent to the manager.
+- **`throttle run`.** `Jobs::outside` is `wsp-host`'s runner in this process (`inproc_anywhere`, its root `/`).
+  `as_job` sends a run whose cwd is not under the manager's root there, and a run under the root still goes to the
+  manager. The decision (slots, nice, job cap) is the same. A heavy run's holds are marked `here`, and `live_by`
+  judges them by their pid, because no table that other shims read holds their job.
+- **Checks and barriers.** `check::Runner::chosen` returns `Inproc` for a tree that
+  `job_place::outside_tree_root` says is outside the root. It does this before anything is placed or dialled.
+  `wsp check <id>` in the shared check tree, the barrier in its tree and a seat's work tree outside the root all
+  use this path.
+
+Tests: `run_raw_under_manager_runs_a_build_outside_the_tree_root_in_this_process` and
+`a_hold_of_a_run_outside_the_tree_root_is_its_pids` (throttle.rs `manager_tests`), and
+`the_verb_under_a_manager_runs_in_the_shared_check_tree_outside_the_installed_root` and
+`a_host_with_no_manager_stays_in_process_and_one_with_a_manager_runs_a_tree_outside_the_root_here` (check.rs).
 
 Tests: `crates/wire/tests/host.rs` runs a job with `WSP_JOBS` unset on a loopback manager. The manager's host and
 its exec dir keep the log. The same job under `inproc` runs in this process, with its log under `<state>/inproc`.

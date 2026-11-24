@@ -162,6 +162,29 @@ pub fn dir_on(host: &str, dir: &Path, what: &str) -> Result<HostDir, String> {
     Ok(at)
 }
 
+/// Whether `dir` (on this machine, there or not yet) is outside the tree
+/// root: the shared check and barrier trees and a seat's scratch, under the
+/// state directory, are wherever the projects are not under it (wsp-361). A
+/// run there goes in this process, as on a host with no manager; the
+/// manager's jobs stay under its root. The root itself is not outside it.
+pub fn outside_tree_root(dir: &Path) -> bool {
+    let root = tree_root();
+    let root = root.canonicalize().unwrap_or(root);
+    !real_as_far_as_it_is(dir).starts_with(&root)
+}
+
+/// `dir` with its deepest existing ancestor made real and the rest kept as
+/// written, so a tree not made yet compares with a real root.
+fn real_as_far_as_it_is(dir: &Path) -> PathBuf {
+    for (n, up) in dir.ancestors().enumerate() {
+        if let Ok(real) = up.canonicalize() {
+            let rest: PathBuf = dir.components().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
+            return real.join(rest);
+        }
+    }
+    dir.to_path_buf()
+}
+
 /// `dir` (on this machine) as a [`HostDir`] on `host`, relative to `root`:
 /// how the throttle's shim places a build at its cwd under the root its jobs
 /// host was made with — the manager's tree root, or `/` for the in-process

@@ -1350,7 +1350,8 @@ impl Runner<'static> {
     /// places nothing;
     /// `manager` takes the place from [`place_of`] and runs on the manager of
     /// the place's host. A place on a host with no manager (only this
-    /// machine has one until M4) keeps the in-process path. A manager that
+    /// machine has one until M4), and a tree outside the tree root (wsp-361),
+    /// keep the in-process path. A manager that
     /// cannot be reached is an error, and nothing is run here in its place.
     pub(crate) fn chosen(store: &Store, whose: Whose<'_>, kind: TreeKind, tree: &Path, lock: Option<&Path>) -> Result<Runner<'static>, String> {
         use crate::host::JobsChoice;
@@ -1362,6 +1363,13 @@ impl Runner<'static> {
         // (wsp-346), and a host with none runs here wherever the tree is.
         let managed = crate::host_tcp::record(&store.state).ok().map(|(local, _)| local.host);
         if managed.as_deref() != Some(wsp_trees::job_place::host_of(whose).as_str()) {
+            return Ok(Runner::Inproc);
+        }
+        // A tree outside the tree root (the shared check and barrier trees,
+        // under the state directory) runs here too, as on a host with no
+        // manager (wsp-361): the manager's jobs stay under its root, and a
+        // run it cannot take is not refused for that.
+        if wsp_trees::job_place::outside_tree_root(tree) {
             return Ok(Runner::Inproc);
         }
         let place = place_of(whose, kind, tree)?;
@@ -3661,10 +3669,11 @@ mod tests {
 
     /// Under the default `WSP_JOBS` (`manager`), a host with no manager
     /// record runs here whatever the tree root is, and places nothing; once
-    /// this host has a manager, a tree outside the root is refused before
-    /// the manager is dialled (wsp-346).
+    /// this host has a manager, a tree outside the root runs here too, before
+    /// the manager is dialled (wsp-346, wsp-361), and only a tree under the
+    /// root goes to the manager.
     #[test]
-    fn a_host_with_no_manager_stays_in_process_and_one_with_a_manager_refuses_a_tree_outside_the_root() {
+    fn a_host_with_no_manager_stays_in_process_and_one_with_a_manager_runs_a_tree_outside_the_root_here() {
         let env = util::isolated("check-chosen-unmanaged");
         let store = Store::open();
         let root = env.path("root");
@@ -3682,9 +3691,12 @@ mod tests {
         crate::manager::write_record(&store.state, &local, "token").unwrap();
         assert!(matches!(chosen(&tree), Ok(Runner::Inproc)), "the in-process host's record names no manager here");
         std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
-        let refused = chosen(&tree).err().expect("a manager here refuses a tree outside its root");
+        let outside = chosen(&tree);
+        let under = chosen(&root.join("m-1"));
         std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
-        assert!(refused.contains("not under the tree root"), "{refused}");
+        assert!(matches!(outside, Ok(Runner::Inproc)), "a manager here leaves a tree outside its root in-process");
+        assert!(!tree.exists(), "and places nothing");
+        assert!(!matches!(under, Ok(Runner::Inproc)), "a tree under the root is the manager's");
         wsp_trees::job_place::set_tree_root(None);
     }
 
@@ -4902,6 +4914,32 @@ mod tests {
         assert!(tree.join("check.sh").exists(), "the warm tree is under the state directory");
         assert_eq!(git(&tree, &["rev-parse", "HEAD"]).unwrap().trim(), sha);
         assert_eq!(t.status(), Status::Review, "a pass moves nobody");
+    }
+
+    /// `wsp check <id>` under `WSP_JOBS=manager`, on a host whose manager the
+    /// install gave a tree root the state directory is not under (wsp-361):
+    /// the shared check tree is outside it, and the check runs in this
+    /// process rather than "not run".
+    #[test]
+    fn the_verb_under_a_manager_runs_in_the_shared_check_tree_outside_the_installed_root() {
+        let (env, store, _) = world("outside-root", "- script: sh check.sh", "exit 0\n");
+        let root = env.path("root");
+        std::fs::create_dir_all(&root).unwrap();
+        wsp_wire::manager::write_jobs(&store.state, &wsp_wire::manager::Jobs { build: 2, check: 4, tree_root: root.clone() }).unwrap();
+        wsp_trees::job_place::set_tree_root(None);
+        assert_eq!(wsp_trees::job_place::tree_root(), root, "the installed root");
+        let local = crate::manager::Local::new(&env.path("exec"), 1);
+        crate::manager::write_record(&store.state, &local, "token").unwrap();
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+        let code = check(&store, &Args::synth("check", &["pj-001"], &[]));
+        std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(code, 0, "{}", t.body);
+        let runs = v::runs(&t);
+        assert_eq!(runs.len(), 1, "{}", t.body);
+        assert_eq!(runs[0].state, RunState::Passed, "{}", runs[0].text);
+        let tree = env.state().join("checks/pj-repo/tree");
+        assert!(tree.join("check.sh").exists() && !tree.starts_with(&root), "the shared check tree, outside the root");
     }
 
     #[test]
