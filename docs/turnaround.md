@@ -226,3 +226,107 @@ Ed's figures (hand-off §2, his store, his Mac) set against omarchy's:
 | share of wsp rows sent back at least once | 42 % | 47 % |
 
 The Mac was thermally limited to 40 % of its clock for long stretches, and its load reached about 800. Omarchy's clock was not limited, and its load stayed under 5 at the p75. So the crate split's case cannot rest on omarchy's build and test time: here that is about 2 of a row's 9.5 minutes. Measure (b), the inner loop, should time the split's gain on this machine before phase 2 is planned.
+
+## The inner loop
+
+Measured 2026-11-24 by wsp-430, in the row's own tree (`/mnt/data/src/private/wsp/.worktrees/wsp-430`, `target/`
+in the tree), at wsp d70a4fa, on the person's machine (omarchy): i9-14900KF, 32 threads, 64 GB, NVMe. No sccache
+on it (`.cargo/rustc-wrap` runs bare rustc), `lld` is installed but no linker override is set in `.cargo/config.toml` or `~/.cargo/config.toml`, so the link
+is the toolchain's default. rustc 1.98.1, the `dev`/`test` profile (opt-level 0, debuginfo, **incremental on**, 16 codegen
+units).
+
+**Load.** `load1` is `/proc/loadavg` read just before each run; every figure below was started at load1 below 4
+(0.3 to 3.4; the row's own previous build is part of it). A first attempt at the cold build
+was started at 5.18 and refused by the cargo shim anyway; the run reported is the second, at 3.41.
+
+**Clock.** Governor `powersave` under `intel_pstate` (active), energy preference `performance`, `scaling_max_freq`
+5.7 GHz = `cpuinfo_max_freq`: the clock was **not limited by policy**. The mean of the 32 threads' MHz read at
+each start was 1.8 to 4.4 GHz (most threads idle, so it says little). The package sensor read 99 to 100 °C (high
+80, crit 100) at the start of the step 1 runs 4 and 5 and 53 to 85 °C elsewhere; the figures of those two runs
+(4.48, 4.37 s) equal the cool ones (4.47), so a thermal limit did not show, but the throttle counters in
+`/sys/devices/system/cpu/*/thermal_throttle` were not read before and after each run, so it is not excluded.
+
+**Method.** "Warm" is a build of the same command just before, then one line edited, then the command. The edit
+is a constant no test reads: `WAKE_CAP_SECS` in `src/cycle.rs` (`10 * 60` to `10 * 6N`, a different N each run),
+and the message string `"not packing: a commit is in flight there"` in `crates/trees/src/gc.rs` (a digit added,
+a different one each run). Build and test run are timed apart with `cargo test … --no-run`, then the same
+command without it. The three runs of a figure are in the order run.
+
+| Step | Command | Run 1 | Run 2 | Run 3 | Load1 at start (1, 2, 3) |
+|---|---|---|---|---|---|
+| 1a. edit `src/cycle.rs`, build | `cargo test --bin wsp cycle:: --no-run` | 4.48 s | 4.37 s | 4.47 s | 2.33, 2.65, 2.50 |
+| 1b. then the test run (build is a no-op) | `cargo test --bin wsp cycle::` | 12.20 s | 12.08 s | 12.07 s | 2.46, 2.60, 2.46 |
+| 2a. edit `crates/trees/src/gc.rs`, build | `cargo test -p wsp-trees --lib gc:: --no-run` | 0.76 s | 0.67 s | 0.68 s | 2.23, 2.13, 2.13 |
+| 2b. then the test run (4 tests) | `cargo test -p wsp-trees --lib gc::` | 0.67 s | 0.67 s | 0.66 s | 2.23, 2.13, 2.13 |
+| 3a. bin test-binary build after the step 1 edit | `cargo test --bin wsp --no-run --timings` | 4.66 s (cargo: wsp unit 4.17 s) | 4.37 s (4.14 s) | 4.47 s (4.19 s) | 1.82, 1.83, 1.77 |
+| 3b. the same, rustc's own passes (`RUSTC_BOOTSTRAP=1`) | `cargo rustc --profile test --bin wsp -- -Z time-passes` | 4.65 s wall, rustc total 4.40 | 4.56 s, 4.31 | 4.57 s, 4.29 | 2.11, 2.10, 2.09 |
+| 3c. of which front end | parse, expand, resolve, type check, borrow check, checks | 1.58 s | 1.56 s | 1.56 s | |
+| 3d. of which codegen | mono collection, CGU partition, LLVM IR 0.74 / 0.73 / 0.76, LLVM passes 0.19 | 0.93 s | 0.92 s | 0.95 s | |
+| 3e. of which incremental state written | `serialize_dep_graph` | 0.60 s | 0.64 s | 0.59 s | |
+| 3f. of which link | `link_binary`, one `ld` | 0.49 s | 0.49 s | 0.50 s | |
+| 3g. of which rustc start-up, metadata, dep-graph load | rest of the total | 0.81 s | 0.69 s | 0.69 s | |
+| 4. `wsp check --affected --run` after the step 1 edit | one step, `crate:wsp`: `cargo test -p wsp`, build included | 241.17 s | 242.53 s | 245.05 s | 1.94, 0.88, 0.27 |
+| 5. the full suite | `cargo test --workspace` (the plan names no other steps), build after one edit included | 332.58 s, all passed | 333.27 s, all passed | 328.56 s, one test failed (`--no-fail-fast`) | 1.14, 1.20, 1.79 |
+
+Once:
+
+| | Figure | Load1 |
+|---|---|---|
+| Cold `cargo test --workspace --no-run` (no `target/`, 75 crates compiled) | 61.93 s, one run | 3.41 |
+| Tests the cuts must keep: `cargo test --workspace -- --list \| grep -c ': test'` | **4102** (0 benchmarks) | |
+
+### What it says
+
+- **One edit in the bin crate costs 4.4 s of build and 12 s of tests** (`cycle::`); an edit in `wsp-trees` costs
+  0.7 s of build and 0.7 s of its test. The bin crate costs about six times a small crate for a one-line edit.
+- **The split of the 4.4 s (step 3).** The front end is 1.6 s, 36 %. Codegen (mono collection, partition, IR and
+  LLVM) is 0.9 s, 21 %, small because incremental reuse leaves most CGUs alone. Writing the incremental state is
+  0.6 s, 14 %, and the link 0.5 s, 11 %. What is left, 0.7 to 0.8 s, 17 %, is start-up, loading the crate
+  metadata and the previous dep graph. The macro expansion alone is 0.68 s of the front end.
+  `cargo --timings` gave one duration for the `wsp` unit (4.14 to 4.19 s) and no front-end or codegen sections,
+  so the split is rustc's `-Z time-passes`. It needs a nightly flag: `RUSTC_BOOTSTRAP=1` on 1.98.1 gives it
+  without a nightly toolchain, and the build is not the one the checks run (the `cargo rustc` flags differ), but
+  its total (4.29 to 4.40 s) is within 0.3 s of step 3a.
+- **`wsp check --affected --run` after an edit in `src/cycle.rs` runs one step, `cargo test -p wsp`: 242 s.**
+  That is the whole root package (the bin's 2,831 unit tests, 142 s, and the root `tests/*.rs` binaries), not
+  `cycle::`. The edit reaches only crate `wsp`, so the affected set is already the narrowest crate-level one.
+  The row has no narrower step, so the check cannot do better than the crate until it can run a module.
+- **The full suite is 330 s, of which 142 s (43 %) is the bin crate's unit-test binary** (2,831 tests, one binary).
+  The binaries run one after the other: the sum of their `finished in` is 327 s of the 333 s wall; the build
+  after one edit is about 5 s. The slowest ten (run 1; the other runs are within 5 s of each):
+
+| Test binary | Seconds (run 1) |
+|---|---|
+| `wsp` unit tests (`src/main.rs`) | 142.33 |
+| `server` (`crates/server/tests/server.rs`) | 41.17 |
+| `wip_api` | 25.15 |
+| `standalone` | 20.28 |
+| `wsp_trees` unit tests | 17.26 |
+| `mirror` | 12.28 |
+| `hub_sync` | 10.92 |
+| `hub_cache` | 7.27 |
+| `cc_wrap` | 7.03 |
+| `privacy` | 6.46 |
+
+### Things the figures hide
+
+- **The first run of a command after a different command is not warm.** The first pass of steps 1 and 2 (which
+  was discarded and redone with a warm-up) read 34.80 s for the first `cargo test --bin wsp … --no-run` after the
+  cold `--workspace` build, then 4.57 and 4.38 s: cargo unifies features per command, so `--bin wsp` rebuilt
+  `wsp-api`, `wsp-server`, `wsp-client` and `wsp-hub`. The same showed in step 2 (2.78 s, then 0.68 and 0.68 s).
+  A seat that alternates `-p` and `--workspace` pays that each time.
+- **Incremental compilation is on.** These are loop figures. A barrier's tree is warm and moved in place, so it
+  is incremental too; a fresh checkout is the 62 s cold figure, not the 4.4 s one. A non-incremental build of the
+  bin crate alone was not measured.
+- **The suite has flakes at load below 2.** Two of five full runs stopped at the first red test binary (a plain
+  `cargo test --workspace` stops there): after 145.74 s on
+  `cmd_initiative::tests::plan_assembles_the_order_from_the_doc_and_a_dry_run_seats_nothing` (its two plans differ
+  only in a `/tmp/wsp-t-…-<pid>` path from another test's directory) and after 163.06 s on
+  `hub_cache::doctor_on_a_logged_in_spoke_names_the_hub_the_user_the_last_sync_and_the_journal`. Those two runs
+  are not in the table (they did not finish); both started at load1 1.31 and 0.94. The third red run in the table
+  failed `mirror::tests::a_pass_where_only_machines_json_moved_reads_the_machines_alone` and finished because it
+  ran with `--no-fail-fast`. So the count of tests the cuts must keep is of tests listed, not of tests that pass
+  every time. Each of the three passed when run alone afterwards; they are named here for whoever owns them, not
+  fixed in this row.
+- **`WSP_FULL_SUITE`.** The shim refuses `cargo test --workspace` in a seat without a reason; every run above
+  was made with the reason "wsp-430: turnaround measure (b) …", as the packet orders.
