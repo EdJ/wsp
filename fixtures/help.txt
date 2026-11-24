@@ -420,6 +420,9 @@ AGENTS
                                     kind is passed by --kind, for the backend
   wsp agent pi-extension            the pi extension this binary carries, which
                                     `wsp install` writes into pi's extensions
+  wsp agent seat-hook               the seat hook (claude-code/wsp-session.sh) this
+                                    binary carries, which `wsp install` writes to
+                                    ~/.claude/hooks for every seat's kill guard
   wsp wip                           everything in flight, with agents
   wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
                                     for a separate process polling on an
