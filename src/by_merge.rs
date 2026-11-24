@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use wsp_base::calls::Command;
 
@@ -23,6 +24,10 @@ const MERGED: &str = "· merged";
 
 /// How often a repository's remote is fetched.
 const FETCH_EVERY: i64 = 60;
+
+/// How long one fetch may take before it is killed: the daemon's pass over
+/// every project waits for it.
+const FETCH_LIMIT: Duration = Duration::from_secs(30);
 
 static FETCHED: Mutex<Option<HashMap<(PathBuf, String), i64>>> = Mutex::new(None);
 
@@ -174,16 +179,36 @@ fn fetch(repo: &Path, remote: &str, branch: &str) {
 
 /// [`fetch`] with no wait between two, and whether it reached the branch.
 fn fetch_now(repo: &Path, remote: &str, branch: &str) -> bool {
+    fetch_within(repo, remote, branch, FETCH_LIMIT)
+}
+
+/// [`fetch_now`], killed and reaped once `limit` has passed.
+fn fetch_within(repo: &Path, remote: &str, branch: &str, limit: Duration) -> bool {
     // No prompt: the daemon has nobody to answer one.
-    Command::new("git")
-        .arg("-C")
+    let mut git = Command::new("git");
+    git.arg("-C")
         .arg(repo)
         .args(["fetch", "--quiet", remote, &format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}")])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_INDEX_FILE")
         .stdin(Stdio::null())
-        .output()
-        .is_ok_and(|o| o.status.success())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // A group of its own, so the kill reaches git's ssh or remote helper.
+        .process_group(0);
+    let Ok(mut child) = git.spawn() else { return false };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            _ => break,
+        }
+    }
+    let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 fn run(repo: &Path, args: &[&str]) -> Option<String> {
@@ -459,6 +484,36 @@ mod tests {
             )),
             "{order}"
         );
+    }
+
+    #[test]
+    fn a_fetch_from_a_remote_that_never_answers_is_given_up() {
+        let f = fix("silent", true, &["work"], "m-1");
+        // Connections are queued and never accepted, so git waits for a reply.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("git://{}/origin.git", silent.local_addr().unwrap());
+        git(&f.repo, &["remote", "set-url", "origin", &url]);
+        let tracked = git(&f.repo, &["rev-parse", "origin/master"]);
+        let started = Instant::now();
+        assert!(!fetch_within(&f.repo, "origin", "master", Duration::from_secs(1)));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_secs(1) && took < Duration::from_secs(10), "{took:?}");
+        assert_eq!(git(&f.repo, &["rev-parse", "origin/master"]), tracked);
+    }
+
+    #[test]
+    fn a_local_trunk_with_its_own_commit_is_left_and_the_row_still_lands() {
+        let f = fix("diverged", true, &["work"], "m-1");
+        let sha = f.merge("m-1", false);
+        let local = commit(&f.repo, "only-here");
+        crate::cycle::tests::SAID.with(|s| s.borrow_mut().clear());
+        f.pass();
+        let log = f.log();
+        assert!(log.contains(&format!("{LANDED} {sha} on master · since ")), "{log}");
+        assert_eq!(crate::repair::ready(&f.store.find_task("m-1").unwrap()), None);
+        assert_eq!(git(&f.repo, &["rev-parse", "master"]).trim(), local);
+        let said = crate::cycle::tests::SAID.with(|s| s.borrow().join("\n"));
+        assert!(said.contains("was not fast-forwarded to origin/master"), "{said}");
     }
 
     #[test]
