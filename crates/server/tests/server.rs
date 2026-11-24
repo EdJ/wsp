@@ -513,6 +513,97 @@ impl wsp_server::Views for FakeViews {
     }
 }
 
+/// The first request's reply on a fresh connection, as the bytes on the wire.
+fn wip_line(dir: &Path) -> Vec<u8> {
+    let mut c = connect(dir);
+    let id = c.send(Call::Verb(Verb::Wip(NoArgs {})));
+    assert_eq!(id, ReqId(1));
+    c.conn.recv_line(WAIT).unwrap().expect("a reply")
+}
+
+/// The server caches `wip`'s cut by event head (wsp-373): while the head stays,
+/// every `wip` is the same bytes and the store is not cut again; once it moves,
+/// the next `wip` is a fresh cut at the new head.
+#[test]
+fn wip_is_cut_once_per_head_and_the_same_head_answers_the_same_bytes() {
+    let d = dir("wip-cache");
+    let store = mirror_store();
+    apply(&store, everything(), vec![], "all");
+    let kept = Arc::new(Retained { inner: store.handle(), oldest: EventId(0), cuts: AtomicUsize::new(0) });
+    let server = start(kept.clone(), &d, Duration::from_secs(10));
+    assert_eq!(kept.cuts.load(Ordering::SeqCst), 0, "nothing is cut before a wip");
+
+    let first = wip_line(&d);
+    let again = wip_line(&d);
+    assert_eq!(first, again, "the same head answers the same bytes");
+    assert_eq!(kept.cuts.load(Ordering::SeqCst), 1, "the second wip is answered from the cache");
+    let Ok(Frame::Reply(Reply { outcome: Outcome::Ok(Answer::Wip { state, at }), .. })) = serde_json::from_slice(&first) else {
+        panic!("not a wip reply: {}", String::from_utf8_lossy(&first))
+    };
+    assert_eq!((state, at), store.wip_snapshot().unwrap(), "the cached answer is the store's cut");
+
+    // A connection that stays open is answered from the same cache.
+    let mut c = connect(&d);
+    let Answer::Wip { at: on_c, .. } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    assert_eq!((on_c, kept.cuts.load(Ordering::SeqCst)), (at, 1));
+
+    // The head moves: the next wip cuts afresh and carries the new row.
+    apply(&store, vec![Entity::Row(row("wsp-77", "landed since"))], vec![], "more");
+    let head = store.head().unwrap();
+    assert!(head > at);
+    let Answer::Wip { state, at: moved } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    assert_eq!(kept.cuts.load(Ordering::SeqCst), 2, "a moved head is a fresh cut");
+    assert_eq!(moved, head);
+    assert!(state.rows.contains_key(&RowId("wsp-77".into())), "the fresh cut holds what landed");
+    assert_ne!(wip_line(&d), first);
+    assert_eq!(kept.cuts.load(Ordering::SeqCst), 2, "and is cached in its turn");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The cut comes off the request path (wsp-373): once a `wip` has been asked,
+/// the server cuts afresh when the head moves, with no request, so the next
+/// `wip` (the census's, just after a change) is answered from the cache. A
+/// server nobody asks `wip` of never cuts, however its head moves.
+#[test]
+fn a_moved_head_is_cut_before_the_next_wip_asks_once_one_has() {
+    let d = dir("wip-warm");
+    let store = mirror_store();
+    apply(&store, everything(), vec![], "all");
+    let kept = Arc::new(Retained { inner: store.handle(), oldest: EventId(0), cuts: AtomicUsize::new(0) });
+    let server = start(kept.clone(), &d, Duration::from_secs(10));
+    let cuts = || kept.cuts.load(Ordering::SeqCst);
+    // Unasked, a moving head is not followed by cuts.
+    apply(&store, vec![Entity::Row(row("wsp-70", "before any wip"))], vec![], "early");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(cuts(), 0, "nothing is cut before a wip is asked");
+
+    let first = wip_line(&d);
+    assert_eq!(cuts(), 1);
+    // The head moves: the server cuts on its own, without a wip asked.
+    apply(&store, vec![Entity::Row(row("wsp-78", "landed after the first wip"))], vec![], "more");
+    let head = store.head().unwrap();
+    let t = Instant::now();
+    while cuts() < 2 && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(cuts(), 2, "the moved head was cut with no wip asked");
+    // The next wip is that cut, at the new head, with no cut of its own.
+    let next = wip_line(&d);
+    assert_eq!(cuts(), 2, "the wip after the move is answered from the cache");
+    assert_ne!(next, first);
+    let Ok(Frame::Reply(Reply { outcome: Outcome::Ok(Answer::Wip { state, at }), .. })) = serde_json::from_slice(&next) else {
+        panic!("not a wip reply: {}", String::from_utf8_lossy(&next))
+    };
+    assert_eq!(at, head);
+    assert!(state.rows.contains_key(&RowId("wsp-78".into())), "the warmed cut holds what landed");
+    // A quiet head is not cut again.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(cuts(), 2, "a head that stays is not cut again");
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
 #[test]
 fn the_view_verbs_answer_what_the_views_hand_in_whole_and_are_unsupported_without_them() {
     let d = dir("views");
@@ -662,7 +753,7 @@ fn subscribe_from_before_retention_is_answered_too_old() {
     let d = dir("too-old");
     let store = mirror_store();
     rows(&store, 0, 6);
-    let kept = Retained { inner: store.handle(), oldest: EventId(3) };
+    let kept = Retained { inner: store.handle(), oldest: EventId(3), cuts: AtomicUsize::new(0) };
     let server = start(Arc::new(kept), &d, Duration::from_secs(2));
     let mut c = connect(&d);
     match c.call(Call::Verb(Verb::Subscribe(Subscribe { from: Some(EventId(1)) }))) {
@@ -844,9 +935,11 @@ fn the_mirrors_fold_equals_the_snapshot() {
 // ---------------------------------------------------------------- a store with retention
 
 /// `MemStore` with retention: `events_after` refuses `too_old` before `oldest`.
+/// It counts its `wip_snapshot` cuts, for the cache's test.
 struct Retained {
     inner: MemStore,
     oldest: EventId,
+    cuts: AtomicUsize,
 }
 
 impl Reads for Retained {
@@ -881,6 +974,7 @@ impl Reads for Retained {
         self.inner.snapshot()
     }
     fn wip_snapshot(&self) -> Result<(State, EventId)> {
+        self.cuts.fetch_add(1, Ordering::SeqCst);
         self.inner.wip_snapshot()
     }
 }

@@ -96,6 +96,11 @@ impl Tcp {
         self.write_bytes(line.as_bytes())
     }
 
+    /// A frame already serialised, newline ended, written as it is.
+    pub(crate) fn write_line(&mut self, line: &[u8]) -> Result<(), ConnError> {
+        self.write_bytes(line)
+    }
+
     /// All of `bytes`, on the socket or through the TLS session.
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
         let Some(tls) = &self.tls else { return self.stream.write_all(bytes).map_err(io) };

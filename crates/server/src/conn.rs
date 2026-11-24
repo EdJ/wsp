@@ -4,7 +4,8 @@
 //!
 //! - A read verb is one call on the store's `Reads` or `Events` (`lists`,
 //!   `asks`, `machines`, and `orders` of no seat, which `Reads` has no verb
-//!   for, read the one `snapshot`).
+//!   for, read the one `snapshot`). `wip` is answered from the server's cut
+//!   cached by event head (the `wip` module), cut again once the head moves.
 //! - `throttle`, `spend` and `show` are the CLI's documents, from the
 //!   [`crate::Views`] the server was started with (wsp-307), `unsupported`
 //!   without one.
@@ -62,6 +63,11 @@ pub(crate) type Writer = Arc<Mutex<Tcp>>;
 /// Send `frame` on `w`; `false` when the connection is gone.
 pub(crate) fn send(w: &Writer, frame: &Frame) -> bool {
     w.lock().unwrap_or_else(|e| e.into_inner()).send(frame).is_ok()
+}
+
+/// Write `line` (a whole frame, newline ended) on `w`; `false` when the connection is gone.
+fn send_bytes(w: &Writer, line: &[u8]) -> bool {
+    w.lock().unwrap_or_else(|e| e.into_inner()).write_line(line).is_ok()
 }
 
 /// Whether two tokens are equal, comparing every byte whatever the first
@@ -270,6 +276,11 @@ impl Client<'_> {
             Call::Verb(Verb::Subscribe(sub)) => return self.subscribe(id, sub),
             // Who this connection is: the principal it was welcomed as, which `read` does not hold (wsp-165).
             Call::Verb(Verb::Whoami(_)) => Ok(Answer::Whoami { by: self.by.clone(), server: self.shared.cfg.instance.clone() }),
+            // From the cut cached by head, spliced into the reply rather than serialised again (wsp-373).
+            Call::Verb(Verb::Wip(_)) => match self.shared.wip.answer(self.shared.store.as_ref()) {
+                Ok(ok) => return send_bytes(&self.writer, &crate::wip::line(id, &ok)),
+                Err(e) => Err(store_failure(e)),
+            },
             Call::Verb(verb) => read(self.shared, verb),
             Call::Command(cmd) => return self.command(id, req.key, cmd),
             // The sync verbs are the hub's (wsp-460): answered by what it handed in, else not this server's.
@@ -407,29 +418,13 @@ pub(crate) fn store_failure(e: Error) -> Failure {
     }
 }
 
-/// The `wip` cut, from the cache while the event head is where it was cut.
-fn wip_cut(shared: &Shared) -> Result<(wsp_store_contract::State, wsp_api::EventId), Error> {
-    let head = shared.store.head()?;
-    if let Ok(g) = shared.wip_cut.lock() {
-        if let Some((state, at)) = g.as_ref() {
-            if *at == head {
-                return Ok((state.clone(), *at));
-            }
-        }
-    }
-    let (state, at) = shared.store.wip_snapshot()?;
-    if let Ok(mut g) = shared.wip_cut.lock() {
-        *g = Some((state.clone(), at));
-    }
-    Ok((state, at))
-}
-
 /// One read verb, as one call on the store.
 fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
     let s = &shared.store;
     let r = match verb {
         Verb::State(_) => s.snapshot().map(|(state, at)| Answer::State { state, at }),
-        Verb::Wip(_) => wip_cut(shared).map(|(state, at)| Answer::Wip { state, at }),
+        // `answer` serves it from the cache; this uncached cut is for any other caller.
+        Verb::Wip(_) => s.wip_snapshot().map(|(state, at)| Answer::Wip { state, at }),
         Verb::Row { row } => s.row(&row).map(Answer::Row),
         Verb::Rows(filter) => s.rows(&filter).map(Answer::Rows),
         Verb::List { list } => s.list(&list).map(Answer::List),

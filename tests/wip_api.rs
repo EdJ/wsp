@@ -16,6 +16,9 @@
 //! 4. `WSP_READ=files` never dials: `api.json` names a listener that counts
 //!    what it accepts, and it accepts nothing.
 //!
+//! With `WSP_READ` unset, `wip` reads the API (wsp-373): the same bytes as
+//! `files`, no child, nothing said, and it dials the counting listener.
+//!
 //! `ls --json --all` is held to the same four (wsp-374), but it reads the
 //! API by default and `WSP_READ=files` forces the files.
 //!
@@ -169,11 +172,16 @@ impl Sandbox {
         wsp_store::store::Store::at(PathBuf::from(&self.env["WSP_HOME"]), self.state.clone())
     }
 
-    /// `wsp wip --json` under `WSP_READ=read`: its output, how long it took,
-    /// and the children its call line counted.
+    /// `wsp wip --json` under `WSP_READ=read` (unset where empty): its output,
+    /// how long it took, and the children its call line counted.
     fn wip(&self, read: &str) -> (Output, Duration, Value) {
+        let mut c = self.cmd(&["wip", "--json"]);
+        match read {
+            "" => c.env_remove("WSP_READ"),
+            r => c.env("WSP_READ", r),
+        };
         let start = Instant::now();
-        let out = self.cmd(&["wip", "--json"]).env("WSP_READ", read).output().expect("wsp runs");
+        let out = c.output().expect("wsp runs");
         let took = start.elapsed();
         assert!(out.status.success(), "wsp wip under {read}: {}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice::<Value>(&out.stdout)
@@ -574,6 +582,14 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     assert!(!agent["waiting"].is_null(), "the seat waits on its open ask: {agent}");
     assert!(json.to_string().contains("list-a"), "the running list is in wip: {json}");
 
+    // The default (wsp-373): with WSP_READ unset, wip reads the API, as under
+    // api: no child, nothing on stderr, and the same bytes as the files.
+    let (unset, _, children) = sb.wip("");
+    assert_eq!(ran(&children), Vec::<String>::new(), "wip with WSP_READ unset ran {children}");
+    assert!(unset.stderr.is_empty(), "wip with WSP_READ unset fell back: {}", String::from_utf8_lossy(&unset.stderr));
+    let (files, _, _) = sb.wip("files");
+    assert_eq!(masked(&unset), masked(&files), "wip --json with WSP_READ unset (left) and files (right)");
+
     // 3. With the daemon stopped: the files, within the dial's budget, said
     // once, and the same json.
     sb.stop_daemon();
@@ -608,13 +624,11 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     sb.wip("api");
     std::thread::sleep(Duration::from_millis(200));
     assert!(accepted.load(Ordering::SeqCst) > orders_dials, "the counting listener counted nothing under api");
-    // 5. WSP_READ unset is the API: the same listener counts a dial, and the
-    // output is what `WSP_READ=api` printed.
-    let before = accepted.load(Ordering::SeqCst);
-    let unset = sb.cmd(&["wip", "--json"]).env_remove("WSP_READ").output().expect("wsp runs");
-    assert!(unset.status.success(), "wsp wip with WSP_READ unset: {}", String::from_utf8_lossy(&unset.stderr));
+    // With WSP_READ unset it dials too: the API is the default.
+    let under_api = accepted.load(Ordering::SeqCst);
+    sb.wip("");
     std::thread::sleep(Duration::from_millis(200));
-    assert!(accepted.load(Ordering::SeqCst) > before, "WSP_READ unset did not dial the API");
+    assert!(accepted.load(Ordering::SeqCst) > under_api, "wip with WSP_READ unset did not dial the API");
 }
 
 // ------------------------------------------------ ls --json --all (wsp-374)
