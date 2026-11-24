@@ -16,6 +16,9 @@
 //! 4. `WSP_READ=files` never dials: `api.json` names a listener that counts
 //!    what it accepts, and it accepts nothing.
 //!
+//! `ls --json --all` is held to the same four (wsp-374), but it reads the
+//! API by default and `WSP_READ=files` forces the files.
+//!
 //! 1 and 2 run twice, with the throttle `on` and on its default `auto`, and a
 //! live build holder in a slot (what every shimmed cargo build leaves): the
 //! throttle line names the build on both paths, and under `auto` says in force
@@ -607,6 +610,125 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     assert!(accepted.load(Ordering::SeqCst) > orders_dials, "the counting listener counted nothing under api");
 }
 
+// ------------------------------------------------ ls --json --all (wsp-374)
+
+/// `wsp ls --json --all` under `WSP_READ=read` (unset where empty): its
+/// output and how long it took.
+fn ls_all(sb: &Sandbox, read: &str) -> (Output, Duration) {
+    let mut c = sb.cmd(&["ls", "--json", "--all"]);
+    match read {
+        "" => c.env_remove("WSP_READ"),
+        r => c.env("WSP_READ", r),
+    };
+    let start = Instant::now();
+    let out = c.output().expect("wsp runs");
+    let took = start.elapsed();
+    assert!(out.status.success(), "wsp ls --json --all under {read:?}: {}", String::from_utf8_lossy(&out.stderr));
+    (out, took)
+}
+
+/// The children `ls`'s last call line counted.
+fn children_of_last_ls(sb: &Sandbox) -> Value {
+    let calls = |f: &str| std::fs::read_to_string(sb.state.join(f)).unwrap_or_default();
+    calls("polls.jsonl")
+        .lines()
+        .chain(calls("calls.jsonl").lines())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|l| l["verb"] == "ls")
+        .last()
+        .map(|l| l["children"].clone())
+        .expect("ls's call line")
+}
+
+/// A listener that accepts and then says nothing, holding each connection
+/// until the test ends: a silent dial.
+fn silent_listener() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in l.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+/// `ls --json --all` reads the daemon's API by default (wsp-374): the rows'
+/// heads and the `tasks` reading, the same bytes as `WSP_READ=files` once the
+/// reading has caught up with the files, with no child started and nothing
+/// said; with the daemon stopped, or its address silent, it prints the files'
+/// bytes within the dial's 200 ms and says why once; and `WSP_READ=files`
+/// never dials.
+#[test]
+fn ls_json_all_reads_the_same_through_the_api_and_the_files() {
+    let mut seed = seeded("ls");
+    let sb = &mut seed.sb;
+
+    // 1 and 2: the same bytes, no child, no fallback. The reading is taken
+    // again every 30 s, so until it has, the API path may fall back and say so.
+    let deadline = Instant::now() + Duration::from_secs(70);
+    let (api, files) = loop {
+        let (api, _) = ls_all(sb, "");
+        let children = children_of_last_ls(sb);
+        let (files, _) = ls_all(sb, "files");
+        let same = api.stdout == files.stdout && api.stderr.is_empty();
+        if same {
+            assert_eq!(ran(&children), Vec::<String>::new(), "ls --json --all through the API ran {children}");
+        }
+        if same || Instant::now() > deadline {
+            break (api, files);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(api.stderr.is_empty(), "ls --json --all never read the API: {}", String::from_utf8_lossy(&api.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&api.stdout),
+        String::from_utf8_lossy(&files.stdout),
+        "ls --json --all through the API (left) and off the files (right)"
+    );
+    let rows: Value = serde_json::from_slice(&api.stdout).unwrap();
+    assert_eq!(rows.as_array().map(Vec::len), Some(7), "every seeded row: {rows}");
+    assert!(rows.as_array().unwrap().iter().any(|r| r["legs"].as_array().is_some_and(|l| l.len() == 2)), "a row with legs: {rows}");
+
+    // A filtered ls reads the files, and says nothing of it.
+    let doing = sb.cmd(&["ls", "--json", "--all", "-s", "doing"]).env_remove("WSP_READ").output().unwrap();
+    assert!(doing.status.success() && doing.stderr.is_empty(), "ls -s doing: {}", String::from_utf8_lossy(&doing.stderr));
+
+    // 3. With the daemon stopped (its api.json left behind): the files, said
+    // once, within the dial's budget of what the files take.
+    sb.stop_daemon();
+    let (files, files_took) = ls_all(sb, "files");
+    let fell_back = |sb: &Sandbox, what: &str| {
+        let (fell, took) = ls_all(sb, "");
+        let said = String::from_utf8_lossy(&fell.stderr);
+        assert_eq!(said.matches("wsp: ls reads the files").count(), 1, "{what}: the fallback is said once: {said}");
+        assert_eq!(said.lines().count(), 1, "{what}: one line on stderr: {said}");
+        assert_eq!(fell.stdout, files.stdout, "{what}: the fallback prints the files' bytes");
+        assert!(
+            took < files_took + Duration::from_millis(200) + Duration::from_millis(300),
+            "{what}: the fallback took {took:?} against the files' {files_took:?}"
+        );
+    };
+    fell_back(sb, "a failed dial");
+
+    // A silent one: an address that accepts and never welcomes.
+    std::fs::write(sb.state.join("api.json"), serde_json::json!({ "addrs": [silent_listener()] }).to_string()).unwrap();
+    fell_back(sb, "a silent dial");
+
+    // 4. WSP_READ=files never dials.
+    let (addr, accepted) = counting_listener();
+    std::fs::write(sb.state.join("api.json"), serde_json::json!({ "addrs": [addr] }).to_string()).unwrap();
+    let (forced, _) = ls_all(sb, "files");
+    assert!(forced.stderr.is_empty(), "ls under files said: {}", String::from_utf8_lossy(&forced.stderr));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(accepted.load(Ordering::SeqCst), 0, "WSP_READ=files dialled");
+    // And the listener counts: unset, the same call dials it.
+    ls_all(sb, "");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(accepted.load(Ordering::SeqCst) > 0, "the counting listener counted nothing with WSP_READ unset");
+}
+
 // ------------------------------------------------- the census reads (wsp-743)
 //
 // web-chrome's census reads tasks, flags, agents, worklists, machines,
@@ -618,9 +740,10 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
 // minute is up, and then compares. Moments the CLI reads live at its call
 // (load, idle time, memory, clocks) are masked, as in `masked` above.
 
-/// The CLI's `--json` for `args`, parsed.
+/// The CLI's `--json` for `args`, parsed, off the files (`ls --json --all`
+/// reads the API by default since wsp-374, and these compare against the files).
 fn cli_json(sb: &Sandbox, args: &[&str]) -> Value {
-    let out = sb.cmd(args).output().expect("wsp runs");
+    let out = sb.cmd(args).env("WSP_READ", "files").output().expect("wsp runs");
     assert!(out.status.success(), "wsp {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("wsp {args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)))
 }
@@ -669,7 +792,8 @@ fn moments_masked(mut value: Value, keys: &[&str]) -> Value {
 }
 
 /// tasks: `rows {heads: true}` and the `tasks` reading, drawn by
-/// `task::ls_json_row` in the reading's order, are `ls --json --all`.
+/// `task::ls_of_reading` (`task::ls_json_row` in the reading's order), are
+/// `ls --json --all`.
 #[test]
 fn the_census_tasks_through_the_api_are_ls_json_all() {
     let mut seed = seeded("tasks");
@@ -680,13 +804,8 @@ fn the_census_tasks_through_the_api_are_ls_json_all() {
         || {
             let heads = client.rows(RowFilter { heads: true, ..Default::default() }).expect("rows answers");
             let t: reading::Tasks = reading_of!(client, reading::TASKS)?;
-            let by: BTreeMap<String, _> = heads.iter().map(|r| (r.id.0.clone(), r)).collect();
             heads_seen = heads.clone();
-            let rows = t.order.iter().map(|id| {
-                let record = wsp_view::common::task_json(by.get(id)?);
-                Some(wsp_view::task::ls_json_row(record, t.stages.get(id), t.legs.get(id).map(Vec::as_slice)))
-            });
-            Some(Value::Array(rows.collect::<Option<Vec<_>>>()?))
+            serde_json::from_str::<Value>(&wsp_view::task::ls_of_reading(&heads, &t)?).ok()
         },
         || cli_json(sb, &["ls", "--json", "--all"]),
     );

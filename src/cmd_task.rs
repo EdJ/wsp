@@ -308,6 +308,10 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     };
 
     if args.json() {
+        if let Some(out) = ls_all_api(store, args) {
+            println!("{out}");
+            return 0;
+        }
         let tasks = filtered(store, args, &index, scope.clone());
         println!("{}", rows_json(store, &tasks));
         return 0;
@@ -3697,6 +3701,44 @@ pub(crate) fn rows_json(store: &Store, tasks: &[Task]) -> String {
     let picked: Vec<&wsp_store_contract::Row> =
         tasks.iter().filter_map(|t| state.rows.get(&wsp_store_contract::RowId(t.id.clone()))).collect();
     wsp_view::task::ls_rows(&state, &picked, util::epoch_secs())
+}
+
+/// How long `ls --json --all` waits for the API's hello before it reads the
+/// files, as `wip` does (`docs/state-core.md` 4.6 (c)).
+const LS_DIAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long each of its two reads may take once the API has answered: a full
+/// store's heads are about 3 MB.
+const LS_READ: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `ls --json --all` off the API (wsp-374): the rows' heads and the daemon's
+/// `tasks` reading, drawn by `wsp_view::task::ls_of_reading`, with no task file
+/// opened and no child started. `None` reads the files: under `WSP_READ=files`;
+/// for any other `ls` (a project, `-s` or `-t`, or open rows alone); where no
+/// daemon has written an `api.json` (said nothing, as that is the files' own
+/// case); and, said once on stderr, where the dial is silent or fails within
+/// [`LS_DIAL`], a read fails, the daemon has no `tasks` reading yet, or the
+/// reading does not tell of the rows the heads do.
+fn ls_all_api(store: &Store, args: &Args) -> Option<String> {
+    let filtered = ["project", "status", "tag"].iter().any(|k| args.has(k));
+    if !args.has("all") || filtered || std::env::var("WSP_READ").is_ok_and(|v| v.trim() == "files") {
+        return None;
+    }
+    if !store.state.join(wsp_api::LISTEN_FILE).exists() {
+        return None;
+    }
+    let read = || -> Result<String, String> {
+        let by = wsp_store_contract::Principal::Wsp("ls".into());
+        let mut c = wsp_client::Client::dial(&store.state, by, LS_DIAL).map_err(|e| e.to_string())?;
+        c.set_timeout(LS_READ);
+        let heads = c.rows(wsp_store_contract::RowFilter { heads: true, ..Default::default() }).map_err(|e| format!("`rows`: {e}"))?;
+        let readings = c.readings(&[wsp_view::reading::TASKS]).map_err(|e| format!("`readings`: {e}"))?;
+        let reading = readings.get(wsp_view::reading::TASKS).ok_or("the daemon has no `tasks` reading yet")?;
+        let tasks: wsp_view::reading::Tasks =
+            wsp_view::reading::of(&reading.json).ok_or("the `tasks` reading does not read as its shape")?;
+        wsp_view::task::ls_of_reading(&heads, &tasks).ok_or_else(|| "the `tasks` reading trails the rows".to_string())
+    };
+    read().map_err(|why| eprintln!("wsp: ls reads the files: {why}")).ok()
 }
 
 /// What `ls --json` prints of `tasks` beside each record, as `wsp-view` takes

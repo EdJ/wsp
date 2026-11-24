@@ -329,13 +329,40 @@ pub fn ls_rows(state: &State, picked: &[&Row], _now: i64) -> String {
 /// (`Status::rank`), then priority, then id.
 pub fn ls_all(state: &State, now: i64) -> String {
     let mut rows: Vec<&Row> = state.rows.values().collect();
+    ls_order(&mut rows);
+    ls_rows(state, &rows, now)
+}
+
+/// `ls`'s order: status (`Status::rank`), then priority, then id.
+fn ls_order(rows: &mut [&Row]) {
     rows.sort_by(|a, b| {
         status_rank(status(a))
             .cmp(&status_rank(status(b)))
             .then(priority_rank(priority(a)).cmp(&priority_rank(priority(b))))
             .then(a.id.0.cmp(&b.id.0))
     });
-    ls_rows(state, &rows, now)
+}
+
+/// `ls --all --json` off the API (wsp-374): the rows' heads (`rows {heads:
+/// true}`) and the `tasks` reading beside them, each row
+/// [`ls_json_row`] of its head's record, its stage and its legs, in the
+/// reading's order, pretty — the bytes `ls --all --json` prints off the files.
+///
+/// `None` where the two do not tell of the same rows: the reading's `order`
+/// is not exactly the heads' ids in `ls`'s order (a row added, filed away or
+/// moved since the reading was taken, which trails the rows by its period), so
+/// the caller reads the files rather than print a list that is not theirs.
+pub fn ls_of_reading(heads: &[Row], reading: &crate::reading::Tasks) -> Option<String> {
+    let mut rows: Vec<&Row> = heads.iter().collect();
+    ls_order(&mut rows);
+    if rows.len() != reading.order.len() || rows.iter().zip(&reading.order).any(|(r, id)| r.id.0 != *id) {
+        return None;
+    }
+    let drawn: Vec<Value> = rows
+        .iter()
+        .map(|r| ls_json_row(task_json(r), reading.stages.get(&r.id.0), reading.legs.get(&r.id.0).map(Vec::as_slice)))
+        .collect();
+    Some(ls(&drawn))
 }
 
 /// What `show --json` adds to the record, all of it read by the caller.
@@ -378,4 +405,40 @@ pub fn show_json(row: &Row, s: &Show) -> Value {
     v["stage"] = json!(s.stage.as_ref().map(stage_json));
     v["stages"] = json!(s.stage.as_ref().map(|g| g.steps.iter().map(Step::json).collect::<Vec<_>>()));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use wsp_store_contract::{ProjectId, RowId, RowState};
+
+    fn head(id: &str, status: &str) -> Row {
+        Row {
+            workspace: Default::default(),
+            id: RowId(id.into()),
+            project: ProjectId("p".into()),
+            title: format!("row {id}"),
+            state: RowState::Todo,
+            before_block: None,
+            seat: None,
+            group: None,
+            commit: None,
+            fields: BTreeMap::from([(key::STATUS.to_string(), status.to_string())]),
+        }
+    }
+
+    /// The reading's order is the heads' in `ls`'s order, or nothing is drawn:
+    /// a reading taken before a row was added, filed or moved is not printed.
+    #[test]
+    fn a_reading_that_trails_the_heads_draws_nothing() {
+        let heads = [head("p-2", "todo"), head("p-1", "doing")];
+        let reading = |order: &[&str]| crate::reading::Tasks { order: order.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        let drawn = ls_of_reading(&heads, &reading(&["p-1", "p-2"])).expect("the reading tells of the heads");
+        let ids: Vec<Value> = serde_json::from_str::<Vec<Value>>(&drawn).unwrap().into_iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(ids, [json!("p-1"), json!("p-2")], "doing before todo");
+        assert_eq!(ls_of_reading(&heads, &reading(&["p-2", "p-1"])), None, "a row moved since");
+        assert_eq!(ls_of_reading(&heads, &reading(&["p-1"])), None, "a row added since");
+        assert_eq!(ls_of_reading(&heads, &reading(&["p-1", "p-2", "p-3"])), None, "a row filed away since");
+    }
 }

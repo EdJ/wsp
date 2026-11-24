@@ -104,8 +104,9 @@ mod tests {
     use wsp_view::{flag, machine, spend, throttle, wip, worklist};
 
     /// The `tasks` reading beside the mirror's rows cut to heads (what `rows {heads: true}`
-    /// serves) gives `ls --json --all` row for row: each is `ls_json_row` of the head's
-    /// record, its stage and its legs, in the reading's order.
+    /// serves) gives `ls --json --all` row for row: `ls_of_reading`, each `ls_json_row` of
+    /// the head's record, its stage and its legs, in the reading's order (wsp-374: what
+    /// `ls --json --all` prints off the API).
     #[test]
     fn the_tasks_reading_and_the_heads_give_ls_json_all() {
         let store = crate::testkit::store("readings-tasks");
@@ -125,25 +126,18 @@ mod tests {
 
         let reading: r::Tasks = r::of(&take(&store, r::TASKS).unwrap()).expect("the reading decodes as its shape");
         let tasks = store.tasks();
-        let heads: std::collections::BTreeMap<String, wsp_store_contract::Row> =
+        let heads: Vec<wsp_store_contract::Row> =
             crate::mirror::rows(&tasks, &store.claims(), &store.worklists(), &crate::mirror::texts_of(&store, &tasks), &Default::default())
                 .into_iter()
                 .filter_map(|e| match e {
                     wsp_store_contract::Entity::Row(mut row) => {
                         wsp_store_contract::heads_only(&mut row.fields);
-                        Some((row.id.0.clone(), row))
+                        Some(row)
                     }
                     _ => None,
                 })
                 .collect();
-        let drawn: Vec<Value> = reading
-            .order
-            .iter()
-            .map(|id| {
-                let record = wsp_view::common::task_json(&heads[id]);
-                wsp_view::task::ls_json_row(record, reading.stages.get(id), reading.legs.get(id).map(Vec::as_slice))
-            })
-            .collect();
+        let drawn: Vec<Value> = serde_json::from_str(&wsp_view::task::ls_of_reading(&heads, &reading).expect("the reading tells of the heads' rows")).unwrap();
 
         let cli: Vec<Value> = serde_json::from_str(&crate::cmd_task::rows_json(&store, &crate::cmd_task::ls_all(&store))).unwrap();
         assert_eq!(reading.order, ["s-2", "s-3", "s-1"], "ls's order: doing, then todo, then done");
