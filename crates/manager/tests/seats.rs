@@ -553,13 +553,16 @@ fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-/// The manager as its own process, so it can be killed with SIGKILL.
+/// The manager as its own process, so it can be killed with SIGKILL. Its
+/// handshake is the test's WAIT, as [`start`]'s is: a slow fake under load is
+/// waited on, not refused at the manager's 5 s.
 fn run_manager(dir: &Path, sup: &Path, port: u16) -> Child {
     Command::new(env!("CARGO_BIN_EXE_wsp-manager"))
         .arg("--exec-dir")
         .arg(dir)
         .args(["--host", "test-host", "--port", &port.to_string(), "--no-tailnet", "--compound-sup"])
         .arg(sup)
+        .args(["--handshake-secs", &WAIT.as_secs().to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

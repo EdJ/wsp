@@ -6,6 +6,7 @@
 //!             [--tailnet ADDR]... [--no-tailnet] [--volume PATH]...
 //!             [--compound-sup PATH] [--seats N] [--inproc-run DIR]...
 //!             [--build N] [--check N] [--tree-root DIR]
+//!             [--handshake-secs N]
 //! ```
 //!
 //! It binds loopback and this host's tailnet addresses (from `tailscale ip`,
@@ -19,6 +20,11 @@
 //! `--build` and `--check` are its job capacity per class, a hard cap that
 //! `hello` reports (2 and 4 unless told). `--tree-root` is the directory a
 //! job's `dir` is relative to (the home directory unless told).
+//!
+//! `--handshake-secs` is how long a spawn waits for compound-sup's handshake
+//! before it answers `seat.refused` (5 unless told). A test that runs the
+//! binary passes its own wait, so the manager never refuses before the test
+//! has stopped listening (wsp-371).
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -26,7 +32,7 @@ use std::process::ExitCode;
 
 use wsp_manager::{tailnet_addrs, Config, Manager, DEFAULT_PORT};
 
-const USAGE: &str = "usage: wsp-manager [--exec-dir DIR] [--host ID] [--port N] [--tailnet ADDR]... [--no-tailnet] [--volume PATH]... [--compound-sup PATH] [--seats N] [--inproc-run DIR]... [--build N] [--check N] [--tree-root DIR]";
+const USAGE: &str = "usage: wsp-manager [--exec-dir DIR] [--host ID] [--port N] [--tailnet ADDR]... [--no-tailnet] [--volume PATH]... [--compound-sup PATH] [--seats N] [--inproc-run DIR]... [--build N] [--check N] [--tree-root DIR] [--handshake-secs N]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -64,6 +70,7 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     let mut seats = None;
     let mut inproc_runs = Vec::new();
     let (mut build, mut check, mut tree_root) = (None, None, None);
+    let mut handshake = None;
     let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -80,6 +87,9 @@ fn run(argv: Vec<String>) -> Result<(), String> {
             "--build" => build = Some(value()?.parse().map_err(|e| format!("--build: {e}"))?),
             "--check" => check = Some(value()?.parse().map_err(|e| format!("--check: {e}"))?),
             "--tree-root" => tree_root = Some(wsp_base::util::expand(&value()?)),
+            "--handshake-secs" => {
+                handshake = Some(value()?.parse::<u64>().map_err(|e| format!("--handshake-secs: {e}"))?)
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -103,6 +113,9 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     }
     if let Some(root) = tree_root {
         cfg.tree_root = root;
+    }
+    if let Some(secs) = handshake {
+        cfg.handshake = std::time::Duration::from_secs(secs);
     }
     if inproc_runs.is_empty() {
         inproc_runs.push(compound_run_dir());

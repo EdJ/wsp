@@ -126,9 +126,9 @@ pub const DEFAULT_BUILD: u32 = 2;
 pub const DEFAULT_CHECK: u32 = 4;
 /// `job.stop`'s grace between `TERM` and `KILL`.
 pub const DEFAULT_JOB_GRACE: Duration = Duration::from_secs(5);
-/// How long an ended job is kept for a retry before it is pruned: a day.
 /// How long a spawn waits for compound-sup's handshake unless told otherwise.
 pub const DEFAULT_HANDSHAKE: Duration = Duration::from_secs(5);
+/// How long an ended job is kept for a retry before it is pruned: a day.
 pub const DEFAULT_JOB_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl Config {
