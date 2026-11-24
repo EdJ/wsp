@@ -1041,6 +1041,11 @@ pub(crate) fn verdict_core(store: &Store, member: Task, judged: Judged, me: Opti
             }
             // Not a block of the work (`wsp-605`): the verdict holds and the
             // land is owed, retried once the tree is clean.
+            // `wsp-350`: the row lands by merge, so the hold stands and the
+            // trunk is the reviewer's to move; the row lands when its PR does.
+            crate::cmd_checkout::Verdict::ByMerge(why) => {
+                println!("{}", Paint::new().yellow(&format!("■ the hold stands, and nothing is landed: {why}")));
+            }
             crate::cmd_checkout::Verdict::Dirty(why) => {
                 land_owes = Some(why);
                 println!("{}", Paint::new().yellow("■ the hold stands, but the tree is dirty, so its land is owed; the run lands it once the tree is clean"));
@@ -1162,6 +1167,9 @@ pub(crate) enum Owed {
     Landed(Option<String>),
     /// Refused again on a dirty tree: still owed, said on the row and to the governor.
     Still(String),
+    /// The row lands by merge (`wsp-350`), so no land is owed by wsp: the owed
+    /// mark is cleared and the row waits for its PR. The text names the PR.
+    ByMerge(String),
     /// Refused for a reason the member owes work for (a conflict, a red
     /// rerun): recorded as the block it now is, and the row sent back.
     Blocked(String),
@@ -1195,6 +1203,10 @@ pub(crate) fn retry_owed(store: &Store, member: &str, by: &str) -> Option<Owed> 
             fold_pieces(store, member);
             store.log_event("task-verified", serde_json::json!({ "id": member, "verdict": "holds", "landed": landed.sha, "owed": "landed", "by": by }));
             Owed::Landed(Some(landed.sha))
+        }
+        crate::cmd_checkout::Verdict::ByMerge(why) => {
+            set_owed(store, member, None, by);
+            Owed::ByMerge(why)
         }
         crate::cmd_checkout::Verdict::Dirty(why) => {
             set_owed(store, member, Some(&why), &format!("{by}, and refused again"));
@@ -2374,6 +2386,47 @@ mod tests {
 
         // The same row with the side chain gone lands: the refusal was the whole of it.
         std::fs::remove_file(g.store.state.join("hub").join("side.json")).unwrap();
+        assert_eq!(land(&[]), 0);
+        assert_ne!(g.trunk(), before);
+    }
+
+    /// `wsp-350`, EdJ/wsp#6: in a project marked `lands: by-merge`, `wsp land`
+    /// (and the run's `--for-run`) refuses with the PR to merge named, the
+    /// verifier's hold stands and lands nothing, and nothing reaches the trunk.
+    #[test]
+    fn a_row_that_lands_by_merge_is_held_without_a_land_and_wsp_land_refuses_naming_the_pr() {
+        let g = ground("by-merge", "", &[("m.txt", "mine\n")], &[]);
+        let mut p = g.store.project("p").unwrap();
+        p.lands = crate::lands::BY_MERGE.into();
+        g.store.save_project(&p).unwrap();
+        let before = g.trunk();
+
+        let land = |extra: &[(&str, &str)]| crate::cmd_checkout::land(&g.store, &Args::synth("land", &["m-1"], extra));
+        assert_eq!(land(&[]), 1, "`wsp land` is refused");
+        assert_eq!(land(&[("for-run", "true")]), 1, "and the run's land of the member");
+        match crate::cmd_checkout::land_verdict(&g.store, "m-1") {
+            crate::cmd_checkout::Verdict::ByMerge(said) => assert_eq!(
+                said,
+                "wsp: m-1 lands by merge (the project p), so `wsp land` does not put it on the local trunk — merge the PR from branch m-1 \
+                 (no open PR was found for it: push the branch and open one); the row is waiting for the PR to merge, and wsp lands it \
+                 when the merge is on the remote's trunk",
+                "the refusal names the PR's branch, golden"
+            ),
+            _ => panic!("the hold's own land is by merge"),
+        }
+        assert_eq!(g.trunk(), before, "nothing reached the trunk");
+
+        assert_eq!(g.verdict("holds"), 0, "the hold is recorded");
+        let t = g.member();
+        let pass = passes(&t).pop().unwrap();
+        assert_eq!(pass.state, State::Holds, "the verdict holds");
+        assert!(pass.owed.is_none() && land_owed(&t).is_none(), "and no land is owed by wsp");
+        assert_eq!(g.trunk(), before, "still nothing on the trunk");
+        assert_eq!(t.status_raw, "review", "not sent back");
+
+        // The field off: the same row lands, as before.
+        p.lands.clear();
+        g.store.save_project(&p).unwrap();
         assert_eq!(land(&[]), 0);
         assert_ne!(g.trunk(), before);
     }

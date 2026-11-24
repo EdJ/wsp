@@ -3440,6 +3440,7 @@ pub(crate) fn retry_owed_land(store: &Store, list: &str, at: usize, member: &Tas
         Some(crate::verification::Owed::Landed(Some(sha))) => format!("the hold's owed land landed at {}", &sha[..sha.len().min(12)]),
         Some(crate::verification::Owed::Landed(None)) => "the hold's owed land had nothing left to land".into(),
         Some(crate::verification::Owed::Still(why)) => format!("the hold's land is still owed: {}", util::fold(&why)),
+        Some(crate::verification::Owed::ByMerge(why)) => format!("the hold's land is not wsp's: {}", util::fold(&why)),
         Some(crate::verification::Owed::Blocked(why)) => format!("the hold's owed land was refused, sent back: {}", util::fold(&why)),
         None => return,
     };

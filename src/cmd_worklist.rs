@@ -3170,7 +3170,10 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     the earlier planned) and whether it waits for
                                     any executing list on its project (default on
                                     for wsp's own source). `--no-retro` gives the list no
-                                    timing retro when it clears. `new` takes them too.
+                                    timing retro when it clears. `--lands by-merge|direct|project`
+                                    says how its members reach the trunk, over the
+                                    project's `lands:` (by-merge: only a PR's merge).
+                                    `new` takes them too.
                                     `ls` and `next <slug>` say what a planned list
                                     waits on: room, throttle, after, alone, manual"##,
             },
@@ -7203,6 +7206,26 @@ fn set_queue_flags(args: &Args, w: &mut Worklist) -> Result<Vec<String>, i32> {
         w.no_retro = true;
         said.push("no retro".into());
     }
+    // `wsp-350`: how this list's members reach the trunk, over the project's
+    // `lands:`. `project` takes the list's word off.
+    if args.has("lands") {
+        let word = args.get("lands").unwrap_or_default();
+        w.lands = match word.trim() {
+            "project" | "" => None,
+            other => match crate::lands::word(other) {
+                Some(m) => Some(m),
+                None => {
+                    eprintln!("wsp: `{word}` is not a way to land — by-merge, direct or project");
+                    return Err(2);
+                }
+            },
+        };
+        said.push(match w.lands {
+            Some(true) => "lands by merge".into(),
+            Some(false) => "lands direct".into(),
+            None => "lands as its project says".into(),
+        });
+    }
     Ok(said)
 }
 
@@ -7624,7 +7647,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
     // queue flags were never read. Both are checked before either is written,
     // so a bad `--prio` leaves the project as it was.
     let projecting = args.get("project").is_some();
-    let queueing = args.has("prio") || args.has("alone") || args.has("no-alone") || args.has("no-retro");
+    let queueing = args.has("prio") || args.has("alone") || args.has("no-alone") || args.has("no-retro") || args.has("lands");
     if projecting && queueing {
         if let Err(code) = set_queue_flags(args, &mut w.clone()) {
             return code;

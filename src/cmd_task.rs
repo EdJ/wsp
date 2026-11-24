@@ -2080,6 +2080,9 @@ fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> 
                 let at = sha.map(|s| format!(" at {}", &s[..s.len().min(12)])).unwrap_or_default();
                 println!("✓ {}: the verifier's hold was owed its land, and it landed{at} — no new verifier", t.id);
             }
+            Some(crate::verification::Owed::ByMerge(why)) => {
+                println!("{why}");
+            }
             Some(crate::verification::Owed::Still(why)) => {
                 eprintln!("{why}");
                 eprintln!("wsp: {} stays at review with its land owed; its governor is told", t.id);

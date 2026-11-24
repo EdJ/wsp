@@ -1125,6 +1125,7 @@ pub(crate) mod tests {
             crate::cmd_checkout::Verdict::Blocked(why) => panic!("blocked: {why}"),
             crate::cmd_checkout::Verdict::Dirty(why) => panic!("dirty: {why}"),
             crate::cmd_checkout::Verdict::Nothing => panic!("nothing landed"),
+            crate::cmd_checkout::Verdict::ByMerge(why) => panic!("by merge: {why}"),
         }
     }
 

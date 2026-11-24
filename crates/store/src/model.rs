@@ -217,6 +217,12 @@ pub struct Project {
     /// one. Empty is no light rows, which is every project before this. A
     /// group's `weight:` and a member's `weight <member>:` override it.
     pub light: String,
+    /// `lands:` — `by-merge` where this project's work reaches its trunk only
+    /// by a reviewer merging the row's PR (`wsp-350`, EdJ/wsp#6): no `wsp
+    /// land`, no idle-seat land, and the row lands once its commits are on the
+    /// remote's trunk. Empty is today's local land. A list's own `lands:`
+    /// beats it ([`crate::lands`]).
+    pub lands: String,
     /// `kind:` — `product` marks a node that only groups the projects under it
     /// (`wsp-721`); empty is an ordinary project, which is every project before
     /// this, so the schema is not bumped. A product holds no tasks by
@@ -285,6 +291,7 @@ impl Project {
             at_review: doc.opt("at_review").unwrap_or_default(),
             auto_close: doc.opt("auto_close").unwrap_or_default(),
             light: doc.opt("light").unwrap_or_default(),
+            lands: doc.opt("lands").map(|l| l.trim().to_string()).unwrap_or_default(),
             kind: doc.opt("kind").unwrap_or_default(),
             seq: doc.opt("seq").and_then(|s| s.parse().ok()).unwrap_or(0),
             workspace: workspace_of_doc(doc),
@@ -324,6 +331,9 @@ impl Project {
         }
         if !self.light.trim().is_empty() {
             d.set_str("light", &self.light);
+        }
+        if !self.lands.trim().is_empty() {
+            d.set_str("lands", &self.lands);
         }
         if !self.kind.trim().is_empty() {
             d.set_str("kind", &self.kind);
@@ -2623,6 +2633,10 @@ pub struct Worklist {
     /// `alone:` — `on` or `off` where a hand said, absent where nobody did and
     /// the project's default stands (`wsp-383`).
     pub alone: Option<bool>,
+    /// `lands:` — `by-merge` or `direct` where a hand said, beating the
+    /// project's `lands:` for this list's members (`wsp-350`); absent is the
+    /// project's say. `Some(true)` is by merge. See [`crate::lands`].
+    pub lands: Option<bool>,
     /// `no_retro:` — `on` where the list was run with `--no-retro` (`wsp-472`):
     /// no timing retro when it clears.
     pub no_retro: bool,
@@ -2667,6 +2681,7 @@ impl Worklist {
             prio: None,
             after: None,
             alone: None,
+            lands: None,
             no_retro: false,
             retro: None,
             held_until: None,
@@ -2748,6 +2763,7 @@ impl Worklist {
                 "off" | "false" | "no" => Some(false),
                 _ => None,
             }),
+            lands: doc.opt("lands").and_then(|l| crate::lands::word(&l)),
             no_retro: doc.opt("no_retro").is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes")),
             retro: doc.opt("retro_at").filter(|a| !a.trim().is_empty()).map(|at| (at.trim().to_string(), doc.opt("retro_seat").unwrap_or_default().trim().to_string())),
             held_until: doc.opt("held_until").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
@@ -2791,6 +2807,9 @@ impl Worklist {
         }
         if let Some(a) = self.alone {
             d.set_str("alone", if a { "on" } else { "off" });
+        }
+        if let Some(m) = self.lands {
+            d.set_str("lands", if m { crate::lands::BY_MERGE } else { crate::lands::DIRECT });
         }
         if self.no_retro {
             d.set_str("no_retro", "on");

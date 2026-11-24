@@ -2091,6 +2091,10 @@ fn sha_after(line: &str, marker: &str) -> Option<String> {
 fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     let tasks = store.tasks_shared();
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
+        if let Some(by) = crate::lands::said(store, &s.id) {
+            waiting_for_merge(store, w, s, &by, crate::cycle::verified(&tasks, &s.id));
+            continue;
+        }
         let note = s.note();
         let why = if note.is_empty() { "its branch is not on the trunk".to_string() } else { note };
         let said = format!("{WHY_NOT} {} is at {} and not on the trunk: {why}.", s.id, s.settlement.word());
@@ -2237,6 +2241,36 @@ pub(crate) fn gone_seat_claims(store: &Store, seats: &dyn Seats) -> Vec<String> 
     released
 }
 
+/// [`skipped`]'s notice for a member that lands by merge (`wsp-350`,
+/// EdJ/wsp#6): it waits for its PR to merge, and nobody is told to land it —
+/// the notice that said "land" was followed by seats after the governor had
+/// said the run would not land, and put unreviewed work on a local trunk
+/// nobody else had. Once per reason, as the notice it replaces. A member
+/// whose hold is not in yet still owes its review, and is told so.
+fn waiting_for_merge(store: &Store, w: &Worklist, s: &worklist::Standing, by: &crate::lands::Said, held: bool) {
+    use crate::lands::WAITING;
+    let id = &s.id;
+    let word = s.settlement.word();
+    let said = format!("{WHY_NOT} {id} is at {word}, {WAITING}: it lands by merge ({}), so wsp does not land it.", by.words());
+    if !said_once_per_reason(store, id, &format!("{WHY_NOT} {id} is at "), &said) {
+        return;
+    }
+    let owed = if held { String::new() } else { format!(" {}", Flow::Verified.owes(id)) };
+    crate::cycle::tell_logged(store, w, &format!(
+        "{id} in the {} run is at {word}, {WAITING} — it lands by merge ({}), so neither wsp nor its seat lands it: \
+         the reviewer merges its PR, and the row lands when its commits reach the remote's trunk.{owed}",
+        w.id,
+        by.words()
+    ));
+    if !store.panes_for_task(id).is_empty() {
+        tell_member(store, id, &format!(
+            "wsp: {id} is at {word}, {WAITING} — it lands by merge ({}), so never `wsp land` it or land by hand. \
+             Push your branch and open its PR if there is none; the row lands when the PR merges.{owed}",
+            by.words()
+        ));
+    }
+}
+
 /// How long after a member was told to land the run waits before it lands for
 /// the member, if the member's seat has done nothing in that time.
 const LAND_GRACE: i64 = 5 * 60;
@@ -2269,6 +2303,11 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
     let now = util::epoch_secs();
     let mut asks = None;
     for s in pos.members.iter().filter(|s| s.settlement.settled() && !s.owes_a_verifier()) {
+        // `wsp-350`: a row that lands by merge is the reviewer's to land, idle
+        // seat or not.
+        if crate::lands::by_merge(store, &s.id) {
+            continue;
+        }
         let Some(t) = store.find_task(&s.id) else { continue };
         let log = t.section("Log").unwrap_or_default();
         let Some(notice) = log.lines().filter(|l| l.contains(WHY_NOT) && l.contains("not on the trunk")).last() else { continue };
@@ -4931,6 +4970,55 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
     fn landed_for() -> Vec<String> {
         LANDED_FOR.with(|l| l.borrow_mut().drain(..).collect())
+    }
+
+    /// `wsp-350`, EdJ/wsp#6: in a project marked `lands: by-merge`, a verified
+    /// row at review with commits off the trunk and an idle seat an hour after
+    /// its notice is **not** landed by the run, and the notice says it waits
+    /// for its PR to merge and orders no land. The same row with the field off
+    /// is the test above: landed.
+    #[test]
+    fn a_verified_row_that_lands_by_merge_with_an_idle_seat_is_not_landed_and_the_notice_waits_for_the_pr() {
+        let (env, store) = scratch("bymerge");
+        landed_member(&env, &store, true);
+        let mut p = store.project("p").unwrap();
+        p.lands = crate::lands::BY_MERGE.into();
+        store.save_project(&p).unwrap();
+        let mut t = store.find_task("m-1").unwrap();
+        crate::verification::write(&mut t, &[crate::verification::Pass::opened(None, None)]);
+        store.save_task(&t).unwrap();
+        crate::verification::record(&store, "m-1", crate::verification::State::Holds, "holds", None, None).unwrap();
+        assert!(crate::cycle::verified(&store.tasks(), "m-1"), "the row is verified");
+        claim(&store, "m-1", "cpd-1");
+        let _ = (governed(), member_told(), stamped(), landed_for());
+
+        tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        let notice = store.find_task("m-1").unwrap().section("Log").unwrap_or_default();
+        let notice = notice.lines().filter(|l| l.contains(WHY_NOT)).last().expect("the notice is on the row").to_string();
+        assert!(
+            notice.ends_with("wsp: this member is waiting because m-1 is at review, waiting for the PR to merge: it lands by merge (the project p), so wsp does not land it."),
+            "the notice, golden: {notice}"
+        );
+        let gov = governed();
+        assert_eq!(gov.len(), 1, "the seat is told once: {gov:?}");
+        assert!(gov[0].contains("waiting for the PR to merge") && !gov[0].contains("`wsp land"), "no land is recommended: {}", gov[0]);
+        let told = member_told();
+        assert!(told.iter().any(|(id, t)| id == "m-1" && t.contains("waiting for the PR to merge") && t.contains("never `wsp land` it")), "{told:?}");
+
+        // An hour on, the seat still idle: the run lands nothing.
+        let mut t = store.find_task("m-1").unwrap();
+        let log = t.section("Log").unwrap_or_default();
+        let aged: Vec<String> = log
+            .lines()
+            .map(|l| if l.contains(WHY_NOT) { format!("- {}{}", util::iso_at(util::epoch_secs() - 3600), &l[22..]) } else { l.to_string() })
+            .collect();
+        crate::model::set_section_in(&mut t.body, "Log", &format!("## Log\n\n{}\n", aged.join("\n")));
+        store.save_task(&t).unwrap();
+        for _ in 0..3 {
+            tick(&store, &Fake::new(&[("cpd-1", Some(State::Idle))]), &mut Pass::new());
+        }
+        assert!(landed_for().is_empty(), "a by-merge row is the reviewer's to land, idle seat or not");
+        assert!(governed().is_empty(), "and the notice is not said again");
     }
 
     /// `wsp-328`, seen on `compounding-040`: the member moved itself to review

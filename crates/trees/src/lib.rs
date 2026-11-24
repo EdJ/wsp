@@ -2,7 +2,7 @@
 //! Depends on `wsp-base`, `wsp-store` and `wsp-wire`.
 
 pub use wsp_base::{base, choices, fm, input, risk, util};
-pub use wsp_store::{agent_kind, caption, checks, decisions, governors, lapse, log, message, model, resolve, sharing, store, tags, verbs};
+pub use wsp_store::{agent_kind, caption, checks, decisions, governors, lands, lapse, log, message, model, resolve, sharing, store, tags, verbs};
 pub use wsp_wire::{fake, far, host, launchd, place, place_compound, place_super, systemd, tunnel};
 
 pub mod at_stop;

@@ -2764,6 +2764,40 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
     Ok(Landed { commits: landed, files, base, sha })
 }
 
+/// Why `w`'s row is not landed here: it lands by merge (`wsp-350`), with the
+/// PR to merge named where one can be found.
+fn by_merge_refusal(store: &Store, w: &Where) -> Option<String> {
+    let by = crate::lands::said(store, &w.task)?;
+    let branch = w.on().unwrap_or_else(|| w.task.clone());
+    let pr = open_pr(store, &w.task, &w.dir, &branch);
+    Some(crate::lands::refusal(&w.task, &by, &branch, pr.as_deref()))
+}
+
+/// The open PR from `branch`, by `gh`, when the tree's remote is on GitHub;
+/// `None` when there is none, `gh` is not there, or the remote is elsewhere —
+/// a land refused names the branch then. Never asked of a tree with no GitHub
+/// remote, so a test fixture starts no `gh`.
+fn open_pr(store: &Store, task: &str, dir: &Path, branch: &str) -> Option<String> {
+    let remote = store
+        .find_task(task)
+        .and_then(|t| crate::model::project_of(&t))
+        .and_then(|p| store.project(&p))
+        .map(|p| p.remote().to_string())
+        .unwrap_or_else(|| crate::model::DEFAULT_REMOTE.to_string());
+    let url = git(dir, &["remote", "get-url", &remote])?;
+    if !url.contains("github") {
+        return None;
+    }
+    let out = wsp_base::calls::Command::new("gh")
+        .args(["pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && url.starts_with("http")).then_some(url)
+}
+
 pub fn land(store: &Store, args: &Args) -> i32 {
     let p = util::Paint::new();
     let w = match locate(store, args) {
@@ -2775,6 +2809,12 @@ pub fn land(store: &Store, args: &Args) -> i32 {
     };
     // Another user leased the row while this spoke was offline: nothing moves.
     if let Some(why) = (engine().refused)(store, &w.task) {
+        eprintln!("{why}");
+        return 1;
+    }
+    // `wsp-350`: a row that lands by merge reaches the trunk when a reviewer
+    // merges its PR, and never by this verb — `--for-run` included.
+    if let Some(why) = by_merge_refusal(store, &w) {
         eprintln!("{why}");
         return 1;
     }
@@ -2853,6 +2893,10 @@ pub enum Verdict {
     },
     /// The trunk is untouched; this is what is owed.
     Blocked(String),
+    /// The trunk is untouched because the row lands by merge (`wsp-350`): the
+    /// hold stands and nothing is owed by the member; the row lands when its PR
+    /// merges. The text names the PR.
+    ByMerge(String),
     /// The trunk is untouched because the tree holds uncommitted files
     /// (`wsp-605`). Not a block of the work: the hold stands and the land is
     /// owed, retried when the tree is clean. The text names the files.
@@ -2940,6 +2984,9 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
     }
     if let Some(why) = (engine().refused)(store, &w.task) {
         return Verdict::Blocked(why);
+    }
+    if let Some(why) = by_merge_refusal(store, &w) {
+        return Verdict::ByMerge(why);
     }
     let tree = util::contract(&w.dir);
     let moved = |w: &Where| git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err();

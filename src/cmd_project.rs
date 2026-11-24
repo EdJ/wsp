@@ -900,8 +900,19 @@ pub fn set(store: &Store, args: &Args) -> i32 {
             // The tags that mark a light row (a retro, a plan, docs): half a
             // place under the seat's cap (`wsp-601`). Empty takes them off.
             "light" => proj.light = v.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" "),
+            // `wsp-350`: `by-merge` where the work reaches the trunk only by a
+            // reviewer merging the row's PR; empty or `direct` is the local land.
+            "lands" => match crate::lands::word(v) {
+                _ if v.trim().is_empty() => proj.lands.clear(),
+                Some(true) => proj.lands = crate::lands::BY_MERGE.into(),
+                Some(false) => proj.lands.clear(),
+                None => {
+                    eprintln!("wsp: lands: `{v}` is not by-merge or direct");
+                    return 2;
+                }
+            },
             other => {
-                eprintln!("wsp: cannot set `{other}` (name|brief|status|parent|tags|roots|at_stop|at_review|light)");
+                eprintln!("wsp: cannot set `{other}` (name|brief|status|parent|tags|roots|at_stop|at_review|light|lands)");
                 return 2;
             }
         }
@@ -1099,7 +1110,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Projects,
                 order: 70,
-                text: r##"  wsp project set <id> k=v…         name/parent/status/brief/tags/roots"##,
+                text: r##"  wsp project set <id> k=v…         name/parent/status/brief/tags/roots
+                                    lands=by-merge: rows reach the trunk only by
+                                    a PR's merge, never `wsp land` (direct undoes)"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Projects,

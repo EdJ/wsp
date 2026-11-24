@@ -8,6 +8,7 @@ pub mod checks;
 pub mod decisions;
 pub mod governors;
 pub mod agent_kind;
+pub mod lands;
 pub mod lapse;
 pub mod lease;
 pub mod log;
