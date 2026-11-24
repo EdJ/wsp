@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use wsp_host::Tcp;
 use wsp_host_api::{
     AgentSpec, ConnError, Connection, Epoch, EventId, Frame, Gate, Hello, Key, ManagerHello, Message, OrderCancel,
-    OrderDeliver, OrderFail, OrderId, Refusal, ReqId, Role, RowId, SeatId, SeatSpawn, SeatState, SeatStop, Seats,
+    OrderDeliver, OrderFail, OrderId, Refusal, ReqId, Role, RowId, SeatId, SeatSpawn, SeatStarted, SeatState, SeatStop, Seats,
     Subscribe, Token, Workdir, WspHello, PROTOCOL,
 };
 use wsp_manager::{Config, Manager, TOKEN_FILE};
@@ -94,7 +94,17 @@ esac
 "#;
 
 /// A short exec dir (the fake's paths stay well inside a socket's 104 bytes)
-/// and the fake beside it.
+/// and the fake beside it, run once and answered before any test asks the
+/// manager to fork it.
+///
+/// What raced (wsp-371): the manager's handshake clock (5 s outside tests)
+/// starts when it forks the fake, so a start of the fake that the machine
+/// made slow (seven tests each exec'ing a script written a moment before, on
+/// a box busy with a workspace run) landed inside it, and the spawn came back
+/// `seat.refused` `failed` "never announced a socket" at 5.1 s — "both spawns
+/// are answered seat.started" failing while the test still had seconds to
+/// wait. So the fake's first start is waited on here, on its answer and on no
+/// clock, and [`start`] gives the manager's handshake the test's own [`WAIT`].
 fn place(tag: &str) -> (PathBuf, PathBuf) {
     let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let dir = base.join(format!("wm-{tag}-{}", std::process::id()));
@@ -102,6 +112,8 @@ fn place(tag: &str) -> (PathBuf, PathBuf) {
     let sup = base.join(format!("wm-{tag}-{}.sup", std::process::id()));
     fs::create_dir_all(&base).unwrap();
     write_script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
+    let out = Command::new(&sup).arg("wire-version").stderr(Stdio::inherit()).output().expect("the fake runs");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "9 9", "the fake answers wire-version: {out:?}");
     (dir, sup)
 }
 
@@ -154,6 +166,7 @@ fn start(dir: &Path, sup: &Path) -> Manager {
     let mut cfg = Config::new(dir, "test-host");
     cfg.port = 0;
     cfg.sup = Some(sup.to_path_buf());
+    cfg.handshake = WAIT;
     Manager::start(cfg).expect("the manager starts")
 }
 
@@ -259,6 +272,15 @@ fn spawn_msg(row: &str, attempt: u32, seat: &str, cwd: &Path) -> Message {
     })
 }
 
+/// A spawn's answer as `seat.started`, or a panic that names what came instead
+/// (a refusal's detail says why the seat did not start).
+fn started(answer: Message, what: &str) -> SeatStarted {
+    match answer {
+        Message::SeatStarted(s) => s,
+        other => panic!("{what}: expected seat.started, got {other:?}"),
+    }
+}
+
 fn stop_msg(seat: &str, epoch: u64) -> Message {
     Message::SeatStop(SeatStop { seat: SeatId(seat.into()), epoch: Epoch(epoch), grace_secs: 1 })
 }
@@ -299,9 +321,8 @@ fn two_spawns_with_one_key_give_one_seat() {
     // Both asked before either is answered: one fork, one answer for both.
     let ra = a.send(spawn_msg("wsp-1", 1, "cpd-1", &dir));
     let rb = b.send(spawn_msg("wsp-1", 1, "cpd-1", &dir));
-    let (Message::SeatStarted(first), Message::SeatStarted(second)) = (a.answer(ra), b.answer(rb)) else {
-        panic!("both spawns are answered seat.started");
-    };
+    let first = started(a.answer(ra), "the first of two spawns with one key");
+    let second = started(b.answer(rb), "the second of two spawns with one key");
     assert_eq!(first, second, "a retry gets the same seat.started");
     assert_eq!(first.epoch, Epoch(1));
     assert!(alive(first.pid), "the seat's session runs");
@@ -350,11 +371,11 @@ fn a_stop_or_an_order_naming_a_stale_epoch_is_refused() {
     let m = start(&dir, &sup);
     let (mut c, _) = Client::new(m.addrs()[0], &dir);
 
-    let Message::SeatStarted(one) = c.ask(spawn_msg("wsp-2", 1, "cpd-e", &dir)) else { panic!("started") };
+    let one = started(c.ask(spawn_msg("wsp-2", 1, "cpd-e", &dir)), "started");
     assert_eq!(one.epoch, Epoch(1));
     assert!(matches!(c.ask(stop_msg("cpd-e", 1)), Message::SeatStopped(_)));
     // The same seat started again, under the row's next attempt: epoch 2.
-    let Message::SeatStarted(two) = c.ask(spawn_msg("wsp-2", 2, "cpd-e", &dir)) else { panic!("started again") };
+    let two = started(c.ask(spawn_msg("wsp-2", 2, "cpd-e", &dir)), "started again");
     assert_eq!(two.epoch, Epoch(2));
 
     match c.ask(stop_msg("cpd-e", 1)) {
@@ -385,7 +406,7 @@ fn an_order_answers_delivered_then_acked() {
     let run = dir.join(wsp_manager::seats::RUN_DIR);
     let (mut c, _) = Client::new(m.addrs()[0], &dir);
     c.subscribe(None);
-    let Message::SeatStarted(s) = c.ask(spawn_msg("wsp-3", 1, "cpd-o", &dir)) else { panic!("started") };
+    let s = started(c.ask(spawn_msg("wsp-3", 1, "cpd-o", &dir)), "started");
 
     let req = c.send(order("o-1", "cpd-o", s.epoch.0, "do the work"));
     match (c.answer(req), c.answer(req)) {
@@ -454,7 +475,7 @@ fn a_delivered_order_and_its_hooks_journal_one_turn_began_with_the_order_and_one
     let m = start(&dir, &sup);
     let (mut c, _) = Client::new(m.addrs()[0], &dir);
     c.subscribe(None);
-    let Message::SeatStarted(s) = c.ask(spawn_msg("wsp-32", 1, "cpd-t", &dir)) else { panic!("started") };
+    let s = started(c.ask(spawn_msg("wsp-32", 1, "cpd-t", &dir)), "started");
 
     let req = c.send(order("o-t", "cpd-t", s.epoch.0, "do the work"));
     assert!(matches!(c.answer(req), Message::OrderDelivered(_)));
@@ -508,7 +529,7 @@ fn a_turn_with_no_order_reads_working_while_open_and_idle_at_its_stop() {
     let _sweep = Sweep::new(&dir);
     let m = start(&dir, &sup);
     let (mut c, _) = Client::new(m.addrs()[0], &dir);
-    let Message::SeatStarted(s) = c.ask(spawn_msg("wsp-38", 1, "cpd-p", &dir)) else { panic!("started") };
+    let s = started(c.ask(spawn_msg("wsp-38", 1, "cpd-p", &dir)), "started");
     assert_eq!(state_in(&mut c, "cpd-p"), SeatState::Idle, "nothing heard yet");
 
     let dial = Dial::Manager { addr: m.addrs()[0], token_file: dir.join(TOKEN_FILE) };
@@ -568,7 +589,7 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
     sweep.manager = Some(run_manager(&dir, &sup, port));
     let (mut c, _) = reach(port, &dir);
     c.subscribe(None);
-    let Message::SeatStarted(s) = c.ask(spawn_msg("wsp-4", 1, "cpd-k", &dir)) else { panic!("started") };
+    let s = started(c.ask(spawn_msg("wsp-4", 1, "cpd-k", &dir)), "started");
 
     // An order compound-sup takes two seconds over; the manager is killed once
     // it has asked.
@@ -628,8 +649,8 @@ fn a_seat_whose_socket_is_gone_under_a_reused_pid_is_ended_not_starting() {
     sweep.manager = Some(run_manager(&dir, &sup, port));
     let (mut c, _) = reach(port, &dir);
     c.subscribe(None);
-    let Message::SeatStarted(a) = c.ask(spawn_msg("wsp-94", 1, "cpd-ra", &dir)) else { panic!("started") };
-    let Message::SeatStarted(b) = c.ask(spawn_msg("wsp-94", 2, "cpd-rb", &dir)) else { panic!("started") };
+    let a = started(c.ask(spawn_msg("wsp-94", 1, "cpd-ra", &dir)), "started");
+    let b = started(c.ask(spawn_msg("wsp-94", 2, "cpd-rb", &dir)), "started");
 
     // In the manager's life: the socket goes, the pid runs on.
     fs::remove_file(&a.sockets[0]).unwrap();

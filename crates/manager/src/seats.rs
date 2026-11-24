@@ -75,8 +75,6 @@ use crate::{now, Shared};
 pub const RUN_DIR: &str = "run";
 pub const ORDERS_DIR: &str = "orders";
 
-/// How long a spawn waits for compound-sup's handshake.
-const HANDSHAKE: Duration = Duration::from_secs(5);
 /// How long one `compound-sup deliver` is waited on before it is asked again
 /// under the same id.
 const DELIVER_WAIT: Duration = Duration::from_secs(60);
@@ -394,7 +392,7 @@ fn fork(shared: &Shared, s: &SeatSpawn, epoch: Epoch) -> Result<Forked, String> 
         let _ = child.kill();
         return Err("compound-sup gave no handshake pipe".into());
     };
-    match handshake(stdout, HANDSHAKE) {
+    match handshake(stdout, shared.cfg.handshake) {
         Some(Handshake { sup: pid, socket, render }) => {
             let pid = pid.unwrap_or(child.id());
             let child = (pid == child.id()).then_some(child);

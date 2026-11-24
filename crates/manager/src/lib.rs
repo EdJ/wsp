@@ -94,6 +94,11 @@ pub struct Config {
     /// How many seats it runs or starts at once, as `hello`'s capacity says;
     /// a spawn past it is refused `full`.
     pub seats: u32,
+    /// How long a spawn waits for compound-sup's handshake before it answers
+    /// `seat.refused` `failed`: [`DEFAULT_HANDSHAKE`] outside tests. A test
+    /// sets its own wait, so the manager never answers refused before the
+    /// test has stopped listening (wsp-371).
+    pub handshake: Duration,
     /// The run directories of seats it did not start: the in-process host's
     /// (`$COMPOUND_RUN_DIR`, else `~/.compound/run`). At start, a labelled
     /// session there that answers is adopted (wsp-029, 6.2), as one under its
@@ -122,6 +127,8 @@ pub const DEFAULT_CHECK: u32 = 4;
 /// `job.stop`'s grace between `TERM` and `KILL`.
 pub const DEFAULT_JOB_GRACE: Duration = Duration::from_secs(5);
 /// How long an ended job is kept for a retry before it is pruned: a day.
+/// How long a spawn waits for compound-sup's handshake unless told otherwise.
+pub const DEFAULT_HANDSHAKE: Duration = Duration::from_secs(5);
 pub const DEFAULT_JOB_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl Config {
@@ -137,6 +144,7 @@ impl Config {
             volumes: vec![exec_dir.to_path_buf()],
             sup: None,
             seats: DEFAULT_SEATS,
+            handshake: DEFAULT_HANDSHAKE,
             inproc_runs: Vec::new(),
             build: DEFAULT_BUILD,
             check: DEFAULT_CHECK,
