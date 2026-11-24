@@ -1999,7 +1999,9 @@ bench::b: benchmark
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wsp-verify-{}-{}", name, std::process::id()));
+        // Canonical: macOS's temp dir is under /var, a link to /private/var, and a
+        // job's tree root is compared with the paths it is given after resolving.
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("wsp-verify-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
