@@ -158,6 +158,21 @@ fn world() -> Vec<Entity> {
         pid: Some(42),
         fields: fields(&[("role", "worker")]),
     }));
+    // Seats whose state is gone, by each of the three words: the cut leaves them out.
+    for (id, state, word) in [("cpd-gone", SeatState::Gone, ""), ("cpd-lost", SeatState::Lost, ""), ("cpd-word", SeatState::Idle, "gone")] {
+        es.push(Entity::Seat(Seat {
+            id: SeatId(id.into()),
+            machine: MachineName("local".into()),
+            kind: "claude".into(),
+            model: None,
+            state,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: None,
+            fields: fields(&[("census", word)]),
+        }));
+    }
     es.push(Entity::Claim(Claim { row: RowId("open".into()), seat: SeatId("cpd-1".into()), token: Token(3), expires: At(9_000) }));
     es.push(Entity::Order(Order {
         workspace: Default::default(),
@@ -239,8 +254,11 @@ fn wip_snapshot_keeps_bodies_on_open_rows_alone_and_raised_asks_alone() {
     assert_eq!(wip.asks.keys().map(|a| a.0.as_str()).collect::<Vec<_>>(), ["q-raised"]);
     assert_eq!(wip.asks.values().next(), whole.asks.get(&AskId("q-raised".into())));
 
-    // Seats and claims whole; the rest empty.
-    assert_eq!((&wip.seats, &wip.claims), (&whole.seats, &whole.claims));
+    // Claims whole; seats whole but those whose state is gone, with no age cutoff; the rest empty.
+    assert_eq!(wip.claims, whole.claims);
+    assert_eq!(wip.seats.keys().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["cpd-1"]);
+    assert_eq!(wip.seats.len() + 3, whole.seats.len(), "the seed has the three gone seats the cut leaves out");
+    assert_eq!(wip.seats.get(&SeatId("cpd-1".into())), whole.seats.get(&SeatId("cpd-1".into())));
     assert!(wip.orders.is_empty() && wip.runs.is_empty() && wip.machines.is_empty() && wip.leases.is_empty());
     assert!(!whole.orders.is_empty() && !whole.machines.is_empty(), "the seed has what the cut leaves out");
 

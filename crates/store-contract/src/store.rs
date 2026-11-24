@@ -70,6 +70,18 @@ pub const WIP_BODIES: [&str; 2] = ["body", "prose"];
 /// [`Reads::wip_snapshot`] keeps its [`WIP_BODIES`] (wsp-695).
 pub const WIP_SEATED: &str = "seated";
 
+/// The seat `fields` key that carries the census word (`wsp_view::common::key::CENSUS`).
+pub const WIP_CENSUS: &str = "census";
+
+/// Whether [`Reads::wip_snapshot`] leaves a seat out: one whose state is gone,
+/// as `wsp_view::stage::census_word` reads it (an ended, ending or lost seat,
+/// or a census word of `gone`), with no age cutoff. `wip` draws no such seat
+/// (wsp-373), so the reply does not carry the fleet of them a store keeps.
+pub fn wip_drops_seat(seat: &Seat) -> bool {
+    matches!(seat.state, SeatState::Gone | SeatState::Ending | SeatState::Lost)
+        || seat.fields.get(WIP_CENSUS).is_some_and(|w| w == "gone")
+}
+
 /// Which rows `rows` returns; an empty field does not filter.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowFilter {

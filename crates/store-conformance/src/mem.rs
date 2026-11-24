@@ -398,7 +398,8 @@ impl Reads for MemStore {
             })
             .collect();
         let asks = s.asks.into_iter().filter(|(_, a)| a.state == AskState::Raised).collect();
-        Ok((State { rows, lists, seats: s.seats, claims: s.claims, asks, ..State::default() }, at))
+        let seats = s.seats.into_iter().filter(|(_, seat)| !wip_drops_seat(seat)).collect();
+        Ok((State { rows, lists, seats, claims: s.claims, asks, ..State::default() }, at))
     }
 }
 

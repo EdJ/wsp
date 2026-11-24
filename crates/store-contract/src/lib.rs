@@ -32,7 +32,7 @@ pub use id::*;
 pub use refusal::{Error, Refusal, Result};
 pub use store::{
     heads_only, Claims, Commands, Events, Leases, ListFilter, Reading, Readings, Reads, RowFilter,
-    SeatFilter, Store, Texts, STORE_INSTANCE, WIP_BODIES, WIP_SEATED,
+    SeatFilter, Store, Texts, STORE_INSTANCE, WIP_BODIES, WIP_CENSUS, WIP_SEATED, wip_drops_seat,
 };
 pub use subscribe::{Feed, Subscribe, BEAT_SECS, MISSED_BEATS, SNAPSHOT_PART};
 

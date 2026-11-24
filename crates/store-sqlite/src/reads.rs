@@ -104,6 +104,7 @@ impl Reads for SqliteStore {
         let finished = word(serde_json::json!(ListState::Finished));
         let [body, prose] = WIP_BODIES.map(|k| format!("$.fields.{k}"));
         let seated = format!("$.fields.{WIP_SEATED}");
+        let census = format!("$.fields.{WIP_CENSUS}");
         self.with_conn(|c| {
             let (json, head): (String, i64) = c
                 .query_row(
@@ -117,14 +118,18 @@ impl Reads for SqliteStore {
                                                AND json_extract(value, ?6) IS NULL
                                           THEN json_remove(value, ?3, ?4) ELSE json(value) END)
                                   FROM json_each(s.json, '$.lists')),
-                        'seats', json(COALESCE(json_extract(s.json, '$.seats'), '{}')),
+                        'seats', COALESCE((SELECT json_group_object(key, json(value))
+                                           FROM json_each(s.json, '$.seats')
+                                           WHERE json_extract(value, '$.state') NOT IN ('gone', 'ending', 'lost')
+                                             AND COALESCE(json_extract(value, ?7), '') <> 'gone'),
+                                          json('{}')),
                         'claims', json(COALESCE(json_extract(s.json, '$.claims'), '{}')),
                         'asks', (SELECT json_group_object(key, json(value))
                                  FROM json_each(s.json, '$.asks')
                                  WHERE json_extract(value, '$.state') = ?2)),
                      (SELECT COALESCE(MAX(id), 0) FROM event)
                      FROM (SELECT (SELECT json FROM state WHERE id = 1) AS json) AS s",
-                    params![done, raised, body, prose, finished, seated],
+                    params![done, raised, body, prose, finished, seated, census],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(be)?;
