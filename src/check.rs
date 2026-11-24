@@ -654,6 +654,9 @@ fn full_suite_in(text: &str) -> FullSuite {
 pub(crate) struct Plan {
     pub steps: Vec<Step>,
     pub changed: Vec<String>,
+    /// One line per step the change let [`crate::affected::narrow_steps`]
+    /// narrow or leave to the barrier, saying why.
+    pub narrowed: Vec<String>,
 }
 
 /// The member's steps, then the project's rules the changed paths call for,
@@ -672,6 +675,10 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
     // repository that carries `fixtures/help.txt` always has them.
     let at_sha = |path: &str| git(&tg.repo, &["show", &format!("{}:{path}", tg.sha)]);
     let wants_paths = rules.iter().any(|s| s.of == Of::Rule && !s.barrier && !s.end) || [HELP_FIXTURE, LAYERING_FILE, READONLY_FILE].iter().any(|f| at_sha(f).is_some());
+    // A broad `cargo test` step is narrowed by what changed (`wsp-433`), so
+    // the paths are read for one too.
+    let narrowable = |c: &str| c.trim_start().starts_with("cargo test") || c.trim_start().starts_with("cargo nextest run");
+    let wants_paths = wants_paths || steps.iter().chain(rules.iter()).any(|s| narrowable(&s.command));
     let changed = if wants_paths { changed_paths(tg, t, at.is_none()) } else { Vec::new() };
     for r in rules.into_iter().filter(|r| !r.barrier && !r.end) {
         let made = match r.of {
@@ -699,7 +706,9 @@ pub(crate) fn plan(store: &Store, t: &Task, tg: &Target, at: Option<&str>) -> Pl
             }
         }
     }
-    Plan { steps, changed }
+    let in_tests = |word: &str| git(&tg.repo, &["grep", "-q", "-F", "-e", word, &tg.sha, "--", "tests"]).is_some();
+    let (steps, narrowed) = crate::affected::narrow_steps(steps, &changed, &at_sha, &in_tests);
+    Plan { steps, changed, narrowed }
 }
 
 /// The module a source path belongs to, as `tests/layering.rs` counts them:
@@ -2183,7 +2192,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             return if auto { 0 } else { 1 };
         }
     };
-    let Plan { steps, changed } = plan(store, &t, &tg, at.as_deref());
+    let Plan { steps, changed, narrowed } = plan(store, &t, &tg, at.as_deref());
     if steps.is_empty() {
         if !auto {
             println!(
@@ -2207,12 +2216,15 @@ pub fn check(store: &Store, args: &Args) -> i32 {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::json!({ "task": t.id, "commit": tg.sha, "steps": rows }));
+            println!("{}", serde_json::json!({ "task": t.id, "commit": tg.sha, "steps": rows, "narrowed": narrowed }));
             return 0;
         }
         println!("{} at {}", p.bold(&t.id), &tg.sha[..12]);
         for s in &steps {
             println!("  {}", plan_line(s, green(s).as_ref()));
+        }
+        for l in &narrowed {
+            println!("  {}", p.dim(&format!("narrowed: {l}")));
         }
         if !changed.is_empty() {
             println!("  {}", p.dim(&format!("{} changed path(s) read for the rules", changed.len())));
@@ -2284,6 +2296,11 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     for line in start.install(&tree, &dir.join("last.log"), &runner) {
         if !auto && !args.json() {
             println!("  {}", p.dim(&line));
+        }
+    }
+    if !auto && !args.json() {
+        for l in &narrowed {
+            println!("  {}", p.dim(&format!("narrowed: {l}")));
         }
     }
     let ran = run_all(&tree, &steps, &dir.join("last.log"), ledger.as_ref(), &runner, |r| {
@@ -2575,6 +2592,8 @@ fn inner(store: &Store, args: &Args) -> i32 {
             }
         }
     }
+    let in_tests = |word: &str| git(&tree, &["grep", "-q", "--untracked", "-F", "-e", word, "--", "tests"]).is_some();
+    let (steps, narrowed) = crate::affected::narrow_steps(steps, &changed, &in_tree, &in_tests);
     if steps.is_empty() {
         println!("{} {}", p.dim("nothing to run —"), p.dim(&format!("{} changed path(s) call for no check of {}", changed.len(), t.id)));
         return 0;
@@ -2584,7 +2603,13 @@ fn inner(store: &Store, args: &Args) -> i32 {
         for s in &steps {
             println!("  {} · {} · up to {}s · {}", s.name, s.command, s.limit.as_secs(), why_in(s));
         }
+        for l in &narrowed {
+            println!("  {}", p.dim(&format!("narrowed: {l}")));
+        }
         return 0;
+    }
+    for l in &narrowed {
+        println!("  {}", p.dim(&format!("narrowed: {l}")));
     }
     let log = store.state_file("checks").join(format!("{}-inner.log", t.id));
     let _ = std::fs::create_dir_all(store.state_file("checks"));
@@ -4388,6 +4413,31 @@ mod tests {
         }
         git_run(repo, &["commit", "--quiet", "-m", "pj-001: more"]);
         git(repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn a_rows_plan_narrows_a_workspace_step_to_the_crate_its_commit_changed_and_says_why() {
+        let (env, store, base) = world("narrow", "", "exit 0\n");
+        let repo = env.path("repo");
+        let mut t = store.find_task("pj-001").unwrap();
+        t.body.push_str("\n## Checks\n- all: cargo test --workspace\n");
+        store.save_task(&t).unwrap();
+        let t = store.find_task("pj-001").unwrap();
+        let at = |sha: &str| Target { since: Some(base.clone()), ..target(&store, &t, Some(sha)).unwrap() };
+        let manifests = commit_files(&repo, &[("Cargo.toml", "[package]\nname = \"app\"\n"), ("crates/wire/Cargo.toml", "[package]\nname = \"app-wire\"\n")]);
+
+        // The manifests themselves are build-wide: nothing narrows.
+        let got = plan(&store, &t, &at(&manifests), Some(&manifests));
+        assert_eq!(got.steps.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(), ["cargo test --workspace"]);
+        assert!(got.narrowed.is_empty(), "{:?}", got.narrowed);
+
+        // One crate's source since a base past the manifests: that crate only.
+        let since = Target { since: Some(manifests.clone()), ..at(&manifests) };
+        let wire = commit_files(&repo, &[("crates/wire/src/lib.rs", "pub fn f() {}\n")]);
+        let got = plan(&store, &t, &Target { sha: wire.clone(), ..since }, Some(&wire));
+        assert_eq!(got.steps.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(), ["cargo test -p app-wire"]);
+        assert_eq!(got.narrowed.len(), 1);
+        assert!(got.narrowed[0].contains("only app-wire changed"), "{:?}", got.narrowed);
     }
 
     #[test]
