@@ -736,6 +736,76 @@ fn the_census_worklists_through_the_api_are_worklist_ls_json() {
     assert!(heads.len() == 1 && !heads[0].fields.contains_key("body"), "{heads:?}");
 }
 
+/// `wsp worklist show --all --json` under `read` (unset for the default):
+/// its output, how long it took, and the children its call line counted.
+fn show_all(sb: &Sandbox, read: Option<&str>) -> (Output, Duration, Value) {
+    let mut c = sb.cmd(&["worklist", "show", "--all", "--json"]);
+    // The orders stay on the files, so that a dial is the read's own.
+    c.env("WSP_ORDERS", "files");
+    if let Some(r) = read {
+        c.env("WSP_READ", r);
+    }
+    let start = Instant::now();
+    let out = c.output().expect("wsp runs");
+    let took = start.elapsed();
+    assert!(out.status.success(), "worklist show --all under {read:?}: {}", String::from_utf8_lossy(&out.stderr));
+    let calls = |f: &str| std::fs::read_to_string(sb.state.join(f)).unwrap_or_default();
+    let line = calls("polls.jsonl")
+        .lines()
+        .chain(calls("calls.jsonl").lines())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|l| l["verb"] == "worklist" && l["sub"] == "show")
+        .last()
+        .expect("show's call line");
+    (out, took, line["children"].clone())
+}
+
+/// wsp-375: `worklist show --all --json` reads the lists through the API by
+/// default (`lists {heads: true}`, what the mirror wrote beside each head) and
+/// prints the files' bytes, with no child; a silent dial reads the files within
+/// the dial's budget and says so once; `WSP_READ=files` never dials.
+#[test]
+fn worklist_show_all_reads_the_same_through_the_api_and_the_files() {
+    let mut seed = seeded("show");
+    let sb = &mut seed.sb;
+    // 1 and 2: the same bytes once the mirror has caught up, no child, no fallback.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (api, files) = loop {
+        let (api, _, children) = show_all(sb, None);
+        let (files, _, _) = show_all(sb, Some("files"));
+        assert_eq!(ran(&children), Vec::<String>::new(), "show --all through the API ran {children}");
+        assert!(api.stderr.is_empty(), "show --all fell back: {}", String::from_utf8_lossy(&api.stderr));
+        if api.stdout == files.stdout || Instant::now() > deadline {
+            break (api, files);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(String::from_utf8_lossy(&api.stdout), String::from_utf8_lossy(&files.stdout), "show --all --json, api (left) and files (right)");
+    let v: Value = serde_json::from_slice(&api.stdout).unwrap();
+    let list = v.as_array().and_then(|a| a.iter().find(|l| l["worklist"]["id"] == "list-a")).cloned().unwrap_or_default();
+    assert_eq!(list["groups"].as_array().map(Vec::len), Some(2), "the running list, its groups whole: {v}");
+
+    // 3. A silent dial (a listener that never welcomes): the files, within the
+    // dial's budget, said once, and the same bytes.
+    sb.stop_daemon();
+    let (addr, accepted) = counting_listener();
+    std::fs::write(sb.state.join("api.json"), serde_json::json!({ "addrs": [addr] }).to_string()).unwrap();
+    let (files, files_took, _) = show_all(sb, Some("files"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(accepted.load(Ordering::SeqCst), 0, "WSP_READ=files dialled");
+    let (fell, fell_took, _) = show_all(sb, None);
+    let said = String::from_utf8_lossy(&fell.stderr);
+    assert_eq!(said.matches("wsp: worklist show --all reads the files").count(), 1, "the fallback is said once: {said}");
+    assert_eq!(said.lines().count(), 1, "one line on stderr: {said}");
+    assert_eq!(fell.stdout, files.stdout, "the fallback prints the files' bytes");
+    assert!(
+        fell_took < files_took + Duration::from_millis(200) + Duration::from_millis(300),
+        "the fallback took {fell_took:?} against the files' {files_took:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(accepted.load(Ordering::SeqCst) >= 1, "the default read dialled the listener");
+}
+
 /// machines: the `machines` reading, drawn by `machine::list_json`, is
 /// `machine ls --json`.
 #[test]

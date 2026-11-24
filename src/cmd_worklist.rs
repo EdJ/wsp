@@ -3507,6 +3507,32 @@ impl ShowShared {
     }
 }
 
+/// Whether `show --all --json` reads through the API: unless `WSP_READ=files`
+/// (wsp-375). Its read is the lists alone, cheap where `wip`'s is not.
+fn show_reads_api() -> bool {
+    !std::env::var("WSP_READ").is_ok_and(|v| v.trim() == "files")
+}
+
+/// Every list as the daemon's mirror holds it, in a `State` of its own:
+/// `lists {heads: true}`, each list's fields without its text but with what
+/// `show --json` draws beside its head (`mirror::LIST_SHOW`, the overview
+/// among it), dialled within `wip`'s budget. `Err(None)` where nothing serves
+/// this store (no `api.json`), which is the files' read and says nothing;
+/// `Err(Some(why))` where a dial or a request failed.
+fn lists_from_api(store: &Store) -> Result<wsp_store_contract::State, Option<String>> {
+    use wsp_store_contract::{ListFilter, Principal, State};
+    let by = Principal::Wsp("worklist".into());
+    let mut client = match wsp_client::Client::dial(&store.state, by, crate::cmd_agent::API_BUDGET) {
+        Ok(c) => c,
+        Err(wsp_client::Silent::NoListenFile(_)) => return Err(None),
+        Err(e) => return Err(Some(e.to_string())),
+    };
+    let lists = client.lists(ListFilter { heads: true }).map_err(|e| Some(format!("`lists` got no answer: {e}")))?;
+    let mut state = State::default();
+    state.lists = lists.into_iter().map(|l| (l.id.clone(), l)).collect();
+    Ok(state)
+}
+
 /// `wsp worklist show --all --json` — every list not closed, each as `show
 /// <slug> --json` gives it, in one process (`--include-closed` for the rest).
 fn show_all(store: &Store, args: &Args) -> i32 {
@@ -3514,9 +3540,21 @@ fn show_all(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: wsp worklist show --all --json [--include-closed]");
         return 2;
     }
-    // Printed by `wsp-view` over the `State` the files make (wsp-308), as
-    // web-chrome draws it from the daemon's fold.
-    let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    // Printed by `wsp-view` over a `State` (wsp-308): the daemon's lists, read
+    // through the API (wsp-375), else the one the files make. Only the lists:
+    // `show_all_of_state` reads nothing else.
+    let state = match show_reads_api() {
+        false => None,
+        true => match lists_from_api(store) {
+            Ok(state) => Some(state),
+            Err(None) => None,
+            Err(Some(why)) => {
+                eprintln!("wsp: worklist show --all reads the files: {why}");
+                None
+            }
+        },
+    };
+    let state = state.unwrap_or_else(|| crate::mirror::state_of(store, crate::mirror::LOCAL));
     let out = wsp_view::worklist::show_all_of_state(&state, util::epoch_secs(), args.has("include-closed"));
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     0
