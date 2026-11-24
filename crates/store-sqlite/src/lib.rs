@@ -4,9 +4,11 @@
 //! an `Error::Backend` with text.
 //!
 //! Modules: `schema` (the tables, the pragmas), `apply` (`Commands::apply` and the helpers every
-//! write shares), `leases` (`Leases` and `Claims`), `reads` (`Reads`, `Events`, `Texts`).
+//! write shares), `entities` (the folded state, a row per entity, and the handle's cache of it),
+//! `leases` (`Leases` and `Claims`), `reads` (`Reads`, `Events`, `Texts`).
 
 mod apply;
+mod entities;
 mod events;
 mod leases;
 mod reads;
@@ -51,6 +53,8 @@ pub struct SqliteStore {
     domain: Option<Arc<dyn Domain + Send + Sync>>,
     hook: AtomicU8,
     wake: Arc<events::Wake>,
+    /// The state this handle last read or wrote (`entities`).
+    cache: entities::Cache,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -67,7 +71,7 @@ impl SqliteStore {
         schema::pragmas(&conn)?;
         schema::init(&conn)?;
         let wake = events::wake_for(&path);
-        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: Some(domain), hook: AtomicU8::new(LIVE), wake })
+        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: Some(domain), hook: AtomicU8::new(LIVE), wake, cache: Default::default() })
     }
 
     /// Opens the store file at `path` read-only (4.6's fallback): reads, `snapshot()`,
@@ -78,7 +82,7 @@ impl SqliteStore {
             .map_err(be)?;
         conn.busy_timeout(Duration::from_secs(10)).map_err(be)?;
         let wake = events::wake_for(&path);
-        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: None, hook: AtomicU8::new(LIVE), wake })
+        Ok(SqliteStore { conn: Mutex::new(Some(conn)), path, domain: None, hook: AtomicU8::new(LIVE), wake, cache: Default::default() })
     }
 
     /// The file this handle is on.
@@ -122,9 +126,11 @@ impl SqliteStore {
             let mut g = self.lock();
             let conn = g.as_mut().ok_or_else(crashed)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(be)?;
-            let out = f(&tx)?;
-            tx.commit().map_err(be)?;
-            out
+            let out = f(&tx).and_then(|out| tx.commit().map_err(be).map(|()| out));
+            if out.is_err() {
+                self.cache.clear(); // it may hold a fold the rollback undid
+            }
+            out?
         };
         self.bump();
         Ok(out)

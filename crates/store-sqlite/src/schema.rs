@@ -9,7 +9,7 @@ use crate::be;
 use wsp_store_contract::Result;
 
 /// The schema version this build writes and reads (`PRAGMA user_version`).
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 
 const DDL: &str = "
 CREATE TABLE IF NOT EXISTS event (
@@ -32,10 +32,15 @@ CREATE TABLE IF NOT EXISTS lease (
     token   INTEGER,
     expires INTEGER
 );
-CREATE TABLE IF NOT EXISTS state (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
+CREATE TABLE IF NOT EXISTS entity (
+    map  TEXT NOT NULL,
+    key  TEXT NOT NULL,
     json TEXT NOT NULL,
-    at   INTEGER NOT NULL
+    PRIMARY KEY (map, key)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS fold (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS text (
     row     TEXT NOT NULL,
@@ -76,7 +81,43 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE event ADD COLUMN workspace TEXT NOT NULL DEFAULT 'private'").map_err(be)?;
     }
     if version < VERSION {
-        conn.pragma_update(None, "user_version", VERSION).map_err(be)?;
+        migrate_state(conn)?;
     }
     Ok(())
+}
+
+/// Schema 2's one `state` blob, split into `entity` rows (schema 3, wsp-757), in one transaction
+/// so a second process opening the file at once sees the blob or the rows, never half of either;
+/// the version is stamped in it too.
+/// Each map's entities keep the blob's keys and JSON, `runs` (an array) is one row of key `''`,
+/// and `fold.at` is the blob's `at`; the blob is then dropped.
+fn migrate_state(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(be)?;
+    let run = || -> rusqlite::Result<()> {
+        let has: bool = conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'state'")?.exists([])?;
+        if has {
+            conn.execute_batch(
+                "INSERT INTO entity (map, key, json)
+                     SELECT m.key, e.key, json(e.value)
+                     FROM state AS s, json_each(s.json) AS m, json_each(m.value) AS e
+                     WHERE s.id = 1 AND m.key != 'runs' AND m.type = 'object'
+                 ON CONFLICT(map, key) DO UPDATE SET json = excluded.json;
+                 INSERT INTO entity (map, key, json)
+                     SELECT 'runs', '', json(json_extract(s.json, '$.runs')) FROM state AS s
+                     WHERE s.id = 1 AND json_type(s.json, '$.runs') = 'array'
+                 ON CONFLICT(map, key) DO UPDATE SET json = excluded.json;
+                 INSERT INTO fold (id, at) SELECT 1, at FROM state WHERE id = 1
+                 ON CONFLICT(id) DO UPDATE SET at = excluded.at;
+                 DROP TABLE state;",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", VERSION)
+    };
+    match run() {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(be),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(be(e))
+        }
+    }
 }

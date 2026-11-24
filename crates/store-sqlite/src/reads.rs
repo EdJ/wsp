@@ -1,4 +1,4 @@
-//! The reads, from the state row and the event table; `Texts` and `wait_for` wait for later legs.
+//! The reads, from the entity rows (or the handle's cache of them) and the event table; `Texts` and `wait_for` wait for later legs.
 
 use std::time::Duration;
 
@@ -6,66 +6,71 @@ use rusqlite::{params, OptionalExtension};
 use wsp_store_contract::*;
 
 use crate::apply::{from_json, head_of, write_event};
+use crate::entities::{key_text, one, with_state};
 use crate::{be, SqliteStore};
 
 impl Reads for SqliteStore {
     fn row(&self, id: &RowId) -> Result<Option<Row>> {
-        Ok(self.snapshot()?.0.rows.get(id).cloned())
+        self.entity("rows", &key_text!(id), |j| from_json!(j))
     }
 
     fn rows(&self, filter: &RowFilter) -> Result<Vec<Row>> {
-        let all = match filter.heads {
-            // Cut in SQL, as `wip_snapshot` is, so the text is never decoded (wsp-743).
-            true => self.cut("$.rows", true)?.iter().map(|t| from_json!(t)).collect::<Result<Vec<Row>>>()?,
-            false => self.snapshot()?.0.rows.into_values().collect(),
+        let keep = |r: &Row| {
+            filter.project.as_ref().is_none_or(|p| r.project == *p)
+                && (filter.states.is_empty() || filter.states.contains(&r.state))
+                && filter.list.as_ref().is_none_or(|l| r.group.as_ref().is_some_and(|g| g.list == *l))
+                && filter.seat.as_ref().is_none_or(|s| r.seat.as_ref() == Some(s))
         };
-        Ok(all
-            .iter()
-            .filter(|r| filter.project.as_ref().is_none_or(|p| r.project == *p))
-            .filter(|r| filter.states.is_empty() || filter.states.contains(&r.state))
-            .filter(|r| filter.list.as_ref().is_none_or(|l| r.group.as_ref().is_some_and(|g| g.list == *l)))
-            .filter(|r| filter.seat.as_ref().is_none_or(|s| r.seat.as_ref() == Some(s)))
-            .cloned()
-            .collect())
+        match filter.heads {
+            // Cut in SQL, as `wip_snapshot` is, so the bodies are never decoded (wsp-743).
+            true => Ok(self.cut("rows", true)?.iter().map(|t| from_json!(t)).collect::<Result<Vec<Row>>>()?.into_iter().filter(keep).collect()),
+            false => self.read(|c| with_state(c, &self.cache, |s| s.rows.values().filter(|r| keep(r)).cloned().collect())),
+        }
     }
 
     fn seat(&self, id: &SeatId) -> Result<Option<Seat>> {
-        Ok(self.snapshot()?.0.seats.get(id).cloned())
+        self.entity("seats", &key_text!(id), |j| from_json!(j))
     }
 
     fn seats(&self, filter: &SeatFilter) -> Result<Vec<Seat>> {
-        let (state, _) = self.snapshot()?;
-        Ok(state
-            .seats
-            .values()
-            .filter(|s| filter.machine.as_ref().is_none_or(|m| s.machine == *m))
-            .filter(|s| filter.states.is_empty() || filter.states.contains(&s.state))
-            .filter(|s| filter.row.as_ref().is_none_or(|r| s.row.as_ref() == Some(r)))
-            .cloned()
-            .collect())
+        self.read(|c| {
+            with_state(c, &self.cache, |state| {
+                state
+                    .seats
+                    .values()
+                    .filter(|s| filter.machine.as_ref().is_none_or(|m| s.machine == *m))
+                    .filter(|s| filter.states.is_empty() || filter.states.contains(&s.state))
+                    .filter(|s| filter.row.as_ref().is_none_or(|r| s.row.as_ref() == Some(r)))
+                    .cloned()
+                    .collect()
+            })
+        })
     }
 
     fn list(&self, id: &ListId) -> Result<Option<List>> {
-        Ok(self.snapshot()?.0.lists.get(id).cloned())
+        self.entity("lists", &key_text!(id), |j| from_json!(j))
     }
 
-    /// Over the state row's lists alone, whole or cut in SQL: the rows are never decoded.
+    /// Over the lists' rows alone, whole or cut in SQL: the rows are never decoded.
     fn lists(&self, filter: &ListFilter) -> Result<Vec<List>> {
-        self.cut("$.lists", filter.heads)?.iter().map(|t| from_json!(t)).collect()
+        self.cut("lists", filter.heads)?.iter().map(|t| from_json!(t)).collect()
     }
 
     fn orders_for(&self, seat: &SeatId, states: &[OrderState]) -> Result<Vec<Order>> {
-        let (state, _) = self.snapshot()?;
-        Ok(state
-            .orders
-            .values()
-            .filter(|o| o.to == *seat && (states.is_empty() || states.contains(&o.state)))
-            .cloned()
-            .collect())
+        self.read(|c| {
+            with_state(c, &self.cache, |state| {
+                state
+                    .orders
+                    .values()
+                    .filter(|o| o.to == *seat && (states.is_empty() || states.contains(&o.state)))
+                    .cloned()
+                    .collect()
+            })
+        })
     }
 
     fn claim(&self, row: &RowId) -> Result<Option<Claim>> {
-        Ok(self.snapshot()?.0.claims.get(row).cloned())
+        self.entity("claims", &key_text!(row), |j| from_json!(j))
     }
 
     /// The lease while someone holds it (expired or not), claims' `claim:<row>` included.
@@ -74,28 +79,18 @@ impl Reads for SqliteStore {
     }
 
     fn machine(&self, name: &MachineName) -> Result<Option<Machine>> {
-        Ok(self.snapshot()?.0.machines.get(name).cloned())
+        self.entity("machines", &key_text!(name), |j| from_json!(j))
     }
 
     fn snapshot(&self) -> Result<(State, EventId)> {
-        self.with_conn(|c| {
-            // One statement, so the state row and the head are of one moment.
-            let (json, head): (Option<String>, i64) = c
-                .query_row(
-                    "SELECT (SELECT json FROM state WHERE id = 1), (SELECT COALESCE(MAX(id), 0) FROM event)",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(be)?;
-            let state = match json {
-                Some(j) => from_json!(&j)?,
-                None => State::default(),
-            };
-            Ok((state, EventId(head as u64)))
+        // One read transaction, so the state and the head are of one moment.
+        self.read(|c| {
+            let state = with_state(c, &self.cache, State::clone)?;
+            Ok((state, EventId(head_of(c)?)))
         })
     }
 
-    /// Cut down in SQL, over the state row, so the full domain is never decoded into Rust: one
+    /// Cut down in SQL, over the entity rows, so the full domain is never decoded into Rust: one
     /// statement, so the cut and the head are of one moment, as `snapshot()`'s are.
     fn wip_snapshot(&self) -> Result<(State, EventId)> {
         let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
@@ -109,21 +104,19 @@ impl Reads for SqliteStore {
                 .query_row(
                     "SELECT json_object(
                         'rows', (SELECT json_group_object(key,
-                                    CASE WHEN json_extract(value, '$.state') = ?1
-                                         THEN json_remove(value, ?3, ?4) ELSE json(value) END)
-                                 FROM json_each(s.json, '$.rows')),
+                                    CASE WHEN json_extract(json, '$.state') = ?1
+                                         THEN json_remove(json, ?3, ?4) ELSE json(json) END)
+                                 FROM entity WHERE map = 'rows'),
                         'lists', (SELECT json_group_object(key,
-                                     CASE WHEN json_extract(value, '$.state') = ?5
-                                               AND json_extract(value, ?6) IS NULL
-                                          THEN json_remove(value, ?3, ?4) ELSE json(value) END)
-                                  FROM json_each(s.json, '$.lists')),
-                        'seats', json(COALESCE(json_extract(s.json, '$.seats'), '{}')),
-                        'claims', json(COALESCE(json_extract(s.json, '$.claims'), '{}')),
-                        'asks', (SELECT json_group_object(key, json(value))
-                                 FROM json_each(s.json, '$.asks')
-                                 WHERE json_extract(value, '$.state') = ?2)),
-                     (SELECT COALESCE(MAX(id), 0) FROM event)
-                     FROM (SELECT (SELECT json FROM state WHERE id = 1) AS json) AS s",
+                                     CASE WHEN json_extract(json, '$.state') = ?5
+                                               AND json_extract(json, ?6) IS NULL
+                                          THEN json_remove(json, ?3, ?4) ELSE json(json) END)
+                                  FROM entity WHERE map = 'lists'),
+                        'seats', (SELECT json_group_object(key, json(json)) FROM entity WHERE map = 'seats'),
+                        'claims', (SELECT json_group_object(key, json(json)) FROM entity WHERE map = 'claims'),
+                        'asks', (SELECT json_group_object(key, json(json)) FROM entity
+                                 WHERE map = 'asks' AND json_extract(json, '$.state') = ?2)),
+                     (SELECT COALESCE(MAX(id), 0) FROM event)",
                     params![done, raised, body, prose, finished, seated],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -134,18 +127,33 @@ impl Reads for SqliteStore {
 }
 
 impl SqliteStore {
-    /// The JSON of each entity under `path` (`$.rows`, `$.lists`) of the state row, in key
-    /// order (a `BTreeMap`'s), each without its `WIP_BODIES` fields where `heads`.
-    fn cut(&self, path: &str, heads: bool) -> Result<Vec<String>> {
+    /// Runs `f` in one read transaction: what it reads is of one moment.
+    fn read<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> Result<T>) -> Result<T> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction().map_err(be)?;
+            let out = f(&tx);
+            drop(tx); // it wrote nothing: the rollback only ends it
+            out
+        })
+    }
+
+    /// One entity of `map`, decoded alone (by `decode`: this crate names no `serde` bound).
+    fn entity<T>(&self, map: &str, key: &str, decode: impl FnOnce(&str) -> Result<T>) -> Result<Option<T>> {
+        self.with_conn(|c| one(c, map, key, decode))
+    }
+
+    /// The JSON of each entity of `map` (`rows`, `lists`), in key order (a `BTreeMap`'s), each
+    /// without its `WIP_BODIES` fields where `heads`.
+    fn cut(&self, map: &str, heads: bool) -> Result<Vec<String>> {
         let [body, prose] = WIP_BODIES.map(|k| format!("$.fields.{k}"));
         self.with_conn(|c| {
             let mut stmt = c
                 .prepare_cached(
-                    "SELECT CASE WHEN ?2 THEN json_remove(e.value, ?3, ?4) ELSE json(e.value) END
-                     FROM state AS s, json_each(s.json, ?1) AS e WHERE s.id = 1 ORDER BY e.key",
+                    "SELECT CASE WHEN ?2 THEN json_remove(json, ?3, ?4) ELSE json(json) END
+                     FROM entity WHERE map = ?1 ORDER BY key",
                 )
                 .map_err(be)?;
-            let texts = stmt.query_map(params![path, heads, body, prose], |r| r.get::<_, String>(0)).map_err(be)?;
+            let texts = stmt.query_map(params![map, heads, body, prose], |r| r.get::<_, String>(0)).map_err(be)?;
             texts.map(|t| t.map_err(be)).collect()
         })
     }
@@ -248,7 +256,7 @@ impl Texts for SqliteStore {
             )
             .map_err(be)?;
             let by = Principal::Wsp(STORE_INSTANCE.into());
-            write_event(tx, domain, EventKind::TextSet, Subject::Row(row.clone()), serde_json::json!({ "section": section, "rev": next }), &by)?;
+            write_event(tx, &self.cache, domain, EventKind::TextSet, Subject::Row(row.clone()), serde_json::json!({ "section": section, "rev": next }), &by)?;
             Ok(next)
         })
     }

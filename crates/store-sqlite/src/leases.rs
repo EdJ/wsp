@@ -1,5 +1,5 @@
 //! `Leases` and `Claims`: the lease table, each change with its event (the table in
-//! store-contract's `store` module) in the same transaction, folded into the state row.
+//! store-contract's `store` module) in the same transaction, folded into the state.
 //! A lease's `last` token is kept across releases, so tokens strictly increase.
 
 use std::time::Duration;
@@ -66,7 +66,7 @@ impl Leases for SqliteStore {
             let last = Token(last.0 + 1);
             let lease = Lease { name: name.clone(), holder: holder.clone(), token: last, expires: plus(at, ttl) };
             put(tx, name, last, Some(&lease))?;
-            write_event(tx, domain, EventKind::LeaseTaken, Subject::Lease(name.clone()), json!(lease), holder)?;
+            write_event(tx, &self.cache, domain, EventKind::LeaseTaken, Subject::Lease(name.clone()), json!(lease), holder)?;
             Ok(Some(last))
         })
     }
@@ -78,7 +78,7 @@ impl Leases for SqliteStore {
             let Some(mut lease) = cur.filter(|l| l.token == token) else { return Ok(false) };
             lease.expires = plus(now(), ttl);
             put(tx, name, last, Some(&lease))?;
-            write_event(tx, domain, EventKind::LeaseTaken, Subject::Lease(name.clone()), json!(lease), &lease.holder)?;
+            write_event(tx, &self.cache, domain, EventKind::LeaseTaken, Subject::Lease(name.clone()), json!(lease), &lease.holder)?;
             Ok(true)
         })
     }
@@ -89,7 +89,7 @@ impl Leases for SqliteStore {
             let (last, cur) = slot(tx, name)?;
             let Some(lease) = cur.filter(|l| l.token == token) else { return Ok(()) };
             put(tx, name, last, None)?;
-            write_event(tx, domain, EventKind::LeaseReleased, Subject::Lease(name.clone()), Value::Null, &lease.holder)
+            write_event(tx, &self.cache, domain, EventKind::LeaseReleased, Subject::Lease(name.clone()), Value::Null, &lease.holder)
         })
     }
 }
@@ -115,7 +115,7 @@ impl Claims for SqliteStore {
             let expires = plus(at, ttl);
             put(tx, &name, last, Some(&Lease { name: name.clone(), holder: who.clone(), token, expires }))?;
             let claim = Claim { row: row.clone(), seat: seat.clone(), token, expires };
-            write_event(tx, domain, EventKind::ClaimTaken, Subject::Claim(row.clone()), json!(claim), &who)?;
+            write_event(tx, &self.cache, domain, EventKind::ClaimTaken, Subject::Claim(row.clone()), json!(claim), &who)?;
             Ok(token)
         })
     }
@@ -127,7 +127,7 @@ impl Claims for SqliteStore {
             let (last, cur) = slot(tx, &name)?;
             let Some(lease) = cur.filter(|l| l.token == token) else { return Ok(()) };
             put(tx, &name, last, None)?;
-            write_event(tx, domain, EventKind::ClaimReleased, Subject::Claim(row.clone()), Value::Null, &lease.holder)
+            write_event(tx, &self.cache, domain, EventKind::ClaimReleased, Subject::Claim(row.clone()), Value::Null, &lease.holder)
         })
     }
 }
