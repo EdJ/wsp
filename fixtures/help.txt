@@ -33,6 +33,9 @@ TASKS
   wsp add "title" --parent <id>     a sub-task, filed where its parent is; refused from
                                     a seat working that member, which stages legs instead
                                     (`--anyway` files it, unrun)
+  wsp add "title" --from <id>       a follow-up: work found while doing <id>, filed where
+                                    <id> is; it records where it came from and never holds
+                                    <id> open (a sub-task is --parent, the row's own work)
   wsp add "title" --caption "…"     …with the line a glance reads, under 60
   wsp add "title" --after <id>[,<id>…]   …that rests on those, as `wsp after`
   wsp add "title" --workspace shared:<name>   …filed in a shared workspace (needs a login;
@@ -917,6 +920,9 @@ PLUMBING
   wsp migrate --barrier-rows [-n]   every settled Barrier row wsp filed, moved
                                     onto its group's checks: and archived; open
                                     rows and hand-made ones are named and left
+  wsp migrate --follow-ups [-n]     open sub-tasks under a row at review or done,
+                                    on none of its lists, made follow-ups (found_by
+                                    set, parent cleared); the daemon runs it once
   wsp migrate --run-notices [-n]    the run's notices raised before wsp-272 as
                                     a person's hands: from wsp, and for the
                                     seat they were handed to

@@ -1764,7 +1764,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
         Some(_) if session => {
             out.push(String::new());
             out.push(p.dim(
-                "verbs  wsp say · edit --overview - · review · block · park · note · flag · add --parent · commit-help — wsp brief prints how",
+                "verbs  wsp say · edit --overview - · review · block · park · note · flag · add --from · commit-help — wsp brief prints how",
             ));
         }
         Some(_) if terse => {
@@ -2026,6 +2026,8 @@ mod tests {
                 assert_eq!(text.contains("wsp leg add t-001 <name> --order FILE"), told, "{what}: {text}");
                 assert_eq!(text.contains("wsp release t-001"), told, "{what}: {text}");
                 assert_eq!(text.contains("never `wsp add --parent`"), told, "{what}: {text}");
+                // `wsp-345`: and what it finds outside its done-when is a follow-up.
+                assert_eq!(text.contains("--from <this row>"), told, "{what}: {text}");
             }
         }
     }
@@ -2824,6 +2826,8 @@ mod tests {
         assert!(session.contains("the near handbook opens here"), "{session}");
         assert!(!session.contains("the root handbook opens here"), "{session}");
         assert!(session.contains("wsp project show robustness --decisions"), "{session}");
+        // `wsp-345`: the verbs teach a follow-up's `--from`, not `--parent`.
+        assert!(session.contains("· add --from ·") && !session.contains("add --parent ·"), "{session}");
     }
     /// A log entry is bounded per entry, and the bound is stated rather than
     /// silent. A review note that ran to 2,000 characters arrives looking

@@ -49,14 +49,15 @@ fn steps(id: &str) -> String {
 
 /// The sentence that goes with [`route`]: why not a sub-task.
 pub(crate) const NOT_A_SUBTASK: &str =
-    "never `wsp add --parent` for a piece of this row: a sub-task is no member, so nothing runs or verifies it";
+    "never `wsp add --parent` for a piece of this row: a sub-task is no member, so nothing runs or verifies it; \
+     work found while doing it, outside its done-when, is a follow-up: `wsp add \"…\" --from <this row>`, which never holds the row open";
 
 /// Why `wsp add --parent <parent>` is refused from `pane`, or `None` when it is
 /// not. Refused when the pane is bound to the parent (its claim-holder or one of
 /// its legs), the parent is a member of a running list, and it is at `doing`.
 ///
-/// A member at review is left alone: a follow-up filed under finished work is
-/// what the rules ask for. So is every seat not bound to the row, such as a
+/// A member at review is left alone, as it was when follow-ups were filed
+/// under finished work; they are filed with `--from` now (`wsp-345`). So is every seat not bound to the row, such as a
 /// barrier check filing follow-ups, a governor or a person.
 pub(crate) fn refusal(
     parent: &Task,

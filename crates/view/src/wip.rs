@@ -105,6 +105,10 @@ pub struct Census {
     /// The planned lists wsp started on its own lately (`pickup`), present
     /// when it has lines to say (wsp-384), else the key is left out.
     pub planned_started: Option<Vec<Value>>,
+    /// Follow-ups found by a closed row that no list and no seat holds
+    /// (`wsp-345`), each `{id, title, found_by}`; the key is left out when
+    /// there are none.
+    pub unheld_follow_ups: Vec<Value>,
 }
 
 /// `wip --json`, whole.
@@ -115,6 +119,9 @@ pub fn census_json(c: &Census) -> Value {
     }
     if let (Some(o), Some(started)) = (v.as_object_mut(), &c.planned_started) {
         o.insert("planned_started".into(), json!(started));
+    }
+    if let (Some(o), false) = (v.as_object_mut(), c.unheld_follow_ups.is_empty()) {
+        o.insert("unheld_follow_ups".into(), json!(c.unheld_follow_ups));
     }
     v
 }

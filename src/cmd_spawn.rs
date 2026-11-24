@@ -702,7 +702,9 @@ const STAGE_WHEN_FILED: &str = "A row you file or direct that will run past ~80 
      of it) is legs: `wsp leg add <id> <name> --order FILE` per leg, ending in one last leg, and the run \
      starts them with the row. A done-when of three or more observations, or a build over ~5 minutes before \
      a drive, needs one of these, or `--whole --why \"...\"` when one seat is right. Never file one as \
-     \"split it if larger\": the seat that meets it can only stage legs inside its one row.";
+     \"split it if larger\": the seat that meets it can only stage legs inside its one row. Work found while \
+     doing a row, outside its done-when, is a follow-up, never a sub-task: `wsp add \"...\" --from <id>` records \
+     where it came from and does not hold that row open; put it on a list or it is never run.";
 
 /// What a task's work order adds when the tree it starts in already holds
 /// uncommitted work — empty otherwise. `wsp-171`'s second half.
@@ -11458,6 +11460,9 @@ mod tests {
             assert_eq!(order.contains("`wsp leg add <id> <name> --order FILE` per leg"), told, "{who}: legs are the planner's too, wsp-499: {order}");
             assert_eq!(order.contains("`--whole --why"), told, "{who}: {order}");
             assert_eq!(order.contains("split it if larger"), told, "{who}: {order}");
+            // `wsp-345`: what is found while doing a row is a follow-up, never a sub-task.
+            assert_eq!(order.contains("`wsp add \"...\" --from <id>`"), told, "{who}: {order}");
+            assert!(!order.contains("--parent <id>` for") && !order.contains("follow-up with `wsp add \"...\" --parent"), "{who}: {order}");
             assert!(!order.contains('\n') && order.is_ascii(), "{who}: one ASCII line");
         }
     }

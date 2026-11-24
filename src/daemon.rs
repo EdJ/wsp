@@ -693,6 +693,12 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         eprintln!("wsp daemon: dropped {dropped} stale claim(s)");
     }
 
+    // Follow-ups filed as sub-tasks before `--from` existed (`wsp-345`), made
+    // follow-ups once per store, so none holds a closed row open.
+    if let Some(n) = crate::follow_up::migrate_once(store).filter(|n| verbose && *n > 0) {
+        eprintln!("wsp daemon: {n} sub-task(s) of closed rows made follow-ups");
+    }
+
     // The first pass runs at once; every later one a `TICK` after the last.
     let mut first = true;
     loop {

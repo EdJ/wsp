@@ -4020,7 +4020,8 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
     let tail = match crate::cmd_worklist::spent_by(w, &g.members) {
         None => format!(
             "\n\n**Small work found at this barrier can be attached, not just reported.** File each row with \
-             `wsp add \"…\" --parent <member>`, with a **Done when:** line in its overview, then run one of \
+             `wsp add \"…\" --from <member>` (a follow-up: it records the member it was found on and never \
+             holds it open), with a **Done when:** line in its overview, then run one of \
              these in place of `go` or `hold`:\n\
              - it passes, with follow-ups: `wsp worklist followup {list} <id>… --next --from FILE --caption \"…\"`. The rows \
              become the next group, ahead of anything planned, on this group's agent line;\n\
@@ -6004,6 +6005,19 @@ pub(crate) mod tests {
         assert!(crate::barrier::open(&store, &stale, 1, None, None, &|_| false).is_some(), "a check opens");
         let order = check_order(&store, "run", 1).expect("an order");
         assert!(order.contains("sonnet stays at 2/10"), "the barrier was handed a stop already corrected: {order}");
+    }
+
+    /// `wsp-345`: a barrier check files what it finds as follow-ups of the
+    /// member (`--from`), which never hold the member open, and is no longer
+    /// told to file them as its sub-tasks.
+    #[test]
+    fn a_barrier_check_files_its_findings_with_from_and_never_as_sub_tasks() {
+        let mut w = Worklist::new("run", "run");
+        w.set_groups(&[Group { members: vec!["m-1".into()], agent: "claude".into(), ..Group::default() }]);
+        let g = w.groups().remove(0);
+        let order = barrier_order(&w, 1, &g, "");
+        assert!(order.contains("`wsp add \"…\" --from <member>`"), "{order}");
+        assert!(!order.contains("--parent"), "{order}");
     }
 
     /// `wsp-326`: the check is handed the members, their verdicts, the stop's

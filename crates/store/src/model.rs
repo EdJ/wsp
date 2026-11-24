@@ -976,6 +976,12 @@ pub struct Task {
     pub status_raw: String,
     pub priority_raw: String,
     pub parent: Option<String>,
+    /// `found_by:` — the row this one was found while doing: a **follow-up**,
+    /// and never a sub-task (`wsp-345`). [`Self::parent`] is a row's own
+    /// done-when, and `wsp done` refuses a parent with open sub-tasks; this
+    /// records where the work came from and holds nothing open. Written by
+    /// `wsp add --from <id>`. Optional in the front matter, as `after` is.
+    pub found_by: Option<String>,
     /// `after:` — the tasks this one rests on: a **wait**, and never
     /// provenance. Who made a task is [`Self::parent`]; this says which
     /// finished work it needs before it starts. Read by the run to hold a
@@ -1033,6 +1039,8 @@ pub struct TaskHead {
     pub status_raw: String,
     pub priority_raw: String,
     pub parent: Option<String>,
+    /// As [`Task::found_by`].
+    pub found_by: Option<String>,
     pub after: Vec<String>,
     pub created: String,
     pub updated: String,
@@ -1057,6 +1065,7 @@ impl TaskHead {
             status_raw: t.status_raw.clone(),
             priority_raw: t.priority_raw.clone(),
             parent: t.parent.clone(),
+            found_by: t.found_by.clone(),
             after: t.after.clone(),
             created: t.created.clone(),
             updated: t.updated.clone(),
@@ -1102,6 +1111,7 @@ impl TaskHead {
             status_raw: self.status_raw.clone(),
             priority_raw: self.priority_raw.clone(),
             parent: self.parent.clone(),
+            found_by: self.found_by.clone(),
             after: self.after.clone(),
             created: self.created.clone(),
             updated: self.updated.clone(),
@@ -1129,6 +1139,11 @@ impl TaskHead {
         if let Some(u) = &self.for_user {
             v["for"] = serde_json::Value::String(u.clone());
         }
+        // Only where there is one, so an index written before `wsp-345`
+        // reads the same.
+        if let Some(f) = &self.found_by {
+            v["found_by"] = serde_json::Value::String(f.clone());
+        }
         v
     }
 
@@ -1154,6 +1169,7 @@ impl TaskHead {
             status_raw: s("status")?,
             priority_raw: s("priority")?,
             parent: opt("parent")?,
+            found_by: s("found_by"),
             after: list("after")?,
             created: s("created")?,
             updated: s("updated")?,
@@ -1347,6 +1363,7 @@ impl Task {
             status_raw: doc.opt("status").unwrap_or_else(|| "todo".into()),
             priority_raw: doc.opt("priority").unwrap_or_else(|| "normal".into()),
             parent: doc.opt("parent"),
+            found_by: doc.opt("found_by").filter(|f| !f.trim().is_empty()),
             after: doc.list("after"),
             created: doc.str("created"),
             updated: doc.str("updated"),
@@ -1368,6 +1385,9 @@ impl Task {
         d.set_str("priority", &self.priority_raw);
         if let Some(p) = &self.parent {
             d.set_str("parent", p);
+        }
+        if let Some(f) = &self.found_by {
+            d.set_str("found_by", f);
         }
         // Only where there is one, as `parent`: nearly every task has none,
         // and an empty line in each of them is noise in every diff of the store.
@@ -1392,7 +1412,7 @@ impl Task {
     }
 
     pub fn json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "id": self.id,
             "title": self.title,
             "project": self.project,
@@ -1405,7 +1425,12 @@ impl Task {
             "updated": self.updated,
             "refs": self.refs,
             "caption": crate::caption::of_task(self).json(),
-        })
+        });
+        // Only on a follow-up, so every other row's JSON is what it was.
+        if let Some(f) = &self.found_by {
+            v["found_by"] = serde_json::Value::String(f.clone());
+        }
+        v
     }
 }
 
@@ -2940,6 +2965,25 @@ mod tests {
         assert!(!w.render().contains("for:"));
         w.for_user = Some("jesper".into());
         assert_eq!(Worklist::from_doc(&fm::parse(&w.render()), "wl").for_user.as_deref(), Some("jesper"));
+    }
+
+    /// `found_by:` (`wsp-345`) is written only on a follow-up, read back, rides
+    /// the head the index keeps and the row's JSON, and is not a parent; a row
+    /// without it renders, and prints as JSON, as it always has.
+    #[test]
+    fn found_by_round_trips_is_written_only_when_set_and_is_not_a_parent() {
+        let mut t = Task::new("A title", "f-2");
+        assert!(!t.render().contains("found_by:"));
+        assert!(t.json().get("found_by").is_none());
+        assert!(TaskHead::of(&t).to_json().get("found_by").is_none(), "an index entry from before reads the same");
+        t.found_by = Some("f-1".into());
+        let back = Task::from_doc(&fm::parse(&t.render()), "f-2");
+        assert_eq!(back.found_by.as_deref(), Some("f-1"));
+        assert!(back.parent.is_none());
+        assert_eq!(back.json()["found_by"], "f-1");
+        let head = TaskHead::of(&t);
+        assert_eq!(TaskHead::from_json(&head.to_json()), Some(head.clone()));
+        assert_eq!(head.bodiless().found_by.as_deref(), Some("f-1"));
     }
 
     /// The distinction the vocabulary went without: `blocked` and `parked` are

@@ -5966,7 +5966,8 @@ fn unattached_named(store: &Store, w: &Worklist, at: usize, said: &str) -> Vec<S
             continue;
         }
         let since = opened.as_ref().is_some_and(|o| t.created.as_str() >= o.as_str());
-        let sub = t.parent.as_ref().is_some_and(|p| on_list.contains(&p));
+        // Under a member, or found while doing one (`wsp-345`).
+        let sub = t.parent.as_ref().or(t.found_by.as_ref()).is_some_and(|p| on_list.contains(&p));
         if since || sub {
             out.push(t.id.clone());
         }
@@ -6172,7 +6173,7 @@ const FOLLOWUP_MAX: usize = 4;
 /// with a tail, and the agent that found the tail was the barrier check. It
 /// could only write it into a verdict for a governor to compose by hand.
 ///
-/// It files nothing. The rows already exist (`wsp add --parent`). This attaches
+/// It files nothing. The rows already exist (`wsp add --from <member>`). This attaches
 /// them and records the verdict, in one of two senses:
 ///
 /// - **`--blocking`: "holds, pending follow-ups".** The group's own done-when is
@@ -6300,7 +6301,7 @@ pub(crate) fn followup_by(store: &Store, args: &Args, here: &[String]) -> i32 {
             Some(at) => eprintln!("wsp: only the agent checking group {at}'s barrier may add follow-ups to `{}`", w.id),
             None => eprintln!("wsp: `{}` is not standing at a barrier being checked, so there is no verdict to attach follow-ups to", w.id),
         }
-        eprintln!("     a governor composes the list with `wsp worklist add` and `group`; anybody else files the row with `wsp add --parent` and says so");
+        eprintln!("     a governor composes the list with `wsp worklist add` and `group`; anybody else files the row with `wsp add --from <row>` and says so");
         return 1;
         }
     };
@@ -6409,6 +6410,7 @@ fn duplicates_of(store: &Store, w: &Worklist, at: usize, row: &str, members: &[S
         let Some(t) = tasks.iter().find(|t| &t.id == m) else { continue };
         let mut skip = skip.clone();
         skip.extend(t.parent.clone());
+        skip.extend(t.found_by.clone());
         for f in crate::duplicate::of(store, t, tasks, since.as_deref(), &skip) {
             found.push((m.clone(), f));
         }
@@ -9161,6 +9163,11 @@ mod tests {
         store.save_task(&t).unwrap();
         assert_eq!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first"), ["wl-003"]);
         t.parent = None;
+        // Or a follow-up found on one (`wsp-345`), as the barrier order files it.
+        t.found_by = Some("wl-001".into());
+        store.save_task(&t).unwrap();
+        assert_eq!(unattached_named(&store, &store.worklist("run").unwrap(), 1, "wl-003 first"), ["wl-003"]);
+        t.found_by = None;
         t.created = "2999-01-01T00:00:00Z".into();
         store.save_task(&t).unwrap();
 
@@ -9244,7 +9251,7 @@ mod tests {
         crate::cycle::tests::TOLD.with(|t| t.borrow().clone())
     }
 
-    /// A row with a done-when, as `wsp add --parent` files one.
+    /// A row with a done-when, as `wsp add --from` files one.
     fn row_with(store: &Store, id: &str, overview: &str) {
         let mut t = Task::new(id, id);
         t.status_raw = "todo".into();

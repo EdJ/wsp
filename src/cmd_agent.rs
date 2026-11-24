@@ -4084,6 +4084,8 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     // wsp-384: the planned lists wsp started on its own, for a day after.
     let mut picked_up = crate::pickup::wip_lines(store);
     picked_up.extend(silent_lines(store, &w.tasks));
+    // Follow-ups nothing will run (`wsp-345`), named so they are not lost.
+    let unheld = crate::follow_up::unheld(store);
     match args.json() {
         true => {
             let sw = match api {
@@ -4104,6 +4106,9 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
                     .collect();
                 o.insert("planned_started".into(), serde_json::json!(started));
             }
+            if let (Some(o), false) = (v.as_object_mut(), unheld.is_empty()) {
+                o.insert("unheld_follow_ups".into(), serde_json::json!(crate::follow_up::json_of(&unheld)));
+            }
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
         }
         false => {
@@ -4121,6 +4126,10 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
                 for l in picked_up {
                     println!("{l}");
                 }
+            }
+            if let Some(l) = crate::follow_up::line(&unheld) {
+                println!();
+                println!("{}", Paint::new().yellow(&l));
             }
         }
     }
@@ -5661,7 +5670,8 @@ fn census_of(store: &Store, w: &Wip, cap_waits: Vec<String>, picked_up: bool) ->
             .map(|(at, id, why)| serde_json::json!({ "at": at, "worklist": id, "why": why }))
             .collect()
     });
-    wsp_view::wip::Census { agents, head, waiting_at_cap: cap_waits, planned_started }
+    let unheld_follow_ups = crate::follow_up::json_of(&crate::follow_up::unheld(store));
+    wsp_view::wip::Census { agents, head, waiting_at_cap: cap_waits, planned_started, unheld_follow_ups }
 }
 
 /// The `wip` reading (wsp-743): `wip --json`'s input as the CLI reads it on

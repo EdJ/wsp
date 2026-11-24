@@ -23,7 +23,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
 pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     let title = args.text(0);
     if title.trim().is_empty() {
-        eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high] [--parent id] [--after id,…]");
+        eprintln!("usage: wsp add \"title\" [-p project] [-t tag]… [--prio high] [--parent id | --from id] [--after id,…]");
         // A title that begins with a dash is read as a flag, and then there is
         // no title — the usage line alone says nothing about why.
         if !args.flag_names().is_empty() {
@@ -76,6 +76,29 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         },
         None => None,
     };
+    // A follow-up (`wsp-345`): the row this was found while doing. Resolved
+    // before an id exists for the reason the parent is, and never made a
+    // parent: a follow-up records where it came from and holds nothing open,
+    // so `wsp done` on its origin is not refused for it. The archive is asked
+    // too, since work is found on a row after it closed as often as before.
+    let found_by = match args.get("from") {
+        Some(needle) => match store.find_task(&needle).or_else(|| store.archived_task(&needle).map(|(t, _)| t)) {
+            Some(o) => Some(o),
+            None => {
+                eprintln!("wsp: no such task `{needle}` to be a follow-up from");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    if let (Some(p), Some(o)) = (&parent, &found_by) {
+        eprintln!(
+            "wsp: --parent {} and --from {} are two different things: a sub-task is part of its parent's done-when, \
+             a follow-up is work found while doing a row and holds nothing open — give one",
+            p.id, o.id
+        );
+        return 2;
+    }
     // A member's own seat splitting its row into sub-tasks no run will start
     // (`wsp-311`, compound-758). Read whether or not it applies, so the flag is
     // never refused as unknown on an ordinary add.
@@ -110,6 +133,10 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         None
     } else if let (Some(p), false) = (&parent, args.has("project")) {
         p.project.clone()
+    } else if let (Some(o), false) = (&found_by, args.has("project")) {
+        // Where it was found, unless said otherwise: `-p` may differ, since a
+        // follow-up is not part of its origin and may belong elsewhere.
+        o.project.clone()
     } else {
         match current_project(store, args, &index) {
             Ok(p) => p,
@@ -130,7 +157,8 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
 
     // Private unless said otherwise; a sub-task is where its parent is (wsp-172).
     // Before an id exists, so a refusal leaves nothing reserved.
-    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), parent.as_ref().map(|p| &p.workspace)) {
+    let beside = parent.as_ref().or(found_by.as_ref()).map(|p| &p.workspace);
+    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), beside) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("wsp: {why}");
@@ -173,6 +201,7 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         t.status_raw = "inbox".into();
     }
     t.parent = parent.as_ref().map(|p| p.id.clone());
+    t.found_by = found_by.as_ref().map(|o| o.id.clone());
     t.after = after;
     t.workspace = workspace;
 
@@ -204,6 +233,9 @@ pub(crate) fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         if let Some(parent) = &unrun {
             println!("  {}", p.yellow(&crate::split::filed_anyway(parent, &t.id)));
         }
+        if let Some(o) = &found_by {
+            println!("  {}", p.dim(&format!("a follow-up from {}: it does not hold {} open", o.id, o.id)));
+        }
     }
     0
 }
@@ -230,8 +262,8 @@ pub(crate) fn file_new(store: &Store, t: &mut Task, caller: &crate::cmd_message:
 /// tail, and only `add`'s own names: a title that *mentions* a flag mid-way is
 /// about the CLI, which titles here usually are.
 fn flag_in_title(title: &str) -> Option<String> {
-    const VALUED: [&str; 11] =
-        ["parent", "project", "p", "tag", "t", "ref", "prio", "priority", "status", "s", "caption"];
+    const VALUED: [&str; 12] =
+        ["parent", "from", "project", "p", "tag", "t", "ref", "prio", "priority", "status", "s", "caption"];
     let name = |tok: &str| tok.strip_prefix("--").or_else(|| tok.strip_prefix('-')).map(str::to_string);
     let toks: Vec<&str> = title.split_whitespace().collect();
     let last = *toks.last()?;
@@ -329,6 +361,9 @@ pub fn list(store: &Store, args: &Args) -> i32 {
             Some(s) => println!("{}", p.dim(&format!("no open tasks in {s} — wsp add \"…\""))),
             None => println!("{}", p.dim("no open tasks — wsp add \"…\"")),
         }
+        if let Some(l) = crate::follow_up::line(&crate::follow_up::unheld(store)) {
+            println!("{}", p.yellow(&l));
+        }
         return 0;
     }
 
@@ -336,6 +371,13 @@ pub fn list(store: &Store, args: &Args) -> i32 {
         println!("{}", p.dim(&scope_line(s, &tasks)));
     }
     print_tasks(&tasks, &all, &p, scope.is_none());
+    // Follow-ups nothing will run (`wsp-345`): found by a closed row, on no
+    // list and under no seat. Named under the rows, whatever the scope, since
+    // a row nobody runs is lost wherever it is filed.
+    if let Some(l) = crate::follow_up::line(&crate::follow_up::unheld(store)) {
+        println!();
+        println!("{}", p.yellow(&l));
+    }
     0
 }
 
@@ -786,6 +828,16 @@ pub(crate) fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
     if let Some(u) = &t.for_user {
         v["for"] = Value::String(u.clone());
     }
+    // Both ends of a follow-up (`wsp-345`), each only where there is one, so a
+    // row that has neither prints what it did.
+    if let Some(f) = &t.found_by {
+        v["found_by"] = Value::String(f.clone());
+    }
+    let all = store.tasks();
+    let found = crate::follow_up::of(&all, &t.id);
+    if !found.is_empty() {
+        v["follow_ups"] = json!(found.iter().map(|k| json!({ "id": k.id, "status": k.status().as_str(), "title": k.title })).collect::<Vec<_>>());
+    }
     Ok(v)
 }
 
@@ -926,6 +978,34 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         println!(
             "{} {} {} {}",
             p.dim(&util::pad(if i == 0 { "sub" } else { "" }, 9)),
+            p.dim(&k.id),
+            p.dim(&util::pad(k.status().as_str(), 8)),
+            util::truncate(&k.title, 56)
+        );
+    }
+    // The other way a row comes from another (`wsp-345`): found while doing
+    // it. Beside `under` and `sub`, and never one of them, because a follow-up
+    // holds nothing open; both ends say so, as both ends of a parent do.
+    if let Some((origin, filed)) = t.found_by.as_ref().and_then(|id| {
+        all.iter()
+            .find(|x| &x.id == id)
+            .map(|x| (x.clone(), false))
+            .or_else(|| store.archived_task(id).map(|(x, _)| (x, true)))
+    }) {
+        println!(
+            "{} {}  {}{}",
+            p.dim(&util::pad("from", 9)),
+            p.dim(&origin.id),
+            util::truncate(&origin.title, 56),
+            if filed { p.dim("  · archived") } else { String::new() }
+        );
+    } else if let Some(id) = &t.found_by {
+        println!("{} {}", p.dim(&util::pad("from", 9)), p.dim(id));
+    }
+    for (i, k) in crate::follow_up::of(&all, &t.id).iter().enumerate() {
+        println!(
+            "{} {} {} {}",
+            p.dim(&util::pad(if i == 0 { "follow-up" } else { "" }, 9)),
             p.dim(&k.id),
             p.dim(&util::pad(k.status().as_str(), 8)),
             util::truncate(&k.title, 56)
@@ -3860,6 +3940,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Tasks,
+                order: 25,
+                text: r##"  wsp add "title" --from <id>       a follow-up: work found while doing <id>, filed where
+                                    <id> is; it records where it came from and never holds
+                                    <id> open (a sub-task is --parent, the row's own work)"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
                 order: 30,
                 text: r##"  wsp add "title" --caption "…"     …with the line a glance reads, under 60"##,
             },
@@ -5378,6 +5465,50 @@ pub(crate) mod tests {
             assert!(store.bindings().contains_key("cpd-9"));
             assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "{st:?}: nothing ended");
         }
+    }
+
+    /// `wsp-345`: `wsp add --from` files a follow-up, recording `found_by` and
+    /// no parent, and `wsp done` closes its origin while it is open; a sub-task
+    /// (`--parent`) still holds its parent until it is finished. Both ends say
+    /// so in `show --json`, and `--parent` with `--from` is refused.
+    #[test]
+    fn a_follow_up_records_where_it_came_from_and_does_not_hold_it_open_and_a_sub_task_does() {
+        let _env = util::isolated("follow-up-from");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut origin = Task::new("the row being worked", "p-001");
+        origin.set_status(Status::Doing);
+        store.save_task(&origin).unwrap();
+        let filed = |s: &Store, title: &str| s.tasks().into_iter().find(|t| t.title == title).expect(title);
+
+        assert_eq!(add_from(&store, &parse(&["add", "found while doing it", "--from", "p-001"]), None), 0);
+        let found = filed(&store, "found while doing it");
+        assert_eq!((found.found_by.as_deref(), found.parent.as_deref()), (Some("p-001"), None), "found_by, never a parent");
+        assert_eq!(found.project, origin.project, "filed where it was found");
+        assert_eq!(add_from(&store, &parse(&["add", "both", "--from", "p-001", "--parent", "p-001"]), None), 2);
+        assert_eq!(add_from(&store, &parse(&["add", "from nothing", "--from", "p-404"]), None), 1);
+        assert!(store.tasks().iter().all(|t| t.title != "both" && t.title != "from nothing"), "a refusal files nothing");
+
+        let shown = show_json(&store, "p-001").unwrap();
+        assert_eq!(shown["follow_ups"][0]["id"], found.id.as_str(), "{shown}");
+        assert_eq!(show_json(&store, &found.id).unwrap()["found_by"], "p-001");
+
+        // A sub-task is part of the row's done-when: `done` refuses while it is open.
+        assert_eq!(add_from(&store, &parse(&["add", "a piece of it", "--parent", "p-001"]), None), 0);
+        let piece = filed(&store, "a piece of it");
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 1);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Doing);
+
+        // The sub-task finished, the open follow-up does not stop the close.
+        assert_eq!(done_with(&store, &parse(&["done", &piece.id]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(store.task(&found.id).unwrap().status().is_open(), "the follow-up is still open, and held nothing");
+
+        // And it is now a follow-up of a closed row on no list and under no
+        // seat: what `wsp ls` and `wsp wip` name.
+        let unheld = crate::follow_up::unheld(&store);
+        assert_eq!(unheld.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec![found.id.as_str()]);
     }
 
     fn scratch_file(name: &str, text: &str) -> String {

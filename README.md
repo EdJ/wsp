@@ -209,7 +209,7 @@ with its evidence; it is not a routine to repeat. `wsp worklist advance` is
 still there, as the repair for a trigger that was lost.
 
 **A barrier can add its own tail** (`wsp-210`). A check that finds small work
-files the rows (`wsp add "…" --parent <member>`, with a **Done when:** line) and
+files the rows (`wsp add "…" --from <member>`, with a **Done when:** line) and
 answers with `wsp worklist followup` in place of `go` or `hold`. `--next` is
 "passes, with follow-ups": the rows become the next group, ahead of any group
 already planned and never at the end. `--blocking` is "holds, pending
@@ -3004,9 +3004,9 @@ The rules are the few that keep the tree honest:
   while it is a member at doing, is refused and names legs instead: commit,
   `wsp leg add` the rest, `wsp release` (`docs/legs.md`, *Staging a row
   already running*). `--anyway` files it regardless, and `wsp worklist
-  show` lists it as **unrun** under its member until it closes. A follow-up
-  under a member at review, and anything a person or a barrier check files,
-  is not refused.
+  show` lists it as **unrun** under its member until it closes. Anything a
+  person or a barrier check files, or a sub-task under a member at review,
+  is not refused; work found while doing a row is a follow-up, below.
 - **Filtering never drops a child.** A task whose parent is not in the list is
   drawn at the top level rather than hidden; a row indented under nothing is
   just a row that looks broken.
@@ -3041,6 +3041,29 @@ project by a half-applied move is precisely the state the rule exists to
 prevent. `counts_under` and the carry walk the tree through one shared function
 for the same reason `tally` is shared: two walks are two chances to disagree
 about what "beneath" means.
+
+### Follow-ups are not sub-tasks
+
+```sh
+wsp add "MAP.md names the old verb" --from 121   # found while doing 121
+wsp done 121                                     # not held open by it
+```
+
+A sub-task is part of its parent's own done-when: the parent is not done until
+it is, which is why `wsp done` refuses. **A follow-up** is work found while
+doing a row: a barrier's finding, a verifier's, a seat's "found while". It is
+filed with `--from <id>`, which records `found_by` (shown by `wsp show` on both
+rows, and in `--json`) and never sets a parent, so the row it came from closes
+when its own work is done (`wsp-345`). Filed as sub-tasks, follow-ups held
+their origin open until somebody ran `--force` or detached them by hand
+(wsp-121 held by wsp-341; wsp-155/wsp-156's 86 rows, wsp-303).
+
+A follow-up still has to be run. `wsp ls` and `wsp wip` name every open
+follow-up found by a row at review or done that no list and no seat holds, so
+one is not lost; put it on a list or pick it up. `wsp migrate --follow-ups`
+(run once by the daemon) made the follow-ups already filed as sub-tasks — open,
+under a row at review or done, and on none of its lists — follow-ups, with a log
+line on each.
 
 ## What a task rests on
 

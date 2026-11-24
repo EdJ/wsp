@@ -129,6 +129,11 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     if args.has("run-notices") {
         return run_notices(store, args);
     }
+    // `wsp-345`: sub-tasks of closed rows that are follow-ups. The daemon runs
+    // it once by itself; this is the same pass by hand, planned under `-n`.
+    if args.has("follow-ups") {
+        return crate::follow_up::migrate(store, args);
+    }
 
     let p = Paint::new();
     let (map, tops) = plan(store);
@@ -667,6 +672,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 text: r##"  wsp migrate --barrier-rows [-n]   every settled Barrier row wsp filed, moved
                                     onto its group's checks: and archived; open
                                     rows and hand-made ones are named and left"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 425,
+                text: r##"  wsp migrate --follow-ups [-n]     open sub-tasks under a row at review or done,
+                                    on none of its lists, made follow-ups (found_by
+                                    set, parent cleared); the daemon runs it once"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Plumbing,

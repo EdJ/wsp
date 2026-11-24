@@ -239,6 +239,7 @@ mod tests {
             head: wip::Head { attention: json!({"needs_you": [], "follow_up": []}), daemon: Some("up".into()), idle_memory: json!(null), inbox: 3, ..Default::default() },
             waiting_at_cap: vec!["wsp-1 waits".into()],
             planned_started: Some(vec![json!({"worklist": "w"})]),
+            unheld_follow_ups: vec![json!({"id": "wsp-341", "title": "a doc fix", "found_by": "wsp-121"})],
         };
         assert_eq!(wip::census_json(&again!(c)), wip::census_json(&c));
         let item = flag::Item {
@@ -263,7 +264,7 @@ mod tests {
 
         let bare = wip::Census::default();
         let v = wip::census_json(&again!(bare));
-        assert!(v.get("waiting_at_cap").is_none() && v.get("planned_started").is_none(), "the CLI's keys stay absent: {v}");
+        assert!(v.get("waiting_at_cap").is_none() && v.get("planned_started").is_none() && v.get("unheld_follow_ups").is_none(), "the CLI's keys stay absent: {v}");
     }
 
     /// wsp-743's measure: each reply the census takes, built in-process on the
