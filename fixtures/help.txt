@@ -423,7 +423,7 @@ AGENTS
   wsp agent seat-hook               the seat hook (claude-code/wsp-session.sh) this
                                     binary carries, which `wsp install` writes to
                                     ~/.claude/hooks for every seat's kill guard
-  wsp wip                           everything in flight, with agents
+  wsp wip [--json]                  everything in flight, with agents
   wsp stamp [--headless] [--json]   has anything changed? Three opaque tokens
                                     for a separate process polling on an
                                     interval — the records, the raised hands,
