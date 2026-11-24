@@ -15,7 +15,8 @@
 //! does not land; repair's idle-seat land passes the row by; and the notice
 //! says the row waits for its PR to merge rather than ordering a land.
 
-use crate::model::{project_of, WorklistStatus};
+use crate::log::LANDED;
+use crate::model::{project_of, Task, WorklistStatus};
 use crate::store::Store;
 
 /// The word for a project or list whose rows land by a PR's merge.
@@ -26,6 +27,16 @@ pub const DIRECT: &str = "direct";
 /// The marker the notice and the refusal share: what a by-merge row at review
 /// is waiting on. Golden in the tests; a reader greps for it.
 pub const WAITING: &str = "waiting for the PR to merge";
+
+/// The note on a landing line naming the branch tip it covers: a squash or
+/// rebase merge leaves that tip off the trunk, and [`covers`] reads it.
+pub const MERGED: &str = "· merged";
+
+/// Whether a landing on the row already covers the branch tip `tip`.
+pub fn covers(t: &Task, tip: &str) -> bool {
+    let note = format!("{MERGED} {}", tip.trim());
+    t.section("Log").is_some_and(|log| log.lines().any(|l| l.contains(LANDED) && l.contains(&note)))
+}
 
 /// `Some(true)` for by merge, `Some(false)` for the local land, `None` for a
 /// word this build does not know (read as nobody having said).

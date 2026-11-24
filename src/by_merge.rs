@@ -12,15 +12,12 @@ use std::time::{Duration, Instant};
 use wsp_base::calls::Command;
 
 use crate::cmd_checkout::{candidates, member_tree, open_pr_json, trunk, trunk_branch};
+use crate::lands::MERGED;
 use crate::model::{project_of, Task, Worklist};
 use crate::repair::LANDED;
 use crate::store::Store;
 use crate::util;
 use crate::worklist::Position;
-
-/// The note on a landing line naming the branch tip it covers: a squash or
-/// rebase merge leaves that tip off the trunk, and [`covers`] reads it.
-const MERGED: &str = "· merged";
 
 /// How often a repository's remote is fetched.
 const FETCH_EVERY: i64 = 60;
@@ -30,12 +27,6 @@ const FETCH_EVERY: i64 = 60;
 const FETCH_LIMIT: Duration = Duration::from_secs(30);
 
 static FETCHED: Mutex<Option<HashMap<(PathBuf, String), i64>>> = Mutex::new(None);
-
-/// Whether a landing on the row already covers the branch tip `tip`.
-pub(crate) fn covers(t: &Task, tip: &str) -> bool {
-    let note = format!("{MERGED} {}", tip.trim());
-    t.section("Log").is_some_and(|log| log.lines().any(|l| l.contains(LANDED) && l.contains(&note)))
-}
 
 /// Lands every settled by-merge member of the current group whose work the
 /// remote's trunk now holds.

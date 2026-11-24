@@ -736,11 +736,33 @@ pub fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
         if whose == Whose::Stranger {
             continue;
         }
-        let commits = ahead(repo, &onto, branch).len();
+        let commits = unlanded(repo, &onto, branch).len();
         out.push(Stray { branch: branch.to_string(), whose, commits });
     }
     out.sort_by(|a, b| a.branch.cmp(&b.branch));
     out
+}
+
+/// [`ahead`], less a branch whose tip a landing line on its row covers: a PR
+/// merged by squash or rebase leaves the tip off the trunk (`wsp-513`). The
+/// stale and gc decisions ask this; a commit past that tip is work again.
+fn unlanded(repo: &Path, onto: &str, branch: &str) -> Vec<String> {
+    let commits = ahead(repo, onto, branch);
+    if !commits.is_empty() && merged_by_note(repo, branch) {
+        return Vec::new();
+    }
+    commits
+}
+
+/// Whether the row `branch` is named for, open or archived, records its tip as merged.
+fn merged_by_note(repo: &Path, branch: &str) -> bool {
+    let Some(tip) = git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]) else { return false };
+    let store = Store::open();
+    let id = tree_row(branch);
+    store
+        .find_task(id)
+        .or_else(|| store.archived_task(id).map(|(t, _)| t))
+        .is_some_and(|t| crate::lands::covers(&t, &tip))
 }
 
 /// Take a branch that has nothing left on it.
@@ -758,6 +780,9 @@ pub fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
 /// the trunk has and this one has not, and in the unsafe direction for one this
 /// tree merged and the trunk never saw.
 ///
+/// The one `-D` is a branch whose tip the row records as merged
+/// ([`merged_by_note`]), which `-d` cannot see after a squash.
+///
 /// The guard is load-bearing beyond this function, and [`orphan`] is where that
 /// is written down: a renumbered task's work lives on a branch of the id it had
 /// then, with no tree, which is precisely what this is pointed at. The two rest
@@ -765,6 +790,7 @@ pub fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
 /// the other is what would break it.
 fn prune(trunk: &Path, branch: &str) -> bool {
     git(trunk, &["branch", "-d", branch]).is_some()
+        || (merged_by_note(trunk, branch) && git(trunk, &["branch", "-D", branch]).is_some())
 }
 
 /// Whether one tree is finished with, and why — or, in the `Err`, why it is
@@ -804,7 +830,7 @@ fn judge(repo: &Path, onto: &str, task: &str, dir: &Path, closed: bool, passed: 
     let Some(branch) = trunk_branch(dir) else {
         return Err("on a detached HEAD — no branch to compare with the trunk".into());
     };
-    let commits = ahead(repo, onto, &branch);
+    let commits = unlanded(repo, onto, &branch);
     if !commits.is_empty() {
         return Err(format!("{} on {branch} that {onto} has not got", n_commits(commits.len())));
     }
@@ -865,7 +891,7 @@ pub fn remove(repo: &Path, dir: &Path) -> Removed {
     // for `--sweep` and `--rm` that is routinely an agent's own task tree. See
     // [`prune`], which is the same one-line rule from the other direction.
     let at = trunk(repo).unwrap_or_else(|| repo.to_path_buf());
-    let kept = branch.filter(|b| git(&at, &["branch", "-d", b]).is_none());
+    let kept = branch.filter(|b| !prune(&at, b));
     Removed { existed, kept }
 }
 
@@ -888,7 +914,7 @@ pub fn remove(repo: &Path, dir: &Path) -> Removed {
 /// has not.
 fn foresee(repo: &Path, dir: &Path, onto: &str) -> Removed {
     let at = trunk(repo).unwrap_or_else(|| repo.to_path_buf());
-    let kept = trunk_branch(dir).filter(|b| !ahead(&at, onto, b).is_empty());
+    let kept = trunk_branch(dir).filter(|b| !unlanded(&at, onto, b).is_empty());
     Removed { existed: dir.exists(), kept }
 }
 
@@ -4686,6 +4712,46 @@ mod tests {
         let out = sweep_closed(&store, &["p-001".to_string()], false);
         assert!(out.removed.is_empty());
         assert!(out.kept[0].1.contains("wsp despawn p-001"), "{:?}", out.kept);
+    }
+
+    /// `wsp-513`: a PR merged by squash leaves the tip off the trunk, and the
+    /// landing line's note is what says it landed.
+    #[test]
+    fn a_squash_merged_rows_tree_is_collected_on_its_landing_note() {
+        let env = util::isolated("co-squashed");
+        let dir = lane(&env, "p", "p-001");
+        let store = Store::open();
+        let tree = checkout_dir(&dir, "p-001");
+        ensure(&dir, &tree, "p-001", "master").unwrap();
+        std::fs::write(tree.join("work.txt"), "work\n").unwrap();
+        run(&tree, &["add", "."]);
+        run(&tree, &["commit", "--quiet", "-m", "work"]);
+        run(&dir, &["merge", "--quiet", "--squash", "p-001"]);
+        run(&dir, &["commit", "--quiet", "-m", "squashed PR"]);
+        assert!(git_ok(&dir, &["merge-base", "--is-ancestor", "p-001", "master"]).is_err());
+        let tip = git(&dir, &["rev-parse", "p-001"]).unwrap().trim().to_string();
+        let passed = |_: &str| true;
+
+        assert!(stale(&dir, &|_| false, &passed).is_empty(), "no note: the branch still holds work");
+        assert_eq!(foresee(&dir, &tree, "master").kept.as_deref(), Some("p-001"));
+
+        let mut t = store.find_task("p-001").unwrap();
+        t.log(&format!("{} abc on master · since def {} {tip}", crate::log::LANDED, crate::lands::MERGED));
+        store.save_task(&t).unwrap();
+
+        let found = stale(&dir, &|_| false, &passed);
+        assert_eq!(found.iter().map(|s| s.why).collect::<Vec<_>>(), [Why::Landed]);
+        assert_eq!(foresee(&dir, &tree, "master").kept, None);
+        let out = sweep(&dir, &|_| false, &passed, &all_ours, &|_| None, false);
+        assert_eq!(out.removed, ["p-001"]);
+        assert!(out.branches.is_empty(), "{:?}", out.branches);
+        assert!(git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/p-001"]).is_none(), "the branch stayed");
+
+        // The same branch left without a tree is litter, not stranded work.
+        run(&dir, &["branch", "p-001", &tip]);
+        let out = sweep(&dir, &|_| false, &|_| false, &all_ours, &|_| None, false);
+        assert_eq!(out.pruned, ["p-001"]);
+        assert!(out.stranded.is_empty());
     }
 
     /// `wsp-508`: a piece's tree and branch are named by its id (`p-001-2`) and are
