@@ -116,6 +116,13 @@ const HOST_FNS: &[&str] = &[
     "last_written",
 ];
 
+/// Calls whose string arguments are a command handed to a kill guard as its
+/// payload, to see whether the guard refuses it: the guard reads the text and
+/// nothing runs it. `wsp doctor` probes the seat hook with a broad `pkill`
+/// through `guard_refuses` (wsp-428, wsp-501). A literal anywhere else, a
+/// `sh(...)` included, is read as before.
+const GUARD_PROBES: &[&str] = &["guard_refuses"];
+
 /// The paths the host's free functions are reached by: the host crate and its
 /// module, and the wire modules that hand them on (`pub use`).
 const HOST_MODS: &[&str] = &["wsp_host", "inproc", "host", "place_super", "place_compound"];
@@ -437,9 +444,13 @@ fn command_hits(src: &Src, sk: &str, out: &mut BTreeSet<String>) {
 /// `!`/`exec`/`xargs`, and followed by an argument. The bare word alone
 /// (`"ps"`, a label or one element of an argv) is not a shell line, and
 /// neither is one inside a markdown code span: that is a message showing a
-/// person (or an agent) a command, which nothing here runs.
-fn shell_hits(src: &Src, out: &mut BTreeSet<String>) {
-    for (_, _, lit) in src.literals() {
+/// person (or an agent) a command, which nothing here runs. Nor is an
+/// argument of a [`GUARD_PROBES`] call: a kill guard's payload.
+fn shell_hits(src: &Src, sk: &str, out: &mut BTreeSet<String>) {
+    for (at, _, lit) in src.literals() {
+        if callee(sk, at).is_some_and(|f| GUARD_PROBES.contains(&f)) {
+            continue;
+        }
         let b = lit.as_bytes();
         for prog in PROBES {
             for (i, _) in lit.match_indices(prog) {
@@ -465,6 +476,32 @@ fn shell_hits(src: &Src, out: &mut BTreeSet<String>) {
             }
         }
     }
+}
+
+/// The name of the call whose parens hold offset `at` directly (`f(a, "x")`
+/// gives `f`; `f(g("x"))` gives `g`), read on the skeleton. `None` outside any
+/// parens, or where the nearest open bracket is a `[` or `{` (an array, a
+/// block, a `json!` body).
+fn callee(sk: &str, at: usize) -> Option<&str> {
+    let b = sk.as_bytes();
+    let mut depth = 0i32;
+    let mut j = at;
+    while j > 0 {
+        j -= 1;
+        match b[j] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth > 0 => depth -= 1,
+            b'[' | b'{' => return None,
+            b'(' => {
+                let end = sk[..j].trim_end().len();
+                let start = sk[..end].rfind(|c: char| !(c.is_alphanumeric() || c == '_')).map_or(0, |k| k + 1);
+                return (start < end).then(|| &sk[start..end]);
+            }
+            b';' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `extern "C" { fn kill(...) }` and the like.
@@ -592,7 +629,7 @@ fn hits(src: &Src) -> BTreeSet<String> {
     let sk = src.skeleton();
     let mut out = BTreeSet::new();
     command_hits(src, &sk, &mut out);
-    shell_hits(src, &mut out);
+    shell_hits(src, &sk, &mut out);
     ffi_hits(src, &sk, &mut out);
     host_fn_hits(src, &sk, &mut out);
     transcript_hits(src, &sk, &mut out);
@@ -878,6 +915,13 @@ fn the_guard_reads_probes_in_product_code_and_not_in_tests_comments_or_prose() {
     assert_eq!(kinds("fn f() { ssh(\"cd x; ps -axo command= | grep y\"); }"), ["shell ps"]);
     assert_eq!(kinds("fn f() { sh(\"while kill -0 1; do sleep 1; done\"); }"), ["shell kill"]);
     assert_eq!(kinds("fn f() { sh(\"ioreg -r -n IODisplayWrangler\"); }"), ["shell ioreg"]);
+    // A kill guard's payload is read by the guard, not run (wsp-501); the same
+    // text run, or merely near the probe, is still a hit.
+    assert!(kinds("fn f(p: &Path) -> bool { guard_refuses(p, \"pkill -f yes\") }").is_empty(), "a kill guard's payload");
+    assert_eq!(kinds("fn f() { sh(\"pkill -f yes\"); }"), ["shell pkill"]);
+    assert_eq!(kinds("fn f(p: &Path) { guard_refuses(p, &sh(\"pkill -f yes\")); }"), ["shell pkill"]);
+    assert_eq!(kinds("fn f(p: &Path) { if guard_refuses(p, \"x\") { sh(\"pkill -f yes\"); } }"), ["shell pkill"]);
+    assert_eq!(kinds("fn f(p: &Path) { guard_refuses(p, &[\"pkill -f yes\"]); }"), ["shell pkill"]);
     assert!(
         kinds("fn f() { say(\"wait on a pid (`while kill -0 $pid; do sleep 5; done`), or `kill {pid}` first\"); }").is_empty(),
         "a command in a code span is prose for a person"
