@@ -208,6 +208,17 @@ pub(crate) trait Seats {
         false
     }
 
+    /// Let go of `row`'s claim, held by `seat`, which [`Seats::absent`] has
+    /// just called gone (`wsp-344`): binding and claim, with `why` on the row.
+    /// `true` when it was let go. An act verb on the port because the repair
+    /// tick that decides it is below the seats that own the release.
+    ///
+    /// **Defaults to `false`, releasing nothing**, for [`Seats::absent`]'s
+    /// reason: a fake that is not asked to act does not act.
+    fn release_gone(&self, _store: &Store, _row: &str, _seat: &str, _why: &str) -> bool {
+        false
+    }
+
     /// Whether a turn began at this seat at or after `since`, as the manager's
     /// events folded say ([`crate::fold::turn_began_since`]): the `turn` edge,
     /// or the turn an `order.acked` names. `None` is nobody can say, a seat

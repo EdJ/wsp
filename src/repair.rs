@@ -2225,11 +2225,9 @@ pub(crate) fn gone_seat_claims(store: &Store, seats: &dyn Seats) -> Vec<String> 
             continue;
         }
         let why = format!("its seat {seat} is gone — the manager holds no such seat, so wsp released the claim");
-        crate::cmd_agent::release_pane_because(store, &seat, &why);
-        if store.claims().contains_key(&row) {
-            crate::cmd_agent::hand_off(store, &row, None, &why);
+        if !seats.release_gone(store, &row, &seat, &why) {
+            continue;
         }
-        crate::lapse::seat_ended(store, &seat);
         released.push(format!("{row} ({seat})"));
     }
     if !released.is_empty() {
@@ -2736,6 +2734,10 @@ impl Seats for Absent {
     }
     fn absent(&self, seat: &str) -> bool {
         self.0.iter().any(|s| s == seat)
+    }
+    fn release_gone(&self, store: &Store, row: &str, seat: &str, why: &str) -> bool {
+        crate::cmd_spawn::release_gone(store, row, seat, why);
+        true
     }
 }
 

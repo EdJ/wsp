@@ -5138,6 +5138,20 @@ pub(crate) fn release_lost(store: &Store, row: &str, why: &str) -> Result<Lost, 
     Ok(Lost { seat, machine, far })
 }
 
+/// Let go of `row`'s claim held by `seat`, which every backend has reported
+/// gone (`wsp-344`): the binding and the claim go with `why` on the row's
+/// `## Log`, what the seat asked is closed, and nothing else — not the status,
+/// not the tree. The act behind [`crate::cycle::Seats::release_gone`], which
+/// is how the repair tick (engine) reaches it.
+pub(crate) fn release_gone(store: &Store, row: &str, seat: &str, why: &str) {
+    cmd_agent::release_pane_because(store, seat, why);
+    // A claim no binding stood for is still a claim.
+    if store.claims().contains_key(row) {
+        cmd_agent::hand_off(store, row, None, why);
+    }
+    crate::lapse::seat_ended(store, seat);
+}
+
 /// Which pane is running this despawn, and what it holds the seat of.
 ///
 /// Two facts about the caller rather than one, because two of this verb's
@@ -5949,6 +5963,11 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     fn pids(&self, seat: &str) -> Option<Vec<u32>> {
         let seat_id = Seat::new(seat);
         crate::cycle::Fleet::here(seat).find_map(|b| b.pids(&seat_id))
+    }
+
+    fn release_gone(&self, store: &Store, row: &str, seat: &str, why: &str) -> bool {
+        release_gone(store, row, seat, why);
+        true
     }
 
     fn typed(&self, seat: &str) -> Option<bool> {
