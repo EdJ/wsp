@@ -47,6 +47,37 @@ pub fn script(path: &Path, body: &str) {
     assert!(child.wait().unwrap().success(), "writing {}", path.display());
 }
 
+/// A stub `gh` first on `PATH` until dropped: `pr list --head <branch>` for
+/// the open PR it was made with is answered with that PR, any other question
+/// with `[]`. `PATH` is the process's, so the caller holds the environment lock
+/// (`util::isolated`) for as long as this lives, and drops this first.
+pub struct StubGh {
+    path: Option<std::ffi::OsString>,
+}
+
+impl StubGh {
+    /// The script is written in `bin`, which is created.
+    pub fn open_pr(bin: &Path, branch: &str, url: &str, head_oid: &str) -> StubGh {
+        std::fs::create_dir_all(bin).unwrap();
+        let pr = format!(r#"[{{"url":"{url}","headRefOid":"{head_oid}","headRefName":"{branch}"}}]"#);
+        let asked = format!("pr list --head {branch} --state open --json ");
+        script(&bin.join("gh"), &format!("#!/bin/sh\ncase \"$*\" in\n'{asked}'*) echo '{pr}' ;;\n*) echo '[]' ;;\nesac\n"));
+        let path = std::env::var_os("PATH");
+        let rest = path.iter().flat_map(std::env::split_paths);
+        std::env::set_var("PATH", std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(rest)).unwrap());
+        StubGh { path }
+    }
+}
+
+impl Drop for StubGh {
+    fn drop(&mut self) {
+        match &self.path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
 /// The empty repository every [`repo`] is a copy of, made on first use.
 fn template() -> &'static Path {
     static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();

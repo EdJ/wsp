@@ -3198,6 +3198,25 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 mod gh_bound_tests {
     use super::*;
 
+    #[test]
+    fn the_open_pr_a_gh_answers_with_is_read_on_a_github_remote_only() {
+        let env = util::isolated("co-gh-pr");
+        let store = Store::at(env.home(), env.state());
+        let repo = env.path("repo");
+        wsp_testkit::repo(&repo);
+        wsp_testkit::git(&repo, &["remote", "add", "origin", "https://elsewhere.invalid/o/r.git"]);
+        let url = "https://github.com/o/r/pull/7";
+        let _gh = wsp_testkit::StubGh::open_pr(&env.path("bin"), "t-1", url, "0123abcd");
+        let ask = |branch: &str| open_pr_json(&store, "t-1", &repo, branch, "url,headRefOid,headRefName");
+        assert_eq!(ask("t-1"), None, "no GitHub remote");
+
+        wsp_testkit::git(&repo, &["remote", "set-url", "origin", "https://github.invalid/o/r.git"]);
+        let pr = ask("t-1").expect("the stub's PR");
+        assert_eq!((pr["url"].as_str(), pr["headRefOid"].as_str(), pr["headRefName"].as_str()), (Some(url), Some("0123abcd"), Some("t-1")));
+        assert_eq!(open_pr(&store, "t-1", &repo, "t-1").as_deref(), Some(url));
+        assert_eq!(ask("t-2"), None, "an empty list is no PR");
+    }
+
     fn sh(script: &str, limit: Duration) -> Option<Vec<u8>> {
         let mut c = wsp_base::calls::Command::new("sh");
         c.args(["-c", script]);

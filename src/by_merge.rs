@@ -444,6 +444,29 @@ mod tests {
     }
 
     #[test]
+    fn the_pr_head_is_the_sha_gh_gives_for_the_open_pr() {
+        let f = fix("gh-head", true, &["work"], "m-1");
+        // The bare origin under a path that reads as GitHub, still fetchable.
+        let github = f._env.path("github.git");
+        std::fs::rename(f._env.path("origin.git"), &github).unwrap();
+        for dir in [&f.repo, &f.reviewer] {
+            git(dir, &["remote", "set-url", "origin", &github.display().to_string()]);
+        }
+        // The branch has moved past the sha gh names, so the branch fallback
+        // would give another.
+        git(&f.reviewer, &["checkout", "--quiet", "-b", "m-1", "origin/m-1"]);
+        let head = commit(&f.reviewer, "review-fix");
+        commit(&f.reviewer, "pushed-since");
+        git(&f.reviewer, &["push", "--quiet", "origin", "m-1"]);
+        let url = "https://github.com/o/r/pull/7";
+        let _gh = wsp_testkit::StubGh::open_pr(&f._env.path("bin"), "m-1", url, &head);
+
+        let t = f.store.find_task("m-1").unwrap();
+        let got = pr_head(&f.store, &t, &f.ready).expect("a head");
+        assert_eq!((got.sha, got.from.as_deref()), (head, Some(url)));
+    }
+
+    #[test]
     fn a_by_merge_rows_pass_reads_the_remote_branch_head() {
         let f = fix("pass", true, &["work"], "m-1");
         let (head, pass, order) = opened(&f);

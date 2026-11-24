@@ -2455,6 +2455,27 @@ mod tests {
         assert_ne!(g.trunk(), before);
     }
 
+    /// `wsp-515`: the same refusal with a PR open, as `gh` says it is.
+    #[test]
+    fn wsp_land_on_a_by_merge_row_with_an_open_pr_refuses_naming_its_url() {
+        let g = ground("by-merge-pr", "", &[("m.txt", "mine\n")], &[]);
+        let mut p = g.store.project("p").unwrap();
+        p.lands = crate::lands::BY_MERGE.into();
+        g.store.save_project(&p).unwrap();
+        git_t(&g.repo, &["remote", "add", "origin", "https://github.invalid/o/r.git"]);
+        let url = "https://github.com/o/r/pull/7";
+        let _gh = wsp_testkit::StubGh::open_pr(&g._env.path("bin"), "m-1", url, &g.ready);
+        let before = g.trunk();
+
+        assert_eq!(crate::cmd_checkout::land(&g.store, &Args::synth("land", &["m-1"], &[])), 1, "`wsp land` is refused");
+        // What it prints on stderr is this same refusal.
+        match crate::cmd_checkout::land_verdict(&g.store, "m-1") {
+            crate::cmd_checkout::Verdict::ByMerge(said) => assert!(said.contains(&format!("merge its PR, {url};")), "{said}"),
+            _ => panic!("the row lands by merge"),
+        }
+        assert_eq!(g.trunk(), before, "nothing reached the trunk");
+    }
+
     #[test]
     fn a_hold_whose_land_meets_a_dirty_tree_is_owed_its_land_not_a_block() {
         for (tag, trunk) in [("owed-ff", &[][..]), ("owed-moved", &[("t.txt", "theirs\n")][..])] {
