@@ -94,16 +94,21 @@ no longer has, and that file may only lose lines. `cargo test --test layering --
 Measured by it on 6 Nov (`ad10223`), with nothing moved yet: **171 upward edges, 335 symbols** (the spike gives the same 171
 with this map; the 80 / 207 of try 3 assume `p1` and `p2` have moved their symbols), and **890 distinct
 cross-component symbols over 60 of the 72 pairs** (the spike gives 890 too; the 499 / 49 below it does not reproduce).
+Re-measured on 24 Nov (`9cf9a3e`, wsp-432) with the 7 Nov map: 82 upward edges, 145 symbols. With the
+`engine` and `seats` rows re-derived (§5, phase 2) and the modules gone from the code dropped (`ended_panes`, `sync`,
+`herdr`, `place_herdr`, `detect_override`): **76 upward edges, 133 symbols; 1229 distinct cross-component symbols over
+44 of the 90 pairs**. Every module in the root package now sits in a phase 2 row or in `timeline`, `surface` or `top`,
+except `base` and `testkit`, whose names are also modules of `wsp-base` and `wsp-store` and which stay with them.
 
 | component | modules |
 |---|---|
-| `base` | `base`, `util`, `calls`, `fm`, `input`, `risk`, `memory`, `choices` |
+| `base` | `base`, `util`, `calls`, `fm`, `input`, `risk`, `choices` |
 | `host` | `facts`, `hooks`, `inproc`, `jobs`, `port`, `price`, `shed`, `tcp`, `test_sups` |
-| `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `lease`, `sharing`, `cmd_migrate`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
-| `wire` | `herdr`, `place`, `place_herdr`, `place_compound`, `place_super`, `host`, `host_tcp`, `host_inproc`, `artefact`, `cmd_mandate`, `cmd_hub`, `tunnel`, `far`, `launchd`, `systemd`, `manager`, `detect_override`, `fake` |
+| `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `lease`, `sharing`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags` |
+| `wire` | `place`, `place_compound`, `place_super`, `host`, `host_tcp`, `host_inproc`, `tunnel`, `far`, `launchd`, `systemd`, `manager`, `fake` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `job_place`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
-| `engine` | `stage`, `history`, `after`, `worklist`, `cycle`, `fold`, `mirror`, `orders`, `deliver`, `owed`, `classify`, `barrier`, `barrier_run`, `barrier_replay`, `verification`, `check`, `exit`, `leg_tree`, `cold`, `affected`, `build_output`, `list_sweep`, `did`, `closing`, `ending`, `repair`, `refusals`, `split`, `size_check`, `starts`, `stepping`, `stand_down`, `untaken`, `waiting`, `local_trust`, `legs`, `pieces`, `piece_seat`, `piece_close`, `inner`, `leg_seat`, `cmd_worklist`, `duplicate`, `cmd_task`, `door`, `reconcile`, `hub_sync`, `hub_cache`, `hub_journal`, `hub_lease`, `record_workspace`, `cmd_allocate`, `cmd_publish`, `cmd_whoami`, `cmd_login`, `cmd_initiative`, `cmd_submit`, `packet`, `packet_gen`, `verifier_packet`, `attention`, `kind_attention`, `cmd_attend`, `cmd_message`, `hold`, `hold_close`, `pickup`, `waits`, `scope`, `retro_yours`, `address`, `tell_log`, `scratch`, `disk`, `auto_close` |
-| `seats` | `agent_commands`, `ended_panes`, `kind_data`, `cmd_project`, `cmd_spawn`, `cmd_agent`, `cmd_resume`, `wake`, `room`, `cmd_govern`, `cmd_machine`, `cmd_sandbox`, `cmd_watch`, `cmd_brief`, `cmd_install`, `cmd_role`, `cmd_stamp`, `stuck`, `sync` |
+| `engine` | `address`, `affected`, `after`, `artefact`, `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `check`, `classify`, `closing`, `cmd_allocate`, `cmd_hub`, `cmd_initiative`, `cmd_login`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_publish`, `cmd_submit`, `cmd_task`, `cmd_whoami`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`, `history`, `hold`, `hold_close`, `hub_cache`, `hub_journal`, `hub_lease`, `hub_sync`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `local_trust`, `mirror`, `orders`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`, `pieces`, `reconcile`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `scope`, `scratch`, `size_check`, `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`, `verifier_packet`, `waiting`, `waits`, `worklist` |
+| `seats` | `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`, `cmd_install`, `cmd_machine`, `cmd_project`, `cmd_resume`, `cmd_role`, `cmd_sandbox`, `cmd_spawn`, `cmd_stamp`, `cmd_watch`, `kind_attention`, `kind_data`, `memory`, `room`, `wake` |
 | `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `spend`, `cmd_calls`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications`, `retro`, `retro_run`, `retro_series`, `stale` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
 | `top` | `main`, `registry`, `readonly`, `daemon`, `readings`, `cmd_piece` |
@@ -154,8 +159,9 @@ not a structure problem (row `c0-fixtures` below).
 | `wsp-hub` | `crates/hub` | multiplayer v1 (wsp-460) | the hub, a separate minimal service (`wsp-hub serve --config <file>`; the file is JSON: `data_dir`, `bind`, `port`, `peers`, `name`, loopback by default; `tls` {`cert`, `key`} (wsp-461) serves every connection over TLS and is required to bind any address that is not loopback): objects in `objects/ab/cdef…` keyed by hash (a temp file, a rename, an id present is not rewritten), refs and leases in one `hub.db` through `wsp-store-sqlite` (`refs.move` a compare-and-swap in one transaction, a lease's tokens the sqlite crate's own), and the verbs of wsp-459 answered through `Hub::answer`. Served on `wsp-server`'s carrier and connection loop (hello with the admin token `api.token` in the data dir, requests, subscribe), handed `Hub` as its `SyncVerbs` and `HubStore` as its store, whose event log reads the hub's announcement row as `ref.moved { workspace, subject, to }` (the subject's head now). Runs no agents and builds nothing. **Links `wsp-api`, `wsp-objects`, `wsp-server` (and `wsp-machines` through it), `wsp-store-contract` and `wsp-store-sqlite` only** (the second manifest, after the root's, that may name the sqlite crate); never the root, `wsp-store`, `wsp-manager`, `wsp-trees` or `wsp-host`: `tests/store.rs`'s `cargo tree` test and `tests/layering.rs`. `wsp-hub admin init --config <file> --admin <name>` (wsp-163, `admin`) makes the first admin through the bootstrap principal and prints its token once (the hub keeps the hash); the other admin verbs are the root crate's `wsp hub user|token|workspace|member` (`cmd_hub`), from a logged-in admin's spoke. `tests/serve.rs` runs the binary: two clients converge through it across a kill and a restart | — |
 | `wsp-machines` | `crates/machines` | state-core step 2 (wsp-118) | the state core's machines (docs/state-core.md sections 3 and 6), each a pure `Domain` over the contract; step 2's part is `orders::Orders`, 3.1's machine: `Orders::owns` (the seven `order.*` verbs, for the server's routing), `decide` (`order.send` → `queued`; `order.deliver` → `typed` by the holder of `deliver:<seat>` at its current token, to a seat `idle` or `working` (`started` for a `first` order) with no other order `typed`; the executor's `delivered`, `acked`, `refused` (`attempts + 1`, `failed` at `ATTEMPTS` = 3; `counts: false` no attempt) and `done`; `cancel` from any state but `done`), every refusal one of the contract's codes and drafting nothing, a repeat answer an empty decision; and `evolve` (the `order.*` events and `lease.*`). One test per transition and a table of every illegal one in `tests/orders.rs`, which stands in for conformance case 9 (fixed to `TestDomain`). `wsp-server`'s `domain::Composed` composes it beside the mirror (wsp-121). **Links `wsp-store-contract` alone**, beside `serde_json`, and its source names no IO and reads no clock: `tests/layering.rs` walks its path dependencies and its source | `crates/machines/MAP.md` |
 
-`disk` and `memory` are mapped to `base` in the layering table but stay in the root package: each reaches up
-(`cmd_checkout`, `place`). Dependencies are `serde_json` only (and `rusqlite`, in `wsp-store-sqlite` alone: D2); the members are path dependencies in the workspace.
+`disk` and `memory` stay in the root package; since wsp-432 the layering table maps them where they live, `disk` to
+`engine` and `memory` to `seats`, and neither reaches above its row but `disk -> cmd_sandbox` (inside the phase 2
+crate). Dependencies are `serde_json` only (and `rusqlite`, in `wsp-store-sqlite` alone: D2); the members are path dependencies in the workspace.
 The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
 the two layering tests); the 2534 above is the figure of 5 Nov.
 
@@ -318,6 +324,38 @@ After phase 2 (`engine` and `seats` cut): `wsp-surface` and `wsp-timeline`. The 
 **Phase 2, gated:** `engine` and `seats` (63k lines, 50% of the code) are cut only after `p5` has held for a
 fortnight and the contract-change share is known. If the share is above ~35% the gain is under 40% and the cut is not
 worth the churn, and the plan stops at six crates.
+
+**Phase 2's sets, re-derived on 24 Nov (wsp-432, `9cf9a3e`).** The map rows above, from today's `src/` and
+`cargo test --test layering -- --nocapture`; lines are non-test (up to the first `#[cfg(test)] mod`), counted by the
+test's own split. The root package holds 131.3k such lines in 125 modules.
+
+| set | modules | lines | upward lines out (module pairs) | distinct symbols, per pair as the test prints |
+|---|---|---|---|---|
+| `engine` | 78: the 7 Nov row less `ended_panes`, `cmd_attend` and `kind_attention`, plus `stuck`, and the root's `artefact`, `cmd_hub`, `cmd_mandate`, `cmd_migrate` (mapped to `wire` and `store`, never cut) | 66.2k | **49**: 28 to `seats`, 5 to `timeline`, 1 to `surface`, 15 to `top` | 59 / 12 / 1 / 2 |
+| `seats` | 19: the 7 Nov row less `ended_panes`, `sync` and `stuck`, plus `cmd_attend`, `kind_attention` and `memory` | 34.7k | **17**: 2 to `surface`, 1 to `timeline`, 14 to `top` | 6 / 1 / 8 |
+| one crate, `engine` + `seats` | 97 | 100.9k (77% of the root) | **38**: 29 to `top` (26 of them `-> main: Args`/`build_stamp`/`stamp_word`, 3 `-> daemon`), 6 to `timeline`, 3 to `surface` | 8 / 12 / 6 |
+
+The moves that cut edges, each found by trying every single and every pair of `engine` ↔ `seats` moves against
+`docs/components-upward.txt` (a move may only delete lines from it, since the test bounds the list by the trunk's):
+`cmd_attend` and `kind_attention` to `seats` (−3 lines: their uses of `agent_commands` and `cmd_agent`), `stuck` to
+`engine` (−1: `repair -> stuck`), `memory` from `base` to `seats` (−2: `memory -> cmd_spawn`, `memory -> place`).
+No other single or pair move cuts a line without adding one: `wake`, `room`, `cmd_govern`, `agent_commands` and
+`attention` each add more than they remove, because `seats` uses `engine` through 219 symbols and `engine` uses
+`seats` through 59. The two rows are one tangle, and the map can be moved no further without moving code.
+
+**Phase 2 is one crate, `engine` and `seats` together.** Two crates cost the 28 `engine -> seats` lines (59 symbols:
+`cycle`, `repair`, `stand_down`, `stage`, `waits` into `cmd_govern`, `wake`, `room`, `cmd_agent`, `cmd_spawn`,
+`agent_commands`, 15 lines; `cmd_task`, `cmd_worklist`, `cmd_message`, `leg_seat` into the same, 10; `attention ->
+cmd_watch`, `attention -> wake`, `disk -> cmd_sandbox`, 3), which is the `Fleet` port `p5` was meant to finish and did
+not, plus a second serial cut. What two buys is a seats-only edit rebuilding 34.7k lines instead of 100.9k; an edit
+to `engine` rebuilds `seats` either way. Of the 689 commits since 25 Oct that touch `src/`, 80 (12%) touch `seats`
+modules alone, against 195 `engine` alone, 95 both and 201 either beside other sets. So the crate is cut whole:
+the 38 lines out of it are the gate (`-> main`, `-> daemon`, `-> panel`, `-> cmd_attempts`, `-> cmd_cost`,
+`-> cmd_report`), the 28 `engine -> seats` lines stay in the list as a ratchet inside the crate, and the map keeps two
+rows so a later split starts from them. The seam rows that are left: wsp-434 (`-> main`, 26 lines out of the crate, 10
+more from `timeline` and `surface`), wsp-435 (`-> daemon`, `-> panel`, 6 lines), wsp-436 (`-> cmd_attempts`,
+`-> cmd_cost`, `-> cmd_report`, 6 lines), then the one cut, wsp-440. wsp-437, wsp-438, wsp-439 and wsp-441 leave the
+path to the cut.
 
 Hazards the order is built around: the cut rows touch every file in flight (rename detection is the only protection,
 hence pure moves and `git mv`); `tests/`-style paths in checks (`wsp check` scripts in each project's `## Checks`,

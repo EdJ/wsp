@@ -14,9 +14,7 @@ cmd_agent -> daemon: a_backend_answered, dead, health, running  # seats -> top
 cmd_agent -> main: Args  # seats -> top
 cmd_agent -> panel: BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL, glyph  # seats -> surface
 cmd_attempts -> main: Args  # timeline -> top
-cmd_attend -> agent_commands: *, self  # engine -> seats
-cmd_attend -> cmd_agent: learn_sessions  # engine -> seats
-cmd_attend -> main: Args  # engine -> top
+cmd_attend -> main: Args  # seats -> top
 cmd_brief -> daemon: a_backend_answered, dead, running  # seats -> top
 cmd_brief -> main: Args  # seats -> top
 cmd_burn -> main: Args  # timeline -> top
@@ -58,27 +56,23 @@ detail -> main: Args  # surface -> top
 disk -> cmd_sandbox: strays  # engine -> seats
 ending -> cmd_attempts: attempts_of  # engine -> timeline
 kanban -> main: Args  # surface -> top
-kind_attention -> agent_commands: Kind, Spawn  # engine -> seats
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
 leg_seat -> main: Args  # engine -> top
 legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
 legs -> main: Args  # engine -> top
-memory -> cmd_spawn: local_backends  # base -> seats
-memory -> place: *, Seat, Seated, State  # base -> wire
 packet -> main: Args  # engine -> top
 panel -> main: Args  # surface -> top
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
 repair -> cmd_govern: *  # engine -> seats
 repair -> cmd_spawn: seat_kind  # engine -> seats
-repair -> stuck: Kind, Stall  # engine -> seats
 repair -> wake: owed_to, scopes_owed  # engine -> seats
 stage -> cmd_agent: sentence  # engine -> seats
 stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats
 stand_down -> wake: owed_to  # engine -> seats
 story -> main: Args  # surface -> top
-stuck -> main: Args  # seats -> top
+stuck -> main: Args  # engine -> top
 timeline -> main: Args  # timeline -> top
 verification -> cmd_attempts: Row, attempts_of  # engine -> timeline
 verification -> main: Args  # engine -> top
