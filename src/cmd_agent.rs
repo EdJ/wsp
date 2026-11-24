@@ -7469,7 +7469,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
                 order: 510,
-                text: r##"  wsp wip                           everything in flight, with agents"##,
+                text: r##"  wsp wip [--json]                  everything in flight, with agents"##,
             },
         ],
     },
