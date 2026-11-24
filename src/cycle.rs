@@ -5312,6 +5312,8 @@ fn despawn_argv(target: &[&str], keep: bool) -> Vec<String> {
 pub(crate) fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String> {
     if cfg!(test) {
         #[cfg(test)]
+        tests::ON_END.with(|h| h.borrow().as_ref().map(|f| f(seat)));
+        #[cfg(test)]
         return tests::ENDED.with(|s| {
             s.borrow_mut().push(seat.to_string());
             if keep {
@@ -5910,6 +5912,10 @@ pub(crate) mod tests {
         pub(super) static PACK_MISSING: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
         pub(super) static END_FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Set, and it runs for each seat an end on this thread ends, standing
+        /// in for what a real `wsp despawn` does in its own process — as its
+        /// release writing on the row's log (`wsp-509`).
+        pub(crate) static ON_END: RefCell<Option<Box<dyn Fn(&str)>>> = const { RefCell::new(None) };
         /// The ends that asked for the tree to be kept (`--keep-tree`).
         pub(crate) static KEPT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// What `wsp-147`'s reconciler told a member's seat, as (task, sentence).

@@ -1428,7 +1428,10 @@ fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &d
                     eprintln!("wsp: could not end {seat} ({}) — its claim is released and {} closed; `wsp despawn --pane {seat}` ends it", util::truncate(e.trim(), 200), t.id);
                 }
             }
-            let mut t = t.clone();
+            // Read the row again: a real despawn runs in its own process, and
+            // its release writes "released after …" on this row's log
+            // (`wsp-509`). Saving the copy read before it would drop that line.
+            let mut t = store.task(&t.id).unwrap_or_else(|| t.clone());
             t.log(&format!("wsp: verification holds and {} sat idle — `wsp done` ended it and released the claim", seats.join(", ")));
             let _ = store.save_task(&t);
         } else if !seats.is_empty() {
@@ -5447,6 +5450,68 @@ pub(crate) mod tests {
         assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
         assert!(!store.claims().contains_key("p-001"));
         assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "nothing left to end");
+    }
+
+    /// `wsp-509`: a real despawn runs in its own process, and its release
+    /// writes "released after …" on the row's log while `wsp done` waits on
+    /// it. Done's own save reads the row after the despawn, so that line stays.
+    #[test]
+    fn done_keeps_the_line_the_despawn_writes_on_the_row() {
+        let _env = util::isolated("done-verified-despawn-log");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+        crate::cycle::tests::ON_END.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|seat: &str| {
+                // Another process: its own store handle, its own read and save.
+                let other = Store::open();
+                let mut t = other.task("p-001").unwrap();
+                t.log(&format!("released after 12m — {seat} ended"));
+                other.save_task(&t).unwrap();
+            }));
+        });
+
+        let code = done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Reads(vec![("cpd-9", State::Idle)]));
+        crate::cycle::tests::ON_END.with(|h| *h.borrow_mut() = None);
+        assert_eq!(code, 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("released after 12m — cpd-9 ended"), "done's save dropped the despawn's line: {log}");
+        assert!(log.contains("`wsp done` ended it and released the claim") && log.contains("→ done"), "{log}");
+    }
+
+    /// A seat no backend has: `state` reads `None`, `absent` reads true.
+    struct Absent;
+
+    impl crate::cycle::Seats for Absent {
+        fn state(&self, _: &str) -> Option<State> {
+            None
+        }
+        fn absent(&self, _: &str) -> bool {
+            true
+        }
+    }
+
+    /// `wsp-509`: a verified row whose seat `locate` still finds but the Seats
+    /// port positively does not have reads as idle (`standing_as`), so the close
+    /// goes through in one call and ends the seat as an idle one.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_live_by_locate_but_absent_by_the_port() {
+        let _env = util::isolated("done-verified-absent");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        assert_eq!(standing_as(&Absent, "cpd-9"), Standing::Idle);
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Absent), 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"), "the claim is released");
+        assert!(!store.bindings().contains_key("cpd-9"));
+        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the seat locate found is ended");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("`wsp done` ended it and released the claim"), "{log}");
     }
 
     /// `wsp-344`: a turn in progress still refuses the close, verified or not,
