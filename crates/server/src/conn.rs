@@ -260,6 +260,9 @@ impl Client<'_> {
                     if !self.answer_line(&line) {
                         return "closed, a reply could not be written".into();
                     }
+                    // A client waiting on its reply is not silent: the time taken to
+                    // answer (a page of rows near the line, wsp-377) is not its to count.
+                    heard = Instant::now();
                 }
                 Ok(None) => {}
                 Err(_) if self.revoked.load(Ordering::SeqCst) => return DROPPED.into(),

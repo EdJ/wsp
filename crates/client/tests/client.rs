@@ -454,6 +454,41 @@ fn the_census_reads_come_back_typed() {
     let _ = fs::remove_dir_all(&d);
 }
 
+/// `rows` on a store past the line (wsp-377): one reply of the rows whole is
+/// `too_large`, and `Client::rows` follows the pages itself, so the whole read
+/// through the client is the store's rows, every one, with no `too_large`.
+#[test]
+fn rows_whole_on_a_store_past_the_line_come_back_every_one_through_the_pages() {
+    let d = dir("rows-pages");
+    let store = mirror_store();
+    // 48 rows of 512 KB each: 24 MB of rows, past the 16 MB line.
+    let body = "x".repeat(512 * 1024);
+    let put: Vec<Entity> = (0..48)
+        .map(|i| {
+            let mut r = row(&format!("r-{i:02}"), "big");
+            r.fields.insert("body".into(), body.clone());
+            Entity::Row(r)
+        })
+        .collect();
+    apply(&store, put, vec![], "big");
+    let server = start(Arc::new(store.handle()), &d);
+    let mut c = dial(&d);
+    c.set_timeout(WAIT);
+
+    match c.request("rows", json!({})).unwrap().outcome {
+        Outcome::Err(f) => assert_eq!(f.code, Code::TooLarge, "{f:?}"),
+        Outcome::Ok(_) => panic!("rows {{}} answered past the line"),
+    }
+    let whole = store.rows(&RowFilter::default()).unwrap();
+    assert_eq!(c.rows(RowFilter::default()).unwrap(), whole, "every row, through the pages");
+    // A small page size still reads every row; `after` reads on from there.
+    assert_eq!(c.rows(RowFilter { limit: Some(5), ..Default::default() }).unwrap(), whole);
+    let tail = c.rows(RowFilter { after: Some(RowId("r-44".into())), ..Default::default() }).unwrap();
+    assert_eq!(tail.iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>(), ["r-45", "r-46", "r-47"]);
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_request_after_a_lost_connection_dials_again() {
     let d = dir("redial");

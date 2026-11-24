@@ -63,6 +63,11 @@ pub use sync::{ObjectSource, Stale, SyncError, SyncReport, IDS_PER_REQUEST, PUT_
 /// says otherwise (or the dial's `wait` is longer).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many rows [`Client::rows`] asks for in one page when its filter sets
+/// no `limit` (wsp-377). The server cuts a page shorter where the rows would
+/// take its reply past `MAX_LINE`, so this caps the count, not the bytes.
+pub const ROWS_PAGE: u32 = 1000;
+
 /// Why a request got no reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -315,14 +320,35 @@ impl Client {
         }
     }
 
-    /// The `rows` verb: the rows `filter` keeps, each as its head when
-    /// `filter.heads` (no `body` or `prose`), which is what keeps every row of
-    /// a full store under `MAX_LINE`.
+    /// The `rows` verb: every row `filter` keeps after `filter.after` (all
+    /// when unset), in id order, each as its head when `filter.heads` (no
+    /// `body` or `prose`). Read in pages (wsp-377) of up to `filter.limit`
+    /// rows ([`ROWS_PAGE`] when unset), each from the last id of the one
+    /// before, until a page brings no row past it. The server cuts each page
+    /// short of `MAX_LINE`, so a full store's rows whole come back where one
+    /// reply of them would be `too_large`. A server that does not page
+    /// answers every row to each ask; the second brings nothing new, and the
+    /// read ends there.
     pub fn rows(&mut self, filter: RowFilter) -> Result<Vec<Row>, Error> {
-        self.read_typed(Verb::Rows(filter), "rows", |a| match a {
-            Answer::Rows(rows) => Ok(rows),
-            other => Err(other),
-        })
+        let limit = filter.limit.unwrap_or(ROWS_PAGE);
+        let mut after = filter.after.clone();
+        let mut out = Vec::new();
+        loop {
+            let ask = RowFilter { after: after.clone(), limit: Some(limit), ..filter.clone() };
+            let page = self.read_typed(Verb::Rows(ask), "rows", |a| match a {
+                Answer::Rows(rows) => Ok(rows),
+                other => Err(other),
+            })?;
+            let mut fresh: Vec<Row> =
+                page.into_iter().filter(|r| after.as_ref().is_none_or(|a| r.id > *a)).collect();
+            if fresh.is_empty() {
+                break;
+            }
+            fresh.sort_by(|a, b| a.id.cmp(&b.id));
+            after = fresh.last().map(|r| r.id.clone());
+            out.extend(fresh);
+        }
+        Ok(out)
     }
 
     /// The `lists` verb: every list, each without its text when `filter.heads`.
