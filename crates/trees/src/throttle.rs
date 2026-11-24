@@ -339,6 +339,13 @@ pub fn parse_speed_limit(pmset: &str) -> Option<u32> {
     line.split('=').nth(1)?.trim().parse().ok()
 }
 
+/// The clock as `pmset` limits it: a limit under 100%, and none for an
+/// unlimited clock, whether `pmset` records no level or records 100 (which
+/// macOS does once a machine has run hot: wsp-370). That is the clock a
+/// manager's beat says ([`limit_of`]), which cannot tell the two apart, so
+/// `wip` draws the same cell through the API and through the files. Linux has
+/// no `pmset`, so there is no clock on either path. A pinned machine's
+/// `thermal` is taken as it is given.
 fn speed_limit() -> Option<u32> {
     if let Some(m) = pinned() {
         return m["thermal"].as_u64().map(|n| n as u32);
@@ -346,7 +353,14 @@ fn speed_limit() -> Option<u32> {
     if cfg!(test) {
         return None;
     }
-    parse_speed_limit(&LOCAL.thermal()?)
+    limited(parse_speed_limit(&LOCAL.thermal()?))
+}
+
+/// A `CPU_Speed_Limit` as a limit: under 100%, or none. The one rule for the
+/// clock cell, on the files path ([`speed_limit`]) and from a beat
+/// ([`limit_of`], `wip`'s `throttle_of_facts`).
+pub fn limited(pct: Option<u32>) -> Option<u32> {
+    pct.filter(|&p| p < 100)
 }
 
 /// Three load averages out of `/proc/loadavg` (`0.5 0.4 0.3 1/200 99`) or
@@ -2322,7 +2336,7 @@ impl Given {
 /// The clock a beat says, as `pmset` would have: a limit under 100%, and no
 /// cell for an unlimited clock (the beat says 100 where `pmset` records none).
 fn limit_of(f: &HostFacts) -> Option<u32> {
-    Given::of_facts(f).speed_limit.filter(|&p| p < 100)
+    limited(Given::of_facts(f).speed_limit)
 }
 
 /// The three load averages a beat says; a five- or fifteen-minute one it does
@@ -3005,6 +3019,34 @@ mod tests {
         assert_eq!(parse_speed_limit(PMSET), Some(31));
         assert_eq!(parse_speed_limit("Note: No thermal warning level has been recorded\n"), None);
         assert_eq!(parse_speed_limit("\tCPU_Speed_Limit \t= x\n"), None);
+    }
+
+    /// wsp-370: macOS records `CPU_Speed_Limit = 100` once it has run hot. The
+    /// beat says 100 for that and for no level recorded alike, so the files
+    /// path draws no cell for it either, and `wip` reads the same both ways.
+    #[test]
+    fn a_recorded_full_clock_is_no_limit_on_either_path() {
+        let recorded = "Note: No thermal warning level has been recorded\nCPU_Speed_Limit \t= 100\n";
+        assert_eq!(parse_speed_limit(recorded), Some(100));
+        assert_eq!(limited(parse_speed_limit(recorded)), None, "the files path");
+        assert_eq!(limited(parse_speed_limit("Note: No thermal warning level has been recorded\n")), None);
+        assert_eq!(limited(parse_speed_limit(PMSET)), Some(31), "a limited clock is drawn");
+        let beat = |pct| HostFacts {
+            load_centi: 0,
+            cpus: 8,
+            memory: wsp_host_api::MemoryPressure::Normal,
+            swap_used_bytes: 0,
+            disks: vec![],
+            thermal: Thermal::Nominal,
+            load5_centi: None,
+            load15_centi: None,
+            speed_limit_pct: pct,
+            hid_idle_secs: None,
+            free_memory_bytes: None,
+            pageouts: None,
+        };
+        assert_eq!(limit_of(&beat(Some(100))), limited(parse_speed_limit(recorded)), "the beat for the same pmset");
+        assert_eq!(limit_of(&beat(Some(31))), limited(parse_speed_limit(PMSET)));
     }
 
     #[test]

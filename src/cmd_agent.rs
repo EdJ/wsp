@@ -4766,7 +4766,7 @@ fn throttle_of_facts(store: &Store, f: Option<&crate::host_tcp::Facts>) -> Strin
     let given = crate::throttle::Given {
         load1: 0.0,
         cores: f.map(|f| f.cpus as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)),
-        speed_limit: f.and_then(|f| f.speed_limit_pct).filter(|&p| p < 100),
+        speed_limit: crate::throttle::limited(f.and_then(|f| f.speed_limit_pct)),
     };
     let idle = f.and_then(|f| f.hid_idle_secs);
     crate::throttle::View::of_beat(&store.state, given, idle).status_line()
