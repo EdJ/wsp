@@ -868,12 +868,35 @@ pub fn seated_of(seat: &c::Seat) -> crate::place::Seated {
 
 /// Reads the fingerprint half: tasks, claims, worklists, machines.
 pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
+    with_machines(store, read_records(store), local)
+}
+
+/// What [`read_rows_etc`] reads of everything but `machines.json`: the rows,
+/// claims and lists, and the seat's own facts. The mirror thread keeps the
+/// last one, so a pass that only `machines.json` moved re-reads the machines
+/// alone (wsp-767): an unreachable machine's tunnel rewrites that file every
+/// few seconds, and each rewrite cost a whole re-read of every row and list.
+#[derive(Clone, Debug)]
+pub struct Records {
+    entities: Vec<Entity>,
+    seat: BTreeMap<String, String>,
+}
+
+/// [`Records`], read now.
+pub fn read_records(store: &Store) -> Records {
     let tasks = store.tasks();
     let worklists = store.worklists();
-    let mut out = row_half(store, &tasks, &worklists);
-    out.extend(list_half(store, &tasks, worklists, Shown::Every));
+    let mut entities = row_half(store, &tasks, &worklists);
+    entities.extend(list_half(store, &tasks, worklists, Shown::Every));
+    Records { entities, seat: seat_facts(store) }
+}
+
+/// `records` with the machines as the files say them now, the seat's facts
+/// riding on the one named `local`: [`read_rows_etc`]'s whole answer.
+pub fn with_machines(store: &Store, records: Records, local: &str) -> Vec<Entity> {
+    let mut out = records.entities;
     out.extend(machines(&store.machines(), &store.machines_live(), local));
-    seat_machine(store, &mut out, local);
+    seat_machine(&mut out, records.seat, local);
     out
 }
 
@@ -977,7 +1000,20 @@ pub static SEAT_WORKING: std::sync::OnceLock<fn(&Store) -> Vec<String>> = std::s
 /// hostname, cap and the agents counted against it ride on the machine named
 /// `local` (wsp-308; keys in [`wsp_view::machine::key`]). A record named
 /// `local` takes the facts too.
-fn seat_machine(store: &Store, out: &mut Vec<Entity>, local: &str) {
+fn seat_machine(out: &mut Vec<Entity>, f: BTreeMap<String, String>, local: &str) {
+    for e in out.iter_mut() {
+        if let Entity::Machine(m) = e {
+            if m.name.0 == local {
+                m.facts.extend(f);
+                return;
+            }
+        }
+    }
+    out.push(Entity::Machine(c::Machine { name: MachineName(local.to_string()), transport: Transport::Local, beat: None, facts: f }));
+}
+
+/// [`seat_machine`]'s facts: nothing in them is read from `machines.json`.
+fn seat_facts(store: &Store) -> BTreeMap<String, String> {
     use wsp_view::machine::key as k;
     let cap = store.seat_cap();
     let mut f = BTreeMap::new();
@@ -990,15 +1026,7 @@ fn seat_machine(store: &Store, out: &mut Vec<Entity>, local: &str) {
         f.insert(k::SEAT_CAP.to_string(), n.to_string());
         f.insert(k::SEAT_WORKING.to_string(), serde_json::json!(SEAT_WORKING.get().map(|f| f(store)).unwrap_or_default()).to_string());
     }
-    for e in out.iter_mut() {
-        if let Entity::Machine(m) = e {
-            if m.name.0 == local {
-                m.facts.extend(f);
-                return;
-            }
-        }
-    }
-    out.push(Entity::Machine(c::Machine { name: MachineName(local.to_string()), transport: Transport::Local, beat: None, facts: f }));
+    f
 }
 
 /// A list's declared outputs as `{name, kind, file, present}` and the
@@ -1249,7 +1277,7 @@ pub const LOCAL: &str = "local";
 /// What moves a half: the stamp, plus (for the rows half) the mtimes of the
 /// state files neither stamp covers, `claims.json`, `machines.json` and
 /// `governors.json` (a vacated post takes a done list's [`c::WIP_SEATED`] off).
-fn stamp_of(store: &Store, half: Half) -> (u64, [Option<std::time::SystemTime>; 3]) {
+fn stamp_of(store: &Store, half: Half) -> Stamp {
     match half {
         Half::Attention => (store.attention_stamp(), [None, None, None]),
         Half::RowsEtc => {
@@ -1264,6 +1292,25 @@ fn read_half(store: &Store, half: Half) -> Vec<Entity> {
         Half::RowsEtc => read_rows_etc(store, LOCAL),
         Half::Attention => read_attention(store),
     }
+}
+
+/// [`stamp_of`]'s answer for a half.
+pub type Stamp = (u64, [Option<std::time::SystemTime>; 3]);
+
+/// The rows half's re-read at stamp `now`. Where `kept` holds the last
+/// reading and only `machines.json` has moved since its stamp — the
+/// fingerprint, `claims.json` and `governors.json` as they were — the
+/// machines alone are read again and the rest is `kept`'s (wsp-767);
+/// otherwise it is the whole [`read_rows_etc`], and `kept` becomes it.
+pub fn rows_etc_pass(store: &Store, now: &Stamp, kept: &mut Option<(Stamp, Records)>, local: &str) -> Vec<Entity> {
+    if let Some(((fp, f), r)) = kept.as_ref() {
+        if *fp == now.0 && f[0] == now.1[0] && f[2] == now.1[2] {
+            return with_machines(store, r.clone(), local);
+        }
+    }
+    let r = read_records(store);
+    *kept = Some((*now, r.clone()));
+    with_machines(store, r, local)
 }
 
 /// What `state` already holds of `half`, keyed by subject.
@@ -1321,7 +1368,9 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
             let store = Store::at(root, state);
             let say = |line: String| wsp_store::store::log_line(&store, &format!("mirror: {line}"));
             let mut seq = 0u64;
-            let mut stamps: [Option<(u64, [Option<std::time::SystemTime>; 3])>; 2] = [None, None];
+            let mut stamps: [Option<Stamp>; 2] = [None, None];
+            // The rows half's last reading but its machines ([`rows_etc_pass`]).
+            let mut kept: Option<(Stamp, Records)> = None;
             let mut last: [Option<BTreeMap<Subject, Entity>>; 2] = [None, None];
             // The soonest `until` a held barrier waits for (`wsp-095`): no file
             // moves when it comes, so the rows half is re-read then.
@@ -1329,6 +1378,7 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
             while !flag.load(Ordering::SeqCst) {
                 if due.is_some_and(|d| wsp_base::util::epoch_secs() >= d) {
                     stamps[0] = None;
+                    kept = None;
                     due = None;
                 }
                 for (i, half) in [Half::RowsEtc, Half::Attention].into_iter().enumerate() {
@@ -1347,7 +1397,10 @@ pub fn start(store: &Store, db: SharedStore) -> (std::thread::JoinHandle<()>, Ar
                             }
                         },
                     };
-                    let now = read_half(&store, half);
+                    let now = match half {
+                        Half::RowsEtc => rows_etc_pass(&store, &now_stamp, &mut kept, LOCAL),
+                        Half::Attention => read_half(&store, half),
+                    };
                     if half == Half::RowsEtc {
                         due = next_due(&now);
                     }
@@ -1557,6 +1610,39 @@ mod tests {
         both.extend(key(&read_attention(&s)));
         let Command::Mirror { gone, .. } = diff_half(&both, read_rows_etc(&s, "here"), Half::RowsEtc) else { panic!() };
         assert!(!gone.iter().any(|g| matches!(g, Subject::Ask(_))));
+    }
+
+    /// `wsp-767`: an unreachable machine's tunnel rewrites `machines.json`
+    /// every few seconds. A pass where only that file moved reads the machines
+    /// again and nothing else — no task directory walked — and says what the
+    /// whole re-read says; a task that moves is a whole re-read again.
+    #[test]
+    fn a_pass_where_only_machines_json_moved_reads_the_machines_alone() {
+        let s = seed("mirror-machines-only");
+        let live = |tunnel: &str| wsp_store::store::MachineLive { tunnel: tunnel.into(), ..Default::default() };
+        let mut kept = None;
+        let first = rows_etc_pass(&s, &stamp_of(&s, Half::RowsEtc), &mut kept, LOCAL);
+        assert_eq!(key(&first), key(&read_rows_etc(&s, LOCAL)));
+        s.set_machine_live("far", &live("retrying"));
+        let walks = wsp_store::store::dir_walks();
+        let moved = rows_etc_pass(&s, &stamp_of(&s, Half::RowsEtc), &mut kept, LOCAL);
+        assert_eq!(wsp_store::store::dir_walks(), walks, "no record directory is read for a machines.json move");
+        assert_eq!(key(&moved), key(&read_rows_etc(&s, LOCAL)), "what the whole re-read says");
+        let Entity::Machine(far) = &key(&moved)[&Subject::Machine(MachineName("far".into()))] else { panic!() };
+        assert_eq!(far.facts.get(wsp_view::machine::key::TUNNEL).map(String::as_str), Some("retrying"));
+        let Command::Mirror { put, gone } = diff_half(&key(&first), moved.clone(), Half::RowsEtc) else { panic!() };
+        assert_eq!((put.iter().map(subject_of).collect::<Vec<_>>(), gone), (vec![Subject::Machine(MachineName("far".into()))], vec![]));
+        // A task written is the whole re-read, and the row says it.
+        let mut t = s.task("wsp-1").unwrap();
+        t.status_raw = "doing".into();
+        s.save_task(&t).unwrap();
+        s.set_machine_live("far", &live("starting"));
+        let walks = wsp_store::store::dir_walks();
+        let whole = rows_etc_pass(&s, &stamp_of(&s, Half::RowsEtc), &mut kept, LOCAL);
+        assert!(wsp_store::store::dir_walks() > walks);
+        assert_eq!(key(&whole), key(&read_rows_etc(&s, LOCAL)));
+        let Entity::Row(r1) = &key(&whole)[&Subject::Row(RowId("wsp-1".into()))] else { panic!() };
+        assert_eq!(r1.state, RowState::Doing);
     }
 
     /// A restart's first pass diffs the files against what the database holds;

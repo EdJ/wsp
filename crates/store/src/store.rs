@@ -710,6 +710,7 @@ impl Store {
         generation: &Cell<u64>,
         collect: bool,
     ) -> Vec<T> {
+        DIR_WALKS.with(|n| n.set(n.get() + 1));
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(dir) else {
             if !cache.borrow().is_empty() {
@@ -6037,3 +6038,15 @@ mod tests {
     }
 }
 
+
+thread_local! {
+    static DIR_WALKS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many record directories this thread has listed and `stat`ed file by
+/// file, ever: one per `tasks()`, `worklists()` or `projects()` read outside a
+/// held pass. A test reads it before and after a pass to hold how many walks
+/// one mirror pass costs (`wsp-767`).
+pub fn dir_walks() -> u64 {
+    DIR_WALKS.with(|n| n.get())
+}
