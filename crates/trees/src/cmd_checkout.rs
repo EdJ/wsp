@@ -168,6 +168,8 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -2794,16 +2796,52 @@ pub fn open_pr_json(store: &Store, task: &str, dir: &Path, branch: &str, fields:
     if !url.contains("github") {
         return None;
     }
-    let out = wsp_base::calls::Command::new("gh")
-        .args(["pr", "list", "--head", branch, "--state", "open", "--json", fields])
+    let mut gh = wsp_base::calls::Command::new("gh");
+    gh.args(["pr", "list", "--head", branch, "--state", "open", "--json", fields])
         .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        // No prompt: the daemon has nobody to answer one.
+        .env("GH_PROMPT_DISABLED", "1");
+    let out = answer_within(gh, GH_LIMIT)?;
+    serde_json::from_slice::<Vec<serde_json::Value>>(&out).ok()?.into_iter().next()
+}
+
+/// How long `gh` may take before it is killed: the run cycle waits for it.
+const GH_LIMIT: Duration = Duration::from_secs(30);
+
+/// What `command` printed, if it succeeded within `limit`; else its process
+/// group is killed, it is reaped, and the answer is `None`.
+fn answer_within(mut command: wsp_base::calls::Command, limit: Duration) -> Option<Vec<u8>> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // A group of its own, so the kill reaches what it started.
+        .process_group(0);
+    let started = Instant::now();
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (send, said) = std::sync::mpsc::channel();
+    // Drained while waiting, so a long answer never fills the pipe.
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let read = std::io::Read::read_to_end(&mut stdout, &mut out);
+        let _ = send.send(read.map(|_| out));
+    });
+    // The end of the output first: something it started may hold the pipe
+    // after it has exited.
+    if let Ok(Ok(out)) = said.recv_timeout(limit) {
+        while started.elapsed() < limit {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success().then_some(out),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
     }
-    serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout).ok()?.into_iter().next()
+    crate::host::Host::signal_group(&crate::host::LOCAL, child.id(), "KILL");
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 pub fn land(store: &Store, args: &Args) -> i32 {
@@ -3129,6 +3167,31 @@ pub const VERBS: &[crate::verbs::Verb] = &[
         ],
     },
 ];
+
+#[cfg(test)]
+mod gh_bound_tests {
+    use super::*;
+
+    fn sh(script: &str, limit: Duration) -> Option<Vec<u8>> {
+        let mut c = wsp_base::calls::Command::new("sh");
+        c.args(["-c", script]);
+        answer_within(c, limit)
+    }
+
+    #[test]
+    fn a_gh_that_hangs_is_given_up_and_one_that_answers_is_read_whole() {
+        let long = Duration::from_secs(10);
+        assert_eq!(sh("head -c 1000000 /dev/zero", long).map(|o| o.len()), Some(1_000_000), "past a pipe's buffer");
+        assert_eq!(sh("echo no; exit 1", long), None);
+        // Hung itself, hung with its output closed, and gone with a child of
+        // its own still holding the pipe.
+        for script in ["sleep 30", "exec >&-; sleep 30", "sleep 30 & echo '[]'"] {
+            let started = Instant::now();
+            assert_eq!(sh(script, Duration::from_millis(300)), None, "{script}");
+            assert!(started.elapsed() < long, "{script} took {:?}", started.elapsed());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
