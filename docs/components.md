@@ -291,7 +291,7 @@ so `wsp install`, `build.rs` (the commit stamp), the throttle shim and `warm.rs`
 **Every row follows the rules of this repo:** one commit series per row in its own tree; rebase onto master before `wsp
 verify --release`; `wsp review`; a verifier lands it. A cut row is **pure moves**: `git mv` (so a concurrent edit to a
 moved file rebases across the rename), `Cargo.toml`, `pub use` shims at the old paths so no caller changes, and no
-logic edit. The check on every cut: `cargo test -- --list` counts the same tests before and after (2534 today).
+logic edit. The check on every cut: `cargo test -- --list` counts the same tests before and after (4102 today).
 Cut rows are serial: a second cut does not start until the first has landed and been installed.
 
 **Phase 0, seams inside the one crate (no crate yet; each row stands alone and removes build and context cost on its own):**
@@ -314,7 +314,7 @@ removed per risk; `p0` and `c0-fixtures` are first because they are independent 
 
 | row | crate | gate before the next cut |
 |---|---|---|
-| `c1` | workspace skeleton + `wsp-base` (+ `wsp-testkit`). `wsp verify`, declared `## Checks`, `affected`, `packet_gen` taught `-p` | install the result; edit `wsp-base` once and time it; the 2534 count |
+| `c1` | workspace skeleton + `wsp-base` (+ `wsp-testkit`). `wsp verify`, declared `## Checks`, `affected`, `packet_gen` taught `-p` | install the result; edit `wsp-base` once and time it; the 4102 count |
 | `c2` | `wsp-store`, after its seams (wsp-460) | edit it once and time it; the count of tests |
 | `c3` | `wsp-wire`, after its seams | |
 | `c4` | `wsp-trees`, after its seams | |
