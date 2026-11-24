@@ -158,6 +158,13 @@ pub fn env_lock() -> EnvGuard {
     };
     LAST_CHANGE.store(since_start(), SeqCst);
     *LAST_TAKER.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
+    // wsp-372: the first take in a process clears the seat the suite was run
+    // in, before the test that took it sets anything of its own.
+    if !OUTER_SEAT_CLEARED.swap(true, SeqCst) {
+        for key in SEAT_VARS {
+            std::env::remove_var(key);
+        }
+    }
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = done.clone();
     std::thread::spawn(move || {
@@ -232,6 +239,26 @@ pub struct Isolated {
 /// itself.
 #[cfg(any(test, feature = "test-support"))]
 pub const SEAT_VARS: [&str; 5] = [crate::base::seat::SEAT_ENV, "WSP_SEAT_KIND", "WSP_EXIT", "WSP_VERDICT", "WSP_SEAT_EPOCH"];
+
+/// Whether this process has cleared the seat it was started in ([`SEAT_VARS`]):
+/// the first [`env_lock`] does, holding the lock.
+#[cfg(any(test, feature = "test-support"))]
+static OUTER_SEAT_CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clear the seat a test process was started in, for a fixture that touches no
+/// other environment (the scratch store, `testkit::store`). [`isolated`] clears
+/// [`SEAT_VARS`] on every take; a test that never takes it saw the seat's values
+/// whenever it ran ahead of every test that did, which is always under nextest's
+/// one process per test (wsp-372: `cmd_worklist::tests::a_hold_leaves_its_check…`
+/// refused as a check's hold). Once per process, under [`ENV`]: a test that
+/// already holds the lock has had it done by its own take, so this never waits
+/// on itself, and after the first take it is one load.
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_outer_seat() {
+    if !OUTER_SEAT_CLEARED.load(std::sync::atomic::Ordering::SeqCst) {
+        drop(env_lock());
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn isolated(name: &str) -> Isolated {
@@ -1249,7 +1276,7 @@ mod tests {
         assert!(SEAT_VARS.contains(&"WSP_SEAT_ID") && SEAT_VARS.contains(&"WSP_SEAT_EPOCH"));
         {
             let _env = env_lock();
-            for (key, value) in [("WSP_SEAT_KIND", "check"), ("WSP_EXIT", "/x/exit.md"), ("WSP_VERDICT", "/x/verdict"), ("WSP_SEAT_ID", "w9:p9"), ("WSP_SEAT_EPOCH", "7")] {
+            for (key, value) in CHECK_SEAT {
                 std::env::set_var(key, value);
             }
         }
@@ -1257,6 +1284,38 @@ mod tests {
         for key in SEAT_VARS {
             assert_eq!(std::env::var(key).ok(), None, "{key} survives the isolation");
         }
+    }
+
+    /// The five variables as a check seat sets them.
+    const CHECK_SEAT: [(&str, &str); 5] = [("WSP_SEAT_KIND", "check"), ("WSP_EXIT", "/x/exit.md"), ("WSP_VERDICT", "/x/verdict"), ("WSP_SEAT_ID", "w9:p9"), ("WSP_SEAT_EPOCH", "7")];
+
+    /// What a fixture that never takes [`isolated`] does first (the scratch
+    /// store): after it, no seat variable is left. Run alone in a process
+    /// started inside a seat by the test below; beside the rest it holds too.
+    #[test]
+    fn a_fixture_that_skips_the_isolation_still_sees_no_seat() {
+        clear_outer_seat();
+        let _env = env_lock();
+        for key in SEAT_VARS {
+            assert_eq!(std::env::var(key).ok(), None, "{key} survives clear_outer_seat");
+        }
+    }
+
+    /// wsp-372: nextest runs every test in its own process, so a test that takes
+    /// no [`isolated`] runs ahead of every one that does. This runs the test
+    /// above that way, in a process started with a check seat's environment.
+    #[test]
+    fn a_process_started_in_a_check_seat_clears_it_for_a_test_without_the_isolation() {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["--exact", "util::tests::a_fixture_that_skips_the_isolation_still_sees_no_seat", "--test-threads=1"]);
+        for (key, value) in CHECK_SEAT {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{said}");
+        assert!(said.contains("1 passed"), "the probe ran: {said}");
     }
 
     /// `wsp add "-p" -p demo` reported "no such project `-p`", which sent the

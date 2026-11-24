@@ -4,7 +4,7 @@
 //! it stood up. Test-only; at cut `c1` it becomes the `wsp-testkit` dev-crate.
 //!
 //! **Stores.** [`store`] is a store in a directory of its own under the temp
-//! dir, with no environment touched, for tests that pass the store around;
+//! dir, with no environment touched but the outer seat's, for tests that pass the store around;
 //! [`isolated_store`] is a store at [`util::isolated`]'s `WSP_HOME`, for tests
 //! whose code under test calls `Store::open()` or reads the environment.
 //!
@@ -20,7 +20,12 @@ use crate::util;
 /// A store at `<temp>/wsp-<tag>-<pid>`, emptied first. The tag names the
 /// directory, so a module prefixes its own (`msg-…`) to keep clear of another
 /// module's tests running beside it.
+///
+/// It clears the seat the suite was started in ([`util::clear_outer_seat`],
+/// wsp-372): a `cargo test` inside a check seat otherwise sends a test's
+/// `worklist hold` through the check's validator.
 pub fn store(tag: &str) -> Store {
+    util::clear_outer_seat();
     let root = std::env::temp_dir().join(format!("wsp-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let store = Store::at(root.clone(), root.join("state"));
