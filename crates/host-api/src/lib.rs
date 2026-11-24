@@ -372,6 +372,12 @@ pub struct ManagerHello {
     /// The seats it runs now.
     pub seats: Vec<SeatEpoch>,
     pub capacity: Capacity,
+    /// The directory its jobs' `dir`s are under (its `--tree-root`), as it
+    /// runs now: what a client places a job relative to, rather than what an
+    /// install wrote beside the record (wsp-427). `None` from a manager
+    /// built before it said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_root: Option<String>,
 }
 
 /// An inclusive range of wire versions.

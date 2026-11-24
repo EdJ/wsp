@@ -130,9 +130,15 @@ impl Jobs {
 /// side places a job under; else the deepest directory all of them share.
 /// Two roots that share nothing but `/` are said by the caller, since `/`
 /// confines no job.
+///
+/// Each is compared as it resolves, symlinks followed, since that is how a
+/// job's `dir` is held to the root (`job_place::dir_under` canonicalizes
+/// both): on omarchy the roots are written `~/src/…` and `~/src` is a link to
+/// `/mnt/data/src`, so read as text every root was "under ~" and the root
+/// install wrote refused every build under `/mnt/data/src` (wsp-427).
 pub fn tree_root_for(home: &Path, roots: &[PathBuf]) -> PathBuf {
-    let roots: Vec<&PathBuf> = roots.iter().filter(|r| r.is_absolute()).collect();
-    if roots.iter().all(|r| r.starts_with(home)) {
+    let roots: Vec<PathBuf> = roots.iter().filter(|r| r.is_absolute()).map(|r| resolved(r)).collect();
+    if roots.iter().all(|r| r.starts_with(home) || r.starts_with(resolved(home))) {
         return home.to_path_buf();
     }
     let mut common: PathBuf = roots[0].to_path_buf();
@@ -144,6 +150,25 @@ pub fn tree_root_for(home: &Path, roots: &[PathBuf]) -> PathBuf {
         }
     }
     common
+}
+
+/// `path` with its symlinks followed: its deepest ancestor that is there
+/// canonicalized, the rest (not made yet) joined on as written.
+fn resolved(path: &Path) -> PathBuf {
+    let mut head = path.to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(real) = head.canonicalize() {
+            return tail.iter().rev().fold(real, |p, c: &std::ffi::OsString| p.join(c));
+        }
+        match (head.file_name().map(|n| n.to_os_string()), head.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                head = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 pub fn jobs_path(state: &Path) -> PathBuf {
@@ -366,6 +391,21 @@ pub fn health_with(
                         c.build, c.check, j.build, j.check
                     ));
                 }
+                // wsp-427: a drop-in that overrides ExecStart runs the manager
+                // on another root than the install wrote; a client that placed
+                // by jobs.json had every build under the real root refused.
+                if let Some(live) = m.tree_root.as_deref().map(Path::new) {
+                    if live != j.tree_root {
+                        problems.push(format!(
+                            "the manager runs with tree root {}, jobs.json says {} — a launcher drop-in overrides what `wsp install` wrote; builds place by the manager's own root, but fix the one that is wrong (the drop-in, or the projects' roots install reads)",
+                            util::contract(live),
+                            util::contract(&j.tree_root)
+                        ));
+                    }
+                }
+            }
+            if let Some(live) = &m.tree_root {
+                notes.push(format!("manager {} keeps its jobs under {}", m.host.0, util::contract(Path::new(live))));
             }
             sup_in_range(sup, m.compound_sup, problems, notes);
         }
@@ -521,7 +561,7 @@ mod tests {
         assert!(!problems.iter().any(|p| p.contains("the install wrote")), "{problems:?}");
 
         // Another capacity than the install wrote is a problem.
-        write_jobs(&state, &Jobs { build: 2, ..jobs }).unwrap();
+        write_jobs(&state, &Jobs { build: 2, ..jobs.clone() }).unwrap();
         let (mut problems, mut notes) = (vec![], vec![]);
         assert!(health(&state, None, wsp_manager::VERSION, &mut problems, &mut notes));
         assert!(problems.iter().any(|p| p.contains("runs 3 build and 6 check") && p.contains("the install wrote 2 and 6")), "{problems:?}");
@@ -533,12 +573,58 @@ mod tests {
     }
 
     #[test]
+    fn doctor_names_a_jobs_json_tree_root_that_is_not_the_running_managers() {
+        // wsp-427: the manager started on root A, jobs.json naming root B.
+        let root = scratch("root-427");
+        let exec = root.join("exec");
+        let state = root.join("state");
+        let (a, b) = (root.join("a"), root.join("b"));
+        let mut cfg = Config::new(&exec, "testhost");
+        cfg.port = 0;
+        cfg.tree_root = a.clone();
+        let m = Manager::start(cfg.clone()).expect("a manager starts on loopback");
+        let mut local = Local::new(&exec, m.addrs()[0].port());
+        local.host = "testhost".into();
+        install_record(&state, &local, Duration::from_secs(2)).unwrap();
+
+        let jobs = Jobs { build: cfg.build, check: cfg.check, tree_root: a.clone() };
+        write_jobs(&state, &jobs).unwrap();
+        let (mut problems, mut notes) = (vec![], vec![]);
+        assert!(health(&state, None, wsp_manager::VERSION, &mut problems, &mut notes));
+        assert!(!problems.iter().any(|p| p.contains("tree root")), "{problems:?}");
+        assert!(notes.iter().any(|n| n.contains("keeps its jobs under") && n.contains(&a.display().to_string())), "{notes:?}");
+
+        write_jobs(&state, &Jobs { tree_root: b.clone(), ..jobs }).unwrap();
+        let (mut problems, mut notes) = (vec![], vec![]);
+        assert!(health(&state, None, wsp_manager::VERSION, &mut problems, &mut notes));
+        let said = problems.iter().find(|p| p.contains("tree root")).unwrap_or_else(|| panic!("named: {problems:?}"));
+        assert!(said.contains(&a.display().to_string()) && said.contains(&b.display().to_string()), "{said}");
+
+        m.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tree_root_for_is_home_while_every_root_is_under_it() {
         let home = Path::new("/home/e");
         assert_eq!(tree_root_for(home, &[]), home);
         assert_eq!(tree_root_for(home, &["/home/e/a".into()]), home);
         assert_eq!(tree_root_for(home, &["/mnt/data/src/a".into(), "/mnt/data/src/b/c".into()]), Path::new("/mnt/data/src"));
         assert_eq!(Jobs::defaults().args()[..4], ["--build", "2", "--check", "4"]);
+    }
+
+    #[test]
+    fn tree_root_for_follows_a_home_link_to_the_volume_the_roots_are_on() {
+        // wsp-427 on omarchy: roots written ~/src/…, ~/src -> /mnt/data/src.
+        let d = scratch("root-link-427");
+        let (home, vol) = (d.join("home"), d.join("mnt/data/src"));
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(vol.join("private/wsp")).unwrap();
+        std::os::unix::fs::symlink(&vol, home.join("src")).unwrap();
+        let roots = [home.join("src/private/wsp"), home.join("src/private/not-made-yet")];
+        assert_eq!(tree_root_for(&home, &roots), vol.join("private").canonicalize().unwrap(), "the roots as they resolve");
+        assert_eq!(tree_root_for(&home, &[home.join("work/a")]), home, "a root really under home keeps home");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

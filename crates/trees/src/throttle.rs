@@ -1783,7 +1783,8 @@ pub fn beat_thermal(facts: &dyn Fn() -> Option<HostFacts>) -> impl Fn() -> Optio
 /// [`run_raw`] under `WSP_JOBS=manager`: the decision reads the manager's
 /// beat (d1 Q11: wsp keeps the decision), the holds the job table, and an
 /// admitted build is one `job.run` at the shim's cwd under the manager's tree
-/// root (the home directory, the manager's default).
+/// root as the running manager says it in its `hello` (wsp-427), not as
+/// `jobs.json` wrote it.
 fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, args: &[String]) -> i32 {
     let Some(on) = host.job_host() else {
         eprintln!("wsp: WSP_JOBS=manager and the manager did not say its host; the build was not run");
@@ -1820,7 +1821,7 @@ fn run_raw_on(store: &Store, host: &'static dyn crate::host::Host, tool: &str, a
         },
         body: &|task| store.find_task(task).map(|t| t.body).unwrap_or_default(),
     };
-    let tree_root = crate::job_place::installed_tree_root(&store.state);
+    let tree_root = crate::job_place::jobs_tree_root(host, &store.state);
     let outside = Some(inproc_anywhere(&store.state));
     let jobs = Jobs { host, on, tree_root, outside, env: std::env::vars().collect(), out: &out };
     run_on(&ctx, &jobs, tool, args)
@@ -3653,6 +3654,31 @@ mod manager_tests {
         assert_eq!(rows[0].0.row.0, "wsp-9");
         assert!(rows[0].0.job.starts_with("throttle:build@") && !rows[0].2, "{rows:?}");
         assert!(!builds_dir(&rig.state).join("slot-0").exists(), "the slot is let go: {:?}", said.borrow());
+        m.stop();
+    }
+
+    #[test]
+    fn the_shim_takes_its_tree_root_from_the_running_manager_not_a_jobs_json_that_names_another() {
+        // wsp-427: install wrote jobs.json with ~ while a systemd drop-in ran
+        // the manager on /mnt/data/src, and every build under it was refused.
+        let rig = rig("throttle-427-root");
+        mode(&rig, Mode::On, 2);
+        let m = manager(&rig);
+        let host = tcp(&rig, &m);
+        let elsewhere = rig.iso.path("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let wrote = wsp_wire::manager::Jobs { build: 2, check: 4, tree_root: elsewhere.clone() };
+        wsp_wire::manager::write_jobs(&rig.state, &wrote).unwrap();
+        assert_eq!(crate::job_place::installed_tree_root(&rig.state), elsewhere, "jobs.json names root B");
+        let root = crate::job_place::jobs_tree_root(&host, &rig.state);
+        assert_eq!(root, rig.root, "the manager's hello names root A, and A is the one used");
+        let said = RefCell::new(Vec::<String>::new());
+        let say = |l: &str| said.borrow_mut().push(l.to_string());
+        let got = Mutex::new(String::new());
+        let out = |t: &str| got.lock().unwrap().push_str(t);
+        let jobs = Jobs { host: &host, on: HostId("test-host".into()), tree_root: root, outside: None, env: caller_env(), out: &out };
+        assert_eq!(run_on(&ctx(&rig, &say), &jobs, "cargo", &s(&["build"])), 0, "the build under A runs: {:?}", said.borrow());
+        assert!(got.lock().unwrap().contains("built by job:"), "{:?}", said.borrow());
         m.stop();
     }
 

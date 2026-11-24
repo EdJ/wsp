@@ -276,6 +276,7 @@ pub fn fake_manager(state: &Path) {
                             journal_head: None,
                             seats: vec![SeatEpoch { seat: SeatId(SEAT.into()), epoch: Epoch(1) }],
                             capacity: Capacity { seats: 8, build: 2, check: 2 },
+                            tree_root: None,
                         })),
                         Message::Seats(_) => Message::SeatsList(SeatsList {
                             seats: vec![SeatRow {

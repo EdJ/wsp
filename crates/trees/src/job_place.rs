@@ -98,15 +98,29 @@ pub fn trunk_host() -> String {
 }
 
 /// The directory a host's manager keeps the trees it runs jobs in under (its
-/// `--tree-root`): what `wsp install` told it (`<state>/manager/jobs.json`,
-/// wsp-056), else the home directory, the manager's default.
+/// `--tree-root`): under `WSP_JOBS=manager`, what the running manager's
+/// `hello` says (wsp-427: a systemd drop-in may run it on another root than
+/// the install wrote); else what `wsp install` told it
+/// (`<state>/manager/jobs.json`, wsp-056), else the home directory, the
+/// manager's default.
 pub fn tree_root() -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(root) = TREE_ROOT.with(|r| r.borrow().clone()) {
         return root;
     }
     let state = std::env::var_os("WSP_STATE").map(PathBuf::from).unwrap_or_else(crate::store::Store::default_state);
-    installed_tree_root(&state)
+    match crate::throttle::manager_jobs(&state) {
+        Ok(Some(host)) => jobs_tree_root(host, &state),
+        _ => installed_tree_root(&state),
+    }
+}
+
+/// The tree root `host` places its jobs under: its own word (the manager's
+/// `hello`, wsp-427), else the one the install under `state` wrote. The shim
+/// and [`tree_root`] read it here, so a `jobs.json` that disagrees with the
+/// running manager refuses no build.
+pub fn jobs_tree_root(host: &dyn crate::host::Host, state: &Path) -> PathBuf {
+    host.job_tree_root().unwrap_or_else(|| installed_tree_root(state))
 }
 
 /// The tree root the install under `state` wrote into the manager's launcher,

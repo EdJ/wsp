@@ -199,6 +199,7 @@ fn manager_hello(shared: &Shared, head: Option<wsp_host_api::EventId>, seats: Ve
         journal_head: head,
         seats,
         capacity: shared.capacity(),
+        tree_root: Some(shared.cfg.tree_root.display().to_string()),
     }
 }
 

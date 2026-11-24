@@ -134,6 +134,7 @@ fn table() -> Vec<Frame> {
                 build: 2,
                 check: 4,
             },
+            tree_root: Some("/mnt/data/src".into()),
         }))),
         request(
             1,

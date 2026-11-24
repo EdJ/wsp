@@ -381,6 +381,14 @@ pub trait Host: Sync {
     fn job_host(&self) -> Option<HostId> {
         None
     }
+    /// The directory this host's jobs are placed under, as its running
+    /// manager's `hello` says it (wsp-427): not `<state>/manager/jobs.json`,
+    /// which an install writes from its own rule while a drop-in may run the
+    /// manager on another root. `None` where the host does not say it (the
+    /// in-process runner, a manager built before it did).
+    fn job_tree_root(&self) -> Option<PathBuf> {
+        None
+    }
     /// The host's facts as its manager's last beat read them (`seats`'s reply
     /// carries them): what the throttle decides on under `WSP_JOBS=manager`
     /// (d1 Q11, wsp-052), in place of its own `sysctl`, `pmset`, `ioreg` and

@@ -1208,6 +1208,9 @@ impl Host for Tcp {
     fn job_host(&self) -> Option<wsp_host_api::HostId> {
         self.hello().ok().map(|h| h.host)
     }
+    fn job_tree_root(&self) -> Option<PathBuf> {
+        self.hello().ok().and_then(|h| h.tree_root).map(PathBuf::from)
+    }
     fn facts(&self) -> Option<HostFacts> {
         self.seats_within(SILENT).ok().and_then(|l| l.host)
     }
