@@ -205,7 +205,7 @@ fn fetch_within(repo: &Path, remote: &str, branch: &str, limit: Duration) -> boo
             _ => break,
         }
     }
-    let _ = Command::new("kill").args(["-s", "KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+    crate::host::Host::signal_group(&crate::host::LOCAL, child.id(), "KILL");
     let _ = child.kill();
     let _ = child.wait();
     false

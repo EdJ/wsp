@@ -24,6 +24,8 @@ PROJECTS
                                     work is for, and which file in the repo
                                     holds the map of the code
   wsp project set <id> k=v…         name/parent/status/brief/tags/roots
+                                    lands=by-merge: rows reach the trunk only by
+                                    a PR's merge, never `wsp land` (direct undoes)
   wsp project rm <id> [--force] [-n]  retire it to the archive; --force orphans
                                     the tasks and children it still held, and -n
                                     names them without moving anything
@@ -734,7 +736,10 @@ WORKLISTS
                                     the earlier planned) and whether it waits for
                                     any executing list on its project (default on
                                     for wsp's own source). `--no-retro` gives the list no
-                                    timing retro when it clears. `new` takes them too.
+                                    timing retro when it clears. `--lands by-merge|direct|project`
+                                    says how its members reach the trunk, over the
+                                    project's `lands:` (by-merge: only a PR's merge).
+                                    `new` takes them too.
                                     `ls` and `next <slug>` say what a planned list
                                     waits on: room, throttle, after, alone, manual
   wsp worklist pickup               the daemon's pass over the planned lists, once:

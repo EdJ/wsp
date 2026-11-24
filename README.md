@@ -1741,6 +1741,13 @@ wsp verified wsp-148 --blocks --from verdict.md   # back to doing, verdict owed,
 
 **Verify before merge** (Ed, 2026-11-02). A member used to `wsp land` and a verifier then read the trunk, often in a tree whose `target/` was already gone, so verifying was a cold build and master carried unverified work for a while. Now `wsp review` only marks the member ready, the verifier stands in the member's own warm tree at the commit it is ready at, and the verdict lands the row.
 
+**Lands by merge** (`wsp-350`). Where work reaches the trunk only when a reviewer merges its PR, say so on the project (`wsp project set <p> lands=by-merge`). A list can override it for its members either way (`wsp worklist edit <l> --lands by-merge|direct|project`; `project` drops the override). Saying nothing is the local land described here. For a by-merge row:
+
+- `wsp land` refuses and names the open PR, or the branch to open one from. A `holds` verdict lands nothing, and the idle-seat repair leaves the row alone.
+- The notice says the row is `waiting for the PR to merge` and orders no land.
+- A verifier reads the head of the row's PR (found by `gh`, else the remote branch of the same name, else the ready commit), compared against the remote's trunk. The branch is not rebased on the local trunk. A new push to the PR opens no new pass until the row is ready again.
+- The daemon fetches the remote's trunk and records the landing once the ready commit's work is there: merged, rebased or squashed, from any branch. The local trunk is fast-forwarded when that is clean, and otherwise left, with the reason in the message. A squash is matched by patch, so one whose content was changed while merging is not recognised.
+
 `--holds` on a member that is ready and unlanded lands it, in the member's own
 tree: a fast-forward when the trunk has not moved since the checks ran, else a
 rebase and a rerun of only the checks the rebase can have affected, up to three
