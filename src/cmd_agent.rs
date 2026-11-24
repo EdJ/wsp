@@ -4035,7 +4035,7 @@ fn silent_lines(store: &Store) -> Vec<String> {
 }
 
 pub fn wip(store: &Store, args: &Args) -> i32 {
-    // The files unless `WSP_READ=api`; a silent or failed dial reads the files
+    // The API unless `WSP_READ=files`; a silent or failed dial reads the files
     // and says why, once (wsp-076). The orders, which under `WSP_ORDERS=store`
     // are read through the API on the files path too (wsp-127), are not dialled
     // for a second time after it failed: that is said on the same line.
@@ -4065,7 +4065,14 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     picked_up.extend(silent_lines(store));
     match args.json() {
         true => {
-            let mut v = wsp_view::wip::of_state(&state_with_wip(store, &w), util::epoch_secs());
+            let sw = match api {
+                Some(mut state) => {
+                    wip_overlay(&w, &mut state);
+                    state
+                }
+                None => state_with_wip(store, &w),
+            };
+            let mut v = wsp_view::wip::of_state(&sw, util::epoch_secs());
             if let (Some(o), false) = (v.as_object_mut(), cap_waits.is_empty()) {
                 o.insert("waiting_at_cap".into(), serde_json::json!(cap_waits));
             }
@@ -4799,12 +4806,11 @@ fn load_of_facts(store: &Store, f: &crate::host_tcp::Facts) -> Option<String> {
 /// 4.6 (c)).
 const API_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Whether `wip` reads through the API: only under `WSP_READ=api`. Unset or
-/// anything else is the files path and never dials, because on a full store the
-/// API path costs about five times the files' CPU until it meets state-core's
-/// step 1 bar.
+/// Whether `wip` reads through the API: unless `WSP_READ=files`, which never
+/// dials. The `wip` verb's reply is cut under `MAX_LINE`, and the one overlay
+/// `--json` prints is laid on it rather than on a `State` rebuilt from the files.
 fn wip_reads_api() -> bool {
-    std::env::var("WSP_READ").is_ok_and(|v| v.trim() == "api")
+    !std::env::var("WSP_READ").is_ok_and(|v| v.trim() == "files")
 }
 
 /// One `state` through the API, dialled within [`API_BUDGET`], or why not:
@@ -4813,10 +4819,10 @@ fn wip_reads_api() -> bool {
 fn api_state(store: &Store) -> Result<wsp_store_contract::State, String> {
     let mut client = wsp_client::Client::dial(&store.state, wsp_store_contract::Principal::Wsp("wip".into()), API_BUDGET)
         .map_err(|e| e.to_string())?;
-    match client.request("state", json!({})).map_err(|e| e.to_string())?.outcome {
-        wsp_api::Outcome::Ok(wsp_api::Answer::State { state, .. }) => Ok(state),
-        wsp_api::Outcome::Ok(_) => Err("`state` was answered with another verb's answer".into()),
-        wsp_api::Outcome::Err(f) => Err(format!("`state` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
+    match client.request("wip", json!({})).map_err(|e| e.to_string())?.outcome {
+        wsp_api::Outcome::Ok(wsp_api::Answer::Wip { state, .. }) => Ok(state),
+        wsp_api::Outcome::Ok(_) => Err("`wip` was answered with another verb's answer".into()),
+        wsp_api::Outcome::Err(f) => Err(format!("`wip` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
     }
 }
 
@@ -4830,7 +4836,7 @@ fn api_state(store: &Store) -> Result<wsp_store_contract::State, String> {
 /// work with none of those, which `wip` reads for its status, project and
 /// parent alone: three quarters of the store, and the files it no longer opens.
 fn wip_tasks(store: &Store) -> Vec<Task> {
-    store.tasks_read_where(wip_reads_in_full)
+    store.tasks_read_where(|h| h.status().is_open())
 }
 
 pub(crate) use crate::mirror::wip_reads_in_full;
@@ -5713,6 +5719,12 @@ pub(crate) fn wip_overlay(w: &Wip, state: &mut wsp_store_contract::State) {
     use wsp_store_contract as c;
     use wsp_view::wip::key;
     let (agents, head) = wip_view(w);
+    // A state the API cut carries what an earlier reading left on its seats:
+    // only the seats this one drew are agents.
+    for seat in state.seats.values_mut() {
+        seat.fields.remove(key::AGENT);
+        seat.fields.remove(key::OWED);
+    }
     for a in &agents {
         let id = c::SeatId(a.pane.clone());
         let seat = state.seats.entry(id.clone()).or_insert_with(|| c::Seat {
