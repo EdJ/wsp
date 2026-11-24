@@ -869,29 +869,104 @@ pub fn seated_of(seat: &c::Seat) -> crate::place::Seated {
 /// Reads the fingerprint half: tasks, claims, worklists, machines.
 pub fn read_rows_etc(store: &Store, local: &str) -> Vec<Entity> {
     let tasks = store.tasks();
-    let claims_file = store.claims();
     let worklists = store.worklists();
-    let texts = texts_of(store, &tasks);
-    let mut out = rows(&tasks, &claims_file, &worklists, &texts, &crate::stage::sayings(store));
-    {
-        // A review row's project chain, for `yours --json -p`'s count.
-        let index = crate::resolve::Index::new(store.projects());
-        for e in out.iter_mut() {
-            if let Entity::Row(r) = e {
-                let project = r.fields.get(key::PROJECT).cloned().unwrap_or_default();
-                if r.fields.get(key::STATUS).map(String::as_str) == Some("review") && !project.is_empty() {
-                    r.fields.insert(wsp_view::asks::key::CHAIN.to_string(), chain_of(&index, &project));
-                }
+    let mut out = row_half(store, &tasks, &worklists);
+    out.extend(list_half(store, &tasks, worklists, Shown::Every));
+    out.extend(machines(&store.machines(), &store.machines_live(), local));
+    seat_machine(store, &mut out, local);
+    out
+}
+
+/// [`read_rows_etc`]'s rows, with a review row's project chain, and claims.
+fn row_half(store: &Store, tasks: &[Task], worklists: &[Worklist]) -> Vec<Entity> {
+    let claims_file = store.claims();
+    let texts = texts_of(store, tasks);
+    let mut out = rows(tasks, &claims_file, worklists, &texts, &crate::stage::sayings(store));
+    // A review row's project chain, for `yours --json -p`'s count.
+    let index = crate::resolve::Index::new(store.projects());
+    for e in out.iter_mut() {
+        if let Entity::Row(r) = e {
+            let project = r.fields.get(key::PROJECT).cloned().unwrap_or_default();
+            if r.fields.get(key::STATUS).map(String::as_str) == Some("review") && !project.is_empty() {
+                r.fields.insert(wsp_view::asks::key::CHAIN.to_string(), chain_of(&index, &project));
             }
         }
     }
     out.extend(claims(&claims_file));
-    let mut ls = lists(&worklists, &tasks, &list_texts_of(store, &worklists), &store.governors());
-    list_facts(store, worklists.clone(), &mut ls);
-    out.extend(ls);
-    out.extend(machines(&store.machines(), &store.machines_live(), local));
-    seat_machine(store, &mut out, local);
     out
+}
+
+/// [`read_rows_etc`]'s lists, with [`list_facts`] and `shown`'s show facts.
+fn list_half(store: &Store, tasks: &[Task], worklists: Vec<Worklist>, shown: Shown) -> Vec<Entity> {
+    let mut ls = lists(&worklists, tasks, &list_texts_of(store, &worklists), &store.governors());
+    list_facts_of(store, worklists, &mut ls, shown);
+    ls
+}
+
+/// Which lists a read builds `worklist show --json`'s facts for
+/// ([`LIST_SHOW`]): each costs a pass over its members' stages, groups and
+/// history, and `show <slug>` printing one list must not pay for 200 (wsp-766).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown<'a> {
+    /// Every list: the mirror's and the daemon's whole State.
+    Every,
+    /// None: `worklist ls --json` prints the heads alone.
+    Heads,
+    /// The one list `show <slug> --json` prints.
+    One(&'a str),
+    /// Each list `show --all --json` prints without `--include-closed`.
+    Open,
+}
+
+impl Shown<'_> {
+    fn takes(self, l: &crate::worklist::Listed) -> bool {
+        match self {
+            Shown::Every => true,
+            Shown::Heads => false,
+            Shown::One(id) => l.list.id == id,
+            Shown::Open => l.segment != crate::worklist::Segment::Closed,
+        }
+    }
+}
+
+/// The lists alone, as [`state_of`] has them, but with `show --json`'s facts
+/// only on those `shown` takes: what `worklist ls --json` and `worklist show
+/// --json` print from (wsp-766). Every list's head facts are still built —
+/// `ls`'s order, segment and queue place are read across all of them.
+pub fn lists_state(store: &Store, shown: Shown) -> c::State {
+    let tasks = store.tasks();
+    let mut s = c::State::default();
+    for e in list_half(store, &tasks, store.worklists(), shown) {
+        if let Entity::List(l) = e {
+            s.lists.insert(l.id.clone(), l);
+        }
+    }
+    s
+}
+
+/// The rows, their claims and the seats, as [`state_of`] has them: what `ls
+/// --json` prints from (a row's stage reads its seats), without the lists'
+/// facts, the machines or the asks (wsp-766).
+pub fn rows_state(store: &Store, local: &str) -> c::State {
+    let tasks = store.tasks();
+    let worklists = store.worklists();
+    let mut s = c::State::default();
+    let seats = crate::fold::seats_of(store, local).into_iter().map(Entity::Seat);
+    for e in row_half(store, &tasks, &worklists).into_iter().chain(seats) {
+        match e {
+            Entity::Row(r) => {
+                s.rows.insert(r.id.clone(), r);
+            }
+            Entity::Claim(x) => {
+                s.claims.insert(x.row.clone(), x);
+            }
+            Entity::Seat(x) => {
+                s.seats.insert(x.id.clone(), x);
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 /// The agents counted against the seat's cap, named. Installed by `main`
@@ -949,6 +1024,11 @@ pub type ListShow = fn(&Store, &[crate::worklist::Listed]) -> Vec<Vec<(&'static 
 /// what it waits on. One `worklist::listing` and one `waits::read`, as the CLI does;
 /// and, through [`LIST_SHOW`], what `worklist show --json` draws beside the head.
 pub fn list_facts(store: &Store, lists: Vec<Worklist>, out: &mut [Entity]) {
+    list_facts_of(store, lists, out, Shown::Every)
+}
+
+/// [`list_facts`], with [`LIST_SHOW`]'s facts only for the lists `shown` takes.
+pub fn list_facts_of(store: &Store, lists: Vec<Worklist>, out: &mut [Entity], shown: Shown) {
     use wsp_view::worklist::key as k;
     let listed = crate::worklist::listing(store, lists);
     let waits = crate::waits::read(store, &listed);
@@ -981,6 +1061,10 @@ pub fn list_facts(store: &Store, lists: Vec<Worklist>, out: &mut [Entity]) {
         }
     }
     let Some(show) = LIST_SHOW.get() else { return };
+    let listed: Vec<crate::worklist::Listed> = listed.into_iter().filter(|l| shown.takes(l)).collect();
+    if listed.is_empty() {
+        return;
+    }
     for (l, facts) in listed.iter().zip(show(store, &listed)) {
         let Some(Entity::List(e)) = out.iter_mut().find(|e| matches!(e, Entity::List(x) if x.id.0 == l.list.id)) else { continue };
         for (key, value) in facts {

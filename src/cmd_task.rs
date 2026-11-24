@@ -3693,7 +3693,8 @@ const ARCHIVE_MAX: usize = 20;
 /// prints these bytes too (`wsp_view::task::ls_all`). Each row's stage is the
 /// mirror's half (`stage`, `stage_steps`, `stage_live`) with its seats' over it.
 pub(crate) fn rows_json(store: &Store, tasks: &[Task]) -> String {
-    let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    // Rows, claims and seats: no list's facts, machine or ask (wsp-766).
+    let state = crate::mirror::rows_state(store, crate::mirror::LOCAL);
     let picked: Vec<&wsp_store_contract::Row> =
         tasks.iter().filter_map(|t| state.rows.get(&wsp_store_contract::RowId(t.id.clone()))).collect();
     wsp_view::task::ls_rows(&state, &picked, util::epoch_secs())
