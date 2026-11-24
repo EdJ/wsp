@@ -571,7 +571,15 @@ impl<'a> Gate<'a> {
     /// place left is not one a list's start is judged on.
     pub(crate) fn free_places(&self) -> Option<usize> {
         let cap = self.cap?;
-        Some((cap * WHOLE).saturating_sub(load(&self.working())) / WHOLE)
+        Gate::free_of(Some(cap), &self.working())
+    }
+
+    /// [`Gate::free_places`] off a count of the working agents already taken,
+    /// for a reader that counted them once for more than this (`waits::read_on`,
+    /// wsp-767). `None` where there is no cap.
+    pub(crate) fn free_of(cap: Option<usize>, working: &[Counted]) -> Option<usize> {
+        let cap = cap?;
+        Some((cap * WHOLE).saturating_sub(load(working)) / WHOLE)
     }
 
     pub(crate) fn take_held(&self) -> Vec<(String, Vec<Counted>)> {

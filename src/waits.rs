@@ -282,8 +282,22 @@ impl Machine {
         // `holding_back` guards on `cfg!(test)` inside the trees crate, which is not under
         // test when this crate's tests run: on a throttled machine the live reading
         // held every planned list. The guard is asked here, in the crate under test.
-        Machine { free: free_places(store), cap: store.seat_cap(), throttled: (!cfg!(test)).then(|| crate::throttle::holding_back(store)).flatten() }
+        Machine { free: free_places(store), cap: store.seat_cap(), throttled: throttled(store) }
     }
+
+    /// [`Machine::now`], with the working agents counted by `working`, which
+    /// is asked only where there is a cap: [`read_on`] counts them once for
+    /// this and for [`idle_on_ed`] (wsp-767), where each had read every
+    /// record and asked every seat's backend on its own.
+    fn counted(store: &Store, working: &dyn Fn() -> Vec<crate::room::Counted>) -> Machine {
+        let cap = store.seat_cap();
+        let free = cap.and_then(|_| crate::room::Gate::free_of(cap, &working()));
+        Machine { free, cap, throttled: throttled(store) }
+    }
+}
+
+fn throttled(store: &Store) -> Option<crate::throttle::Pause> {
+    (!cfg!(test)).then(|| crate::throttle::holding_back(store)).flatten()
 }
 
 /// One planned list in queue order: whether it may start, and what its first
@@ -315,7 +329,11 @@ pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Ve
     }
     let seat_cap = store.seat_cap();
     let entries: Vec<Entry> = planned.iter().map(|l| entry_of(store, l, seat_cap)).collect();
-    let machine = machine.unwrap_or_else(|| Machine::now(store));
+    // One count of the working agents, taken when first asked, for the
+    // room and for the lists waiting on a person.
+    let counted: std::cell::OnceCell<Vec<crate::room::Counted>> = std::cell::OnceCell::new();
+    let working = || counted.get_or_init(|| crate::room::working_now(store, &crate::cycle::Fleet)).clone();
+    let machine = machine.unwrap_or_else(|| Machine::counted(store, &working));
     let mut world = World { free: machine.free, throttled: machine.throttled, ..World::default() };
     for l in listed {
         match l.phase(store).status {
@@ -326,7 +344,7 @@ pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Ve
             _ => {}
         }
     }
-    world.waiting_on_ed = idle_on_ed(store, listed);
+    world.waiting_on_ed = idle_on_ed(store, listed, &working);
     let need: std::collections::BTreeMap<String, (usize, usize, bool)> =
         entries.iter().map(|e| (e.id.clone(), (e.need, e.width, e.together))).collect();
     queue(entries, &world)
@@ -340,7 +358,7 @@ pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Ve
 
 /// The executing lists that wait on a person and have no seat of their own
 /// working (`wsp-435`). Reads the seats only when there is such a list.
-fn idle_on_ed(store: &Store, listed: &[Listed]) -> BTreeSet<String> {
+fn idle_on_ed(store: &Store, listed: &[Listed], working: &dyn Fn() -> Vec<crate::room::Counted>) -> BTreeSet<String> {
     let waiting: Vec<&Listed> = listed
         .iter()
         .filter(|l| {
@@ -351,7 +369,7 @@ fn idle_on_ed(store: &Store, listed: &[Listed]) -> BTreeSet<String> {
     if waiting.is_empty() {
         return BTreeSet::new();
     }
-    let working = crate::room::working_now(store, &crate::cycle::Fleet);
+    let working = working();
     waiting.into_iter().filter(|l| !has_a_seat_working(&l.list, &working)).map(|l| l.list.id.clone()).collect()
 }
 

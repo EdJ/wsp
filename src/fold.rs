@@ -413,7 +413,8 @@ fn scalars(m: &serde_json::Map<String, Value>, keys: &[&str], into: &mut BTreeMa
 
 /// The seat as the files now say it, over what the database held of it.
 fn seat_entity(store: &Store, db: &SharedStore, host: &str, seat: &str, state: SeatState) -> c::Seat {
-    let held = db.snapshot().ok().and_then(|(s, _)| s.seats.get(&SeatId(seat.to_string())).cloned());
+    // One seat, read alone: no snapshot of the whole state (wsp-757).
+    let held = db.seat(&SeatId(seat.to_string())).ok().flatten();
     // The state word is the event's.
     let census = match state {
         SeatState::Working => crate::place::State::Working,

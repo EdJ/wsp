@@ -710,6 +710,7 @@ impl Store {
         generation: &Cell<u64>,
         collect: bool,
     ) -> Vec<T> {
+        DIR_WALKS.with(|n| n.set(n.get() + 1));
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(dir) else {
             if !cache.borrow().is_empty() {
@@ -1364,9 +1365,12 @@ impl Store {
         out
     }
 
+    /// One task, by id, through the in-process cache: `stat`ed, and read and
+    /// parsed only when its file has moved since this process last parsed it
+    /// (`wsp-763`). The daemon's `spend` reading asks for every row written in
+    /// the week, every minute, and each asking was a fresh read of the file.
     pub fn task(&self, id: &str) -> Option<Task> {
-        let text = fs::read_to_string(self.task_path(id)).ok()?;
-        Some(Task::from_doc(&fm::parse(&text), id))
+        self.task_at(&self.task_path(id))
     }
 
     /// The user `row` is allocated to (`wsp allocate`, wsp-414): its own `for:`,
@@ -2141,6 +2145,22 @@ impl Store {
         // (`wsp-308`).
         crate::lapse::row_moved(self, &t.id, "row was archived");
         Ok(filed)
+    }
+
+    /// [`Store::archive_task`] for a sweep: files each task, then closes what
+    /// was raised about all of them in one pass instead of one scan per row.
+    /// Returns the ids that were filed.
+    pub fn archive_tasks(&self, ts: &[Task]) -> Vec<String> {
+        let mut filed = Vec::new();
+        for t in ts {
+            let month = if t.updated.len() >= 7 { &t.updated[0..7] } else { "unknown" };
+            let dir = self.archive_dir().join(month);
+            if self.file_away(&dir, &t.id, &t.render(), self.task_path(&t.id)).is_ok() {
+                filed.push(t.id.clone());
+            }
+        }
+        crate::lapse::rows_moved(self, &filed, "row was archived");
+        filed
     }
 
     /// Retire a project to `archive/projects/`, on the same terms as a task.
@@ -6018,3 +6038,15 @@ mod tests {
     }
 }
 
+
+thread_local! {
+    static DIR_WALKS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many record directories this thread has listed and `stat`ed file by
+/// file, ever: one per `tasks()`, `worklists()` or `projects()` read outside a
+/// held pass. A test reads it before and after a pass to hold how many walks
+/// one mirror pass costs (`wsp-767`).
+pub fn dir_walks() -> u64 {
+    DIR_WALKS.with(|n| n.get())
+}

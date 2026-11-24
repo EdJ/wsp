@@ -379,6 +379,46 @@ pub(crate) struct Api {
     _deliver: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     /// wsp-743: the census reads' inputs, beside the mirror's entities.
     _readings: Option<(std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// wsp-756: the compaction pass, ended with the daemon.
+    _compact: (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>),
+}
+
+/// How often the daemon compacts `state.db` (wsp-756): superseded `mirror.put`
+/// history dropped and the WAL truncated.
+pub(crate) const COMPACT_EVERY: Duration = Duration::from_secs(3600);
+
+/// One compaction, one `cycle.log` line when it did anything or failed.
+pub(crate) fn compact_once(store: &Store, db: &wsp_store_sqlite::SqliteStore) {
+    match db.compact() {
+        Ok(c) if c.deleted > 0 => wsp_store::store::log_line(
+            store,
+            &format!("compact: dropped {} superseded mirror.put event(s); wal {} bytes", c.deleted, c.wal_bytes),
+        ),
+        Ok(_) => {}
+        Err(e) => wsp_store::store::log_line(store, &format!("compact: failed ({e:?})")),
+    }
+}
+
+/// Compacts at once and then every `every`, until the flag is set.
+pub(crate) fn start_compaction(
+    store: &Store,
+    db: std::sync::Arc<wsp_store_sqlite::SqliteStore>,
+    every: Duration,
+) -> (std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, root, state) = (stop.clone(), store.root.clone(), store.state.clone());
+    let handle = std::thread::spawn(move || {
+        let store = Store::at(root, state); // a Store is not Send: built here
+        let mut last: Option<std::time::Instant> = None;
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if last.is_none_or(|t| t.elapsed() >= every) {
+                compact_once(&store, &db);
+                last = Some(std::time::Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    (handle, stop)
 }
 
 /// Open `state.db`, serve it, and start the mirror thread. Each failure is one
@@ -393,14 +433,14 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
     // decides them and the delivery worker runs beside the server (wsp-122).
     let orders = crate::orders::mode();
     let domain = std::sync::Arc::new(wsp_server::Composed::new(crate::orders::server_mode(orders)));
-    let db: wsp_server::SharedStore =
-        match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), domain) {
-            Ok(db) => std::sync::Arc::new(db),
-            Err(e) => {
-                say(format!("api: state.db did not open ({e:?}); the daemon runs without the API"));
-                return None;
-            }
-        };
+    let sqlite = match wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), domain) {
+        Ok(db) => std::sync::Arc::new(db),
+        Err(e) => {
+            say(format!("api: state.db did not open ({e:?}); the daemon runs without the API"));
+            return None;
+        }
+    };
+    let db: wsp_server::SharedStore = sqlite.clone();
     let mut cfg = wsp_server::Config::new(&store.state);
     cfg.port = crate::mirror::api_port();
     cfg.addrs = tailnet_addrs();
@@ -425,7 +465,8 @@ pub(crate) fn start_api(store: &Store) -> Option<Api> {
         crate::orders::Mode::Files => None,
     };
     let readings = crate::readings::start(store, db.clone());
-    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver, _readings: readings })
+    let compact = start_compaction(store, sqlite, COMPACT_EVERY);
+    Some(Api { db, _server: server, _mirror: mirror, _deliver: deliver, _readings: readings, _compact: compact })
 }
 
 /// What `doctor` says about the daemon: that there is one, that there are two,
@@ -1064,6 +1105,46 @@ mod tests {
     }
 
     use super::*;
+
+    /// wsp-756: the daemon's compaction thread runs `compact` on the store's
+    /// `state.db` (superseded `mirror.put` events go, the WAL is truncated) and
+    /// says so in `cycle.log`.
+    #[test]
+    fn the_daemon_compacts_state_db_on_its_schedule() {
+        let _env = crate::util::isolated("daemon-compact");
+        let store = Store::open();
+        use wsp_store_contract::{Command, Commands, Entity, EventId, Events, IdempotencyKey, Principal, ProjectId, Row, RowId, RowState};
+        let db = std::sync::Arc::new(
+            wsp_store_sqlite::SqliteStore::open(store.state.join("state.db"), std::sync::Arc::new(wsp_server::Mirror)).unwrap(),
+        );
+        for i in 0..4 {
+            let row = Row {
+                workspace: Default::default(),
+                id: RowId("wsp-1".into()),
+                project: ProjectId("wsp".into()),
+                title: format!("t{i}"),
+                state: RowState::Todo,
+                before_block: None,
+                seat: None,
+                group: None,
+                commit: None,
+                fields: Default::default(),
+            };
+            db.apply(Command::Mirror { put: vec![Entity::Row(row)], gone: Vec::new() }, IdempotencyKey(format!("k{i}")), Principal::Wsp("test".into()))
+                .unwrap();
+        }
+        assert_eq!(db.events_after(EventId(0), 100).unwrap().len(), 4);
+        let (handle, stop) = start_compaction(&store, db.clone(), Duration::from_secs(3600));
+        let start = std::time::Instant::now();
+        while db.events_after(EventId(0), 100).unwrap().len() != 1 {
+            assert!(start.elapsed() < Duration::from_secs(10), "the daemon never compacted");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap();
+        let log = std::fs::read_to_string(store.state.join("cycle.log")).unwrap_or_default();
+        assert!(log.contains("compact: dropped 3"), "cycle.log: {log}");
+    }
 
     /// One backend answering —
     /// compound's local directory, which never fails to survey — is enough to
@@ -1719,5 +1800,60 @@ mod tests {
             repairs(store, &Seats, &mut crate::repair::Pass::new());
             wsp_base::calls::tick_end();
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_tick {
+    use super::*;
+
+    /// wsp-763's done-when: once a tick has read the tree, a tick in which no
+    /// task file changed parses none — the repairs, the attention pass and every
+    /// reading the `readings` thread takes. The rows are all written today, so
+    /// each falls inside `spend`'s window, which read every one of them afresh
+    /// through `Store::task` every minute. And a file that does move is the one
+    /// parsed again, and no other.
+    #[test]
+    fn a_tick_with_no_changed_file_parses_nothing() {
+        let _env = crate::util::isolated("idle-tick-763");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        for i in 0..300 {
+            let mut t = wsp_store::model::Task::new(&format!("task {i}"), &format!("wsp-{i:03}"));
+            t.project = Some("wsp".into());
+            store.save_task(&t).unwrap();
+        }
+        let tick = |store: &Store| -> Vec<(String, u64)> {
+            let p = wsp_store::model::task_parses;
+            let mut by = Vec::new();
+            let a = p();
+            repairs(store, &crate::cycle::Fleet, &mut crate::repair::Pass::new());
+            by.push(("repairs".to_string(), p() - a));
+            let a = p();
+            let mut pass = attention::Pass::new();
+            store.steady(|| {
+                let mut source = attention::machine_source(store);
+                attention::tick(store, &mut pass, &mut source, crate::util::epoch_secs())
+            });
+            by.push(("attention".to_string(), p() - a));
+            for (name, _) in crate::readings::PERIODS {
+                let a = p();
+                assert!(crate::readings::take(store, name).is_some(), "{name} is a reading this build takes");
+                by.push((format!("reading {name}"), p() - a));
+            }
+            by
+        };
+        let cold: u64 = tick(&store).iter().map(|(_, n)| n).sum();
+        assert!(cold >= 300, "the first tick reads the tree: {cold}");
+        let warm = tick(&store);
+        assert!(warm.iter().all(|(_, n)| *n == 0), "a tick with nothing changed parsed: {warm:?}");
+
+        // One file moves: that one is parsed again, by whichever phase asks first.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut t = store.task("wsp-007").unwrap();
+        t.title = "moved".into();
+        store.save_task(&t).unwrap();
+        let moved: u64 = tick(&store).iter().map(|(_, n)| n).sum();
+        assert_eq!(moved, 1, "only the file that moved is parsed again");
     }
 }

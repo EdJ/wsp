@@ -2628,18 +2628,18 @@ fn save(store: &Store, w: &mut Worklist, groups: &[Group], what: &str, msg: &str
 // change that pays.
 
 pub fn list(store: &Store, args: &Args) -> i32 {
+    if args.json() {
+        // No collapse and no `--all` here: an abridgement is a thing done for
+        // a reader, and a parser is not one. The heads alone: `ls` prints no
+        // list's show facts (wsp-766).
+        let out = wsp_view::worklist::ls_of_state(&crate::mirror::lists_state(store, crate::mirror::Shown::Heads), wsp_base::util::epoch_secs());
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return 0;
+    }
     // Read once, whatever is drawn: `--all` reveals rows this already holds
     // rather than asking a second question of the store.
     let listed = worklist::listing(store, store.worklists());
     let all = args.has("all");
-
-    if args.json() {
-        // No collapse and no `--all` here: an abridgement is a thing done for
-        // a reader, and a parser is not one.
-        let out = wsp_view::worklist::ls_of_state(&crate::mirror::state_of(store, crate::mirror::LOCAL), wsp_base::util::epoch_secs());
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-        return 0;
-    }
     if listed.is_empty() {
         println!("no worklists yet — wsp worklist new <slug> \"title\"");
         return 0;
@@ -3440,6 +3440,7 @@ fn show_json(store: &Store, w: &Worklist, shared: &ShowShared, pos: &Position) -
 /// them back together; the position is `listed`'s own, as `show --all`'s was.
 pub(crate) fn show_facts(store: &Store, listed: &[worklist::Listed]) -> Vec<Vec<(&'static str, String)>> {
     use wsp_view::worklist::key as k;
+    SHOW_FACTS.with(|n| n.set(n.get() + listed.len() as u64));
     let shared = ShowShared::read(store, &listed.iter().map(|l| &l.list).collect::<Vec<_>>());
     listed
         .iter()
@@ -3462,6 +3463,17 @@ pub(crate) fn show_facts(store: &Store, listed: &[worklist::Listed]) -> Vec<Vec<
             ]
         })
         .collect()
+}
+
+thread_local! {
+    static SHOW_FACTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many lists this thread has built [`show_facts`] for, ever. A test reads
+/// it before and after a read to hold that `show <slug> --json` builds one
+/// list's, not every list's (wsp-766).
+pub(crate) fn show_facts_built() -> u64 {
+    SHOW_FACTS.with(|n| n.get())
 }
 
 /// What `show --json` reads that is the same for every list, read once: `--all`
@@ -3546,7 +3558,8 @@ fn show_all(store: &Store, args: &Args) -> i32 {
         return 2;
     }
     // Printed by `wsp-view` over a `State` (wsp-308): the daemon's lists, read
-    // through the API (wsp-375), else the one the files make. Only the lists:
+    // through the API (wsp-375), else the one the files make, where only the
+    // lists it prints carry their show facts (wsp-766). Only the lists:
     // `show_all_of_state` reads nothing else.
     let state = match show_reads_api() {
         false => None,
@@ -3559,7 +3572,10 @@ fn show_all(store: &Store, args: &Args) -> i32 {
             }
         },
     };
-    let state = state.unwrap_or_else(|| crate::mirror::state_of(store, crate::mirror::LOCAL));
+    let state = state.unwrap_or_else(|| {
+        let shown = if args.has("include-closed") { crate::mirror::Shown::Every } else { crate::mirror::Shown::Open };
+        crate::mirror::lists_state(store, shown)
+    });
     let out = wsp_view::worklist::show_all_of_state(&state, util::epoch_secs(), args.has("include-closed"));
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     0
@@ -3595,7 +3611,8 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     };
 
     if args.json() {
-        let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+        // The lists' heads, and this one's show facts alone (wsp-766).
+        let state = crate::mirror::lists_state(store, crate::mirror::Shown::One(&w.id));
         let mut out = wsp_view::worklist::show_of_state(&state, &w.id, util::epoch_secs()).unwrap_or_default();
         // Only where allocated (`wsp allocate`), as the file carries it.
         if let (Some(u), Some(head)) = (&w.for_user, out.get_mut("worklist")) {
@@ -8059,6 +8076,57 @@ mod tests {
         assert_eq!(wsp_view::worklist::show_all_of_state(&state, now, true).as_array().unwrap().len(), 4);
         let tms = wsp_view::worklist::show_of_state(&state, "tms", now).unwrap();
         assert!(!tms["groups"][0]["events"].as_array().unwrap().is_empty() && tms["hold_caption"].is_object(), "{tms}");
+    }
+
+    /// `wsp-766`: a `--json` read builds `show`'s facts only for the lists it
+    /// prints — `show <slug>` one, `show --all` the open ones, `ls` none — and
+    /// prints what the whole State says of them. Every list's facts was 148 s
+    /// for one `show` on a store of 208 lists.
+    #[test]
+    fn a_json_read_builds_show_facts_only_for_the_lists_it_prints() {
+        let (_env, store) = running("show-one");
+        let _ = crate::mirror::LIST_OUTPUTS.set(crate::cmd_report::list_outputs);
+        let _ = crate::mirror::LIST_SHOW.set(show_facts);
+        for (list, ids) in [("one", ["o-1", "o-2"]), ("two", ["t-1", "t-2"]), ("six", ["x-1", "x-2"])] {
+            for id in ids {
+                task(&store, id, "todo");
+            }
+            assert_eq!(run(&store, &["new", list, list]), 0);
+            assert_eq!(run(&store, &["add", list, ids[0]]), 0);
+            assert_eq!(run(&store, &["add", list, ids[1]]), 0);
+        }
+        task(&store, "f-1", "done");
+        assert_eq!(run(&store, &["new", "fin", "Fin"]), 0);
+        assert_eq!(run(&store, &["add", "fin", "f-1"]), 0);
+        let mut w = store.worklist("fin").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        let built = |argv: &[&str], flags: &[(&str, &str)]| {
+            let was = show_facts_built();
+            assert_eq!(dispatch(&store, &Args::synth("worklist", argv, flags)), 0);
+            show_facts_built() - was
+        };
+        let json = [("json", "true")];
+        assert_eq!(built(&["show", "two"], &json), 1, "show <slug> builds its own list's facts alone");
+        assert_eq!(built(&["show"], &[("all", "true"), ("json", "true")]), 3, "show --all: the open lists");
+        assert_eq!(built(&["show"], &[("all", "true"), ("json", "true"), ("include-closed", "true")]), 4);
+        assert_eq!(built(&["ls"], &json), 0, "ls --json prints no list's show facts");
+
+        // And what each prints is what the whole State says.
+        let now = util::epoch_secs();
+        let whole = crate::mirror::state_of(&store, crate::mirror::LOCAL);
+        for id in ["one", "two", "six", "fin"] {
+            let one = crate::mirror::lists_state(&store, crate::mirror::Shown::One(id));
+            let drawn = wsp_view::worklist::show_of_state(&one, id, now);
+            assert_eq!(drawn, wsp_view::worklist::show_of_state(&whole, id, now), "{id}");
+        }
+        let open = crate::mirror::lists_state(&store, crate::mirror::Shown::Open);
+        assert_eq!(wsp_view::worklist::show_all_of_state(&open, now, false), wsp_view::worklist::show_all_of_state(&whole, now, false));
+        let heads = crate::mirror::lists_state(&store, crate::mirror::Shown::Heads);
+        assert_eq!(wsp_view::worklist::ls_of_state(&heads, now), wsp_view::worklist::ls_of_state(&whole, now));
+        let rows = crate::mirror::rows_state(&store, crate::mirror::LOCAL);
+        let picked = |s: &wsp_store_contract::State| wsp_view::task::ls_all(s, now);
+        assert_eq!(picked(&rows), picked(&whole), "ls --json's rows");
     }
 
     /// `wsp-134`, Ed: configured when the group is created, with a sensible

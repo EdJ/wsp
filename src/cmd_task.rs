@@ -3624,12 +3624,12 @@ pub fn archive(store: &Store, args: &Args) -> i32 {
         .collect();
     due.sort_by(|a, b| a.updated.cmp(&b.updated).then_with(|| a.id.cmp(&b.id)));
 
-    let mut moved: Vec<Task> = Vec::new();
-    for t in due {
-        if dry || store.archive_task(&t).is_ok() {
-            moved.push(t);
-        }
-    }
+    let moved: Vec<Task> = if dry {
+        due
+    } else {
+        let filed: std::collections::HashSet<String> = store.archive_tasks(&due).into_iter().collect();
+        due.into_iter().filter(|t| filed.contains(&t.id)).collect()
+    };
     if !dry && !moved.is_empty() {
         store.git_commit(&format!("wsp: archive {} tasks", moved.len()));
     }
@@ -3697,7 +3697,8 @@ const ARCHIVE_MAX: usize = 20;
 /// prints these bytes too (`wsp_view::task::ls_all`). Each row's stage is the
 /// mirror's half (`stage`, `stage_steps`, `stage_live`) with its seats' over it.
 pub(crate) fn rows_json(store: &Store, tasks: &[Task]) -> String {
-    let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+    // Rows, claims and seats: no list's facts, machine or ask (wsp-766).
+    let state = crate::mirror::rows_state(store, crate::mirror::LOCAL);
     let picked: Vec<&wsp_store_contract::Row> =
         tasks.iter().filter_map(|t| state.rows.get(&wsp_store_contract::RowId(t.id.clone()))).collect();
     wsp_view::task::ls_rows(&state, &picked, util::epoch_secs())
@@ -4847,6 +4848,24 @@ pub(crate) mod tests {
         let all = Args::synth("find", &["reverb"], &[("all", ""), ("project", "wsp")]);
         let said = nothing(&store, &index, &all, Some("wsp"), "reverb");
         assert!(said.contains("1 in the archive") && !said.contains("--all"), "{said}");
+    }
+
+    /// wsp-764: a sweep files every due row in one pass and reports them all.
+    #[test]
+    fn a_sweep_archives_every_done_row_in_one_run() {
+        let store = scratch("sweep-batch");
+        store.save_project(&crate::model::Project::new("render")).unwrap();
+        for n in 0..30 {
+            let mut t = Task::new("old work", &format!("render-{n:03}"));
+            t.project = Some("render".into());
+            t.updated = "2026-01-15T22:08:05Z".into();
+            t.status_raw = "done".into();
+            store.save_task(&t).unwrap();
+        }
+        let args = Args::synth("archive", &[], &[("days", "0"), ("json", "")]);
+        assert_eq!(archive(&store, &args), 0);
+        assert!(store.tasks().is_empty());
+        assert_eq!(store.archived_ids().len(), 30);
     }
 
     /// The dead end this task was filed about: `find` could see the archive

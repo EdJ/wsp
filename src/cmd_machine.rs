@@ -200,11 +200,13 @@ impl Fleet {
 
 /// The working agents the seat's cap is held against, named. Empty with no
 /// cap: nothing counts against a number nobody set, and the reading asks
-/// every seat's backend.
+/// every seat's backend. One reading of the records and one look per seat,
+/// as the run's [`crate::room::Gate`] counts them but without its lock and
+/// its second reading, which only a start needs (wsp-767).
 pub(crate) fn seat_working(store: &Store) -> Vec<String> {
     match store.seat_cap() {
         None => Vec::new(),
-        Some(_) => crate::room::Gate::new(store, &crate::cycle::Fleet).working().iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
+        Some(_) => crate::room::working_now(store, &crate::cycle::Fleet).iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
     }
 }
 

@@ -2,13 +2,14 @@
 //!
 //! One `apply` is one `BEGIN IMMEDIATE ... COMMIT`, in this order: the key, the fence, `decide` on
 //! the stored state, the events stamped `MAX(id)+1..` and inserted, the state folded by `evolve`
-//! and written back, the key recorded. A refusal rolls back and records no key.
+//! and what changed of it written back (`entities`), the key recorded. A refusal rolls back and records no key.
 
 use std::sync::atomic::Ordering;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use wsp_store_contract::*;
 
+use crate::entities::{fold, with_state, Cache};
 use crate::{be, crashed, now, SqliteStore, ARMED, DEAD};
 
 /// The fence a command is issued under, if any (2.2); the contract names no accessor.
@@ -37,15 +38,6 @@ macro_rules! from_json {
 }
 
 pub(crate) use {from_json, to_json};
-
-/// The folded state as the state row holds it; empty before the first event.
-pub(crate) fn load_state(c: &Connection) -> Result<State> {
-    let row: Option<String> = c.query_row("SELECT json FROM state WHERE id = 1", [], |r| r.get(0)).optional().map_err(be)?;
-    match row {
-        Some(j) => from_json!(&j),
-        None => Ok(State::default()),
-    }
-}
 
 /// The last id committed, `0` when there is none.
 pub(crate) fn head_of(c: &Connection) -> Result<u64> {
@@ -83,21 +75,10 @@ pub(crate) fn insert_drafts(c: &Connection, drafts: Vec<Draft>, by: &Principal, 
     Ok(out)
 }
 
-/// Folds `events` into the state row (`at` is the id of the last one folded).
-pub(crate) fn fold(c: &Connection, domain: &dyn Domain, events: &[Event]) -> Result<()> {
-    let Some(last) = events.last() else { return Ok(()) };
-    let state = events.iter().fold(load_state(c)?, |s, e| domain.evolve(s, e));
-    c.execute(
-        "INSERT INTO state (id, json, at) VALUES (1, ?1, ?2) ON CONFLICT(id) DO UPDATE SET json = excluded.json, at = excluded.at",
-        params![to_json!(&state)?, last.id.0 as i64],
-    )
-    .map_err(be)?;
-    Ok(())
-}
-
 /// Writes one event the store causes itself (a lease's, a claim's, a text's), folded at once.
 pub(crate) fn write_event(
     c: &Connection,
+    cache: &Cache,
     domain: &dyn Domain,
     kind: EventKind,
     subject: Subject,
@@ -105,7 +86,7 @@ pub(crate) fn write_event(
     by: &Principal,
 ) -> Result<()> {
     let events = insert_drafts(c, vec![Draft { kind, subject, workspace: Default::default(), payload }], by, now())?;
-    fold(c, domain, &events)
+    fold(c, cache, domain, &events)
 }
 
 enum Outcome {
@@ -125,8 +106,7 @@ impl SqliteStore {
         if let Some(fence) = fence_of(&cmd) {
             check_fence(&tx, fence)?;
         }
-        let state = load_state(&tx)?;
-        let drafts = domain.decide(&state, &cmd, &by).map_err(Error::Refused)?;
+        let drafts = with_state(&tx, &self.cache, |s| domain.decide(s, &cmd, &by))?.map_err(Error::Refused)?;
         if self.hook.compare_exchange(ARMED, DEAD, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             let half = drafts.len() / 2;
             insert_drafts(&tx, drafts.into_iter().take(half).collect(), &by, now())?;
@@ -134,11 +114,17 @@ impl SqliteStore {
             return Ok(Outcome::Crashed);
         }
         let events = insert_drafts(&tx, drafts, &by, now())?;
-        fold(&tx, domain, &events)?;
-        let applied = Applied { events: events.iter().map(|e| e.id).collect() };
-        tx.execute("INSERT INTO command (key, result) VALUES (?1, ?2)", params![key.0, to_json!(&applied)?]).map_err(be)?;
-        tx.commit().map_err(be)?;
-        Ok(Outcome::Done(applied))
+        let written = (|| {
+            fold(&tx, &self.cache, domain, &events)?;
+            let applied = Applied { events: events.iter().map(|e| e.id).collect() };
+            tx.execute("INSERT INTO command (key, result) VALUES (?1, ?2)", params![key.0, to_json!(&applied)?]).map_err(be)?;
+            tx.commit().map_err(be)?;
+            Ok(applied)
+        })();
+        if written.is_err() {
+            self.cache.clear(); // it may hold the fold the rollback undid
+        }
+        Ok(Outcome::Done(written?))
     }
 }
 

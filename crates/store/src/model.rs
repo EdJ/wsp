@@ -1166,6 +1166,17 @@ impl TaskHead {
     }
 }
 
+thread_local! {
+    static TASK_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many task records this thread has built from a parsed file
+/// ([`Task::from_doc`]), ever. A test reads it before and after a pass to hold
+/// that a pass over a store nobody touched parses nothing (`wsp-763`).
+pub fn task_parses() -> u64 {
+    TASK_PARSES.with(|n| n.get())
+}
+
 impl Task {
     pub fn new(title: &str, id: &str) -> Task {
         let now = util::now_iso();
@@ -1327,6 +1338,7 @@ impl Task {
     }
 
     pub fn from_doc(doc: &Doc, fallback_id: &str) -> Task {
+        TASK_PARSES.with(|n| n.set(n.get() + 1));
         Task {
             id: doc.opt("id").unwrap_or_else(|| fallback_id.to_string()),
             title: doc.str("title"),

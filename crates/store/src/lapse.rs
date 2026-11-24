@@ -102,6 +102,28 @@ pub fn row_moved(store: &Store, task: &str, why: &str) -> Vec<String> {
     })
 }
 
+/// [`row_moved`] for many rows at once: one read of the bindings and one scan
+/// of the messages however many rows moved, which is what a sweep that retires
+/// thousands needs (`wsp-764`).
+pub fn rows_moved(store: &Store, tasks: &[String], why: &str) -> Vec<String> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+    let set: std::collections::HashSet<&str> = tasks.iter().map(|t| t.as_str()).collect();
+    let panes: std::collections::HashSet<String> = store
+        .bindings()
+        .iter()
+        .filter(|(_, b)| b.get("task_id").and_then(|x| x.as_str()).is_some_and(|t| set.contains(t)))
+        .map(|(pane, _)| pane.clone())
+        .collect();
+    close_where(store, &Party::lapsed(), |m| {
+        let about = m.about.task().is_some_and(|t| set.contains(t));
+        let held = m.waiting.as_ref().is_some_and(|w| set.contains(w.task.as_str()));
+        let from_there = matches!(&m.from, Party::Pane { pane, .. } if panes.contains(pane));
+        (about || held || from_there).then(|| why.to_string())
+    })
+}
+
 /// The agent in `pane` is gone — closed, despawned, or its seat vanished:
 /// everything it asked or raised from there is closed. *Agent closed.*
 pub fn seat_ended(store: &Store, pane: &str) -> Vec<String> {
