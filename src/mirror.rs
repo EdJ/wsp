@@ -187,8 +187,9 @@ fn placements(lists: &[Worklist]) -> BTreeMap<String, GroupId> {
 ///
 /// A row at review that is finished (`wsp-105`: verified, not reverted, no
 /// held barrier still judging it) carries `attention` = `needs-you`,
-/// `attention_text`, and `action` (`wsp done <id>`, Mark done), as groups and
-/// asks do. Where several are, each also carries [`ATTENTION_GROUP`], and
+/// `attention_text`, and `action` (`wsp done <id>`, Mark done, or the steps
+/// that make it close, and Send back: `wsp-315`), as groups and asks do. A
+/// row whose seat is working is not one. Where several are, each also carries [`ATTENTION_GROUP`], and
 /// the first by id alone `group_text` and `group_action` (wsp-755: a count
 /// that moves re-puts one row, not every member): the one item
 /// [`crate::classify::finished`] makes of them, Mark all done and its items.
@@ -198,10 +199,11 @@ pub fn rows(
     lists: &[Worklist],
     texts: &BTreeMap<String, String>,
     said: &BTreeMap<String, String>,
+    holders: &BTreeMap<String, crate::classify::Holder>,
 ) -> Vec<Entity> {
     let place = placements(lists);
     let mut staged = crate::stage::filed(tasks, lists, claims, said);
-    let finished = finished_rows(tasks, lists);
+    let finished = finished_rows(tasks, lists, holders);
     let group = (finished.len() > 1).then(|| finished_item(&finished)).flatten();
     tasks
         .iter()
@@ -298,7 +300,7 @@ pub fn shared_row(t: &Task, text: &str) -> Option<c::Row> {
         return None;
     }
     let texts = BTreeMap::from([(t.id.clone(), text.to_string())]);
-    rows(std::slice::from_ref(t), &BTreeMap::new(), &[], &texts, &BTreeMap::new()).into_iter().find_map(|e| match e {
+    rows(std::slice::from_ref(t), &BTreeMap::new(), &[], &texts, &BTreeMap::new(), &BTreeMap::new()).into_iter().find_map(|e| match e {
         Entity::Row(r) => Some(r),
         _ => None,
     })
@@ -434,7 +436,17 @@ fn reverted(t: &Task) -> bool {
 /// sorts it, by id: its newest verification holds, its change was not
 /// reverted, and no held or ready barrier's stop still judges it (a member of
 /// a group at `held` or `barrier`).
-pub(crate) fn finished_rows(tasks: &[Task], lists: &[Worklist]) -> BTreeMap<String, crate::classify::Attention> {
+///
+/// `wsp-315`: with what stands between it and `wsp done` — who stands on it
+/// (`holders`, by id, [`Holder::Nobody`](crate::classify::Holder) where it
+/// names none), its open sub-tasks, and whether a running list's run lands
+/// it — so its buttons are the ones that work, and a row whose seat is
+/// working is not among them.
+pub(crate) fn finished_rows(
+    tasks: &[Task],
+    lists: &[Worklist],
+    holders: &BTreeMap<String, crate::classify::Holder>,
+) -> BTreeMap<String, crate::classify::Attention> {
     let settled = settled_in(tasks);
     let mut judged: BTreeSet<String> = BTreeSet::new();
     for w in lists {
@@ -446,6 +458,7 @@ pub(crate) fn finished_rows(tasks: &[Task], lists: &[Worklist]) -> BTreeMap<Stri
             }
         }
     }
+    let running = crate::worklist::Running::over(lists);
     tasks
         .iter()
         .filter(|t| Status::parse(&t.status_raw) == Some(Status::Review))
@@ -455,9 +468,29 @@ pub(crate) fn finished_rows(tasks: &[Task], lists: &[Worklist]) -> BTreeMap<Stri
                 review: true,
                 verified: crate::verification::verified(tasks, &t.id),
                 owes: reverted(t) || judged.contains(&t.id),
+                holder: holders.get(&t.id).copied().unwrap_or_default(),
+                open: crate::resolve::counts_under(tasks, &t.id).open,
+                run_closes: running.of(&t.id).is_some_and(|p| p.run),
             };
             Some((t.id.clone(), crate::classify::of(crate::classify::Item::Row(row))?))
         })
+        .collect()
+}
+
+/// Who stands on a row as `wsp done` reads its seats (`wsp-315`). Installed
+/// by `main` (`cmd_task` reads the seats, and is above the mirror); unset,
+/// every row reads as held by nobody.
+pub static ROW_HOLDER: std::sync::OnceLock<fn(&Store, &str) -> crate::classify::Holder> = std::sync::OnceLock::new();
+
+/// [`ROW_HOLDER`] for each row at review whose verification holds — the only
+/// rows [`finished_rows`] can offer — leaving out those held by nobody.
+pub(crate) fn holders_of(store: &Store, tasks: &[Task]) -> BTreeMap<String, crate::classify::Holder> {
+    let Some(read) = ROW_HOLDER.get() else { return BTreeMap::new() };
+    tasks
+        .iter()
+        .filter(|t| Status::parse(&t.status_raw) == Some(Status::Review) && crate::verification::verified(tasks, &t.id))
+        .map(|t| (t.id.clone(), read(store, &t.id)))
+        .filter(|(_, h)| *h != crate::classify::Holder::Nobody)
         .collect()
 }
 
@@ -904,7 +937,7 @@ pub fn with_machines(store: &Store, records: Records, local: &str) -> Vec<Entity
 fn row_half(store: &Store, tasks: &[Task], worklists: &[Worklist]) -> Vec<Entity> {
     let claims_file = store.claims();
     let texts = texts_of(store, tasks);
-    let mut out = rows(tasks, &claims_file, worklists, &texts, &crate::stage::sayings(store));
+    let mut out = rows(tasks, &claims_file, worklists, &texts, &crate::stage::sayings(store), &holders_of(store, tasks));
     // A review row's project chain, for `yours --json -p`'s count.
     let index = crate::resolve::Index::new(store.projects());
     for e in out.iter_mut() {
@@ -2084,12 +2117,13 @@ mod tests {
 
         let read = |s: &Store| {
             let tasks = s.tasks();
-            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks), &BTreeMap::new())
+            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks), &BTreeMap::new(), &BTreeMap::new())
         };
         let es = read(&s);
         let f = |id: &str| row_of(&es, id).fields;
         let done = |id: &str| json!({ "verb": "done", "args": [id], "sentence": "none", "buttons": [
             { "label": "Mark done", "verb": "done", "args": [id], "sentence": "none" },
+            { "label": "Send back", "verb": "reopen", "args": [id], "sentence": "needed" },
         ] });
         for id in ["wsp-11", "wsp-12"] {
             let r = f(id);
@@ -2140,7 +2174,7 @@ mod tests {
         }
         let read = |s: &Store| {
             let tasks = s.tasks();
-            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks), &BTreeMap::new())
+            rows(&tasks, &BTreeMap::new(), &s.worklists(), &texts_of(s, &tasks), &BTreeMap::new(), &BTreeMap::new())
         };
         let before = read(&s);
         assert_eq!(row_of(&before, "wsp-20").fields.get("group_text").map(String::as_str), Some("3 finished rows to close"));

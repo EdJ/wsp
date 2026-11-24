@@ -4255,6 +4255,10 @@ pub(crate) struct Wip {
     /// section 3): the heading line, drawn as the dead daemon is, and the word
     /// (`unreachable 4m`) each of their seats wears in place of `gone`.
     pub silent: crate::far::Silence,
+    /// Who stands on each finished row (`wsp-315`): the buttons its
+    /// `finished` item offers, as the mirror reads them
+    /// ([`crate::mirror::holders_of`]).
+    pub holders: std::collections::BTreeMap<String, crate::classify::Holder>,
 }
 
 /// What a reading asks of the host: the idle members' shells, their memory,
@@ -4757,6 +4761,7 @@ impl Wip {
             .map(|(s, _)| s)
             .collect::<Vec<_>>();
         let Probed { shells, memory: idle_memory, daemon, disk, load, throttle } = probe(&agents, &bindings);
+        let holders = crate::mirror::holders_of(store, &tasks);
         Wip {
             tasks,
             index: Index::new(store.projects()),
@@ -4788,6 +4793,7 @@ impl Wip {
             full_suite: crate::throttle::full_suite_seats(&store.state),
             stuck,
             silent: crate::far::Silence::read(store),
+            holders,
         }
     }
 }
@@ -5636,7 +5642,7 @@ fn answers_to(
 /// group action, or one row alone with its Mark done).
 fn wip_attention(w: &Wip, rows: &[WipRow]) -> serde_json::Value {
     let (mut needs_you, mut follow_up) = (Vec::new(), Vec::new());
-    let finished = crate::mirror::finished_rows(&w.tasks, &w.lists);
+    let finished = crate::mirror::finished_rows(&w.tasks, &w.lists, &w.holders);
     if let Some(a) = crate::mirror::finished_item(&finished) {
         let mut v = a.json();
         v["kind"] = "finished".into();
@@ -9036,6 +9042,7 @@ mod tests {
             full_suite: Default::default(),
             stuck: Default::default(),
             silent: Default::default(),
+            holders: Default::default(),
         };
         assert_eq!(wip_json(&w)["agents"][0]["said"], "running the suite", "the key compound's header reads");
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
@@ -9271,6 +9278,7 @@ mod tests {
             full_suite: Default::default(),
             stuck: Default::default(),
             silent: Default::default(),
+            holders: Default::default(),
         }
     }
 
@@ -10553,7 +10561,7 @@ mod tests {
         let item = needs_you.iter().find(|e| e["kind"] == "finished").expect("the finished rows are one item");
         assert_eq!(item["rows"], json!(["r-1", "r-2"]));
         assert_eq!(item["text"], "2 finished rows to close");
-        let mirrored = crate::mirror::rows(&w.tasks, &BTreeMap::new(), &w.lists, &BTreeMap::new(), &BTreeMap::new());
+        let mirrored = crate::mirror::rows(&w.tasks, &BTreeMap::new(), &w.lists, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         let first = mirrored
             .iter()
             .find_map(|e| match e {

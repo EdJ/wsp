@@ -534,7 +534,7 @@ mod tests {
         let mut t = t.clone();
         t.workspace = WorkspaceId::Shared(SharedName("team".into()));
         t.project = Some("wsp".into());
-        let row = crate::mirror::rows(&[t], &BTreeMap::new(), &[], &BTreeMap::new(), &BTreeMap::new())
+        let row = crate::mirror::rows(&[t], &BTreeMap::new(), &[], &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
             .into_iter()
             .find_map(|e| match e {
                 Entity::Row(r) => Some(r),

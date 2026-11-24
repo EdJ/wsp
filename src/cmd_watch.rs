@@ -2671,6 +2671,7 @@ impl Source for Poll<'_> {
             full_suite: Default::default(),
             stuck: Default::default(),
             silent: Default::default(),
+            holders: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
         // The routing, taken once for every task in the store and before any

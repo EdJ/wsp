@@ -380,7 +380,7 @@ mod tests {
         t.status_raw = status.into();
         t.workspace = shared();
         t.body = prose.into();
-        let row = crate::mirror::rows(&[t], &BTreeMap::new(), &[], &BTreeMap::new(), &BTreeMap::new())
+        let row = crate::mirror::rows(&[t], &BTreeMap::new(), &[], &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
             .into_iter()
             .find_map(|e| match e {
                 Entity::Row(r) => Some(r),

@@ -29,6 +29,11 @@
 //!   still judged by a held barrier's stop → neither. Several such rows are
 //!   one item, [`finished`]: "N finished rows to close", **Mark all done**,
 //!   and each row beneath with its own Mark done.
+//! - Mark done is offered only where `wsp done` would go through (`wsp-315`):
+//!   a row whose seat finished and still claims it offers **Release and mark
+//!   done**, one with open sub-tasks **Done anyway**, one whose far seat is
+//!   lost **Despawn (lost)**, and one its run closes none; each offers **Send
+//!   back**. A row whose seat is working is neither.
 //!
 //! A needs-you barrier or question carries the [`Action`] that does it
 //! (`wsp-097`); a follow-up carries none. A seat carries none yet: the act on a
@@ -115,11 +120,33 @@ pub struct Button {
     /// Run the command once per entry, each with these args in place of
     /// `args`, in order: **Mark all done** (`wsp done` takes one row).
     pub each: Vec<Vec<String>>,
+    /// Ask the person to confirm before running it (`wsp-315`): **Done
+    /// anyway** past open sub-tasks, **Despawn (lost)**.
+    pub confirm: bool,
+    /// Commands run after this one, in order, each `(verb, args)`, and only
+    /// where the one before succeeded: **Release and mark done** is `wsp
+    /// release <id>`, then `wsp done <id>`.
+    pub then: Vec<(String, Vec<String>)>,
 }
 
 impl Button {
     fn new(label: &str, verb: &str, args: Vec<String>, sentence: Sentence) -> Self {
-        Button { label: label.into(), verb: verb.into(), args, sentence, prefix: None, stdin: None, each: Vec::new() }
+        Button {
+            label: label.into(),
+            verb: verb.into(),
+            args,
+            sentence,
+            prefix: None,
+            stdin: None,
+            each: Vec::new(),
+            confirm: false,
+            then: Vec::new(),
+        }
+    }
+
+    fn confirmed(mut self) -> Self {
+        self.confirm = true;
+        self
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -135,7 +162,59 @@ impl Button {
         if !self.each.is_empty() {
             v["each"] = self.each.clone().into();
         }
+        if self.confirm {
+            v["confirm"] = true.into();
+        }
+        if !self.then.is_empty() {
+            v["then"] = self.then.iter().map(|(verb, args)| serde_json::json!({ "verb": verb, "args": args })).collect::<Vec<_>>().into();
+        }
         v
+    }
+}
+
+/// Who stands on a finished row, as `wsp done` reads its seats (`wsp-315`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Holder {
+    /// No seat stands on it: `wsp done` closes it as it is.
+    #[default]
+    Nobody,
+    /// Its seat has finished — idle at its prompt, or gone — and still
+    /// claims it: `wsp release <id>` frees it, then it closes.
+    Finished,
+    /// A seat on it is in a turn, starting, or on a prompt: nothing is
+    /// offered, and the row is in no finished group.
+    Working,
+    /// Its seat is on a far machine that cannot be reached: `wsp despawn
+    /// <id> --lost` lets it go.
+    Lost,
+}
+
+/// The next steps a refused `wsp done <id>` offers, or a finished row offers
+/// in its place (`wsp-315`): by who holds it and how many sub-tasks are open.
+/// Empty where the close would go through, and where a seat is working.
+///
+/// - Its seat finished and still claims it: **Release and mark done**
+///   (`release <id>`, then `done <id>`) and **Release**.
+/// - Its seat on a far machine that is gone: **Despawn (lost)** (`despawn
+///   <id> --lost`), confirmed.
+/// - Open sub-tasks, nobody on it: **Done anyway** (`done <id> --force`),
+///   confirmed.
+pub fn next_steps(id: &str, holder: Holder, open: usize) -> Vec<Button> {
+    let row = vec![id.to_string()];
+    let mut done = row.clone();
+    if open > 0 {
+        done.push("--force".into());
+    }
+    match holder {
+        Holder::Finished => {
+            let mut both = Button::new("Release and mark done", "release", row.clone(), Sentence::None);
+            both.then = vec![("done".into(), done)];
+            both.confirm = open > 0;
+            vec![both, Button::new("Release", "release", row, Sentence::None)]
+        }
+        Holder::Lost => vec![Button::new("Despawn (lost)", "despawn", vec![id.to_string(), "--lost".into()], Sentence::None).confirmed()],
+        Holder::Nobody if open > 0 => vec![Button::new("Done anyway", "done", done, Sentence::None).confirmed()],
+        Holder::Nobody | Holder::Working => Vec::new(),
     }
 }
 
@@ -153,9 +232,12 @@ impl Button {
 ///   **Allow**, **Allow for session** where the prompt offered a suggestion
 ///   (the JSON form on stdin, its first suggestion as the rule, which `wsp
 ///   answer` scopes to the session), and **Deny**.
-/// - A finished row (`wsp-105`): `done <id>`, no sentence, **Mark done**.
+/// - A finished row (`wsp-105`): `done <id>`, no sentence, **Mark done**
+///   where `wsp done` would go through, else [`next_steps`] (`wsp-315`);
+///   and **Send back** (`reopen <id>`, with what is owed).
 /// - Several finished rows: `group <ids…>`, **Mark all done** (`done` once
-///   per row, [`Button::each`]), and `items`, each row with its own act.
+///   per row that offers Mark done, [`Button::each`]), and `items`, each row
+///   with its own act.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
     pub verb: String,
@@ -164,6 +246,8 @@ pub struct Action {
     pub buttons: Vec<Button>,
     /// A group's members, by id, each with what it asks on its own.
     pub items: Vec<(String, Attention)>,
+    /// A finished row's open sub-tasks, where it has any (`wsp-315`).
+    pub open: usize,
 }
 
 impl Action {
@@ -179,28 +263,52 @@ impl Action {
                 Button::new("Hold", "worklist", hold, Sentence::Needed),
             ],
             items: Vec::new(),
+            open: 0,
         }
     }
 
-    /// A finished row: `wsp done <id>`, as it is.
-    fn done(id: &str) -> Self {
-        let args = vec![id.to_string()];
+    /// A finished row (`wsp-105`, `wsp-315`): **Mark done** only where `wsp
+    /// done <id>` would go through as it is, else the steps that make it
+    /// ([`next_steps`]); none where its run closes it. Then **Send back**
+    /// (`reopen <id>` with what is owed), always. The action's own command
+    /// is its first button's.
+    fn row(r: &Row) -> Self {
+        let id = vec![r.id.to_string()];
+        let mut buttons = match (r.run_closes, r.holder, r.open) {
+            (true, _, _) => Vec::new(),
+            (false, Holder::Nobody, 0) => vec![Button::new("Mark done", "done", id.clone(), Sentence::None)],
+            (false, holder, open) => next_steps(r.id, holder, open),
+        };
+        buttons.push(Button::new("Send back", "reopen", id, Sentence::Needed));
+        let (verb, args, sentence) = (buttons[0].verb.clone(), buttons[0].args.clone(), buttons[0].sentence);
         Action {
-            verb: "done".into(),
-            args: args.clone(),
-            sentence: Sentence::None,
-            buttons: vec![Button::new("Mark done", "done", args, Sentence::None)],
+            verb,
+            args,
+            sentence,
+            buttons,
             items: Vec::new(),
+            open: r.open,
         }
     }
 
     /// Several finished rows as one: Mark all done runs `wsp done` once per
-    /// row; `items` holds each row and its own Mark done.
+    /// row whose own action offers Mark done — the rest want a step of their
+    /// own first, and Mark all done is left off where none does; `items`
+    /// holds each row and its own buttons.
     fn group(items: Vec<(String, Attention)>) -> Self {
         let ids: Vec<String> = items.iter().map(|(id, _)| id.clone()).collect();
-        let mut all = Button::new("Mark all done", "done", Vec::new(), Sentence::None);
-        all.each = ids.iter().map(|id| vec![id.clone()]).collect();
-        Action { verb: "group".into(), args: ids, sentence: Sentence::None, buttons: vec![all], items }
+        let closable: Vec<Vec<String>> = items
+            .iter()
+            .filter(|(_, a)| a.action.as_ref().is_some_and(|a| a.buttons.iter().any(|b| b.label == "Mark done")))
+            .map(|(id, _)| vec![id.clone()])
+            .collect();
+        let mut buttons = Vec::new();
+        if !closable.is_empty() {
+            let mut all = Button::new("Mark all done", "done", Vec::new(), Sentence::None);
+            all.each = closable;
+            buttons.push(all);
+        }
+        Action { verb: "group".into(), args: ids, sentence: Sentence::None, buttons, items, open: 0 }
     }
 
     /// An open question for the person, by the choices its record carries.
@@ -213,7 +321,7 @@ impl Action {
             .and_then(|r| r.get("choices").cloned())
             .filter(|c| c.is_object());
         let Some(c) = choices else {
-            return Action { verb: "answer".into(), args: vec![id], sentence: Sentence::Needed, buttons: Vec::new(), items: Vec::new() };
+            return Action { verb: "answer".into(), args: vec![id], sentence: Sentence::Needed, buttons: Vec::new(), items: Vec::new(), open: 0 };
         };
         let with = |more: &[&str]| -> Vec<String> {
             std::iter::once(id.clone()).chain(more.iter().map(|s| s.to_string())).collect()
@@ -245,7 +353,7 @@ impl Action {
                 other.prefix = several.then(|| format!("{name}="));
                 buttons.push(other);
             }
-            return Action { verb: "answer".into(), args: with(&["--choice"]), sentence: Sentence::None, buttons, items: Vec::new() };
+            return Action { verb: "answer".into(), args: with(&["--choice"]), sentence: Sentence::None, buttons, items: Vec::new(), open: 0 };
         }
         buttons.push(Button::new("Allow", "answer", with(&["--choice", "allow"]), Sentence::None));
         let suggestion = c.get("suggestions").and_then(|s| s.as_array()).and_then(|s| s.first()).filter(|s| s.is_object());
@@ -255,7 +363,7 @@ impl Action {
             buttons.push(session);
         }
         buttons.push(Button::new("Deny", "answer", with(&["--choice", "deny"]), Sentence::None));
-        Action { verb: "answer".into(), args: vec![id], sentence: Sentence::None, buttons, items: Vec::new() }
+        Action { verb: "answer".into(), args: vec![id], sentence: Sentence::None, buttons, items: Vec::new(), open: 0 }
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -263,6 +371,9 @@ impl Action {
             "verb": self.verb, "args": self.args, "sentence": self.sentence.word(),
             "buttons": self.buttons.iter().map(Button::json).collect::<Vec<_>>(),
         });
+        if self.open > 0 {
+            v["open_subtasks"] = self.open.into();
+        }
         if !self.items.is_empty() {
             v["items"] = self
                 .items
@@ -347,10 +458,35 @@ pub struct Row<'a> {
     /// It owes a step besides the person's close: its change was reverted on
     /// the trunk, or a held barrier's stop still judges it.
     pub owes: bool,
+    /// Who stands on it (`wsp-315`). A working seat leaves it out.
+    pub holder: Holder,
+    /// Its open sub-tasks, which `wsp done` refuses without `--force`.
+    pub open: usize,
+    /// A member of a running list whose run verifies and closes it: the
+    /// person's close is not offered.
+    pub run_closes: bool,
 }
 
 /// What a finished row says (`wsp-105`).
 pub const FINISHED: &str = "finished and verified: close it or send it back";
+
+/// What a finished row says when its run closes it (`wsp-315`).
+pub const RUN_CLOSES: &str = "finished and verified: its run closes it — send it back if it is not done";
+
+/// What a finished row says, by what stands between it and `wsp done`.
+fn finished_text(r: &Row) -> String {
+    if r.run_closes {
+        return RUN_CLOSES.to_string();
+    }
+    match (r.holder, r.open) {
+        (Holder::Finished, _) => {
+            "finished and verified, its seat done and still holding the claim: release it and close it, or send it back".into()
+        }
+        (Holder::Lost, _) => "finished and verified, its seat on a machine that is gone: let the seat go, or send it back".into(),
+        (_, 0) => FINISHED.to_string(),
+        (_, n) => format!("finished and verified, with {n} open sub-task(s): close it anyway, or send it back"),
+    }
+}
 
 /// Something that could involve the person.
 #[derive(Clone, Copy, Debug)]
@@ -419,6 +555,7 @@ pub fn of(item: Item) -> Option<Attention> {
                     sentence: Sentence::None,
                     buttons: vec![Button::new("Done", "answer", args, Sentence::None)],
                     items: Vec::new(),
+                    open: 0,
                 }))
             }
         }
@@ -436,8 +573,8 @@ pub fn of(item: Item) -> Option<Attention> {
                 (None, task) => format!("stopped on {task}: read its screen and tell it what is next, or end it"),
             })
         }),
-        Item::Row(r) => (r.review && r.verified && !r.owes)
-            .then(|| Attention::needs_you(FINISHED.to_string()).with(Action::done(r.id))),
+        Item::Row(r) => (r.review && r.verified && !r.owes && r.holder != Holder::Working)
+            .then(|| Attention::needs_you(finished_text(&r)).with(Action::row(&r))),
     }
 }
 
@@ -705,7 +842,7 @@ mod tests {
         assert_eq!(read(NOW).unwrap().kind, Kind::FollowUp);
     }
     fn row(id: &str, verified: bool, owes: bool) -> Row<'_> {
-        Row { id, review: true, verified, owes }
+        Row { id, review: true, verified, owes, holder: Holder::Nobody, open: 0, run_closes: false }
     }
 
     /// `wsp-105`. A row at review whose newest verification holds needs you,
@@ -720,6 +857,7 @@ mod tests {
             a.action.unwrap().json(),
             serde_json::json!({ "verb": "done", "args": ["wsp-93"], "sentence": "none", "buttons": [
                 { "label": "Mark done", "verb": "done", "args": ["wsp-93"], "sentence": "none" },
+                { "label": "Send back", "verb": "reopen", "args": ["wsp-93"], "sentence": "needed" },
             ] })
         );
         assert_eq!(of(Item::Row(row("wsp-93", false, false))), None, "unverified, or its verifier sent it back");
@@ -743,6 +881,7 @@ mod tests {
         assert_eq!((g.kind, g.text.as_str()), (Kind::NeedsYou, "2 finished rows to close"));
         let mark = |id: &str| serde_json::json!({ "verb": "done", "args": [id], "sentence": "none", "buttons": [
             { "label": "Mark done", "verb": "done", "args": [id], "sentence": "none" },
+            { "label": "Send back", "verb": "reopen", "args": [id], "sentence": "needed" },
         ] });
         assert_eq!(
             g.action.unwrap().json(),
@@ -754,5 +893,91 @@ mod tests {
                     { "id": "wsp-2", "attention": "needs-you", "text": FINISHED, "action": mark("wsp-2") },
                 ] })
         );
+    }
+
+    fn held(id: &str, holder: Holder, open: usize, run_closes: bool) -> Row<'_> {
+        Row { holder, open, run_closes, ..row(id, true, false) }
+    }
+
+    fn buttons(a: &Attention) -> Vec<serde_json::Value> {
+        a.action.as_ref().unwrap().json()["buttons"].as_array().unwrap().clone()
+    }
+
+    fn send_back(id: &str) -> serde_json::Value {
+        serde_json::json!({ "label": "Send back", "verb": "reopen", "args": [id], "sentence": "needed" })
+    }
+
+    /// `wsp-315`. A finished row whose seat finished and still claims it
+    /// offers Release and mark done (`release`, then `done`) and Release in
+    /// place of Mark done; one whose seat is working is neither, so in no
+    /// group; Send back is on every one offered.
+    #[test]
+    fn a_finished_row_still_claimed_offers_release_and_one_whose_seat_works_is_left_out() {
+        let a = of(Item::Row(held("wsp-1", Holder::Finished, 0, false))).unwrap();
+        assert_eq!(a.kind, Kind::NeedsYou);
+        assert!(a.text.contains("still holding the claim"), "{}", a.text);
+        assert_eq!(
+            buttons(&a),
+            vec![
+                serde_json::json!({ "label": "Release and mark done", "verb": "release", "args": ["wsp-1"], "sentence": "none",
+                    "then": [{ "verb": "done", "args": ["wsp-1"] }] }),
+                serde_json::json!({ "label": "Release", "verb": "release", "args": ["wsp-1"], "sentence": "none" }),
+                send_back("wsp-1"),
+            ]
+        );
+        let j = a.action.as_ref().unwrap().json();
+        assert_eq!((j["verb"].as_str(), &j["args"]), (Some("release"), &serde_json::json!(["wsp-1"])));
+
+        assert_eq!(of(Item::Row(held("wsp-2", Holder::Working, 0, false))), None, "a working seat's row is not offered");
+        let g = finished(vec![
+            ("wsp-1".into(), a.clone()),
+            ("wsp-3".into(), of(Item::Row(row("wsp-3", true, false))).unwrap()),
+        ])
+        .unwrap();
+        let j = g.action.unwrap().json();
+        assert_eq!(j["buttons"][0]["each"], serde_json::json!([["wsp-3"]]), "Mark all done runs only where done goes through");
+        assert_eq!(j["items"][0]["action"]["buttons"][0]["label"], "Release and mark done");
+    }
+
+    /// `wsp-315`. Open sub-tasks: the count, and Done anyway (`done <id>
+    /// --force`) wanting a confirm, in place of Mark done. A far seat that is
+    /// lost: Despawn (lost) (`despawn <id> --lost`), confirmed. Both still
+    /// offer Send back.
+    #[test]
+    fn open_sub_tasks_offer_done_anyway_and_a_lost_seat_offers_despawn_lost_both_confirmed() {
+        let a = of(Item::Row(held("wsp-4", Holder::Nobody, 2, false))).unwrap();
+        assert!(a.text.contains("2 open sub-task(s)"), "{}", a.text);
+        let j = a.action.as_ref().unwrap().json();
+        assert_eq!(j["open_subtasks"], 2);
+        assert_eq!(
+            buttons(&a),
+            vec![
+                serde_json::json!({ "label": "Done anyway", "verb": "done", "args": ["wsp-4", "--force"], "sentence": "none", "confirm": true }),
+                send_back("wsp-4"),
+            ]
+        );
+
+        let lost = of(Item::Row(held("wsp-5", Holder::Lost, 0, false))).unwrap();
+        assert_eq!(
+            buttons(&lost),
+            vec![
+                serde_json::json!({ "label": "Despawn (lost)", "verb": "despawn", "args": ["wsp-5", "--lost"], "sentence": "none", "confirm": true }),
+                send_back("wsp-5"),
+            ]
+        );
+        assert!(next_steps("wsp-5", Holder::Working, 3).is_empty(), "a working seat: nothing to press");
+        assert!(next_steps("wsp-5", Holder::Nobody, 0).is_empty(), "nothing in the way: no step");
+    }
+
+    /// `wsp-315`. A member of a running list whose run closes it: no Mark
+    /// done, the card says the run closes it, and Send back alone.
+    #[test]
+    fn a_row_its_run_closes_offers_no_mark_done_and_says_the_run_closes_it() {
+        let a = of(Item::Row(held("wsp-309", Holder::Finished, 0, true))).unwrap();
+        assert_eq!(a.text, RUN_CLOSES);
+        assert_eq!(buttons(&a), vec![send_back("wsp-309")]);
+        let j = a.action.unwrap().json();
+        assert_eq!((j["verb"].as_str(), j["sentence"].as_str()), (Some("reopen"), Some("needed")));
+        assert_eq!(of(Item::Row(held("wsp-309", Holder::Working, 0, true))), None, "working: not even Send back");
     }
 }

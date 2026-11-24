@@ -127,7 +127,7 @@ mod tests {
         let reading: r::Tasks = r::of(&take(&store, r::TASKS).unwrap()).expect("the reading decodes as its shape");
         let tasks = store.tasks();
         let heads: Vec<wsp_store_contract::Row> =
-            crate::mirror::rows(&tasks, &store.claims(), &store.worklists(), &crate::mirror::texts_of(&store, &tasks), &Default::default())
+            crate::mirror::rows(&tasks, &store.claims(), &store.worklists(), &crate::mirror::texts_of(&store, &tasks), &Default::default(), &crate::mirror::holders_of(&store, &tasks))
                 .into_iter()
                 .filter_map(|e| match e {
                     wsp_store_contract::Entity::Row(mut row) => {

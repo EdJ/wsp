@@ -561,6 +561,7 @@ fn main() {
     let _ = mirror::LIST_OUTPUTS.set(cmd_report::list_outputs);
     let _ = mirror::LIST_SHOW.set(cmd_worklist::show_facts);
     let _ = mirror::SEAT_WORKING.set(cmd_machine::seat_working);
+    let _ = mirror::ROW_HOLDER.set(cmd_task::holder_now);
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,

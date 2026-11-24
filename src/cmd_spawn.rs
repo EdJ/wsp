@@ -11098,6 +11098,7 @@ mod tests {
             full_suite: Default::default(),
             stuck: Default::default(),
             silent: Default::default(),
+            holders: Default::default(),
         };
         cmd_agent::wip_rows(&w).into_iter().find(|r| r.pane == seat).expect("the seat is drawn")
     }
