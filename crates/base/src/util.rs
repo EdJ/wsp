@@ -222,6 +222,17 @@ pub struct Isolated {
     dir: PathBuf,
 }
 
+/// What a spawn puts in a seat's environment, which [`isolated`] clears: a
+/// `cargo test` run inside a check seat otherwise hands every test the seat's
+/// own values. `WSP_SEAT_KIND=check` sends every `worklist hold` a test runs
+/// through the check's validator, `WSP_EXIT`/`WSP_VERDICT` name a file in the
+/// real state rather than the test's store, and `WSP_SEAT_ID`/`WSP_SEAT_EPOCH`
+/// answer "who am I" with the outer seat (wsp-390, wsp-372: 19 closing,
+/// cmd_worklist and cycle tests). A test that is a seat of some kind sets them
+/// itself.
+#[cfg(any(test, feature = "test-support"))]
+pub const SEAT_VARS: [&str; 5] = [crate::base::seat::SEAT_ENV, "WSP_SEAT_KIND", "WSP_EXIT", "WSP_VERDICT", "WSP_SEAT_EPOCH"];
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn isolated(name: &str) -> Isolated {
     let lock = env_lock();
@@ -239,13 +250,9 @@ pub fn isolated(name: &str) -> Isolated {
     // `my_pane()` reads the seat variable ahead of backend's, so a `cargo test`
     // run from inside an agent's seat (as `wsp verify` is) would answer every
     // "who am I" with the outer seat. A test that wants a seat sets its own.
-    std::env::remove_var(crate::base::seat::SEAT_ENV);
-    // wsp-390: the rest of what a spawn gives its seat goes the same way. A
-    // check seat's `WSP_SEAT_KIND=check` sends every `worklist hold` a test
-    // runs through the check's validator, and its `WSP_EXIT`/`WSP_VERDICT`
-    // name a file in the real state rather than this store's; a test that is
-    // a seat of some kind sets them itself.
-    for key in ["WSP_SEAT_KIND", "WSP_EXIT", "WSP_VERDICT"] {
+    // wsp-390, wsp-372: the rest of what a spawn gives its seat goes the same
+    // way ([`SEAT_VARS`]).
+    for key in SEAT_VARS {
         std::env::remove_var(key);
     }
     // wsp-307: `WSP_JOBS` is the default (`manager`) in a test unless the test
@@ -1234,6 +1241,23 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    /// wsp-372: a suite run inside a check seat starts with the seat's five
+    /// variables set, and every test under [`isolated`] must see none of them.
+    #[test]
+    fn isolation_clears_a_check_seats_environment() {
+        assert!(SEAT_VARS.contains(&"WSP_SEAT_ID") && SEAT_VARS.contains(&"WSP_SEAT_EPOCH"));
+        {
+            let _env = env_lock();
+            for (key, value) in [("WSP_SEAT_KIND", "check"), ("WSP_EXIT", "/x/exit.md"), ("WSP_VERDICT", "/x/verdict"), ("WSP_SEAT_ID", "w9:p9"), ("WSP_SEAT_EPOCH", "7")] {
+                std::env::set_var(key, value);
+            }
+        }
+        let _iso = isolated("seat-env");
+        for key in SEAT_VARS {
+            assert_eq!(std::env::var(key).ok(), None, "{key} survives the isolation");
+        }
+    }
 
     /// `wsp add "-p" -p demo` reported "no such project `-p`", which sent the
     /// caller to their projects when the project was the one right word.
