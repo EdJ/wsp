@@ -68,6 +68,8 @@ const ALLOWED: &[&str] = &[
     "sandbox/<n>/state/events.jsonl",
     "sandbox/<n>/state/index/**",
     "sandbox/<n>/state/mem.json",
+    // A starting daemon's once-per-store follow-up migration (`wsp-345`).
+    "sandbox/<n>/state/migrated-follow-ups",
     "sandbox/<n>/state/state.db*",
     "sandbox/<n>/state/watches.json",
     // The store: a git repository of projects, tasks and worklists.
