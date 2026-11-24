@@ -23,10 +23,9 @@ impl SqliteStore {
         let deleted = self.tx(|c| {
             let n = c
                 .execute(
-                    "DELETE FROM event WHERE kind = '\"mirror.put\"' AND EXISTS (
-                         SELECT 1 FROM event AS l
-                         WHERE l.subject = event.subject AND l.id > event.id
-                           AND l.kind IN ('\"mirror.put\"', '\"mirror.gone\"'))",
+                    "DELETE FROM event WHERE kind = '\"mirror.put\"' AND id NOT IN (
+                         SELECT MAX(id) FROM event
+                         WHERE kind IN ('\"mirror.put\"', '\"mirror.gone\"') GROUP BY subject)",
                     [],
                 )
                 .map_err(be)?;
