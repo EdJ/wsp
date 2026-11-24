@@ -1391,13 +1391,10 @@ fn holder_from(read: &[(String, Standing)], far: &dyn Fn(&str) -> bool) -> crate
     }
 }
 
-/// [`holder_from`] for `id` now, its seats read as `wsp done` reads them:
-/// the mirror's [`crate::mirror::ROW_HOLDER`].
-pub(crate) fn holder_now(store: &Store, id: &str) -> crate::classify::Holder {
-    holder_with(store, id, &crate::cmd_spawn::seat_is_live, &crate::cycle::Fleet)
-}
-
-fn holder_with(store: &Store, id: &str, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> crate::classify::Holder {
+/// [`holder_from`] for `id`, its seats read through `live` and `reader` as
+/// `wsp done` reads them. main wires it, with the live-seat check from above
+/// this layer, into the mirror's [`crate::mirror::ROW_HOLDER`].
+pub(crate) fn holder_with(store: &Store, id: &str, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> crate::classify::Holder {
     let read: Vec<(String, Standing)> = standing_on(store, id, live).into_iter().map(|s| { let r = standing_as(reader, &s); (s, r) }).collect();
     holder_from(&read, &|s| far_seat(store, s))
 }
