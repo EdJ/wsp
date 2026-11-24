@@ -8,11 +8,13 @@ Written by wsp-429 on 2026-11-24, on omarchy (i9-14900KF, 32 threads). Row ids a
 
 **The finding.** On omarchy, wsp does not show the slowdown Ed saw on his Mac. A wsp row takes 9.5 min from start to landed at the median (14.1 at p75). A compound-react row takes 23.9 min (44.8 at p75).
 
-The stages are ranked by the median per row. The p75 and the mean are given beside it in the gap table below. **Ranked that way, wsp loses the most minutes per row against compound-react at the group barrier: a row's share is 1.4 min against 1.2 at the median (+0.2), and 5.4 against 3.2 at p75 (+2.2), but by the mean wsp is 11.4 min ahead, because compound-react had barriers held for hours.**
+The stages are ranked by the median per row, with the p75 beside it for the tail (the gap table below). **Ranked that way, wsp loses the most minutes per row against compound-react at the group barrier: a row's share is 1.4 min against 1.2 at the median (+0.2), and 5.4 against 3.2 at p75 (+2.2).**
 
 Two other stages are slower on wsp at the median:
 - `wsp check` reads 0.7 against 0.3 min (+0.3), a larger gap than the barrier's. That gap comes from rows with no check stage, which count as 0: 12 of the 44 compound-react rows had none, against 6 of the 101 wsp rows. Among rows that had a check stage, wsp's check is faster: 0.7 / 1.1 min against 0.9 / 3.5. So the ranking sets the check-less rows aside for this stage.
 - Seat start is slower by 1 s.
+
+Caveat on the mean: it is not used to rank. compound-react's held barriers skew it, and by the mean wsp is 11.4 min ahead at the barrier (5.5 against 16.8 min per row).
 
 On wsp's lists other than mp-coord, the barrier share is 5.3 / 9.3 min per row, mostly check seats running the full workspace suite by hand.
 
@@ -58,19 +60,19 @@ The table covers 101 wsp rows in 42 groups (50 check seats) and 44 compound-reac
 
 wsp minus compound-react, in minutes, from the same rows. A plus sign means wsp is slower.
 
-| Stage | median | p75 | mean |
-|---|---|---|---|
-| seat start | +1 s | +1 s | +4 s |
-| the agent's own work | −3.7 | −16.1 | −9.9 |
-| `wsp check`, every row (0 for a row with none) | +0.3 | −1.0 | −0.7 |
-| `wsp check`, rows that had a check stage | −0.2 | −2.5 | −1.3 |
-| verifier, all of it | −1.5 | −4.6 | −2.4 |
-| rebase and land | −0.2 | −0.2 | −0.1 |
-| other waits | −0.9 | −4.6 | −4.7 |
-| **barrier: the row's share** | **+0.2** | **+2.2** | **−11.4** |
-| start → landed, held taken out | −14.5 | −30.7 | −17.7 |
+| Stage | median | p75 |
+|---|---|---|
+| seat start | +1 s | +1 s |
+| the agent's own work | −3.7 | −16.1 |
+| `wsp check`, every row (0 for a row with none) | +0.3 | −1.0 |
+| `wsp check`, rows that had a check stage (6 wsp and 12 compound-react rows left out) | −0.2 | −2.5 |
+| verifier, all of it | −1.5 | −4.6 |
+| rebase and land | −0.2 | −0.2 |
+| other waits | −0.9 | −4.6 |
+| **barrier: the row's share** | **+0.2** | **+2.2** |
+| start → landed, held taken out | −14.5 | −30.7 |
 
-The means are pulled by a few long waits (see the outliers under "How the stages were cut"). compound-react's mean barrier share of 16.8 min, against wsp's 5.5, is mostly cr-linux-panes group 4, held overnight for 607 min.
+The means are left out because a few long waits pull them (see the outliers under "How the stages were cut"). compound-react's mean barrier share of 16.8 min, against wsp's 5.5, is mostly cr-linux-panes group 4, held overnight for 607 min.
 
 wsp's lists other than mp-coord (51 rows) read as follows:
 - start → landed 10.7 / 14.0;
@@ -172,7 +174,7 @@ Outliers sit in the means but hardly move the medians:
 
 The scripts and their outputs are in `$WSP_SCRATCH`, i.e. `~/.local/state/wsp/scratch/wsp-429/`:
 - `collect.py` and `analyze.py` make rows.json and stages.json;
-- `summary.py` and `table.py` give the figures, and `gaps.py` the gap table.
+- `summary.py` and `table.py` give the figures, and `gaps.py` the gap table (it prints the means too).
 
 ### Rows used
 
