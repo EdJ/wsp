@@ -161,9 +161,7 @@ pub fn env_lock() -> EnvGuard {
     // wsp-372: the first take in a process clears the seat the suite was run
     // in, before the test that took it sets anything of its own.
     if !OUTER_SEAT_CLEARED.swap(true, SeqCst) {
-        for key in SEAT_VARS {
-            std::env::remove_var(key);
-        }
+        clear_seat_vars();
     }
     // wsp-502: the tally of children is the process's, and every test beside
     // this one adds to it, so a tick a test opens counts only its own thread's.
@@ -243,14 +241,34 @@ pub struct Isolated {
 #[cfg(any(test, feature = "test-support"))]
 pub const SEAT_VARS: [&str; 5] = [crate::base::seat::SEAT_ENV, "WSP_SEAT_KIND", "WSP_EXIT", "WSP_VERDICT", "WSP_SEAT_EPOCH"];
 
-/// Whether this process has cleared the seat it was started in ([`SEAT_VARS`]):
+/// What an agent harness marks every process it runs with, which [`isolated`]
+/// clears beside [`SEAT_VARS`]: a suite run from a Claude seat starts with
+/// `CLAUDECODE=1`, and `wsp answer` reads it as *an agent is asking*
+/// (`cmd_message::an_agent_process`), so every test that closes the person's
+/// question as the person was refused as an agent's pane (wsp-502:
+/// `repair::tests::a_member_whose_shell_ended_is_told_then_ended_after_the_window_unless_its_tree_is_uncommitted`,
+/// run as the test binary inside a seat). `CLAUDE_CODE_ENTRYPOINT` comes with
+/// it, and `OPENCODE` is opencode's marker. A test that is an agent sets its own.
+#[cfg(any(test, feature = "test-support"))]
+pub const AGENT_VARS: [&str; 3] = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE"];
+
+/// Remove [`SEAT_VARS`] and [`AGENT_VARS`] from this process. Under [`ENV`].
+#[cfg(any(test, feature = "test-support"))]
+fn clear_seat_vars() {
+    for key in SEAT_VARS.iter().chain(AGENT_VARS.iter()) {
+        std::env::remove_var(key);
+    }
+}
+
+/// Whether this process has cleared the seat it was started in ([`SEAT_VARS`],
+/// [`AGENT_VARS`]):
 /// the first [`env_lock`] does, holding the lock.
 #[cfg(any(test, feature = "test-support"))]
 static OUTER_SEAT_CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Clear the seat a test process was started in, for a fixture that touches no
 /// other environment (the scratch store, `testkit::store`). [`isolated`] clears
-/// [`SEAT_VARS`] on every take; a test that never takes it saw the seat's values
+/// [`SEAT_VARS`] and [`AGENT_VARS`] on every take; a test that never takes it saw the seat's values
 /// whenever it ran ahead of every test that did, which is always under nextest's
 /// one process per test (wsp-372: `cmd_worklist::tests::a_hold_leaves_its_check…`
 /// refused as a check's hold). Once per process, under [`ENV`]: a test that
@@ -281,10 +299,9 @@ pub fn isolated(name: &str) -> Isolated {
     // run from inside an agent's seat (as `wsp verify` is) would answer every
     // "who am I" with the outer seat. A test that wants a seat sets its own.
     // wsp-390, wsp-372: the rest of what a spawn gives its seat goes the same
-    // way ([`SEAT_VARS`]).
-    for key in SEAT_VARS {
-        std::env::remove_var(key);
-    }
+    // way ([`SEAT_VARS`]), and so does the agent that ran the suite
+    // ([`AGENT_VARS`]).
+    clear_seat_vars();
     // wsp-307: `WSP_JOBS` is the default (`manager`) in a test unless the test
     // sets it. A tree outside the manager's root runs the suite only with
     // `WSP_JOBS=inproc` set, and a test that asks for the default was reading
@@ -1274,9 +1291,11 @@ mod tests {
 
     /// wsp-372: a suite run inside a check seat starts with the seat's five
     /// variables set, and every test under [`isolated`] must see none of them.
+    /// wsp-502: nor the marks of the Claude seat the check was started from.
     #[test]
     fn isolation_clears_a_check_seats_environment() {
         assert!(SEAT_VARS.contains(&"WSP_SEAT_ID") && SEAT_VARS.contains(&"WSP_SEAT_EPOCH"));
+        assert!(AGENT_VARS.contains(&"CLAUDECODE") && AGENT_VARS.contains(&"CLAUDE_CODE_ENTRYPOINT") && AGENT_VARS.contains(&"OPENCODE"));
         {
             let _env = env_lock();
             for (key, value) in CHECK_SEAT {
@@ -1284,13 +1303,23 @@ mod tests {
             }
         }
         let _iso = isolated("seat-env");
-        for key in SEAT_VARS {
+        for key in SEAT_VARS.iter().chain(AGENT_VARS.iter()) {
             assert_eq!(std::env::var(key).ok(), None, "{key} survives the isolation");
         }
     }
 
-    /// The five variables as a check seat sets them.
-    const CHECK_SEAT: [(&str, &str); 5] = [("WSP_SEAT_KIND", "check"), ("WSP_EXIT", "/x/exit.md"), ("WSP_VERDICT", "/x/verdict"), ("WSP_SEAT_ID", "w9:p9"), ("WSP_SEAT_EPOCH", "7")];
+    /// The five variables as a check seat sets them, and the marks the Claude
+    /// seat that ran it leaves on every process under it.
+    const CHECK_SEAT: [(&str, &str); 8] = [
+        ("WSP_SEAT_KIND", "check"),
+        ("WSP_EXIT", "/x/exit.md"),
+        ("WSP_VERDICT", "/x/verdict"),
+        ("WSP_SEAT_ID", "w9:p9"),
+        ("WSP_SEAT_EPOCH", "7"),
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+        ("OPENCODE", "1"),
+    ];
 
     /// What a fixture that never takes [`isolated`] does first (the scratch
     /// store): after it, no seat variable is left. Run alone in a process
@@ -1299,7 +1328,7 @@ mod tests {
     fn a_fixture_that_skips_the_isolation_still_sees_no_seat() {
         clear_outer_seat();
         let _env = env_lock();
-        for key in SEAT_VARS {
+        for key in SEAT_VARS.iter().chain(AGENT_VARS.iter()) {
             assert_eq!(std::env::var(key).ok(), None, "{key} survives clear_outer_seat");
         }
     }
