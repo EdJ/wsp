@@ -1,0 +1,14 @@
+# Keep the build context to the source: no build output, no store, no git history.
+target/
+**/target/
+.git/
+.worktrees/
+.claude/
+.wsp/
+*.db
+*.db-wal
+*.db-shm
+api.token
+# Secrets and data that must never enter an image.
+*.pem
+*.key

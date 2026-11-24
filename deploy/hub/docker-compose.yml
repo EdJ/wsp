@@ -1,0 +1,27 @@
+# The hub on one host. Put hub.json, fullchain.pem and privkey.pem in ./etc
+# (docs/hub-deploy.md), then:
+#
+#   docker compose run --rm hub admin init --config /etc/wsp-hub/hub.json --admin <name>
+#   docker compose up -d
+services:
+  hub:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: wsp-hub:latest
+    restart: unless-stopped
+    ports:
+      - "7489:7489"
+    volumes:
+      - hub-data:/var/lib/wsp-hub
+      - ./etc:/etc/wsp-hub:ro
+    healthcheck:
+      # A TLS handshake on the hub's own port: the hub has no readiness verb.
+      test: ["CMD-SHELL", "timeout 5 openssl s_client -connect 127.0.0.1:7489 </dev/null >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  hub-data:

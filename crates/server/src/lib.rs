@@ -341,7 +341,9 @@ impl Server {
         if let Some(bad) = cfg.addrs.iter().find(|ip| !cfg.admits(ip)) {
             return Err(StartError::Address(*bad));
         }
-        let mut ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        // Loopback is always bound, except where the IPv4 wildcard is asked for: it covers loopback, and
+        // on Linux a bind of 0.0.0.0:port after 127.0.0.1:port is refused as in use.
+        let mut ips = if cfg.addrs.contains(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)) { Vec::new() } else { vec![IpAddr::V4(Ipv4Addr::LOCALHOST)] };
         for ip in &cfg.addrs {
             if !ips.contains(ip) {
                 ips.push(*ip);

@@ -1,0 +1,10 @@
+{
+  "data_dir": "/var/lib/wsp-hub",
+  "bind": ["0.0.0.0"],
+  "port": 7489,
+  "peers": ["0.0.0.0/0", "::/0"],
+  "tls": {
+    "cert": "/etc/wsp-hub/fullchain.pem",
+    "key": "/etc/wsp-hub/privkey.pem"
+  }
+}
