@@ -1451,6 +1451,10 @@ fn landing_and_tip(repos: &mut Repos, t: &Task) -> (Landing, Option<String>) {
         0 => (Landing::Nothing, None),
         commits => {
             let tip = git(&trunk.dir, &["rev-parse", &format!("refs/heads/{branch}")]);
+            // Squashed or rebased onto the remote's trunk (`wsp-350`).
+            if tip.as_deref().is_some_and(|tip| crate::by_merge::covers(t, tip)) {
+                return (Landing::Nothing, None);
+            }
             (Landing::Ahead { commits, trunk: trunk.branch }, tip)
         }
     }

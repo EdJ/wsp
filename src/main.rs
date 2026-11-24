@@ -31,6 +31,7 @@ mod agent_commands;
 mod barrier;
 mod barrier_replay;
 mod barrier_run;
+mod by_merge;
 mod cold;
 mod hold;
 mod hold_close;

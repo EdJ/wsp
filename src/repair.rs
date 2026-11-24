@@ -234,6 +234,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         // found it as a test that failed one run in three.
         let before = worklist::position(store, &w, Reading::Landed);
         if let Some(at) = before.at {
+            // First, so a by-merge row's landing names the commit on the
+            // remote's trunk and never what the local one stands at.
+            crate::by_merge::land_merged(store, &w, at, &before);
             if w.groups().get(at - 1).is_some_and(|g| g.policy().is_some()) {
                 unrecorded_landing(store, &w, at, &before);
             }
@@ -587,7 +590,7 @@ const RUNNING: &str = "this list is running";
 /// the run steps' have to land in the *same file*: the reconciler's stdout is
 /// launchd's `daemon.log`, so "through stdout" would have put them in a file
 /// nobody reads for a run. See [`crate::store::log_line`].
-fn stamp(store: &Store, line: &str) {
+pub(crate) fn stamp(store: &Store, line: &str) {
     crate::store::log_line(store, line);
 }
 
