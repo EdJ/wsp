@@ -5,9 +5,10 @@
 //!
 //! Modules: `schema` (the tables, the pragmas), `apply` (`Commands::apply` and the helpers every
 //! write shares), `entities` (the folded state, a row per entity, and the handle's cache of it),
-//! `leases` (`Leases` and `Claims`), `reads` (`Reads`, `Events`, `Texts`).
+//! `compact` (superseded mirror history and the WAL), `leases` (`Leases` and `Claims`), `reads` (`Reads`, `Events`, `Texts`).
 
 mod apply;
+mod compact;
 mod entities;
 mod events;
 mod leases;
@@ -22,6 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, TransactionBehavior};
 use wsp_store_contract::*;
+
+pub use compact::Compacted;
 
 pub(crate) const LIVE: u8 = 0;
 pub(crate) const ARMED: u8 = 1;

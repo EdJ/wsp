@@ -177,3 +177,24 @@ fn a_handles_cached_state_never_hides_another_handles_write() {
     assert_eq!(b.seats(&SeatFilter::default()).unwrap(), vec![]);
     assert_eq!(b.rows(&RowFilter::default()).unwrap().len(), 3);
 }
+
+#[test]
+fn compact_drops_superseded_mirror_puts_and_truncates_the_wal() {
+    let p = path("compact");
+    let s = SqliteStore::open(&p, Arc::new(Mirror)).unwrap();
+    for i in 0..5 {
+        apply(&s, &format!("a{i}"), vec![Entity::Row(row("wsp-1", &format!("t{i}")))], vec![]);
+    }
+    apply(&s, "b", vec![Entity::Row(row("wsp-2", "x"))], vec![]);
+    apply(&s, "c", vec![Entity::Row(row("wsp-3", "y"))], vec![]);
+    apply(&s, "d", vec![], vec![Subject::Row(RowId("wsp-3".into()))]);
+    let (state, head) = (s.snapshot().unwrap().0, s.head().unwrap());
+    let c = s.compact().unwrap();
+    // wsp-1's first four puts, and wsp-3's put (its gone supersedes it); the last put of wsp-1, wsp-2's, and the gone stay.
+    assert_eq!(c.deleted, 5);
+    assert_eq!(c.wal_bytes, 0);
+    assert_eq!(s.head().unwrap(), head);
+    assert_eq!(s.snapshot().unwrap().0, state);
+    assert_eq!(s.events_after(EventId(0), 100).unwrap().len(), 3);
+    assert_eq!(s.compact().unwrap().deleted, 0);
+}
