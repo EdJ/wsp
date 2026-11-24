@@ -374,14 +374,6 @@ impl Spoke {
         let dir = rig.dir.join(who);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let hubs = home.join(".config/wsp/hubs.json");
-        std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
-        let login = serde_json::json!({
-            "url": rig.urls[who], "token": rig.tokens[who], "user": who, "at": "2026-11-23T00:00:00Z",
-            "ca": rig.pki.ca.display().to_string(),
-        });
-        std::fs::write(&hubs, login.to_string()).unwrap();
-        std::fs::set_permissions(&hubs, std::fs::Permissions::from_mode(0o600)).unwrap();
         let outer: BTreeMap<String, String> = [
             ("WSP_HOME".to_string(), dir.join("store").display().to_string()),
             ("WSP_STATE".to_string(), dir.join("state").display().to_string()),
@@ -392,7 +384,16 @@ impl Spoke {
         let out = bare(&outer, &home).args(["sandbox", "--fake", "--json", "--name", &name]).output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("sandbox json: {e}: {}", String::from_utf8_lossy(&out.stderr)));
-        let env = v["env"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+        let env: BTreeMap<String, String> = v["env"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+        // The login, as `wsp login` writes it, under the sandbox's hub home (wsp-490).
+        let hubs = std::path::PathBuf::from(&env["WSP_HUB_HOME"]).join(".config/wsp/hubs.json");
+        std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
+        let login = serde_json::json!({
+            "url": rig.urls[who], "token": rig.tokens[who], "user": who, "at": "2026-11-23T00:00:00Z",
+            "ca": rig.pki.ca.display().to_string(),
+        });
+        std::fs::write(&hubs, login.to_string()).unwrap();
+        std::fs::set_permissions(&hubs, std::fs::Permissions::from_mode(0o600)).unwrap();
         let s = Spoke { user: who.into(), dir, name, outer, env, home, daemon: None };
         s.ok(&["init"]);
         s.ok(&["project", "add", "alpha", "--name", "Alpha"]);
