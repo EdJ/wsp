@@ -165,6 +165,9 @@ pub fn env_lock() -> EnvGuard {
             std::env::remove_var(key);
         }
     }
+    // wsp-502: the tally of children is the process's, and every test beside
+    // this one adds to it, so a tick a test opens counts only its own thread's.
+    crate::calls::ticks_count_their_own_thread();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = done.clone();
     std::thread::spawn(move || {

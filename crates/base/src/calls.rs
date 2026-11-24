@@ -215,10 +215,58 @@ fn program_name(p: &OsStr) -> String {
 /// path that cannot use [`Command`] (a thread that waits on a child someone
 /// else started) can still say what it cost.
 pub fn note_child(program: &str, n: u64, wall: Duration) {
-    let mut k = kids();
+    let mut k = if off_the_tick() { lock(&ELSEWHERE) } else { kids() };
     let e = k.0.entry(program.to_string()).or_insert((0, 0.0));
     e.0 += n;
     e.1 += wall.as_secs_f64() * 1000.0;
+}
+
+/// Whether an open tick counts only the children run on the thread that
+/// opened it (wsp-502). Off in the daemon, whose tick line has counted every
+/// child the process ran while it was open since wsp-481. On in a test
+/// process: every [`crate::util::env_lock`] the harness takes turns it on,
+/// because there the tally is shared with every thread beside the tick's.
+/// `daemon::tests::tick_by_host::under_the_manager_the_tick_reads_the_folded_events_and_probes_nothing`
+/// read a `df` as its tick's probe under load. The `df` was the beat of an
+/// in-process manager (`host_inproc::reach`) that an earlier `WSP_HOST=inproc`
+/// test had started and forgotten, which beats every 10 s for the rest of
+/// the process whoever holds the env lock. In one run of the wsp bin 663 of
+/// its 710 `df`s came from such beats, the first while
+/// `barrier_run::tests::a_barrier_run_under_manager_probes_no_process_from_wsp`
+/// held the lock.
+static TICK_OWN_THREAD: AtomicBool = AtomicBool::new(false);
+
+/// The thread that opened the tick now open, if there is one.
+static TICK_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// What other threads ran while a tick that counts only its own thread was
+/// open. It goes back to the process's tally when the tick ends, so a call
+/// line still has it.
+static ELSEWHERE: Mutex<Kids> = Mutex::new(Kids(BTreeMap::new()));
+
+/// From now on a tick counts only the children of the thread that opened it.
+/// For a test process; see [`TICK_OWN_THREAD`].
+pub fn ticks_count_their_own_thread() {
+    TICK_OWN_THREAD.store(true, Ordering::SeqCst);
+}
+
+/// Whether a child noted on this thread now is left out of the open tick.
+fn off_the_tick() -> bool {
+    TICK_OWN_THREAD.load(Ordering::SeqCst)
+        && lock(&TICK_THREAD).is_some_and(|t| t != std::thread::current().id())
+}
+
+/// The tick is over: nothing is off it now, and what other threads ran while
+/// it was open goes back to the process's tally.
+fn tick_scope_end() {
+    *lock(&TICK_THREAD) = None;
+    let other = std::mem::take(&mut *lock(&ELSEWHERE));
+    let mut k = kids();
+    for (prog, (n, wall)) in other.0 {
+        let e = k.0.entry(prog).or_insert((0, 0.0));
+        e.0 += n;
+        e.1 += wall;
+    }
 }
 
 /// Take what has accumulated.
@@ -915,6 +963,7 @@ pub fn tick_begin() {
         return;
     }
     let _ = drain_children();
+    *lock(&TICK_THREAD) = Some(std::thread::current().id());
     *tick_guard() = Some(Tick {
         at: crate::util::epoch_secs(),
         started: Instant::now(),
@@ -991,8 +1040,18 @@ pub fn tick_line(at: i64, wall: Duration, me: (u64, u64), kids_cpu: (u64, u64), 
 
 /// Finish the tick and write its line.
 pub fn tick_end() {
+    if let Some(line) = tick_finish() {
+        write(Log::Actions, line);
+    }
+}
+
+/// Finish the tick: its line, not yet written.
+fn tick_finish() -> Option<Value> {
     let t = tick_guard().take();
-    let Some(mut t) = t else { return };
+    let Some(mut t) = t else {
+        tick_scope_end();
+        return None;
+    };
     close(&mut t);
     let (u, s) = own_cpu();
     let (ku, ks) = children_cpu();
@@ -1014,7 +1073,8 @@ pub fn tick_end() {
         o.insert("phase_cpu_ms".into(), phase_cpu_json(&t.cpu));
         o.insert("phase_kids".into(), phase_kids_json(&t.spent));
     }
-    write(Log::Actions, line);
+    tick_scope_end();
+    Some(line)
 }
 
 /// Per phase, this process's own CPU in ms. Pure.
@@ -1041,6 +1101,7 @@ pub fn phase_kids_json(spent: &[(String, Kids)]) -> Value {
 pub fn tick_discard() {
     *tick_guard() = None;
     let _ = drain_children();
+    tick_scope_end();
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,6 +1807,37 @@ mod tests {
         assert_eq!(v["two"]["compound-sup"]["n"], 1);
         assert!(v.get("three").is_none(), "a phase that ran nothing says nothing");
         assert!(phase_cpu_json(&t.cpu).get("three").is_some(), "every phase has a CPU figure");
+    }
+
+    /// **wsp-502.** In a test process a tick counts only its own thread's
+    /// children. A `df` another test ran while the tick was open was counted
+    /// as the tick's probe (`daemon::tests::tick_by_host::under_the_manager_…`).
+    /// What the other thread ran is left out of the tick and is still the
+    /// process's afterwards.
+    #[test]
+    fn a_probe_run_on_another_thread_while_a_tick_is_open_is_not_counted_in_it() {
+        let _g = KIDS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        if off() {
+            return;
+        }
+        ticks_count_their_own_thread();
+        let _ = drain_children();
+        tick_begin();
+        phase("own");
+        assert!(Command::new("true").status().unwrap().success());
+        let beside = std::thread::spawn(|| Command::new("echo").arg("df").output().unwrap());
+        assert!(beside.join().unwrap().status.success());
+        phase("later");
+        let line = tick_finish().expect("the tick was open");
+        assert_eq!(line["children"]["true"]["n"], 1, "the tick's own child is counted: {line}");
+        assert!(line["children"].get("echo").is_none(), "another thread's child was counted in the tick: {line}");
+        assert!(line["phase_kids"]["later"].is_null() && line["phase_kids"].get("own").is_some(), "{line}");
+        let after = drain_children();
+        assert_eq!(after.0.get("echo").map(|e| e.0), Some(1), "the other thread's child is the process's again: {after:?}");
+        assert!(!after.0.contains_key("true"), "the tick's own child was counted twice: {after:?}");
+        // With no tick open, any thread's child is the process's.
+        std::thread::spawn(|| Command::new("echo").arg("x").output().unwrap()).join().unwrap();
+        assert_eq!(drain_children().0.get("echo").map(|e| e.0), Some(1));
     }
 
     /// The whole of what an exit does — role, parent name, both `getrusage`s,
