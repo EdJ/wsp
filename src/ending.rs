@@ -236,7 +236,7 @@ fn holds(tasks: &[Task], member: &Task) -> Option<Holds> {
         return None;
     }
     let now = crate::repair::landed(member);
-    if let (Some(read), Some(now)) = (p.read.as_deref(), now.as_deref()) {
+    if let (Some(read), Some(now)) = (p.own(), now.as_deref()) {
         if !same_commit(read, now) {
             return None;
         }
@@ -258,7 +258,7 @@ fn handed(tasks: &[Task], member: &Task) -> Option<Holds> {
     if p.state != Verdict::Running {
         return None;
     }
-    if let (Some(read), Some(now)) = (p.read.as_deref(), crate::repair::commit_of(member).as_deref()) {
+    if let (Some(read), Some(now)) = (p.own(), crate::repair::commit_of(member).as_deref()) {
         if !same_commit(read, now) {
             return None;
         }

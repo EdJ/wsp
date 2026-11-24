@@ -3383,7 +3383,9 @@ pub(crate) fn verified(tasks: &[Task], member: &str) -> bool {
 /// `doing` after, and owes nothing). No agent is spent.
 fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
     use crate::cmd_checkout::Prepared;
-    if crate::repair::ready(member).is_none() {
+    // A by-merge row is not rebased on the local trunk (`wsp-350`): its PR
+    // merges into the remote's, and the branch stays as it was pushed.
+    if crate::repair::ready(member).is_none() || crate::lands::by_merge(store, &member.id) {
         return true;
     }
     let tasks = store.tasks_shared();
@@ -3464,7 +3466,7 @@ pub(crate) fn open_verifier(
 ) -> Option<Opened> {
     use crate::verification::{self as v, Ending, State};
     let now_landing = crate::repair::commit_of(member);
-    let landed_again = |p: &v::Pass| match (&now_landing, &p.read) {
+    let landed_again = |p: &v::Pass| match (&now_landing, p.own()) {
         (Some(now), Some(then)) => !v::same_commit(now, then) && !p.landed.as_deref().is_some_and(|l| v::same_commit(now, l)),
         _ => false,
     };
@@ -3517,7 +3519,7 @@ pub(crate) fn open_verifier(
                 // has not changed (wsp-526). A seat that disagrees says so with
                 // `wsp review --anyway`, and the governor is told the block is
                 // unanswered ([`answered_block`]).
-                let at_blocked = matches!((&now_landing, &p.read), (Some(n), Some(r)) if v::same_commit(n, r));
+                let at_blocked = matches!((&now_landing, p.own()), (Some(n), Some(r)) if v::same_commit(n, r));
                 if at_blocked || (!moved_since(&now_landing, &member.updated, p) && !reviewed_since_sent_back(&m)) {
                     return None;
                 }
@@ -3541,6 +3543,9 @@ pub(crate) fn open_verifier(
         store.save_task(&m).ok()?;
         Some(Opened { superseded, again: false, lost })
     })?;
+    if !made.again {
+        read_pr_head(store, &member.id);
+    }
     let why = match (&made.superseded, made.again) {
         (_, true) => "again: the last start never arrived".to_string(),
         (_, _) if made.lost.is_some() => format!("the pass in {} lost its seat", made.lost.as_deref().unwrap_or_default()),
@@ -3549,6 +3554,29 @@ pub(crate) fn open_verifier(
     };
     store.git_commit(&format!("wsp: verify {} — {why}", member.id));
     Some(made)
+}
+
+/// A by-merge row's new pass reads the PR's head (`wsp-350`), not the ready
+/// commit. Asked outside the lock, since it calls `gh` and fetches.
+fn read_pr_head(store: &Store, id: &str) {
+    if !crate::lands::by_merge(store, id) {
+        return;
+    }
+    let Some(member) = store.find_task(id) else { return };
+    let Some(ready) = crate::repair::ready(&member) else { return };
+    let Some(head) = crate::by_merge::pr_head(store, &member, &ready) else { return };
+    store.locked(|| {
+        let mut m = store.find_task(id)?;
+        let mut own = crate::verification::passes(&m);
+        let pass = own.last_mut().filter(|p| p.state == crate::verification::State::Running)?;
+        if !crate::verification::same_commit(&head.sha, &ready) {
+            pass.ready = pass.read.take();
+            pass.read = Some(head.sha.chars().take(12).collect());
+        }
+        pass.from = head.from.clone();
+        crate::verification::write(&mut m, &own);
+        store.save_task(&m).ok()
+    });
 }
 
 /// What [`open_verifier`] did: a fresh pass, or a wedged one taken again, and
@@ -3573,7 +3601,7 @@ pub(crate) struct Opened {
 /// is the old predicate rather than `true`, so the first landing after it does
 /// not itself buy a verifier for code that was never re-read.
 fn moved_since(now_landing: &Option<String>, member_updated: &str, pass: &crate::verification::Pass) -> bool {
-    match (now_landing, &pass.read) {
+    match (now_landing, pass.own()) {
         // The commit a hold landed is the work it read, rebased.
         (Some(now), Some(then)) => {
             !crate::verification::same_commit(now, then) && !pass.landed.as_deref().is_some_and(|l| crate::verification::same_commit(now, l))
@@ -3626,7 +3654,7 @@ fn reviewed_since_sent_back(t: &Task) -> bool {
 /// **The commits only, never `updated`**: a governor's note moves the member
 /// and answers nothing.
 pub(crate) fn answered_block(t: &Task) -> bool {
-    let landed_again = match (crate::repair::commit_of(t), crate::verification::passes(t).last().and_then(|p| p.read.clone())) {
+    let landed_again = match (crate::repair::commit_of(t), crate::verification::passes(t).last().and_then(|p| p.own().map(str::to_string))) {
         (Some(now), Some(then)) => !crate::verification::same_commit(&now, &then),
         _ => false,
     };
@@ -3643,7 +3671,7 @@ pub(crate) fn answered_block(t: &Task) -> bool {
 pub(crate) fn blocked_at_tip(t: &Task) -> Option<crate::verification::Pass> {
     let now = crate::repair::commit_of(t)?;
     let pass = crate::verification::passes(t).pop()?;
-    let read = pass.read.as_deref()?;
+    let read = pass.own()?;
     (pass.state == crate::verification::State::Blocks && crate::verification::same_commit(&now, read)).then_some(pass)
 }
 
@@ -3827,15 +3855,17 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         ),
         None => (String::new(), String::new()),
     };
-    let read = crate::verification::passes(member)
+    let pass = crate::verification::passes(member)
         .into_iter()
         .rev()
-        .find(|p| p.state == crate::verification::State::Running)
-        .and_then(|p| p.read)
-        .map(|r| format!(" at {r}"))
-        .unwrap_or_default();
+        .find(|p| p.state == crate::verification::State::Running);
+    let read = pass.as_ref().and_then(|p| p.read.as_ref()).map(|r| format!(" at {r}")).unwrap_or_default();
     let ready = crate::repair::ready(member).is_some();
+    let by_merge = ready && crate::lands::by_merge(store, &member.id);
+    // The pass reads a commit the member's tree does not stand at.
+    let elsewhere = pass.as_ref().is_some_and(|p| p.ready.is_some());
     let (started, stand, readonly, holds) = match ready {
+        true if by_merge => by_merge_order(store, member, pass.as_ref()),
         true => (
             format!("wsp started you when {m} reached review, ready{read} and rebased on the trunk; it is not on the trunk yet and nobody else is going to read this work before it is", m = member.id),
             format!("**You stand in {m}'s own tree**, at the commit it is ready at, with its build output: verify there, with `cargo test <module>::` or the project's equivalent incrementally, and read the trunk with `git show master:<path>` where you need it. ", m = member.id),
@@ -3875,8 +3905,41 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         pieces = pieces_block(store, member),
         whole = crate::size_check::whole_line(member),
         ran_full = full_suite_line(member),
-        reuse = crate::check::greens_held(store, member).map(|(sha, held)| reuse_text(&sha, &held)).unwrap_or_default(),
+        // The greens are the ready commit's, which says nothing of another.
+        reuse = crate::check::greens_held(store, member).filter(|_| !elsewhere).map(|(sha, held)| reuse_text(&sha, &held)).unwrap_or_default(),
         split = crate::split::for_verifier(member, &crate::split::unrun(&store.tasks(), &member.id, &running)),
+    )
+}
+
+/// The four parts of a by-merge row's order that differ (`wsp-350`): how the
+/// verifier was started, where it stands, what it may not do and what a hold
+/// does.
+fn by_merge_order(store: &Store, member: &Task, pass: Option<&crate::verification::Pass>) -> (String, String, String, String) {
+    let m = &member.id;
+    let ready = crate::repair::ready(member).unwrap_or_default();
+    let read = pass.and_then(|p| p.read.clone()).unwrap_or_else(|| ready.clone());
+    let from = match pass.and_then(|p| p.from.as_deref()) {
+        Some(url) if url.starts_with("http") => format!("the head of its PR, {url}"),
+        Some(branch) => format!("the head of {branch} (no open PR was found)"),
+        None => "its ready commit (no PR and no remote branch was found)".to_string(),
+    };
+    let base = crate::by_merge::base_ref(store, member).unwrap_or_else(|| "the remote's trunk".into());
+    let stand = match pass.is_some_and(|p| p.ready.is_some()) {
+        true => format!(
+            "**You stand in {m}'s own tree, whose HEAD is {ready} and not the commit you read**: read files with `git show {read}:<path>`, \
+             and run tests on a copy (`git archive {read} | tar -x -C <a new dir under $WSP_SCRATCH>`). "
+        ),
+        false => format!("**You stand in {m}'s own tree**, at the commit you read, with its build output: verify there, with `cargo test <module>::` or the project's equivalent incrementally. "),
+    };
+    (
+        format!(
+            "wsp started you when {m} reached review; it is {waiting}, and nobody else is going to read this work before it does. \
+             **Read commit {read}**, {from}. Compare it against `{base}`, not the local trunk: `git diff {base}...{read}`",
+            waiting = crate::lands::WAITING,
+        ),
+        format!("{stand}Read the trunk with `git show {base}:<path>` where you need it. "),
+        format!("**You are read-only.** Do not edit, commit, rebase, push, merge, or change {m}'s status. "),
+        format!("it holds: `wsp verified {m} --holds --from FILE --caption \"…\"`, which records the verdict; {m} stays {}", crate::lands::WAITING),
     )
 }
 

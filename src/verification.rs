@@ -119,6 +119,12 @@ pub(crate) struct Pass {
     /// The commit it was asked to read: the member's landing when the pass was
     /// opened. `None` for work with no repository behind it.
     pub read: Option<String>,
+    /// The member's own commit when `read` is another (`wsp-350`): a by-merge
+    /// row's pass reads the PR's head, and "has the member moved" is asked of
+    /// this one ([`Pass::own`]).
+    pub ready: Option<String>,
+    /// Where a by-merge row's `read` came from: the PR, or the remote branch.
+    pub from: Option<String>,
     /// The commit that reached the trunk when it is not the one read: a hold
     /// lands the branch rebased onto a trunk that moved.
     pub landed: Option<String>,
@@ -212,11 +218,19 @@ impl Spent {
 
 impl Pass {
     /// A pass opened now, on the commit the member's work is on.
+    /// The member's own commit the pass was opened at: what its landing, ready
+    /// or reading line is compared against.
+    pub(crate) fn own(&self) -> Option<&str> {
+        self.ready.as_deref().or(self.read.as_deref())
+    }
+
     pub(crate) fn opened(read: Option<String>, on: Option<String>) -> Pass {
         Pass {
             at: util::now_iso(),
             state: State::Running,
             read: read.map(|s| short(&s)),
+            ready: None,
+            from: None,
             landed: None,
             pane: None,
             on,
@@ -245,6 +259,8 @@ impl Pass {
             }
         };
         clause("read", &self.read);
+        clause("ready", &self.ready);
+        clause("from", &self.from);
         clause("landed", &self.landed);
         clause("pane", &self.pane);
         clause("on", &self.on);
@@ -341,6 +357,8 @@ impl Pass {
             at: at.to_string(),
             state,
             read: None,
+            ready: None,
+            from: None,
             landed: None,
             pane: None,
             on: None,
@@ -364,6 +382,8 @@ impl Pass {
                 let v = Some(v.trim().to_string());
                 match k {
                     "read" => p.read = v,
+                    "ready" => p.ready = v,
+                    "from" => p.from = v,
                     "landed" => p.landed = v,
                     "pane" => p.pane = v,
                     "on" => p.on = v,
@@ -686,6 +706,8 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         at: row.created.clone(),
         state,
         read: crate::repair::landed(row).map(|s| short(&s)),
+        ready: None,
+        from: None,
         landed: None,
         pane: attempt.map(|a| a.pane).filter(|p| !p.is_empty()),
         on,
@@ -1271,7 +1293,7 @@ fn note_landing(store: &Store, member: &str, l: &crate::cmd_checkout::Landed, re
         let mut t = store.find_task(member)?;
         let mut ps = passes(&t);
         let last = ps.last_mut()?;
-        if last.read.as_deref().is_none_or(|r| !same_commit(r, &l.sha)) {
+        if last.own().is_none_or(|r| !same_commit(r, &l.sha)) {
             last.landed = Some(short(&l.sha));
         }
         let pass = last.clone();
@@ -1720,6 +1742,8 @@ mod tests {
             at: "2026-10-06T10:00:00Z".into(),
             state: State::Blocks,
             read: Some("55c4839abcde".into()),
+            ready: Some("66bb1111cccc".into()),
+            from: Some("https://github.com/o/r/pull/7".into()),
             landed: Some("77aa0000bbbb".into()),
             pane: Some("cpd-12".into()),
             on: Some("claude opus/high".into()),
@@ -1748,7 +1772,7 @@ mod tests {
         write(&mut t, &[bare.clone(), full.clone()]);
         assert_eq!(passes(&t), vec![full, bare], "oldest first, whichever order they were handed in");
         assert!(t.body.find("## Verification").unwrap() < t.body.find("## Log").unwrap(), "and the log stays last");
-        assert!(t.body.contains("- 2026-10-06T10:00:00Z blocks · read 55c4839abcde · landed 77aa0000bbbb · pane cpd-12"), "{}", t.body);
+        assert!(t.body.contains("- 2026-10-06T10:00:00Z blocks · read 55c4839abcde · ready 66bb1111cccc · from https://github.com/o/r/pull/7 · landed 77aa0000bbbb · pane cpd-12"), "{}", t.body);
     }
 
     /// A verifier's usage lands on its pass (`compounding-104`): the load it

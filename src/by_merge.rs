@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use wsp_base::calls::Command;
 
-use crate::cmd_checkout::{candidates, trunk, trunk_branch};
+use crate::cmd_checkout::{candidates, member_tree, open_pr_json, trunk, trunk_branch};
 use crate::model::{project_of, Task, Worklist};
 use crate::repair::LANDED;
 use crate::store::Store;
@@ -55,19 +55,71 @@ struct Merged {
     tip: String,
 }
 
-fn land_one(store: &Store, w: &Worklist, at: usize, t: &Task, ready: &str) {
-    let id = t.id.clone();
-    let Some(repo) = candidates(store, Path::new("/"), &id)
+/// The repository holding a row's ready commit, and what its PR merges into.
+struct Base {
+    repo: PathBuf,
+    trunk_dir: PathBuf,
+    on: String,
+    remote: String,
+}
+
+fn base(store: &Store, t: &Task, ready: &str) -> Option<Base> {
+    let repo = candidates(store, Path::new("/"), &t.id)
         .into_iter()
-        .find(|r| run(r, &["cat-file", "-e", &format!("{ready}^{{commit}}")]).is_some())
-    else {
-        return;
-    };
-    let Some(trunk_dir) = trunk(&repo) else { return };
-    let Some(on) = trunk_branch(&trunk_dir) else { return };
+        .find(|r| run(r, &["cat-file", "-e", &format!("{ready}^{{commit}}")]).is_some())?;
+    let trunk_dir = trunk(&repo)?;
+    let on = trunk_branch(&trunk_dir)?;
     let remote = project_of(t)
         .and_then(|p| store.project(&p))
         .map_or_else(|| crate::model::DEFAULT_REMOTE.to_string(), |p| p.remote().to_string());
+    Some(Base { repo, trunk_dir, on, remote })
+}
+
+/// `<remote>/<trunk>`: what a by-merge row's change is compared against.
+pub(crate) fn base_ref(store: &Store, t: &Task) -> Option<String> {
+    let b = base(store, t, &crate::repair::ready(t)?)?;
+    Some(format!("{}/{}", b.remote, b.on))
+}
+
+/// The commit a by-merge row's verifier reads.
+pub(crate) struct Head {
+    pub sha: String,
+    /// The PR's url, or the remote branch; `None` for the ready commit.
+    pub from: Option<String>,
+}
+
+/// The head of the row's PR: by `gh` on a GitHub remote, else the remote's
+/// branch of the same name after a fetch, else the ready commit. Fetches the
+/// remote's trunk too, so the comparison base is current.
+pub(crate) fn pr_head(store: &Store, t: &Task, ready: &str) -> Option<Head> {
+    let b = base(store, t, ready)?;
+    let dir = member_tree(store, &t.id).unwrap_or_else(|| b.repo.clone());
+    let branch = run(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).filter(|x| *x != b.on).unwrap_or_else(|| t.id.clone());
+    fetch_now(&b.trunk_dir, &b.remote, &b.on);
+    let has = |sha: &str| run(&b.repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some();
+    if let Some(pr) = open_pr_json(store, &t.id, &dir, &branch, "headRefOid,headRefName,url") {
+        let said = |k: &str| pr.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        if let (Some(sha), Some(name), Some(url)) = (said("headRefOid"), said("headRefName"), said("url")) {
+            fetch_now(&b.trunk_dir, &b.remote, &name);
+            if has(&sha) {
+                return Some(Head { sha, from: Some(url) });
+            }
+        }
+    }
+    // Only a branch the fetch just reached: a tracking ref left from before
+    // may be older than the work.
+    if fetch_now(&b.trunk_dir, &b.remote, &branch) {
+        let tracked = format!("refs/remotes/{}/{branch}", b.remote);
+        if let Some(sha) = run(&b.repo, &["rev-parse", "--verify", "--quiet", &tracked]) {
+            return Some(Head { sha, from: Some(format!("{}/{branch}", b.remote)) });
+        }
+    }
+    Some(Head { sha: ready.to_string(), from: None })
+}
+
+fn land_one(store: &Store, w: &Worklist, at: usize, t: &Task, ready: &str) {
+    let id = t.id.clone();
+    let Some(Base { trunk_dir, on, remote, .. }) = base(store, t, ready) else { return };
     let upstream = format!("refs/remotes/{remote}/{on}");
     fetch(&trunk_dir, &remote, &on);
     let Some(m) = merged(&trunk_dir, &upstream, &on, &id, ready) else { return };
@@ -117,15 +169,21 @@ fn fetch(repo: &Path, remote: &str, branch: &str) {
         }
         held.insert(key, now);
     }
+    fetch_now(repo, remote, branch);
+}
+
+/// [`fetch`] with no wait between two, and whether it reached the branch.
+fn fetch_now(repo: &Path, remote: &str, branch: &str) -> bool {
     // No prompt: the daemon has nobody to answer one.
-    let _ = Command::new("git")
+    Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["fetch", "--quiet", remote, &format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}")])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_INDEX_FILE")
         .stdin(Stdio::null())
-        .output();
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn run(repo: &Path, args: &[&str]) -> Option<String> {
@@ -354,6 +412,53 @@ mod tests {
         assert_eq!(f.log(), before);
         assert!(crate::cycle::tests::SAID.with(|s| s.borrow().is_empty()));
         assert!(before.contains(&f.ready) && !before.contains(LANDED), "{before}");
+    }
+
+    /// The reviewer's branch moved past the ready commit; then a pass opens.
+    fn opened(f: &Fix) -> (String, crate::verification::Pass, String) {
+        git(&f.reviewer, &["checkout", "--quiet", "-b", "m-1", "origin/m-1"]);
+        let head = commit(&f.reviewer, "review-fix");
+        git(&f.reviewer, &["push", "--quiet", "origin", "m-1"]);
+        let on = crate::model::Policy::parse("claude").unwrap();
+        let t = f.store.find_task("m-1").unwrap();
+        crate::cycle::open_verifier(&f.store, &t, &on, &|_: &str| false, &|_: &str| false, &|| true).expect("a pass opens");
+        let t = f.store.find_task("m-1").unwrap();
+        let pass = crate::verification::passes(&t).pop().unwrap();
+        (head, pass, crate::cycle::verifier_order(&f.store, &t))
+    }
+
+    #[test]
+    fn a_by_merge_rows_pass_reads_the_remote_branch_head() {
+        let f = fix("pass", true, &["work"], "m-1");
+        let (head, pass, order) = opened(&f);
+        let (read, ready) = (&head[..12], &f.ready[..12]);
+        assert_eq!(pass.read.as_deref(), Some(read));
+        assert_eq!(pass.ready.as_deref(), Some(ready));
+        assert_eq!(pass.from.as_deref(), Some("origin/m-1"));
+        assert!(order.contains(&format!("**Read commit {read}**, the head of origin/m-1")), "{order}");
+        assert!(order.contains(&format!("`git diff origin/master...{read}`")), "{order}");
+        assert!(order.contains(crate::lands::WAITING), "{order}");
+        assert!(!order.contains("rebased on the trunk") && !order.contains("wsp land") && !order.contains("lands "), "{order}");
+        // The head differing from the ready commit is not the member moving.
+        let t = f.store.find_task("m-1").unwrap();
+        let on = crate::model::Policy::parse("claude").unwrap();
+        assert!(crate::cycle::open_verifier(&f.store, &t, &on, &|_: &str| false, &|_: &str| false, &|| true).is_none());
+    }
+
+    #[test]
+    fn without_the_field_a_pass_reads_the_ready_commit_in_todays_words() {
+        let f = fix("pass-off", false, &["work"], "m-1");
+        let (_, pass, order) = opened(&f);
+        let ready = &f.ready[..12];
+        assert_eq!((pass.read.as_deref(), pass.ready, pass.from), (Some(ready), None, None));
+        assert!(
+            order.contains(&format!(
+                "wsp started you when m-1 reached review, ready at {ready} and rebased on the trunk; it is not on the trunk yet and nobody else is going to read this work before it is.\n\n\
+                 **You are read-only.** Do not edit, commit, rebase, land, or change m-1's status; never type `wsp land`. \
+                 **You stand in m-1's own tree**, at the commit it is ready at, with its build output: "
+            )),
+            "{order}"
+        );
     }
 
     #[test]

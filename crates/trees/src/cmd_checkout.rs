@@ -2773,11 +2773,17 @@ fn by_merge_refusal(store: &Store, w: &Where) -> Option<String> {
     Some(crate::lands::refusal(&w.task, &by, &branch, pr.as_deref()))
 }
 
-/// The open PR from `branch`, by `gh`, when the tree's remote is on GitHub;
-/// `None` when there is none, `gh` is not there, or the remote is elsewhere —
-/// a land refused names the branch then. Never asked of a tree with no GitHub
-/// remote, so a test fixture starts no `gh`.
+/// The url of the open PR from `branch`; `None` as [`open_pr_json`].
 fn open_pr(store: &Store, task: &str, dir: &Path, branch: &str) -> Option<String> {
+    let pr = open_pr_json(store, task, dir, branch, "url")?;
+    pr.get("url")?.as_str().filter(|u| u.starts_with("http")).map(str::to_string)
+}
+
+/// `fields` of the open PR from `branch`, by `gh`, when the tree's remote is on
+/// GitHub; `None` when there is none, `gh` is not there, or the remote is
+/// elsewhere. Never asked of a tree with no GitHub remote, so a test fixture
+/// starts no `gh`.
+pub fn open_pr_json(store: &Store, task: &str, dir: &Path, branch: &str, fields: &str) -> Option<serde_json::Value> {
     let remote = store
         .find_task(task)
         .and_then(|t| crate::model::project_of(&t))
@@ -2789,13 +2795,15 @@ fn open_pr(store: &Store, task: &str, dir: &Path, branch: &str) -> Option<String
         return None;
     }
     let out = wsp_base::calls::Command::new("gh")
-        .args(["pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url"])
+        .args(["pr", "list", "--head", branch, "--state", "open", "--json", fields])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && url.starts_with("http")).then_some(url)
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout).ok()?.into_iter().next()
 }
 
 pub fn land(store: &Store, args: &Args) -> i32 {

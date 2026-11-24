@@ -159,15 +159,18 @@ fn stop_lines(overview: &str) -> Vec<&str> {
 /// The packet for a row's verifier, and `None` for a row that is not a React
 /// row (or whose commit, tree or history cannot be read).
 pub(crate) fn build(store: &Store, t: &Task) -> Option<String> {
-    let tg = crate::check::target(store, t, None).ok()?;
+    // A by-merge row (`wsp-350`): the commit its pass reads, over what the
+    // remote's trunk does not hold — a PR's commits need not name the row.
+    let by_merge = crate::repair::ready(t).is_some() && crate::lands::by_merge(store, &t.id);
+    let read = crate::verification::passes(t).pop().filter(|_| by_merge).and_then(|p| p.read);
+    let upstream = by_merge.then(|| crate::by_merge::base_ref(store, t)).flatten();
+    let tg = crate::check::target(store, t, read.as_deref()).ok()?;
     let (repo, sha) = (tg.repo.clone(), tg.sha.clone());
-    let mut commits: Vec<String> = git(
-        &repo,
-        &["log", "--format=%H", "-E", &format!("--grep=^{}([^0-9]|$)", t.id), &sha, "--max-count=40"],
-    )?
-    .split_whitespace()
-    .map(String::from)
-    .collect();
+    let own = match &upstream {
+        Some(up) => git(&repo, &["log", "--format=%H", &format!("{up}..{sha}"), "--max-count=40"]),
+        None => git(&repo, &["log", "--format=%H", "-E", &format!("--grep=^{}([^0-9]|$)", t.id), &sha, "--max-count=40"]),
+    };
+    let mut commits: Vec<String> = own?.split_whitespace().map(String::from).collect();
     commits.reverse();
     if commits.is_empty() {
         commits.push(sha.clone());
@@ -178,12 +181,17 @@ pub(crate) fn build(store: &Store, t: &Task) -> Option<String> {
     let ws = workspace(&repo, &sha, &files)?;
 
     let mut out = String::new();
-    out.push_str(&format!("# Verification packet · {} · ready at {}\n\n", t.id, &sha[..12.min(sha.len())]));
+    let at = if by_merge { "reads" } else { "ready at" };
+    out.push_str(&format!("# Verification packet · {} · {at} {}\n\n", t.id, &sha[..12.min(sha.len())]));
     out.push_str(
         "Everything you need to decide is below, so **do not read the tree for what the packet already holds**: \
          the overview, the stop clause, the commits, the seat's summary, the check plan and the diff. Read a file \
-         only where the diff does not show enough of it. The tree is at the ready commit.\n\n",
+         only where the diff does not show enough of it. ",
     );
+    out.push_str(match by_merge {
+        true => "Your order says where the tree is.\n\n",
+        false => "The tree is at the ready commit.\n\n",
+    });
     let overview = t.section("Overview").unwrap_or_default();
     out.push_str(&format!("## Row\n\n{}\n\n## Stop clause\n\n", overview.trim()));
     let stop = stop_lines(&overview);

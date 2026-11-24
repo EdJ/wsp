@@ -2241,7 +2241,7 @@ fn done_when_of(t: &Task) -> String {
 /// seat is putting up again, unchanged (`wsp-529`).
 pub(crate) fn blocked_at(t: &Task, tip: &str) -> Option<crate::verification::Pass> {
     let p = crate::verification::passes(t).pop()?;
-    let read = p.read.as_deref()?;
+    let read = p.own()?;
     (p.state == crate::verification::State::Blocks && crate::verification::same_commit(read, tip)).then_some(p)
 }
 
