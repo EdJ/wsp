@@ -23,7 +23,6 @@ use serde_json::json;
 use crate::model::{Status, Task, Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::Paint;
-use crate::Args;
 
 /// The rows found while doing `id`, by id.
 pub(crate) fn of<'a>(tasks: &'a [Task], id: &str) -> Vec<&'a Task> {
@@ -182,9 +181,10 @@ pub(crate) fn apply(store: &Store, plan: &[Convert]) -> usize {
 }
 
 /// `wsp migrate --follow-ups [-n]`: the migration by hand, planned in full
-/// under `-n`. The daemon runs it once by itself ([`migrate_once`]).
-pub(crate) fn migrate(store: &Store, args: &Args) -> i32 {
-    let dry = args.has("n") || args.has("dry-run");
+/// under `-n` (`dry`). The daemon runs it once by itself ([`migrate_once`]).
+/// It takes the flag rather than `Args` so this module links nothing above
+/// `engine` (tests/layering.rs).
+pub(crate) fn migrate(store: &Store, dry: bool) -> i32 {
     let p = Paint::new();
     let plan = plan(&store.tasks(), &store.worklists());
     for c in &plan {

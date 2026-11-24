@@ -132,7 +132,7 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     // `wsp-345`: sub-tasks of closed rows that are follow-ups. The daemon runs
     // it once by itself; this is the same pass by hand, planned under `-n`.
     if args.has("follow-ups") {
-        return crate::follow_up::migrate(store, args);
+        return crate::follow_up::migrate(store, args.has("n") || args.has("dry-run"));
     }
 
     let p = Paint::new();
