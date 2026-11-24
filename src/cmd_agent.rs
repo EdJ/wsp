@@ -4051,6 +4051,13 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
     // are read through the API on the files path too (wsp-127), are not dialled
     // for a second time after it failed: that is said on the same line.
     let mut fell = false;
+    // The managers' census does not wait on the reply (wsp-373): it is asked
+    // beside the dial, so the call costs the longer of the two, not their sum.
+    // On a failed dial it is left to finish unread, and the files ask their own.
+    let census = wip_reads_api().then(|| {
+        let state = store.state.clone();
+        std::thread::spawn(move || crate::host_tcp::census(&state, env!("CARGO_PKG_VERSION")))
+    });
     let api = match wip_reads_api() {
         false => None,
         true => match api_state(store) {
@@ -4067,7 +4074,10 @@ pub fn wip(store: &Store, args: &Args) -> i32 {
         },
     };
     let w = match &api {
-        Some(state) => Wip::from_api(store, state),
+        Some(state) => {
+            let reading = census.and_then(|c| c.join().ok());
+            Wip::from_api_read(store, state, reading.unwrap_or_else(|| crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"))))
+        }
         None => Wip::from_managers(store, !fell),
     };
     let cap_waits = crate::room::waiting_lines(store, &w.agents);
@@ -4619,6 +4629,12 @@ impl Wip {
     /// stamp's (the daemon has just answered, so a stamp gone stale is the one
     /// thing left to say).
     pub(crate) fn from_api(store: &Store, state: &wsp_store_contract::State) -> Wip {
+        Wip::from_api_read(store, state, crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION")))
+    }
+
+    /// [`Wip::from_api`] with the managers' census already asked, as `wip`
+    /// asks it beside its dial.
+    pub(crate) fn from_api_read(store: &Store, state: &wsp_store_contract::State, reading: crate::host_tcp::Reading) -> Wip {
         let tasks: Vec<Task> = state
             .rows
             .values()
@@ -4667,7 +4683,6 @@ impl Wip {
         // decision): the seats' rss and shells and the host's disks and load
         // come live from the managers' `seats` replies, the source
         // `from_managers` reads them from, and no child runs for them.
-        let reading = crate::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
         let rss: BTreeMap<String, u64> = reading.rows.iter().map(|(s, r)| (s.clone(), r.rss_bytes)).collect();
         let counts: BTreeMap<String, u32> = reading.rows.iter().map(|(s, r)| (s.clone(), r.shells)).collect();
         let disks: Vec<crate::host_tcp::DiskFree> = reading.facts.values().flat_map(|f| f.disks.iter().cloned()).collect();

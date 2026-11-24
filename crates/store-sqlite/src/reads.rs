@@ -96,7 +96,9 @@ impl Reads for SqliteStore {
     }
 
     /// Cut down in SQL, over the state row, so the full domain is never decoded into Rust: one
-    /// statement, so the cut and the head are of one moment, as `snapshot()`'s are.
+    /// statement, so the cut and the head are of one moment, as `snapshot()`'s are. The row's
+    /// text is parsed once, into JSONB, and each `json_each` and `json_extract` walks that, not
+    /// the text again (wsp-373: 76 ms to about 45 ms on a 17.6 MB row; the output is the same).
     fn wip_snapshot(&self) -> Result<(State, EventId)> {
         let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
         let done = word(serde_json::json!(RowState::Done));
@@ -128,7 +130,7 @@ impl Reads for SqliteStore {
                                  FROM json_each(s.json, '$.asks')
                                  WHERE json_extract(value, '$.state') = ?2)),
                      (SELECT COALESCE(MAX(id), 0) FROM event)
-                     FROM (SELECT (SELECT json FROM state WHERE id = 1) AS json) AS s",
+                     FROM (SELECT (SELECT jsonb(json) FROM state WHERE id = 1) AS json) AS s",
                     params![done, raised, body, prose, finished, seated, census],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )

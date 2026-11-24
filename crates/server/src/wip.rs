@@ -12,7 +12,7 @@
 //! `wsp stamp`), so a cache cut on request would make its reads the cold
 //! ones. Once anything has asked for `wip`, a thread that follows the head
 //! (through `wait_for`, as `revoke` and `subscribe` do) cuts afresh when the
-//! head moves, after the burst settles, and a read finds the cache warm. A
+//! head moves, and a read finds the cache warm. A
 //! read that comes while that cut runs waits for it, and only a read at a
 //! head the thread has not reached yet cuts for itself. A server nobody asks
 //! `wip` of never cuts.
@@ -21,7 +21,7 @@
 //! the hub's) is cached alike.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use wsp_api::{Answer, ReqId};
 use wsp_store_contract::{EventId, Result, Store};
@@ -81,17 +81,16 @@ fn cut(store: &(dyn Store + Send + Sync), held: &mut Held) -> Result<Arc<Vec<u8>
     Ok(bytes)
 }
 
-/// How long the head must stay put before [`follow`] cuts: a fold of several
-/// events is one cut, not one each.
-const SETTLE: Duration = Duration::from_millis(10);
-/// The longest [`follow`] waits for a busy head to settle before it cuts anyway.
-const SETTLE_MAX: Duration = Duration::from_millis(100);
 /// How often [`follow`] looks at `stopping`, and how long it backs off when the store fails.
 const POLL: Duration = Duration::from_millis(100);
 
-/// Keep the cache warm until the server stops: each time the head moves (and
-/// has settled), cut afresh, so the census's read just after a change finds
-/// the cut made. Nothing is cut until a `wip` has been asked once.
+/// Keep the cache warm until the server stops: each time the head moves, cut
+/// afresh at once, so the census's read just after a change finds the cut
+/// made or under way. A burst is not cut once per event: the head is read
+/// again only after a cut, so whatever folded while it ran is one next cut.
+/// (A settling wait was tried and dropped: on the live store a fold takes
+/// 55 ms or more, longer than any wait worth the delay it adds to every read.)
+/// Nothing is cut until a `wip` has been asked once.
 pub(crate) fn follow(shared: Arc<Shared>) {
     let store = shared.store.as_ref();
     let mut cursor = loop {
@@ -103,7 +102,7 @@ pub(crate) fn follow(shared: Arc<Shared>) {
     };
     let mut failing = false;
     while !shared.stopping() {
-        let mut head = match store.wait_for(cursor, POLL) {
+        let head = match store.wait_for(cursor, POLL) {
             Ok(h) => h,
             Err(_) => {
                 std::thread::sleep(POLL);
@@ -112,13 +111,6 @@ pub(crate) fn follow(shared: Arc<Shared>) {
         };
         if head <= cursor {
             continue;
-        }
-        let until = Instant::now() + SETTLE_MAX;
-        while Instant::now() < until {
-            match store.wait_for(head, SETTLE) {
-                Ok(h) if h > head => head = h,
-                _ => break,
-            }
         }
         cursor = head;
         match shared.wip.refresh(store) {
