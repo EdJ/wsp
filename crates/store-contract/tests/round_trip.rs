@@ -958,6 +958,13 @@ fn the_whole_state_events_and_feed_round_trip() {
         list: Some(list()),
         seat: None,
         heads: true,
+        after: None,
+        limit: None,
+    });
+    trip(&RowFilter {
+        after: Some(RowId("wsp-9".into())),
+        limit: Some(200),
+        ..Default::default()
     });
     trip(&ListFilter { heads: true });
     trip(&Reading {

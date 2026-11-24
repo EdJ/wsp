@@ -23,8 +23,10 @@ use crate::Frame;
 use std::time::Duration;
 
 /// The longest line a carrier reads, in bytes: 16 MB, as the manager's
-/// carrier (`wsp-host`'s `MAX_LINE`). A `state` reply of today's fleet is well
-/// under a megabyte.
+/// carrier (`wsp-host`'s `MAX_LINE`). A full store's `state` and `rows` are
+/// past it (51.5 and 40.6 MB), so the server sends no reply longer: it answers
+/// [`Code::TooLarge`](crate::Code::TooLarge) instead, and pages `rows` when
+/// asked (`after`, `limit`).
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 
 /// Why a connection could not send or receive.

@@ -423,6 +423,75 @@ fn each_read_verb_answers_what_the_store_holds_and_a_command_is_unsupported() {
     let _ = fs::remove_dir_all(&d);
 }
 
+/// A store past the line (wsp-377): `state` and `rows {}` would be replies
+/// longer than `MAX_LINE`, so each is answered `too_large` and the connection
+/// stays up; `rows` asked in pages returns every row once, in id order, each
+/// page's line under `MAX_LINE`, and ends on an empty page.
+#[test]
+fn a_reply_past_the_line_is_too_large_and_rows_in_pages_are_every_row() {
+    let d = dir("too-large");
+    let store = mirror_store();
+    // 48 rows of 512 KB each: 24 MB of rows, past the 16 MB line.
+    let n = 48;
+    let body = "x".repeat(512 * 1024);
+    let put: Vec<Entity> = (0..n)
+        .map(|i| {
+            let mut r = row(&format!("r-{i:02}"), "big");
+            r.fields.insert("body".into(), body.clone());
+            Entity::Row(r)
+        })
+        .collect();
+    apply(&store, put, vec![], "big");
+    let server = start(Arc::new(store.handle()), &d, Duration::from_secs(10));
+    let mut c = connect(&d);
+
+    for verb in [Verb::State(NoArgs {}), Verb::Rows(RowFilter::default())] {
+        match c.call(Call::Verb(verb.clone())) {
+            Outcome::Err(f) => {
+                assert_eq!(f.code, Code::TooLarge, "{verb:?}: {f:?}");
+                assert!(f.text.contains(&wsp_api::MAX_LINE.to_string()), "the text names the line: {}", f.text);
+            }
+            Outcome::Ok(_) => panic!("{verb:?} answered past the line"),
+        }
+    }
+    // The connection is still up, and a reply under the line still goes.
+    assert!(matches!(c.read(Verb::Rows(RowFilter { heads: true, ..Default::default() })), Answer::Rows(r) if r.len() == n));
+
+    let mut every = vec![];
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        let filter = RowFilter { after: after.clone(), limit: Some(1000), ..Default::default() };
+        let id = c.send(Call::Verb(Verb::Rows(filter)));
+        let reply = c.reply(id);
+        let line = serde_json::to_vec(&Frame::Reply(reply.clone())).unwrap().len() + 1;
+        assert!(line <= wsp_api::MAX_LINE, "page {pages} is a line of {line} bytes");
+        let Outcome::Ok(Answer::Rows(page)) = reply.outcome else { panic!("a page was refused: {:?}", reply.outcome) };
+        if page.is_empty() {
+            break;
+        }
+        pages += 1;
+        after = page.last().map(|r| r.id.clone());
+        every.extend(page);
+    }
+    assert!(pages > 1, "24 MB of rows came in {pages} page");
+    let mut whole = store.rows(&RowFilter::default()).unwrap();
+    whole.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(every, whole, "the pages are every row, once, in id order");
+
+    // `limit` caps a page under the line too, and `after` alone pages.
+    match c.read(Verb::Rows(RowFilter { limit: Some(3), ..Default::default() })) {
+        Answer::Rows(r) => assert_eq!(r.iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>(), ["r-00", "r-01", "r-02"]),
+        other => panic!("{other:?}"),
+    }
+    match c.read(Verb::Rows(RowFilter { after: Some(RowId("r-46".into())), ..Default::default() })) {
+        Answer::Rows(r) => assert_eq!(r.iter().map(|r| r.id.0.as_str()).collect::<Vec<_>>(), ["r-47"]),
+        other => panic!("{other:?}"),
+    }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
 /// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
 /// on rows not done and lists not finished, raised asks only, and `state` beside
 /// it unchanged.

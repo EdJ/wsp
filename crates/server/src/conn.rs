@@ -37,6 +37,12 @@
 //!   the hello sent, and each request is then put to the gate's `admits`, and
 //!   a command the gate `owns` is applied like the orders machine's, its
 //!   domain deciding who may. Either way `welcome` names it.
+//! - A reply whose line would be longer than [`MAX_LINE`] is not sent: the
+//!   client would drop the connection on it (wsp-377). The request is
+//!   answered `too_large` instead, naming the length. `state` of a full store
+//!   is such a reply; `rows` of one is too, unless asked a page (`after` or
+//!   `limit`): the rows the filter keeps, in id order, cut short where the
+//!   next would take the reply past the line.
 //! - A client silent for [`MISSED_BEATS`] beats is dropped. Any frame counts,
 //!   a malformed line included; a subscriber with nothing to ask keeps its
 //!   connection with a cheap read (`events { from: <its last>, limit: 0 }`).
@@ -50,10 +56,10 @@ use std::time::Instant;
 use serde_json::Value;
 use wsp_api::{
     Answer, Call, Code, ConnError, Connection, Failure, Frame, Hello, Outcome, Refused, Reply, ReqId, Request, Verb,
-    Welcome, COMMAND_VERBS, MAX_EVENTS, MAX_EVENTS_BYTES, MISSED_BEATS, PROTOCOL, READ_VERBS, SYNC_VERBS,
+    Welcome, COMMAND_VERBS, MAX_EVENTS, MAX_EVENTS_BYTES, MAX_LINE, MISSED_BEATS, PROTOCOL, READ_VERBS, SYNC_VERBS,
 };
 use wsp_machines::Orders;
-use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal};
+use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal, Row, RowFilter};
 
 use crate::revoke::{Entry, DROPPED};
 use crate::tcp::Tcp;
@@ -70,6 +76,37 @@ pub(crate) fn send(w: &Writer, frame: &Frame) -> bool {
 /// Write `line` (a whole frame, newline ended) on `w`; `false` when the connection is gone.
 fn send_bytes(w: &Writer, line: &[u8]) -> bool {
     w.lock().unwrap_or_else(|e| e.into_inner()).write_line(line).is_ok()
+}
+
+/// Send the reply `frame` to `id`, or `too_large` in its place where its
+/// line would be longer than [`MAX_LINE`] (wsp-377).
+fn send_reply(w: &Writer, id: ReqId, frame: &Frame) -> bool {
+    match serde_json::to_vec(frame) {
+        Ok(mut line) => {
+            line.push(b'\n');
+            send_sized(w, id, &line)
+        }
+        Err(_) => send(w, frame),
+    }
+}
+
+/// Write the reply `line` to `id` as it is, or `too_large` in its place where
+/// it is longer than [`MAX_LINE`]: a client stops reading at that length and
+/// drops the connection, so the request would get no answer at all.
+fn send_sized(w: &Writer, id: ReqId, line: &[u8]) -> bool {
+    if line.len() > MAX_LINE {
+        return send(w, &reply(id, Err(too_large(line.len()))));
+    }
+    send_bytes(w, line)
+}
+
+/// The `too_large` for a reply of `len` bytes.
+fn too_large(len: usize) -> Failure {
+    let text = format!(
+        "the reply is {len} bytes, past the {MAX_LINE} a line may be: ask for less \
+         (`rows` pages with `after` and `limit`, and takes `heads`)"
+    );
+    failure(Code::TooLarge, text)
 }
 
 /// Whether two tokens are equal, comparing every byte whatever the first
@@ -280,7 +317,7 @@ impl Client<'_> {
             Call::Verb(Verb::Whoami(_)) => Ok(Answer::Whoami { by: self.by.clone(), server: self.shared.cfg.instance.clone() }),
             // From the cut cached by head, spliced into the reply rather than serialised again (wsp-373).
             Call::Verb(Verb::Wip(_)) => match self.shared.wip.answer(self.shared.store.as_ref()) {
-                Ok(ok) => return send_bytes(&self.writer, &crate::wip::line(id, &ok)),
+                Ok(ok) => return send_sized(&self.writer, id, &crate::wip::line(id, &ok)),
                 Err(e) => Err(store_failure(e)),
             },
             Call::Verb(verb) => read(self.shared, verb),
@@ -304,7 +341,7 @@ impl Client<'_> {
                 }
             }
         };
-        send(&self.writer, &reply(id, outcome))
+        send_reply(&self.writer, id, &reply(id, outcome))
     }
 
     /// One command: the orders machine's, from a principal that may send it,
@@ -458,6 +495,9 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
         // `answer` serves it from the cache; this uncached cut is for any other caller.
         Verb::Wip(_) => s.wip_snapshot().map(|(state, at)| Answer::Wip { state, at }),
         Verb::Row { row } => s.row(&row).map(Answer::Row),
+        Verb::Rows(filter) if filter.after.is_some() || filter.limit.is_some() => {
+            s.rows(&filter).map(|rows| Answer::Rows(page(rows, &filter)))
+        }
         Verb::Rows(filter) => s.rows(&filter).map(Answer::Rows),
         Verb::List { list } => s.list(&list).map(Answer::List),
         Verb::Lists(filter) => s.lists(&filter).map(Answer::Lists),
@@ -493,6 +533,35 @@ fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
         Verb::Whoami(_) => return Err(failure(Code::Backend, "whoami is answered by the connection".into())),
     };
     r.map_err(store_failure)
+}
+
+/// What a page of rows leaves of [`MAX_LINE`] for the reply around them
+/// (`{"type":"reply","id":…,"ok":{"rows":[…]},"events":[]}` and its newline).
+const PAGE_SLACK: usize = 4096;
+
+/// One page of `rows` (wsp-377): those after `filter.after`, in id order, at
+/// most `filter.limit` of them, and no more than fit one reply under
+/// [`MAX_LINE`]. A page holds at least one row where any is left, so a client
+/// that asks from its page's last id always moves on; a row too long for a
+/// line alone is answered `too_large`.
+fn page(mut rows: Vec<Row>, filter: &RowFilter) -> Vec<Row> {
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let limit = filter.limit.map_or(usize::MAX, |n| n as usize);
+    let mut room = MAX_LINE - PAGE_SLACK;
+    let mut out = Vec::new();
+    for row in rows.into_iter().filter(|r| filter.after.as_ref().is_none_or(|a| r.id > *a)) {
+        if out.len() >= limit {
+            break;
+        }
+        // Its JSON and the comma before the next.
+        let size = serde_json::to_vec(&row).map_or(0, |b| b.len()) + 1;
+        if !out.is_empty() && size > room {
+            break;
+        }
+        room = room.saturating_sub(size);
+        out.push(row);
+    }
+    out
 }
 
 /// A view verb, answered by the [`crate::Views`] the server was started with,

@@ -99,6 +99,18 @@ pub struct RowFilter {
     /// when false, so a filter without it is the frame it always was.
     #[serde(default, skip_serializing_if = "is_false")]
     pub heads: bool,
+    /// A page (wsp-377): only rows whose id sorts after this one. Set, or
+    /// [`limit`](Self::limit) set, the server answers one page: the rows the
+    /// filter keeps, in id order, cut short so the reply stays under the API's
+    /// line. A store's `rows` reads past it and returns every row the filter
+    /// keeps; the server pages them. Left out of the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<RowId>,
+    /// A page of at most this many rows (wsp-377), as [`after`](Self::after).
+    /// A page may hold fewer when the next row would take its reply past the
+    /// line, so the rows are done when a page comes back empty, not short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// What `lists` returns (wsp-743): every list, each whole unless `heads`.

@@ -556,6 +556,12 @@ pub enum Code {
     /// has not noticed. Carries no contract refusal; the text names the current
     /// token. Nothing was written.
     Fenced,
+    /// The reply would be a line longer than [`MAX_LINE`], which the client
+    /// could not read (wsp-377): nothing was sent in its place but this. The
+    /// text says how long it was and how to ask for less (`rows` pages with
+    /// `after` and `limit`, or takes `heads`). A retry of the same request
+    /// fails the same way.
+    TooLarge,
     /// A code this build does not know, from a newer peer.
     #[serde(other)]
     Unknown,

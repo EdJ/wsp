@@ -401,6 +401,8 @@ fn requests() -> Vec<Frame> {
             list: Some(list_id()),
             seat: None,
             heads: false,
+            after: Some(row_id()),
+            limit: Some(500),
         }),
         Verb::List { list: list_id() },
         Verb::Lists(ListFilter { heads: true }),
@@ -797,7 +799,7 @@ fn every_answer_round_trips() {
 
 // ---------------------------------------------------------------- codes
 
-const CODES: usize = 15;
+const CODES: usize = 16;
 
 fn code_ordinal(c: Code) -> (usize, &'static str) {
     match c {
@@ -815,7 +817,8 @@ fn code_ordinal(c: Code) -> (usize, &'static str) {
         Code::Unsupported => (11, "unsupported"),
         Code::Backend => (12, "backend"),
         Code::Fenced => (13, "fenced"),
-        Code::Unknown => (14, "unknown"),
+        Code::TooLarge => (14, "too_large"),
+        Code::Unknown => (15, "unknown"),
     }
 }
 
@@ -915,7 +918,8 @@ fn errors() -> Vec<Frame> {
         err(12, Code::Unsupported, None),
         err(13, Code::Backend, None),
         err(14, Code::Fenced, None),
-        err(15, Code::Unknown, None),
+        err(15, Code::TooLarge, None),
+        err(16, Code::Unknown, None),
     ]
 }
 
