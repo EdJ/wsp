@@ -6,7 +6,15 @@ This doc measures how long a wsp row takes from start to landed, so the cuts tha
 
 Written by wsp-429 on 2026-11-24, on omarchy (i9-14900KF, 32 threads). Row ids are this store's.
 
-**The finding.** On omarchy, wsp does not show the slowdown Ed saw on his Mac. A wsp row takes 9.5 min from start to landed at the median (14.1 at p75). A compound-react row takes 23.9 min (44.8 at p75). Every stage of a wsp row is as fast as compound-react's or faster, with one exception: **wsp loses the most minutes per row at the group barrier. A row's share of it is 1.4 / 5.4 min (median / p75) against 1.2 / 3.2 for compound-react. On wsp's lists other than mp-coord the share is 5.3 / 9.3 min, mostly check seats running the full workspace suite by hand.**
+**The finding.** On omarchy, wsp does not show the slowdown Ed saw on his Mac. A wsp row takes 9.5 min from start to landed at the median (14.1 at p75). A compound-react row takes 23.9 min (44.8 at p75).
+
+The stages are ranked by the median per row. The p75 and the mean are given beside it in the gap table below. **Ranked that way, wsp loses the most minutes per row against compound-react at the group barrier: a row's share is 1.4 min against 1.2 at the median (+0.2), and 5.4 against 3.2 at p75 (+2.2), but by the mean wsp is 11.4 min ahead, because compound-react had barriers held for hours.**
+
+Two other stages are slower on wsp at the median:
+- `wsp check` reads 0.7 against 0.3 min (+0.3), a larger gap than the barrier's. That gap comes from rows with no check stage, which count as 0: 12 of the 44 compound-react rows had none, against 6 of the 101 wsp rows. Among rows that had a check stage, wsp's check is faster: 0.7 / 1.1 min against 0.9 / 3.5. So the ranking sets the check-less rows aside for this stage.
+- Seat start is slower by 1 s.
+
+On wsp's lists other than mp-coord, the barrier share is 5.3 / 9.3 min per row, mostly check seats running the full workspace suite by hand.
 
 Building and testing is a small part of a wsp row. At the median, the row's own `wsp check` takes 0.7 min, the verifier's checks 0.1 min and the barrier share 1.4 min. Together that is about 2.2 of the 9.5 min. The agent's own work is 6.3 min.
 
@@ -27,7 +35,8 @@ The effort reports carry no load figure; each says "missing: the record carries 
 | **start → landed, held taken out** | **9.5 / 14.1** | 2.3 / 4.7 | **23.9 / 44.8** | 2.6 / 4.6 |
 | seat start: spawn → first tool call | 6 / 7 s | 2.3 / 4.7 | 5 / 6 s | 2.6 / 4.6 |
 | the agent's own work: first tool call → review | 6.3 / 10.1 | 2.3 / 4.7 | 10.1 / 26.3 | 2.6 / 4.6 |
-| `wsp check`: review → result (the row's wall, every run) | 0.7 / 1.0 | 2.3 / 4.7 | 0.3 / 2.0 | 2.6 / 4.6 |
+| `wsp check`: review → result (the row's wall, every run; 0 for a row with none) | 0.7 / 1.0 | 2.3 / 4.7 | 0.3 / 2.0 | 2.6 / 4.6 |
+| &nbsp;&nbsp;the same, rows that had a check stage (95 wsp, 32 compound-react) | 0.7 / 1.1 | 2.3 / 4.7 | 0.9 / 3.5 | 2.6 / 4.6 |
 | &nbsp;&nbsp;one check run (`took`), per run | 30 / 50 s | 2.3 / 4.7 | 37 / 101 s | 2.6 / 4.6 |
 | verifier: spawn → verdict, all of it | 1.3 / 2.2 | 2.9 / 5.4 | 2.7 / 6.8 | 4.0 / 5.6 |
 | &nbsp;&nbsp;its seat start | 4 / 6 s | 2.9 / 5.4 | 4 / 7 s | 4.0 / 5.6 |
@@ -45,12 +54,31 @@ The effort reports carry no load figure; each says "missing: the record carries 
 
 The table covers 101 wsp rows in 42 groups (50 check seats) and 44 compound-react rows in 25 groups (26 check seats).
 
+### The gap, stage by stage
+
+wsp minus compound-react, in minutes, from the same rows. A plus sign means wsp is slower.
+
+| Stage | median | p75 | mean |
+|---|---|---|---|
+| seat start | +1 s | +1 s | +4 s |
+| the agent's own work | −3.7 | −16.1 | −9.9 |
+| `wsp check`, every row (0 for a row with none) | +0.3 | −1.0 | −0.7 |
+| `wsp check`, rows that had a check stage | −0.2 | −2.5 | −1.3 |
+| verifier, all of it | −1.5 | −4.6 | −2.4 |
+| rebase and land | −0.2 | −0.2 | −0.1 |
+| other waits | −0.9 | −4.6 | −4.7 |
+| **barrier: the row's share** | **+0.2** | **+2.2** | **−11.4** |
+| start → landed, held taken out | −14.5 | −30.7 | −17.7 |
+
+The means are pulled by a few long waits (see the outliers under "How the stages were cut"). compound-react's mean barrier share of 16.8 min, against wsp's 5.5, is mostly cr-linux-panes group 4, held overnight for 607 min.
+
 wsp's lists other than mp-coord (51 rows) read as follows:
 - start → landed 10.7 / 14.0;
 - the agent's work 6.5 / 10.4;
 - `wsp check` 0.6 / 0.9;
 - verifier 1.4 / 2.6;
-- barrier share 5.3 / 9.3, group wall 13.7 / 35.6;
+- barrier share 5.3 / 9.3 per row;
+- group wall 5.6 / 14.0 per group (25 groups). Taken as a median over rows, as the share is, so that each group counts once per member, it reads 13.7 / 35.6;
 - check load 2.5 / 6.6.
 
 mp-coord's groups were sonnet rows, three to five to a group, so its barrier shares are small.
@@ -79,11 +107,11 @@ The rules:
 
 | Rule | Command | Fires when | Builds the bin crate's test binary |
 |---|---|---|---|
-| `help` (`help_step`, wsp-564) | `cargo test the_help_is_what_it_was_before_the_registry` | a changed `.rs` is `src/main.rs`, `src/registry.rs` or `src/verbs.rs`, or holds `const VERBS` or `HELP_NOTES` | **yes**: with no `-p` at the root it builds every test target of the `wsp` package, which is the bin's unit-test binary and the 22 integration tests |
+| `help` (`help_step`, wsp-564) | `cargo test the_help_is_what_it_was_before_the_registry` | a changed `.rs` is `src/main.rs`, `src/registry.rs` or `src/verbs.rs`, or holds `const VERBS` or `HELP_NOTES` | **yes**: with no `-p` at the root it builds every test target of the `wsp` package, which is the bin's unit-test binary and the 21 integration tests |
 | `readonly` (`structure_steps`, wsp-569) | `cargo test readonly::tests` | a changed `.rs` is main, registry or verbs, or holds `const VERBS` | **yes**, the same build. It runs after `help`, so it finds the build done |
 | `layering` (`structure_steps`, or `layering_step` for a new module, wsp-572) | `cargo test --test layering` | as `readonly`, or the diff adds a module | no: one integration target |
 
-Most `cmd_*.rs` files declare `const VERBS`, so the three rules fire on almost every row. Each sat in 157 of wsp's 172 check runs (87 or 88 of 101 rows):
+Most `cmd_*.rs` files declare `const VERBS`, so the three rules fire on almost every row. Each sat in 155 of wsp's 172 check runs, row and land checks together (87 of 101 rows):
 - `help` paid for the build: 4 / 17.5 s, at most 39 s, 1,523 s in all;
 - `readonly` then took 1 / 1 s, and `layering` 1 / 1 s.
 
@@ -94,14 +122,14 @@ Most rows' own lines are narrow, such as `cargo test -p <crate> --lib <module>::
 Overall:
 - 61 % of the check seconds that ran (4,213 of 6,875 s) were in steps that build that binary;
 - 91 of 101 rows' own checks built it;
-- 4 steps, on two rows, ran the whole test binary: wsp-368's "full suite" (333 s) and wsp-307's `WSP_FULL_SUITE=asked-by-send-back cargo test --workspace` three times (63 to 195 s);
+- 4 steps, on two rows, ran the whole test binary: wsp-368's "full suite" (333 s) and wsp-307's `WSP_FULL_SUITE=asked-by-send-back cargo test --workspace` three times (63 to 195 s). wsp-163's own "bin unit tests" line, `cargo test --bin wsp -- tests:: readonly`, ran for 119, 238 and 241 s and selects nearly the whole bin test binary;
 - the checks ran in a warm target 144 times and a cold one 12 times.
 
 compound-react's row checks are mostly `npm run check` in `spikes/web-chrome` (vitest and Playwright), at 37 / 101 s per run.
 
 ### The barrier figures, and which barriers ran steps
 
-**Caveat.** Since the manager's tree root came in, the barrier's own run on omarchy has read "0 step(s)", because it could not run. The record says "the barrier tree … is not under the tree root /mnt/data/src". This held from s2-state-core group 7 (2026-11-20 12:38Z) to omarchy-env group 1 (2026-11-24 10:15Z). In that stretch the check seats ran the suite by hand. Here that was 27 of the 42 wsp groups and 11 of the 25 compound-react groups.
+**Caveat.** Since the manager's tree root came in, the barrier's own run on omarchy has read "0 step(s)", because it could not run. The record says "the barrier tree … is not under the tree root /mnt/data/src". This held from s2-state-core group 7 (2026-11-20 11:38Z) to omarchy-env group 1 (2026-11-24 09:15Z). In that stretch the check seats ran the suite by hand. Here that was 27 of the 42 wsp groups and 11 of the 25 compound-react groups.
 
 The barriers that ran a step:
 - wsp: s2-state-core groups 2, 4 and 6, read-api groups 1 and 3, trunk-green group 1 (one of its four runs), cr-events-1 group 1, cr-events-2 group 1;
@@ -144,7 +172,7 @@ Outliers sit in the means but hardly move the medians:
 
 The scripts and their outputs are in `$WSP_SCRATCH`, i.e. `~/.local/state/wsp/scratch/wsp-429/`:
 - `collect.py` and `analyze.py` make rows.json and stages.json;
-- `summary.py` and `table.py` give the figures.
+- `summary.py` and `table.py` give the figures, and `gaps.py` the gap table.
 
 ### Rows used
 
