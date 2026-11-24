@@ -151,7 +151,7 @@ The hub (`wsp-hub serve --config <file>`) serves TLS when its config names a cer
 
 **Trust.** A `tls://` hub's certificate must be for the URL's host and chain to the platform's root certificates (`crates/client/src/tls.rs:34`). A private CA (a test, a self-hosted hub) is *pinned* with a PEM file, named by `--ca <file>`, `$WSP_HUB_CA`, or `"ca"` in `~/.config/wsp/hubs.json`: the client then trusts that CA's certificates and no other root. A certificate it refuses ends the dial as `Silent::Tls`, naming the fault (`invalid peer certificate: UnknownIssuer`, `... not valid for name ...`); the user's token is not sent.
 
-**Deploying it.** A container image, a compose file and the step-by-step recipe (certificate, firewall port, backup, upgrade, first login) are wsp-489's: the recipe lives under `docs/` and `deploy/hub/` once that row lands. Hosting and network are configuration, and no machine name or address is a literal anywhere in code, docs or plans (d5).
+**Deploying it.** A container image, a compose file and the step-by-step recipe (certificate, firewall port, backup, upgrade, first login) are in [`docs/hub-deploy.md`](hub-deploy.md), the recipe, and [`deploy/hub/`](../deploy/hub/) (`hub.json`, `docker-compose.yml`, `smoke.sh`). Hosting and network are configuration, and no machine name or address is a literal anywhere in code, docs or plans (d5).
 
 ## Doctor
 
