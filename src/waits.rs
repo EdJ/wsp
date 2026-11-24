@@ -263,13 +263,6 @@ fn free_places(store: &Store) -> Option<usize> {
     gate.free_places()
 }
 
-/// [`free_places`] off a count of the working agents already taken: the
-/// same sum [`crate::room::Gate::free_places`] makes. Whole places only.
-fn free_of(cap: Option<usize>, working: &[crate::room::Counted]) -> Option<usize> {
-    let cap = cap?;
-    Some((cap * crate::room::WHOLE).saturating_sub(crate::room::load(working)) / crate::room::WHOLE)
-}
-
 /// What the machine says right now, the two readings [`queue`] cannot get from
 /// the store: the places free under the seat's cap, and the load warning.
 /// Separate from [`read_on`] so a test can say what the machine says.
@@ -298,7 +291,7 @@ impl Machine {
     /// record and asked every seat's backend on its own.
     fn counted(store: &Store, working: &dyn Fn() -> Vec<crate::room::Counted>) -> Machine {
         let cap = store.seat_cap();
-        let free = cap.and_then(|_| free_of(cap, &working()));
+        let free = cap.and_then(|_| crate::room::Gate::free_of(cap, &working()));
         Machine { free, cap, throttled: throttled(store) }
     }
 }
