@@ -1364,9 +1364,12 @@ impl Store {
         out
     }
 
+    /// One task, by id, through the in-process cache: `stat`ed, and read and
+    /// parsed only when its file has moved since this process last parsed it
+    /// (`wsp-763`). The daemon's `spend` reading asks for every row written in
+    /// the week, every minute, and each asking was a fresh read of the file.
     pub fn task(&self, id: &str) -> Option<Task> {
-        let text = fs::read_to_string(self.task_path(id)).ok()?;
-        Some(Task::from_doc(&fm::parse(&text), id))
+        self.task_at(&self.task_path(id))
     }
 
     /// The user `row` is allocated to (`wsp allocate`, wsp-414): its own `for:`,

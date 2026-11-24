@@ -1802,3 +1802,58 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod idle_tick {
+    use super::*;
+
+    /// wsp-763's done-when: once a tick has read the tree, a tick in which no
+    /// task file changed parses none — the repairs, the attention pass and every
+    /// reading the `readings` thread takes. The rows are all written today, so
+    /// each falls inside `spend`'s window, which read every one of them afresh
+    /// through `Store::task` every minute. And a file that does move is the one
+    /// parsed again, and no other.
+    #[test]
+    fn a_tick_with_no_changed_file_parses_nothing() {
+        let _env = crate::util::isolated("idle-tick-763");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        for i in 0..300 {
+            let mut t = wsp_store::model::Task::new(&format!("task {i}"), &format!("wsp-{i:03}"));
+            t.project = Some("wsp".into());
+            store.save_task(&t).unwrap();
+        }
+        let tick = |store: &Store| -> Vec<(String, u64)> {
+            let p = wsp_store::model::task_parses;
+            let mut by = Vec::new();
+            let a = p();
+            repairs(store, &crate::cycle::Fleet, &mut crate::repair::Pass::new());
+            by.push(("repairs".to_string(), p() - a));
+            let a = p();
+            let mut pass = attention::Pass::new();
+            store.steady(|| {
+                let mut source = attention::machine_source(store);
+                attention::tick(store, &mut pass, &mut source, crate::util::epoch_secs())
+            });
+            by.push(("attention".to_string(), p() - a));
+            for (name, _) in crate::readings::PERIODS {
+                let a = p();
+                assert!(crate::readings::take(store, name).is_some(), "{name} is a reading this build takes");
+                by.push((format!("reading {name}"), p() - a));
+            }
+            by
+        };
+        let cold: u64 = tick(&store).iter().map(|(_, n)| n).sum();
+        assert!(cold >= 300, "the first tick reads the tree: {cold}");
+        let warm = tick(&store);
+        assert!(warm.iter().all(|(_, n)| *n == 0), "a tick with nothing changed parsed: {warm:?}");
+
+        // One file moves: that one is parsed again, by whichever phase asks first.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut t = store.task("wsp-007").unwrap();
+        t.title = "moved".into();
+        store.save_task(&t).unwrap();
+        let moved: u64 = tick(&store).iter().map(|(_, n)| n).sum();
+        assert_eq!(moved, 1, "only the file that moved is parsed again");
+    }
+}
