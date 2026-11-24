@@ -318,6 +318,10 @@ pub(crate) struct Shared {
     /// the credentials revoked (`revoke`).
     pub(crate) clients: Mutex<revoke::Clients>,
     next_client: AtomicU64,
+    /// The last `wip` cut and the event head it was cut at: the census polls every few
+    /// seconds and the head rarely moves between polls, so a poll at the same head is
+    /// answered from here without cutting the state row again.
+    pub(crate) wip_cut: Mutex<Option<(State, wsp_api::EventId)>>,
 }
 
 impl Shared {
@@ -405,6 +409,7 @@ impl Server {
             stopping: AtomicBool::new(false),
             clients: Mutex::new(Default::default()),
             next_client: AtomicU64::new(1),
+            wip_cut: Mutex::new(None),
         });
         let mut threads: Vec<JoinHandle<()>> = listeners
             .into_iter()

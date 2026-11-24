@@ -608,6 +608,13 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     sb.wip("api");
     std::thread::sleep(Duration::from_millis(200));
     assert!(accepted.load(Ordering::SeqCst) > orders_dials, "the counting listener counted nothing under api");
+    // 5. WSP_READ unset is the API: the same listener counts a dial, and the
+    // output is what `WSP_READ=api` printed.
+    let before = accepted.load(Ordering::SeqCst);
+    let unset = sb.cmd(&["wip", "--json"]).env_remove("WSP_READ").output().expect("wsp runs");
+    assert!(unset.status.success(), "wsp wip with WSP_READ unset: {}", String::from_utf8_lossy(&unset.stderr));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(accepted.load(Ordering::SeqCst) > before, "WSP_READ unset did not dial the API");
 }
 
 // ------------------------------------------------ ls --json --all (wsp-374)

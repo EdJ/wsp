@@ -407,12 +407,29 @@ pub(crate) fn store_failure(e: Error) -> Failure {
     }
 }
 
+/// The `wip` cut, from the cache while the event head is where it was cut.
+fn wip_cut(shared: &Shared) -> Result<(wsp_store_contract::State, wsp_api::EventId), Error> {
+    let head = shared.store.head()?;
+    if let Ok(g) = shared.wip_cut.lock() {
+        if let Some((state, at)) = g.as_ref() {
+            if *at == head {
+                return Ok((state.clone(), *at));
+            }
+        }
+    }
+    let (state, at) = shared.store.wip_snapshot()?;
+    if let Ok(mut g) = shared.wip_cut.lock() {
+        *g = Some((state.clone(), at));
+    }
+    Ok((state, at))
+}
+
 /// One read verb, as one call on the store.
 fn read(shared: &Shared, verb: Verb) -> Result<Answer, Failure> {
     let s = &shared.store;
     let r = match verb {
         Verb::State(_) => s.snapshot().map(|(state, at)| Answer::State { state, at }),
-        Verb::Wip(_) => s.wip_snapshot().map(|(state, at)| Answer::Wip { state, at }),
+        Verb::Wip(_) => wip_cut(shared).map(|(state, at)| Answer::Wip { state, at }),
         Verb::Row { row } => s.row(&row).map(Answer::Row),
         Verb::Rows(filter) => s.rows(&filter).map(Answer::Rows),
         Verb::List { list } => s.list(&list).map(Answer::List),
