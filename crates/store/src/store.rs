@@ -2146,6 +2146,22 @@ impl Store {
         Ok(filed)
     }
 
+    /// [`Store::archive_task`] for a sweep: files each task, then closes what
+    /// was raised about all of them in one pass instead of one scan per row.
+    /// Returns the ids that were filed.
+    pub fn archive_tasks(&self, ts: &[Task]) -> Vec<String> {
+        let mut filed = Vec::new();
+        for t in ts {
+            let month = if t.updated.len() >= 7 { &t.updated[0..7] } else { "unknown" };
+            let dir = self.archive_dir().join(month);
+            if self.file_away(&dir, &t.id, &t.render(), self.task_path(&t.id)).is_ok() {
+                filed.push(t.id.clone());
+            }
+        }
+        crate::lapse::rows_moved(self, &filed, "row was archived");
+        filed
+    }
+
     /// Retire a project to `archive/projects/`, on the same terms as a task.
     ///
     /// A project file is the only place its handbook, its decisions and its
