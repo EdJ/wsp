@@ -669,7 +669,7 @@ impl Primaries<'_> {
 /// `text` to `to` (`primary:<user>`) as a routed message of the hub's
 /// (`wsp-470`): the hub queues it for an offline spoke and tells it once.
 fn through_the_hub(store: &Store, to: &str, text: &str) -> Result<String, String> {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").ok_or("no HOME")?);
+    let home = wsp_client::hub_home().ok_or("no HOME")?;
     if !home.join(wsp_client::HUBS_FILE).exists() {
         return Err("not logged in to a hub: `wsp login <url>`".into());
     }

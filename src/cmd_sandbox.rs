@@ -123,6 +123,12 @@ struct Sandbox {
     /// Without it `artefact::root()` falls back to the real
     /// `~/.compound/artefacts`, and a sandbox list writes over a real one.
     artefacts: PathBuf,
+    /// Where the hub login is kept: `WSP_HUB_HOME`. `wsp login` writes
+    /// `<hub_home>/.config/wsp/hubs.json` and every reader looks there, so two
+    /// sandboxes hold two logins and none of them touches the developer's own
+    /// `~/.config/wsp/hubs.json` (wsp-490). `HOME` itself is left alone: the
+    /// commit identity, `git` config and an agent's own credentials are under it.
+    hub_home: PathBuf,
     /// The binary under test — whichever one is running right now.
     bin: PathBuf,
     /// The directory holding the `wsp` symlink, which goes first on `PATH`.
@@ -139,6 +145,7 @@ impl Sandbox {
             home: dir.join("wsp"),
             state: dir.join("state"),
             artefacts: dir.join("artefacts"),
+            hub_home: dir.join("hub"),
             shim: dir.join("bin"),
             socket: PathBuf::new(),
             bin,
@@ -161,6 +168,7 @@ impl Sandbox {
             ("WSP_HOME".into(), self.home.display().to_string()),
             ("WSP_STATE".into(), self.state.display().to_string()),
             ("WSP_ARTEFACTS".into(), self.artefacts.display().to_string()),
+            (wsp_client::HUB_HOME_ENV.into(), self.hub_home.display().to_string()),
             ("WSP_BIN".into(), self.bin.display().to_string()),
             ("PATH".into(), path_with(&self.shim, std::env::var("PATH").ok().as_deref())),
         ]
@@ -607,6 +615,12 @@ fn lay_out(sb: &Sandbox, seed: Option<&Store>) -> Result<(), String> {
             .map_err(|e| format!("cannot copy {}: {e}", util::contract(&live.root)))?;
     }
     crate::cmd_project::init_store(&store).map_err(|e| format!("cannot make the store: {e}"))?;
+    // A seeded store is a copy of an existing repo, which `git_init` leaves as it
+    // is, and its commits may have worked only through the developer's global git
+    // config. Where `HOME` is not that one (a sandbox run with its own), the
+    // sandbox's store gets the repo-local identity itself, which is all
+    // `wsp doctor --fix-identity` does (wsp-490).
+    store.git_ensure_identity().map_err(|e| format!("cannot give the store a git identity: {e}"))?;
     Ok(())
 }
 
@@ -867,6 +881,7 @@ fn up(store: &Store, args: &Args) -> i32 {
     println!("export WSP_HOME={}", sb.home.display());
     println!("export WSP_STATE={}", sb.state.display());
     println!("export WSP_ARTEFACTS={}", sb.artefacts.display());
+    println!("export {}={}", wsp_client::HUB_HOME_ENV, sb.hub_home.display());
     println!("export WSP_BIN={}", sb.bin.display());
     println!("export PATH={}:$PATH", sb.shim.display());
     let forget = forget_keys();
@@ -1280,10 +1295,10 @@ mod tests {
         sb.socket = sb.dir.join("backend.sock");
         let env: std::collections::HashMap<String, String> = sb.env().into_iter().collect();
 
-        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS", "WSP_BIN"] {
+        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS", "WSP_HUB_HOME", "WSP_BIN"] {
             assert!(env.contains_key(key), "{key} is not in the sandbox environment");
         }
-        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS"] {
+        for key in ["WSP_BACKEND_SOCKET_PATH", "WSP_HOME", "WSP_STATE", "WSP_ARTEFACTS", "WSP_HUB_HOME"] {
             let v = &env[key];
             assert!(
                 v.starts_with(&sb.dir.display().to_string()),

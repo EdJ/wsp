@@ -123,7 +123,7 @@ fn logged_in(home: &Path) -> bool {
 }
 
 fn home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    wsp_client::hub_home()
 }
 
 /// The lease a claim on `row` needs, taken before anything is written: `None`

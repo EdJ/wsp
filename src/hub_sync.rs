@@ -180,7 +180,7 @@ const DIAL_WAIT: Duration = Duration::from_secs(3);
 /// Start the worker when `home` holds a login; `None` (no thread, no file)
 /// without one.
 pub(crate) fn start(store: &Store) -> Option<std::thread::JoinHandle<()>> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let home = wsp_client::hub_home()?;
     if !home.join(HUBS_FILE).exists() {
         return None;
     }
@@ -197,7 +197,7 @@ pub(crate) fn start(store: &Store) -> Option<std::thread::JoinHandle<()>> {
 
 /// Take the row `id`, kept as a head only, whole from the hub (`wsp show --fetch`).
 pub(crate) fn fetch(store: &Store, id: &str) -> Result<(), String> {
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME")?);
+    let home = wsp_client::hub_home().ok_or("no HOME")?;
     if !home.join(HUBS_FILE).exists() {
         return Err("not logged in to a hub: `wsp login <url>`".into());
     }

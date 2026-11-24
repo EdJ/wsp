@@ -269,7 +269,7 @@ pub fn run(store: &Store, args: &Args) -> i32 {
             return 2;
         }
     };
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+    let Some(home) = wsp_client::hub_home() else {
         eprintln!("wsp: publish: HOME is not set, so there is no login to read");
         return 1;
     };

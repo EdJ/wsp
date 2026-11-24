@@ -7123,7 +7123,7 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         // A seat is alive when the fleet census the seat checks above read lists it.
         crate::hub_sync::health(
             store,
-            std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref(),
+            wsp_client::hub_home().as_deref(),
             util::epoch_secs(),
             &mut |seat| seats.iter().any(|s| s.seat.as_str() == seat),
             &mut problems,

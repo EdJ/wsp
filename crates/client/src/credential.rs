@@ -32,6 +32,9 @@ pub const HUB_URL_ENV: &str = "WSP_HUB_URL";
 pub const HUB_CA_ENV: &str = "WSP_HUB_CA";
 /// The environment variable that holds the user's name, the hello's hint.
 pub const HUB_USER_ENV: &str = "WSP_HUB_USER";
+/// The environment variable that names the directory the login file is under,
+/// in place of `$HOME`. `wsp sandbox` sets it, one directory per sandbox.
+pub const HUB_HOME_ENV: &str = "WSP_HUB_HOME";
 /// The file of the login, under the home directory.
 pub const HUBS_FILE: &str = ".config/wsp/hubs.json";
 
@@ -149,7 +152,16 @@ pub fn hub_login_in(home: &Path) -> Result<Option<HubLogin>, Silent> {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    hub_home().unwrap_or_default()
+}
+
+/// The directory `hubs.json` is under (`HUBS_FILE` is relative to it):
+/// `$WSP_HUB_HOME` when it is set and not empty, which is how a sandbox keeps
+/// its login apart from the developer's and from every other sandbox's (wsp-490),
+/// else `$HOME`. None when neither is set.
+pub fn hub_home() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    env(HUB_HOME_ENV).or_else(|| std::env::var_os("HOME").map(PathBuf::from))
 }
 
 /// The login `hubs.json` holds; None when there is no such file.

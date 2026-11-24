@@ -54,7 +54,7 @@ pub(crate) struct LoggedIn {
 
 /// The home directory the login file is under: `$HOME`, which is a path or nothing.
 fn home() -> Result<PathBuf, String> {
-    match std::env::var_os("HOME").map(PathBuf::from).filter(|h| !h.as_os_str().is_empty()) {
+    match wsp_client::hub_home().filter(|h| !h.as_os_str().is_empty()) {
         Some(h) => Ok(h),
         None => Err("HOME is not set, so there is no ~/.config/wsp/hubs.json to write".into()),
     }

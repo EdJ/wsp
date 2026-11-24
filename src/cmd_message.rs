@@ -2838,7 +2838,7 @@ pub(crate) fn hub_tell(
 /// to the hub.
 pub(crate) fn tell_via_hub(store: &Store, args: &Args, needle: &str, text: &str, re: Option<&str>, from: &str) -> Option<i32> {
     crate::address::parse(needle)?;
-    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let home = wsp_client::hub_home()?;
     if !home.join(wsp_client::HUBS_FILE).exists() {
         return None;
     }

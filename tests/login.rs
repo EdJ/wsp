@@ -269,3 +269,67 @@ fn login_over_a_file_wider_than_0600_is_refused_naming_it_and_leaves_it() {
     assert_eq!(out.status.code(), Some(1));
     assert!(said(&out).contains("0600"), "{}", said(&out));
 }
+
+/// What `wsp sandbox --fake --name <name>` exported, as the pairs a shell would set.
+fn sandbox_exports(rig: &Rig, name: &str) -> Vec<(String, String)> {
+    let _ = rig.command(&["init"]).output().unwrap();
+    let out = rig.command(&["sandbox", "--fake", "--name", name]).output().unwrap();
+    assert!(out.status.success(), "{}", said(&out));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("export "))
+        .filter(|l| !l.contains("$PATH"))
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect()
+}
+
+/// `wsp args` as the sandbox with `exports` runs it, with the same `HOME` as every other.
+fn in_sandbox(rig: &Rig, exports: &[(String, String)], args: &[&str], stdin: &str) -> Output {
+    let mut c = rig.command(args);
+    for (k, v) in exports {
+        c.env(k, v);
+    }
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// wsp-490: the hub login is kept where a sandbox isolates it. Two sandboxes, one
+/// `HOME`, two users logged in against one hub: each says its own user, the
+/// second login replaces nothing of the first's, and the `HOME` they share, which
+/// stands for the developer's own, never holds a `hubs.json`.
+#[test]
+fn two_sandboxes_hold_two_logins_and_the_developers_is_untouched() {
+    let rig = Rig::new("sandboxes", &["alice", "bob"]);
+    let ca = rig.pki.ca.display().to_string();
+    let a = sandbox_exports(&rig, "alice-sb");
+    let b = sandbox_exports(&rig, "bob-sb");
+    for exports in [&a, &b] {
+        assert!(exports.iter().any(|(k, _)| k == "WSP_HUB_HOME"), "the exports do not name the hub login's home: {exports:?}");
+    }
+    let hub_home = |e: &[(String, String)]| e.iter().find(|(k, _)| k == "WSP_HUB_HOME").map(|(_, v)| v.clone()).unwrap();
+    assert_ne!(hub_home(&a), hub_home(&b), "two sandboxes share a login directory");
+
+    for (exports, user) in [(&a, "alice"), (&b, "bob")] {
+        let out = in_sandbox(&rig, exports, &["login", &rig.url, "--ca", &ca], &format!("{}\n", rig.tokens[user]));
+        assert!(out.status.success(), "{}", said(&out));
+    }
+
+    for (exports, user, other) in [(&a, "alice", "bob"), (&b, "bob", "alice")] {
+        let out = in_sandbox(&rig, exports, &["hub", "status"], "");
+        assert!(out.status.success(), "{}", said(&out));
+        assert!(said(&out).contains(user) && !said(&out).contains(other), "{user}'s sandbox says: {}", said(&out));
+        let out = in_sandbox(&rig, exports, &["whoami"], "");
+        assert!(said(&out).contains(user) && !said(&out).contains(other), "{user}'s sandbox says: {}", said(&out));
+    }
+
+    assert!(!rig.hubs().exists(), "a sandbox wrote the developer's {}", rig.hubs().display());
+    for (exports, user) in [(&a, "alice"), (&b, "bob")] {
+        let file = PathBuf::from(hub_home(exports)).join(".config/wsp/hubs.json");
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(doc["user"].as_str(), Some(user));
+    }
+    for name in ["alice-sb", "bob-sb"] {
+        let _ = rig.command(&["sandbox", "rm", name]).output();
+    }
+}

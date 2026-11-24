@@ -51,7 +51,7 @@ mod tls;
 pub mod testing;
 
 pub use credential::{
-    hub_ca, hub_ca_in, hub_login_in, hub_url, hub_url_in, Credential, HubLogin, Target, HUBS_FILE, HUB_CA_ENV, HUB_TOKEN_ENV, HUB_URL_ENV,
+    hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, Credential, HubLogin, Target, HUBS_FILE, HUB_CA_ENV, HUB_HOME_ENV, HUB_TOKEN_ENV, HUB_URL_ENV,
     HUB_USER_ENV,
 };
 pub use dial::{hub_cert_expiry, Silent};
