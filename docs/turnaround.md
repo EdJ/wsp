@@ -331,6 +331,31 @@ Once:
 - **`WSP_FULL_SUITE`.** The shim refuses `cargo test --workspace` in a seat without a reason; every run above
   was made with the reason "wsp-430: turnaround measure (b) …", as the packet orders.
 
+### After the phase 2 cut (wsp-440)
+
+Measured 2026-11-25 at 0f21ae1, in wsp-440's tree, on the same machine and toolchain as above. The engine and the
+seats are one crate, `crates/engine` (`wsp-engine`). The edit is the same constant, `WAKE_CAP_SECS`, now in
+`crates/engine/src/cycle.rs`, a different N each run. Each command had one warm-up build just before its three runs.
+Times are wall clock of the whole cargo call. `load1` was read just before each run, all below 4 (the climb past 3
+follows the `-p wsp-engine` warm-up; no cargo or rustc of another seat was seen before the first pass).
+
+| Command, after the edit | Run 1 | Run 2 | Run 3 | Load1 at start (1, 2, 3) | Of 4.4 s |
+|---|---|---|---|---|---|
+| `cargo test --no-run` (the root package's test targets) | 3.84 s | 3.83 s | 3.75 s | 1.59, 1.62, 1.89 | 87 % |
+| `cargo test -p wsp-engine --no-run` | 3.34 s | 3.35 s | 3.56 s | 3.90, 3.75, 3.53 | 76 % |
+| `cargo test --bin wsp --no-run` (wsp-430's step 1a command) | 3.05 s | 2.93 s | 2.96 s | 3.33, 3.14, 3.14 | 67 % |
+| wsp-430, before: `cargo test --bin wsp cycle:: --no-run`, edit in `src/cycle.rs` | 4.48 s | 4.37 s | 4.47 s | 2.33, 2.65, 2.50 | 100 % |
+
+- **The cut did not meet half of the bin-crate figure** (under 2.2 s). The best of the three commands is 2.9 to 3.1 s,
+  and the engine's own test build is 3.3 to 3.6 s.
+- **The prediction for one crate held:** 3.4 s ("The cuts, ranked", cut 3) against 3.35 s median measured.
+- **Seats** are in the same crate, so an edit in a seats module rebuilds the same unit; it was not timed apart. The
+  1.5 s predicted for a seats crate of its own does not apply.
+- `cargo test --no-run` at the root does not build the engine's own tests. It rebuilds the engine library, then the
+  root package's test targets, so it is not the same work as either of the other two.
+- An earlier pass the same morning (loads 0.4 to 1.8) lost its wall times to a script fault. Cargo's own `Finished`
+  times from it: 3.37, 3.77, 4.01 s; 3.20, 3.16, 3.17 s; 2.76, 2.67, 2.69 s, in the table's order.
+
 ## The cuts, ranked
 
 Written by wsp-431 on 2026-11-24, from the two sections above and wsp-429's 101 wsp rows (its `stages.json` and
@@ -353,6 +378,7 @@ row.** Two cuts take more at the median, and neither needs a crate:
 
 wsp-440's gate wants a build under half of the bin crate's 4.4 s, so under 2.2 s. A straight line through wsp-430's
 two figures predicts 2.4 s for an edit in engine, a narrow miss. One crate for engine and seats predicts 3.4 s.
+Measured after the cut, one crate: 3.35 s for `-p wsp-engine`, gate not met ("After the phase 2 cut", above).
 
 ### The ranking
 
@@ -416,6 +442,7 @@ The savings do not add: rows 2 and 6 overlap, and so do rows 9 and 10.
 
   wsp-440's gate is under half, 2.2 s. Two crates miss it by 0.2 s, which is within what a straight line from two
   points can say, so wsp-440's own timing decides. One crate misses it plainly.
+  (wsp-440 cut one crate and measured 3.35 s; seats, being in it, have that figure, not 1.5 s.)
 - **Who gets the gain:** only a seat that runs `cargo test -p wsp-engine …`. A `cargo test --bin wsp …` after an
   engine edit builds engine and then the bin, about 2.4 + 1.3 s, which is near today's 4.4 s.
 - **What phase 2 does not shorten:**
