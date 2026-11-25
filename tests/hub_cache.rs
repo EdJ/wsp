@@ -56,8 +56,15 @@ impl Proxy {
                     let _ = client.shutdown(Shutdown::Both);
                     continue;
                 };
-                o.lock().unwrap().push(client.try_clone().unwrap());
-                o.lock().unwrap().push(hub.try_clone().unwrap());
+                {
+                    // Keep only the connections still open: a clone held past
+                    // its pipe's end keeps the descriptor, and a reconnecting
+                    // spoke ran the process out of them.
+                    let mut open = o.lock().unwrap();
+                    open.retain(|s| s.peer_addr().is_ok());
+                    open.push(client.try_clone().unwrap());
+                    open.push(hub.try_clone().unwrap());
+                }
                 for (from, into) in [(client.try_clone().unwrap(), hub.try_clone().unwrap()), (hub, client)] {
                     let w = w.clone();
                     std::thread::spawn(move || pipe(from, into, &w));

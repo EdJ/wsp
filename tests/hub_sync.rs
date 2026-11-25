@@ -258,7 +258,13 @@ impl Rig {
 
     fn threads(&self) -> Vec<String> {
         let pid = self.daemon.as_ref().expect("the daemon is up").id();
-        std::fs::read_dir(format!("/proc/{pid}/task"))
+        let task = format!("/proc/{pid}/task");
+        if !Path::new(&task).exists() {
+            // No /proc (macOS): thread names cannot be read, so the worker is
+            // known by what only it does, taking turns.
+            return if self.turns() > 0 { vec!["hub-sync".to_string()] } else { Vec::new() };
+        }
+        std::fs::read_dir(task)
             .into_iter()
             .flatten()
             .flatten()
