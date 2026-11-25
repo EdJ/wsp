@@ -553,3 +553,88 @@ The barrier applies these lines with a `--why`. This row edits no list.
 | wsp-440 | keep | The predicted 2.4 s against a 2.2 s gate is too close to settle without the cut, so its own timed figure decides. Its hold on missing the gate stands. |
 | wsp-441 | keep under two crates; drop under one | It is predicted at 1.5 s per seats edit once engine is out, and the list already drops it under one crate. |
 | wsp-442 | keep | It re-measures on the same machine. Its re-rank should also carry cuts 1, 2 and 10 here, which neither the hand-off nor its overview names. Cut 2 needs its stage split, on rows landed after wsp-361's fix, to confirm it. |
+
+## After phase 2
+
+Measured 2026-11-25 by wsp-442 (leg measure) on omarchy, the same machine and toolchain (rustc 1.98.1) as the "before"
+figures. The re-rank is the next leg's and is not here yet.
+
+### The inner loop, before and after
+
+wsp-430's five steps at df704d8 (phase 2's one-crate cut and wsp-522), in wsp-442's tree, three runs each, 09:55 to
+10:36 local. Each timed run started only at load1 below 3.5; the loads were 0.62 to 2.20. Each figure is wall time of
+the whole command; "after" is the median of three, with the runs in order. The `src/cycle.rs` edit is now the same
+constant (`WAKE_CAP_SECS`) in `crates/engine/src/cycle.rs`; the `gc.rs` edit is unchanged.
+
+| Step | Command after the cut | Before (wsp-430, median) | After, median | Runs 1, 2, 3 | Load1 at start |
+|---|---|---|---|---|---|
+| 1a. edit cycle, build | `cargo test -p wsp-engine --lib cycle:: --no-run` | 4.47 s | **3.45 s** | 3.45, 3.45, 3.44 | 2.07, 1.75, 1.43 |
+| 1b. the test run | `cargo test -p wsp-engine --lib cycle::` (186 tests) | 12.08 s | 11.96 s | 11.95, 11.96, 12.06 | 2.06, 1.69, 1.39 |
+| 2a. edit gc, build | `cargo test -p wsp-trees --lib gc:: --no-run` | 0.68 s | 0.65 s | 0.65, 0.64, 0.65 | 1.24, 1.24, 1.24 |
+| 2b. the test run | `cargo test -p wsp-trees --lib gc::` | 0.67 s | 0.66 s | 0.65, 0.66, 0.66 | 1.24, 1.24, 1.22 |
+| 3a. bin test binary after the engine edit | `cargo test --bin wsp --no-run --timings` | 4.47 s | **2.85 s** | 2.95, 2.84, 2.85 | 1.51, 1.51, 1.47 |
+| 3b. the same with `-Z time-passes`, bin | `cargo rustc --profile test --bin wsp -- -Z time-passes` (`RUSTC_BOOTSTRAP=1`) | 4.57 s wall, rustc 4.31 | 2.95 s wall, bin's rustc 1.15 | 2.95, 2.98, 2.85 | 1.60, 1.55, 1.55 |
+| 3b. the edited crate's test build | `cargo rustc --profile test -p wsp-engine --lib -- -Z time-passes` | (was the bin) | 3.54 s wall, rustc 3.29 | 3.54, 3.56, 3.44 | 1.70, 1.70, 1.64 |
+| 4. the affected check after the edit | `wsp check --affected --run` | 242.53 s (`cargo test -p wsp`) | **162 s** (`wsp-engine` 138 to 275 s, `wsp-trees` 18 s) | 157, 162, 294 | 0.79, 2.20, 0.62 |
+| 5. the full suite | `cargo test --workspace --no-fail-fast` | 332.58 s | 334.08 s | 334.08, 335.68, 333.88 | 1.49, 1.72, 1.34 |
+
+Once: a cold `cargo test --workspace --no-run` took 60.99 s at load 0.85 (before: 61.93 s at 3.41). The suite lists
+**4147** tests (before: 4102).
+
+- **rustc's passes** (run 2), engine test build / bin test build / the old bin: front end (expand, resolve, type
+  check, borrow check, checks) 1.10 / about 0.26 / 1.56 s; codegen (mono, partition, IR, LLVM) 0.66 / about 0.13 /
+  0.92 s; dep graph 0.44 / 0.13 / 0.64 s; link 0.41 / 0.42 / 0.50 s; total 3.29 / 1.15 / 4.31 s.
+- **Step 4** now leaves `cargo test -p wsp` to the barrier (wsp-433, wsp-522): the plan is `crate:wsp-engine` and
+  `crate:wsp-trees`. Run 3 took 294 s against 157 and 162. Its package throttle count rose by 1,327 (below); the cause
+  was not established.
+- **Step 5:** the `wsp-engine` unit tests are now the long binary, 137 to 139 s (about 42 % of the wall); the bin's
+  unit tests are 6.3 s. Then `server` 41 s, `wip_api` 25 s, `standalone` 20 s, `wsp-trees` 17 s. Run 2 failed two
+  tests in `wsp-engine` (`mirror::tests::a_pass_where_only_machines_json_moved_reads_the_machines_alone` and
+  `mirror::tests::diff_edit_removal_and_quiet`).
+- **Thermal: the package did throttle.** `cpu0/thermal_throttle/package_throttle_count`, read before and after each
+  run, did not move or moved by 3 at most in steps 1 to 3. It rose by 663 in the cold build, 1,327 in step 4's run 3
+  and 312 to 985 in each full suite. The package sensor read up to 95 °C at a run's start. The counter says that
+  throttling happened, not what it cost. wsp-429 and wsp-430 did not read it.
+
+### The stage split
+
+**Only one wsp row, wsp-522, had landed after wsp-440** when this was measured, so there are no after-phase-2 medians.
+The split on 10 or more such rows is **wsp-524**. The middle column below is 26 rows landed after wsp-361's fix
+(2026-11-24 09:15Z). **Most of them landed before the cut** (all but wsp-440 and wsp-522), and the read-api rows are
+also in wsp-429's 101. It answers cut 2, not phase 2.
+
+Minutes, median / p75, unless marked s. Method as in "How the stages were cut".
+
+| Stage | Before (wsp-429, 101 rows) | Since wsp-361's fix (26 rows) | After wsp-440 (wsp-522, n=1) |
+|---|---|---|---|
+| load1 at the row checks' start | 2.3 / 4.7 | 1.6 / 2.9 | 0.5 |
+| start → landed, held taken out | 9.5 / 14.1 | 12.6 / 16.4 | 6.7 |
+| seat start | 6 / 7 s | 6 / 8 s | 7 s |
+| **the agent's own work** | **6.3 / 10.1** | **7.1 / 11.2** | **5.1** |
+| `wsp check`, the row's wall | 0.7 / 1.0 | 0.4 / 1.4 | 0.3 |
+| one check run (`took`) | 30 / 50 s | 25 / 54 s | 19 s |
+| verifier, all of it | 1.3 / 2.2 | 1.6 / 2.6 | 1.0 |
+| &nbsp;&nbsp;its checks | 0.1 / 0.5 | 0.1 / 0.3 | 0.0 |
+| rebase and land | 2 / 6 s | 2 / 5 s | 5 s |
+| other waits | 0.0 / 0.3 | 0.0 / 0.8 | 0.0 |
+| barrier: the row's share | 1.4 / 5.4 | 3.0 / 9.3 | 0.4 |
+| group barrier wall, per group | 3.4 / 7.0 | 3.7 / 16.0 (16 groups) | 0.4 |
+| barrier's own run, where a step ran | 44 / 72 s | 41 / 45 s (9 runs) | 25 s |
+| check seat's by-hand builds and tests, per seat | 73 / 134 s | 24 / 403 s | no seat |
+| the same per row (÷ members) | 0.35 / 1.56 (0-step stretch) | 0.2 / 3.7 (mean 1.7) | 0 |
+
+- **The stage with the most minutes per row is the agent's own work** (7.1 of 12.6 min; 5.1 of 6.7 on wsp-522). Next at
+  the median are the barrier share (3.0) and the verifier (1.6). The barrier share's mean, 20.7 min, is mostly holds:
+  turnaround group 2 waited 593 min for the person's go.
+- **Cut 1 (verifier beside the check):** the shorter of check and verifier is 0.4 / 1.3 min per row (mean 0.8) on the
+  26 rows.
+- **Cut 2 is only partly confirmed.** The barrier's own run no longer reads 0 steps (16 runs, none). Check seats still
+  ran the full suite by hand in 3 of 16 groups: read-api 5 (328 s), turnaround 3 (329 s) and turnaround 4 (378 s).
+  6 of 16 had more than a minute of by-hand builds and tests.
+- **Cut 10 (a barrier without a check seat)** happened once: turnaround group 6 was "passed by wsp with no agent".
+- **Send-backs:** 11 of 26 rows, 23 send-backs (14 verifier, 9 check); rework per row 0.0 / 1.7 min (mean 3.5).
+
+Left out of the 35 wsp rows landed since the fix: four retro rows, omarchy-env's wsp-427 (its group ended the 0-step
+stretch) and the docs-only turnaround rows wsp-429 to wsp-432. The scripts and outputs are in
+`~/.local/state/wsp/scratch/wsp-442/`: `loop/` (`run.sh`, `results.tsv`, each run's log) and `split/` (`collect.py`,
+`analyze.py`, `post.py`, `rows.json`, `stages.json`).
