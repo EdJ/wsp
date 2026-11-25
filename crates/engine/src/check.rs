@@ -1635,6 +1635,24 @@ pub const BY_CARGO_TEST: &str = "wsp: run by cargo test (no cargo-nextest on thi
 /// libraries.
 pub const BY_CARGO_TEST_UNREAD: &str = "wsp: run by cargo test (cargo metadata did not say which libraries have doctests)";
 
+/// The first line when the step runs as written for a glob in its `--exclude`:
+/// the doctest packages are left out by exact name.
+pub const BY_CARGO_TEST_GLOB: &str = "wsp: run by cargo test (a glob --exclude is not read for nextest)";
+
+/// A `--exclude` value cargo reads as a pattern.
+fn is_glob(spec: &str) -> bool {
+    spec.contains(['*', '?', '['])
+}
+
+/// Whether `command` is a `cargo test` (a leading `cd <dir> &&` kept) with a
+/// glob `--exclude`, quoted or not.
+fn excludes_by_glob(command: &str) -> bool {
+    let words: Vec<&str> = split_cd(command).1.split_whitespace().collect();
+    let ["cargo", "test", args @ ..] = words.as_slice() else { return false };
+    let args: Vec<&str> = args.iter().copied().take_while(|w| *w != "--").collect();
+    args.windows(2).any(|w| w[0] == "--exclude" && is_glob(w[1])) || args.iter().any(|w| w.strip_prefix("--exclude=").is_some_and(is_glob))
+}
+
 /// Flags without a value that mean the same to both.
 const SAME: &[&str] = &["--lib", "--bins", "--tests", "--workspace", "--all", "--all-features", "--no-default-features", "-r", "--release"];
 
@@ -1676,7 +1694,8 @@ pub struct Doc {
 /// `command` read for `cargo nextest run` with the same package, targets and
 /// filters, where it is one plain `cargo test` (a leading `cd <dir> &&`
 /// kept) whose every argument is one known to read alike ([`SAME`],
-/// [`VALUED`]); `None` otherwise.
+/// [`VALUED`]); `None` otherwise, and for a glob `--exclude`. The run ignores
+/// the project's nextest `default-filter`, which `cargo test` does not read.
 pub fn by_nextest(command: &str) -> Option<ByNextest> {
     let (dir, rest) = split_cd(command);
     let rest = rest.trim();
@@ -1686,7 +1705,7 @@ pub fn by_nextest(command: &str) -> Option<ByNextest> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let ["cargo", "test", args @ ..] = words.as_slice() else { return None };
     // A filter matching nothing passes, as it does under `cargo test`.
-    let mut out: Vec<String> = ["cargo", "nextest", "run", "--no-tests=pass"].map(String::from).to_vec();
+    let mut out: Vec<String> = ["cargo", "nextest", "run", "--no-tests=pass", "--ignore-default-filter"].map(String::from).to_vec();
     let mut doc = Doc::default();
     let (mut narrowed, mut filters, mut after_dashes) = (false, 0, false);
     let mut args = args.iter().copied();
@@ -1727,6 +1746,9 @@ pub fn by_nextest(command: &str) -> Option<ByNextest> {
             Some(v) => v,
             None => args.next().filter(|v| !v.starts_with('-'))?,
         };
+        if flag == "--exclude" && is_glob(value) {
+            return None;
+        }
         out.extend([to.to_string(), value.to_string()]);
         match flag {
             "-p" | "--package" => doc.packages.push(value.to_string()),
@@ -1750,7 +1772,7 @@ fn doctested(metadata: &str, doc: &Doc) -> Option<Vec<String>> {
     let packages = meta["packages"].as_array()?;
     let ids = meta[if doc.workspace { "workspace_members" } else { "workspace_default_members" }].as_array()?;
     let name_of = |p: &serde_json::Value| p["name"].as_str().map(String::from);
-    // A spec that is no member's name (a glob, `name@version`) is not read here.
+    // A spec that is no member's name (`name@version`) is not read here.
     let named = |n: &String| packages.iter().find(|p| p["name"].as_str() == Some(n));
     if !doc.exclude.iter().all(|n| named(n).is_some()) {
         return None;
@@ -1776,8 +1798,12 @@ fn doctested(metadata: &str, doc: &Doc) -> Option<Vec<String>> {
 /// [`BY_NEXTEST_AND_DOC`], [`BY_CARGO_TEST`]). `metadata` gives what `cargo
 /// metadata` says under the command's `cd`, and is asked only where doctests
 /// would follow; where it cannot tell, `command` runs as written
-/// ([`BY_CARGO_TEST_UNREAD`]). `None` for one [`by_nextest`] leaves alone.
+/// ([`BY_CARGO_TEST_UNREAD`]). A glob `--exclude` runs as written too
+/// ([`BY_CARGO_TEST_GLOB`]). `None` for any other [`by_nextest`] leaves alone.
 pub fn runner_script(command: &str, metadata: impl FnOnce(Option<&str>) -> Option<String>) -> Option<String> {
+    if excludes_by_glob(command) {
+        return Some(format!("echo '{BY_CARGO_TEST_GLOB}'; {}", command.trim()));
+    }
     let ByNextest { run, dir, doc } = by_nextest(command)?;
     let (mut run, mut line) = (run, BY_NEXTEST);
     if let Some(doc) = doc {
@@ -1808,7 +1834,7 @@ pub fn via_of(log: &Path) -> Option<&'static str> {
     match first.trim() {
         BY_NEXTEST => Some("cargo nextest run"),
         BY_NEXTEST_AND_DOC => Some("cargo nextest run + cargo test --doc"),
-        BY_CARGO_TEST | BY_CARGO_TEST_UNREAD => Some("cargo test"),
+        BY_CARGO_TEST | BY_CARGO_TEST_UNREAD | BY_CARGO_TEST_GLOB => Some("cargo test"),
         _ => None,
     }
 }
@@ -3645,7 +3671,7 @@ mod tests {
     #[test]
     fn a_plain_cargo_test_reads_as_nextest_with_its_package_and_filters_and_anything_else_stays() {
         let run = |c: &str| by_nextest(c).map(|n| n.run);
-        let to = |rest: &str| Some(format!("cargo nextest run --no-tests=pass {rest}"));
+        let to = |rest: &str| Some(format!("cargo nextest run --no-tests=pass --ignore-default-filter {rest}"));
         assert_eq!(run("cargo test -p wsp-engine --lib cycle::"), to("-p wsp-engine --lib cycle::"));
         assert_eq!(run("cargo test --test layering --features=a,b"), to("--test layering --features a,b"));
         // cargo's `--profile` is the build's; nextest's is not.
@@ -3680,6 +3706,17 @@ mod tests {
             "npm test",
         ] {
             assert_eq!(by_nextest(kept), None, "{kept}");
+        }
+        // A glob `--exclude` stays as written, under cargo test, and says so.
+        for glob in [
+            "cargo test --workspace --exclude wsp-*",
+            "cargo test --workspace --exclude 'wsp-*'",
+            "cargo test --workspace --lib --exclude=wsp-?",
+            "cd web && cargo test --workspace --exclude \"[ab]\"",
+        ] {
+            assert_eq!(by_nextest(glob), None, "{glob}");
+            let script = runner_script(glob, |_| panic!("no metadata is asked for {glob}"));
+            assert_eq!(script, Some(format!("echo '{BY_CARGO_TEST_GLOB}'; {glob}")));
         }
     }
 
@@ -3737,13 +3774,13 @@ mod tests {
         let command = "cargo test -p on --lib cycle::";
         std::fs::write(dir.join("has-nextest"), "").unwrap();
         let (said, ran) = run(command);
-        assert_eq!(asked(&said), ["nextest run --no-tests=pass -p on --lib cycle::"], "{said}");
+        assert_eq!(asked(&said), ["nextest run --no-tests=pass --ignore-default-filter -p on --lib cycle::"], "{said}");
         assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo nextest run")));
         assert!(line(&ran).starts_with(&format!("✓ s · {command} · by cargo nextest run · ")), "{}", line(&ran));
         // The workspace's doctests: only the library that has them on.
         std::fs::write(dir.join("doc-fails"), "").unwrap();
         let (said, ran) = run("cargo test --workspace");
-        assert_eq!(asked(&said), ["nextest run --no-tests=pass --workspace", "test --doc -p on"], "{said}");
+        assert_eq!(asked(&said), ["nextest run --no-tests=pass --ignore-default-filter --workspace", "test --doc -p on"], "{said}");
         assert_eq!(ran.done, Done::Failed { exit: Some(101), timed_out: false }, "a failing doctest is a failing step");
         assert_eq!(ran.via, Some("cargo nextest run + cargo test --doc"));
         std::fs::remove_file(dir.join("doc-fails")).unwrap();
