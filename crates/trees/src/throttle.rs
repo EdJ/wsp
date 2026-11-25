@@ -2936,6 +2936,10 @@ mod tests {
         crate::host::LOCAL.rows_of(&[std::process::id()], "ni=").unwrap().trim().parse().unwrap()
     }
 
+    /// The most `nice -n` reaches: 19 on Linux, 20 on macOS. A suite run from a
+    /// seat that is itself niced is born near it.
+    const NICE_CEILING: i32 = if cfg!(target_os = "macos") { 20 } else { 19 };
+
     fn nice_of(line: &str) -> i32 {
         let rest = line.split("nice=").nth(1).unwrap_or_else(|| panic!("no nice in {line}"));
         rest.split_whitespace().next().unwrap().parse().unwrap()
@@ -2944,7 +2948,7 @@ mod tests {
     /// Niced by the throttle: the job's argv starts `nice -n NICE`, which adds
     /// to the runner's own, to the most there is.
     fn niced(line: &str) -> bool {
-        nice_of(line) == (base_nice() + NICE).min(19)
+        nice_of(line) == (base_nice() + NICE).min(NICE_CEILING)
     }
 
     /// Left at the niceness it was born with, whatever that is.
@@ -3646,6 +3650,8 @@ mod manager_tests {
     }
 
     /// The niceness this process runs at, which the manager in it hands on.
+    const NICE_CEILING: i32 = if cfg!(target_os = "macos") { 20 } else { 19 };
+
     fn base_nice() -> i32 {
         let out = std::process::Command::new("ps").args(["-o", "ni=", "-p", &std::process::id().to_string()]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
@@ -3691,7 +3697,7 @@ mod manager_tests {
         assert!(text.contains("jobs=2") && text.contains("held=yes"), "the decision's cap and hold went with it: {text}");
         assert!(text.contains("token=none") && text.contains("other=none"), "only the allowlist crossed: {text}");
         let nice: i32 = text.split("nice=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
-        assert_eq!(nice, (base_nice() + NICE).min(19), "niced by the argv's prefix: {text}");
+        assert_eq!(nice, (base_nice() + NICE).min(NICE_CEILING), "niced by the argv's prefix: {text}");
         let rows = m.jobs();
         assert_eq!(rows.len(), 1, "one job.run: {rows:?}");
         assert_eq!(rows[0].0.row.0, "wsp-9");
@@ -3817,7 +3823,7 @@ mod manager_tests {
         let away = run(facts(Some(3600), Some(100)), Mode::Auto);
         assert!(away.contains("jobs=none") && away.contains(&format!("nice={}", base_nice())), "the beat says the person left: {away}");
         let here = run(facts(Some(10), Some(100)), Mode::Auto);
-        assert!(here.contains("jobs=4") && here.contains(&format!("nice={}", (base_nice() + NICE).min(19))), "the beat says the person is here: {here}");
+        assert!(here.contains("jobs=4") && here.contains(&format!("nice={}", (base_nice() + NICE).min(NICE_CEILING))), "the beat says the person is here: {here}");
         let hot = run(facts(Some(3600), Some(31)), Mode::Off);
         assert!(hot.contains("jobs=1") && hot.contains(&format!("nice={}", base_nice())), "the beat's clock is limited: {hot}");
         // And the view the daemon and `wip` read takes the same beat.
