@@ -652,7 +652,7 @@ fn released_seats(
 
 /// Whether the member's last claim was made from `seat` and has been let go.
 fn released_from(m: &Task, seat: &str) -> bool {
-    crate::cmd_attempts::attempts_of(m)
+    crate::attempt::attempts_of(m)
         .iter()
         .rfind(|a| a.leg.is_none())
         .is_some_and(|a| a.pane == seat && !a.until.is_empty())

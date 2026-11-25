@@ -129,15 +129,15 @@ pub fn dispatch(store: &Store, args: &Args) -> i32 {
         "show" | "get" => show(store, args),
         // wsp-264: what the list spent, by group and member.
         "cost" => match args.rest.get(1) {
-            Some(slug) => crate::cmd_cost::cost(store, args, slug),
+            Some(slug) => crate::outputs::cost(store, args, slug),
             None => {
                 eprintln!("wsp worklist cost: which list? `wsp worklist cost <slug> [--json]`");
                 2
             }
         },
         // wsp-375: what the list hands back, and the effort report wsp writes.
-        "output" | "outputs" => crate::cmd_report::output(store, args),
-        "report" => crate::cmd_report::report(store, args),
+        "output" | "outputs" => crate::outputs::output(store, args),
+        "report" => crate::outputs::report(store, args),
         // Running it, which is the barrier. Everything above composes a plan.
         "next" => next(store, args),
         "go" | "start" => go(store, args),
@@ -3646,7 +3646,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // moves when they do, and the reader deciding whether to state one wants to
     // know it was never stated.
     println!("{}  {}", p.dim(&util::pad("under", 8)), home_line(&p, &w.id, worklist::home(store, &w).as_ref()));
-    println!("{}  {}", p.dim(&util::pad("outputs", 8)), crate::cmd_report::line(&w));
+    println!("{}  {}", p.dim(&util::pad("outputs", 8)), crate::outputs::line(&w));
     if let Some(u) = &w.for_user {
         println!("{}  for {u}", p.dim(&util::pad("for", 8)));
     }
@@ -5266,9 +5266,9 @@ fn go_with(
     // not put its own, and a declared output still missing holds the barrier.
     if let Some((Gate::After(at), _)) = &shut {
         if *at == groups.len() && !groups.is_empty() {
-            if let Err(miss) = crate::cmd_report::at_last_barrier(store, &w, &said, args.has("dry-run")) {
+            if let Err(miss) = crate::outputs::at_last_barrier(store, &w, &said, args.has("dry-run")) {
                 eprintln!("wsp: the last barrier of `{}` holds — declared output(s) missing: {}", w.id, miss.join(", "));
-                eprintln!("     in {} · a member-sourced output is written by that member; `wsp worklist output {} rm <name>` takes one off", crate::cmd_report::dir(&w.id).display(), w.id);
+                eprintln!("     in {} · a member-sourced output is written by that member; `wsp worklist output {} rm <name>` takes one off", crate::outputs::dir(&w.id).display(), w.id);
                 return 1;
             }
         }
@@ -7052,11 +7052,11 @@ pub(crate) fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cyc
         None
     } else {
         let why = args.has("force").then(|| args.rest.iter().skip(2).cloned().collect::<Vec<_>>().join(" "));
-        match crate::cmd_report::gate_done(&w, why.as_deref()) {
+        match crate::outputs::gate_done(&w, why.as_deref()) {
             Ok(f) => f,
             Err(miss) => {
                 eprintln!("wsp: {} cannot be done — its declared output(s) are missing: {}", w.id, miss.join(", "));
-                eprintln!("     in {} · `wsp worklist report {}` writes the effort report", crate::cmd_report::dir(&w.id).display(), w.id);
+                eprintln!("     in {} · `wsp worklist report {}` writes the effort report", crate::outputs::dir(&w.id).display(), w.id);
                 eprintln!("     `wsp worklist output {} rm <name>` or `--none` takes one off; `done {} --force <why>` goes past, logged", w.id, w.id);
                 return 1;
             }
@@ -7806,16 +7806,16 @@ fn head_of(w: &Worklist, at: &Position, phase: worklist::Phase) -> wsp_view::wor
         created: w.created.clone(),
         groups: at.of,
         at: at.at,
-        outputs: crate::cmd_report::declared(w)
+        outputs: crate::outputs::declared(w)
             .iter()
             .map(|o| wsp_view::worklist::Output {
                 name: o.name.clone(),
                 kind: o.kind.clone(),
                 file: o.file(),
-                present: crate::cmd_report::dir(&w.id).join(o.file()).is_file(),
+                present: crate::outputs::dir(&w.id).join(o.file()).is_file(),
             })
             .collect(),
-        outputs_dir: crate::cmd_report::dir(&w.id).display().to_string(),
+        outputs_dir: crate::outputs::dir(&w.id).display().to_string(),
     }
 }
 

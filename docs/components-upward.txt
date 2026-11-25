@@ -3,7 +3,6 @@
 # This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
 attention -> wake: wake  # engine -> seats
-cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
 cmd_message -> agent_commands: of  # engine -> seats
 cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
@@ -12,18 +11,14 @@ cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, s
 cmd_task -> cmd_resume: thread_for_task  # engine -> seats
 cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
 cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
-cmd_worklist -> cmd_cost: cost  # engine -> timeline
 cmd_worklist -> cmd_govern: slots  # engine -> seats
-cmd_worklist -> cmd_report: at_last_barrier, declared, dir, gate_done, line, output, report  # engine -> timeline
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, notice  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
 cycle -> room: Gate  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
 disk -> cmd_sandbox: strays  # engine -> seats
-ending -> cmd_attempts: attempts_of  # engine -> timeline
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
-legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
 repair -> cmd_govern: *  # engine -> seats
@@ -33,5 +28,4 @@ stage -> cmd_agent: sentence  # engine -> seats
 stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats
 stand_down -> wake: owed_to  # engine -> seats
-verification -> cmd_attempts: Row, attempts_of  # engine -> timeline
 waits -> room: Counted, Gate, working_now  # engine -> seats

@@ -697,9 +697,9 @@ pub(crate) fn legacy(row: &Task) -> Pass {
         Status::Blocked => State::Blocks,
         _ => State::Running,
     };
-    let attempt = crate::cmd_attempts::attempts_of(row).into_iter().last();
+    let attempt = crate::attempt::attempts_of(row).into_iter().last();
     let on = attempt.as_ref().and_then(|a| {
-        let ran = crate::cmd_attempts::Row(a.clone()).tier();
+        let ran = crate::attempt::Row(a.clone()).tier();
         (!ran.is_empty()).then_some(ran)
     });
     Pass {
@@ -833,7 +833,7 @@ pub(crate) fn verified_in(tasks: &[Task], seat: &str) -> Option<(String, Pass)> 
             found.extend(passes(t).into_iter().filter(|p| p.pane.as_deref() == Some(seat)).map(|p| (t.id.clone(), p)));
         }
         if filed_by_wsp(t) {
-            if crate::cmd_attempts::attempts_of(t).iter().any(|a| a.pane == seat) {
+            if crate::attempt::attempts_of(t).iter().any(|a| a.pane == seat) {
                 let member = t.parent.clone().unwrap_or_default();
                 found.push((member, Pass { pane: Some(seat.to_string()), ..legacy(t) }));
             }
@@ -1272,7 +1272,7 @@ pub(crate) fn fold_pieces(store: &Store, member: &str) {
         if !crate::pieces::staged(&t) {
             return None;
         }
-        let ran: Vec<crate::pieces::PieceRan> = crate::cmd_attempts::attempts_of(&t)
+        let ran: Vec<crate::pieces::PieceRan> = crate::attempt::attempts_of(&t)
             .into_iter()
             .filter(|a| !a.until.is_empty())
             .filter_map(|a| {

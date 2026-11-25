@@ -5285,7 +5285,7 @@ fn runs(
     let kind = text(w.claims.get(&t.id), "agent_kind").or_else(|| text(w.bindings.get(seat), "agent_kind"));
     // The newest claim line, and only when it is this seat's: an older line,
     // or one another pane wrote, is somebody else's start.
-    let tier = crate::cmd_attempts::attempts_of(t)
+    let tier = crate::attempt::attempts_of(t)
         .pop()
         .filter(|a| a.pane == seat)
         .map(|a| a.spawned)

@@ -1052,10 +1052,10 @@ pub(crate) fn rework_by(old: &[Leg], verdict: &str, head: &str) -> Result<Option
 /// What a done leg cost, from its end line: null for a leg that has not ended
 /// (compound-561 A5). `usd` is null where the record kept nothing to price,
 /// which is not the same as free.
-fn spent(ran: &[crate::cmd_attempts::Attempt], l: &Leg) -> Option<wsp_view::task::Spent> {
+fn spent(ran: &[crate::attempt::Attempt], l: &Leg) -> Option<wsp_view::task::Spent> {
     let a = ran.iter().find(|a| a.leg.as_deref() == Some(l.name.as_str()) && !a.until.is_empty())?;
     Some(wsp_view::task::Spent {
-        usd: crate::cmd_attempts::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
+        usd: crate::attempt::priced(&a.ran, &a.spend).map(|m| m as f64 / 1e6),
         turns: a.turns,
         peak: a.peak,
         seconds: a.seconds(),
@@ -1072,7 +1072,7 @@ pub(crate) fn view(t: &Task) -> Vec<wsp_view::task::Leg> {
     let ls = legs(t);
     let w = waits(&ls);
     let ready = ready(&ls);
-    let ran = crate::cmd_attempts::attempts_of(t);
+    let ran = crate::attempt::attempts_of(t);
     ls.iter()
         .zip(w)
         .map(|(l, w)| wsp_view::task::Leg {
