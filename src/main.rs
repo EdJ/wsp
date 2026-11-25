@@ -7,145 +7,39 @@
 
 use std::collections::{HashMap, HashSet};
 
-mod address;
-mod follow_up;
-mod record_workspace;
-mod duplicate;
-mod tell_log;
-mod affected;
 pub(crate) use wsp_trees::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
+pub(crate) use wsp_engine::{address, affected, after, agent_commands, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, classify, closing, cmd_agent, cmd_allocate, cmd_attend, cmd_brief, cmd_govern, cmd_hub, cmd_initiative, cmd_install, cmd_login, cmd_machine, cmd_mandate, cmd_message, cmd_migrate, cmd_project, cmd_publish, cmd_resume, cmd_role, cmd_sandbox, cmd_spawn, cmd_stamp, cmd_submit, cmd_task, cmd_watch, cmd_whoami, cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close, hub_cache, hub_journal, hub_lease, hub_sync, inner, kind_attention, kind_data, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, memory, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close, piece_seat, pieces, reconcile, record_workspace, refusals, repair, retro_yours, room, scope, scratch, size_check, split, stage, stand_down, starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, wake, worklist};
 mod base;
 pub(crate) use wsp_base::{choices, input, risk, util};
 pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lands, lapse, lease, log, message, model, resolve, sharing, store, tags, verbs};
 pub(crate) use wsp_wire::{fake, far, host, host_tcp, launchd, manager, place, place_compound, place_super, systemd, tunnel};
-mod artefact;
 mod registry;
 mod readonly;
-mod after;
-mod closing;
-mod packet;
-mod pickup;
-mod packet_gen;
-mod verifier_packet;
-mod agent_commands;
-mod barrier;
-mod barrier_replay;
-mod barrier_run;
-mod by_merge;
-mod cold;
-mod hold;
-mod hold_close;
 #[cfg(test)]
 mod testkit;
-mod check;
-mod exit;
-mod auto_close;
-mod build_output;
-mod list_sweep;
-mod scope;
-mod scratch;
-mod disk;
 mod arrange;
-mod attempt;
-mod attention;
-mod cmd_agent;
-mod cmd_allocate;
-mod cmd_whoami;
 mod cmd_attempts;
-mod cmd_brief;
 mod cmd_burn;
 mod cmd_calls;
 mod cmd_cost;
 mod cmd_report;
-mod cmd_role;
-mod cmd_govern;
-mod cmd_install;
-mod cmd_login;
-mod cmd_publish;
-mod cmd_machine;
-mod cmd_hub;
-mod cmd_mandate;
-mod cmd_message;
-mod cmd_migrate;
-mod cmd_initiative;
-mod cmd_project;
-mod cmd_resume;
-mod cmd_sandbox;
-mod local_trust;
-mod cmd_spawn;
-mod cmd_stamp;
-mod cmd_task;
-// The import door (wsp-175): its caller is the spoke's sync worker (wsp-464, wsp-469), which is not built yet.
-#[allow(dead_code)]
-mod door;
-// After a `stale` (wsp-176): the merge, and the push and stale glue; called by the sync worker (wsp-464, wsp-469).
-#[allow(dead_code)]
-mod hub_cache;
-mod hub_journal;
-mod hub_lease;
-mod hub_sync;
-#[allow(dead_code)]
-mod reconcile;
-mod cmd_submit;
 mod cmd_verifications;
-mod leg_seat;
-mod piece_seat;
-mod leg_tree;
-mod legs;
 mod cmd_piece;
-mod piece_close;
-mod pieces;
-mod inner;
-mod verification;
-mod cmd_watch;
-mod refusals;
-mod wake;
-mod cmd_worklist;
-mod cycle;
 mod daemon;
-mod liveness;
-mod deliver;
-mod fold;
-mod mirror;
-mod orders;
 mod readings;
-mod outputs;
-mod owed;
-mod classify;
 mod detail;
-mod did;
 mod draw;
-mod ending;
-mod history;
 mod kanban;
 mod live;
-mod kind_data;
-mod kind_attention;
-mod cmd_attend;
-mod memory;
 mod panel;
-mod repair;
 mod retro;
 mod retro_run;
 mod retro_series;
-mod retro_yours;
 mod stale;
-mod room;
-mod size_check;
 mod spend;
-mod split;
-mod stage;
-mod starts;
-mod stepping;
-mod stand_down;
 mod story;
-mod stuck;
 mod timeline;
 mod wallbuckets;
-mod untaken;
-mod waiting;
-mod waits;
-mod worklist;
 
 pub use base::args::*;
 pub use base::stamp::*;
@@ -561,6 +455,7 @@ fn needs_store(args: &Args) -> bool {
 fn main() {
     die_on_broken_pipe();
     let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
+    let _ = wsp_engine::base::stamp::BUILD_STAMP.set(base::stamp::build_stamp);
     let _ = mirror::LIST_OUTPUTS.set(cmd_report::list_outputs);
     outputs::install(cmd_report::REPORTS);
     let _ = mirror::LIST_SHOW.set(cmd_worklist::show_facts);
@@ -1830,6 +1725,8 @@ mod tests {
             &["worklist", "rm", "night", "t-1"][..],
             &["wl", "remove", "night", "t-1"][..],
             &["worklist", "group", "night", "2", "--drop"][..],
+            // `worklist cut` looks first (from cmd_worklist's dry-run test, wsp-440).
+            &["worklist", "cut", "cl", "c-2", "-n"][..],
         ] {
             let a = args(argv);
             assert!(super::dry_run(&a).0, "`wsp {}` reads -n and was refused it", argv.join(" "));

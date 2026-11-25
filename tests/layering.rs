@@ -382,6 +382,7 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
         root.join("crates/store/src"),
         root.join("crates/wire/src"),
         root.join("crates/trees/src"),
+        root.join("crates/engine/src"),
     ]);
 
     let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
@@ -585,6 +586,40 @@ fn the_host_crate_links_neither_the_store_nor_the_wire() {
     );
 }
 
+/// The workspace crates the package at `dir` reaches through its normal path
+/// dependencies alone (no dev-dependency at any depth), each with its chain.
+fn reached_normally(dir: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut reached: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(dir.join("Cargo.toml"), vec![dir.display().to_string()])];
+    while let Some((manifest, via)) = stack.pop() {
+        for (dep, at) in path_deps(&manifest, false) {
+            let mut chain = via.clone();
+            chain.push(dep.clone());
+            if reached.insert(dep, chain.clone()).is_none() {
+                stack.push((at.join("Cargo.toml"), chain));
+            }
+        }
+    }
+    reached
+}
+
+/// `wsp-engine`, the engine and the seats (the phase 2 cut, wsp-440), is linked by the root
+/// and links the crates below it in `docs/components.md`: never the sqlite backend (D2: only
+/// the binaries link it; the engine's tests do, as a dev-dependency), the hub, the root or a
+/// test kit, through any normal path dependency. (The in-process manager comes in through
+/// `wsp-wire`, as it does for the root.)
+#[test]
+fn the_engine_links_neither_the_sqlite_crate_nor_a_binary() {
+    const NEVER: &[&str] = &["wsp-store-sqlite", "wsp-hub", "wsp-testkit", "wsp-store-conformance", "wsp"];
+    let dir = root().join("crates/engine");
+    assert!(fs::read_to_string(dir.join("Cargo.toml")).unwrap().lines().any(|l| l.trim() == "name = \"wsp-engine\""));
+    let reached = reached_normally(&dir);
+    println!("wsp-engine reaches: {:?}", reached.keys().collect::<Vec<_>>());
+    let bad: String =
+        reached.iter().filter(|(n, _)| NEVER.contains(&n.as_str())).map(|(_, chain)| format!("  {}\n", chain.join(" -> "))).collect();
+    assert!(bad.is_empty(), "wsp-engine's normal dependencies must reach none of {NEVER:?}:\n{bad}");
+}
+
 /// `wsp-manager`, the agent manager, depends on `wsp-host-api`, `wsp-base` and
 /// `wsp-host`, and on nothing of the store or the wire (2.3 R1, d1 Q3; wsp-021).
 #[test]
@@ -708,11 +743,22 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
 
 /// No manifest of the workspace but the root's and the hub's names `wsp-store-sqlite`: nothing
 /// but the two binaries links the backend (wsp-460: the hub keeps its refs and leases in it).
+/// One exception, for tests alone: `wsp-engine` (wsp-440) names it as a dev-dependency, because
+/// the engine's orders, fold and mirror tests open a real `state.db` as the daemon does; its
+/// normal dependencies never reach it (`the_engine_links_neither_the_sqlite_crate_nor_a_binary`).
 #[test]
 fn no_manifest_but_the_roots_names_the_sqlite_crate() {
     let binaries = [root().join("Cargo.toml"), root().join("crates/hub/Cargo.toml")];
+    let engine = root().join("crates/engine/Cargo.toml");
     for m in manifests() {
         if binaries.contains(&m) {
+            continue;
+        }
+        if m == engine {
+            assert!(
+                !path_deps(&m, false).contains_key("wsp-store-sqlite"),
+                "wsp-engine names wsp-store-sqlite as a dependency; only its tests may (docs/state-core.md section 6)"
+            );
             continue;
         }
         let text = fs::read_to_string(&m).unwrap();

@@ -532,17 +532,17 @@ mod tests {
     fn each_sign_reads_the_words_its_writer_prints() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let words: &[(&str, &[&str])] = &[
-            ("src/ending.rs", &["wsp: the seat of an accepted exit had already gone —"]),
-            ("src/cmd_spawn.rs", &["started but never became ready for input"]),
-            ("src/wake.rs", &["typed at the seat — no turn seen yet"]),
-            ("src/cmd_task.rs", &["but its pane did not get it"]),
-            ("src/repair.rs", &[
+            ("crates/engine/src/ending.rs", &["wsp: the seat of an accepted exit had already gone —"]),
+            ("crates/engine/src/cmd_spawn.rs", &["started but never became ready for input"]),
+            ("crates/engine/src/wake.rs", &["typed at the seat — no turn seen yet"]),
+            ("crates/engine/src/cmd_task.rs", &["but its pane did not get it"]),
+            ("crates/engine/src/repair.rs", &[
                 "the screen says working and opencode finished",
                 "ended the shell waiting on itself",
                 "verifier seat(s) with nothing left to do, ended: {}",
             ]),
-            ("src/waiting.rs", &["is at a prompt on its screen"]),
-            ("src/cycle.rs", &["has already gone — nothing to end"]),
+            ("crates/engine/src/waiting.rs", &["is at a prompt on its screen"]),
+            ("crates/engine/src/cycle.rs", &["has already gone — nothing to end"]),
         ];
         for (file, want) in words {
             let text = std::fs::read_to_string(root.join(file)).unwrap();

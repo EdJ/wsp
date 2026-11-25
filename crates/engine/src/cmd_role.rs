@@ -1,0 +1,1139 @@
+//! Verbs whose reach depends on who is asking (`wsp-473`).
+//!
+//! The primary seat (the fleet watch) was refused by Claude Code's permission
+//! classifier every time it tried to finish a step it had already checked, and
+//! each refusal became a command for Ed to paste. The fix is not a wider allow
+//! list on raw `kill` and `launchctl`: the risky steps are wsp verbs that check
+//! the caller's role and scope themselves, so the allow rule only gets the call
+//! to wsp and wsp decides.
+//!
+//! | verb | primary | governor | member, verifier, check |
+//! |---|---|---|---|
+//! | `wsp despawn <row> --why …` | any seat | seats of rows on a list it governs | refused |
+//! | `wsp reap --list` (reads the manager; `wsp reap <pid>` is removed, wsp-057) | yes | yes | yes |
+//! | `wsp done <row>` | rows at review | refused | refused |
+//! | `wsp daemon reload` | yes | refused | refused |
+//! | `wsp check <row> --set --why …` (gated in `check`) | any row | rows on a list it governs, any change | its own row: raise a budget, add or correct a `cd`, narrow to its files, add a step |
+//!
+//! **The role is read from the seat wsp recorded**, never from anything the
+//! caller says: the caller's seat (`WSP_SEAT_ID`, or backend's pane) is looked up
+//! in the governors record, which names the primary seat and each list's
+//! governor. A seat that is bound to a row, or that wsp spawned (its environment
+//! carries `WSP_SEAT_ID`), and is neither of those, is a member, verifier or
+//! check. A caller in no seat at all is Ed at a terminal, or the daemon, and is
+//! as free as it ever was: the refusals here are about seats.
+//!
+//! Where a despawn is refused for a *wrong scope* and not for a role, the
+//! message names the scope it would have needed, and the refusal is logged.
+//! The permission layer is the other half (`claude-code/*.settings.json`): a
+//! member's Claude Code is not allowed to call these verbs without a prompt,
+//! and wsp refuses the call besides.
+
+use std::collections::BTreeMap;
+
+use serde_json::{json, Value};
+
+use crate::model::Status;
+use crate::store::Store;
+use crate::util;
+use crate::base::args::Args;
+
+/// The settings a primary seat is started with, passed with `--settings`.
+pub const PRIMARY_SETTINGS: &str = include_str!("../../../claude-code/primary.settings.json");
+/// The settings a governor seat is started with.
+pub const GOVERNOR_SETTINGS: &str = include_str!("../../../claude-code/governor.settings.json");
+
+pub const RETRO_SETTINGS: &str = include_str!("../../../claude-code/retro.settings.json");
+/// The settings a member seat is started with, `<row>` its own row (wsp-681).
+pub const MEMBER_SETTINGS: &str = include_str!("../../../claude-code/member.settings.json");
+const RETRO_FILE: &str = "wsp-retro.settings.json";
+const GUARD_FILE: &str = "wsp-seat.settings.json";
+const PRIMARY_FILE: &str = "wsp-primary.settings.json";
+const GOVERNOR_FILE: &str = "wsp-governor.settings.json";
+
+/// Who is asking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Role {
+    /// No seat: a person at a terminal, or the daemon.
+    Outside,
+    /// The primary seat.
+    Primary,
+    /// The governor of this list (or project).
+    Governor(String),
+    /// A member, verifier or check.
+    Seat,
+}
+
+impl Role {
+    /// The role of a caller in `pane`, which holds the slot of `governs` (if
+    /// any), and which is `bound` (to a row, or started by wsp).
+    pub fn of(pane: Option<&str>, governs: Option<&str>, bound: bool) -> Role {
+        match (pane, governs) {
+            (None, _) => Role::Outside,
+            (Some(_), Some(s)) if crate::governors::is_primary(s) => Role::Primary,
+            (Some(_), Some(s)) => Role::Governor(s.to_string()),
+            (Some(_), None) if bound => Role::Seat,
+            (Some(_), None) => Role::Outside,
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Role::Outside => "a person".into(),
+            Role::Primary => "the primary seat".into(),
+            Role::Governor(s) => format!("the governor of {s}"),
+            Role::Seat => "a member, verifier or check seat".into(),
+        }
+    }
+}
+
+/// The caller's role, from the seat it is standing in.
+pub fn role(store: &Store) -> Role {
+    let pane = crate::cmd_agent::my_pane();
+    let governs = pane
+        .as_deref()
+        .and_then(|p| crate::place::governs(&store.governors(), &crate::place::Seat::new(p)));
+    let spawned = std::env::var_os(crate::base::seat::SEAT_ENV).is_some_and(|v| !v.is_empty());
+    let bound = spawned || pane.as_deref().is_some_and(|p| store.bindings().contains_key(p));
+    Role::of(pane.as_deref(), governs.as_deref(), bound)
+}
+
+/// Whether the process in `pane` is a seat wsp spawned or bound to a row, and so
+/// a member, verifier or check unless it holds a slot.
+///
+/// The one exemption is by name: a seat's own deferred ending (`wsp despawn
+/// --pane <seat> --keep-tree`, run detached under `WSP_END_WHEN_IDLE`) is the
+/// seat finishing, not a reach into somebody else's, so it reads as unbound.
+pub fn bound_here(store: &Store, pane: Option<&str>) -> bool {
+    if std::env::var_os("WSP_END_WHEN_IDLE").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    let spawned = std::env::var_os(crate::base::seat::SEAT_ENV).is_some_and(|v| !v.is_empty());
+    spawned || pane.is_some_and(|p| store.bindings().contains_key(p))
+}
+
+/// The role a `Caller` (already resolved by `despawn`) stands for. `bound` is
+/// [`bound_here`]: a member, verifier or check seat is refused by wsp itself.
+pub fn role_of_caller(pane: Option<&str>, governs: Option<&str>, bound: bool) -> Role {
+    Role::of(pane, governs, bound)
+}
+
+fn refuse(store: &Store, verb: &str, role: &Role, why: &str) -> i32 {
+    eprintln!("wsp: {verb}: {why}");
+    crate::store::log_line(store, &format!("refused {verb} by {}: {why}", role.name()));
+    2
+}
+
+fn list_of_row(store: &Store, row: &str) -> Option<String> {
+    let t = store.task(row)?;
+    crate::worklist::Running::read(store).list_for(&t).map(str::to_string)
+}
+
+// ---- despawn ----------------------------------------------------------------
+
+/// Whether `role` may end the seat of `row` (on `list`), as a pure decision.
+///
+/// `why` is required from the primary; a mid-turn seat is refused to it unless
+/// `now`. A governor ends only the seats of rows on its own list.
+pub fn despawn_allowed(
+    role: &Role,
+    why: Option<&str>,
+    list: Option<&str>,
+    mid_turn: bool,
+    now: bool,
+) -> Result<(), String> {
+    match role {
+        Role::Outside => Ok(()),
+        Role::Seat => Err("a member, verifier or check seat does not end other seats".into()),
+        Role::Primary => {
+            if why.map(str::trim).unwrap_or_default().is_empty() {
+                return Err("the primary seat says why: `wsp despawn <row> --why \"…\"`".into());
+            }
+            if mid_turn && !now {
+                return Err("that seat is mid-turn — wait for it to be idle, or `--now` to end it anyway".into());
+            }
+            Ok(())
+        }
+        Role::Governor(scope) => match list {
+            Some(l) if l == scope => Ok(()),
+            Some(l) => Err(format!(
+                "that seat is on a row of list {l}; the governor of {scope} ends seats of rows on {scope} only — it needs the governor of {l}, or the primary seat"
+            )),
+            None => Err(format!(
+                "that seat is on no row of a list; the governor of {scope} ends seats of rows on {scope} only — it needs the primary seat"
+            )),
+        },
+    }
+}
+
+/// The list a verifier's or a barrier check's seat belongs to, for a seat that
+/// is on no row of its own (`compounding-285`): a verifier stands on the member
+/// it reads, a check on its list's group, and a governor ends both on its list.
+fn list_of_seat(store: &Store, seat: &str) -> Option<String> {
+    if let Some(member) = crate::verification::seats(&store.tasks()).get(seat) {
+        return list_of_row(store, member);
+    }
+    crate::barrier::seats(&store.worklists()).remove(seat).map(|(list, _)| list)
+}
+
+/// The gate `despawn` runs once it knows which seat it is about. `Err` carries
+/// the exit code, after the refusal has been said and logged.
+pub fn gate_despawn(
+    store: &Store,
+    args: &Args,
+    caller: (Option<&str>, Option<&str>, bool),
+    seat: &str,
+    task: Option<&str>,
+) -> Result<(), i32> {
+    let role = role_of_caller(caller.0, caller.1, caller.2);
+    if role == Role::Outside {
+        return Ok(());
+    }
+    // A successor ending the seat it is replacing is the rotation finishing, not
+    // a reach into somebody's list: the handover record names both seats.
+    if crate::cmd_govern::incoming(&store.handovers(), caller.0).is_some_and(|(_, from)| from == seat) {
+        return Ok(());
+    }
+    let list = task.and_then(|t| list_of_row(store, t)).or_else(|| list_of_seat(store, seat));
+    let mid_turn = role == Role::Primary && seat_mid_turn(seat);
+    let why = args.get("why");
+    match despawn_allowed(&role, why.as_deref(), list.as_deref(), mid_turn, args.has("now")) {
+        Ok(()) => {
+            crate::store::log_line(
+                store,
+                &format!(
+                    "despawn {seat}{} by {}{}",
+                    task.map(|t| format!(" ({t})")).unwrap_or_default(),
+                    role.name(),
+                    why.map(|w| format!(" — {w}")).unwrap_or_default()
+                ),
+            );
+            Ok(())
+        }
+        Err(why) => Err(refuse(store, "despawn", &role, &why)),
+    }
+}
+
+fn seat_mid_turn(seat: &str) -> bool {
+    for backend in crate::place::local_backends() {
+        let Ok(census) = backend.census() else { continue };
+        for s in census.seats() {
+            if s.seat.as_str() == seat {
+                return s.state.turn_in_flight();
+            }
+        }
+    }
+    false
+}
+
+// ---- done -------------------------------------------------------------------
+
+/// Whether `role` may mark a row done. The primary only for a row at `review`
+/// whose verifier held, or that owes none.
+pub fn done_allowed(role: &Role, status: Status, owes: Option<bool>) -> Result<(), String> {
+    match role {
+        Role::Outside => Ok(()),
+        Role::Governor(_) => Err("done is Ed's bookkeeping; a governor finishes nothing with it".into()),
+        Role::Seat => Err("a member finishes with `wsp review`".into()),
+        Role::Primary => {
+            if status != Status::Review {
+                return Err(format!("the primary seat marks done only rows at review — this one is {}", status.as_str()));
+            }
+            match owes {
+                Some(false) => Err("its verifier has not held it — nothing lands as done before that".into()),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// `wsp done`, behind the role gate.
+pub fn done(store: &Store, args: &Args) -> i32 {
+    let role = role(store);
+    if role != Role::Outside {
+        let row = args.rest.first().and_then(|n| store.find_task(n));
+        let (status, owes) = match &row {
+            Some(t) => {
+                let all = store.tasks();
+                // `Some(false)`: a verification stands and has not held.
+                let owes = crate::verification::latest(&all, &t.id).map(|_| crate::verification::verified(&all, &t.id));
+                (t.status(), owes)
+            }
+            None => (Status::Todo, None),
+        };
+        if let Err(why) = done_allowed(&role, status, owes) {
+            return refuse(store, "done", &role, &why);
+        }
+        crate::store::log_line(store, &format!("done {} by {}", row.map(|t| t.id).unwrap_or_default(), role.name()));
+    }
+    crate::cmd_task::done(store, args, &crate::cmd_spawn::seat_is_live, &crate::cycle::Fleet)
+}
+
+// ---- daemon reload ------------------------------------------------------------
+
+pub fn reload_allowed(role: &Role) -> Result<(), String> {
+    match role {
+        Role::Outside | Role::Primary => Ok(()),
+        other => Err(format!("{} does not reload the daemon — that is the primary seat's", other.name())),
+    }
+}
+
+/// `wsp daemon reload`: put the launchd job back when no daemon answers.
+/// `answering` is the daemons found running for this store (`None`: the
+/// process list could not be read), asked by the caller that owns that rule.
+pub fn daemon_reload(store: &Store, answering: Option<Vec<u32>>) -> i32 {
+    let role = role(store);
+    if let Err(why) = reload_allowed(&role) {
+        return refuse(store, "daemon reload", &role, &why);
+    }
+    match answering {
+        None => return refuse(store, "daemon reload", &role, "the process list could not be read, so whether a daemon answers is not known"),
+        Some(pids) if !pids.is_empty() => {
+            return refuse(store, "daemon reload", &role, &format!("a daemon already answers (pid {}) — nothing to reload", pids[0]));
+        }
+        Some(_) => {}
+    }
+    if crate::launchd::sandboxed() {
+        return refuse(store, "daemon reload", &role, "this is a sandbox, not the machine's own daemon");
+    }
+    #[cfg(target_os = "macos")]
+    let reloaded = crate::launchd::reload();
+    #[cfg(not(target_os = "macos"))]
+    let reloaded = crate::systemd::reload();
+    match reloaded {
+        Ok(said) => {
+            crate::launchd::clear_unloaded(&store.state);
+            crate::store::log_line(store, &format!("daemon reload by {}: {said}", role.name()));
+            println!("{said}");
+            0
+        }
+        Err(why) => {
+            crate::store::log_line(store, &format!("daemon reload by {} failed: {why}", role.name()));
+            eprintln!("wsp: daemon reload: {why}");
+            1
+        }
+    }
+}
+
+// ---- reap -------------------------------------------------------------------
+
+// What stays of the process table here is wsp-691's burner line (`wsp wip`'s
+// load warning, stamped by the daemon's tick, wsp-716): it names CPU burners
+// in no tree and stops none, so it keeps to wsp-057's rule for reap below.
+
+/// The CPU a `while :` loop must be over to be a busy loop.
+const LOOP_CPU: f32 = 20.0;
+
+/// One row of `ps`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    /// Seconds since it started.
+    pub age: u64,
+    pub cpu: f32,
+    /// CPU seconds it has used in all.
+    pub cputime: u64,
+    pub command: String,
+}
+
+/// `[[dd-]hh:]mm:ss` (`etime`) or `[hh:]mm:ss[.cc]` (`time`), in seconds.
+pub fn clock_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let rest = rest.split('.').next()?;
+    let mut secs = 0u64;
+    for part in rest.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
+/// One `ps -o pid=,ppid=,etime=,pcpu=,time=,command=` line.
+pub fn parse_ps(line: &str) -> Option<Proc> {
+    let mut it = line.split_whitespace();
+    let pid = it.next()?.parse().ok()?;
+    let ppid = it.next()?.parse().ok()?;
+    let age = clock_secs(it.next()?)?;
+    let cpu = it.next()?.parse().ok()?;
+    let cputime = clock_secs(it.next()?)?;
+    let command = it.collect::<Vec<_>>().join(" ");
+    Some(Proc { pid, ppid, age, cpu, cputime, command })
+}
+
+pub fn processes() -> Vec<Proc> {
+    let Some(out) = crate::host::Host::table(&crate::host::LOCAL, "pid=,ppid=,etime=,pcpu=,time=,command=", false) else {
+        return Vec::new();
+    };
+    out.lines().filter_map(parse_ps).collect()
+}
+
+/// Every process's working directory, from `lsof -d cwd -Fpn`.
+pub fn parse_cwds(lsof: &str) -> BTreeMap<u32, String> {
+    let mut out = BTreeMap::new();
+    let mut pid = None;
+    for line in lsof.lines() {
+        match line.split_at_checked(1) {
+            Some(("p", rest)) => pid = rest.trim().parse::<u32>().ok(),
+            Some(("n", rest)) => {
+                if let Some(p) = pid {
+                    out.entry(p).or_insert_with(|| rest.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The tree a working directory is in: `(its name, its root)`, the directory
+/// under a `.worktrees/` the path goes through.
+pub fn tree_named(cwd: &str) -> Option<(String, String)> {
+    let mut root = std::path::PathBuf::new();
+    let mut parts = std::path::Path::new(cwd).components();
+    while let Some(c) = parts.next() {
+        root.push(c);
+        if c.as_os_str() == ".worktrees" {
+            let name = parts.next()?;
+            root.push(name);
+            return Some((name.as_os_str().to_string_lossy().into_owned(), root.display().to_string()));
+        }
+    }
+    None
+}
+
+/// A zsh `while :` loop left running.
+pub fn is_busy_loop(p: &Proc) -> bool {
+    let prog = p.command.split_whitespace().next().unwrap_or_default();
+    prog.rsplit('/').next() == Some("zsh") && p.command.contains("while :") && p.cpu > LOOP_CPU && p.ppid == 1
+}
+
+/// How old a tree-less burner is before `wsp wip` names it.
+const BURNER_AGE: u64 = 10 * 60;
+
+/// A CPU burner: a `yes`, a `stress`, or a busy `while :` loop, orphaned to
+/// launchd, busy, and older than [`BURNER_AGE`].
+pub fn is_burner(p: &Proc) -> bool {
+    if p.ppid != 1 || p.age <= BURNER_AGE || p.cpu <= LOOP_CPU {
+        return false;
+    }
+    let prog = p.command.split_whitespace().next().unwrap_or_default();
+    matches!(prog.rsplit('/').next(), Some("yes" | "stress" | "stress-ng")) || is_busy_loop(p)
+}
+
+/// Whether a working directory is in a tree: under a project root or a
+/// `.worktrees/` directory.
+fn in_a_tree(cwd: &str, roots: &[String]) -> bool {
+    tree_named(cwd).is_some()
+        || roots.iter().any(|r| {
+            let r = r.trim_end_matches('/');
+            !r.is_empty() && (cwd == r || cwd.starts_with(&format!("{r}/")))
+        })
+}
+
+/// The burners standing in no tree, as one line for the load warning, from
+/// the process table and a working-directory read passed in. They are named,
+/// never stopped: they are outside every tree. A burner whose directory is
+/// unknown is not named.
+pub fn burners_line(procs: &[Proc], cwd_of: &dyn Fn(&[u32]) -> BTreeMap<u32, String>, roots: &[String]) -> Option<String> {
+    let cand: Vec<&Proc> = procs.iter().filter(|p| is_burner(p)).collect();
+    if cand.is_empty() {
+        return None;
+    }
+    let pids: Vec<u32> = cand.iter().map(|p| p.pid).collect();
+    let cwds = cwd_of(&pids);
+    let loose: Vec<String> = cand
+        .iter()
+        .filter(|p| cwds.get(&p.pid).is_some_and(|c| !in_a_tree(c, roots)))
+        .map(|p| format!("{} {}", p.pid, util::truncate(&p.command, 40)))
+        .collect();
+    if loose.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} CPU burner{} in no tree, orphaned for over 10 minutes: {} — not stopped, they are outside every tree (`kill <pid>`)",
+        loose.len(),
+        if loose.len() == 1 { "" } else { "s" },
+        loose.join("; ")
+    ))
+}
+
+/// [`burners_line`] from the machine.
+pub fn burners_now(store: &Store) -> Option<String> {
+    let procs = processes();
+    let roots: Vec<String> = store.projects().into_iter().flat_map(|p| p.roots).collect();
+    let cwd_of = |pids: &[u32]| crate::host::Host::cwds(&crate::host::LOCAL, Some(pids)).map(|o| parse_cwds(&o)).unwrap_or_default();
+    burners_line(&procs, &cwd_of, &roots)
+}
+
+/// The state file the daemon's tick writes [`burners_now`] into: its epoch
+/// second, then the line (empty for none). `wsp wip` reads it here rather
+/// than reading the process table itself, because under the manager `wip`
+/// runs no `ps` (wsp-030, `docs/agent-manager.md` 4.3; wsp-716).
+const BURNERS_FILE: &str = "burners";
+
+/// How often the tick reads the process table for burners: they are named
+/// only past [`BURNER_AGE`], so a minute late is no burner missed.
+const BURNERS_EVERY: i64 = 60;
+
+/// How old a stamped burner line may be and still be said: past this the
+/// daemon is not ticking (which `wip` says on its own), and a pid named from
+/// that long ago may be gone.
+const BURNERS_FRESH: i64 = 5 * 60;
+
+/// `<at>\n<line>` out of [`BURNERS_FILE`].
+fn parse_burners(text: &str) -> Option<(i64, String)> {
+    let (at, line) = text.split_once('\n')?;
+    Some((at.trim().parse().ok()?, line.trim().to_string()))
+}
+
+/// On the daemon's tick: [`burners_now`] into [`BURNERS_FILE`], at most once
+/// per [`BURNERS_EVERY`]. Best effort, as the tick stamp is.
+pub fn stamp_burners(store: &Store, now: i64) {
+    let path = store.state_file(BURNERS_FILE);
+    let last = std::fs::read_to_string(&path).ok().and_then(|t| parse_burners(&t));
+    if last.is_some_and(|(at, _)| (0..BURNERS_EVERY).contains(&(now - at))) {
+        return;
+    }
+    let line = burners_now(store).unwrap_or_default();
+    let _ = std::fs::write(&path, format!("{now}\n{line}\n"));
+}
+
+/// The burners line the daemon last stamped, for `wsp wip`'s load warning:
+/// none where nothing was stamped, the stamp names none, or it is older than
+/// [`BURNERS_FRESH`]. Reads one file and runs nothing.
+pub fn burners_stamped(store: &Store, now: i64) -> Option<String> {
+    let (at, line) = parse_burners(&std::fs::read_to_string(store.state_file(BURNERS_FILE)).ok()?)?;
+    (now - at <= BURNERS_FRESH && !line.is_empty()).then_some(line)
+}
+
+/// `wsp reap --list`: what this host's manager runs, its seats and its jobs,
+/// read from the manager (wsp-057, the person's (b) on wsp-042). wsp finds no
+/// process and stops none: a seat's group ends with the seat, a job's with the
+/// job, both by the manager, and what escapes a group is reported and counted
+/// and stopped by no one ((c)). `wsp reap <pid>` is removed. Open to every
+/// role: it changes nothing.
+pub fn reap(store: &Store, args: &Args) -> i32 {
+    if !args.rest.is_empty() || !args.has("list") {
+        eprintln!("wsp: `wsp reap <pid>` is removed (wsp-057): wsp stops no process by pid. A seat's processes end with the seat (`wsp despawn`), a job's with the job; `wsp reap --list` shows what this host's manager runs");
+        return 2;
+    }
+    let tcp = match crate::host_tcp::Tcp::from_record(&store.state, wsp_host_api::Role::Cli, env!("CARGO_PKG_VERSION")) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("wsp: reap --list: no manager on this host to ask: {e}");
+            return 1;
+        }
+    };
+    let seats = tcp.seats().map_err(|e| e.to_string());
+    let jobs = crate::host::Host::jobs(&tcp).map_err(|e| e.to_string());
+    for line in list_lines(&seats, &jobs, util::epoch_secs()) {
+        println!("{line}");
+    }
+    i32::from(seats.is_err() || jobs.is_err())
+}
+
+/// What `wsp reap --list` prints of a manager's seats and jobs at `now`
+/// (epoch seconds): one line each, and why for a table it could not read.
+pub fn list_lines(
+    seats: &Result<Vec<wsp_host_api::SeatRow>, String>,
+    jobs: &Result<Vec<crate::host::JobRow>, String>,
+    now: i64,
+) -> Vec<String> {
+    let word = |d: &dyn std::fmt::Debug| format!("{d:?}").to_lowercase();
+    let mut out = Vec::new();
+    match seats {
+        Ok(rows) if rows.is_empty() => out.push("seats: none".to_string()),
+        Ok(rows) => {
+            out.push(format!("seats: {}", rows.len()));
+            for r in rows {
+                out.push(format!("  {}  {}  {} MB  {} shell(s)", r.seat.0, word(&r.state), r.rss_bytes >> 20, r.shells));
+            }
+        }
+        Err(why) => out.push(format!("seats: not read — {why}")),
+    }
+    match jobs {
+        Ok(rows) if rows.is_empty() => out.push("jobs: none".to_string()),
+        Ok(rows) => {
+            out.push(format!("jobs: {}", rows.len()));
+            for r in rows {
+                let secs = (now - r.started.0 as i64).max(0);
+                out.push(format!("  {}  {}  {}  group {}  {}s", crate::check::key_text(&r.key), word(&r.class), word(&r.state), r.pgid, secs));
+            }
+        }
+        Err(why) => out.push(format!("jobs: not read — {why}")),
+    }
+    out
+}
+
+// ---- the seat's settings ------------------------------------------------------
+
+fn settings_path(file: &str) -> std::path::PathBuf {
+    util::home().join(".claude").join(file)
+}
+
+/// The deny rule the primary's `wsp done` used to hit. A deny beats any allow in
+/// any `--settings` layer, so it has to go for the primary's allow to count; the
+/// role gate in [`done`] is what stands in its place.
+pub const STALE_DONE_DENY: &str = "\"Bash(wsp done:*)\"";
+
+/// Whether `settings` (a `settings.json`) still denies `Bash(wsp done:*)`.
+pub fn has_stale_done_deny(settings: &str) -> bool {
+    strip_done_deny(settings).is_some()
+}
+
+/// `settings` without the `Bash(wsp done:*)` entry of `permissions.deny`, or
+/// `None` when it has none. Text in, text out, so the rest of the file —
+/// its key order, its spacing, its comments' neighbours — is byte for byte as it
+/// was; the result is checked to parse and to differ from the original by that one
+/// entry, or nothing is returned.
+pub fn strip_done_deny(settings: &str) -> Option<String> {
+    let before: Value = serde_json::from_str(settings).ok()?;
+    let deny = before.pointer("/permissions/deny")?.as_array()?;
+    if !deny.iter().any(|v| v.as_str() == Some("Bash(wsp done:*)")) {
+        return None;
+    }
+    // The array is the one after the `"deny"` key inside `"permissions"`.
+    let perm = settings.find("\"permissions\"")?;
+    let key = perm + settings[perm..].find("\"deny\"")?;
+    let open = key + settings[key..].find('[')?;
+    // Walk to the matching `]`, splitting on commas outside strings.
+    let (mut parts, mut start, mut in_str, mut esc, mut close) = (Vec::new(), open + 1, false, false, None);
+    for (i, c) in settings[open + 1..].char_indices().map(|(i, c)| (i + open + 1, c)) {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            ',' => {
+                parts.push(&settings[start..i]);
+                start = i + 1;
+            }
+            ']' => {
+                parts.push(&settings[start..i]);
+                close = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let tail = &parts.last()?[parts.last()?.trim_end().len()..];
+    let mut kept: Vec<&str> = parts.iter().copied().filter(|p| p.trim() != STALE_DONE_DENY).collect();
+    if kept.len() == parts.len() {
+        return None;
+    }
+    let mut body = match kept.pop() {
+        Some(last) => {
+            let mut b = kept.join(",");
+            if !kept.is_empty() {
+                b.push(',');
+            }
+            b.push_str(last.trim_end());
+            b
+        }
+        None => String::new(),
+    };
+    body.push_str(tail);
+    let out = format!("{}{}{}", &settings[..open + 1], body, &settings[close..]);
+    let mut want = before;
+    want.pointer_mut("/permissions/deny")?.as_array_mut()?.retain(|v| v.as_str() != Some("Bash(wsp done:*)"));
+    (serde_json::from_str::<Value>(&out).ok()? == want).then_some(out)
+}
+
+/// Take the stale `Bash(wsp done:*)` deny out of `~/.claude/settings.json`,
+/// touching nothing else in it. Whether it did.
+pub fn remove_stale_done_deny() -> bool {
+    let path = settings_path("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    match strip_done_deny(&text) {
+        Some(out) => crate::store::write_atomic(&path, &out).is_ok(),
+        None => false,
+    }
+}
+
+/// What `doctor` says about the seat's settings: the deny that would still stop
+/// the primary's `wsp done`.
+pub fn health(warnings: &mut Vec<String>) {
+    if std::fs::read_to_string(settings_path("settings.json")).is_ok_and(|s| has_stale_done_deny(&s)) {
+        warnings.push("~/.claude/settings.json denies Bash(wsp done:*), which beats the primary's allow — `wsp install` removes it".into());
+    }
+}
+
+/// Write the two settings files beside the seat's other settings. Called by
+/// `wsp install`; returns the paths written.
+pub fn write_settings() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for (file, body) in [(PRIMARY_FILE, PRIMARY_SETTINGS), (GOVERNOR_FILE, GOVERNOR_SETTINGS)] {
+        let path = settings_path(file);
+        if std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
+            continue;
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, body).is_ok() {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The argument pair a seat's Claude Code is started with: `--settings <file>`
+/// for the primary and for a governor, and nothing for anyone else. Only when
+/// the file is there, so a machine that has not run `wsp install` since this
+/// landed starts its seats exactly as it did.
+pub fn settings_args(kind: &str, scope: Option<&str>, primary: bool) -> Vec<String> {
+    if kind != "claude" {
+        return Vec::new();
+    }
+    let file = match (primary, scope) {
+        (true, _) => PRIMARY_FILE,
+        (false, Some(_)) => GOVERNOR_FILE,
+        (false, None) => return Vec::new(),
+    };
+    let path = settings_path(file);
+    match path.exists() {
+        true => vec!["--settings".into(), path.display().to_string()],
+        false => Vec::new(),
+    }
+}
+
+/// Where the retro seat's settings file lives: under wsp's own state, not in
+/// `~/.claude`. Only `--settings <path>` reads it, so it need not sit beside the
+/// person's own settings, and a build run in `wsp sandbox` makes its own copy.
+pub fn retro_settings_path(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("claude-code").join(RETRO_FILE)
+}
+
+/// The argument pair a retro seat's Claude Code is started with: `--settings
+/// <file>`, which allows the read-only verbs its packet tells it to search with
+/// (`wsp ls`, `wsp find`, `wsp show`). The file is written under `state` when
+/// it is missing or differs; if it cannot be written the seat starts without.
+pub fn retro_settings_args(kind: &str, state: &std::path::Path) -> Vec<String> {
+    if kind != "claude" {
+        return Vec::new();
+    }
+    let path = retro_settings_path(state);
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == RETRO_SETTINGS) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, RETRO_SETTINGS).is_err() {
+            return Vec::new();
+        }
+    }
+    vec!["--settings".into(), path.display().to_string()]
+}
+
+/// Whether a spawn is a retro seat's: its row is tagged `retro` and it is not
+/// the row's verifier.
+pub fn retro_wanted(verifying: bool, row_tags: &[String]) -> bool {
+    !verifying && row_tags.iter().any(|g| g == "retro")
+}
+
+/// The settings of a member seat on `row` (wsp-681): the allow rule for
+/// `wsp check <row> --set` on its own row, as a permission and as the
+/// classifier's own rule, and, on a retro row, the retro seat's besides. One
+/// file, because a seat is started with one `--settings`.
+pub fn member_settings(row: &str, retro: bool) -> String {
+    let mut v: Value = serde_json::from_str(&MEMBER_SETTINGS.replace("<row>", row)).unwrap_or_else(|_| json!({}));
+    if retro {
+        let r: Value = serde_json::from_str(RETRO_SETTINGS).unwrap_or_else(|_| json!({}));
+        for key in ["/permissions/allow", "/autoMode/allow"] {
+            let more: Vec<Value> = r.pointer(key).and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(a) = v.pointer_mut(key).and_then(Value::as_array_mut) {
+                a.extend(more.into_iter().filter(|m| m.as_str() != Some("$defaults")));
+            }
+        }
+    }
+    serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+}
+
+/// Where a member seat's settings file for `row` lives, under wsp's state.
+pub fn member_settings_path(state: &std::path::Path, row: &str) -> std::path::PathBuf {
+    state.join("claude-code").join(format!("wsp-member-{row}.settings.json"))
+}
+
+/// What a spawn adds for its seat's own settings: a member seat on a row gets
+/// its member settings (with the retro seat's on a retro row), a retro row's
+/// other seats nothing, as before, and anyone else nothing. `member_row` is the
+/// row of a member seat, `None` for any other spawn.
+pub fn seat_spawn_args(kind: &str, member_row: Option<&str>, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
+    let Some(row) = member_row.filter(|_| kind == "claude" && !verifying) else {
+        return retro_spawn_args(kind, verifying, row_tags, state);
+    };
+    let body = member_settings(row, retro_wanted(verifying, row_tags));
+    let path = member_settings_path(state, row);
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, &body).is_err() {
+            return retro_spawn_args(kind, verifying, row_tags, state);
+        }
+    }
+    vec!["--settings".into(), path.display().to_string()]
+}
+
+/// What a spawn adds for a seat that is no member: a retro seat's settings
+/// when the row is tagged `retro` and the seat is not its verifier, and for any
+/// other Claude seat (a verifier, a check's or a leg's seat) the guard settings,
+/// so that every seat runs the Bash kill guard (wsp-691).
+pub fn retro_spawn_args(kind: &str, verifying: bool, row_tags: &[String], state: &std::path::Path) -> Vec<String> {
+    match retro_wanted(verifying, row_tags) {
+        true => retro_settings_args(kind, state),
+        false => guard_settings_args(kind, state),
+    }
+}
+
+/// The settings of a seat with no role file of its own (wsp-691): the hooks
+/// every role file holds, which is the PreToolUse kill guard, and nothing else.
+/// On 2026-11-19 a verifier, which was started with no `--settings` at all, ran
+/// the `pkill -f "scripts/check.mjs" -P 0` that ended every session.
+pub fn guard_settings() -> String {
+    let member: Value = serde_json::from_str(MEMBER_SETTINGS).unwrap_or_else(|_| json!({}));
+    let v = json!({
+        "_comment": "Written by wsp under its state and passed with --settings to a Claude seat that has no role file of its own: a verifier, a check's seat, a leg's (wsp-691). It holds only the hooks every role file holds, the Bash kill guard.",
+        "hooks": member.get("hooks").cloned().unwrap_or_else(|| json!({})),
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+}
+
+/// The argument pair for the guard settings, written under `state` when it is
+/// missing or differs; nothing for an agent that is not Claude, or when the
+/// file cannot be written.
+pub fn guard_settings_args(kind: &str, state: &std::path::Path) -> Vec<String> {
+    if kind != "claude" {
+        return Vec::new();
+    }
+    let path = state.join("claude-code").join(GUARD_FILE);
+    let body = guard_settings();
+    if !std::fs::read_to_string(&path).is_ok_and(|s| s == body) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if crate::store::write_atomic(&path, &body).is_err() {
+            return Vec::new();
+        }
+    }
+    vec!["--settings".into(), path.display().to_string()]
+}
+
+pub const VERBS: &[crate::verbs::Verb] = &[
+    crate::verbs::Verb {
+        names: &["done", "close"],
+        run: done,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 200,
+                text: r##"  wsp done <id> [--force]           the person's verb (a member finishes with
+                                    `wsp review`); complete; --force over open sub-tasks. Its
+                                    worktree and branch go too when the work is
+                                    on the trunk and nobody is in it; otherwise
+                                    kept and said why. --keep-tree leaves it"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+    names: &["reap"],
+    run: reap,
+    help: &[crate::verbs::Help {
+        section: crate::verbs::Section::Agents,
+        order: 310,
+        text: r##"  wsp reap --list                   what this host's manager runs: its seats and its
+                                    jobs, read from the manager. wsp stops no
+                                    process by pid (`wsp reap <pid>` is removed):
+                                    a seat's end with it, a job's with the job"##,
+    }],
+}];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn burners_are_named_only_when_in_no_tree() {
+        let orphan = |pid, age, cpu, ppid, cmd: &str| Proc { pid, ppid, age, cpu, cputime: 9, command: cmd.into() };
+        let procs = vec![
+            orphan(10, 700, 90.0, 1, "/usr/bin/yes"),
+            orphan(11, 700, 90.0, 1, "yes"),
+            orphan(12, 700, 90.0, 1, "/usr/local/bin/stress --cpu 4"),
+            orphan(13, 700, 90.0, 1, "/bin/zsh -c while :; do :; done"),
+            orphan(14, 300, 90.0, 1, "yes"),
+            orphan(15, 700, 90.0, 400, "yes"),
+            orphan(16, 700, 2.0, 1, "yes"),
+            orphan(17, 700, 90.0, 1, "/usr/bin/yes"),
+            orphan(18, 700, 90.0, 1, "sleep 100"),
+        ];
+        let cwds: BTreeMap<u32, String> = [
+            (10, "/Users/e/scratch"),
+            (11, "/Users/e/claude/wsp/.worktrees/wsp-693"),
+            (12, "/tmp/x"),
+            (13, "/Users/e/claude/wsp"),
+            (14, "/tmp"),
+            (15, "/tmp"),
+            (16, "/tmp"),
+        ]
+        .into_iter()
+        .map(|(p, c)| (p, c.to_string()))
+        .collect();
+        let read = std::cell::RefCell::new(Vec::new());
+        let cwd_of = |pids: &[u32]| {
+            read.borrow_mut().extend_from_slice(pids);
+            cwds.clone()
+        };
+        let line = burners_line(&procs, &cwd_of, &["/Users/e/claude/wsp".to_string()]).unwrap();
+        assert!(line.starts_with("2 CPU burners in no tree"), "{line}");
+        assert!(line.contains("10 /usr/bin/yes") && line.contains("12 /usr/local/bin/stress"), "{line}");
+        assert!(!line.contains("11 yes") && !line.contains("13 ") && !line.contains("17 "), "{line}");
+        // only the candidates were looked up, and none is named without a cwd
+        assert_eq!(*read.borrow(), vec![10, 11, 12, 13, 17]);
+        assert!(burners_line(&procs[..1], &|_| BTreeMap::new(), &[]).is_none());
+        assert!(burners_line(&procs[4..], &cwd_of, &[]).is_none());
+    }
+
+    #[test]
+    fn wip_reads_the_burners_the_tick_stamped_and_runs_nothing() {
+        let env = crate::util::isolated("role-burners-stamped");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let now = 1_000_000;
+        assert_eq!(burners_stamped(&store, now), None, "nothing stamped is nothing said");
+        let line = "1 CPU burner in no tree, orphaned for over 10 minutes: 10 /usr/bin/yes";
+        std::fs::write(store.state_file(BURNERS_FILE), format!("{now}\n{line}\n")).unwrap();
+        assert_eq!(burners_stamped(&store, now + 20).as_deref(), Some(line));
+        assert_eq!(burners_stamped(&store, now + BURNERS_FRESH + 1), None, "a stamp the daemon left long ago is not said");
+        // Within the interval the tick reads no process table: the stamp stands.
+        stamp_burners(&store, now + BURNERS_EVERY - 1);
+        assert_eq!(burners_stamped(&store, now + BURNERS_EVERY - 1).as_deref(), Some(line));
+        std::fs::write(store.state_file(BURNERS_FILE), format!("{now}\n\n")).unwrap();
+        assert_eq!(burners_stamped(&store, now), None, "a stamp naming none says none");
+        assert_eq!(parse_burners("garbage"), None);
+    }
+    #[test]
+    fn the_stale_done_deny_comes_out_and_nothing_else_does() {
+        let old = "{\n  \"model\": \"x\",\n  \"permissions\": {\n    \"allow\": [\"Bash(ls:*)\"],\n    \"deny\": [\n      \"Bash(git push:*)\",\n      \"Bash(wsp done:*)\",\n      \"Bash(rm -rf:*)\"\n    ]\n  },\n  \"zed\": 1\n}\n";
+        assert!(has_stale_done_deny(old));
+        let out = strip_done_deny(old).unwrap();
+        assert_eq!(out, old.replace("      \"Bash(wsp done:*)\",\n", ""));
+        assert!(!has_stale_done_deny(&out));
+        // last in the list, and alone
+        let last = "{\"permissions\":{\"deny\":[\"Bash(a)\", \"Bash(wsp done:*)\"]}}";
+        assert_eq!(strip_done_deny(last).unwrap(), "{\"permissions\":{\"deny\":[\"Bash(a)\"]}}");
+        let only = "{\"permissions\":{\"deny\":[\"Bash(wsp done:*)\"]}}";
+        assert_eq!(strip_done_deny(only).unwrap(), "{\"permissions\":{\"deny\":[]}}");
+        // one without it is left alone
+        assert_eq!(strip_done_deny("{\"permissions\":{\"deny\":[\"Bash(a)\"]}}"), None);
+        assert_eq!(strip_done_deny("{}"), None);
+        assert_eq!(strip_done_deny("not json"), None);
+    }
+
+    #[test]
+    fn a_member_is_a_seat_and_not_outside_for_despawn() {
+        assert_eq!(role_of_caller(Some("cpd-3"), None, true), Role::Seat);
+        assert_eq!(role_of_caller(Some("w1:p1"), None, false), Role::Outside);
+    }
+
+    #[test]
+    fn roles_come_from_the_seat_and_not_from_the_caller() {
+        assert_eq!(Role::of(None, None, false), Role::Outside);
+        assert_eq!(Role::of(Some("cpd-1"), Some("primary"), true), Role::Primary);
+        assert_eq!(Role::of(Some("cpd-2"), Some("fleet"), true), Role::Governor("fleet".into()));
+        assert_eq!(Role::of(Some("cpd-3"), None, true), Role::Seat);
+        assert_eq!(Role::of(Some("w1:p1"), None, false), Role::Outside, "Ed's own pane");
+    }
+
+    #[test]
+    fn despawn_scope_by_role() {
+        let gov = Role::Governor("fleet".into());
+        assert!(despawn_allowed(&gov, None, Some("fleet"), false, false).is_ok());
+        let why = despawn_allowed(&gov, None, Some("other"), false, false).unwrap_err();
+        assert!(why.contains("other") && why.contains("fleet"), "{why}");
+        assert!(despawn_allowed(&gov, None, None, false, false).is_err());
+        assert!(despawn_allowed(&Role::Seat, None, Some("fleet"), false, false).is_err());
+        assert!(despawn_allowed(&Role::Primary, None, None, false, false).is_err(), "--why is required");
+        assert!(despawn_allowed(&Role::Primary, Some("dropped"), None, false, false).is_ok());
+        assert!(despawn_allowed(&Role::Primary, Some("dropped"), None, true, false).is_err(), "mid-turn");
+        assert!(despawn_allowed(&Role::Primary, Some("dropped"), None, true, true).is_ok(), "--now");
+        assert!(despawn_allowed(&Role::Outside, None, None, true, false).is_ok());
+    }
+
+    #[test]
+    fn a_verifiers_seat_is_on_the_list_of_the_row_it_reads() {
+        let (env, store) = (crate::util::isolated("role-verifier-seat"), ());
+        let _ = store;
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let mut m = crate::model::Task::new("m", "m-1");
+        crate::verification::write(&mut m, &[crate::verification::Pass { pane: Some("w3:p1".into()), ..crate::verification::Pass::opened(None, None) }]);
+        store.save_task(&m).unwrap();
+        assert_eq!(crate::verification::seats(&store.tasks()).get("w3:p1").map(String::as_str), Some("m-1"));
+        assert_eq!(list_of_seat(&store, "w3:p9"), None, "a seat on nothing is on no list");
+    }
+
+    #[test]
+    fn done_and_reload_by_role() {
+        assert!(done_allowed(&Role::Primary, Status::Review, None).is_ok(), "owes no verifier");
+        assert!(done_allowed(&Role::Primary, Status::Review, Some(true)).is_ok());
+        assert!(done_allowed(&Role::Primary, Status::Review, Some(false)).is_err());
+        assert!(done_allowed(&Role::Primary, Status::Doing, None).is_err());
+        assert!(done_allowed(&Role::Governor("fleet".into()), Status::Review, None).is_err());
+        assert!(done_allowed(&Role::Seat, Status::Review, None).is_err());
+        assert!(done_allowed(&Role::Outside, Status::Doing, None).is_ok());
+        assert!(reload_allowed(&Role::Primary).is_ok());
+        assert!(reload_allowed(&Role::Governor("fleet".into())).is_err());
+        assert!(reload_allowed(&Role::Seat).is_err());
+    }
+
+    #[test]
+    fn reap_list_reads_the_managers_seats_and_jobs_and_says_a_table_it_could_not_read() {
+        use wsp_host_api::{Epoch, SeatId, SeatRow, SeatState};
+        let seat = SeatRow { seat: SeatId("cpd-3".into()), epoch: Epoch(1), state: SeatState::Working, rss_bytes: 412 << 20, shells: 2, last_turn: None, last_word: None };
+        let job = crate::host::JobRow {
+            key: crate::host::job_key("wsp-1", 0, "check:s@1.0"),
+            class: crate::host::JobClass::Check,
+            pgid: 77,
+            started: crate::host::At(1000),
+            state: crate::host::JobState::Running,
+        };
+        let lines = list_lines(&Ok(vec![seat]), &Ok(vec![job]), 1090);
+        assert_eq!(lines, ["seats: 1", "  cpd-3  working  412 MB  2 shell(s)", "jobs: 1", "  wsp-1/0/check:s@1.0  check  running  group 77  90s"]);
+        let none = list_lines(&Ok(Vec::new()), &Err("host silent".into()), 0);
+        assert_eq!(none, ["seats: none", "jobs: not read — host silent"]);
+    }
+
+    #[test]
+    fn the_settings_files_allow_exactly_the_verbs_of_their_role() {
+        let allow = |s: &str| -> Vec<String> {
+            let v: Value = serde_json::from_str(s).unwrap();
+            v["permissions"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(
+            allow(PRIMARY_SETTINGS),
+            ["Bash(wsp despawn:*)", "Bash(wsp done:*)", "Bash(wsp reap:*)", "Bash(wsp daemon reload)"]
+        );
+        assert_eq!(allow(GOVERNOR_SETTINGS), ["Bash(wsp despawn:*)", "Bash(wsp reap:*)", "Bash(wsp check:*)"]);
+        assert!(settings_args("opencode", Some("x"), false).is_empty());
+        assert!(settings_args("claude", None, false).is_empty(), "a member gets neither file");
+        assert_eq!(allow(RETRO_SETTINGS), ["Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
+        assert!(retro_settings_args("opencode", std::path::Path::new("/nonexistent")).is_empty());
+        let v: Value = serde_json::from_str(RETRO_SETTINGS).unwrap();
+        let prose = v["autoMode"]["allow"].as_array().unwrap();
+        assert!(prose.iter().any(|p| {
+            let p = p.as_str().unwrap();
+            p.contains("wsp ls") && p.contains("wsp find") && p.contains("wsp show") && p.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn only_a_retro_rows_own_seat_is_started_with_the_retro_settings() {
+        let retro = vec!["wsp".to_string(), "retro".to_string()];
+        assert!(retro_wanted(false, &retro));
+        assert!(!retro_wanted(true, &retro), "its verifier is not a retro seat");
+        assert!(!retro_wanted(false, &["wsp".to_string()]), "a member is not");
+        assert!(!retro_wanted(false, &[]));
+        let state = std::env::temp_dir().join(format!("wsp-retro-args-{}", std::process::id()));
+        assert!(retro_spawn_args("opencode", false, &retro, &state).is_empty());
+        assert_eq!(retro_spawn_args("claude", true, &retro, &state), guard_settings_args("claude", &state), "its verifier gets the guard");
+        assert_eq!(retro_spawn_args("claude", false, &["wsp".to_string()], &state), guard_settings_args("claude", &state));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_retro_args_name_a_file_under_the_state_holding_the_retro_settings() {
+        let state = std::env::temp_dir().join(format!("wsp-retro-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = retro_settings_args("claude", &state);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--settings");
+        let path = std::path::PathBuf::from(&args[1]);
+        assert!(path.starts_with(&state), "{path:?} is not under {state:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), RETRO_SETTINGS);
+        // A stale copy is replaced, and the args are the same path.
+        std::fs::write(&path, "stale").unwrap();
+        assert_eq!(retro_settings_args("claude", &state), args);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), RETRO_SETTINGS);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_member_seat_is_started_allowed_check_set_on_its_own_row_only_and_the_classifier_is_told() {
+        let v: Value = serde_json::from_str(&member_settings("wsp-9", false)).unwrap();
+        let allow: Vec<&str> = v["permissions"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(allow, ["Bash(wsp check wsp-9 --set:*)"], "its own row, and nothing else");
+        let prose: Vec<&str> = v["autoMode"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(prose[0], "$defaults");
+        assert!(!prose[1].contains("<row>") && prose[1].contains("wsp-9") && prose[1].contains("Ed"), "{prose:?}");
+        // A retro row's member gets the retro rules in the same one file.
+        let r: Value = serde_json::from_str(&member_settings("wsp-9", true)).unwrap();
+        let allow: Vec<&str> = r["permissions"]["allow"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(allow, ["Bash(wsp check wsp-9 --set:*)", "Bash(wsp ls:*)", "Bash(wsp find:*)", "Bash(wsp show:*)"]);
+        assert_eq!(r["autoMode"]["allow"].as_array().unwrap().iter().filter(|x| x.as_str() == Some("$defaults")).count(), 1);
+        // The governor's file tells the classifier too.
+        let g: Value = serde_json::from_str(GOVERNOR_SETTINGS).unwrap();
+        assert!(g["autoMode"]["allow"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().contains("wsp check <row> --set")));
+
+        let state = std::env::temp_dir().join(format!("wsp-member-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = seat_spawn_args("claude", Some("wsp-9"), false, &[], &state);
+        assert_eq!(args, ["--settings".to_string(), member_settings_path(&state, "wsp-9").display().to_string()]);
+        assert_eq!(std::fs::read_to_string(member_settings_path(&state, "wsp-9")).unwrap(), member_settings("wsp-9", false));
+        let guard = guard_settings_args("claude", &state);
+        assert_eq!(seat_spawn_args("claude", Some("wsp-9"), true, &[], &state), guard, "a verifier is no member: the guard alone");
+        assert_eq!(seat_spawn_args("claude", None, false, &[], &state), guard, "no member row: the guard alone");
+        assert!(seat_spawn_args("opencode", Some("wsp-9"), false, &[], &state).is_empty());
+        let retro = vec!["retro".to_string()];
+        assert_eq!(seat_spawn_args("claude", None, false, &retro, &state), retro_settings_args("claude", &state), "a retro seat as before");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// wsp-691: every seat's settings run the Bash kill guard, and the guard
+    /// itself refuses the 11-19 command (claude-code/test-kill-guard.sh).
+    #[test]
+    fn every_seats_settings_run_the_kill_guard_on_bash() {
+        let guard_of = |s: &str| -> String {
+            let v: Value = serde_json::from_str(s).unwrap();
+            let e = &v["hooks"]["PreToolUse"][0];
+            assert_eq!(e["matcher"], "Bash", "{s}");
+            e["hooks"][0]["command"].as_str().unwrap().to_string()
+        };
+        let snippet = include_str!("../../../claude-code/settings.snippet.json");
+        let want = guard_of(snippet);
+        assert!(want.contains("wsp-session.sh") && want.ends_with("PreToolUse"), "{want}");
+        // wsp-428: the one path `wsp install` writes, and no checkout's.
+        assert!(want.contains("$HOME/.claude/hooks/wsp-session.sh") && !want.contains("claude/wsp/"), "{want}");
+        assert!(!snippet.contains("$HOME/claude/wsp/"), "a snippet hook still names a checkout path");
+        for body in [PRIMARY_SETTINGS, GOVERNOR_SETTINGS, RETRO_SETTINGS, MEMBER_SETTINGS] {
+            assert_eq!(guard_of(body), want);
+        }
+        assert_eq!(guard_of(&member_settings("wsp-9", true)), want);
+        assert_eq!(guard_of(&guard_settings()), want);
+        let state = std::env::temp_dir().join(format!("wsp-guard-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let args = guard_settings_args("claude", &state);
+        assert_eq!(args[0], "--settings");
+        assert_eq!(std::fs::read_to_string(&args[1]).unwrap(), guard_settings());
+        assert!(guard_settings_args("opencode", &state).is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn the_kill_guard_shell_tests_pass() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let out = std::process::Command::new("sh").arg(format!("{dir}/../../claude-code/test-kill-guard.sh")).output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("cases pass"), "{said}");
+    }
+}

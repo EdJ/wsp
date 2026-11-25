@@ -1111,7 +1111,14 @@ mod tests {
     use crate::model::{Task, WorklistStatus};
 
     fn list(slug: &str, members: &[&str]) -> (util::Isolated, Store, Worklist) {
+        // The writers, as `main` installs them: the engine's test build installed
+        // these for the whole crate while it was this one (wsp-440).
+        crate::outputs::install(REPORTS);
         let env = util::isolated(&format!("report-{slug}"));
+        // The engine's launches (`cycle::launch`) stand down in its own test
+        // build; this crate's tests run it as the binary does, and a launch
+        // here would run this harness as `wsp` (wsp-440).
+        std::env::set_var("WSP_NO_CYCLE", "1");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let w = more(&store, slug, members);

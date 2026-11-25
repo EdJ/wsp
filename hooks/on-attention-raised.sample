@@ -1,7 +1,7 @@
 #!/bin/sh
 # ~/wsp/hooks/on-attention-raised — what wsp does when it notices, unattended.
 #
-# The daemon derives the level set once a minute (`src/attention.rs`) and writes
+# The daemon derives the level set once a minute (`crates/engine/src/attention.rs`) and writes
 # an edge here whenever one goes up. This file is the whole of the escape to
 # anything louder: a desktop notification is already an executable file, and wsp
 # deliberately ships none, because what is allowed to interrupt you at 3am is

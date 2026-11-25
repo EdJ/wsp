@@ -4,7 +4,7 @@
 //! The binary has no library, so the projections are not called from here: the
 //! snapshot is compared, key by key, with what `wsp ls --json` says of the same
 //! files (the row's id, title, `fields.status`, `prio`, `tags`, `caption`).
-//! The pure projections are tested on a seeded store in `src/mirror.rs`.
+//! The pure projections are tested on a seeded store in `crates/engine/src/mirror.rs`.
 //!
 //! The daemon listens on `WSP_API_PORT` (7488 unless told), which each test
 //! here takes free from the OS so that it never meets the live daemon's.

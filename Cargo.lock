@@ -807,6 +807,7 @@ dependencies = [
  "wsp-api",
  "wsp-base",
  "wsp-client",
+ "wsp-engine",
  "wsp-host",
  "wsp-host-api",
  "wsp-hub",
@@ -854,6 +855,30 @@ dependencies = [
  "wsp-server",
  "wsp-store-conformance",
  "wsp-store-contract",
+]
+
+[[package]]
+name = "wsp-engine"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-api",
+ "wsp-base",
+ "wsp-client",
+ "wsp-host",
+ "wsp-host-api",
+ "wsp-hub",
+ "wsp-machines",
+ "wsp-manager",
+ "wsp-objects",
+ "wsp-server",
+ "wsp-store",
+ "wsp-store-contract",
+ "wsp-store-sqlite",
+ "wsp-testkit",
+ "wsp-trees",
+ "wsp-view",
+ "wsp-wire",
 ]
 
 [[package]]

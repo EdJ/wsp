@@ -3,4 +3,4 @@
 # This file only shrinks: delete a line when the code stops doing it; never add one.
 crates/wire/src/far.rs: shell ioreg  # DISPLAY_PROBE, run on the far machine over ssh; the far machine is M2's (host.rs: "Not here yet")
 crates/wire/src/far.rs: shell ps  # holdings_command, run on the far machine over ssh; M2's, with DISPLAY_PROBE
-src/did.rs: reads transcripts (~/.claude/projects)  # is_scratch names the directory to classify a path a tool call touched; it reads nothing
+crates/engine/src/did.rs: reads transcripts (~/.claude/projects)  # is_scratch names the directory to classify a path a tool call touched; it reads nothing

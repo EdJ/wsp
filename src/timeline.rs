@@ -3820,4 +3820,45 @@ mod tests {
         assert_eq!((p[1].start, p[1].end, p[1].by.as_str(), p[1].open), (60, 100, "primary", true));
         assert!(p[1].words().contains("still parked") && p[0].words().contains("parked by somebody"));
     }
+
+    /// `wsp-334` over wsp-030's five leg boundaries (06:43:38 to 07:08:44 on
+    /// 2026-11-20, `leg-done` each), on the timeline. cycle's
+    /// `wsp_030s_five_leg_boundaries_each_cost_under_30s` drives the run for real
+    /// and finds each next leg started by the poke of the leg done before it,
+    /// with no tick taken; so the starts go into the fixture at the done time
+    /// plus a hand-off for the poke (and a [`TICK`] for each tick, none). The
+    /// gap before each leg is under 30 s. The log as it happened (two ticks a
+    /// boundary) is read the same way for comparison: every gap is "nothing the
+    /// logs name", and 614 s in all. Split from the cycle test when the engine
+    /// left the root crate (wsp-440).
+    #[test]
+    fn wsp_030s_five_leg_boundaries_on_the_timeline() {
+        const NAMES: [&str; 6] = ["wire-inproc", "daemon-tick", "verbs", "tests-docs", "finish", "rework"];
+        let at = |hms: &str| util::epoch_of(&format!("2026-11-20T{hms}Z"));
+        let done = ["06:43:38", "06:57:40", "07:02:46", "07:05:52", "07:08:44"].map(at);
+        let then = ["06:45:26", "06:59:43", "07:04:50", "07:07:55", "07:11:00"].map(at);
+        // The ticks the run took at each boundary, as cycle's test finds them.
+        let ticks = [0usize; 5];
+        let gaps = |starts: &[i64]| {
+            let mut i = Inputs { id: "wsp-030".into(), ..Default::default() };
+            i.legs = NAMES.iter().map(|n| LegIn { name: n.to_string(), ..Default::default() }).collect();
+            i.cycle.push((at("06:35:26"), "m1-agent-manager group 8: starting leg wire-inproc of wsp-030".into()));
+            for k in 0..5 {
+                i.events.push((done[k], "leg-done".into(), serde_json::json!({ "id": "wsp-030", "leg": NAMES[k] })));
+                i.cycle.push((starts[k], format!("m1-agent-manager group 8: starting leg {} of wsp-030", NAMES[k + 1])));
+            }
+            build(&i).into_iter().filter(|p| p.gap && p.label.starts_with("gap before leg")).collect::<Vec<_>>()
+        };
+        let fixed: Vec<i64> = (0..5).map(|k| done[k] + HAND_OFF / 2 + ticks[k] as i64 * TICK).collect();
+        let now = gaps(&fixed);
+        assert_eq!(now.len(), 5, "{now:?}");
+        for g in &now {
+            assert!(g.seconds() < 30, "{g:?}");
+            assert!(!g.waiting_for.as_deref().unwrap_or_default().contains("did not run for longer than a tick"), "{g:?}");
+        }
+        let was = gaps(&then);
+        assert_eq!(was.len(), 5, "{was:?}");
+        assert!(was.iter().all(|g| g.waiting_for.as_deref().unwrap_or_default().contains("the step of wsp-030 did not run for longer than a tick")), "{was:?}");
+        assert_eq!(was.iter().map(|g| g.seconds()).sum::<i64>(), 614);
+    }
 }

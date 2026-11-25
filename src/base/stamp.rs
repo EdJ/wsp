@@ -29,20 +29,6 @@ pub fn build_stamp() -> String {
     stamp_word(COMMIT, DIRTY)
 }
 
-/// The same word, made of a commit and a dirt flag that came from somewhere
-/// else — a binary that is not this one, asked what it carries.
-///
-/// Split out of [`build_stamp`] rather than written twice because the two
-/// sides of every comparison in the fleet are made here: a `wsp watch`
-/// registers [`build_stamp`], and `wsp install` reads a stamp back out of the
-/// artefact it is about to copy and has to produce the same word for the same
-/// build. `cmd_install` spelled that rule out a second time and spelled it
-/// against the *tree* instead, which is `worklist-042`: two shapes for one
-/// question is how they come to disagree.
-pub fn stamp_word(commit: &str, dirty: bool) -> String {
-    match (commit.is_empty(), dirty) {
-        (true, _) => String::new(),
-        (false, false) => commit.to_string(),
-        (false, true) => format!("{commit}+dirty"),
-    }
-}
+/// The word itself is made in `wsp-engine` (`crates/engine/src/base/stamp.rs`),
+/// whose modules compare stamps and cannot read this crate's `build.rs`.
+pub use wsp_engine::base::stamp::stamp_word;

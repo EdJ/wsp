@@ -1073,13 +1073,20 @@ mod tests {
         store.set_claim("t-live", serde_json::json!({ "workspace_id": "cpd-far", "expires": iso(now + 86_400) }));
         store.set_claim("t-old", serde_json::json!({ "workspace_id": "cpd-far" }));
 
+        // What the governor was told: `cycle::tell`'s line in cycle.log. The
+        // engine's test build kept tells off the log, which its own tests read;
+        // this crate's tests run the engine as the binary does (wsp-440).
+        let told = || -> Vec<String> {
+            let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+            log.lines().filter(|l| l.contains("tell run: ")).map(String::from).collect()
+        };
+
         // Off: nothing is released, however late.
         std::env::set_var("WSP_CLAIM_TTL", "off");
-        crate::cycle::tests::TOLD.with(|t| t.borrow_mut().clear());
         assert_eq!(release_lapsed_claims(&store, now), 0);
         std::env::remove_var("WSP_CLAIM_TTL");
         assert!(store.claims().contains_key("t-lapsed"), "WSP_CLAIM_TTL=off releases nothing");
-        assert!(crate::cycle::tests::TOLD.with(|t| t.borrow().is_empty()));
+        assert!(told().is_empty());
 
         assert_eq!(release_lapsed_claims(&store, now), 1);
         assert!(!store.claims().contains_key("t-lapsed"), "the claim is gone from claims.json");
@@ -1093,13 +1100,13 @@ mod tests {
         assert!(lines[0].contains("held by cpd-far on mb3, last renewed "), "{}", lines[0]);
         assert!(store.machine("mb3").unwrap().body.contains("/far/exec/trees/t-lapsed"), "the far copy is named");
 
-        let told = crate::cycle::tests::TOLD.with(|t| t.borrow().clone());
-        assert_eq!(told.len(), 1, "the governor is told once: {told:?}");
-        assert!(told[0].contains("t-lapsed") && told[0].contains("claim expired"), "{told:?}");
+        let once = told();
+        assert_eq!(once.len(), 1, "the governor is told once: {once:?}");
+        assert!(once[0].contains("t-lapsed") && once[0].contains("claim expired"), "{once:?}");
         for tick in 1..5 {
             assert_eq!(release_lapsed_claims(&store, now + tick * 30), 0);
         }
-        assert_eq!(crate::cycle::tests::TOLD.with(|t| t.borrow().len()), 1, "not once per tick");
+        assert_eq!(told().len(), 1, "not once per tick");
     }
 
     /// The marker a crash leaves behind must never be the reason a machine has
@@ -1475,7 +1482,13 @@ mod tests {
             script(&store, &m);
             // `store` is the default under the manager (wsp-128): the tick's
             // tells go through an orders store, as the daemon's in-process one.
-            let _door = crate::refusals::tests::open(&store, &["cpd-t1"]);
+            // The engine's test build stood a test's store in at its door
+            // (`refusals::tests::open`); from this crate it is served in process
+            // as the daemon serves it, once for the process, which only the
+            // manager's tests, run under the isolation lock, read (wsp-440).
+            let orders = db(&env.state().join("orders-db"), wsp_server::Mode::Owned);
+            seat_idle(&orders, "cpd-t1");
+            crate::orders::serve_in_process(orders);
 
             let line = tick(&store);
             for probe in PROBES {
@@ -1547,10 +1560,7 @@ mod tests {
             script(&store, &m);
 
             let mode = crate::orders::mode();
-            let db = crate::orders::tests::db(&env.state().join("db"), crate::orders::server_mode(mode));
-            // Under `store` the tick's tells go through the daemon's open store,
-            // which a test stands in for with the door's.
-            let _door = (mode == crate::orders::Mode::Store).then(|| crate::refusals::tests::open(&store, &["cpd-t1"]));
+            let db = db(&env.state().join("db"), crate::orders::server_mode(mode));
             let worker = crate::deliver::start(&store, db);
             let running = worker.as_ref().is_some_and(|(t, _)| !t.is_finished());
             let line = tick(&store);
@@ -1594,6 +1604,35 @@ mod tests {
             for kept in ["sweep:disk", "sweep:throttle", "ending:verification", "repair:refusing", "retro"] {
                 assert!(line["phases"].get(kept).is_some(), "{kept} did not run: {}", line["phases"]);
             }
+        }
+
+        /// A fresh `state.db` under `dir`, its domain the composed one under
+        /// `mode`, as orders' test kit in the engine makes it.
+        fn db(dir: &std::path::Path, mode: wsp_server::Mode) -> wsp_server::SharedStore {
+            std::fs::create_dir_all(dir).unwrap();
+            let _ = std::fs::remove_file(dir.join("state.db"));
+            std::sync::Arc::new(
+                wsp_store_sqlite::SqliteStore::open(dir.join("state.db"), std::sync::Arc::new(wsp_server::Composed::new(mode))).unwrap(),
+            )
+        }
+
+        /// `seat` mirrored into `db` idle, as the fold puts it.
+        fn seat_idle(db: &wsp_server::SharedStore, seat: &str) {
+            use wsp_store_contract::{Command, Entity, IdempotencyKey, MachineName, Principal, Seat, SeatId, SeatState};
+            let s = Seat {
+                id: SeatId(seat.into()),
+                machine: MachineName("mac".into()),
+                kind: "claude".into(),
+                model: None,
+                state: SeatState::Idle,
+                before_lost: None,
+                row: None,
+                attempt: 0,
+                pid: None,
+                fields: Default::default(),
+            };
+            let key = IdempotencyKey(format!("test:seat:{seat}"));
+            db.apply(Command::Mirror { put: vec![Entity::Seat(s)], gone: vec![] }, key, Principal::Manager(MachineName("mac".into()))).unwrap();
         }
 
         /// The second tick, its line left uncounted by [`tick`]'s filter.

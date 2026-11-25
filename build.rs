@@ -11,7 +11,7 @@
 //! So the build writes down what it can see, and the binary carries it: the
 //! short commit, and whether the tree it came out of had work in it that no
 //! commit holds. `wsp doctor` compares that against the repository's HEAD;
-//! `src/cmd_install.rs` holds the weaker question this does not replace: what
+//! `crates/engine/src/cmd_install.rs` holds the weaker question this does not replace: what
 //! can be said about a binary still sitting beside the tree it came out of.
 //!
 //! Three things worth knowing about how it is taken:

@@ -29,7 +29,7 @@
 //!
 //! **Tree work has no exception** (M3, wsp-057). Every run of a tree's work is
 //! a job, sent through `Host::run_job`, under both `WSP_JOBS` choices. So in
-//! tree work's code (`crates/trees/src/`, `src/check.rs`, `src/barrier_run.rs`)
+//! tree work's code (`crates/trees/src/`, `crates/engine/src/check.rs`, `crates/engine/src/barrier_run.rs`)
 //! the guard also fails:
 //!
 //! - **a spawn of a tree's tools**: `Command::new` of `sh`, `bash`, `cargo` or
@@ -751,8 +751,11 @@ fn nothing_outside_the_in_process_host_reaches_the_os_for_a_seat() {
     let trunk = std::process::Command::new("git").args(["show", &format!("master:{ALLOW}")]).current_dir(&root).output();
     if let Ok(o) = trunk {
         if o.status.success() {
-            let theirs = parse_allow(&String::from_utf8_lossy(&o.stdout));
-            let grown: Vec<_> = allow.difference(&theirs).collect();
+            // A file moved into a crate (`src/x.rs` to `crates/c/src/x.rs`, wsp-440)
+            // keeps its line: the bound compares paths from their `src/`.
+            let key = |(p, k): &(String, String)| (p.split_once("/src/").map_or(p.clone(), |(_, r)| format!("src/{r}")), k.clone());
+            let theirs: BTreeSet<_> = parse_allow(&String::from_utf8_lossy(&o.stdout)).iter().map(key).collect();
+            let grown: Vec<_> = allow.iter().filter(|line| !theirs.contains(&key(line))).collect();
             assert!(
                 grown.is_empty(),
                 "{ALLOW} has lines the trunk's copy does not; the list only shrinks:\n{}",
@@ -765,7 +768,7 @@ fn nothing_outside_the_in_process_host_reaches_the_os_for_a_seat() {
 // ------------------------------------------------- tree work (M3, wsp-057)
 
 /// Tree work's code: where every run of a tree's work is a job.
-const TREE_WORK: &[&str] = &["crates/trees/src/", "src/check.rs", "src/barrier_run.rs"];
+const TREE_WORK: &[&str] = &["crates/trees/src/", "crates/engine/src/check.rs", "crates/engine/src/barrier_run.rs"];
 
 /// Kept under T2 (wsp-093): the remote-agents copy, which M4 retires.
 const TREE_WORK_KEPT: &[&str] = &["crates/trees/src/treecopy.rs"];
