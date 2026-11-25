@@ -4779,6 +4779,7 @@ mod tests {
         let env = util::isolated("check-own-install");
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
         crate::testkit::repo(&repo);
         std::fs::write(repo.join(".gitignore"), "node_modules\n.worktrees\n").unwrap();
         git_run(&repo, &["add", ".gitignore"]);
