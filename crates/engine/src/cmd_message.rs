@@ -164,7 +164,7 @@ fn ask_of(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let text = match crate::cmd_agent::prose(args, 1) {
+    let text = match crate::prose::prose(args, 1) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -250,7 +250,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // With choices the sentence may be left out: the questions are it.
     let text = match (&choices, args.text(1).trim().is_empty() && args.get("from").is_none()) {
         (Some(c), true) => c.sentence(),
-        _ => match crate::cmd_agent::prose(args, 1) {
+        _ => match crate::prose::prose(args, 1) {
             Ok(t) => t,
             Err(code) => return code,
         },
@@ -285,7 +285,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // About the list's group when it can say which: `--group N`, or the group
     // the asking seat is checking.
     let (about, subject_id, seat, to) = match &subject {
-        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cmd_govern::answering_seat(store, t), addressed(store, t)),
+        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cycle::Seats::answering_seat(&crate::cycle::Fleet, store, t), addressed(store, t)),
         Err(w) => {
             let group = args.get("group").and_then(|g| g.parse::<usize>().ok()).or_else(|| {
                 pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p)).filter(|(l, _)| *l == w.id).map(|(_, at)| at)
@@ -321,7 +321,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
                 Some(s) => format!(
                     "asked of the {} governor, above {scope} · {}",
                     s.scope,
-                    crate::cmd_govern::room_of(&store.governors(), &s.scope)
+                    crate::governors::room_of(&store.governors(), &s.scope)
                 ),
                 None => to,
             };
@@ -420,7 +420,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // it — unless that seat is the one asking, which would wake it on its own
     // words.
     let report = seat.as_ref().filter(|s| !(q.for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
-        crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
+        crate::cycle::Seats::say(&crate::cycle::Fleet, store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
 
     if wait.on {
@@ -915,7 +915,7 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     let (text, choice) = match chosen {
         // A set is answered per question, below; its words are its own.
         _ if a_set => (String::new(), None),
-        false => match crate::cmd_agent::prose(args, 1) {
+        false => match crate::prose::prose(args, 1) {
             Ok(t) => (t, None),
             Err(code) => return code,
         },
@@ -927,7 +927,7 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
             let typed = args.text(1);
             let typed = match typed.trim().is_empty() {
                 true => String::new(),
-                false => match crate::cmd_agent::typed_message(&typed) {
+                false => match crate::prose::typed_message(&typed) {
                     Ok(t) => t,
                     Err(code) => return code,
                 },
@@ -1199,7 +1199,7 @@ fn cancel_as(store: &Store, args: &Args, caller: &Answerer) -> i32 {
     let why = args.text(1);
     let why = match why.trim().is_empty() {
         true => CANCELLED.to_string(),
-        false => match crate::cmd_agent::typed_message(&why) {
+        false => match crate::prose::typed_message(&why) {
             Ok(t) => format!("{CANCELLED}: {}", t.trim()),
             Err(code) => return code,
         },
@@ -1659,7 +1659,7 @@ fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
         id = closed.question.id,
         answer = closed.question.via.last().map(|h| h.note.as_str()).unwrap_or_default(),
     );
-    let r = crate::wake::say(store, &seat.scope, &text, Some(&closed.question.id));
+    let r = crate::cycle::Seats::say(&crate::cycle::Fleet, store, &seat.scope, &text, Some(&closed.question.id));
     if !args.json() {
         println!("  {}", r.said(&format!("the {} seat", r.scope), &Paint::new()));
     }
@@ -1926,7 +1926,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // an answer addressed to a compound-hosted agent was filed as "no backend
     // socket" and never delivered, on a machine where the agent was running.
     let backends = crate::place::local_backends();
-    let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
+    let Some((place, found)) = crate::sent::locate_seat(&backends, &pane) else {
         receipt(false, false, &format!("nothing answers for {pane} any more — the answer is written"));
         return 0;
     };
@@ -1958,24 +1958,23 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     if !found.state.will_take_a_prompt() {
         let why = match crate::waiting::on_screen(found.state) {
             Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
-            None => crate::wake::held_because(found.state).unwrap_or("not taking a prompt").to_string(),
+            None => crate::waiting::held_because(found.state).unwrap_or("not taking a prompt").to_string(),
         };
         return hold(store, closed, &pane, &why, &receipt);
     }
 
     let text = wire(closed);
-    let how = crate::agent_commands::of(&found.agent.kind);
-    let sent = crate::cmd_agent::Sent::new(&pane, &asker(closed), &pane, &pane, &text, args);
+    let sent = crate::sent::Sent::new(&pane, &asker(closed), &pane, &pane, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
-            return crate::cmd_agent::twice(&sent, ago, &p);
+            return crate::sent::twice(&sent, ago, &p);
         }
     }
-    let out = how.tell(place.as_ref(), &crate::place::Seat::new(&pane), &text);
+    let out = crate::cycle::Seats::tell_as(&crate::cycle::Fleet, &found.agent.kind, place.as_ref(), &crate::place::Seat::new(&pane), &text);
     // The census row said idle and the backend said busy: the turn started in
     // between. The same hold, for the same reason, rather than a refusal.
     if let Err(crate::place::Refusal::NotReady(state)) = out {
-        let why = crate::wake::held_because(state).unwrap_or("not taking a prompt");
+        let why = crate::waiting::held_because(state).unwrap_or("not taking a prompt");
         return hold(store, closed, &pane, why, &receipt);
     }
     // `delivered` owns the honest-reporting rule and the `agent-told` event, so
@@ -1983,7 +1982,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // on `NotTaken` is right for `wsp tell`, where the sentence is the only
     // thing that happened; here the record is already written, so a rescue is
     // worth printing and is not a failure of the verb.
-    match crate::cmd_agent::delivered(store, out, &sent) {
+    match crate::sent::delivered(store, out, &sent) {
         0 => 0,
         _ => {
             eprintln!("     the answer is on the record whatever the composer does");
@@ -2019,10 +2018,10 @@ fn deliver_as_order(
 ) -> Option<i32> {
     let p = Paint::new();
     let text = wire(closed);
-    let sent = crate::cmd_agent::Sent::new(pane, &asker(closed), pane, pane, &text, args);
+    let sent = crate::sent::Sent::new(pane, &asker(closed), pane, pane, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
-            return Some(crate::cmd_agent::twice(&sent, ago, &p));
+            return Some(crate::sent::twice(&sent, ago, &p));
         }
     }
     let seat = wsp_store_contract::SeatId(pane.to_string());
@@ -2038,7 +2037,7 @@ fn deliver_as_order(
     if !state.will_take_a_prompt() {
         let why = match crate::waiting::on_screen(state) {
             Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
-            None => crate::wake::held_because(state).unwrap_or("not taking a prompt").to_string(),
+            None => crate::waiting::held_because(state).unwrap_or("not taking a prompt").to_string(),
         };
         receipt(false, true, &format!("{pane}: {why} — sent as order {}, typed there by the daemon when it is next idle", id.0));
         return Some(0);
@@ -2054,7 +2053,7 @@ fn deliver_as_order(
     if let Some(o) = now.as_ref() {
         settle_one(store, &closed.reply.id, pane, o);
     }
-    Some(match crate::cmd_agent::delivered(store, outcome, &sent) {
+    Some(match crate::sent::delivered(store, outcome, &sent) {
         0 => 0,
         _ => {
             eprintln!("     the answer is on the record whatever the composer does");
@@ -2179,12 +2178,11 @@ pub fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Vec<Strin
 /// pane or nothing in it is an agent, which a later tick asks again.
 pub fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
     let backends = crate::place::local_backends();
-    let (place, found) = crate::cmd_agent::locate_seat(&backends, pane)?;
+    let (place, found) = crate::sent::locate_seat(&backends, pane)?;
     if found.agent.kind.trim().is_empty() {
         return None;
     }
-    let how = crate::agent_commands::of(&found.agent.kind);
-    Some(how.tell(place.as_ref(), &crate::place::Seat::new(pane), text))
+    Some(crate::cycle::Seats::tell_as(&crate::cycle::Fleet, &found.agent.kind, place.as_ref(), &crate::place::Seat::new(pane), text))
 }
 
 /// How long a held answer is asked about again after a delivery that did not
@@ -2333,7 +2331,7 @@ fn asker(closed: &message::Closed) -> String {
 fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s: &crate::governors::Seat) -> String {
     match crate::governors::user_of_primary(&s.scope) {
         Some(user) => format!("asked of {user}'s primary"),
-        None => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(governors, s)),
+        None => format!("asked of the {} governor · {}", s.scope, crate::governors::whereabouts(governors, s)),
     }
 }
 
@@ -2348,7 +2346,7 @@ fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s
 /// is a property of its shape.
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
     let governors = store.governors();
-    match crate::cmd_govern::answering_seat(store, task) {
+    match crate::cycle::Seats::answering_seat(&crate::cycle::Fleet, store, task) {
         Some(s) => asked_of(&governors, &s),
         None => "asked of every panel — no governor above it".into(),
     }
@@ -2675,7 +2673,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 /// Tell a governor's seat a question was filed for it (`wsp submit`'s asks), kept
 /// here because this module already reaches the seat layer and `cmd_submit` may not.
 pub fn say_to_governor(store: &Store, scope: &str, q: &Message) {
-    let _ = crate::wake::say(store, scope, &for_a_governor(q), Some(&q.id));
+    let _ = crate::cycle::Seats::say(&crate::cycle::Fleet, store, scope, &for_a_governor(q), Some(&q.id));
 }
 
 // ---------------------------------------------------------------- tells through the hub (wsp-470)

@@ -389,7 +389,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
     // Where it stands (`wsp-263`): `-p`, or nothing stated and the seat that
     // made it remembered, since at `new` there are no members to ask.
     let index = crate::resolve::Index::new(store.projects());
-    let (project, made_in) = match crate::cmd_agent::named_project(args, &index) {
+    let (project, made_in) = match crate::resolve::named_project(args, &index) {
         Some(Ok(p)) => (p, None),
         Some(Err(said)) => {
             eprintln!("{said}");
@@ -2450,7 +2450,7 @@ pub fn member(store: &Store, args: &Args) -> i32 {
 /// not been read yet.
 fn member_started(store: &Store, id: &str) -> Option<String> {
     let t = store.find_task(id)?;
-    let claim = store.claims().get(id).map(crate::cmd_agent::claim_where);
+    let claim = store.claims().get(id).map(crate::claims::claim_where);
     match (t.status(), claim) {
         (crate::model::Status::Todo, None) => None,
         (s, None) => Some(s.as_str().to_string()),
@@ -4491,7 +4491,7 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing], holds: &BTreeMa
             // after the claim when the work was sitting unlanded (`wsp-142`).
             let why = match s.settlement.settled() {
                 true => s.note(),
-                false => crate::cmd_agent::claim_where(c),
+                false => crate::claims::claim_where(c),
             };
             waiting.push((s.clone(), why));
         } else if let Some(on) = holds.get(&s.id) {
@@ -5666,7 +5666,7 @@ enum SeatOn {
 /// somewhere — this must agree with it or the line would promise a seat that
 /// no hand arrives at.
 fn seat_on(store: &Store, w: &Worklist) -> SeatOn {
-    let slot = crate::cmd_govern::slots(&store.governors()).into_iter().find(|s| s.scope == w.id);
+    let slot = crate::governors::slots(&store.governors()).into_iter().find(|s| s.scope == w.id);
     match slot {
         Some(s) if s.filled() => SeatOn::Held,
         Some(s) if s.elsewhere() => SeatOn::Elsewhere(s.host),
@@ -7683,7 +7683,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
 /// window to respect. The next escalation reads the new one.
 fn rehome(store: &Store, args: &Args, w: Worklist) -> i32 {
     let index = crate::resolve::Index::new(store.projects());
-    let project = match crate::cmd_agent::named_project(args, &index) {
+    let project = match crate::resolve::named_project(args, &index) {
         Some(Ok(p)) => p,
         Some(Err(said)) => {
             eprintln!("{said}");

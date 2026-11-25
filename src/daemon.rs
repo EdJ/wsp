@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::attention;
+use crate::cmd_watch;
 use crate::store::Store;
 use crate::tunnel::Supervisor;
 
@@ -629,7 +630,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             // the tasks once per seat, and a `stat` of every task per reading
             // was most of what an idle pass cost. See `Store::steady`.
             let emits = store.steady(|| {
-                let mut source = attention::machine_source(store);
+                let mut source = cmd_watch::machine_source(store);
                 let emits = attention::tick(store, &mut pass, &mut source, now);
                 // The third audience, and the one that spends tokens. `tick`
                 // put every edge on the event log for a hook to read at no
@@ -1673,7 +1674,7 @@ mod idle_tick {
             let a = p();
             let mut pass = attention::Pass::new();
             store.steady(|| {
-                let mut source = attention::machine_source(store);
+                let mut source = cmd_watch::machine_source(store);
                 let now = crate::util::epoch_secs();
                 let emits = attention::tick(store, &mut pass, &mut source, now);
                 crate::wake::wake(store, &emits, now);

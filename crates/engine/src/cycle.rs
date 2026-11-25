@@ -364,8 +364,8 @@ pub trait Seats {
     /// Say `text` to `scope`'s seat, through its spool — `wake::say`: held
     /// until the seat can hear it, and `record` the message it carries. What the
     /// spool says of it. Says nothing by default, for [`Seats::rotate`]'s reason.
-    fn say(&self, _store: &Store, _scope: &str, _text: &str, _record: Option<&str>) -> Said {
-        Said::default()
+    fn say(&self, _store: &Store, _scope: &str, _text: &str, _record: Option<&str>) -> Report {
+        Report::default()
     }
 
     /// The messages `scope`'s spool still holds, as `(seq, at, text)` —
@@ -389,15 +389,122 @@ pub trait Seats {
     fn scopes_owed(&self, _store: &Store) -> Vec<(String, usize)> {
         Vec::new()
     }
+
+    // The row, list and message verbs' side (wsp-438): what `cmd_task`,
+    // `cmd_worklist`, `cmd_message` and `leg_seat` asked of the seats directly.
+    // Each default is "a fake has no seats": nothing read, nothing done.
+
+    /// The seat that answers for `task` — `cmd_govern::answering_seat`, the
+    /// whole [`crate::governors::Seat`] where [`Seats::answering_scope`] gives
+    /// its scope. `None` by default.
+    fn answering_seat(&self, _store: &Store, _task: &crate::model::Task) -> Option<crate::governors::Seat> {
+        None
+    }
+
+    /// The project the caller is standing in — `cmd_agent::current_project`:
+    /// `-p`, else the standing-in chain, which reads the seat the caller is in.
+    /// `Err` is the exit code of a `-p` that names nothing, already said.
+    /// Nowhere by default: a fake has no seat to stand in.
+    fn current_project(&self, _store: &Store, _args: &Args, _index: &crate::resolve::Index) -> Result<Option<String>, i32> {
+        Ok(None)
+    }
+
+    /// End the claim on `task` and leave its trace — `cmd_agent::hand_off`,
+    /// which reads what served the attempt off the seat's session. Does nothing
+    /// by default, for [`Seats::rotate`]'s reason.
+    fn hand_off(&self, _store: &Store, _task: &str, _to: Option<&str>, _reason: &str) {}
+
+    /// The agent kind of the session wsp last learned for `task` —
+    /// `cmd_resume::thread_for_task`'s kind. `None` by default.
+    fn thread_kind(&self, _store: &Store, _task: &str) -> Option<String> {
+        None
+    }
+
+    /// What served a leg's seat since `since`, as the clause its end line
+    /// carries — `cmd_agent::ran_in_seat`. Empty by default.
+    fn ran_in_seat(&self, _store: &Store, _seat: &str, _since: &str) -> String {
+        String::new()
+    }
+
+    /// Type `text` at `seat` on `place` the way an agent of `kind` takes it —
+    /// `agent_commands::of(kind).tell`. Refused by default, for
+    /// [`Seats::rotate`]'s reason.
+    fn tell_as(
+        &self,
+        _kind: &str,
+        _place: &dyn crate::place::Place,
+        _seat: &crate::place::Seat,
+        _text: &str,
+    ) -> crate::place::Result<crate::place::Delivery> {
+        Err(crate::place::Refusal::Failed("no seats here to type at".into()))
+    }
 }
 
-/// What a seat's spool says of a sentence [`Seats::say`] put on it: why it is
-/// still holding, in the words `--status` prints, and how many it holds — the
-/// two fields of `wake::Report` the run reads.
+/// What happened to a seat's spool, in the words a receipt prints.
+///
+/// **`wsp-146`'s answer to "where did my sentence go"**, and the reason a verb
+/// can hand a sentence over and still say something true about it. A caller
+/// that used to type at a pane and print `delivered, no turn seen` has one of
+/// three things to report and this is the type that says which.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Said {
-    pub why: String,
+pub struct Report {
+    /// The scope whose seat this was.
+    pub scope: String,
+    /// How many entries cleared, which is zero on every tick that merely held.
+    pub settled: usize,
+    /// How many this seat is still owed.
     pub held: usize,
+    /// When its text last went to the seat and no turn came of it, or `None`
+    /// if it never has been.
+    pub typed_at: Option<i64>,
+    /// Why it is still holding, in the words `--status` prints.
+    pub why: String,
+    /// Set when the sentence went to another user's primary through the hub
+    /// rather than to a seat here (`wsp-418`): whose.
+    pub routed_to: Option<String>,
+}
+
+impl Report {
+    /// Whether the seat has it now — a turn, not a send. See [`Delivery`].
+    ///
+    /// [`Delivery`]: crate::place::Delivery
+    pub fn arrived(&self) -> bool {
+        self.settled > 0
+    }
+
+    /// One line, for a caller that has to say where a sentence went.
+    ///
+    /// **Both halves are load-bearing and the second one is the brief's.** A
+    /// receipt that only says *delivered* leaves the sender unable to tell a
+    /// governor that is busy from a governor that has stopped answering, and a
+    /// receipt that only says *held* teaches an agent to stop trusting the
+    /// channel. So it names the post, says whether the seat has it or is owed
+    /// it, says why in the same words `doctor` would, and points at the drain.
+    pub fn said(&self, what: &str, p: &util::Paint) -> String {
+        if let Some(user) = &self.routed_to {
+            return match self.settled {
+                0 => format!("{} {} · {}", p.dim("→"), p.bold(&format!("{user}'s primary")), self.why),
+                _ => format!("{} sent to {} · through the hub, queued until it is told", p.dim("→"), p.bold(&format!("{user}'s primary"))),
+            };
+        }
+        if self.arrived() {
+            return format!("{} {} · the seat has it", p.dim("→"), p.bold(&self.scope));
+        }
+        let held = match self.held {
+            0 => String::new(),
+            n => format!(" · {n} still owed"),
+        };
+        let typed = match self.typed_at {
+            Some(at) => format!(" · typed {}s ago", (util::epoch_secs() - at).max(0)),
+            None => String::new(),
+        };
+        format!(
+            "{} {}{held}{typed} · {} · `wsp watch --drain` shows what is held",
+            p.dim("→"),
+            p.bold(what),
+            self.why
+        )
+    }
 }
 
 /// The real reading, over the backends on this machine — with opencode's own

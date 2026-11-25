@@ -107,7 +107,7 @@ except `base` and `testkit`, whose names are also modules of `wsp-base` and `wsp
 | `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `lease`, `sharing`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags`, `lands` |
 | `wire` | `place`, `place_compound`, `place_super`, `host`, `host_tcp`, `host_inproc`, `tunnel`, `far`, `launchd`, `systemd`, `manager`, `fake` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `job_place`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
-| `engine` | `address`, `affected`, `after`, `artefact`, `attempt`, `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `by_merge`, `check`, `classify`, `closing`, `cmd_allocate`, `cmd_hub`, `cmd_initiative`, `cmd_login`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_publish`, `cmd_submit`, `cmd_task`, `cmd_whoami`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`, `follow_up`, `history`, `hold`, `hold_close`, `hub_cache`, `hub_journal`, `hub_lease`, `hub_sync`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `liveness`, `local_trust`, `mirror`, `orders`, `outputs`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`, `pieces`, `reconcile`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `room`, `scope`, `scratch`, `size_check`, `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`, `verifier_packet`, `waiting`, `waits`, `worklist` |
+| `engine` | `address`, `affected`, `after`, `artefact`, `attempt`, `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `by_merge`, `check`, `claims`, `classify`, `closing`, `cmd_allocate`, `cmd_hub`, `cmd_initiative`, `cmd_login`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_publish`, `cmd_submit`, `cmd_task`, `cmd_whoami`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`, `follow_up`, `history`, `hold`, `hold_close`, `hub_cache`, `hub_journal`, `hub_lease`, `hub_sync`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `liveness`, `local_trust`, `mirror`, `orders`, `outputs`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`, `pieces`, `prose`, `reconcile`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `room`, `scope`, `scratch`, `sent`, `size_check`, `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`, `verifier_packet`, `waiting`, `waits`, `watch_levels`, `worklist` |
 | `seats` | `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`, `cmd_install`, `cmd_machine`, `cmd_project`, `cmd_resume`, `cmd_role`, `cmd_sandbox`, `cmd_spawn`, `cmd_stamp`, `cmd_watch`, `kind_attention`, `kind_data`, `memory`, `wake` |
 | `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `spend`, `cmd_calls`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications`, `retro`, `retro_run`, `retro_series`, `stale` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
@@ -448,6 +448,21 @@ admits by (its `Gate` reads seats through the `Seats` port already), and its one
 went with it. The rest are acts on the `Seats` port that `Fleet` implements in `cmd_spawn`: `say`, `messages_held`,
 `settle_held`, `owed_to`, `scopes_owed` (the seat's spool), `notice`, `answering_scope`, `occupant` and
 `opencode_finished_at`. Each seats module re-exports what left it, so its other callers are unchanged.
+
+**wsp-438 took the other 11 out**, with no change in behaviour, so `docs/components-upward.txt` has no line left and
+the layering test reads 0 upward edges. Moved down, each re-exported from where it was: the watch's level model
+(`Kind`, `Class`, `Signal`, `EVERYONE`, `Edge`, `Ledger`, `Emit`, `Routing`, `resume`, `Source`, `Scope`) out of
+`cmd_watch` into a new `watch_levels` (engine), so `attention` reads it from its own row; `machine_source`, which
+builds the census-reading `Poll`, went up into `cmd_watch`, and the daemon hands it to `attention::tick` as the
+`&mut dyn Source` it already took. `claim_line`, `worked_line`, `claim_where`, `spawned_at`, `Pane` and
+`live_holders` into a new `claims` (engine); `prose`, `from_source`, `typed_message`, `piped_message` into a new
+`prose` (engine); `Sent`, `twice`, `delivered` and `locate_seat` into a new `sent` (engine); `say_looking` into
+`stage`; `held_because` into `waiting`; `named_project` into `resolve` (store); `room_of`, `whereabouts`, `Slot`
+and `slots` into `governors` (store); `kind_or_default` is `agent_kind`'s, called directly. `wake::Report` is now
+`cycle::Report` and is what `Seats::say` answers with, in place of wsp-437's two-field `Said`. New acts on the
+`Seats` port, which `Fleet` implements in `cmd_spawn`: `answering_seat`, `current_project` (the standing-in chain
+reads the caller's seat), `hand_off` (it reads what served the attempt off the session), `thread_kind`,
+`ran_in_seat`, and `tell_as` (the kind's own typing at a seat).
 
 **seats -> core**: 113 lines, 227 symbols.
 

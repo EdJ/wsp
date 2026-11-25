@@ -6003,9 +6003,8 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         cmd_agent::notice(store, task, text).is_some()
     }
 
-    fn say(&self, store: &Store, scope: &str, text: &str, record: Option<&str>) -> crate::cycle::Said {
-        let report = crate::wake::say(store, scope, text, record);
-        crate::cycle::Said { why: report.why, held: report.held }
+    fn say(&self, store: &Store, scope: &str, text: &str, record: Option<&str>) -> crate::cycle::Report {
+        crate::wake::say(store, scope, text, record)
     }
 
     fn messages_held(&self, store: &Store, scope: &str) -> Vec<(u64, i64, String)> {
@@ -6022,6 +6021,36 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn scopes_owed(&self, store: &Store) -> Vec<(String, usize)> {
         crate::wake::scopes_owed(store)
+    }
+
+    fn answering_seat(&self, store: &Store, task: &crate::model::Task) -> Option<crate::governors::Seat> {
+        cmd_govern::answering_seat(store, task)
+    }
+
+    fn current_project(&self, store: &Store, args: &Args, index: &crate::resolve::Index) -> Result<Option<String>, i32> {
+        cmd_agent::current_project(store, args, index)
+    }
+
+    fn hand_off(&self, store: &Store, task: &str, to: Option<&str>, reason: &str) {
+        cmd_agent::hand_off(store, task, to, reason)
+    }
+
+    fn thread_kind(&self, store: &Store, task: &str) -> Option<String> {
+        crate::cmd_resume::thread_for_task(store, task).map(|th| th.kind)
+    }
+
+    fn ran_in_seat(&self, store: &Store, seat: &str, since: &str) -> String {
+        cmd_agent::ran_in_seat(store, seat, since)
+    }
+
+    fn tell_as(
+        &self,
+        kind: &str,
+        place: &dyn crate::place::Place,
+        seat: &crate::place::Seat,
+        text: &str,
+    ) -> crate::place::Result<crate::place::Delivery> {
+        crate::agent_commands::of(kind).tell(place, seat, text)
     }
 
     fn end_when_idle(&self, store: &Store, seat: &str) -> Result<(), String> {

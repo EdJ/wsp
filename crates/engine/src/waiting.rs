@@ -1358,6 +1358,36 @@ pub fn seat_wait(f: &Facts) -> Option<SeatWait> {
     })
 }
 
+/// Why a pane would not take a wake, in the words `--status` and `doctor`
+/// print.
+///
+/// **One sentence per state rather than one for all of them**, because they
+/// want four different repairs and a reader who cannot tell them apart goes
+/// looking in the wrong place: mid-turn clears itself and is not a fault at
+/// all, `Blocked` needs a person at a keyboard, `Starting` clears itself in
+/// seconds, and `Unknown` means the seat could not be read — which is a fault
+/// about the *reporter* and not about the seat.
+///
+/// No wildcard, for [`crate::cmd_watch::Line::disposition`]'s reason: a state
+/// added later has to come past here and say what a wake does about it, rather
+/// than inheriting a sentence that was written before it existed.
+pub fn held_because(state: crate::place::State) -> Option<&'static str> {
+    use crate::place::State;
+    match state {
+        // The one state a wake may be typed into, and it is
+        // [`crate::place::State::will_take_a_prompt`]'s whole definition. This
+        // function is the only thing [`Tell::deliver`] asks, so a test that
+        // enumerates it is reading the gate rather than a copy of it.
+        State::Idle => None,
+        State::Working => Some("the seat is mid-turn"),
+        State::Blocked => Some("the seat is stopped on a prompt only a person can answer"),
+        State::Starting => Some("the agent is still coming up"),
+        State::Empty | State::Gone => Some("the seat is empty"),
+        State::Unreachable => Some("the seat is unreachable — held until the link returns"),
+        State::Unknown => Some("wsp cannot say what the seat is doing"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

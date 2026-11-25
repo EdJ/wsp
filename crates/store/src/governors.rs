@@ -772,6 +772,89 @@ pub fn seat_kind(governors: &BTreeMap<String, Value>, scope: &str) -> String {
     crate::agent_kind::kind_or_default(&last_seat(governors, scope).map(|s| s.kind).unwrap_or_default())
 }
 
+/// The room a scope's seat is filed under, read off the governor record
+/// itself rather than off a parsed [`Seat`] — the field that carried it,
+/// `Seat::workspace`, is gone (`compound-096`); the record's own `workspace`
+/// key is not and is what every caller here reads instead, the way
+/// [`governs`] already did. Mirrors [`host_of`]: a live record answers first,
+/// a vacated one's `last` second, and a scope with neither answers empty.
+pub fn room_of(governors: &BTreeMap<String, Value>, scope: &str) -> String {
+    let Some(rec) = governors.get(scope) else { return String::new() };
+    match str_at(rec, "workspace") {
+        w if !w.is_empty() => w,
+        _ => rec.get("last").map(|l| str_at(l, "workspace")).unwrap_or_default(),
+    }
+}
+
+/// Where a seat [`seat_for`] reached is, for a receipt: its room, or that wsp
+/// is filling it and what is said to it waits there ([`Seat::vacant`]).
+pub fn whereabouts(governors: &BTreeMap<String, Value>, seat: &Seat) -> String {
+    match seat.vacant {
+        true => "nobody in it yet — wsp is seating one, and it waits there".to_string(),
+        false => room_of(governors, &seat.scope),
+    }
+}
+
+/// A slot on a project or a worklist: the position, and whoever is in it now.
+///
+/// [`Seat`] is the occupancy and this is the post. The difference is the whole
+/// of "it outlives its occupant": a slot whose agent has gone is a slot with
+/// `occupant: None`, which still has a project, a place in the tree and a row
+/// you can stand on — where before, the record was deleted and the position
+/// went with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    /// The scope the post is on — see [`Seat::scope`].
+    pub scope: String,
+    /// Filled, on this machine. `None` covers both an empty slot and one held
+    /// from another host, which are the same thing from here: nobody you can
+    /// reach. `host` below says which.
+    pub occupant: Option<Seat>,
+    /// The machine the slot was last filled from, or empty for a vacant one.
+    /// Carried so a slot held on the laptop does not draw here as empty, which
+    /// would invite two agents into one position.
+    pub host: String,
+    /// When the slot was last filled, or vacated. One field, because what a
+    /// reader wants is "and how long has *that* been true".
+    pub since: String,
+}
+
+impl Slot {
+    /// Somebody is in it, here.
+    pub fn filled(&self) -> bool {
+        self.occupant.is_some()
+    }
+
+    /// Held from another machine — not ours to draw as empty and not ours to
+    /// speak to.
+    pub fn elsewhere(&self) -> bool {
+        self.occupant.is_none() && !self.host.is_empty() && self.host != util::hostname()
+    }
+}
+
+/// Every slot that exists, in project order — vacant ones included.
+///
+/// The display read, where [`seat_for`] is the routing one. Routing wants the
+/// nearest seat that can actually answer; a tree wants every position there is,
+/// because a post nobody is standing in is exactly the thing a person has to be
+/// able to see in order to fill it.
+pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
+    governors
+        .iter()
+        .map(|(scope, rec)| Slot {
+            occupant: seat_of(scope, rec),
+            host: rec.get("host").and_then(Value::as_str).unwrap_or_default().to_string(),
+            since: rec
+                .get("since")
+                .or_else(|| rec.get("vacated"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            scope: scope.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod user_primary_tests {
     use super::*;

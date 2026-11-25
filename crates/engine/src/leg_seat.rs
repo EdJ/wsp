@@ -123,7 +123,7 @@ pub fn attach(store: &Store, id: &str, name: &str, seat: &str, stand: &Standing)
         let why = leg.why.as_deref().map(|w| format!(" · why {}", crate::util::fold(w))).unwrap_or_default();
         t.log(&format!(
             "leg {name} started by pane {seat}{}{why}",
-            crate::cmd_agent::spawned_at(leg.policy.model.as_deref(), leg.policy.effort.as_deref())
+            crate::claims::spawned_at(leg.policy.model.as_deref(), leg.policy.effort.as_deref())
         ));
         legs::write(&mut t, &new);
         if store.save_task(&t).is_err() {
@@ -241,7 +241,7 @@ fn ended_line_at(store: &Store, leg: &Leg, pane: &str, extra: &str, at: &str) ->
     let started = leg.started.clone().unwrap_or_default();
     let secs = if started.is_empty() { 0 } else { (util::epoch_of(at) - util::epoch_of(&started)).max(0) };
     let after = if secs > 0 { format!(" after {}", util::duration_human(secs)) } else { String::new() };
-    let ran = if started.is_empty() { String::new() } else { crate::cmd_agent::ran_in_seat(store, pane, &started) };
+    let ran = if started.is_empty() { String::new() } else { crate::cycle::Seats::ran_in_seat(&crate::cycle::Fleet, store, pane, &started) };
     format!("leg {} ended{after}{extra}{ran}", leg.name)
 }
 

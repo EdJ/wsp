@@ -2,7 +2,8 @@
 
 use serde_json::{json, Value};
 
-use crate::cmd_agent::{claim_line, current_project, worked_line};
+use crate::claims::{claim_line, worked_line};
+use crate::cycle::Seats;
 use crate::message::{self, Ask, Message, Shape};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
@@ -138,7 +139,7 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         // follow-up is not part of its origin and may belong elsewhere.
         o.project.clone()
     } else {
-        match current_project(store, args, &index) {
+        match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -333,7 +334,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     let scope = if args.has("all") && !args.has("project") {
         None
     } else {
-        match current_project(store, args, &index) {
+        match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -443,7 +444,7 @@ pub fn find(store: &Store, args: &Args) -> i32 {
     let scope = if args.has("all") && !args.has("project") {
         None
     } else {
-        match current_project(store, args, &index) {
+        match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -1539,7 +1540,7 @@ fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &d
         for pane in store.panes_for_task(&t.id) {
             store.clear_binding(&pane);
         }
-        crate::cmd_agent::hand_off(store, &t.id, None, "done");
+        Seats::hand_off(&crate::cycle::Fleet, store, &t.id, None, "done");
     }
     let id = args.rest.first().and_then(|needle| store.find_task(needle)).map(|t| t.id);
     let code = mutate(store, args, "done", |t| {
@@ -1726,9 +1727,9 @@ fn reseat(store: &Store, args: &Args, run: Option<String>) {
 fn ran_with(store: &Store, t: &Task) -> Option<Vec<String>> {
     let log = t.section("Log").unwrap_or_default();
     let claim = log.lines().filter(|l| l.contains("claimed by pane ")).last()?;
-    let kind = crate::cmd_resume::thread_for_task(store, &t.id).map(|th| th.kind).unwrap_or_default();
+    let kind = Seats::thread_kind(&crate::cycle::Fleet, store, &t.id).unwrap_or_default();
     let mut argv = vec!["spawn".to_string(), t.id.clone(), "--agent".to_string()];
-    argv.extend(["--kind".to_string(), crate::cmd_spawn::kind_or_default(&kind)]);
+    argv.extend(["--kind".to_string(), crate::agent_kind::kind_or_default(&kind)]);
     let tier = claim.split(" · spawned at ").nth(1).and_then(|r| r.split(" · ").next()).map(str::trim);
     if let Some((model, effort)) = tier.and_then(|s| s.rsplit_once('/')) {
         for (flag, v) in [("--model", model), ("--effort", effort)] {
@@ -3089,7 +3090,7 @@ pub fn pick(b: &Backlog, scope_ids: Option<&[String]>) -> Pick {
     // agents set going at once would otherwise all be handed the same task and
     // all three bounce.
     let taken = |t: &Task| {
-        !crate::cmd_agent::live_holders(&b.bindings, &[], &t.id, b.me.as_deref()).is_empty()
+        !crate::claims::live_holders(&b.bindings, &[], &t.id, b.me.as_deref()).is_empty()
     };
 
     let mut candidates: Vec<Task> = b
@@ -3137,7 +3138,7 @@ pub fn nothing_because(p: &Pick) -> String {
 
 pub fn next(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
-    let scope = match current_project(store, args, &index) {
+    let scope = match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -3151,7 +3152,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         // than a moment. This pane stays like this until somebody hands it
         // something, so of the two labels `say_looking` writes, this is the one
         // that is still on screen when a person comes looking.
-        crate::cmd_agent::say_looking(store, scope.as_deref(), false);
+        crate::stage::say_looking(store, scope.as_deref(), false);
 
         if args.json() {
             println!("null");
@@ -3167,7 +3168,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
 
     // Named, but not yet taken up: the claim is the agent's next move and the
     // reading of the task comes in between. The claim renames over this.
-    crate::cmd_agent::say_looking(store, scope.as_deref(), true);
+    crate::stage::say_looking(store, scope.as_deref(), true);
 
     if args.json() {
         println!("{}", t.json());

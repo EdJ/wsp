@@ -129,6 +129,8 @@
 use crate::agent_commands;
 use crate::cmd_govern;
 use crate::cycle::Seats;
+pub use crate::cycle::Report;
+pub use crate::waiting::held_because;
 use crate::cmd_watch::{Emit, Line, Sink, Spec, Spool, Spooled, Stream, EVERYONE};
 use crate::place::Seat as Pane;
 use crate::refusals::{accepted, refuse};
@@ -468,74 +470,11 @@ pub fn fold_what_was_typed(store: &Store, scope: &str) -> usize {
     n
 }
 
-/// What happened to a seat's spool, in the words a receipt prints.
-///
-/// **`wsp-146`'s answer to "where did my sentence go"**, and the reason a verb
-/// can hand a sentence over and still say something true about it. A caller
-/// that used to type at a pane and print `delivered, no turn seen` has one of
-/// three things to report and this is the type that says which.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Report {
-    /// The scope whose seat this was.
-    pub scope: String,
-    /// How many entries cleared, which is zero on every tick that merely held.
-    pub settled: usize,
-    /// How many this seat is still owed.
-    pub held: usize,
-    /// When its text last went to the seat and no turn came of it, or `None`
-    /// if it never has been.
-    pub typed_at: Option<i64>,
-    /// Why it is still holding, in the words `--status` prints.
-    pub why: String,
-    /// Set when the sentence went to another user's primary through the hub
-    /// rather than to a seat here (`wsp-418`): whose.
-    pub routed_to: Option<String>,
-}
-
+/// [`Report`] is in [`crate::cycle`] since wsp-438, the type the port's
+/// [`Seats::say`] answers with; the spool's at-rest reading stays here.
 impl Report {
     fn at_rest() -> Report {
         Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET.into(), routed_to: None }
-    }
-
-    /// Whether the seat has it now — a turn, not a send. See [`Delivery`].
-    ///
-    /// [`Delivery`]: crate::place::Delivery
-    pub fn arrived(&self) -> bool {
-        self.settled > 0
-    }
-
-    /// One line, for a caller that has to say where a sentence went.
-    ///
-    /// **Both halves are load-bearing and the second one is the brief's.** A
-    /// receipt that only says *delivered* leaves the sender unable to tell a
-    /// governor that is busy from a governor that has stopped answering, and a
-    /// receipt that only says *held* teaches an agent to stop trusting the
-    /// channel. So it names the post, says whether the seat has it or is owed
-    /// it, says why in the same words `doctor` would, and points at the drain.
-    pub fn said(&self, what: &str, p: &util::Paint) -> String {
-        if let Some(user) = &self.routed_to {
-            return match self.settled {
-                0 => format!("{} {} · {}", p.dim("→"), p.bold(&format!("{user}'s primary")), self.why),
-                _ => format!("{} sent to {} · through the hub, queued until it is told", p.dim("→"), p.bold(&format!("{user}'s primary"))),
-            };
-        }
-        if self.arrived() {
-            return format!("{} {} · the seat has it", p.dim("→"), p.bold(&self.scope));
-        }
-        let held = match self.held {
-            0 => String::new(),
-            n => format!(" · {n} still owed"),
-        };
-        let typed = match self.typed_at {
-            Some(at) => format!(" · typed {}s ago", (util::epoch_secs() - at).max(0)),
-            None => String::new(),
-        };
-        format!(
-            "{} {}{held}{typed} · {} · `wsp watch --drain` shows what is held",
-            p.dim("→"),
-            p.bold(what),
-            self.why
-        )
     }
 }
 
@@ -1063,36 +1002,6 @@ const NOT_FOUND: &str = "somebody is in the seat and wsp could not find them to 
 /// not read the sentence and the spool still owes it. The type stays owed, the
 /// stamp says when it was last typed, and the retry waits [`RETYPED`].
 const UNREAD: &str = "typed at the seat — no turn seen yet, and still owed";
-
-/// Why a pane would not take a wake, in the words `--status` and `doctor`
-/// print.
-///
-/// **One sentence per state rather than one for all of them**, because they
-/// want four different repairs and a reader who cannot tell them apart goes
-/// looking in the wrong place: mid-turn clears itself and is not a fault at
-/// all, `Blocked` needs a person at a keyboard, `Starting` clears itself in
-/// seconds, and `Unknown` means the seat could not be read — which is a fault
-/// about the *reporter* and not about the seat.
-///
-/// No wildcard, for [`crate::cmd_watch::Line::disposition`]'s reason: a state
-/// added later has to come past here and say what a wake does about it, rather
-/// than inheriting a sentence that was written before it existed.
-pub fn held_because(state: crate::place::State) -> Option<&'static str> {
-    use crate::place::State;
-    match state {
-        // The one state a wake may be typed into, and it is
-        // [`crate::place::State::will_take_a_prompt`]'s whole definition. This
-        // function is the only thing [`Tell::deliver`] asks, so a test that
-        // enumerates it is reading the gate rather than a copy of it.
-        State::Idle => None,
-        State::Working => Some("the seat is mid-turn"),
-        State::Blocked => Some("the seat is stopped on a prompt only a person can answer"),
-        State::Starting => Some("the agent is still coming up"),
-        State::Empty | State::Gone => Some("the seat is empty"),
-        State::Unreachable => Some("the seat is unreachable — held until the link returns"),
-        State::Unknown => Some("wsp cannot say what the seat is doing"),
-    }
-}
 
 /// Whether anybody is in this scope's seat, said as `--status` prints it —
 /// `None` where somebody is, and the sentence a wake is held under where nobody

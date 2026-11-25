@@ -1,14 +1,3 @@
 # Upward uses the code has today: `from -> to: symbols`, one module pair per line (wsp-400).
 # The layering test (tests/layering.rs) fails on an upward use not here and on a line the code no longer has.
 # This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
-attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
-cmd_message -> agent_commands: of  # engine -> seats
-cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
-cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
-cmd_message -> wake: held_because, say  # engine -> seats
-cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, worked_line  # engine -> seats
-cmd_task -> cmd_resume: thread_for_task  # engine -> seats
-cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
-cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
-cmd_worklist -> cmd_govern: slots  # engine -> seats
-leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
