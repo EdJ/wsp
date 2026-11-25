@@ -854,7 +854,7 @@ fn ask(picker: &mut Picker, when: &str) -> Option<Step> {
         return None;
     }
     let p = Paint::new();
-    crate::panel::stty(&["raw", "-echo", "min", "1", "time", "0"]);
+    crate::base::term::stty(&["raw", "-echo", "min", "1", "time", "0"]);
     let mut keys = Keys::new();
     let mut pending: Vec<Key> = Vec::new();
     let mut buf = [0u8; 64];
@@ -879,7 +879,7 @@ fn ask(picker: &mut Picker, when: &str) -> Option<Step> {
             break step;
         }
     };
-    crate::panel::stty(&["sane"]);
+    crate::base::term::stty(&["sane"]);
     let _ = std::io::stderr().write_all(b"\x1b[H\x1b[2J");
     Some(step)
 }

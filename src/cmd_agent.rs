@@ -348,7 +348,7 @@ fn said_full(task: &Task, said: &str) -> Option<String> {
 /// somebody actually typed.
 fn plain_full(said: &str) -> Option<String> {
     match said.trim() {
-        "" | crate::panel::PANEL_LABEL | crate::panel::VIEW_LABEL | crate::panel::FULL_LABEL => {
+        "" | crate::base::labels::PANEL_LABEL | crate::base::labels::VIEW_LABEL | crate::base::labels::FULL_LABEL => {
             None
         }
         said => Some(said.to_string()),
@@ -1070,14 +1070,14 @@ fn addressed(store: &Store, task: &Task) -> String {
 /// The panel's mark, borrowed for the receipt so the two agree about what a
 /// raised hand looks like.
 fn glyph_flag() -> &'static str {
-    crate::panel::glyph::FLAG
+    crate::base::glyph::FLAG
 }
 
 /// And the panel's mark for a governor's slot, borrowed for the same reason.
 /// The words come from [`cmd_govern::governor_of`], which carries no mark of its
 /// own — a label goes to a host, which has no column to put one in.
 fn glyph_seat() -> &'static str {
-    crate::panel::glyph::SEAT
+    crate::base::glyph::SEAT
 }
 
 /// `wsp flag` with nothing to raise: what is already up.
@@ -4171,7 +4171,7 @@ pub(crate) struct Wip {
     /// [`sentence`]. A seat no host draws has no label to read it off,
     /// so this is where a compound seat's status line is seen at all.
     pub said: std::collections::BTreeMap<String, serde_json::Value>,
-    /// The machine's daemon, when it has none — [`crate::daemon::loud`]'s one
+    /// The machine's daemon, when it has none — [`crate::liveness::loud`]'s one
     /// sentence, read once here because it costs a `ps` and `wip` is asked by a
     /// person looking for work, not by a loop.
     ///
@@ -4618,7 +4618,7 @@ impl Wip {
         Wip::gathered(store, Gathering::files(store, agents, since), |agents, bindings| Probed {
             shells: idle_members_shells(agents, bindings),
             memory: crate::memory::read(&store.state, agents, bindings, || crate::host::Host::seat_memory(&crate::host::LOCAL)),
-            daemon: crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), heard),
+            daemon: crate::liveness::dead(&store.state, crate::liveness::running(&store.state).as_deref(), heard),
             disk: crate::disk::loud(store),
             load: crate::throttle::loud(store),
             throttle: Some(crate::throttle::status_line(store)),
@@ -6112,7 +6112,7 @@ pub fn overlap(store: &Store, args: &Args) -> i32 {
             // A shell is marked rather than described: nobody is driving it,
             // but a person at one can overwrite a file as thoroughly as an
             // agent can, and the panel already means this by `▫`.
-            p.dim(if s.agent { " " } else { crate::panel::glyph::SHELL }),
+            p.dim(if s.agent { " " } else { crate::base::glyph::SHELL }),
             p.dim(&util::pad(&s.pane, 7)),
             name,
             p.dim(&util::pad(s.relation.as_str(), 13)),
@@ -6249,18 +6249,18 @@ pub(crate) fn peek_target(
         // The common case, and the reason there is a default at all: "what
         // does the sidebar look like right now".
         "" | "panel" => named(
-            mine(crate::panel::PANEL_LABEL),
+            mine(crate::base::labels::PANEL_LABEL),
             "the panel",
             "no panel in this workspace — run `wsp panel` in a pane",
         ),
         "view" | "detail" => named(
-            mine(crate::panel::VIEW_LABEL),
+            mine(crate::base::labels::VIEW_LABEL),
             "the view",
             "no view pane open — `↵` on a row in the panel opens one",
         ),
-        "board" | "kanban" => named(mine(crate::panel::BOARD_LABEL), "the board", NOTHING_HOLDS),
+        "board" | "kanban" => named(mine(crate::base::labels::BOARD_LABEL), "the board", NOTHING_HOLDS),
         "full" | "fullscreen" => {
-            named(mine(crate::panel::FULL_LABEL), "the whole tree", NOTHING_HOLDS)
+            named(mine(crate::base::labels::FULL_LABEL), "the whole tree", NOTHING_HOLDS)
         }
         "me" => named(me.map(str::to_string), "this pane", NOTHING_HOLDS),
         // A pane id, given as a host writes them.
@@ -7170,17 +7170,17 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
     // words as `wip`, a brief's seat line and `wsp watch --status` say it —
     // through `a_backend_answered`, the one gate all four ask. A gate that is
     // asked two ways is a gate that is really two gates.
-    crate::daemon::health(
+    crate::liveness::health(
         store.daemon_holder().map(|(pid, _)| pid),
-        crate::daemon::running(&store.state).as_deref(),
-        crate::daemon::a_backend_answered(),
+        crate::liveness::running(&store.state).as_deref(),
+        crate::liveness::a_backend_answered(),
         &mut problems,
         &mut notes,
     );
     crate::orders::health(store, &mut notes);
     crate::mirror::api_health(
         &store.state,
-        crate::daemon::running(&store.state).as_deref(),
+        crate::liveness::running(&store.state).as_deref(),
         &mut problems,
         &mut notes,
     );
@@ -8974,8 +8974,8 @@ mod tests {
 
         // And nothing here can ever be a name the panel hunts for.
         for l in [looking_label(Some("wsp"), true), looking_label(Some("wsp"), false)] {
-            assert_ne!(l, crate::panel::PANEL_LABEL);
-            assert_ne!(l, crate::panel::VIEW_LABEL);
+            assert_ne!(l, crate::base::labels::PANEL_LABEL);
+            assert_ne!(l, crate::base::labels::VIEW_LABEL);
         }
     }
 
@@ -9973,7 +9973,7 @@ mod tests {
             "said it when the machine has a daemon"
         );
 
-        w.daemon = crate::daemon::loud(Some(&[]), true);
+        w.daemon = crate::liveness::loud(Some(&[]), true);
         let text = wip_lines(&w, &Paint::new(), false).join("\n");
         assert!(text.contains("no wsp daemon"), "{text}");
         // Above the rows and above the queues: this is the state of the machine,
@@ -9990,7 +9990,7 @@ mod tests {
             wip_lines(&bare, &Paint::new(), false).join("\n").contains("no agents running"),
             "the fixture does not reach the empty branch"
         );
-        bare.daemon = crate::daemon::loud(Some(&[]), true);
+        bare.daemon = crate::liveness::loud(Some(&[]), true);
         assert!(
             wip_lines(&bare, &Paint::new(), false).join("\n").contains("no wsp daemon"),
             "an empty machine is not a machine that does not need a daemon"
@@ -11027,9 +11027,9 @@ mod tests {
     #[test]
     fn peek_prefers_the_panel_in_your_own_workspace_and_takes_any_other() {
         let panes = vec![
-            labelled("w1:p9", "w1", crate::panel::PANEL_LABEL),
-            labelled("w2:p9", "w2", crate::panel::PANEL_LABEL),
-            labelled("w2:p8", "w2", crate::panel::VIEW_LABEL),
+            labelled("w1:p9", "w1", crate::base::labels::PANEL_LABEL),
+            labelled("w2:p9", "w2", crate::base::labels::PANEL_LABEL),
+            labelled("w2:p8", "w2", crate::base::labels::VIEW_LABEL),
         ];
         assert_eq!(at(peek_target(&panes, Some("w2"), None, "", none_seated, no_task)).0, "w2:p9");
         assert_eq!(at(peek_target(&panes, Some("w1"), None, "panel", none_seated, no_task)).0, "w1:p9");

@@ -4,19 +4,13 @@
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
 attention -> wake: wake  # engine -> seats
 cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
-cmd_agent -> daemon: a_backend_answered, dead, health, running  # seats -> top
-cmd_agent -> panel: BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL, glyph  # seats -> surface
-cmd_brief -> daemon: a_backend_answered, dead, running  # seats -> top
 cmd_message -> agent_commands: of  # engine -> seats
 cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
 cmd_message -> wake: held_because, say  # engine -> seats
-cmd_resume -> panel: stty  # seats -> surface
 cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, worked_line  # engine -> seats
 cmd_task -> cmd_resume: thread_for_task  # engine -> seats
 cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
-cmd_task -> panel: glyph  # engine -> surface
-cmd_watch -> daemon: a_backend_answered, loud, running  # seats -> top
 cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
 cmd_worklist -> cmd_cost: cost  # engine -> timeline
 cmd_worklist -> cmd_govern: slots  # engine -> seats

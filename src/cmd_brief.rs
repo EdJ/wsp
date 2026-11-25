@@ -349,7 +349,7 @@ pub(crate) struct Briefing {
     /// This process's directory, contracted. backend reports the shell's, which
     /// is stale the moment anyone `cd`s.
     pub cwd: Option<String>,
-    /// The machine's daemon, when it has none — [`crate::daemon::loud`]'s one
+    /// The machine's daemon, when it has none — [`crate::liveness::loud`]'s one
     /// sentence, read here because `compose` is pure over this struct and the
     /// `ps` it costs does not belong in a function that draws.
     ///
@@ -371,7 +371,7 @@ pub(crate) struct Briefing {
 /// sentence and drawn the same way. `None` when neither is true, which is almost
 /// always, and costs the machines file's read and nothing else.
 pub(crate) fn seat_faults(store: &Store) -> Option<String> {
-    let daemon = crate::daemon::dead(&store.state, crate::daemon::running(&store.state).as_deref(), crate::daemon::a_backend_answered());
+    let daemon = crate::liveness::dead(&store.state, crate::liveness::running(&store.state).as_deref(), crate::liveness::a_backend_answered());
     let far = crate::far::Silence::read(store).line;
     match (daemon, far) {
         (Some(d), Some(f)) => Some(format!("{d}  {f}")),
@@ -2150,7 +2150,7 @@ mod tests {
     /// drew it everywhere would be just as wrong as one that drew it nowhere.
     #[test]
     fn a_seat_is_told_when_nothing_on_this_machine_is_going_to_wake_it() {
-        let dead = crate::daemon::loud(Some(&[]), true).expect("a machine with a backend and no daemon");
+        let dead = crate::liveness::loud(Some(&[]), true).expect("a machine with a backend and no daemon");
 
         let mut b = briefing();
         b.daemon = Some(dead.clone());

@@ -4617,9 +4617,9 @@ fn status(store: &Store, args: &Args) -> i32 {
     // was that what used to start the daemon had gone and nothing was
     // starting it again. Silence from a watchdog is the one silence nobody investigates, so
     // the cause goes above the table rather than below it.
-    let loud = crate::daemon::loud(
-        crate::daemon::running(&store.state).as_deref(),
-        crate::daemon::a_backend_answered(),
+    let loud = crate::liveness::loud(
+        crate::liveness::running(&store.state).as_deref(),
+        crate::liveness::a_backend_answered(),
     );
     if args.json() {
         // Left as the bare array it has always been. A `daemon` key would mean

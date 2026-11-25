@@ -102,6 +102,7 @@ mod wake;
 mod cmd_worklist;
 mod cycle;
 mod daemon;
+mod liveness;
 mod deliver;
 mod fold;
 mod mirror;

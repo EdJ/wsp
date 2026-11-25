@@ -1053,7 +1053,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     if !raised.is_empty() {
         println!("\n{}", p.dim("RAISED"));
         for m in &raised {
-            println!("  {} {}", p.red(crate::panel::glyph::FLAG), p.bold(&headline(m)));
+            println!("  {} {}", p.red(crate::base::glyph::FLAG), p.bold(&headline(m)));
             let rest = m.body().trim();
             if !rest.is_empty() {
                 for l in rest.lines() {
