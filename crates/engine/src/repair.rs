@@ -225,6 +225,8 @@ pub fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     wsp_base::calls::phase("repair:done-lists-held");
     crate::cycle::hand_on_what_done_lists_held(store);
     wsp_base::calls::phase("cycle");
+    // The branch tips are read once per repository for this loop (`wsp-769`).
+    let reads = worklist::tick_reads();
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         // **A landing nobody recorded is written down before the step**, so
         // the pass the step opens on that member reads the commit. After it,
@@ -242,7 +244,9 @@ pub fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
             }
             landed_at_doing(store, &w, at, &before);
         }
-        let _ = crate::cycle::step(store, &w, seats);
+        if !crate::cycle::step(store, &w, seats).is_empty() {
+            worklist::refs_moved();
+        }
         let pos = worklist::position(store, &w, Reading::Landed);
         let Some(at) = pos.at else { continue };
         let groups = w.groups();
@@ -256,6 +260,7 @@ pub fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         skipped(store, &w, at, &pos);
         landed_for_an_idle_seat(store, seats, &w, at, &pos);
     }
+    drop(reads);
     // A reason a send-back could not type to its pane, typed once the seat reads idle.
     wsp_base::calls::phase("repair:tells");
     retry_undelivered_tells(store, seats);
@@ -2340,7 +2345,9 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
             continue;
         }
         let id = &s.id;
-        match land_for_the_run(id) {
+        let landed = land_for_the_run(id);
+        worklist::refs_moved();
+        match landed {
             Ok(()) => {
                 stamp(store, &format!("{} group {at}: {id} was not landed {} min after it was told — {cause} — so the run landed it", w.id, (now - told_at) / 60));
                 crate::cycle::tell_logged(store, w, &format!(
@@ -5598,5 +5605,39 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         let now = util::epoch_secs();
         assert!(!p.due(now), "and not again a second later");
         assert!(p.due(now + EVERY), "but after its interval");
+    }
+}#[cfg(test)]
+mod fd_tests {
+    fn fds() -> usize {
+        std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// wsp-770: a test's in-process manager ended with its state, so a suite
+    /// of them does not hold ~10 fds each until the process ends (a 256-fd
+    /// seat ran out: `unable to open database file`). Under the env lock only
+    /// tests that took [`util::isolated`] start one, so the count is exact.
+    #[test]
+    fn an_in_process_manager_ends_with_the_state_it_served() {
+        let first = wsp_base::util::isolated("fd-manager-a");
+        wsp_wire::host_inproc::reach(&first.state()).unwrap();
+        assert!(wsp_wire::host_inproc::running_count() >= 1);
+        drop(first);
+        let second = wsp_base::util::isolated("fd-manager-b");
+        wsp_wire::host_inproc::reach(&second.state()).unwrap();
+        assert_eq!(wsp_wire::host_inproc::running_count(), 1, "the first state's manager was stopped");
+    }
+
+    /// wsp-770: the orders test db closes its fds when dropped.
+    #[test]
+    fn the_orders_test_db_closes_its_fds_when_dropped() {
+        let dir = std::env::temp_dir().join(format!("wsp-fd-db-{}", std::process::id()));
+        let before = fds();
+        for _ in 0..60 {
+            drop(crate::orders::tests::db(&dir, wsp_server::Mode::default()));
+        }
+        let after = fds();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Other tests run beside this one, so allow their few; a leak is 60+.
+        assert!(after < before + 40, "fds {before} -> {after}");
     }
 }

@@ -1369,10 +1369,12 @@ impl Repos {
         if let Some(known) = self.seen.get(project) {
             return known.clone();
         }
-        let found: Vec<Trunk> = self
-            .index
-            .roots_of(project)
-            .unwrap_or_default()
+        let roots = self.index.roots_of(project).unwrap_or_default();
+        if let Some(known) = READS.with(|r| r.borrow().known_trunks(&roots)) {
+            self.seen.insert(project.to_string(), known.clone());
+            return known;
+        }
+        let found: Vec<Trunk> = roots
             .iter()
             .filter_map(|r| {
                 let repo = toplevel(&util::expand(r))?;
@@ -1381,6 +1383,7 @@ impl Repos {
                 Some(Trunk { dir, branch })
             })
             .collect();
+        READS.with(|r| r.borrow_mut().remember_trunks(roots, &found));
         self.seen.insert(project.to_string(), found.clone());
         found
     }
@@ -1432,10 +1435,7 @@ fn landing_and_tip(repos: &mut Repos, t: &Task) -> (Landing, Option<String>) {
     // which is indistinguishable from landed. The form is `ensure`'s, which is
     // what creates the branch in the first place.
     let hit = trunks.iter().find_map(|trunk| {
-        let branch = repos
-            .branches(&t.id)
-            .into_iter()
-            .find(|b| git(&trunk.dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_some())?;
+        let branch = repos.branches(&t.id).into_iter().find(|b| branch_tip(&trunk.dir, b).is_some())?;
         Some((trunk.clone(), branch))
     });
     let Some((trunk, branch)) = hit else {
@@ -1447,10 +1447,10 @@ fn landing_and_tip(repos: &mut Repos, t: &Task) -> (Landing, Option<String>) {
     // at the trunk tip and never committed to, which is every member of a group
     // between `wsp spawn` and its first commit. Neither this nor `NoBranch` is
     // a verdict; `Standing::finished` settles both against the store.
-    match cmd_checkout::ahead(&trunk.dir, &trunk.branch, &branch).len() {
+    match commits_ahead(&trunk, &branch) {
         0 => (Landing::Nothing, None),
         commits => {
-            let tip = git(&trunk.dir, &["rev-parse", &format!("refs/heads/{branch}")]);
+            let tip = branch_tip(&trunk.dir, &branch);
             // Squashed or rebased onto the remote's trunk (`wsp-350`).
             if tip.as_deref().is_some_and(|tip| crate::lands::covers(t, tip)) {
                 return (Landing::Nothing, None);
@@ -1458,6 +1458,123 @@ fn landing_and_tip(repos: &mut Repos, t: &Task) -> (Landing, Option<String>) {
             (Landing::Ahead { commits, trunk: trunk.branch }, tip)
         }
     }
+}
+
+/// What the daemon's repair tick has already read (`wsp-769`). It is on only
+/// between [`tick_reads`] and the guard's drop; outside that every question
+/// below goes to git as it always did.
+///
+/// Three things are kept, each by what could change it:
+/// * the branch tips of a repository, **once per tick** — one
+///   `for-each-ref`, which answers both "does the branch exist" and "where is
+///   its tip" for every member of every list;
+/// * how far a branch is ahead of the trunk, **by the two tips**, so a tick
+///   in which no ref moved asks git nothing more;
+/// * where a project's roots resolve to, **by the roots**.
+#[derive(Default)]
+struct Reads {
+    on: bool,
+    heads: HashMap<PathBuf, Option<HashMap<String, String>>>,
+    ahead: HashMap<(PathBuf, String, String, String, String), usize>,
+    trunks: HashMap<Vec<String>, Vec<Trunk>>,
+}
+
+impl Reads {
+    fn known_trunks(&self, roots: &[String]) -> Option<Vec<Trunk>> {
+        if !self.on || roots.is_empty() {
+            return None;
+        }
+        self.trunks.get(roots).cloned()
+    }
+
+    fn remember_trunks(&mut self, roots: Vec<String>, found: &[Trunk]) {
+        if self.on && !roots.is_empty() && !found.is_empty() {
+            self.trunks.insert(roots, found.to_vec());
+        }
+    }
+}
+
+thread_local! {
+    static READS: std::cell::RefCell<Reads> = std::cell::RefCell::new(Reads::default());
+}
+
+/// Held for the length of one repair tick.
+pub struct TickReads;
+
+/// Start reading through the tick's memory: the branch tips are read afresh
+/// the first time each repository is asked about.
+pub fn tick_reads() -> TickReads {
+    READS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.on = true;
+        r.heads.clear();
+        if r.ahead.len() > 4096 {
+            r.ahead.clear();
+        }
+    });
+    TickReads
+}
+
+impl Drop for TickReads {
+    fn drop(&mut self) {
+        READS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.on = false;
+            r.heads.clear();
+        });
+    }
+}
+
+/// Something in the tick may have moved a ref (a spawn, a land): the tips are
+/// read again at the next question.
+pub fn refs_moved() {
+    READS.with(|r| r.borrow_mut().heads.clear());
+}
+
+/// Every local branch of a repository and its tip, once per tick; `None` where
+/// the tick's memory is off or git could not say.
+fn heads_of(dir: &std::path::Path) -> Option<HashMap<String, String>> {
+    if let Some(known) = READS.with(|r| {
+        let r = r.borrow();
+        r.on.then(|| r.heads.get(dir).cloned())
+    }) {
+        if let Some(known) = known {
+            return known;
+        }
+        let read = git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]).map(|out| {
+            out.lines().filter_map(|l| l.split_once(' ')).map(|(n, o)| (n.to_string(), o.trim().to_string())).collect()
+        });
+        READS.with(|r| r.borrow_mut().heads.insert(dir.to_path_buf(), read.clone()));
+        return read;
+    }
+    None
+}
+
+/// The tip of `refs/heads/<branch>` as `git rev-parse` prints it, or `None`
+/// where there is no such branch.
+fn branch_tip(dir: &std::path::Path, branch: &str) -> Option<String> {
+    let spec = format!("refs/heads/{branch}");
+    match heads_of(dir) {
+        Some(heads) => heads.get(&spec).map(|o| format!("{o}\n")),
+        None => git(dir, &["rev-parse", "--verify", "--quiet", &spec]),
+    }
+}
+
+/// `cmd_checkout::ahead(..).len()`, remembered by the two tips it was asked at.
+fn commits_ahead(trunk: &Trunk, branch: &str) -> usize {
+    let key = heads_of(&trunk.dir).and_then(|h| {
+        let t = h.get(&format!("refs/heads/{}", trunk.branch))?;
+        let b = h.get(&format!("refs/heads/{branch}"))?;
+        Some((trunk.dir.clone(), trunk.branch.clone(), branch.to_string(), t.clone(), b.clone()))
+    });
+    if let Some(n) = key.as_ref().and_then(|k| READS.with(|r| r.borrow().ahead.get(k).copied())) {
+        return n;
+    }
+    let n = cmd_checkout::ahead(&trunk.dir, &trunk.branch, branch).len();
+    if let Some(k) = key {
+        READS.with(|r| r.borrow_mut().ahead.insert(k, n));
+    }
+    n
 }
 
 /// Whether a task is a member of a group wsp runs a verifier for — a running
@@ -2370,6 +2487,49 @@ mod tests {
     /// `batch` handbook's failure made impossible rather than warned about.
     /// Running them together is `worklist-049`: the run walked on past a
     /// barrier nobody had read the moment its members went quiet.
+    /// `wsp-769`: a repair tick in which no ref moved spawns one git call for a
+    /// repository however many lists and members read it, and what it reads is
+    /// what the uncached walk reads.
+    #[test]
+    fn a_tick_in_which_no_ref_moved_asks_git_once_per_repository() {
+        let (_env, store, repo) = scratch("tick-reads");
+        for id in ["wsp-1", "wsp-2", "wsp-3", "wsp-4"] {
+            task(&store, id, "review");
+        }
+        committed(&repo, "wsp-1");
+        spawned(&repo, "wsp-2");
+        committed(&repo, "wsp-3");
+        land(&repo, "wsp-3");
+        let w = list("- 1  wsp-1  wsp-2  wsp-3  wsp-4\n");
+        let shape = |p: &Position| format!("{:?}", p.members);
+
+        let plain = shape(&position(&store, &w, Reading::Landed));
+        assert!(plain.contains("Ahead"), "the fixture has a member ahead: {plain}");
+
+        let reads = tick_reads();
+        let first = shape(&position(&store, &w, Reading::Landed));
+        drop(reads);
+        assert_eq!(first, plain, "the tick's reads answer as git does");
+
+        let _ = wsp_base::calls::drain_children();
+        let reads = tick_reads();
+        for _ in 0..3 {
+            assert_eq!(shape(&position(&store, &w, Reading::Landed)), plain);
+        }
+        drop(reads);
+        let git = wsp_base::calls::drain_children().0.get("git").map(|g| g.0).unwrap_or(0);
+        assert_eq!(git, 1, "one git call for the repository, however many readers");
+
+        // A ref that moved is read again.
+        let reads = tick_reads();
+        let _ = position(&store, &w, Reading::Landed);
+        committed(&repo, "wsp-4");
+        refs_moved();
+        let moved = shape(&position(&store, &w, Reading::Landed));
+        drop(reads);
+        assert_ne!(moved, plain);
+    }
+
     #[test]
     fn the_position_is_the_first_barrier_nobody_has_passed() {
         let (_env, store, _repo) = scratch("derived");

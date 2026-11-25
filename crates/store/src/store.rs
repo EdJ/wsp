@@ -397,6 +397,48 @@ impl MachineLive {
 /// function over once, at start (`main`), and the index key reads it here.
 pub static BUILD_STAMP: std::sync::OnceLock<fn() -> String> = std::sync::OnceLock::new();
 
+thread_local! {
+    static WORKLIST_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many times this thread has asked [`Store::worklists`]: the count a test
+/// reads to pin that a loop over every task reads the lists once (`wsp-768`).
+pub fn worklist_reads() -> u64 {
+    WORKLIST_READS.with(|n| n.get())
+}
+
+/// Which user each row is allocated to through a list: the `for:` of the
+/// first list (by slug) that holds the row, has not finished and has a `for:`.
+/// A row's own `for:` wins over this — [`Allocations::of`] asks it first —
+/// which is [`Store::allocated_to`]'s whole meaning, read once for a loop.
+#[derive(Debug, Default, Clone)]
+pub struct Allocations(BTreeMap<String, String>);
+
+impl Allocations {
+    pub fn from_lists(lists: &[Worklist]) -> Self {
+        let mut by_row = BTreeMap::new();
+        for w in lists.iter().filter(|w| w.status() != crate::model::WorklistStatus::Done) {
+            let Some(user) = w.for_user.as_ref() else { continue };
+            for g in w.groups() {
+                for m in &g.members {
+                    by_row.entry(m.clone()).or_insert_with(|| user.clone());
+                }
+            }
+        }
+        Allocations(by_row)
+    }
+
+    /// The user `task` is allocated to: its own `for:`, else its list's.
+    pub fn of(&self, task: &Task) -> Option<String> {
+        self.of_row(&task.id, task.for_user.as_deref())
+    }
+
+    /// [`Allocations::of`] for a row known by id and its own `for:`.
+    pub fn of_row(&self, row: &str, own: Option<&str>) -> Option<String> {
+        own.map(str::to_string).or_else(|| self.0.get(row).cloned())
+    }
+}
+
 impl Store {
     pub fn open() -> Store {
         // The default store is the developer's own, at `~/wsp`, and a test that
@@ -948,6 +990,7 @@ impl Store {
     /// reason a retired machine is still a row: a worklist is a plan, and the
     /// history of a plan is the thing worth keeping about it.
     pub fn worklists(&self) -> Vec<Worklist> {
+        WORKLIST_READS.with(|n| n.set(n.get() + 1));
         let mut out = Store::cached_dir_noting(
             &self.worklists_dir(),
             &self.worklists_cache,
@@ -1383,11 +1426,15 @@ impl Store {
                 return t.for_user;
             }
         }
-        self.worklists()
-            .into_iter()
-            .filter(|w| w.status() != crate::model::WorklistStatus::Done)
-            .filter(|w| w.groups().iter().any(|g| g.members.iter().any(|m| m == row)))
-            .find_map(|w| w.for_user)
+        self.allocations().of_row(row, None)
+    }
+
+    /// Every row's allocation by a list, read once (`wsp-768`): the daemon's
+    /// attention tick asks [`Store::allocated_to`] of every task, twice, and
+    /// each asking cloned every worklist. A loop takes this once and asks
+    /// [`Allocations::of`] per task.
+    pub fn allocations(&self) -> Allocations {
+        Allocations::from_lists(&self.worklists())
     }
 
     pub fn task_path(&self, id: &str) -> PathBuf {
@@ -5180,6 +5227,39 @@ mod tests {
 
     fn scratch(tag: &str) -> Store {
         crate::testkit::store(tag)
+    }
+
+    /// `wsp-768`: the read-once map answers what `allocated_to` answers — a
+    /// row's own `for:` wins, else a not-done list's `for:`, and a done list's
+    /// `for:` is no allocation.
+    #[test]
+    fn allocations_route_as_allocated_to_does() {
+        use crate::model::{Group, WorklistStatus};
+        let store = scratch("allocations-768");
+        for (id, own) in [("t-1", Some("ed")), ("t-2", None), ("t-3", None), ("t-4", None)] {
+            let mut t = Task::new("work", id);
+            t.for_user = own.map(str::to_string);
+            store.save_task(&t).unwrap();
+        }
+        let list = |id: &str, members: &[&str], user: &str, status: WorklistStatus| {
+            let mut w = Worklist::new(id, "run");
+            let groups: Vec<Group> =
+                members.iter().map(|m| Group { members: vec![m.to_string()], ..Group::default() }).collect();
+            w.set_groups(&groups);
+            w.for_user = Some(user.into());
+            w.set_status(status);
+            store.save_worklist(&w).unwrap();
+        };
+        list("a-done", &["t-3"], "gone", WorklistStatus::Done);
+        list("b-running", &["t-1", "t-2", "t-3"], "jesper", WorklistStatus::Running);
+        list("c-later", &["t-2"], "later", WorklistStatus::Running);
+        let alloc = store.allocations();
+        let expect = [("t-1", Some("ed")), ("t-2", Some("jesper")), ("t-3", Some("jesper")), ("t-4", None)];
+        for (id, want) in expect {
+            let t = store.task(id).unwrap();
+            assert_eq!(alloc.of(&t).as_deref(), want, "{id} through the map");
+            assert_eq!(store.allocated_to(id).as_deref(), want, "{id} through allocated_to");
+        }
     }
 
     /// A store whose git children run git itself, not whatever wraps it on

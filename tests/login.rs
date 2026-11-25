@@ -28,7 +28,9 @@ struct Rig {
 
 impl Rig {
     fn new(name: &str, users: &[&str]) -> Rig {
-        let dir = std::env::temp_dir().join(format!("wsp-login-it-{name}-{}", std::process::id()));
+        // Short on purpose: a sandbox's fake listens on a unix socket under here, and macOS
+        // refuses a path past 104 bytes, which `$TMPDIR` (/var/folders/..) alone nearly fills.
+        let dir = PathBuf::from("/tmp").join(format!("wsp-li-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("home")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();
@@ -142,6 +144,19 @@ impl Drop for Rig {
 
 /// The command line of process `pid` and of every process under it now, as `/proc` has them.
 fn command_lines(pid: u32) -> Vec<String> {
+    if !Path::new("/proc/self").exists() {
+        // No /proc (macOS): `ps` has the same table.
+        let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,ppid=,command="]).output() else { return Vec::new() };
+        return String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let p = f.next()?.parse::<u32>().ok()?;
+                let pp = f.next()?.parse::<u32>().ok()?;
+                (p == pid || pp == pid).then(|| f.collect::<Vec<_>>().join(" "))
+            })
+            .collect();
+    }
     let mut pids = vec![pid];
     if let Ok(rd) = std::fs::read_dir("/proc") {
         for e in rd.flatten() {

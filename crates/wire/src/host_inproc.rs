@@ -60,6 +60,7 @@ pub fn reach(state: &Path) -> Result<(Local, Token), HostError> {
     static RUNNING: OnceLock<Mutex<BTreeMap<PathBuf, (Local, Token)>>> = OnceLock::new();
     let running = RUNNING.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut map = running.lock().unwrap_or_else(|e| e.into_inner());
+    prune_gone(&mut map);
     if let Some(had) = map.get(state) {
         return Ok(had.clone());
     }
@@ -74,8 +75,9 @@ pub fn reach(state: &Path) -> Result<(Local, Token), HostError> {
             let token = token_of(&exec)?;
             publish(&exec, &local);
             m.note("started in-process (WSP_HOST=inproc)");
-            // Served for the rest of this process's life; its lock ends with it.
-            std::mem::forget(m);
+            // Served until this process ends, or until `state` is removed from
+            // under it ([`prune_gone`]); its lock ends with either.
+            held().lock().unwrap_or_else(|e| e.into_inner()).insert(state.to_path_buf(), m);
             map.insert(state.to_path_buf(), (local.clone(), token.clone()));
             Ok((local, token))
         }
@@ -85,6 +87,32 @@ pub fn reach(state: &Path) -> Result<(Local, Token), HostError> {
         }
         Err(e) => Err(HostError::Inproc(e.to_string())),
     }
+}
+
+/// The managers this process runs, by the state dir they serve.
+fn held() -> &'static Mutex<BTreeMap<PathBuf, Manager>> {
+    static HELD: OnceLock<Mutex<BTreeMap<PathBuf, Manager>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Stop the managers of states that no longer exist. A test's state is removed
+/// when the test ends, and its manager held a lock, a log, a journal and a
+/// listener per address open for the rest of the process: ~10 fds a test,
+/// which ran a 256-fd seat out of them (wsp-770).
+fn prune_gone(map: &mut BTreeMap<PathBuf, (Local, Token)>) {
+    let gone: Vec<PathBuf> = map.keys().filter(|s| !s.exists()).cloned().collect();
+    for state in gone {
+        map.remove(&state);
+        let m = held().lock().unwrap_or_else(|e| e.into_inner()).remove(&state);
+        if let Some(m) = m {
+            m.stop();
+        }
+    }
+}
+
+/// How many in-process managers this process still runs.
+pub fn running_count() -> usize {
+    held().lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 fn token_of(exec: &Path) -> Result<Token, HostError> {

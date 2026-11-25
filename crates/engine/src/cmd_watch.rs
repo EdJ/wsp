@@ -2583,9 +2583,10 @@ impl<'a> Poll<'a> {
         let index = Index::new(self.store.projects());
         let governors = self.store.governors();
         let lists = worklist::Running::read(self.store);
+        let alloc = self.store.allocations();
         if self.store.tasks().iter().any(|t| {
             outstanding(t, &lists).is_some()
-                && addressed_to(&index, &governors, &lists, t, self.store.allocated_to(&t.id).as_deref()) == self.scope.name
+                && addressed_to(&index, &governors, &lists, t, alloc.of(t).as_deref()) == self.scope.name
         }) {
             return true;
         }
@@ -2598,7 +2599,7 @@ impl<'a> Poll<'a> {
             p.at_barrier()
                 && p.members.iter().any(|m| {
                     self.store.task_now(&renamed, &m.id).is_some_and(|t| {
-                        addressed_to(&index, &governors, &lists, &t, self.store.allocated_to(&t.id).as_deref()) == self.scope.name
+                        addressed_to(&index, &governors, &lists, &t, alloc.of(&t).as_deref()) == self.scope.name
                     })
                 })
         })
@@ -2674,6 +2675,9 @@ impl Source for Poll<'_> {
             holders: Default::default(),
         };
         let lists = worklist::Running::read(self.store);
+        // Every row's allocation, read once for the tick rather than once per
+        // task (`wsp-768`: each `allocated_to` cloned every worklist).
+        let alloc = self.store.allocations();
         // The routing, taken once for every task in the store and before any
         // predicate is evaluated — so the address a level carries and the
         // membership test that kept it are the same reading, rather than two
@@ -2681,9 +2685,9 @@ impl Source for Poll<'_> {
         let to: BTreeMap<String, String> = wip
             .tasks
             .iter()
-            .map(|t| (t.id.clone(), addressed_to(&wip.index, &wip.governors, &lists, t, self.store.allocated_to(&t.id).as_deref())))
+            .map(|t| (t.id.clone(), addressed_to(&wip.index, &wip.governors, &lists, t, alloc.of(t).as_deref())))
             .collect();
-        let mine = |t: &Task| in_scope(&self.scope, &wip.index, &wip.governors, &lists, t, self.store.allocated_to(&t.id).as_deref());
+        let mine = |t: &Task| in_scope(&self.scope, &wip.index, &wip.governors, &lists, t, alloc.of(t).as_deref());
         let task_of = |id: &str| wip.tasks.iter().find(|t| t.id == id);
 
         // Read once and above everything, because (b) and (c) both want it: (c)
@@ -4063,12 +4067,14 @@ fn is_out(store: &Store, scope: &Scope, needle: &str) -> bool {
     }
     let index = Index::new(store.projects());
     let lists = worklist::Running::read(store);
+    let alloc = store.allocations();
+    let governors = store.governors();
     let name = index.find(needle).map(|p| p.id.clone()).unwrap_or_else(|| needle.to_string());
     let asked =
         Scope { name, seated: false, workspace: scope.workspace.clone(), pane: scope.pane.clone(), all: false };
     let members: Vec<&Task> = tasks
         .iter()
-        .filter(|t| in_scope(&asked, &index, &store.governors(), &lists, t, store.allocated_to(&t.id).as_deref()))
+        .filter(|t| in_scope(&asked, &index, &governors, &lists, t, alloc.of(t).as_deref()))
         .collect();
     if members.iter().any(|t| t.status().is_open()) {
         return false;
@@ -6778,6 +6784,33 @@ mod tests {
     /// coincidence — which is the assertion below, and the reason it is written
     /// as one: the pass and `wip` are both handed this census and must say the
     /// same thing about this seat.
+    /// `wsp-768`: a sample reads the worklists a number of times that does
+    /// not grow with the store's tasks — the allocation map is read once, not
+    /// once (twice) per task.
+    #[test]
+    fn a_sample_reads_the_worklists_once_not_once_per_task() {
+        let env = util::isolated("watch-768-reads");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let add = |from: usize, to: usize| {
+            for i in from..to {
+                store.save_task(&Task::new("work", &format!("t-{i:03}"))).unwrap();
+            }
+        };
+        let reads = |store: &Store| {
+            let mut poll = Poll::new(store, Scope::machine(), BTreeSet::new(), None);
+            let a = wsp_store::store::worklist_reads();
+            poll.sample();
+            wsp_store::store::worklist_reads() - a
+        };
+        add(0, 5);
+        let few = reads(&store);
+        add(5, 80);
+        let many = reads(&store);
+        // Per task was 2 × 80 = 160; a tick's own readings are a handful.
+        assert!(few <= 4 && many <= 4, "worklist reads grew with the task count: {few} for 5 tasks, {many} for 80");
+    }
+
     #[test]
     fn a_working_compound_seat_raises_nothing_and_wip_agrees_that_it_is_working() {
         let env = util::isolated("watch-compound-working");
