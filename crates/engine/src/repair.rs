@@ -67,7 +67,6 @@
 use crate::model::{Status, Task, Worklist, WorklistStatus};
 use crate::cycle::Seats;
 use crate::place::State;
-use crate::cmd_govern;
 use crate::cmd_checkout::Flow;
 use crate::store::Store;
 use crate::util;
@@ -472,7 +471,7 @@ fn step_running(store: &Store, seats: &dyn Seats) {
 /// seat a running list governs is examined as that list's own and the backlog
 /// contributes nothing new for it.
 fn seat_scopes(store: &Store) -> Vec<(String, String)> {
-    seat_scopes_owing(store, crate::wake::scopes_owed(store))
+    seat_scopes_owing(store, Seats::scopes_owed(&crate::cycle::Fleet, store))
 }
 
 /// [`seat_scopes`], with the backlog half asked only of the scopes in `owed`.
@@ -567,7 +566,7 @@ fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, 
 /// lines none of which is owed, read `unseated · 8 held · counting` on
 /// 2026-10-06 while this walk never counted it.
 pub fn will_seat(store: &Store, scope: &str) -> bool {
-    let owed = crate::wake::owed_to(store, scope);
+    let owed = Seats::owed_to(&crate::cycle::Fleet, store, scope);
     let owed = if owed > 0 { vec![(scope.to_string(), owed)] } else { Vec::new() };
     seat_scopes_owing(store, owed).iter().any(|(s, _)| s == scope)
 }
@@ -626,7 +625,7 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
             }
             let session = compound.session_of(&crate::place::Seat::new(&seat));
             let Some(finished) = (!session.is_empty())
-                .then(|| crate::agent_commands::opencode_finished_at(&session))
+                .then(|| seats.opencode_finished_at(&session))
                 .flatten()
             else {
                 continue;
@@ -660,7 +659,7 @@ pub fn refusal_tick(store: &Store, seats: &dyn Seats) {
         if n < crate::refusals::REFUSED_TICKS {
             continue;
         }
-        let Some(seat) = cmd_govern::seat_held(&scope, &governors) else {
+        let Some(seat) = crate::governors::seat_held(&scope, &governors) else {
             // Nobody is in the seat any more: the count belongs to one that is gone.
             crate::refusals::accepted(store, &scope);
             continue;
@@ -698,7 +697,7 @@ pub fn refusal_tick(store: &Store, seats: &dyn Seats) {
 fn deaf_tick(store: &Store, seats: &dyn Seats, door: &crate::refusals::Door) {
     let governors = store.governors();
     for scope in governors.keys() {
-        let Some(seat) = cmd_govern::seat_held(scope, &governors) else { continue };
+        let Some(seat) = crate::governors::seat_held(scope, &governors) else { continue };
         let Some(why) = door.deaf(&seat.pane) else { continue };
         if seats.state(&seat.pane) == Some(State::Working) {
             continue;
@@ -773,7 +772,7 @@ pub fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::
             .bindings()
             .keys()
             .filter_map(|seat| {
-                let s = crate::cmd_agent::stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
+                let s = crate::stuck::stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
                 Some((seat.clone(), (s.kind, s.secs)))
             })
             .collect();
@@ -795,7 +794,7 @@ pub fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::
 pub fn stuck_tick(store: &Store, seats: &dyn Seats) {
     if let Some(door) = crate::refusals::door(store) {
         return stuck_ordered(store, seats, &door, &|seat| {
-            crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), None)
+            crate::stuck::stuck_of_seat(store, seat, util::epoch_secs(), None)
         }, &|_| Vec::new());
     }
     let before = held_all(store);
@@ -804,7 +803,7 @@ pub fn stuck_tick(store: &Store, seats: &dyn Seats) {
         seats,
         &|seat| {
             let recorded = before.get(seat).map(|h| (h.command.as_str(), h.at));
-            crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), recorded)
+            crate::stuck::stuck_of_seat(store, seat, util::epoch_secs(), recorded)
         },
         &|_| Vec::new(),
     );
@@ -969,7 +968,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
         return;
     }
     // Somebody else's machine is somebody else's seat. Absent record is ours.
-    if governors.contains_key(&scope) && cmd_govern::host_of(&governors, &scope) != util::hostname() {
+    if governors.contains_key(&scope) && crate::governors::host_of(&governors, &scope) != util::hostname() {
         return;
     }
     let never_filled = !governors.contains_key(&scope);
@@ -977,7 +976,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // means nobody can be asked; see `how_it_reads`.
     let Some(word) = how_it_reads(store, seats, &scope) else { return };
     // This pass's own count, and the record's reading of it, from one write.
-    let here = cmd_govern::count_unseated(store, &scope);
+    let here = crate::governors::count_unseated(store, &scope);
     // **A seat that reads `gone` is not waited on** (`wsp-386`). `Empty` is the
     // reading of a pane between two agents, and that is what the two ticks are
     // for; `Gone` is a pane closed or an agent released, and nobody is coming
@@ -985,7 +984,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // hours between two groups, with the only repair a person's `advance`.
     let gone = word == "gone";
     if gone && !never_filled {
-        if let Some(seat) = cmd_govern::seat_held(&scope, &governors) {
+        if let Some(seat) = crate::governors::seat_held(&scope, &governors) {
             note_gone(store, seats, &seat.pane, &format!("the {scope} governor"));
         }
     }
@@ -1002,7 +1001,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // confirmed — `tokenhub-spec-sync` paid for exactly that every twenty
     // minutes. Said on the pass that crosses the threshold; `wake::unseated`
     // says it on the seat for as long as it stays true.
-    let kind = crate::cmd_spawn::seat_kind(&governors, &scope);
+    let kind = crate::governors::seat_kind(&governors, &scope);
     if !crate::place_compound::reads_kind(&kind) {
         if here.unseated == if gone { 1 } else { EMPTY_TICKS } {
             stamp(store, &format!("{scope}: the seat reads {word} and {trigger}, but it was a {kind} governor and compound cannot run one — nothing seated"));
@@ -1012,7 +1011,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // The claim is the duplicate guard and it is taken *before* the process
     // starts, because the process is where the seat is written and a tick that
     // arrives in between would find an empty post and start a second one.
-    if !cmd_govern::claim_seat(store, &scope) {
+    if !crate::governors::claim_seat(store, &scope) {
         return;
     }
     stamp(store, &format!("{scope}: the seat reads {word} and {trigger} — seating a successor"));
@@ -1025,7 +1024,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // silence and was taken again, and a done list's held sentences read
     // "nobody coming" only once the list closed.
     if let Err(why) = crate::cycle::try_launch(store, &["govern", &scope, "--reseat"]) {
-        cmd_govern::reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` could not be started: {why}"));
+        crate::governors::reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` could not be started: {why}"));
     }
 }
 
@@ -1074,7 +1073,7 @@ pub fn reading(store: &Store, seats: &dyn Seats, scope: &str) -> Occupancy {
     // `seat_held` rather than `seat_of_scope(..).or(last_seat(..))`: a record
     // with a workspace and an empty `pane` is a slot nobody is in, and it was
     // `tooling`'s live shape on 2026-10-05.
-    let Some(seat) = cmd_govern::seat_held(scope, &store.governors()) else {
+    let Some(seat) = crate::governors::seat_held(scope, &store.governors()) else {
         return Occupancy::Vacant("unseated");
     };
     match seats.state(&seat.pane) {
@@ -1113,7 +1112,7 @@ fn how_it_reads(store: &Store, seats: &dyn Seats, scope: &str) -> Option<&'stati
     match reading(store, seats, scope) {
         Occupancy::Vacant(word) => Some(word),
         Occupancy::Occupied => {
-            cmd_govern::forget_unseated(store, scope);
+            crate::governors::forget_unseated(store, scope);
             None
         }
         Occupancy::Unreadable => None,
@@ -2550,6 +2549,7 @@ fn undated(line: &str) -> &str {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::cmd_govern;
     use crate::cycle::tests::{ENDED, MEMBER_TOLD, RESEATED, SPAWNED, TOLD};
     use crate::model::{Group, WorklistStatus};
     use std::path::{Path, PathBuf};

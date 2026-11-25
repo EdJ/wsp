@@ -11,6 +11,9 @@ use crate::message::{self, About, Ask, Hand, Kind, Message, Party, Shape, Waitin
 use crate::model::{Status, Task};
 use crate::place::{Delivery, Place, Refusal, State};
 pub use crate::place::my_pane;
+pub use crate::room::governs_seat;
+pub use crate::stage::sentence;
+pub use crate::stuck::stuck_of_seat;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util::{self, Paint};
@@ -397,25 +400,6 @@ pub fn full_name(
             _ => None,
         })
         .filter(|full| full != name)
-}
-
-/// The sentence a seat's agent last said about itself, while it is still
-/// about the work the seat holds.
-///
-/// Not [`full_name`], which answers *what is the whole of this label* and is
-/// invalidated by a rename. This answers *what did the agent say it is doing*,
-/// for a surface drawing no label of ours — a compound pane header, `wsp wip`
-/// — and what makes it stale is the seat's work changing under it: a sentence
-/// said on one task is not a statement about the next one, or about none. The
-/// task is compared rather than trusted to have been cleared, for the reason
-/// `full_name` compares the label: every claim, release and handoff would
-/// otherwise have to remember this record, and the one that forgot would put
-/// a sentence about old work over new work.
-pub fn sentence(said: &BTreeMap<String, Value>, pane: &str, held: Option<&str>) -> Option<String> {
-    let entry = said.get(pane)?;
-    let task = entry.get("task").and_then(|t| t.as_str());
-    let said = entry.get("said").and_then(|s| s.as_str()).filter(|s| !s.is_empty())?;
-    (task == held).then(|| said.to_string())
 }
 
 /// `wsp flag <id> "why"` — an agent raises a hand about one task.
@@ -2618,16 +2602,6 @@ pub fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agen
 /// transcript is read (wsp-028).
 pub fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::did::Did> {
     crate::fold::did_since(store, seat, util::epoch_of(since))
-}
-
-/// The stalled shell commands in the end of a seat's transcript (`wsp-397`),
-/// open ones counted to `now`: the manager's `seat.stuck` as folded
-/// ([`crate::fold::stall`]), its start kept at the `recorded` one when the
-/// command is the same (wsp-028). No transcript is read.
-pub fn stuck_of_seat(store: &Store, seat: &str, now: i64, recorded: Option<(&str, i64)>) -> Vec<crate::stuck::Stall> {
-    let Some(r) = crate::fold::stall(store, seat, now, recorded) else { return Vec::new() };
-    let kind = crate::stuck::classify(&r.command).unwrap_or(crate::stuck::Kind::TimedOut);
-    vec![crate::stuck::Stall { kind, command: r.command, at: r.at, secs: r.secs, open: r.open }]
 }
 
 /// The kind, session and cwd a seat's binding records, when it has a session.
@@ -4996,13 +4970,6 @@ pub fn holding(
                 == Some(seat)
         })
         .map(|(id, _)| id.clone())
-}
-
-/// Whether `seat` is a project's governor seat, through the same query `wip`
-/// draws its `▣` from.
-pub fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
-    let workspace = seat.split(':').next().unwrap_or(seat);
-    crate::place::governs(governors, &crate::place::seat_query(workspace, Some(seat))).is_some()
 }
 
 /// One agent, as `wip` wants it.

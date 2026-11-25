@@ -330,6 +330,74 @@ pub trait Seats {
     fn fold_typed(&self, _store: &Store, _scope: &str) -> usize {
         0
     }
+
+    /// When opencode's own database says `session` last finished a turn, in
+    /// seconds — `agent_commands::opencode_finished_at`, the reading
+    /// [`overrule`] is handed. `None` is "we do not know", and the default, for
+    /// [`Seats::absent`]'s reason: a fake runs no opencode.
+    fn opencode_finished_at(&self, _session: &str) -> Option<i64> {
+        None
+    }
+
+    /// The pane `seat`'s agent is in now, looked for on the backends here the
+    /// way `cmd_govern::occupant` looks: the recorded pane, then the room, then
+    /// a claim. `None` by default, for [`Seats::absent`]'s reason.
+    fn occupant(&self, _store: &Store, _seat: &crate::governors::Seat) -> Option<String> {
+        None
+    }
+
+    /// The scope of the seat that answers for `task` —
+    /// `cmd_govern::answering_seat`. `None` by default: a fake answers for
+    /// nothing.
+    fn answering_scope(&self, _store: &Store, _task: &crate::model::Task) -> Option<String> {
+        None
+    }
+
+    /// wsp's notice on row `task`, for the seat that answers for it —
+    /// `cmd_agent::notice`. Whether it was raised. **Does nothing by default**,
+    /// for [`Seats::rotate`]'s reason: a fake that raised notices would be
+    /// telling seats out of a fixture.
+    fn notice(&self, _store: &Store, _task: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Say `text` to `scope`'s seat, through its spool — `wake::say`: held
+    /// until the seat can hear it, and `record` the message it carries. What the
+    /// spool says of it. Says nothing by default, for [`Seats::rotate`]'s reason.
+    fn say(&self, _store: &Store, _scope: &str, _text: &str, _record: Option<&str>) -> Said {
+        Said::default()
+    }
+
+    /// The messages `scope`'s spool still holds, as `(seq, at, text)` —
+    /// `wake::messages_held`. None by default: a fake has no spool.
+    fn messages_held(&self, _store: &Store, _scope: &str) -> Vec<(u64, i64, String)> {
+        Vec::new()
+    }
+
+    /// Take these entries off `scope`'s spool — `wake::settle_held`. Does
+    /// nothing by default: a fake has no spool.
+    fn settle_held(&self, _store: &Store, _scope: &str, _seqs: &[u64]) {}
+
+    /// How many lines `scope`'s seat is owed, the withheld ones left out —
+    /// `wake::owed_to`. Nothing by default: a fake has no spool.
+    fn owed_to(&self, _store: &Store, _scope: &str) -> usize {
+        0
+    }
+
+    /// Every scope owed a line, with how many — `wake::scopes_owed`. None by
+    /// default: a fake has no spool.
+    fn scopes_owed(&self, _store: &Store) -> Vec<(String, usize)> {
+        Vec::new()
+    }
+}
+
+/// What a seat's spool says of a sentence [`Seats::say`] put on it: why it is
+/// still holding, in the words `--status` prints, and how many it holds — the
+/// two fields of `wake::Report` the run reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Said {
+    pub why: String,
+    pub held: usize,
 }
 
 /// The real reading, over the backends on this machine — with opencode's own
@@ -361,6 +429,24 @@ pub trait Seats {
 pub struct Fleet;
 
 
+/// How long a completed turn has to have been over before a screen still
+/// reading `Working` is overruled, in seconds.
+///
+/// **The threshold is not arbitrary.** A turn that has just ended leaves the
+/// screen reading `Working` for as long as the TUI takes to repaint, which is
+/// normally under a second; a session that finished longer ago than that and is
+/// *still* reading `Working` is a seat whose screen has stopped telling us
+/// anything. Without a threshold the reader contradicts the screen on every turn
+/// boundary, and one that overrides its most direct witness on every tick is a
+/// reader nobody would believe.
+///
+/// **It lives beside [`overrule`], which makes the comparison, and that is
+/// what makes both testable** (moved here from `agent_commands`, wsp-437): a
+/// test can cross the threshold in microseconds against a supplied clock and
+/// no opencode, a database or a frozen TUI, which is the same bargain
+/// [`crate::repair::Pass::due`] makes.
+pub const SETTLED_AFTER: i64 = 60;
+
 /// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
 /// test can drive it without an opencode, a database and a frozen TUI.
 ///
@@ -373,7 +459,7 @@ pub struct Fleet;
 /// one direction only.
 pub fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
     match (raw, finished) {
-        (State::Working, Some(f)) if f + crate::agent_commands::SETTLED_AFTER <= at => State::Idle,
+        (State::Working, Some(f)) if f + SETTLED_AFTER <= at => State::Idle,
         _ => raw,
     }
 }
@@ -5043,7 +5129,7 @@ pub fn stand_down_own_seat(store: &Store, list: &str) {
             .get(list)
             .is_some_and(|rec| rec.get("workspace").and_then(serde_json::Value::as_str).unwrap_or_default().is_empty());
         if empty && crate::governors::stood_at(&governors, list).is_none() {
-            crate::cmd_govern::mark_stood_down(store, list);
+            crate::governors::mark_stood_down(store, list);
             log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
         }
         return;
@@ -5051,8 +5137,8 @@ pub fn stand_down_own_seat(store: &Store, list: &str) {
     // Read before the vacate: the room a compound seat is found by is on the
     // record the vacate empties.
     let sitting = occupied(store, &seat);
-    crate::cmd_govern::vacate(store, list);
-    crate::cmd_govern::mark_stood_down(store, list);
+    crate::governors::vacate(store, list);
+    crate::governors::mark_stood_down(store, list);
     let Some(seat) = sitting else {
         log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
         return;
@@ -5073,8 +5159,7 @@ pub fn occupied(store: &Store, seat: &crate::governors::Seat) -> Option<String> 
     if cfg!(test) {
         return (!seat.pane.is_empty()).then(|| seat.pane.clone());
     }
-    let backends = crate::place::local_backends();
-    crate::cmd_govern::occupant(store, &backends, seat).map(|(_, found)| found.seat.as_str().to_string())
+    Seats::occupant(&Fleet, store, seat)
 }
 
 /// [`crate::cmd_spawn::end_seat_when_idle`], recorded instead under test.
@@ -5216,7 +5301,7 @@ pub fn end_passes_keeping(
         // folded `seat.spent`'s, and what it did the `seat.did` digests'.
         let spent = crate::verification::Spent::ending(p.spent.as_ref(), None, None);
         let spent = crate::verification::Spent::with_session(spent, None);
-        let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
+        let did = crate::fold::did_since(store, &seat, util::epoch_of(&p.at));
         let outcome = despawn_seat_keeping(&seat, keep).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
             Ok(()) => Ending::Ended,
@@ -5544,7 +5629,7 @@ pub fn governing_post(store: &Store, w: &Worklist) -> Option<String> {
     let governors = store.governors();
     the_chain(store, w)
         .into_iter()
-        .find(|s| governors.contains_key(s) || crate::cmd_govern::last_seat(&governors, s).is_some())
+        .find(|s| governors.contains_key(s) || crate::governors::last_seat(&governors, s).is_some())
 }
 
 /// `list, then the project of its first member that has one, then that project's
@@ -5639,7 +5724,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     // wsp's own notice, for the seat that answers for the member — not a
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
-    crate::cmd_agent::notice(store, &first, &text).is_some()
+    Seats::notice(&Fleet, store, &first, &text)
 }
 
 /// wsp's notice on a row on no list, for the seat that answers for it (its
@@ -5647,7 +5732,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
 /// the engine modules that tell a row's stall reach it through the run and not
 /// up into the seats (`wsp-690`). Returns whether it was raised.
 pub fn notice_on_row(store: &Store, member: &str, text: &str) -> bool {
-    crate::cmd_agent::notice(store, member, text).is_some()
+    Seats::notice(&Fleet, store, member, text)
 }
 
 /// The member [`tell_now`] puts a run's notice on: the first of the group the
@@ -5702,7 +5787,7 @@ pub fn nobody_coming(store: &Store, list: &str) -> Option<String> {
         return Some(format!("its seat was stood down at {}", util::local_hm(at)));
     }
     if crate::governors::vacancy(&governors, list).backed_off() {
-        let why = crate::cmd_govern::reseat_why(&governors, list).map(|w| format!(" — {}", util::truncate(&w, 120)));
+        let why = crate::governors::reseat_why(&governors, list).map(|w| format!(" — {}", util::truncate(&w, 120)));
         return Some(format!("its reseat failed{}", why.unwrap_or_default()));
     }
     None
@@ -5724,7 +5809,7 @@ pub fn nobody_coming(store: &Store, list: &str) -> Option<String> {
 pub fn hand_on_what_done_lists_held(store: &Store) {
     for key in store.watches().keys() {
         let Some(scope) = key.strip_prefix("wake:") else { continue };
-        let held = crate::wake::messages_held(store, scope);
+        let held = Seats::messages_held(&Fleet, store, scope);
         if held.is_empty() {
             continue;
         }
@@ -5754,7 +5839,7 @@ pub fn hand_on_what_done_lists_held(store: &Store) {
                 handed.push(*seq);
             }
         }
-        crate::wake::settle_held(store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
+        Seats::settle_held(&Fleet, store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
         // Said when something moved, not every tick something could not: a
         // done list with no member to put a notice on would otherwise write
         // this line a minute for ever. What stays is still on `--status`.
@@ -5839,7 +5924,7 @@ pub fn hand_it_up(store: &Store, w: &Worklist, text: &str) -> Option<String> {
     if crate::cmd_message::caller(store) == above.scope {
         return None;
     }
-    crate::wake::say(store, &above.scope, text, None);
+    Seats::say(&Fleet, store, &above.scope, text, None);
     Some(above.scope)
 }
 
@@ -5870,7 +5955,7 @@ pub fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -> bool 
     // nowhere, and the caller's hand on a member reaches the seat above.
     let own = || (w.runs_itself() && nobody_coming(store, &w.id).is_none()).then(|| w.id.clone());
     let Some(scope) = governing_scope(store, w).or_else(own) else { return false };
-    let report = crate::wake::say(store, &scope, text, None);
+    let report = Seats::say(&Fleet, store, &scope, text, None);
     // Said as well as returned, because `cycle.log` is how a governor reads what
     // the run has been doing, and *the seat is mid-turn* is the answer to "why
     // has nobody started my next group" that used to be missing from it. The

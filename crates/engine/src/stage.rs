@@ -477,7 +477,7 @@ pub fn sayings(store: &Store) -> BTreeMap<String, String> {
     }
     for (seat, b) in store.bindings() {
         if let Some(task) = b.get("task_id").and_then(|v| v.as_str()) {
-            if let Some(s) = crate::cmd_agent::sentence(&said, &seat, Some(task)) {
+            if let Some(s) = sentence(&said, &seat, Some(task)) {
                 out.insert(task.to_string(), s);
             }
         }
@@ -510,7 +510,7 @@ pub fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> {
             }
             let workspace = seat.split(':').next().unwrap_or(seat);
             let governs = crate::place::governs(&governors, &crate::place::seat_query(workspace, Some(seat))).is_some();
-            let agent = match crate::cmd_govern::needs_a_person(s.state.stopped(), true, governs) {
+            let agent = match wsp_view::stage::needs_a_person(s.state.stopped(), true, governs) {
                 true => Agent::WantsYou,
                 false => Agent::Working,
             };
@@ -661,6 +661,25 @@ pub fn filed(
             (t.id.clone(), Filed { told, steps, live })
         })
         .collect()
+}
+
+/// The sentence a seat's agent last said about itself, while it is still
+/// about the work the seat holds.
+///
+/// Not [`full_name`], which answers *what is the whole of this label* and is
+/// invalidated by a rename. This answers *what did the agent say it is doing*,
+/// for a surface drawing no label of ours — a compound pane header, `wsp wip`
+/// — and what makes it stale is the seat's work changing under it: a sentence
+/// said on one task is not a statement about the next one, or about none. The
+/// task is compared rather than trusted to have been cleared, for the reason
+/// `full_name` compares the label: every claim, release and handoff would
+/// otherwise have to remember this record, and the one that forgot would put
+/// a sentence about old work over new work.
+pub fn sentence(said: &BTreeMap<String, serde_json::Value>, pane: &str, held: Option<&str>) -> Option<String> {
+    let entry = said.get(pane)?;
+    let task = entry.get("task").and_then(|t| t.as_str());
+    let said = entry.get("said").and_then(|s| s.as_str()).filter(|s| !s.is_empty())?;
+    (task == held).then(|| said.to_string())
 }
 
 #[cfg(test)]

@@ -728,6 +728,16 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
+/// The stalled shell commands in the end of a seat's transcript (`wsp-397`),
+/// open ones counted to `now`: the manager's `seat.stuck` as folded
+/// ([`crate::fold::stall`]), its start kept at the `recorded` one when the
+/// command is the same (wsp-028). No transcript is read.
+pub fn stuck_of_seat(store: &crate::store::Store, seat: &str, now: i64, recorded: Option<(&str, i64)>) -> Vec<Stall> {
+    let Some(r) = crate::fold::stall(store, seat, now, recorded) else { return Vec::new() };
+    let kind = classify(&r.command).unwrap_or(Kind::TimedOut);
+    vec![Stall { kind, command: r.command, at: r.at, secs: r.secs, open: r.open }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

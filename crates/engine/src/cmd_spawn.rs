@@ -36,6 +36,8 @@ use crate::cmd_agent;
 use crate::cmd_checkout::{self, Tree};
 use crate::cmd_govern;
 pub use crate::place::local_backends;
+pub use crate::agent_kind::{kind_or_default, DEFAULT_KIND};
+pub use crate::governors::seat_kind;
 use crate::leg_seat;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::resolve::Index;
@@ -1296,42 +1298,6 @@ fn governed(args: &Args, kind: &str, agent: bool, scope: &Scope) -> (Option<Stri
         seat.scope
     );
     (Some(GOVERNED_MODEL.to_string()), Some(GOVERNED_EFFORT.to_string()))
-}
-
-/// backend's default when nobody says which agent. Every other kind it knows is
-/// spelt the way its own CLI spells it and passed straight through — an
-/// unknown one is refused by backend with the whole catalogue in the message,
-/// which is a better list than one kept here and left to go stale.
-pub const DEFAULT_KIND: &str = "claude";
-
-/// The kind a record names, or [`DEFAULT_KIND`] for one that names none.
-///
-/// **`core-031`'s second decision, and it is a decision rather than a
-/// convenience.** A record with no kind can be read two ways — as `claude`,
-/// which is compatible and wrong for exactly the agents `core-020` is adding,
-/// or as *unknown*, which is honest and costs more than it sounds.
-///
-/// Unknown resolves to [`crate::agent_commands::Plain`], and `Plain` has no
-/// resume flag: `wsp resume` on every record written before this existed would
-/// stop working, and the ones written before this existed are all `claude`
-/// because `--kind` was read and thrown away. So honesty about the absence buys
-/// nothing true and loses the whole back catalogue.
-///
-/// What makes the default safe rather than merely convenient is that an absence
-/// no longer lasts: [`crate::cmd_agent::learn_sessions`] and
-/// [`crate::cmd_govern::learn_seats`] take the kind off backend's own reading on
-/// every `sync` tick, so a live record is corrected within a tick of anything
-/// looking at it and only a record whose agent is already gone can still be
-/// reading its default. For those, the default is what they were.
-///
-/// One function because there are three call sites and `cmd_resume`'s census
-/// path already had this line written out; the store path now reads the same
-/// fact the same way.
-pub fn kind_or_default(recorded: &str) -> String {
-    match recorded.trim() {
-        "" => DEFAULT_KIND.to_string(),
-        k => k.to_string(),
-    }
 }
 
 /// How long the caller is prepared to wait, in three numbers and a clock.
@@ -4124,18 +4090,6 @@ pub fn reseat(store: &Store, scope: &str) -> i32 {
     reseat_on(place.as_ref(), store, &args, &Patience::default())
 }
 
-/// The kind a reseat of this scope starts — the seat's own, read live or from
-/// under `last`, or [`DEFAULT_KIND`].
-///
-/// **Under `last` as well, through [`cmd_govern::last_seat`]**, for
-/// [`cmd_govern::tier_of`]'s reason: a governor whose pane died is vacated
-/// before the reconciler looks, so the kind is nearly always there and a reader
-/// of the top level alone defaulted it — right by luck for `claude`, and an
-/// opencode run moved onto claude for everyone else.
-pub fn seat_kind(governors: &BTreeMap<String, Value>, scope: &str) -> String {
-    kind_or_default(&cmd_govern::last_seat(governors, scope).map(|s| s.kind).unwrap_or_default())
-}
-
 /// What the reseat is asked for, read off the seat's own record.
 ///
 /// **Split out because it is the half that can be wrong without a terminal.**
@@ -6030,6 +5984,44 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn fold_typed(&self, store: &Store, scope: &str) -> usize {
         crate::wake::fold_what_was_typed(store, scope)
+    }
+
+    fn opencode_finished_at(&self, session: &str) -> Option<i64> {
+        crate::agent_commands::opencode_finished_at(session)
+    }
+
+    fn occupant(&self, store: &Store, seat: &crate::governors::Seat) -> Option<String> {
+        let backends = crate::place::local_backends();
+        cmd_govern::occupant(store, &backends, seat).map(|(_, found)| found.seat.as_str().to_string())
+    }
+
+    fn answering_scope(&self, store: &Store, task: &crate::model::Task) -> Option<String> {
+        cmd_govern::answering_seat(store, task).map(|s| s.scope)
+    }
+
+    fn notice(&self, store: &Store, task: &str, text: &str) -> bool {
+        cmd_agent::notice(store, task, text).is_some()
+    }
+
+    fn say(&self, store: &Store, scope: &str, text: &str, record: Option<&str>) -> crate::cycle::Said {
+        let report = crate::wake::say(store, scope, text, record);
+        crate::cycle::Said { why: report.why, held: report.held }
+    }
+
+    fn messages_held(&self, store: &Store, scope: &str) -> Vec<(u64, i64, String)> {
+        crate::wake::messages_held(store, scope)
+    }
+
+    fn settle_held(&self, store: &Store, scope: &str, seqs: &[u64]) {
+        crate::wake::settle_held(store, scope, seqs)
+    }
+
+    fn owed_to(&self, store: &Store, scope: &str) -> usize {
+        crate::wake::owed_to(store, scope)
+    }
+
+    fn scopes_owed(&self, store: &Store) -> Vec<(String, usize)> {
+        crate::wake::scopes_owed(store)
     }
 
     fn end_when_idle(&self, store: &Store, seat: &str) -> Result<(), String> {

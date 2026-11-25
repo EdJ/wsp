@@ -11,19 +11,4 @@ cmd_task -> cmd_resume: thread_for_task  # engine -> seats
 cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
 cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
 cmd_worklist -> cmd_govern: slots  # engine -> seats
-cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
-cycle -> cmd_agent: did_of_seat, notice  # engine -> seats
-cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
-cycle -> room: Gate  # engine -> seats
-cycle -> wake: messages_held, say, settle_held  # engine -> seats
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
-repair -> agent_commands: opencode_finished_at  # engine -> seats
-repair -> cmd_agent: stuck_of_seat  # engine -> seats
-repair -> cmd_govern: *  # engine -> seats
-repair -> cmd_spawn: seat_kind  # engine -> seats
-repair -> wake: owed_to, scopes_owed  # engine -> seats
-stage -> cmd_agent: sentence  # engine -> seats
-stage -> cmd_govern: needs_a_person  # engine -> seats
-stand_down -> cmd_govern: *  # engine -> seats
-stand_down -> wake: owed_to  # engine -> seats
-waits -> room: Counted, Gate, working_now  # engine -> seats
