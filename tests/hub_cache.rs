@@ -603,6 +603,10 @@ fn ann_offline_past_the_ttl_with_the_row_re_leased_by_bob_lands_her_journal_as_a
     rig.b.ok(&["claim", &id, "--pane", "w1:p1"]);
     rig.b.wait("Bob's lease", Duration::from_secs(30), |_| rig.holder(&id).is_some_and(|(h, _)| h.contains("bob")));
     rig.b.wait("the row whole on Bob", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    // Let Bob's claim settle, both turns of it, before he edits: a rename that
+    // lands while the turn is still adopting the claim is written over by it.
+    let now = rig.b.turns();
+    rig.b.wait("Bob's claim settled", Duration::from_secs(30), |s| s.turns() >= now + 2 && s.journal() == 0);
     rig.b.ok(&["rename", &id, "Bob's take"]);
     rig.b.wait("Bob's work on the hub", Duration::from_secs(30), |_| rig.hub_head(&id).is_some_and(|h| rig.record(h).0.title == "Bob's take"));
     let bobs = rig.hub_head(&id).unwrap();
