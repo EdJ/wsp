@@ -95,7 +95,7 @@ use crate::base::procs::ancestors;
 use crate::host::{Host, LOCAL};
 use crate::store::Store;
 use crate::util;
-use crate::Args;
+use crate::base::args::Args;
 
 /// How long to wait for a session's socket to answer. Measured at well under a
 /// second on this machine; the deadline is for the case where backend is not

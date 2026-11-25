@@ -27,7 +27,7 @@ use crate::model::Task;
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::verification::{self, Pass, State};
-use crate::Args;
+use crate::base::args::Args;
 
 const USAGE: &str = "wsp verifications [<project>] [--since DATE|Nd] [--until DATE] [--by project|week|month|project,week|project,month] [--json]\n       wsp verifications --transcript FILE   the lines a verifier's transcript would give";
 

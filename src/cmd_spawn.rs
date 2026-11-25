@@ -41,7 +41,7 @@ use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Clock, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// A barrier check's seat opened with no check to go on (`wsp-089`): nothing
 /// names it, so nothing would end it, and it stood in the check's tree for
@@ -10002,7 +10002,7 @@ mod tests {
             "t-260816-095",
             "w1:p1 · no turn running",
         );
-        let mut rec = json!({ "ledger": {}, "build": crate::build_stamp(), "pid": 0 });
+        let mut rec = json!({ "ledger": {}, "build": crate::base::stamp::build_stamp(), "pid": 0 });
         let mut v = stall.json();
         v["since"] = json!(0);
         v["told"] = json!(true);

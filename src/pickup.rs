@@ -320,7 +320,7 @@ mod tests {
     use super::*;
     use crate::model::Task;
     use crate::waits::{Machine, Wait};
-    use crate::Args;
+    use crate::base::args::Args;
 
     fn setup(tag: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("pickup-{tag}"));

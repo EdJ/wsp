@@ -1,67 +1,35 @@
 # Upward uses the code has today: `from -> to: symbols`, one module pair per line (wsp-400).
 # The layering test (tests/layering.rs) fails on an upward use not here and on a line the code no longer has.
 # This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
-after -> main: Args  # engine -> top
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
-attention -> main: build_stamp  # engine -> top
 attention -> wake: wake  # engine -> seats
-barrier -> main: Args  # engine -> top
-barrier_replay -> main: Args  # engine -> top
-check -> main: Args  # engine -> top
-closing -> main: Args  # engine -> top
 cmd_agent -> cmd_attempts: attempts_of  # seats -> timeline
 cmd_agent -> daemon: a_backend_answered, dead, health, running  # seats -> top
-cmd_agent -> main: Args  # seats -> top
 cmd_agent -> panel: BOARD_LABEL, FULL_LABEL, PANEL_LABEL, VIEW_LABEL, glyph  # seats -> surface
-cmd_attempts -> main: Args  # timeline -> top
-cmd_attend -> main: Args  # seats -> top
 cmd_brief -> daemon: a_backend_answered, dead, running  # seats -> top
-cmd_brief -> main: Args  # seats -> top
-cmd_burn -> main: Args  # timeline -> top
-cmd_cost -> main: Args  # timeline -> top
-cmd_govern -> main: Args  # seats -> top
-cmd_install -> main: Args, stamp_word  # seats -> top
-cmd_machine -> main: Args  # seats -> top
 cmd_message -> agent_commands: of  # engine -> seats
 cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
-cmd_message -> main: Args  # engine -> top
 cmd_message -> wake: held_because, say  # engine -> seats
-cmd_report -> main: Args  # timeline -> top
-cmd_resume -> main: Args  # seats -> top
 cmd_resume -> panel: stty  # seats -> surface
-cmd_sandbox -> main: Args  # seats -> top
-cmd_spawn -> main: Args  # seats -> top
-cmd_stamp -> main: Args  # seats -> top
 cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, worked_line  # engine -> seats
 cmd_task -> cmd_resume: thread_for_task  # engine -> seats
 cmd_task -> cmd_spawn: kind_or_default  # engine -> seats
-cmd_task -> main: Args  # engine -> top
 cmd_task -> panel: glyph  # engine -> surface
-cmd_verifications -> main: Args  # timeline -> top
 cmd_watch -> daemon: a_backend_answered, loud, running  # seats -> top
-cmd_watch -> main: Args, build_stamp  # seats -> top
 cmd_worklist -> cmd_agent: claim_where, named_project  # engine -> seats
 cmd_worklist -> cmd_cost: cost  # engine -> timeline
 cmd_worklist -> cmd_govern: slots  # engine -> seats
 cmd_worklist -> cmd_report: at_last_barrier, declared, dir, gate_done, line, output, report  # engine -> timeline
-cmd_worklist -> main: Args  # engine -> top
 cycle -> agent_commands: SETTLED_AFTER  # engine -> seats
 cycle -> cmd_agent: did_of_seat, notice  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
-cycle -> main: Args  # engine -> top
 cycle -> room: Gate  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
-detail -> main: Args  # surface -> top
 disk -> cmd_sandbox: strays  # engine -> seats
 ending -> cmd_attempts: attempts_of  # engine -> timeline
-kanban -> main: Args  # surface -> top
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
-leg_seat -> main: Args  # engine -> top
 legs -> cmd_attempts: Attempt, attempts_of, priced  # engine -> timeline
-legs -> main: Args  # engine -> top
-packet -> main: Args  # engine -> top
-panel -> main: Args  # surface -> top
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats
 repair -> cmd_govern: *  # engine -> seats
@@ -71,9 +39,5 @@ stage -> cmd_agent: sentence  # engine -> seats
 stage -> cmd_govern: needs_a_person  # engine -> seats
 stand_down -> cmd_govern: *  # engine -> seats
 stand_down -> wake: owed_to  # engine -> seats
-story -> main: Args  # surface -> top
-stuck -> main: Args  # engine -> top
-timeline -> main: Args  # timeline -> top
 verification -> cmd_attempts: Row, attempts_of  # engine -> timeline
-verification -> main: Args  # engine -> top
 waits -> room: Counted, Gate, working_now  # engine -> seats

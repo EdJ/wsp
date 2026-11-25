@@ -24,7 +24,7 @@ use crate::far::{self, Readiness, readiness};
 use crate::model::{valid_machine_name, Machine, Task};
 use crate::store::{MachineLive, Store};
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 pub fn dispatch(store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(|s| s.as_str()).unwrap_or("ls") {

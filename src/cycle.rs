@@ -128,7 +128,7 @@ use crate::place::State;
 use crate::store::Store;
 use crate::util;
 use crate::worklist::{self, Reading, Settlement};
-use crate::Args;
+use crate::base::args::Args;
 
 /// The run a start belongs to, handed to `wsp spawn` in its environment so the
 /// row records its owner. `wsp-158`.
@@ -7690,7 +7690,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let from = store.root.join("verdict.md");
         std::fs::write(&from, "holds").unwrap();
         let from = from.display().to_string();
-        let args = crate::Args::synth("verified", &["m-1", "--from", &from], &[("holds", "true"), ("caption", "it holds")]);
+        let args = crate::base::args::Args::synth("verified", &["m-1", "--from", &from], &[("holds", "true"), ("caption", "it holds")]);
         assert_eq!(crate::verification::cmd_verified(&store, &args), 0);
         let m = store.find_task("m-1").unwrap();
         let p = crate::verification::passes(&m).pop().unwrap();
@@ -7779,7 +7779,7 @@ fn only_a_working_screen_is_ever_overruled() {
             let cause = if flag == "blocks" { "\ncause: work — it does not do what was asked" } else { "" };
             std::fs::write(&from, format!("read in the member's tree{cause}")).unwrap();
             let from = from.display().to_string();
-            let args = crate::Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "read in its tree")]);
+            let args = crate::base::args::Args::synth("verified", &["m-1", "--from", &from], &[(flag, "true"), ("caption", "read in its tree")]);
             assert_eq!(crate::verification::cmd_verified(&self.store, &args), 0);
         }
         fn reran(&self) -> String {
@@ -7790,7 +7790,7 @@ fn only_a_working_screen_is_ever_overruled() {
         fn open_the_pass(&self) {
             step(&self.store, &self.w, &Blind);
             if let Some(run) = crate::verification::runs(&self.store.find_task("m-1").unwrap()).pop() {
-                assert_eq!(crate::check::check(&self.store, &crate::Args::synth("check", &["m-1"], &[("auto", "true"), ("run", &run.at)])), 0);
+                assert_eq!(crate::check::check(&self.store, &crate::base::args::Args::synth("check", &["m-1"], &[("auto", "true"), ("run", &run.at)])), 0);
             }
             step(&self.store, &self.w, &Blind);
         }

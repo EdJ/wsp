@@ -42,7 +42,7 @@ use crate::model::{Group, Status, Task, Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::Paint;
 use crate::worklist::{self, Reading, Repos, Settlement};
-use crate::Args;
+use crate::base::args::Args;
 
 /// `wsp after <task> <on>…` replaces the task's list, `wsp after <task>
 /// --clear` empties it, and `wsp after <task>` reads it.

@@ -31,7 +31,7 @@ use crate::agent_commands::{self};
 use crate::check;
 use crate::model::Task;
 use crate::store::{Found, Store};
-use crate::Args;
+use crate::base::args::Args;
 
 /// The harness's executable, unless `$WSP_ATTENTION` names another. A seat's
 /// environment sheds `WSP_*`, so this reaches `wsp attend` run by hand and not

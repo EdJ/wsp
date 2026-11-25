@@ -92,7 +92,7 @@ use crate::model::{Group, Landed, Status, Worklist, WorklistStatus, DEFAULT_POLI
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::worklist::{self, Landing, Position, Reading, Segment, Standing};
-use crate::Args;
+use crate::base::args::Args;
 
 /// What `next` says of the starts its list has waiting at the seat cap (`wsp-550`):
 /// `room::waiting_lines_of`, which `main` installs ([`install_cap_waits`]) because

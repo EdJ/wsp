@@ -207,7 +207,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 use crate::place::Place;
 use crate::store::Store;
 use crate::util::Paint;
-use crate::Args;
+use crate::base::args::Args;
 
 /// The three stamps, as this verb answers them.
 struct Stamps {

@@ -105,7 +105,7 @@ use crate::choices::Choices;
 use crate::message::{self, About, Kind, Landed, Message, Party, Shape, Waiting};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// `wsp ask <id> "the question"` — a question about one task, with a return
 /// path.
@@ -2998,9 +2998,9 @@ mod tests {
         assert!(typed.contains(text), "a short question is typed as asked: {typed}");
         assert!(!typed.contains("prints the whole question"), "and says nothing was cut: {typed}");
 
-        let args = crate::Args::parse(["ask", q.id.as_str()].iter().map(|s| s.to_string()).collect());
+        let args = crate::base::args::Args::parse(["ask", q.id.as_str()].iter().map(|s| s.to_string()).collect());
         assert_eq!(ask(&store, &args), 0, "a message id and nothing to say shows the question");
-        let args = crate::Args::parse(["ask", "m-nothing"].iter().map(|s| s.to_string()).collect());
+        let args = crate::base::args::Args::parse(["ask", "m-nothing"].iter().map(|s| s.to_string()).collect());
         assert_eq!(ask(&store, &args), 1, "an id that names nothing says so");
     }
 
@@ -3020,7 +3020,7 @@ mod tests {
         // The check's own seat, which is who is waiting: said here rather than
         // inherited from whatever seat runs the suite.
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
-        let args = crate::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
+        let args = crate::base::args::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
         let code = ask(&store, &args);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert_eq!(code, 0, "a worklist is somewhere for the answer to live");
@@ -3044,7 +3044,7 @@ mod tests {
     #[test]
     fn a_question_about_nothing_is_refused_where_it_is_cheap() {
         let store = scratch("subject");
-        let args = crate::Args::parse(
+        let args = crate::base::args::Args::parse(
             ["ask", "nothing-095", "can I land this?"].iter().map(|s| s.to_string()).collect(),
         );
         assert_eq!(ask(&store, &args), 1, "no such task, so there is nowhere for an answer to go");
@@ -3259,7 +3259,7 @@ mod tests {
         let _env = util::isolated("slice-replay");
         let store = scratch("slice-replay");
         task(&store, "wsp-149");
-        let args = crate::Args::synth("ask", &[], &[]);
+        let args = crate::base::args::Args::synth("ask", &[], &[]);
         let q = waited_on(&store, "wsp-149", None);
         let clock = Fake::new();
         assert_eq!(wait_and_report(&store, &q.id, None, &args, &clock), 3, "no answer: the wait ends, not the tool call");
@@ -3305,7 +3305,7 @@ mod tests {
         let _env = util::isolated("slice-bound");
         let store = scratch("slice-bound");
         task(&store, "wsp-149");
-        let args = crate::Args::synth("ask", &[], &[]);
+        let args = crate::base::args::Args::synth("ask", &[], &[]);
         let q = waited_on(&store, "wsp-149", None);
         let clock = Fake::new();
         clock.at(540_000, || {
@@ -3450,13 +3450,13 @@ mod tests {
 
         // The primary: refused without `--as-person`, as before.
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
-        assert_eq!(answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "noted"], &[])), 1);
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &[q.id.as_str(), "noted"], &[])), 1);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert!(store.message(&q.id).unwrap().is_open(), "the primary did not close it");
 
         // The governor it is routed to: closes it, as itself.
         std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
-        assert_eq!(answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "noted: nothing for the person"], &[])), 0);
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &[q.id.as_str(), "noted: nothing for the person"], &[])), 0);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
         let m = store.message(&q.id).unwrap();
         assert!(!m.is_open(), "the governor closed it");
@@ -3469,7 +3469,7 @@ mod tests {
             .for_the_person();
         message::raise(&store, &primarys).unwrap();
         std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
-        assert_eq!(answer(&store, &crate::Args::synth("answer", &[primarys.id.as_str(), "yes"], &[])), 1);
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &[primarys.id.as_str(), "yes"], &[])), 1);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
         assert!(store.message(&primarys.id).unwrap().is_open());
         // And the primary, saying it is the person, may close the member's.
@@ -3568,7 +3568,7 @@ mod tests {
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
         let asked = |id: &str, text: &str, flags: &[(&str, &str)]| -> String {
             let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
-            assert_eq!(ask(&store, &crate::Args::synth("ask", &[id, text], flags)), 0);
+            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &[id, text], flags)), 0);
             message::all(&store).into_iter().map(|m| m.id).find(|m| !before.contains(m)).expect("a new question")
         };
         let governed = asked("m-1", "could you paste the panic?", &[]);
@@ -3609,7 +3609,7 @@ mod tests {
         store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
 
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
 
         let q = message::all(&store).into_iter().next().expect("raised");
@@ -3629,7 +3629,7 @@ mod tests {
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-977");
         let asked = |text: &str, flags: &[(&str, &str)]| -> Option<Message> {
             let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
-            let code = ask(&store, &crate::Args::synth("ask", &["lone-1", text], flags));
+            let code = ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", text], flags));
             let new = message::all(&store).into_iter().find(|m| !before.contains(&m.id));
             assert_eq!(code == 0, new.is_some(), "exit {code}");
             new
@@ -3748,13 +3748,13 @@ mod tests {
         store.message(&q.id).unwrap()
     }
 
-    fn answer_args(mid: &str, flags: &[(&str, &str)], typed: &[&str]) -> crate::Args {
+    fn answer_args(mid: &str, flags: &[(&str, &str)], typed: &[&str]) -> crate::base::args::Args {
         let mut rest = vec![mid];
         rest.extend_from_slice(typed);
         let mut f = flags.to_vec();
         // The tests run under an agent, and this is the person typing in it.
         f.push(("as-person", ""));
-        crate::Args::synth("answer", &rest, &f)
+        crate::base::args::Args::synth("answer", &rest, &f)
     }
 
     #[test]
@@ -3779,12 +3779,12 @@ mod tests {
             ("a kind it does not know", vec![("person", ""), ("choices", bad.as_str())], "", 2),
         ] {
             let before = n(&store);
-            assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1", typed], &flags)), code, "{what}");
+            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", typed], &flags)), code, "{what}");
             assert_eq!(n(&store), before, "{what}: nothing was raised");
         }
 
         // Without a sentence the questions are it, and the choices ride along.
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("choices", f.as_str())])), 0);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("choices", f.as_str())])), 0);
         let q = message::all(&store).pop().expect("raised");
         assert_eq!(q.text, "Which figure is the headline? Which views show the split?");
         assert!(q.for_person);
@@ -3802,16 +3802,16 @@ mod tests {
         store.save_worklist(&w).unwrap();
         store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
         let before = n(&store);
-        let code = ask(&store, &crate::Args::synth("ask", &["lone-1", "pick"], &[("choices", f.as_str())]));
+        let code = ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick"], &[("choices", f.as_str())]));
         assert_eq!((code, n(&store)), (2, before), "a seat's question takes no choices");
 
         // A sentence of its own stands, and a question without choices says null.
         assert_eq!(
-            ask(&store, &crate::Args::synth("ask", &["lone-1", "pick one"], &[("person", ""), ("choices", f.as_str())])),
+            ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick one"], &[("person", ""), ("choices", f.as_str())])),
             0
         );
         assert_eq!(message::all(&store).pop().unwrap().text, "pick one");
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
         let plain = message::all(&store).pop().unwrap();
         assert!(plain.choices.is_none() && plain.to_json()["choices"].is_null());
         std::env::remove_var(crate::base::seat::SEAT_ENV);
@@ -4192,7 +4192,7 @@ mod tests {
         let _env = util::isolated("wait-exit");
         let store = scratch("wait-exit");
         task(&store, "lone-1");
-        let args = crate::Args::synth("ask", &[], &[]);
+        let args = crate::base::args::Args::synth("ask", &[], &[]);
         let q = waited_on(&store, "lone-1", None);
         let answered = || {
             message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
@@ -4250,7 +4250,7 @@ mod tests {
             ("--timeout of nothing", vec![("person", ""), ("wait", ""), ("timeout", "0")]),
             ("--timeout of words", vec![("person", ""), ("wait", ""), ("timeout", "soon")]),
         ] {
-            let args = crate::Args::synth("ask", &["lone-1", "go?"], &flags);
+            let args = crate::base::args::Args::synth("ask", &["lone-1", "go?"], &flags);
             assert_eq!(ask_with(&store, &args, &Fake::new()), 2, "{what}");
             assert_eq!(n(&store), before, "{what}: nothing was raised");
         }
@@ -4268,7 +4268,7 @@ mod tests {
             let q = last_question(&store);
             the_person_answers(&store, &q.id, &[("choice", "Land=Land now")]);
         });
-        let args = crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("wait", ""), ("timeout", "60"), ("choices", f.as_str())]);
+        let args = crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("wait", ""), ("timeout", "60"), ("choices", f.as_str())]);
         assert_eq!(ask_with(&store, &args, &clock), 0);
 
         let (marked, held, wip) = seen.borrow()[0].clone();
@@ -4287,7 +4287,7 @@ mod tests {
         // A timeout: exit 3, the question open and unmarked, and the retry is
         // `wsp ask <mid> --wait`, which finds the answer that came meanwhile.
         let clock = Fake::new();
-        let args = crate::Args::synth("ask", &["lone-1", "once more?"], &[("person", ""), ("wait", ""), ("timeout", "3")]);
+        let args = crate::base::args::Args::synth("ask", &["lone-1", "once more?"], &[("person", ""), ("wait", ""), ("timeout", "3")]);
         assert_eq!(ask_with(&store, &args, &clock), 3);
         assert_eq!(clock.now.get(), 3_000);
         let q = last_question(&store);
@@ -4299,7 +4299,7 @@ mod tests {
         let reply = message::all(&store).into_iter().find(|m| m.reply_to.as_deref() == Some(q.id.as_str())).expect("the reply");
         message::held(&store, &reply.id, "cpd-893", "working").unwrap();
         assert_eq!(message::held_replies(&store).len(), 1);
-        let retry = crate::Args::synth("ask", &[q.id.as_str()], &[("wait", "")]);
+        let retry = crate::base::args::Args::synth("ask", &[q.id.as_str()], &[("wait", "")]);
         assert_eq!(ask_with(&store, &retry, &Fake::new()), 0);
         assert!(message::held_replies(&store).is_empty(), "returned once, through the call, and not typed after");
         std::env::remove_var(crate::base::seat::SEAT_ENV);
@@ -4342,14 +4342,14 @@ mod tests {
         kinds
     }
 
-    fn ask_cancel(mid: &str, why: &[&str], as_person: bool) -> crate::Args {
+    fn ask_cancel(mid: &str, why: &[&str], as_person: bool) -> crate::base::args::Args {
         let mut flags = vec![("cancel", "")];
         if as_person {
             flags.push(("as-person", ""));
         }
         let mut rest = vec![mid];
         rest.extend_from_slice(why);
-        crate::Args::synth("ask", &rest, &flags)
+        crate::base::args::Args::synth("ask", &rest, &flags)
     }
 
     /// **The person's dismissal of any ask**, a person's own included: closed
@@ -4474,11 +4474,11 @@ mod tests {
         task(&store, "lone-1");
         let n = |store: &Store| message::all(store).len();
 
-        let bare = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed")]);
+        let bare = crate::base::args::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed")]);
         assert_eq!(ask(&store, &bare), 2, "no --then is refused");
         assert_eq!(n(&store), 0, "and nothing is recorded");
 
-        let asked = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "Ed"), ("then", "merge the bump")]);
+        let asked = crate::base::args::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "Ed"), ("then", "merge the bump")]);
         assert_eq!(ask(&store, &asked), 0);
         let q = message::all(&store).pop().unwrap();
         assert_eq!((q.of.as_deref(), q.then.as_deref()), (Some("ed"), Some("merge the bump")));
@@ -4509,7 +4509,7 @@ mod tests {
         let _env = util::isolated("ask-of-done");
         let store = scratch("ask-of-done");
         task(&store, "lone-1");
-        let asked = crate::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed"), ("then", "merge the bump")]);
+        let asked = crate::base::args::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed"), ("then", "merge the bump")]);
         assert_eq!(ask(&store, &asked), 0);
         let id = message::all(&store).pop().unwrap().id;
         let attention = |store: &Store| {
@@ -4534,7 +4534,7 @@ mod tests {
         let refs: Vec<&str> = typed.iter().map(String::as_str).collect();
         let flags: Vec<(&str, &str)> = vec![("step-done", ""), ("as-person", "")];
         let positional: Vec<&str> = refs.iter().copied().filter(|x| !x.starts_with("--")).collect();
-        assert_eq!(answer(&store, &crate::Args::synth("answer", &positional, &flags)), 0);
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &positional, &flags)), 0);
         assert!(store.message(&id).unwrap().step_done_at.is_some());
         assert_eq!(attention(&store), None, "neither once its step is done");
     }
@@ -4595,20 +4595,20 @@ mod tests {
         let before = message::all(&store).len();
         for (what, v) in &cases {
             let f = file_set(&env, "bad.json", v);
-            let a = crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())]);
+            let a = crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())]);
             assert_eq!(ask(&store, &a), 2, "{what}");
         }
         assert_eq!(message::all(&store).len(), before, "nothing was raised");
 
         let f = file_set(&env, "set.json", &a_set());
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
         let q = message::all(&store).pop().unwrap();
         assert_eq!(q.text, "Plan decisions: One, Two, Three", "the title and the headers");
         let c = q.choices.as_ref().unwrap();
         assert_eq!((c.kind(), c.set_progress()), ("set", (0, 3)));
         // Not beside --choices.
         let both = [("person", ""), ("set", f.as_str()), ("choices", f.as_str())];
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &both)), 2);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &both)), 2);
     }
 
     #[test]
@@ -4618,7 +4618,7 @@ mod tests {
         task(&store, "lone-1");
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
         let f = file_set(&env, "set.json", &a_set());
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
         let id = message::all(&store).pop().unwrap().id;
         let decisions = |store: &Store| store.task("lone-1").unwrap().body.matches("(set ").count();
 
@@ -4668,7 +4668,7 @@ mod tests {
         task(&store, "lone-1");
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
         let f = file_set(&env, "set.json", &a_set());
-        assert_eq!(ask(&store, &crate::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
         let id = message::all(&store).pop().unwrap().id;
         assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("choice", "C")], &[])), 0);
         assert_eq!(answer(&store, &answer_args(&id, &[("finish", "true")], &["enough for today"])), 1);

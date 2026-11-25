@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::host::Host;
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// The daemon's tick, which a step nobody poked waits for.
 pub(crate) const TICK: i64 = 20;

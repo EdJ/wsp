@@ -176,7 +176,7 @@ use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::worklist;
-use crate::Args;
+use crate::base::args::Args;
 
 /// How often a tick runs, when nobody says.
 ///
@@ -2005,7 +2005,7 @@ impl Ledger {
 pub(crate) fn resume(rec: &Value) -> (Ledger, bool) {
     let Some(v) = rec.get("ledger") else { return (Ledger::default(), false) };
     let keyed_by = rec.get("build").and_then(Value::as_str).unwrap_or_default();
-    (Ledger::of_json(v), keyed_by == crate::build_stamp())
+    (Ledger::of_json(v), keyed_by == crate::base::stamp::build_stamp())
 }
 
 // ---------------------------------------------------------------------------
@@ -3073,7 +3073,7 @@ impl Registered {
     /// existed, which makes it old, and one restart of anything makes it
     /// answerable — an unanswerable question is not a fault to put in red.
     pub(crate) fn stale_build(&self) -> bool {
-        self.watching() && !self.daemon && !self.build.is_empty() && self.build != crate::build_stamp()
+        self.watching() && !self.daemon && !self.build.is_empty() && self.build != crate::base::stamp::build_stamp()
     }
 }
 
@@ -3177,9 +3177,9 @@ pub(crate) fn health(store: &Store, problems: &mut Vec<String>) {
                 w.scope,
                 w.key,
                 w.build,
-                match crate::build_stamp().is_empty() {
+                match crate::base::stamp::build_stamp().is_empty() {
                     true => "a binary that cannot say".to_string(),
-                    false => crate::build_stamp(),
+                    false => crate::base::stamp::build_stamp(),
                 }
             ));
         }
@@ -4572,7 +4572,7 @@ fn register_as(store: &Store, key: &str, spec: &Spec, ledger: &Ledger, ticks: u6
             // is running the binary that is now live — which is the same
             // question about the same file, and `worklist-033` is the half of
             // it that has no `exec` behind it.
-            "build": crate::build_stamp(),
+            "build": crate::base::stamp::build_stamp(),
             "ledger": ledger.json(),
         });
         // Merged rather than assigned, so `next_seq` and `spool` — the two
@@ -5480,7 +5480,7 @@ mod tests {
         let up = vec![Signal::new(Kind::Flag, "a-1", "up")];
         assert_eq!(l.advance(&up, &Routing::Unknown, 60, 0).len(), 1);
 
-        let (mut back, known) = resume(&record(&l, &crate::build_stamp()));
+        let (mut back, known) = resume(&record(&l, &crate::base::stamp::build_stamp()));
         assert!(known);
         let out = back.advance(&[], &Routing::Unknown, 120, 0);
         assert_eq!(out.len(), 1, "and the clearing still arrives: {out:?}");
@@ -5526,7 +5526,7 @@ mod tests {
             every: 60,
             standing: 0,
             daemon: false,
-            build: crate::build_stamp(),
+            build: crate::base::stamp::build_stamp(),
             spooled: 0,
             wake: false,
             delivered: 0,
@@ -5569,7 +5569,7 @@ mod tests {
         let old = reg(1, false, "5a1f71d");
         assert!(!old.stale(), "it is ticking, which is the whole difficulty");
         assert!(old.stale_build());
-        assert!(!reg(1, false, &crate::build_stamp()).stale_build(), "this build is not a fault");
+        assert!(!reg(1, false, &crate::base::stamp::build_stamp()).stale_build(), "this build is not a fault");
     }
 
     /// The daemon is the one long-lived process that *does* replace itself —
@@ -5637,8 +5637,8 @@ mod tests {
         assert_eq!(loud["kind"], "direction");
     }
 
-    fn argv(line: &[&str]) -> crate::Args {
-        crate::Args::parse(line.iter().map(|s| (*s).to_string()).collect())
+    fn argv(line: &[&str]) -> crate::base::args::Args {
+        crate::base::args::Args::parse(line.iter().map(|s| (*s).to_string()).collect())
     }
 
     /// The one positional this verb has is ambiguous by design — a bare word is
@@ -5744,7 +5744,7 @@ mod tests {
                 every: 60,
                 standing: 0,
                 daemon: false,
-                build: crate::build_stamp(),
+                build: crate::base::stamp::build_stamp(),
                 spooled: 0,
                 wake: false,
                 delivered: 0,

@@ -3236,7 +3236,7 @@ esac
                 }
             });
             // What it launched, run here (a test's `launch` starts nothing).
-            let code = crate::cmd_govern::govern(&store, &crate::Args::synth("govern", &["run"], &[("reseat", "true")]));
+            let code = crate::cmd_govern::govern(&store, &crate::base::args::Args::synth("govern", &["run"], &[("reseat", "true")]));
             done.store(true, std::sync::atomic::Ordering::SeqCst);
             code
         });
@@ -4506,7 +4506,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         // it is answered — then told afresh, and ended a window later once its
         // tree is clean, as before.
         let q = crate::message::raised(&store).into_iter().find(|m| m.text.contains("does not end it")).unwrap();
-        assert_eq!(crate::cmd_message::answer(&store, &crate::Args::synth("answer", &[q.id.as_str(), "commit them, then end it"], &[])), 0);
+        assert_eq!(crate::cmd_message::answer(&store, &crate::base::args::Args::synth("answer", &[q.id.as_str(), "commit them, then end it"], &[])), 0);
         git_in(&tree, &["add", "."]);
         git_in(&tree, &["commit", "--quiet", "-m", "the probes"]);
         let _ = member_told();

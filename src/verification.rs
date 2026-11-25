@@ -51,7 +51,7 @@ use std::collections::BTreeMap;
 use crate::model::{Status, Task};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// The heading the passes sit under on the member's row.
 pub(crate) const SECTION: &str = "Verification";

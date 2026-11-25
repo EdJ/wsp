@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use crate::model::Project;
 use crate::store::Store;
 use crate::util::Paint;
-use crate::Args;
+use crate::base::args::Args;
 
 /// Is this an id from the dated scheme — `t-YYMMDD-NNN`?
 ///

@@ -233,7 +233,7 @@ fn save(store: &Store, ledger: &Ledger, ticks: u64) {
             // Whose key rules the ledger below is written by. See
             // [`cmd_watch::resume`] for what reads it and what it cost not to
             // have it.
-            "build": crate::build_stamp(),
+            "build": crate::base::stamp::build_stamp(),
             "ledger": ledger.json(),
         }),
     );
@@ -1120,7 +1120,7 @@ mod tests {
     }
 
     fn put_level(store: &Store, s: &Signal) {
-        let mut rec = store.watches().get(KEY).cloned().unwrap_or(json!({ "ledger": {}, "build": crate::build_stamp(), "pid": 0 }));
+        let mut rec = store.watches().get(KEY).cloned().unwrap_or(json!({ "ledger": {}, "build": crate::base::stamp::build_stamp(), "pid": 0 }));
         let mut v = s.json();
         v["since"] = json!(0);
         v["told"] = json!(true);

@@ -509,7 +509,7 @@ mod tests {
         assert!(close_due(&store, util::epoch_secs()).is_empty(), "a second tick found a row");
         assert_eq!(closed_rows(&store).len(), 2);
 
-        let args = crate::Args::synth("reopen", &["p-001", "one more thing", "--no-seat"], &[]);
+        let args = crate::base::args::Args::synth("reopen", &["p-001", "one more thing", "--no-seat"], &[]);
         assert_eq!(crate::cmd_task::reopen(&store, &args), 0);
         assert_eq!(row(&store).status(), Status::Doing);
     }
@@ -536,7 +536,7 @@ mod tests {
         b.project = Some("p".into());
         b.set_status(Status::Doing);
         store.save_task(&b).unwrap();
-        let args = crate::Args::synth("review", &["p-002", "did it", "--hold-review"], &[("hold-review", "true")]);
+        let args = crate::base::args::Args::synth("review", &["p-002", "did it", "--hold-review"], &[("hold-review", "true")]);
         let code = crate::cmd_task::review(&store, &args);
         let kept = store.task("p-002").unwrap();
         if code == 0 {
@@ -570,9 +570,9 @@ mod tests {
         assert_eq!(n(&after) - n(&before), 1, "{before} -> {after}: the batch is one commit");
 
         assert_eq!(unseen(&store).len(), 2);
-        let args = crate::Args::synth("yours", &[], &[("json", "true")]);
+        let args = crate::base::args::Args::synth("yours", &[], &[("json", "true")]);
         assert_eq!(crate::cmd_message::yours(&store, &args), 0);
-        let args = crate::Args::synth("yours", &[], &[("closed", "true")]);
+        let args = crate::base::args::Args::synth("yours", &[], &[("closed", "true")]);
         assert_eq!(crate::cmd_message::yours(&store, &args), 0);
         assert!(unseen(&store).is_empty(), "listing them is looking");
     }

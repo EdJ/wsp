@@ -14,7 +14,7 @@ use crate::pieces::{
 };
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// The verbs this module answers to, each with the help it carries.
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {

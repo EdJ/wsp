@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::model::{Worklist, WorklistStatus};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 pub const SCHEMA: &str = "wsp-effort/1";
 

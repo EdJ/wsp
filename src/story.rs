@@ -2328,7 +2328,7 @@ fn broken(scenes: &[Scene]) -> Vec<String> {
         .collect()
 }
 
-pub fn run(args: &crate::Args) -> i32 {
+pub fn run(args: &crate::base::args::Args) -> i32 {
     let scenes = scenes();
     let html = page(&scenes);
     // Said on the way past rather than instead of writing the page: a page

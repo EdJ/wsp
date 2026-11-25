@@ -37,7 +37,7 @@ use crate::legs::{self, Leg, State};
 use crate::model::{Policy, Status, Task};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// Open `name` on `id`: `running`, stamped, under the store lock, before any seat
 /// exists. Idempotent for a leg already open with no seat.

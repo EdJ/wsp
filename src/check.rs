@@ -95,7 +95,7 @@ use crate::model::{Status, Task};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::verification::{self as v, Run, RunState};
-use crate::Args;
+use crate::base::args::Args;
 use crate::host::{JobClass, JobEnded, JobKey, JobOutput, JobRow, JobRun, JobState};
 
 /// The heading a project or a task lists its checks under.

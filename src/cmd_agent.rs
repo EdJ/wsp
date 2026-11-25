@@ -14,7 +14,7 @@ pub(crate) use crate::place::my_pane;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// One pane row, as the views in this file read one. Nothing fills it live
 /// (`wsp-120`).
@@ -2203,7 +2203,7 @@ pub(crate) fn prose(args: &Args, skip: usize) -> Result<String, i32> {
 /// its prose through a file*, because a shell evaluates backticks inside double
 /// quotes. Four verbs told agents to use a spelling four verbs did not have.
 /// The dropped-word guard in `main` now says so out loud instead of losing it
-/// (see [`crate::Args::dropped`]); this is the other half, which is that the
+/// (see [`crate::base::args::Args::dropped`]); this is the other half, which is that the
 /// spelling should simply work, and it works the same way on all of them
 /// because they are one act and share this function.
 ///
@@ -7380,7 +7380,7 @@ fn section_damage(
 }
 
 /// `wsp reconcile` — rebuild bindings from claims, and say what it did.
-pub fn reconcile_verb(store: &Store, args: &crate::Args) -> i32 {
+pub fn reconcile_verb(store: &Store, args: &crate::base::args::Args) -> i32 {
     let r = reconcile(store, args.has("reap"));
     println!("reconciled {} binding(s) from claims", r.bound);
     println!("named {} pane(s) after the task they hold", r.named);
@@ -7781,7 +7781,7 @@ mod tests {
     #[test]
     fn re_is_recorded_and_an_unknown_id_is_refused() {
         let (_env, store) = scratch("tell-re");
-        let args = crate::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
+        let args = crate::base::args::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
         let first = Sent::new("wsp-491", "wsp-491", "cpd-1", "wsp-491", "first", &args).by("primary", None, true);
         assert_eq!(delivered(&store, Ok(Delivery::Started), &first), 0);
         let reply = Sent::new("primary", "primary", "cpd-2", "primary", "second", &args)
@@ -7830,7 +7830,7 @@ mod tests {
         // `target`, whose display string is `id — title`.
         let task = crate::model::Task::new("wsp-490 probe: throwaway compound seat, reporting back", "wsp-491");
         store.save_task(&task).unwrap();
-        let args = crate::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
+        let args = crate::base::args::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
         let sent = |text: &str| {
             let t = store.find_task("wsp-491").unwrap();
             let what = format!("{} — {}", t.id, util::truncate(&t.title, 44));
@@ -7852,7 +7852,7 @@ mod tests {
     #[test]
     fn a_failed_direct_tell_is_told_in_cycle_log() {
         let (_env, store) = scratch("failed-tell");
-        let args = crate::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
+        let args = crate::base::args::Args::parse(vec!["wsp".into(), "tell".into(), "--json".into()]);
         let sent = Sent::new("wsp-491", "wsp-491 — probe", "cpd-1", "wsp-491", "hi", &args);
         crate::store::SAID.with(|s| s.borrow_mut().clear());
         assert_eq!(delivered(&store, Err(Refusal::Failed("cpd-1: no turn after 4 tries".into())), &sent), 1);
@@ -7878,7 +7878,7 @@ mod tests {
         let index = Index::new(store.projects());
 
         let argv: Vec<String> = ["add", "-p", "-p", "demo"].iter().map(|s| s.to_string()).collect();
-        let args = crate::Args::parse(argv);
+        let args = crate::base::args::Args::parse(argv);
         let said = named_project(&args, &index).expect("-p was given").unwrap_err();
         assert!(said.contains("`--`"), "{said}");
         assert!(said.contains("looks like a flag"), "{said}");
@@ -7889,7 +7889,7 @@ mod tests {
         assert!(store.tasks().is_empty(), "nothing was filed: {:?}", store.tasks());
 
         // A real typo is told what it always was.
-        let typo = crate::Args::parse(["add", "x", "-p", "dmeo"].iter().map(|s| s.to_string()).collect());
+        let typo = crate::base::args::Args::parse(["add", "x", "-p", "dmeo"].iter().map(|s| s.to_string()).collect());
         assert_eq!(named_project(&typo, &index).unwrap().unwrap_err(), "wsp: no such project `dmeo`");
     }
 
@@ -8691,7 +8691,7 @@ mod tests {
         let env = crate::util::isolated("tell-twice");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
-        let args = crate::Args::parse(vec!["wsp".into(), "tell".into()]);
+        let args = crate::base::args::Args::parse(vec!["wsp".into(), "tell".into()]);
         let sent = |pane: &str, text: &str| Sent::new("x-001", "x-001", pane, "x-001", text, &args);
 
         let first = sent("w1:p6", "worklist-005 touches panel/rows.rs");

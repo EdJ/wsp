@@ -1697,7 +1697,7 @@ mod tests {
     use super::*;
     use crate::refusals::refusing;
     use crate::cmd_watch::{Edge, Kind, Signal};
-    use crate::Args;
+    use crate::base::args::Args;
 
     fn emit(kind: Kind, to: &str, subject: &str) -> Emit {
         Emit {
@@ -1789,7 +1789,7 @@ mod tests {
         let text = "a-1  finished and waiting on you";
 
         // What the person's verb would say about sending this a second time.
-        let args = crate::Args::parse(vec!["wsp".into(), "tell".into()]);
+        let args = crate::base::args::Args::parse(vec!["wsp".into(), "tell".into()]);
         let sent = crate::cmd_agent::Sent::new("core", "the core seat", "w1:p1", "core", text, &args);
         assert_eq!(sent.already_sent(&store), None);
         store.log_event(
@@ -2797,7 +2797,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         store.ensure_dirs().unwrap();
 
         // The verb: a seat nothing holds is refused and nothing is kept for it.
-        let args = crate::Args::synth("tell", &["cpd-999", "are you there"], &[]);
+        let args = crate::base::args::Args::synth("tell", &["cpd-999", "are you there"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &args), 1, "nothing holds it");
         assert!(held_tells(&store, "cpd-999").is_empty(), "so nothing is held for it");
 
@@ -2857,9 +2857,9 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let delivered = || store.events_of("agent-told").iter().filter(|e| e["queued"] != json!(true)).count();
         assert_eq!(delivered(), 0);
 
-        let first = crate::Args::synth("tell", &["wsp-700", "the ninth finding: the bar is too tall"], &[]);
+        let first = crate::base::args::Args::synth("tell", &["wsp-700", "the ninth finding: the bar is too tall"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &first), 0, "queued is a success the sender is told about");
-        let second = crate::Args::synth("tell", &["wsp-700", "and the tenth"], &[]);
+        let second = crate::base::args::Args::synth("tell", &["wsp-700", "and the tenth"], &[]);
         assert_eq!(crate::cmd_agent::tell(&store, &second), 0);
         assert_eq!(delivered(), 0, "nothing typed into the turn");
 
@@ -2899,7 +2899,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
         let (seat, _ends) = compound_seat_in(&store, "wsp-701", State::Working);
 
         let tell = |words: &str, flags: &[(&str, &str)]| {
-            crate::cmd_agent::tell(&store, &crate::Args::synth("tell", &["wsp-701", words], flags))
+            crate::cmd_agent::tell(&store, &crate::base::args::Args::synth("tell", &["wsp-701", words], flags))
         };
         assert_eq!(tell("rebase onto the trunk", &[]), 0);
         assert_eq!(tell("rebase onto the trunk", &[]), 0, "a repeat is no failure");

@@ -407,7 +407,7 @@ fn submit_exit(store: &Store, kind: Kind, key: &str, seat: &str, start: Option<i
     if let Err(lines) = crate::cmd_submit::dry_run(store, kind, key, &text) {
         return Some(Err(format!("the exit is refused as it stands: {}", lines.join("; "))));
     }
-    let args = crate::Args::synth("submit", &[row.as_str()], &[("from", &path.display().to_string())]);
+    let args = crate::base::args::Args::synth("submit", &[row.as_str()], &[("from", &path.display().to_string())]);
     let code = crate::cmd_submit::submit_from(store, &args, Some(kind.seat_word()), Some(seat.to_string()));
     if code != 0 {
         crate::store::log_line(store, &format!("{row}: wsp's `wsp submit {row}` for {seat} was refused (exit {code})"));
@@ -935,13 +935,13 @@ fn flag_member(store: &Store, t: &crate::model::Task, seat: &str, evidence: &str
 }
 
 /// `wsp review`'s arguments from the member's verdict file, if there is one.
-fn member_args_for(store: &Store, t: &crate::model::Task) -> Option<(crate::Args, PathBuf, i64)> {
+fn member_args_for(store: &Store, t: &crate::model::Task) -> Option<(crate::base::args::Args, PathBuf, i64)> {
     let (_, body, at) = verdict_source(store, &t.id, Kind::Member, crate::repair::started_at(t))?;
-    Some((crate::Args::synth("review", &[&t.id, "--from", &body.display().to_string()], &[]), body, at))
+    Some((crate::base::args::Args::synth("review", &[&t.id, "--from", &body.display().to_string()], &[]), body, at))
 }
 
 /// A member's `wsp review <id>` given no account: read it from the verdict file.
-pub(crate) fn member_args(store: &Store, args: &crate::Args) -> Option<(crate::Args, i64)> {
+pub(crate) fn member_args(store: &Store, args: &crate::base::args::Args) -> Option<(crate::base::args::Args, i64)> {
     if args.rest.len() != 1 {
         return None;
     }
@@ -960,7 +960,7 @@ fn running_pass(t: &crate::model::Task, me: Option<&str>) -> Option<crate::verif
 
 /// `wsp verified <member>` given no verdict: read it from the verdict file. The
 /// word typed (`--holds`/`--blocks`) wins over the file's, and so does a caption.
-pub(crate) fn verifier_args(store: &Store, args: &crate::Args, me: Option<&str>) -> Option<(crate::Args, i64)> {
+pub(crate) fn verifier_args(store: &Store, args: &crate::base::args::Args, me: Option<&str>) -> Option<(crate::base::args::Args, i64)> {
     if args.rest.len() != 1 {
         return None;
     }
@@ -974,7 +974,7 @@ pub(crate) fn verifier_args(store: &Store, args: &crate::Args, me: Option<&str>)
     };
     let caption = args.get("caption").filter(|c| c != "true").unwrap_or(v.caption);
     let rest = [t.id.as_str(), "--from", &body.display().to_string()];
-    Some((crate::Args::synth("verified", &rest, &[(word.as_str(), "true"), ("caption", &caption)]), at))
+    Some((crate::base::args::Args::synth("verified", &rest, &[(word.as_str(), "true"), ("caption", &caption)]), at))
 }
 
 /// Close a verifier's pass for its seat from its verdict file, when that file was
@@ -996,7 +996,7 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
         }
         None => {}
     }
-    let Some((args, at)) = verifier_args(store, &crate::Args::synth("verified", &[member], &[]), Some(seat)) else {
+    let Some((args, at)) = verifier_args(store, &crate::base::args::Args::synth("verified", &[member], &[]), Some(seat)) else {
         let evidence = verdict_evidence(store, member, Kind::Verifier, written, &tree, why, "wsp does not guess, so it is not recorded");
         flag_about(store, member, "the verifier", seat, &evidence, &fix, None, true);
         return true;
@@ -1020,7 +1020,7 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
 
 /// `worklist go`/`hold` given no words: read the verdict from the barrier's file,
 /// when its first line is the verb's own word.
-pub(crate) fn check_args(store: &Store, args: &crate::Args, verb: &str, w: &Worklist) -> Option<(crate::Args, i64)> {
+pub(crate) fn check_args(store: &Store, args: &crate::base::args::Args, verb: &str, w: &Worklist) -> Option<(crate::base::args::Args, i64)> {
     if args.rest.len() > 2 || args.get("from").is_some() {
         return None;
     }
@@ -1035,7 +1035,7 @@ pub(crate) fn check_args(store: &Store, args: &crate::Args, verb: &str, w: &Work
     }
     let caption = args.get("caption").filter(|c| c != "true").unwrap_or(v.caption);
     let rest = [verb, w.id.as_str()];
-    let synth = crate::Args::synth(&args.cmd, &rest, &[("from", &body.display().to_string()), ("caption", &caption)]);
+    let synth = crate::base::args::Args::synth(&args.cmd, &rest, &[("from", &body.display().to_string()), ("caption", &caption)]);
     Some((synth, written))
 }
 
@@ -1073,7 +1073,7 @@ fn settle_check(store: &Store, w: &Worklist, at: usize, seat: &str, start: Optio
         return true;
     }
     let from = body.display().to_string();
-    let a = crate::Args::synth("worklist", &[word.as_str(), &w.id], &[("from", &from), ("caption", &v.caption)]);
+    let a = crate::base::args::Args::synth("worklist", &[word.as_str(), &w.id], &[("from", &from), ("caption", &v.caption)]);
     let code = match word.as_str() {
         "go" => crate::cmd_worklist::go(store, &a),
         _ => crate::cmd_worklist::hold(store, &a),
@@ -1253,7 +1253,7 @@ mod tests {
         let (store, tree) = staged(&env);
         std::fs::write(tree.join("f"), "x").unwrap();
         wsp_base::calls::Command::new("git").arg("-C").arg(&tree).args(["add", "f"]).status().unwrap();
-        let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "done")]);
+        let args = crate::base::args::Args::synth("leg", &["done", "m-1"], &[("caption", "done")]);
         let rc = crate::leg_seat::cmd_done(&store, &args, Some("cpd-1"));
         assert_eq!(rc, 1, "a refused close exits non-zero");
         assert!(running(&store));
@@ -1270,7 +1270,7 @@ mod tests {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600);
         std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
         let _ = wrote;
-        let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "built")]);
+        let args = crate::base::args::Args::synth("leg", &["done", "m-1"], &[("caption", "built")]);
         assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 0);
         let t = store.find_task("m-1").unwrap();
         assert_eq!(legs::legs(&t)[0].baton, "handed on");
@@ -1293,7 +1293,7 @@ mod tests {
         let file = env.path("exit.md");
         std::fs::write(&file, text).unwrap();
         let from = file.display().to_string();
-        let args = crate::Args::synth("submit", &["m-1"], &[("from", &from)]);
+        let args = crate::base::args::Args::synth("submit", &["m-1"], &[("from", &from)]);
         crate::cmd_submit::submit_from(store, &args, Some("leg"), Some("cpd-1".into()))
     }
 
@@ -1322,12 +1322,12 @@ mod tests {
         assert!(running(&store), "nothing moved");
         // `wsp leg done` with the same file as its baton: refused the same way.
         write_baton(&store, no_owed);
-        let args = crate::Args::synth("leg", &["done", "m-1"], &[]);
+        let args = crate::base::args::Args::synth("leg", &["done", "m-1"], &[]);
         assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 1);
         assert!(running(&store));
         // A baton in prose is taken as it always was.
         write_baton(&store, "handed on\n");
-        let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "built")]);
+        let args = crate::base::args::Args::synth("leg", &["done", "m-1"], &[("caption", "built")]);
         assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 0);
     }
 
@@ -1407,7 +1407,7 @@ mod tests {
         let env = util::isolated("closing-clear");
         let (store, _tree) = staged(&env);
         rerun_with_an_old_baton(&store);
-        let args = crate::Args::synth("leg", &["done", "m-1"], &[("caption", "c")]);
+        let args = crate::base::args::Args::synth("leg", &["done", "m-1"], &[("caption", "c")]);
         assert_eq!(crate::leg_seat::cmd_done(&store, &args, Some("cpd-1")), 0);
         let l = legs::legs(&store.find_task("m-1").unwrap()).remove(0);
         assert_eq!(l.baton, "", "the stale file was not read");
@@ -1633,7 +1633,7 @@ mod tests {
         let (store, _tree) = staged_member(&env, -60);
         put(&store, "m-2", Kind::Member, "Done by the last run\n");
         assert!(fresh_verdict(&store, "m-2", Kind::Member, crate::repair::started_at(&store.find_task("m-2").unwrap())).is_none());
-        let args = crate::Args::synth("review", &["m-2"], &[]);
+        let args = crate::base::args::Args::synth("review", &["m-2"], &[]);
         assert!(member_args(&store, &args).is_none(), "the verb does not read it");
         assert_eq!(crate::cmd_task::review(&store, &args), 2, "and so asks for the account");
         member_tick(&store, Some(State::Gone));
@@ -1646,7 +1646,7 @@ mod tests {
         let env = util::isolated("closing-m-verb");
         let (store, _tree) = staged_member(&env, 3600);
         put(&store, "m-2", Kind::Member, "Read from the file\n");
-        assert_eq!(crate::cmd_task::review(&store, &crate::Args::synth("review", &["m-2"], &[])), 0);
+        assert_eq!(crate::cmd_task::review(&store, &crate::base::args::Args::synth("review", &["m-2"], &[])), 0);
         assert_eq!(member_status(&store), Status::Review);
         assert!(store.find_task("m-2").unwrap().section("Log").unwrap().contains("Read from the file"));
     }
@@ -1742,7 +1742,7 @@ mod tests {
         // This pass opened a minute from now: the file was written before it.
         let store = staged_verifier(&env, -60);
         put(&store, "v-1", Kind::Verifier, "holds\nThe last pass's.\n");
-        assert!(verifier_args(&store, &crate::Args::synth("verified", &["v-1"], &[]), Some("cpd-3")).is_none());
+        assert!(verifier_args(&store, &crate::base::args::Args::synth("verified", &["v-1"], &[]), Some("cpd-3")).is_none());
         tick_at(&store, &Fake(RefCell::new(Some(State::Gone)), false), util::epoch_secs());
         assert_eq!(pass_state(&store), PassState::Running, "an earlier run's verdict is not this one's");
         assert!(raised_texts(&store)[0].contains("no verdict at"));
@@ -1753,7 +1753,7 @@ mod tests {
         let env = util::isolated("closing-v-verb");
         let store = staged_verifier(&env, 3600);
         put(&store, "v-1", Kind::Verifier, "holds\nBut I found a gap.\n");
-        let args = crate::Args::synth("verified", &["v-1"], &[("blocks", "true"), ("caption", "a gap")]);
+        let args = crate::base::args::Args::synth("verified", &["v-1"], &[("blocks", "true"), ("caption", "a gap")]);
         let (a, _) = verifier_args(&store, &args, Some("cpd-3")).unwrap();
         assert!(a.has("blocks") && !a.has("holds"), "the word typed wins");
         assert_eq!(a.get("caption").as_deref(), Some("a gap"));
@@ -1906,7 +1906,7 @@ mod tests {
         let file = env.path("exit.md");
         std::fs::write(&file, text).unwrap();
         let from = file.display().to_string();
-        let args = crate::Args::synth("submit", &["run"], &[("from", &from)]);
+        let args = crate::base::args::Args::synth("submit", &["run"], &[("from", &from)]);
         crate::cmd_submit::submit_from(store, &args, Some("check"), Some("cpd-4".into()))
     }
 
@@ -2013,9 +2013,9 @@ mod tests {
         let store = staged_check(&env);
         put(&store, &check_key(), Kind::Check, "hold\nNot yet.\n");
         let w = store.worklist("run").unwrap();
-        let args = crate::Args::synth("worklist", &["go", "run"], &[]);
+        let args = crate::base::args::Args::synth("worklist", &["go", "run"], &[]);
         assert!(check_args(&store, &args, "go", &w).is_none(), "a hold is not a go");
-        assert!(check_args(&store, &crate::Args::synth("worklist", &["hold", "run"], &[]), "hold", &w).is_some());
+        assert!(check_args(&store, &crate::base::args::Args::synth("worklist", &["hold", "run"], &[]), "hold", &w).is_some());
     }
 
     #[test]

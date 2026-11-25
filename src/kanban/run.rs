@@ -19,7 +19,7 @@ use super::{apply_key, collect, frame, Action, Ctx, Cursor, Mode, Scope};
 /// How long the footer keeps what it was told.
 const NOTE: Duration = Duration::from_secs(4);
 
-pub fn run(store: &Store, args: &crate::Args) -> i32 {
+pub fn run(store: &Store, args: &crate::base::args::Args) -> i32 {
     let index = Index::new(store.projects());
     let scope = match Scope::of(store, args, &index) {
         Ok(s) => s,

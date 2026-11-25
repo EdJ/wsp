@@ -21,7 +21,7 @@ use crate::overlap;
 use crate::resolve;
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// How much backlog to show. The brief is read every session and paid for in
 /// context every session; the tail is one `wsp ls` away.

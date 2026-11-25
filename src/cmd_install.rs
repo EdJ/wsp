@@ -63,7 +63,7 @@
 //! the default `--why` the next agent reads off the lock, the commit written
 //! into the record and quoted back by every later `-n`, the `installed … →`
 //! line, three `--json` bodies, the `keeps the old one` warning — whose other
-//! side is a running `wsp watch`'s [`crate::build_stamp`], so a tree and an
+//! side is a running `wsp watch`'s [`crate::base::stamp::build_stamp`], so a tree and an
 //! artefact were being compared against each other — and [`overtaken`], whose
 //! one exception is *the two commits are equal*. Fed a tree's HEAD that
 //! exception could fire on a coincidence, and let through the silent revert
@@ -110,7 +110,7 @@ use serde_json::{json, Value};
 use crate::cmd_verify::{agent_key, git, toplevel};
 use crate::store::Store;
 use crate::util;
-use crate::Args;
+use crate::base::args::Args;
 
 /// The one file every pane re-execs into.
 fn default_dest() -> PathBuf {
@@ -375,12 +375,12 @@ impl Built {
     /// One word for this build, the same one a `wsp watch` registers for
     /// itself: `c52f3c8`, `c52f3c8+dirty`, or empty.
     ///
-    /// Through [`crate::stamp_word`] rather than formatted here. Both sides of
+    /// Through [`crate::base::stamp::stamp_word`] rather than formatted here. Both sides of
     /// the comparison in [`stale_watchers`] have to be one shape, and this
     /// file keeping its own copy of the rule — over its own idea of the commit
     /// — is how they came to disagree about the same binary.
     fn stamp(&self) -> String {
-        crate::stamp_word(self.commit.as_deref().unwrap_or_default(), self.dirty)
+        crate::base::stamp::stamp_word(self.commit.as_deref().unwrap_or_default(), self.dirty)
     }
 
     /// Where `commit` came from, in one word, for the reader that is a script.
@@ -574,7 +574,7 @@ fn ask(bin: &Path) -> Option<Stamp> {
 /// 755` — which is how every install before this command was made — writes no
 /// record at all, and the bytes still answer.
 fn carried_by(dst: &Path) -> Option<String> {
-    ask(dst).map(|s| crate::stamp_word(&s.commit, s.dirty)).filter(|w| !w.is_empty())
+    ask(dst).map(|s| crate::base::stamp::stamp_word(&s.commit, s.dirty)).filter(|w| !w.is_empty())
 }
 
 /// What `doctor` says about the binary every pane re-execs into.
@@ -1947,7 +1947,7 @@ fn uninstall_manager(store: &Store, json_out: bool, p: &crate::util::Paint) -> i
 /// question a reader has is about the one that is now live.
 fn stale_watchers(store: &Store, ours: &Built) -> Vec<crate::cmd_watch::Registered> {
     // Both sides of this comparison are now what a binary says about itself: a
-    // watch registers [`crate::build_stamp`], and [`Built::stamp`] is the same
+    // watch registers [`crate::base::stamp::build_stamp`], and [`Built::stamp`] is the same
     // rule applied to the stamp read back out of the artefact. Built from the
     // tree instead, this named the wrong set in both directions — a watch
     // already running these bytes reported as keeping the old one, and one
@@ -2175,8 +2175,8 @@ mod tests {
         }
     }
 
-    fn line(argv: &[&str]) -> crate::Args {
-        crate::Args::parse(argv.iter().map(|s| (*s).to_string()).collect())
+    fn line(argv: &[&str]) -> crate::base::args::Args {
+        crate::base::args::Args::parse(argv.iter().map(|s| (*s).to_string()).collect())
     }
 
     /// The fault, at the altitude it happened at. `wsp install --why -` was
@@ -2729,7 +2729,7 @@ mod tests {
         let patched = provenance(&dirty_src, Some(repo.clone()));
         assert!(patched.dirty, "the +dirty half was dropped");
         assert_eq!(patched.stamp(), "be58dac+dirty");
-        assert_eq!(crate::stamp_word("be58dac", true), patched.stamp());
+        assert_eq!(crate::base::stamp::stamp_word("be58dac", true), patched.stamp());
         // The tree has files no commit holds — this one's own `src/lib.rs` is
         // committed, so it does not — but whatever it has, it is not this
         // binary's patch, and a list of them under `carries` would be the same

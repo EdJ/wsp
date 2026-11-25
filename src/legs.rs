@@ -56,7 +56,7 @@ use crate::model::{Policy, Task};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::verification::Ending;
-use crate::Args;
+use crate::base::args::Args;
 
 /// The heading the legs sit under on the row.
 pub(crate) const SECTION: &str = "Legs";

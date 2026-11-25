@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use crate::model::{Group, Status, Task, Worklist};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 #[cfg(test)]
 pub(crate) use crate::checks::{push, text};

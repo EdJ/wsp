@@ -79,7 +79,7 @@ use crate::model::Task;
 use crate::resolve::Index;
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// How an attempt ended, in the vocabulary the store already writes.
 ///

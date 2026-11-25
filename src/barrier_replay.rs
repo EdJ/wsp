@@ -17,7 +17,7 @@
 use crate::barrier::{Check, State};
 use crate::model::{Group, Worklist};
 use crate::store::Store;
-use crate::Args;
+use crate::base::args::Args;
 
 /// What the rule would have done to one barrier that held, or passed with
 /// follow-ups.

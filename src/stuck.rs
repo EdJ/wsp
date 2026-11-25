@@ -677,7 +677,7 @@ const USAGE: &str = "usage: wsp stuck <transcript.jsonl>…   the commands in th
 
 /// `wsp stuck FILE…`: the stalls in whole transcripts, one line each and a
 /// total, which is how the rate is counted (`wsp-397`).
-pub fn stuck(args: &crate::Args) -> i32 {
+pub fn stuck(args: &crate::base::args::Args) -> i32 {
     use crate::host::Host;
     if args.rest.is_empty() {
         eprintln!("{USAGE}");
