@@ -126,6 +126,10 @@ pub(crate) use crate::log::LANDED;
 /// `wsp land`, as before.
 pub(crate) const READY: &str = "wsp: ready";
 
+/// Written by `wsp submit` when the member's tree has nothing ahead of the
+/// trunk: the row's own account that it lands no commit (`wsp-777`).
+pub(crate) const NOTHING_TO_LAND: &str = "submit: nothing to land";
+
 /// The same marker on a **verifier's** row, naming the commit it was asked to
 /// read. A different word and the same shape, and the shape is what matters:
 /// [`landed`] reads both, because the question a reader is asking — "what is
@@ -2017,6 +2021,20 @@ fn unrecorded_landing(store: &Store, w: &Worklist, at: usize, pos: &Position) {
 /// somebody said anything about the row.
 pub(crate) fn landed(t: &Task) -> Option<String> {
     newest_commit(t, &[LANDED, READING])
+}
+
+/// Whether the member's newest submission said it lands no commit: its last
+/// [`NOTHING_TO_LAND`] line is newer than its last [`READY`] one (`wsp-777`).
+///
+/// **A `wsp: landed` line does not undo it.** The sweep records a branch that
+/// reached the trunk without `wsp land` — and a branch cut at the tip and never
+/// committed on is exactly that — so wsp-771's row carried a landed line at the
+/// trunk's own commit after it had said it had nothing. A commit the member
+/// really landed is placed by the reflog, which is asked first.
+pub(crate) fn landed_nothing(t: &Task) -> bool {
+    let Some(log) = t.section("Log") else { return false };
+    let newest = log.lines().filter(|l| l.contains(NOTHING_TO_LAND) || sha_after(l, READY).is_some()).last();
+    newest.is_some_and(|l| l.contains(NOTHING_TO_LAND))
 }
 
 /// The commit of the member's newest `wsp: landed` line (wsp-468: what a shared

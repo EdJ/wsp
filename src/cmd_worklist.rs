@@ -4155,7 +4155,7 @@ fn landed_lines(p: &Paint, g: &Group) -> Vec<String> {
     if g.landed.is_empty() {
         return Vec::new();
     }
-    let placed = g.landed.iter().filter(|e| e.commit.is_some()).count();
+    let placed = g.landed.iter().filter(|e| e.accounted()).count();
     let files: usize = g.landed.iter().map(|e| e.files.len()).sum();
     vec![p.dim(&format!(
         "landed: {} of {} member{} · {} file{}",
@@ -5710,11 +5710,15 @@ fn touched_lines(p: &Paint, t: &worklist::Touched) -> Vec<String> {
     }
     // One line, the commit shortened for reading, because this is a receipt and
     // not the record: the full hashes are on the group, where they are kept.
-    // `@?` is a member nobody could place, said in kind rather than left out.
+    // `@?` is a member nobody could place, said in kind rather than left out;
+    // a member that landed no commit by its own account says that (`wsp-777`).
     let said: Vec<String> = t
         .landed
         .iter()
         .map(|e| {
+            if e.no_commit {
+                return format!("{} no commit", e.member);
+            }
             let at: String =
                 e.commit.as_deref().map(|c| c.chars().take(7).collect()).unwrap_or_else(|| "?".into());
             format!("{}@{} {}", e.member, at, e.files.len())
@@ -5728,7 +5732,7 @@ fn touched_lines(p: &Paint, t: &worklist::Touched) -> Vec<String> {
 fn landed_json(landed: &[Landed]) -> serde_json::Value {
     json!(landed
         .iter()
-        .map(|e| json!({ "member": e.member, "commit": e.commit, "files": e.files }))
+        .map(|e| json!({ "member": e.member, "commit": e.commit, "files": e.files, "no_commit": e.no_commit }))
         .collect::<Vec<_>>())
 }
 
@@ -11060,6 +11064,37 @@ mod tests {
         );
     }
 
+    /// `wsp-777`: the narrower half of the same report. A member whose own
+    /// submission said it had nothing to land — daemon-ticks' wsp-771, a
+    /// sample — is not one nobody could read: the receipt says it landed no
+    /// commit, and only the member that never said anything stays unread.
+    #[test]
+    fn a_member_that_said_it_had_nothing_to_land_is_no_commit_not_unread() {
+        let (_env, store, repo) = grounded("no-commit");
+        member(&store, "wl-001", "review");
+        committed(&repo, "wl-001");
+        land(&repo, "wl-001");
+        member(&store, "wl-002", "review");
+        let mut t = store.find_task("wl-002").unwrap();
+        crate::log::note(&store, &mut t, crate::repair::NOTHING_TO_LAND).unwrap();
+        member(&store, "wl-003", "review");
+        run(&store, &["new", "batch", "b"]);
+        run(&store, &["add", "batch", "wl-001", "wl-002", "wl-003"]);
+        started(&store, "batch");
+
+        let w = store.worklist("batch").unwrap();
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        let st = state(&store, &w, &pos);
+        let t = barrier_evidence(&store, &w, &pos, &st).expect("all settled, and the gate still shut");
+        assert_eq!(t.overlap.unread, ["wl-003"], "only the one with no account of itself");
+        let lines = touched_lines(&Paint::plain(), &t);
+        let unread = lines.iter().find(|l| l.contains("could not be read back")).expect("wl-003 is still named");
+        assert!(!unread.contains("wl-002"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("wl-002 no commit") && l.contains("wl-003@?")), "{lines:?}");
+        let v = landed_json(&t.landed);
+        assert_eq!(v[1]["no_commit"], json!(true), "{v}");
+    }
+
     /// The machine half of the same evidence, under the key names `go --json`
     /// already established — present exactly where a walk ran, absent
     /// otherwise. A governor parsing this must not be able to read an empty
@@ -11083,7 +11118,7 @@ mod tests {
         assert_eq!(v["same_file"], json!([]), "the walk ran and found nothing shared");
         assert_eq!(
             v["landed"][0],
-            json!({ "member": "wl-001", "commit": null, "files": [] }),
+            json!({ "member": "wl-001", "commit": null, "files": [], "no_commit": false }),
             "design-only work is a plain entry, not an unreadable one"
         );
         assert_eq!(v["unread"], json!([]), "and unreadable means something narrower than no repository");
@@ -11113,8 +11148,9 @@ mod tests {
                 member: "wl-001".into(),
                 commit: Some("e3f1c2ade4b5960f8d21c7ba44f0e6d9a1b2c3d4".into()),
                 files: (0..11).map(|i| format!("src/dir{i}/file{i}.rs")).collect(),
+                no_commit: false,
             },
-            Landed { member: "wl-002".into(), commit: None, files: Vec::new() },
+            Landed { member: "wl-002".into(), commit: None, files: Vec::new(), no_commit: false },
         ];
 
         let drawn = landed_lines(&p, &g);
@@ -11128,7 +11164,7 @@ mod tests {
         );
 
         let solo = Group {
-            landed: vec![Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: vec!["one.rs".into()] }],
+            landed: vec![Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: vec!["one.rs".into()], no_commit: false }],
             ..Group::default()
         };
         let line = &landed_lines(&p, &solo)[0];

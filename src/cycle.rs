@@ -8173,6 +8173,68 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(spawned(), vec![("n-1".to_string(), "claude".to_string())]);
     }
 
+    /// `wsp-777`, daemon-ticks group 3: wsp-771 was a sample — install the
+    /// daemon, measure it — that held under its verifier and put no commit on
+    /// the trunk, beside members that did. Its barrier opens on the run's own
+    /// step, with no person's `go`, and the evidence the check reads names it as
+    /// having landed no commit rather than as a member nobody could read back.
+    #[test]
+    fn a_held_member_that_landed_no_commit_does_not_hold_its_barrier() {
+        let (env, store) = scratch("no-commit");
+        let repo = env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&repo).args(args).env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        crate::testkit::repo(&repo);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(&["add", "f"]);
+        git(&["commit", "--quiet", "-m", "one"]);
+        let mut p = crate::model::Project::new("m");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+
+        // m-1 committed and landed; m-2's branch was cut at the tip and never
+        // committed on, and its submission said so.
+        git(&["checkout", "--quiet", "-b", "m-1"]);
+        std::fs::write(repo.join("m-1.txt"), "mine").unwrap();
+        git(&["add", "m-1.txt"]);
+        git(&["commit", "--quiet", "-m", "m-1"]);
+        git(&["checkout", "--quiet", "master"]);
+        git(&["merge", "--ff-only", "--quiet", "m-1"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "m-2"]);
+        for id in ["m-1", "m-2"] {
+            task(&store, id, Status::Review);
+            let mut t = store.find_task(id).unwrap();
+            t.project = Some("m".into());
+            store.save_task(&t).unwrap();
+        }
+        let mut m1 = store.find_task("m-1").unwrap();
+        crate::log::note(&store, &mut m1, &format!("{} {sha} on master", crate::repair::LANDED)).unwrap();
+        let mut m2 = store.find_task("m-2").unwrap();
+        crate::log::note(&store, &mut m2, crate::repair::NOTHING_TO_LAND).unwrap();
+        let w = list(&store, &[(&["m-1", "m-2"], "claude"), (&["n-1"], "claude")]);
+
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        let _ = spawned();
+        step(&store, &w, &Blind);
+        assert!(
+            spawned().iter().any(|(id, _)| id == "run · barrier 1"),
+            "both hold, so the barrier is opened by the run itself"
+        );
+
+        let t = worklist::touched(&store, &["m-1".into(), "m-2".into()]);
+        assert!(t.overlap.unread.is_empty(), "m-2 said it had nothing; it was not unread: {:?}", t.overlap.unread);
+        assert_eq!(t.landed[0].commit.as_deref(), Some(sha.as_str()));
+        assert!(t.landed[1].no_commit && t.landed[1].commit.is_none(), "{:?}", t.landed[1]);
+    }
+
     /// The barrier of a one-member run, open and with its first start taken.
     fn barrier_open(tag: &str) -> (util::Isolated, Store, Worklist) {
         let (env, store) = scratch(tag);

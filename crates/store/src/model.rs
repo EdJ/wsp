@@ -2132,6 +2132,19 @@ pub struct Landed {
     /// rather than smoothed over into an empty file list.
     pub commit: Option<String>,
     pub files: Vec<String>,
+    /// The member put nothing on the trunk, by its own account (`wsp-777`):
+    /// its row's newest submission said "nothing to land" — a measure, an
+    /// install, an investigation. `commit` is `None` here too, and this is
+    /// what tells it apart from a member nobody could place. Written `@-`.
+    pub no_commit: bool,
+}
+
+impl Landed {
+    /// Whether the record says what this member put on the trunk: a commit, or
+    /// nothing by its own account. What a placed count counts.
+    pub fn accounted(&self) -> bool {
+        self.commit.is_some() || self.no_commit
+    }
 }
 
 impl Group {
@@ -2371,7 +2384,8 @@ fn member_weight(line: &str, members: &[String]) -> Option<(String, String)> {
 ///
 /// The grammar is tokens, because the payload is ids, hashes and paths and all
 /// three are whitespace-free: `<member>@<hash>` starts an entry — `@?` for the
-/// member the reflog could not place — every token after it until the next
+/// member the reflog could not place, `@-` for one that landed no commit by its
+/// own account — every token after it until the next
 /// entry is one of that member's files, and `·` separates entries for the
 /// human reading the file. A continuation line is the same walker run again,
 /// which is what makes wrapping free.
@@ -2383,8 +2397,9 @@ fn landed_push(acc: &mut Vec<Landed>, text: &str) {
         match tok.split_once('@') {
             Some((member, commit)) => acc.push(Landed {
                 member: member.to_string(),
-                commit: (commit != "?").then(|| commit.to_string()),
+                commit: (commit != "?" && commit != "-").then(|| commit.to_string()),
                 files: Vec::new(),
+                no_commit: commit == "-",
             }),
             None => {
                 if let Some(last) = acc.last_mut() {
@@ -2405,7 +2420,7 @@ fn landed_text(landed: &[Landed]) -> String {
         }
         out.push_str(&e.member);
         out.push('@');
-        out.push_str(e.commit.as_deref().unwrap_or("?"));
+        out.push_str(e.commit.as_deref().unwrap_or(if e.no_commit { "-" } else { "?" }));
         for f in &e.files {
             out.push(' ');
             out.push_str(f);
@@ -3795,12 +3810,13 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
     fn what_a_group_landed_round_trips_through_the_record() {
         let mut w = Worklist::new("batch", "Overnight batch");
         w.set_groups(&[Group {
-            members: vec!["wl-001".into(), "wl-002".into(), "wl-003".into()],
+            members: vec!["wl-001".into(), "wl-002".into(), "wl-003".into(), "wl-004".into()],
             verdict: "2026-08-23T09:00:00Z clean".into(),
             landed: vec![
-                Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: vec!["src/x.rs".into(), "src/y.rs".into()] },
-                Landed { member: "wl-002".into(), commit: Some("9b02dde".into()), files: Vec::new() },
-                Landed { member: "wl-003".into(), commit: None, files: Vec::new() },
+                Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: vec!["src/x.rs".into(), "src/y.rs".into()], no_commit: false },
+                Landed { member: "wl-002".into(), commit: Some("9b02dde".into()), files: Vec::new(), no_commit: false },
+                Landed { member: "wl-003".into(), commit: None, files: Vec::new(), no_commit: false },
+                Landed { member: "wl-004".into(), commit: None, files: Vec::new(), no_commit: true },
             ],
             ..Group::default()
         }]);
@@ -3810,6 +3826,8 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         let got = Worklist::from_doc(&fm::parse(&w.render()), "batch").groups();
         assert_eq!(got[0].landed, w.groups()[0].landed, "the whole mapping comes back");
         assert_eq!(got[0].landed[2].commit, None, "unplaced is a state, not an absence");
+        assert!(written.contains("wl-004@-"), "no commit is its own word, not `?`: {written}");
+        assert!(got[0].landed[3].no_commit && !got[0].landed[2].no_commit, "and it reads back as itself");
         assert_eq!(got[0].landed[1].files.len(), 0, "placed and empty is different from unplaced");
 
         // A long file list wraps on write; the continuation belongs to the
@@ -3817,7 +3835,7 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         let many: Vec<String> = (0..12).map(|i| format!("src/dir{i}/file{i}.rs")).collect();
         w.set_groups(&[Group {
             members: vec!["wl-001".into()],
-            landed: vec![Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: many }],
+            landed: vec![Landed { member: "wl-001".into(), commit: Some("e3f1c2a".into()), files: many, no_commit: false }],
             ..Group::default()
         }]);
         let got = Worklist::from_doc(&fm::parse(&w.render()), "batch").groups();

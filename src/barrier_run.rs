@@ -913,7 +913,7 @@ mod tests {
     }
 
     fn landed(member: &str, files: &[&str]) -> Landed {
-        Landed { member: member.into(), commit: None, files: files.iter().map(|f| f.to_string()).collect() }
+        Landed { member: member.into(), commit: None, files: files.iter().map(|f| f.to_string()).collect(), no_commit: false }
     }
 
     fn facts<'a>(stop: &'a str) -> Facts<'a> {

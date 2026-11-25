@@ -1161,6 +1161,7 @@ pub fn work_html(store: &Store, w: &Worklist, last: Option<&str>) -> String {
                 left_out.push(format!("{m} (group {}) is {status}", i + 1));
             }
             let (commit, files) = match g.landed.iter().find(|l| l.member == *m) {
+                Some(l) if l.no_commit => ("no commit".into(), String::new()),
                 Some(l) => (l.commit.clone().map(|c| c.chars().take(10).collect::<String>()).unwrap_or_else(|| "unplaced".into()), l.files.join(", ")),
                 None if g.landed.is_empty() && g.verdict.trim().is_empty() => ("pending (the barrier has not been passed)".into(), String::new()),
                 None => ("unplaced".into(), String::new()),

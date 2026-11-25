@@ -380,7 +380,7 @@ mod tests {
         w.set_groups(&[Group { members: vec!["pj-001".into()], ..Default::default() }]);
         w.set_status(WorklistStatus::Running);
         store.save_worklist(&w).unwrap();
-        let landed = vec![Landed { member: "pj-001".into(), commit: Some("x".into()), files: Vec::new() }];
+        let landed = vec![Landed { member: "pj-001".into(), commit: Some("x".into()), files: Vec::new(), no_commit: false }];
         (env, store, landed)
     }
 
