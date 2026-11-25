@@ -14,7 +14,7 @@ use crate::pieces::{
 };
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// The verbs this module answers to, each with the help it carries.
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
@@ -603,6 +603,10 @@ mod tests {
 
     fn scratch(tag: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("pieces-{tag}"));
+        // The engine's launches (`cycle::launch`) stand down in its own test
+        // build; this crate's tests run it as the binary does, and a launch
+        // here would run this harness as `wsp` (wsp-440).
+        std::env::set_var("WSP_NO_CYCLE", "1");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let mut t = Task::new("a row", "m-1");

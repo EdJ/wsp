@@ -109,6 +109,9 @@ mod tests {
     /// `ls --json --all` prints off the API).
     #[test]
     fn the_tasks_reading_and_the_heads_give_ls_json_all() {
+        // `ls`'s stage asks the backends about a doing row, which the engine's
+        // own test build skips: here it asks an isolated, empty one (wsp-440).
+        let _env = crate::util::isolated("readings-tasks");
         let store = crate::testkit::store("readings-tasks");
         let mut staged = Task::new("A staged row", "s-2");
         staged.status_raw = "doing".into();

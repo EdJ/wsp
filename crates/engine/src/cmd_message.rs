@@ -1,0 +1,4690 @@
+//! `wsp ask`, `wsp answer`, `wsp ack` — the return path.
+//!
+//! **The fault this closes, in one sentence Ed wrote on 2026-08-19:** *"the
+//! response from the governor to you was not sent back here, it's just sat at
+//! its tty output."*
+//!
+//! `wsp govern <scope> --tell` writes into a pane and reports `told: true`.
+//! That is a delivery receipt and there is no return path of any kind — the
+//! reply is whatever the receiving agent prints to a screen the sender cannot
+//! read. So for the whole of 2026-08-19 **a person was the transport**: every
+//! message the `wsp` seat got from the `worklist` seat arrived because Ed read
+//! one pane and pasted it into another. A shared-stash repair, a protocol about
+//! `panel/rows.rs`, three falsified hypotheses and a design correction, all
+//! hand-carried.
+//!
+//! # A verb, and why it is not merely a rule
+//!
+//! `wsp-095` left this open: is the reply path a verb, or is it a *rule* — that
+//! a seat answers on the task, never only in prose? The evidence says a verb,
+//! and the evidence is that **the rule was already in force and was already
+//! being followed when it failed.**
+//!
+//! `worklist-013` raised a flag asking whether it could land. The seat answered
+//! within minutes, by `wsp tell`; the agent acted, finished, landed and was
+//! despawned. **The flag stayed up for 2h14m** and came down by hand, while the
+//! seat was clearing something else. Nothing linked the answer to the question.
+//! The raiser was told and the record was not, and for two hours that seat's own
+//! watch reported a hand up on work that was finished. The custodian that wrote
+//! the rule broke it the same day, on its own instrument, and did not notice —
+//! because the answer and the record were two acts and only one of them was on
+//! the path of getting the work moving.
+//!
+//! So the thing being added is not a channel. It is that **the record happens
+//! as a consequence of answering rather than as a second act somebody
+//! remembers.** [`answer`] writes the task log first, closes the question, mints
+//! the reply and delivers it, and there is no ordering in which a person can do
+//! three of those and forget the fourth.
+//!
+//! # And why it is not a second message system
+//!
+//! `wsp-095` is explicit that a verb here must not become one. Four things it
+//! does not add, each of which it would have to for that to be true:
+//!
+//! - **No transport.** Delivery is [`crate::agent_commands::Kind::tell`] through
+//!   [`crate::cmd_agent::Sent`] and [`crate::cmd_agent::delivered`] — the exact
+//!   path `wsp tell` and `wsp govern --tell` take, so there is one delivery,
+//!   one idempotence window and one honest-reporting rule, not a fourth.
+//! - **No address book.** The addressee is [`crate::message::Waiting`], which
+//!   the asker wrote when it asked. Nobody chooses where a reply goes.
+//! - **No record.** `messages.json` and the question lifecycle are
+//!   `worklist-022`'s, landed and untouched here; this is its first consumer.
+//! - **No inbox an agent has to remember to read.** The answer lands on the
+//!   asker's task log, which every brief already injects. That is the one place
+//!   in wsp where task-prose injection is a feature rather than a cost.
+//!
+//! # What happens to `--tell`, since the brief asks
+//!
+//! Nothing. It stays exactly as it is, and the line between them is not
+//! politeness — it is **whether anything is owed back**. A governor telling an
+//! agent to stop is not a conversation, and a one-directional push to a pane is
+//! still right for direction, for a work order, and for prose. What changes is
+//! that the case where something *is* owed back now has a verb of its own, so
+//! `--tell` stops being the thing people reach for when they mean *answering*.
+//! That was the whole of the `worklist-013` failure: the answer went down the
+//! direction channel, which has no memory, and the question was left standing in
+//! the one that does.
+//!
+//! # Level, edge, or both — stated rather than assumed
+//!
+//! All three, and each does a job the other two cannot:
+//!
+//! - **The open question is a LEVEL.** [`crate::message::open_questions`] is a
+//!   full read, correct after any disconnection, and it self-clears when the
+//!   question closes. That is what a watcher subscribes to, per `wsp-095`
+//!   Part 13, and it is why the hand goes down here *because the question
+//!   closed* rather than because somebody remembered to lower it. 2h14m is the
+//!   measured cost of the other arrangement. The subscriber is
+//!   [`crate::cmd_watch::Kind::Unanswered`], and the population it reads is
+//!   [`crate::message::Message::wants_answering`] — the same one [`open`]
+//!   lists, asked once, so the verb and the watch cannot come to disagree about
+//!   whether the fleet is quiet.
+//! - **The answer is an EDGE.** `message-answered` in `events.jsonl`, so
+//!   `~/wsp/hooks/on-message-answered` is a desktop notification away and a
+//!   watcher's liveness stream carries it. An answer is a moment and cannot be
+//!   recomputed.
+//! - **The line on the task is neither.** It is the record, and it is the only
+//!   one of the three that outlives the worktree and the panes.
+//!
+//! # Delivery, against Part 5's hard refusal
+//!
+//! *Nothing may push text into a working agent's composer, except `stop`.* This
+//! pushes, and it is inside the refusal rather than an exception to it, because
+//! **the party being pushed to is the one that is sitting still** — that is what
+//! [`crate::message::Waiting`] means and it is the whole cost of an open
+//! question. The two states where a push is a hazard are checked exactly as
+//! `wsp tell` checks them: a `blocked` pane has a dialog holding the keyboard
+//! and is refused, and a pane mid-turn queues, which [`crate::cmd_agent::delivered`]
+//! reports as *delivered, no turn seen* rather than as success. Either way the
+//! answer is already on the task before a byte is sent, so a delivery that does
+//! not land is late and never lost.
+
+use serde_json::json;
+
+use crate::choices::Choices;
+use crate::message::{self, About, Kind, Landed, Message, Party, Shape, Waiting};
+use crate::store::Store;
+use crate::util::{self, Paint};
+use crate::base::args::Args;
+
+/// `wsp ask <id> "the question"` — a question about one task, with a return
+/// path.
+///
+/// Bare, it lists what is open, the way `wsp flag` does: the question a person
+/// asks from a shell is the same one a panel answers by drawing the section, and
+/// it should not need a second verb.
+///
+/// # Why the subject is required
+///
+/// `wsp flag <id>` and `wsp tell <id>` both take an id first and this matches
+/// them, but the reason here is stronger than consistency: **the subject is
+/// what gives the answer somewhere to live.** For an agent that is its own task
+/// and the subject is a detail; for a seat, which holds no task at all, the
+/// subject is the only durable home an answer has — see
+/// [`crate::message::homes_to`]. A question wsp cannot land an answer on is
+/// refused at the point of asking rather than discovered at the point of
+/// answering, which is the difference between a sentence now and an agent
+/// waiting for one.
+///
+/// If there is genuinely no task — if the thing being said is not owed an
+/// answer at all — that is what `wsp tell` and `wsp govern --tell` are still
+/// for. Prose with nothing owed back does not need a record.
+pub fn ask(store: &Store, args: &Args) -> i32 {
+    ask_with(store, args, &RealClock)
+}
+
+/// `wsp ask <row> --of <name> "…" --then "<step>"` (`wsp-098`) — a decision
+/// waiting on a named other party, who has no access to this store.
+///
+/// Recorded as an ask from the person (`from: human`) with `of: <name>`
+/// (lower-case) and `then: <step>`. Open, it is follow-up; once `wsp answer
+/// <id> --as <name>` closes it, it is needs-you with `then` as its action.
+/// Nobody is woken: no seat is asked. A reader tells it from a seat's ask by
+/// the `of` field; open or answered by `state`, and `answered_by` /
+/// `relayed_by` once answered.
+fn ask_of(store: &Store, args: &Args) -> i32 {
+    let name = args.get("of").unwrap_or_default().trim().to_lowercase();
+    if name.is_empty() {
+        eprintln!("wsp: --of takes the name of the party asked, e.g. `--of ed`");
+        return 2;
+    }
+    let then = args.get("then").unwrap_or_default().trim().to_string();
+    if then.is_empty() {
+        eprintln!("wsp: an ask --of {name} needs --then \"<step>\": what is done once {name} has answered");
+        return 2;
+    }
+    let Some(row) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp ask <row> --of <name> \"…\" --then \"<step>\"");
+        return 2;
+    };
+    let task = match store.task_or_why(&row) {
+        Ok(t) => t,
+        Err(why) => {
+            eprintln!("{why}");
+            return 1;
+        }
+    };
+    let text = match crate::cmd_agent::prose(args, 1) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    let mut q = Message::question(a_person(), Kind::Note, &text, Waiting::new("", &task.id)).about(About::Task(task.id.clone()));
+    q.of = Some(name.clone());
+    q.then = Some(then);
+    if let Err(e) = message::raise(store, &q) {
+        eprintln!("wsp: {e}");
+        return 1;
+    }
+    if args.json() {
+        println!("{}", json!({ "id": q.id, "about": task.id, "of": name, "then": q.then }));
+    } else {
+        println!("? {}  asked of {name} · waiting · `wsp answer {} --as {name} \"…\"` records the reply", q.id, q.id);
+    }
+    0
+}
+
+/// [`ask`] with the clock a `--wait` reads passed in, so a test can be time.
+fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
+    if args.has("cancel") {
+        return cancel(store, args);
+    }
+    if args.has("of") || args.has("then") {
+        return ask_of(store, args);
+    }
+    let Some(needle) = args.rest.first().cloned() else {
+        return open(store, args);
+    };
+    // A message id and nothing to say is the verb a long question points at:
+    // `for_a_governor` and the `unanswered` line both end `wsp ask <id>` when
+    // they had to cut, so a seat never has to read the asker's screen or its
+    // `--from` file to learn what it is being asked.
+    if args.text(1).trim().is_empty() && args.get("from").is_none() && needle.starts_with("m-") {
+        return whole(store, &needle, args, clock);
+    }
+
+    // A task, or — for a barrier check, which holds none (`wsp-230`) — the
+    // worklist it is checking, whose log is then where the answer lives.
+    let subject = match store.task_or_why(&needle) {
+        Ok(t) => Ok(t),
+        Err(why) => match store.worklist(&needle) {
+            Some(w) => Err(w),
+            None => {
+                eprintln!("{why}");
+                eprintln!("     a question needs a task or a worklist to land its answer on · `wsp tell` is for prose");
+                return 1;
+            }
+        },
+    };
+    // `--wait` (`wsp-300`): block on the answer. Read and checked first too, so
+    // a bad `--timeout` is a sentence and not a question left open.
+    let wait = match Wait::read(args) {
+        Ok(w) => w,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
+    };
+    // The structured part, if any (`wsp-299`): read and checked before anything
+    // is raised, so a malformed file is a sentence and not a half-asked question.
+    if args.has("set") && args.has("choices") {
+        eprintln!("wsp: --set is a set of questions and --choices one ask — send one");
+        return 2;
+    }
+    let choices = match (args.get("choices"), args.get("set")) {
+        (None, None) => None,
+        (Some(src), _) => match json_source(&src).and_then(|v| Choices::parse(&v)) {
+            Ok(c) => Some(c),
+            Err(why) => {
+                eprintln!("wsp: --choices: {why}");
+                return 2;
+            }
+        },
+        (None, Some(src)) => match json_source(&src).and_then(|v| set_choices(&v)) {
+            Ok(c) => Some(c),
+            Err(why) => {
+                eprintln!("wsp: --set: {why}");
+                return 2;
+            }
+        },
+    };
+    // With choices the sentence may be left out: the questions are it.
+    let text = match (&choices, args.text(1).trim().is_empty() && args.get("from").is_none()) {
+        (Some(c), true) => c.sentence(),
+        _ => match crate::cmd_agent::prose(args, 1) {
+            Ok(t) => t,
+            Err(code) => return code,
+        },
+    };
+    // The line the flight view names it by (`wsp-276`), checked as `add`'s is.
+    // `--from` is the question's, so the caption has no file of its own.
+    let caption = match crate::caption::flag(args, false) {
+        Ok(c) => c.filter(|c| !c.is_empty()),
+        Err(code) => return code,
+    };
+
+    let (me, pane) = whoami(store);
+    let held = pane
+        .as_deref()
+        .and_then(|p| store.bindings().get(p).cloned())
+        .and_then(|b| b.get("task_id").and_then(|t| t.as_str()).map(str::to_string))
+        .filter(|id| store.task(id).is_some())
+        .unwrap_or_default();
+
+    let kind = match args.get("kind").as_deref().map(Kind::parse) {
+        Some(Some(k)) => k,
+        Some(None) => {
+            eprintln!("wsp: --kind is one of stop, direction, note, fyi");
+            return 2;
+        }
+        // A question's default is the quiet one, and `stop` must be typed:
+        // `wsp-095`'s rule is that every verb defaults to the quietest kind it
+        // can honestly be.
+        None => Kind::Note,
+    };
+
+    // About the list's group when it can say which: `--group N`, or the group
+    // the asking seat is checking.
+    let (about, subject_id, seat, to) = match &subject {
+        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cmd_govern::answering_seat(store, t), addressed(store, t)),
+        Err(w) => {
+            let group = args.get("group").and_then(|g| g.parse::<usize>().ok()).or_else(|| {
+                pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p)).filter(|(l, _)| *l == w.id).map(|(_, at)| at)
+            });
+            let about = match group {
+                Some(g) => About::Group { scope: w.id.clone(), group: g },
+                None => About::Scope(w.id.clone()),
+            };
+            let governors = store.governors();
+            let index = crate::resolve::Index::new(store.projects());
+            let seat = crate::governors::seat_for(&governors, &index, Some(&w.id), None, None);
+            let to = match &seat {
+                Some(s) => asked_of(&governors, s),
+                None => "asked of every panel — no governor above it".into(),
+            };
+            (about, w.id.clone(), seat, to)
+        }
+    };
+
+    // **A seat asking about its own work asks the seat above it** (`wsp-263`).
+    // The walk reaches the asker first — a list governor asking about its list
+    // or a member of it, a project's about its project — and handing it to
+    // itself would wake it on its own words. So the walk goes on one step past
+    // it: a list's seat to its home project's governor, a project's to its
+    // parent's, and the person only when nobody on that walk is seated. Before
+    // this a list governor's question went to the person, past the custodian of
+    // the project the list was run for.
+    let own = seat.as_ref().map(|s| s.scope.clone()).filter(|s| me.scope() == Some(s.as_str()));
+    let (seat, to) = match &own {
+        Some(scope) => {
+            let above = crate::worklist::seat_above_in(store, scope);
+            let to = match &above {
+                Some(s) => format!(
+                    "asked of the {} governor, above {scope} · {}",
+                    s.scope,
+                    crate::cmd_govern::room_of(&store.governors(), &s.scope)
+                ),
+                None => to,
+            };
+            (above, to)
+        }
+        None => (seat, to),
+    };
+
+    // The primary interface's every question is the person's (`wsp-279`): it
+    // is where the person sits, so a seat on the walk that answered it would be
+    // answering the person's own side of the conversation — and it joins
+    // compound's *Require Attention* only as `for: "person"`.
+    let for_person = args.has("person") || me.scope().is_some_and(crate::governors::is_primary);
+    let mut q = Message::question(
+        me.clone(),
+        kind,
+        &text,
+        Waiting::new(pane.as_deref().unwrap_or_default(), &held),
+    )
+    .about(about);
+    q.caption = caption.map(|text| crate::caption::Caption { text, from: "authored" });
+    // **Whose answer it waits on, written now** (`wsp-275`). The seat that
+    // answers for the subject, or the person: asked with `--person`, about a
+    // row no seat answers for, or by a seat with nobody seated above it — a
+    // governor at the top of its walk asking about its own work is asking the
+    // person (`own`, above, is the step it takes first). `for` was null on every plain ask
+    // before this, and the flight view could not tell a governor's question
+    // from Ed's (compound-490's, which went to ux-next).
+    match seat.as_ref().filter(|s| !for_person && me.scope() != Some(s.scope.as_str())) {
+        Some(s) => q.for_seat = Some(s.scope.clone()),
+        None => q = q.for_the_person(),
+    }
+
+    if let Some(c) = choices {
+        // Choices are buttons for the person. A seat's question is answered in
+        // words by a seat, and an answer that had to be one of a list would
+        // be a rule nobody asked the seat to learn.
+        if !q.for_person {
+            eprintln!("wsp: --choices and --set are for a question to the person — add --person");
+            return 2;
+        }
+        // §26.8 D3: how long the question is held, and from when. Only with
+        // a timeout, and only where there are choices to carry it.
+        q.choices = Some(match wait.timeout {
+            Some(secs) => c.held(&q.at, secs),
+            None => c,
+        });
+    }
+    if wait.on {
+        // The answer comes back through this process, and only the person
+        // gives one: a seat's question is answered in words by a seat, to the
+        // composer, which is what `--wait` exists to avoid.
+        if !for_person {
+            eprintln!("wsp: --wait is for a question to the person — add --person");
+            return 2;
+        }
+        q.awaited = Some(message::Awaited::here());
+    }
+
+    // The guarantee this verb makes, checked before the record exists rather
+    // than reported after it does: there is no path here by which an answer can
+    // be written and not routed.
+    if message::homes_to(store, &q).is_none() {
+        eprintln!("wsp: an answer to that would have nowhere to live");
+        eprintln!("     {subject_id} is not a task or a worklist this store holds");
+        return 1;
+    }
+
+    if let Err(e) = message::raise(store, &q) {
+        eprintln!("wsp: {e}");
+        return 1;
+    }
+    if q.for_person {
+        asked_of_the_person(store, &q, &subject_id);
+    }
+
+    // **The seat, now, and not on the next pass.** `wsp-146`: the record being
+    // open was never the same thing as the governor having the question. The
+    // attention pass derives `unanswered` for it within a minute and the wake
+    // path delivers it, which is the whole mechanism — but it meant the words
+    // sat in a file for up to a tick before they were anywhere, and this verb
+    // is the one thing in the system whose entire purpose is getting a sentence
+    // to a governor. So the question goes into that seat's spool here, inside
+    // the lock, and the same [`crate::wake`] delivery the daemon uses is asked
+    // once before the verb returns.
+    //
+    // With no seat above the task there is nobody to hold it and the receipt
+    // says so, which is the one case where *asked of every panel* is the whole
+    // answer — nothing is lost, because a level nobody is addressee of is the
+    // hook's audience and every panel draws it.
+    // `map`, not `and_then`: `wake::say` no longer answers "is there a seat
+    // here" — it spools and reports, because a vacancy is later, not nowhere.
+    //
+    // A question for the person still goes to the seat, because a governor
+    // that does not know Ed owes something cannot say so when he is talking to
+    // it — unless that seat is the one asking, which would wake it on its own
+    // words.
+    let report = seat.as_ref().filter(|s| !(q.for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
+        crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
+    });
+
+    if wait.on {
+        eprintln!("? {}  asked of the person · waiting for the answer · the question stays open if this is stopped", q.id);
+        return wait_and_report(store, &q.id, wait.timeout, args, clock);
+    }
+
+    let home = message::homes_to(store, &q).unwrap_or_default();
+    if args.json() {
+        println!(
+            "{}",
+            json!({ "id": q.id, "about": subject_id, "waiting": held, "pane": pane, "lands_on": home,
+                    "seat": seat.as_ref().map(|s| &s.scope), "for": q.to_json()["for"], "caption": q.caption().json(),
+                    "held": report.as_ref().map(|r| r.held), "why": report.as_ref().map(|r| r.why.clone()),
+                    "choices": q.to_json()["choices"] })
+        );
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}  {}", p.red("?"), p.bold(&q.id), q.title());
+    println!("  {}", p.dim(&format!("about {subject_id} · answered onto {home}")));
+    match q.for_person {
+        true => {
+            if !for_person {
+                let why = match &own {
+                    Some(_) => "the seat that answers for it is the one asking, and none above it is seated".to_string(),
+                    None => format!("no seat answers for {subject_id}"),
+                };
+                println!("  {}", p.dim(&why));
+            }
+            println!("  {}", p.dim("asked of the person · `wsp yours` lists it · only the person may answer it"));
+            if let Some(c) = &q.choices {
+                match c.kind() {
+                    "set" => println!(
+                        "  {}",
+                        p.dim(&format!("set · {}  · answered per question with `wsp answer {} --question H --choice L`, ended by the last answer", answered_of(c), q.id))
+                    ),
+                    _ => println!("  {}", p.dim(&format!("{} · answered with `wsp answer {} --choice …`: {}", c.kind(), q.id, c.options_line()))),
+                }
+            }
+            if let Some(holds) = unblocks(store, &q) {
+                println!("  {}", p.dim(&format!("holds {holds}")));
+            }
+        }
+        false => {
+            println!("  {}", p.dim(&to));
+            println!("  {}", p.dim(&format!("wsp answer {} \"…\" closes it and comes back here", q.id)));
+        }
+    }
+    // Where it went, and when it will arrive — `wsp-146`'s receipt. A verb whose
+    // whole effect is on somebody else's screen has to name the screen; the part
+    // that is new here is the *when*, because for the first time the honest
+    // answer is sometimes "later", and an agent that cannot tell later from
+    // never is how a question sits open for a night.
+    if let Some(r) = &report {
+        println!("  {}", r.said(&format!("the {} seat", r.scope), &p));
+    }
+    0
+}
+
+/// A set's filing: the file is the set, and its kind is `set`.
+fn set_choices(v: &serde_json::Value) -> Result<Choices, String> {
+    let Some(o) = v.as_object() else {
+        return Err("a set is a JSON object: {title, intro?, questions: […]}".into());
+    };
+    if o.get("kind").is_some_and(|k| k != "set") {
+        return Err("a set's kind is `set`, or left out".into());
+    }
+    let mut o = o.clone();
+    o.insert("kind".into(), "set".into());
+    Choices::parse(&serde_json::Value::Object(o))
+}
+
+/// "n of m answered", for a set.
+fn answered_of(c: &Choices) -> String {
+    let (n, m) = c.set_progress();
+    format!("{n} of {m} answered")
+}
+
+/// The question as it goes to the seat, and the return path with it.
+///
+/// **Composed here rather than left to the wake's own rendering**, because the
+/// governor's line is the only place the answer will ever be offered from: an
+/// `unanswered` level names `wsp answer <id>` in its detail, which is right for
+/// a reader reading a column and is useless to an agent deciding whether it can
+/// act in the next thirty seconds. So: who sent it, what it wants, and the two
+/// commands that finish it.
+///
+/// **`wsp ask` and not `wsp flag` is named in the last line**, and that is the
+/// row's third requirement — one verb, chosen out of what exists because it is
+/// the one with a return path. Every other spelling still works and lands in the
+/// same spool; this line is what a governor reads to learn which one to reach for.
+pub fn for_a_governor(q: &Message) -> String {
+    let about = match &q.about {
+        About::Task(t) => t.clone(),
+        About::Group { scope, group } => format!("barrier {group} of {scope}"),
+        About::Scope(s) => s.clone(),
+        About::Nothing => "this work".into(),
+    };
+    format!(
+        "{by} asked about {about}:\n\n{body}\n\n\
+         answer with `wsp answer {id} \"…\"` — it lands on the asker's task and closes this\n\
+         `wsp ask` with no id lists every question still open · `wsp watch --drain` shows what \
+         this seat is owed",
+        by = q.from.byline(),
+        body = as_typed(q),
+        id = q.id,
+    )
+}
+
+/// How much of a question is typed at a seat before it is cut.
+///
+/// **A question arrives whole, or says it did not.** The cut used to be
+/// [`Message::title`] — the first line — so a three-paragraph `wsp ask` whose
+/// choice was in the last paragraph reached the governor as its opening and a
+/// `wsp answer` hint, and the governor went to the asker's pane or `--from`
+/// file to learn what it was being asked (`wsp-170`). Past this length a
+/// governor's composer is better served by the verb that prints it, but the
+/// question line is never what is lost.
+const TYPED_WHOLE: usize = 1500;
+
+/// Of each end of a cut question, how much is kept. A question's choice is
+/// nearly always in its last paragraph and its subject in its first.
+const KEPT: usize = 400;
+
+/// The question as it is typed: whole when it is short, and otherwise its first
+/// and last paragraphs with the verb that prints the rest. Never silently cut.
+fn as_typed(q: &Message) -> String {
+    let text = q.text.trim();
+    if text.chars().count() <= TYPED_WHOLE {
+        return text.to_string();
+    }
+    let paras: Vec<&str> = text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()).collect();
+    let (first, last) = (paras.first().copied().unwrap_or(text), paras.last().copied().unwrap_or(text));
+    let kept = |p: &str, from_end: bool| -> String {
+        let n = p.chars().count();
+        match (n <= KEPT, from_end) {
+            (true, _) => p.to_string(),
+            (false, false) => util::truncate(p, KEPT),
+            (false, true) => format!("…{}", p.chars().skip(n - KEPT + 1).collect::<String>()),
+        }
+    };
+    let verb = format!("`wsp ask {}` prints the whole question", q.id);
+    match paras.len() {
+        0 | 1 => format!("{}\n[{verb}]", kept(first, false)),
+        _ => format!("{}\n\n[… {verb} …]\n\n{}", kept(first, false), kept(last, true)),
+    }
+}
+
+/// `wsp ask <message-id>` — one question, whole.
+fn whole(store: &Store, needle: &str, args: &Args, clock: &dyn Clock) -> i32 {
+    let q = match find(store, needle) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    // `--wait` here is the retry after a timeout: wait on the question that
+    // stayed open, or read the answer that came meanwhile.
+    match Wait::read(args) {
+        Ok(Wait { on: true, timeout }) => {
+            if !q.for_person || q.is_reply() {
+                eprintln!("wsp: --wait is for a question to the person; {} is not one", q.id);
+                return 2;
+            }
+            // Taking it up again is the waiter's mark on the record; a closed
+            // question has nothing to mark and is read straight away.
+            if q.is_open() {
+                if let Err(e) = message::await_by(store, &q.id, message::Awaited::here()) {
+                    eprintln!("wsp: {e}");
+                    return 1;
+                }
+                eprintln!("? {}  waiting for the answer · the question stays open if this is stopped", q.id);
+            }
+            return wait_and_report(store, &q.id, timeout, args, clock);
+        }
+        Ok(_) => {}
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 2;
+        }
+    }
+    if args.json() {
+        println!("{}", q.to_json());
+        return 0;
+    }
+    let p = Paint::new();
+    println!("{} {}", p.red("?"), p.bold(&q.id));
+    println!("  {}", p.dim(&waiting_line(&q)));
+    println!();
+    println!("{}", q.text.trim());
+    if let Some(c) = q.choices.as_ref().filter(|c| c.kind() == "set") {
+        print_set(&p, c);
+    }
+    if q.is_open() && q.choices.as_ref().is_some_and(|c| c.kind() == "set") {
+        println!();
+        println!("{}", p.dim(&format!("wsp answer {} --question H --choice L saves one · the last one ends it", q.id)));
+    } else if q.is_open() {
+        println!();
+        println!("{}", p.dim(&format!("wsp answer {} \"…\" closes it and reaches whoever asked", q.id)));
+    } else if let Some(h) = q.closing() {
+        // What a `--wait` that timed out comes back to read.
+        println!();
+        match h.act {
+            message::Act::Answered => println!("{}", p.dim(&format!("answered by {}:\n{}", h.by.byline(), told(&q)))),
+            _ => println!("{}", p.dim(&format!("abandoned by {}: {}", h.by.byline(), h.note.trim()))),
+        }
+    }
+    0
+}
+
+/// A set, whole: its intro, each question with its options, the recommended
+/// one marked, and the answer saved so far.
+fn print_set(p: &Paint, c: &Choices) {
+    let j = c.json();
+    println!();
+    if let Some(i) = j["intro"].as_str().filter(|i| !i.trim().is_empty()) {
+        println!("{}\n", i.trim());
+    }
+    println!("{}", p.dim(&answered_of(c)));
+    let answers = j.get("answers").and_then(|a| a.as_object()).cloned().unwrap_or_default();
+    for (n, q) in j["questions"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
+        let header = q["header"].as_str().unwrap_or_default();
+        println!("\n{}. {} — {}", n + 1, p.bold(header), q["question"].as_str().unwrap_or_default());
+        let rec = q["recommended"].as_str();
+        for o in q["options"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            let label = o["label"].as_str().unwrap_or_default();
+            let mark = if rec == Some(label) { "  ← recommended" } else { "" };
+            println!("   · {label}{mark}  {}", o["description"].as_str().unwrap_or_default());
+        }
+        if let Some(w) = q["why"].as_str() {
+            println!("   {}", p.dim(&format!("why: {w}")));
+        }
+        match answers.get(header) {
+            Some(a) => {
+                let picks: Vec<&str> = a["pick"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                let mut said = match a["other"].as_str() {
+                    Some(w) => format!("Other — {w}"),
+                    None => picks.join(", "),
+                };
+                if let Some(nt) = a["note"].as_str().filter(|n| !n.is_empty()) {
+                    said.push_str(&format!(" · note: {nt}"));
+                }
+                println!("   answered: {said}  ({})", a["decision"].as_str().unwrap_or_default());
+            }
+            None => println!("   {}", p.dim("not answered")),
+        }
+    }
+}
+
+// ---- `wsp ask --wait`: the tool call that returns with the answer -----------
+
+/// `--wait` and `--timeout`, as given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Wait {
+    on: bool,
+    /// Seconds, when the wait is bounded.
+    timeout: Option<u64>,
+}
+
+impl Wait {
+    fn read(args: &Args) -> Result<Wait, String> {
+        let on = args.has("wait");
+        let timeout = match args.get("timeout") {
+            None => None,
+            Some(t) => match t.trim().parse::<u64>() {
+                Ok(0) | Err(_) => return Err(format!("--timeout is a number of seconds, more than none — not `{t}`")),
+                Ok(secs) if on => Some(secs),
+                Ok(_) => return Err("--timeout bounds a --wait; there is nothing here to time out".into()),
+            },
+        };
+        Ok(Wait { on, timeout })
+    }
+}
+
+/// What the wait ended with.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Answered(Message),
+    Abandoned(Message),
+    /// The timeout passed with the question still open (and no longer
+    /// awaited: [`message::release`] took the mark off).
+    TimedOut,
+}
+
+/// Time, as the wait reads it: a seam so a test can be the clock.
+trait Clock {
+    fn now_ms(&self) -> u64;
+    fn sleep_ms(&self, ms: u64);
+}
+
+struct RealClock;
+
+impl Clock for RealClock {
+    fn now_ms(&self) -> u64 {
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// How often the record is looked at. An answer is a person's act, so half a
+/// second is not felt, and the read is one small file.
+const POLL_MS: u64 = 500;
+
+/// Block until the question closes or `timeout` seconds pass.
+///
+/// **The last look is the release.** A timeout does not read the record and
+/// then give up: [`message::release`] takes the waiter's mark off under the
+/// lock and hands back the record as it stands, so an answer that landed
+/// between the last poll and the deadline is returned, not lost. The same lock
+/// is what [`deliver`] relies on in the other direction: an answer is typed
+/// at the composer only when no live waiter was marked on the question at the
+/// moment it closed.
+fn wait_for(store: &Store, id: &str, timeout: Option<u64>, clock: &dyn Clock) -> Result<Ended, String> {
+    let deadline = timeout.map(|s| clock.now_ms().saturating_add(s.saturating_mul(1000)));
+    loop {
+        let q = store.message(id).ok_or_else(|| format!("no message `{id}` any more"))?;
+        if !q.is_open() {
+            return Ok(ended(q));
+        }
+        let now = clock.now_ms();
+        if let Some(d) = deadline {
+            if now >= d {
+                let q = message::release(store, id).map_err(|e| e.to_string())?;
+                return Ok(match q.is_open() {
+                    true => Ended::TimedOut,
+                    false => ended(q),
+                });
+            }
+            clock.sleep_ms(POLL_MS.min(d - now));
+        } else {
+            clock.sleep_ms(POLL_MS);
+        }
+    }
+}
+
+fn ended(q: Message) -> Ended {
+    match q.closing().map(|h| h.act) {
+        Some(message::Act::Answered) => Ended::Answered(q),
+        _ => Ended::Abandoned(q),
+    }
+}
+
+/// An answered question, as the waiting agent reads it on stdout. See
+/// [`Choices::told`] for a structured one; a question with none is its words.
+fn told(q: &Message) -> String {
+    let Some(h) = q.closing().filter(|h| h.act == message::Act::Answered) else {
+        return String::new();
+    };
+    match (&q.choices, &h.choice) {
+        (Some(c), Some(v)) => c.told(v),
+        _ => h.note.trim().to_string(),
+    }
+}
+
+/// Wait, print, and say how it ended in the exit code: 0 with the answer on
+/// stdout, 3 with the reason on stderr for an abandon or a timeout.
+///
+/// **The wait never outlives the tool call that holds it** (`wsp-469`). A seat
+/// runs this inside a shell tool call with a 600 s limit, and a wait the limit
+/// kills leaves nothing to take the answer: the waiter's mark is a dead pid, the
+/// person's answer is held for a seat that reads `working` and typed only at its
+/// next idle, minutes late. So the wait ends itself at [`TOOL_SLICE`] with the
+/// question still open and the waiter's mark taken off under the lock
+/// ([`message::release`], which returns an answer that landed at the deadline),
+/// and says to ask again. A longer `--timeout` is cut to it; the question's own
+/// expiry (`--choices`) is the person's, and is not touched.
+fn wait_and_report(store: &Store, id: &str, timeout: Option<u64>, args: &Args, clock: &dyn Clock) -> i32 {
+    let sliced = timeout.is_none_or(|t| t > TOOL_SLICE);
+    let bound = Some(timeout.map_or(TOOL_SLICE, |t| t.min(TOOL_SLICE)));
+    let ended = match wait_for(store, id, bound, clock) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    };
+    if sliced && ended == Ended::TimedOut {
+        eprintln!(
+            "wsp: still waiting on {id} after {TOOL_SLICE}s — nobody has answered; the tool call would end at 600s, so this one ends now. \
+             It stays open: run `wsp ask {id} --wait` again at once"
+        );
+        if args.json() {
+            println!("{}", json!({ "id": id, "outcome": "still-waiting", "after": TOOL_SLICE }));
+        }
+        return 3;
+    }
+    report_wait(store, id, &ended, timeout, args)
+}
+
+/// How long one `--wait` holds a shell command: under the 600 s a seat's tool
+/// call is ended at, with a minute for the seat to ask again.
+const TOOL_SLICE: u64 = 540;
+
+fn report_wait(store: &Store, id: &str, ended: &Ended, timeout: Option<u64>, args: &Args) -> i32 {
+    // The answer has come back through the tool call; a copy typed at the
+    // composer later would be the second delivery. Only a reply held for an
+    // asker busy at the time is such a copy (a `wsp ask <mid> --wait` retry
+    // after a timeout), and it is ended here.
+    let settle = |q: &Message| {
+        for r in message::held_replies(store).into_iter().filter(|r| r.reply_to.as_deref() == Some(q.id.as_str())) {
+            let pane = route(store, r.waiting.as_ref());
+            let _ = message::unheld(store, &r.id, &pane, message::Act::Noted, "returned through `wsp ask --wait`; not typed");
+        }
+    };
+    match ended {
+        Ended::Answered(q) => {
+            settle(q);
+            let text = told(q);
+            if args.json() {
+                println!("{}", json!({ "id": q.id, "outcome": "answered", "answer": text, "closed": q.closed_json(), "choices": q.to_json()["choices"] }));
+            } else {
+                println!("{text}");
+            }
+            0
+        }
+        Ended::Abandoned(q) => {
+            settle(q);
+            let (by, why) = q.closing().map(|h| (h.by.byline(), h.note.trim().to_string())).unwrap_or_default();
+            eprintln!("wsp: {} was abandoned by {by}: {why}", q.id);
+            if args.json() {
+                println!("{}", json!({ "id": q.id, "outcome": "abandoned", "reason": why, "closed": q.closed_json() }));
+            }
+            3
+        }
+        Ended::TimedOut => {
+            let after = timeout.map(|s| format!(" in {s}s")).unwrap_or_default();
+            eprintln!("wsp: no answer to {id}{after} — it stays open: `wsp ask {id} --wait` waits again, `wsp ask {id}` reads it");
+            if args.json() {
+                println!("{}", json!({ "id": id, "outcome": "timeout" }));
+            }
+            3
+        }
+    }
+}
+
+/// `wsp answer <message-id> "the sentence"` — close a question, on the record
+/// and at the asker, in that order.
+///
+/// **The order is the design.** `wsp-095` Part 7: the answer is appended to the
+/// asker's task log *first* and delivered *second*, because the delivery is
+/// best-effort and the record is not. Three things follow and the first is the
+/// one that matters — there is no drop case to get wrong. The write happens
+/// whether the asker is alive, stopped or gone; a respawned agent reads it in
+/// its brief; and it outlives the worktree, which `worklist-012` found agent
+/// memory does not.
+///
+/// `--abandon` is the other ending and takes the same road home, because an
+/// asker that learns nothing from a question closing is an asker that sits
+/// waiting for ever. Both require a sentence. Neither is a keystroke, and that
+/// is the refusal `wsp worklist go` already makes at a barrier: *what wsp
+/// contributes is the obligation to write a sentence, not the judgement.*
+///
+/// There is no third ending. Lowering a hand is not a disposition for a
+/// question — `worklist-004`, where a seat answered by another route and then
+/// cleared the flag, so **clearing looked like answering** and the asker learned
+/// nothing from it.
+pub fn answer(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp answer <message-id> \"…\"   (or `-` to read it from stdin)");
+        eprintln!("       wsp ask   lists what is open, with its id");
+        return 2;
+    };
+    let q = match find(store, &needle) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    if args.has("step-done") {
+        // `wsp-098`: the --then step of an answered --of ask is done.
+        if q.of.is_none() || q.answered_by.is_none() {
+            eprintln!("wsp: {} is not an answered ask --of anyone; --step-done marks its step", q.id);
+            return 2;
+        }
+        return match message::step_done(store, &q.id) {
+            Ok(_) => {
+                println!("{}: step done", q.id);
+                0
+            }
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                1
+            }
+        };
+    }
+    let giving_up = args.has("abandon");
+    // A structured answer (`wsp-299`) is `--choice` or `--other`; the sentence
+    // beside it, if any, is a deny's message, and otherwise there is none.
+    let chosen = args.has("choice") || args.has("other");
+    let a_set = q.choices.as_ref().is_some_and(|c| c.kind() == "set") && !giving_up;
+    let (text, choice) = match chosen {
+        // A set is answered per question, below; its words are its own.
+        _ if a_set => (String::new(), None),
+        false => match crate::cmd_agent::prose(args, 1) {
+            Ok(t) => (t, None),
+            Err(code) => return code,
+        },
+        true => {
+            if giving_up {
+                eprintln!("wsp: abandoning takes a reason, not a choice");
+                return 2;
+            }
+            let typed = args.text(1);
+            let typed = match typed.trim().is_empty() {
+                true => String::new(),
+                false => match crate::cmd_agent::typed_message(&typed) {
+                    Ok(t) => t,
+                    Err(code) => return code,
+                },
+            };
+            match choice_given(args, &q) {
+                Ok(v) => (typed, Some(v)),
+                Err(why) => {
+                    eprintln!("wsp: {why}");
+                    return 2;
+                }
+            }
+        }
+    };
+    let (me, pane) = whoami(store);
+    let caller = Answerer {
+        seat: me.scope().is_some(),
+        agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
+        as_person: args.has("as-person"),
+    };
+    // `--as <name>` (`wsp-098`): the named party's reply, typed in by the person.
+    let relayed = args.get("as").map(|a| a.trim().to_lowercase());
+    if let Some(name) = &relayed {
+        if q.of.as_deref() != Some(name.as_str()) {
+            match &q.of {
+                Some(of) => eprintln!("wsp: {} was asked of {of}, not {name}", q.id),
+                None => eprintln!("wsp: {} is not an ask --of anyone; --as is for one", q.id),
+            }
+            return 2;
+        }
+        if giving_up {
+            eprintln!("wsp: --as records a reply; to drop the ask, `wsp ask --cancel {}`", q.id);
+            return 2;
+        }
+        if let Err(why) = the_person(&caller) {
+            eprintln!("wsp: {why}");
+            return 1;
+        }
+    } else if q.of.is_some() && !giving_up {
+        eprintln!("wsp: {} was asked of {} — type their reply with `--as {}`", q.id, q.of.as_deref().unwrap_or_default(), q.of.as_deref().unwrap_or_default());
+        return 2;
+    }
+    let me = match closer(store, &q, me, &caller) {
+        Ok(me) => me,
+        Err(why) => {
+            eprintln!("wsp: {why}");
+            eprintln!("     a seat or an agent says what it knows with `wsp note`, and the person answers it here");
+            return 1;
+        }
+    };
+
+    let routed = q.for_person && me.scope().is_some();
+    if a_set {
+        match set_answer(store, args, &q, &me, routed) {
+            SetStep::Saved(code) => return code,
+            SetStep::Close(finish, words) => {
+                return close_set(store, args, &q, &me, routed, finish, &words);
+            }
+        }
+    }
+    if !a_set && (args.has("question") || args.has("finish")) {
+        eprintln!("wsp: {} is not a set — `--question` and `--finish` answer one", q.id);
+        return 2;
+    }
+    let closed = match (giving_up, &choice) {
+        (false, c) if routed => message::answer_routed(store, &q.id, &me, &text, c.as_ref()),
+        (false, Some(c)) => message::answer_choice(store, &q.id, &me, &text, c),
+        (false, None) => message::answer(store, &q.id, &me, &text),
+        (true, _) => message::abandon(store, &q.id, &me, &text),
+    };
+    let mut closed = match closed {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+    if let Some(name) = &relayed {
+        match message::relay(store, &closed.question.id, name, &crate::cmd_whoami::person()) {
+            Ok(m) => closed.question = m,
+            Err(e) => eprintln!("wsp: answered, but could not record who answered: {e}"),
+        }
+    }
+
+    // The record is written by here and nothing below can unwrite it, which is
+    // why the exit code is 0 for every delivery outcome except a refusal a
+    // person can act on. A verb that returned failure for an answer that landed
+    // is `worklist-010` again, and a retry would be refused as a repeat anyway.
+    let p = Paint::new();
+    if !args.json() {
+        let verb = match giving_up {
+            false => "answered",
+            true => "abandoned",
+        };
+        println!("{} {}  {}", p.dim("·"), p.bold(&closed.question.id), p.dim(verb));
+        let landed = match (&closed.landed, closed.question.for_person && !giving_up) {
+            (Landed::Task(id), true) => format!("as a decision on {id}"),
+            (other, _) => landed_line(other),
+        };
+        println!("  {}", p.dim(&landed));
+        if choice.is_some() || closed.question.choices.is_some() {
+            println!("  {}", p.dim(&format!("→ {}", closed.reply.text.trim())));
+        }
+    }
+    if closed.question.for_person {
+        tell_the_list(store, &closed, args);
+    }
+    // A `not held` exit's decision ask: its seat is gone, and the answer reopens the row (D3).
+    if !giving_up {
+        crate::cmd_submit::answered(store, &closed.question, &closed.reply.text);
+    }
+    deliver(store, &closed, args)
+}
+
+/// What an answer to a set did: saved a question (and printed it, with the
+/// exit code), or is the close.
+enum SetStep {
+    Saved(i32),
+    Close(bool, String),
+}
+
+/// `wsp answer <mid> --question H --choice L [--other W] [--note W]` and
+/// `wsp answer <mid> --finish ["words"]` on a set. A save keeps the answer on
+/// the ask and records a decision on the row; the ask ends when every question
+/// has an answer; `--finish` is refused while one is open.
+fn set_answer(store: &Store, args: &Args, q: &Message, _me: &Party, _routed: bool) -> SetStep {
+    let finish = args.has("finish");
+    let words = match args.get("finish").as_deref() {
+        Some("true") | None => args.text(1),
+        Some(w) => w.to_string(),
+    };
+    let key = args.get("question");
+    if key.is_none() && !finish {
+        eprintln!("wsp: {} is a set — answer a question with `--question 'Header' --choice 'Label'`, every question needs one", q.id);
+        if let Some(c) = &q.choices {
+            eprintln!("     {}", c.options_line());
+        }
+        return SetStep::Saved(2);
+    }
+    let Some(key) = key else {
+        return match q.choices.as_ref() {
+            Some(c) => match open_questions(c) {
+                Some(why) => {
+                    eprintln!("wsp: {} stays open — {why}", q.id);
+                    SetStep::Saved(1)
+                }
+                None => SetStep::Close(true, words.trim().to_string()),
+            },
+            None => SetStep::Saved(1),
+        };
+    };
+    let picks = args.each("choice");
+    let other = args.get("other");
+    let note = args.get("note").filter(|n| n != "true").unwrap_or_default();
+    let p = Paint::new();
+    match message::save_set_answer(store, &q.id, &key, &picks, other.as_deref(), &note) {
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            SetStep::Saved(if matches!(e, message::Refused::BadChoice(_)) { 2 } else { 1 })
+        }
+        Ok(saved) => {
+            if args.json() {
+                println!(
+                    "{}",
+                    json!({ "id": q.id, "saved": saved.header, "decision": saved.decision, "superseded": saved.superseded,
+                            "answered": saved.answered, "of": saved.total })
+                );
+            } else {
+                println!("{} {}  {}", p.dim("·"), p.bold(&q.id), p.dim(&format!("{} saved", saved.header)));
+                println!("  {}", p.dim(&format!("{} of {} answered · decision {}{}", saved.answered, saved.total, saved.decision,
+                    saved.superseded.as_ref().map(|s| format!(" (supersedes {s})")).unwrap_or_default())));
+            }
+            if saved.answered == saved.total {
+                return SetStep::Close(finish, if finish { words.trim().to_string() } else { String::new() });
+            }
+            if finish {
+                if let Some(c) = store.message(&q.id).and_then(|m| m.choices) {
+                    if let Some(why) = open_questions(&c) {
+                        eprintln!("wsp: {} stays open — {why}", q.id);
+                    }
+                }
+                return SetStep::Saved(1);
+            }
+            SetStep::Saved(0)
+        }
+    }
+}
+
+/// Why `--finish` is refused: how many of the set are answered and the headers
+/// still open. `None` when every question has an answer.
+fn open_questions(c: &Choices) -> Option<String> {
+    let (done, total) = c.set_progress();
+    if done == total {
+        return None;
+    }
+    let open = c.open_headers();
+    Some(format!("{done} of {total} answered, every question needs one; open: {}", open.join(", ")))
+}
+
+/// The set ends: the log first (the ask closes onto its row), then whoever
+/// asked, once, with every answer.
+fn close_set(store: &Store, args: &Args, q: &Message, me: &Party, routed: bool, finish: bool, words: &str) -> i32 {
+    let input = json!({ "finish": finish });
+    let closed = if routed {
+        message::answer_routed(store, &q.id, me, words, Some(&input))
+    } else {
+        message::answer_choice(store, &q.id, me, words, &input)
+    };
+    let closed = match closed {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            return 1;
+        }
+    };
+    let p = Paint::new();
+    if !args.json() {
+        println!("{} {}  {}", p.dim("·"), p.bold(&closed.question.id), p.dim("set answered"));
+        println!("  {}", p.dim(&format!("→ {}", closed.reply.text.trim().lines().next().unwrap_or_default())));
+    }
+    tell_the_list(store, &closed, args);
+    deliver(store, &closed, args)
+}
+
+/// `wsp ask --cancel <mid> ["why"]` — the person dismisses an ask that no longer
+/// matters (`wsp-308`): any question, including one only the person may close,
+/// and a notification.
+///
+/// **The person's, always.** `wsp answer --abandon` is open to a seat or an
+/// agent on a question that is not the person's, which is right for an agent
+/// giving up its own question; this is the person *dismissing* one, so the
+/// caller is held to the same check a person's question gets
+/// ([`the_person`]) whatever the question is, and is recorded as the person.
+/// An agent says it no longer needs an answer with `wsp answer --abandon`, and
+/// a person's own question stays out of its hands.
+///
+/// **Told the way an answer tells.** A question goes home through the road
+/// `--abandon` takes — the log line first, the reply addressed to whoever
+/// waited, and [`deliver`] — so a `--wait` returns the cancellation (exit 3)
+/// and any other asker is typed it. A notification has nobody waiting and is
+/// closed on the record. The sentence is `cancelled by the person`, with the
+/// person's own words after it when they gave some.
+fn cancel(store: &Store, args: &Args) -> i32 {
+    let (me, pane) = whoami(store);
+    let caller = Answerer {
+        seat: me.scope().is_some(),
+        agent: pane.as_deref().is_some_and(|p| holds_an_agent(store, p)) || an_agent_process(|k| std::env::var_os(k)),
+        as_person: args.has("as-person"),
+    };
+    cancel_as(store, args, &caller)
+}
+
+/// [`cancel`] with the caller read already, which is the one thing about it
+/// that comes out of the environment — passed in for the reason [`the_person`]
+/// takes a [`Answerer`], so a test reaches the refusal without exporting a
+/// process-wide variable every other test can see.
+fn cancel_as(store: &Store, args: &Args, caller: &Answerer) -> i32 {
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp ask --cancel <message-id> [\"why\"]");
+        return 2;
+    };
+    let q = match find(store, &needle) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    if let Err(why) = the_person(caller) {
+        eprintln!("wsp: {}", why.replace("answer", "cancel"));
+        return 1;
+    }
+    let why = args.text(1);
+    let why = match why.trim().is_empty() {
+        true => CANCELLED.to_string(),
+        false => match crate::cmd_agent::typed_message(&why) {
+            Ok(t) => format!("{CANCELLED}: {}", t.trim()),
+            Err(code) => return code,
+        },
+    };
+    let p = Paint::new();
+    if q.shape() == Some(Shape::Question) {
+        let closed = match message::abandon(store, &q.id, &a_person(), &why) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("wsp: {e}");
+                return 1;
+            }
+        };
+        if !args.json() {
+            println!("{} {}  {}", p.dim("·"), p.bold(&closed.question.id), p.dim("cancelled"));
+            println!("  {}", p.dim(&landed_line(&closed.landed)));
+        }
+        return deliver(store, &closed, args);
+    }
+    match message::lapse(store, &q.id, &a_person(), &why) {
+        Ok(m) => {
+            if args.json() {
+                println!("{}", json!({ "id": m.id, "state": m.state_raw, "closed": m.closed_json() }));
+            } else {
+                println!("{} {}  {}", p.dim("·"), p.bold(&m.id), p.dim("cancelled"));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            1
+        }
+    }
+}
+
+/// What the person's dismissal says, and what a `--wait` is released with.
+const CANCELLED: &str = "cancelled by the person";
+
+// ---- the person's list: `wsp-233` -----------------------------------------
+
+/// Who is running `wsp answer` on a person's item, as far as wsp can tell.
+#[derive(Debug, Clone, Copy, Default)]
+struct Answerer {
+    /// The pane holds a governor seat.
+    seat: bool,
+    /// The pane holds an agent wsp started, or work it is bound to.
+    agent: bool,
+    /// `--as-person`: the person typing in an agent's pane, saying so.
+    as_person: bool,
+}
+
+/// Whether this caller may close a question only the person may close.
+///
+/// **A guard against habit, not identity.** wsp reads its caller off the
+/// environment, and an agent that lies about it can pass; nothing here can stop
+/// that. What it stops is the case `wsp-233` was filed for: a governor closing
+/// the loop on Ed's behalf because it was the one in the conversation. A person
+/// at a shell passes, in a backend pane or out of one. `--as-person` is for Ed
+/// typing `! wsp answer …` into an agent's own pane, which inherits that pane's
+/// environment, and it is a statement an agent would have to make falsely
+/// rather than a default it fell into.
+fn the_person(c: &Answerer) -> Result<(), String> {
+    match (c.seat || c.agent, c.as_person) {
+        (false, _) | (true, true) => Ok(()),
+        (true, false) => Err(format!(
+            "that question is the person's to answer, and this is {} — a seat or an agent may raise one and never close one\n     \
+             the person typing in this pane: `--as-person` says so",
+            if c.seat { "a governor seat" } else { "an agent's pane" }
+        )),
+    }
+}
+
+/// Who closes this question, recorded as whom — or why this caller may not.
+///
+/// `wsp-233`: a governor can add to the person's list and never answer it, and
+/// past [`the_person`] the closer is the person and is recorded as one.
+///
+/// **Except the governor a member's question is routed to** (`wsp-608`). Ed,
+/// 2026-11-12: *governors should be able to answer questions, or at least veto
+/// that they need to go to a user — that's the same as a raised hand*. A
+/// member's `wsp ask` about its own row is waiting on the seat
+/// [`crate::waiting::route`] names, and the barrier says so; that seat answers
+/// it, as itself, the way it answers a raised hand. A question the route gives
+/// to the person — no seat above the row, or a dialog a hook holds — stays the
+/// person's, and the primary (which governs nothing) still says `--as-person`.
+fn closer(store: &Store, q: &Message, me: Party, caller: &Answerer) -> Result<Party, String> {
+    if !q.for_person {
+        return Ok(me);
+    }
+    // A member's: a seat's own question to the person (the primary's, `wsp-279`,
+    // or a governor's) is the person's, whoever governs the row it is about.
+    let a_members = !matches!(q.from, Party::Seat(_));
+    if let (true, Some(scope), crate::waiting::On::Seat(routed)) = (a_members, me.scope(), crate::waiting::route(store, q)) {
+        if scope == routed && !caller.as_person {
+            return Ok(me);
+        }
+    }
+    the_person(caller).map(|_| a_person())
+}
+
+/// Does this pane hold an agent: bound to a task, or a seat wsp started one in?
+fn holds_an_agent(store: &Store, pane: &str) -> bool {
+    store.bindings().contains_key(pane) || store.agent_in_seat(pane).is_some()
+}
+
+/// Is this wsp running under an agent, whatever pane it is in?
+///
+/// The pane only knows the agents wsp put there. Claude started by hand in a
+/// plain pane, or a governor's subagent, holds no binding and would pass as the
+/// person; both harnesses mark their children (`CLAUDECODE`, and opencode's
+/// `OPENCODE=1`), so the same habit-guard reaches them. Ed's `! wsp answer`
+/// from inside a session carries the marker too, and `--as-person` is for that.
+fn an_agent_process(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["CLAUDECODE", "OPENCODE"].iter().any(|k| var(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// Raising one writes a line on its subject, so the committed record says it
+/// was asked even when the machine-local `messages.json` is gone, and an agent
+/// on that row reads it in its brief.
+pub fn asked_of_the_person(store: &Store, q: &Message, subject: &str) {
+    let line = format!("asked of the person by {}: {} · {}", q.from.byline(), util::truncate(q.title(), 160), q.id);
+    let saved = match store.task(subject) {
+        Some(mut t) => {
+            crate::log::note(store, &mut t, &line).is_ok()
+        }
+        None => match store.worklist(subject) {
+            Some(mut w) => {
+                crate::log::note_to_list(store, &mut w, &line).is_ok()
+            }
+            None => false,
+        },
+    };
+    if saved {
+        store.git_commit(&format!("wsp: ask the person about {subject} — {}", util::truncate(q.title(), 60)));
+    }
+}
+
+/// What answering this unblocks, derived from what it is about. Never stored:
+/// a member moved between groups would leave a stored one lying.
+pub fn unblocks(store: &Store, q: &Message) -> Option<String> {
+    crate::mirror::unblocks(store, q)
+}
+
+fn project_of(store: &Store, about: &About) -> Option<String> {
+    crate::mirror::project_of(store, about)
+}
+
+/// An item's inputs, as `wsp yours --json` draws it ([`wsp_view::flag::item_json`]):
+/// the record, and what is worked out here beside it.
+fn item_of(store: &Store, q: &Message) -> wsp_view::flag::Item {
+    wsp_view::flag::Item {
+        record: q.to_json(),
+        asked: q.title().to_string(),
+        from: q.from.byline(),
+        project: project_of(store, &q.about),
+        unblocks: unblocks(store, q),
+    }
+}
+
+/// `yours --json`'s inputs for `project` (none is every project), over the
+/// items and review count `yours` has already read. `person` is left empty:
+/// it is `flag --person`'s, which [`flags_reading`] adds.
+fn yours_reading(store: &Store, project: Option<&str>, index: &crate::resolve::Index, items: &[Message], review: usize) -> wsp_view::flag::Flags {
+    wsp_view::flag::Flags {
+        person: Vec::new(),
+        project: project.map(str::to_string),
+        items: items.iter().map(|q| item_of(store, q)).collect(),
+        review,
+        closed_by_the_run: crate::auto_close::unseen(store).len(),
+        retro: crate::retro_yours::yours_lines(store),
+        // The person's questions closed in the last ten minutes, so a
+        // reader can tell *answered in the pane* from *gone*.
+        closed: recently_closed(store)
+            .into_iter()
+            .filter(|(m, _)| project.is_none() || yours_scope(store, m, project, index))
+            .map(|(m, closed)| wsp_view::flag::Closed { item: item_of(store, &m), closed })
+            .collect(),
+    }
+}
+
+/// How many rows wait at `review` in `project` and every project under it,
+/// or in all.
+fn review_count(store: &Store, project: Option<&str>, index: &crate::resolve::Index) -> usize {
+    store
+        .tasks()
+        .iter()
+        .filter(|t| t.status() == crate::model::Status::Review)
+        .filter(|t| match project {
+            None => true,
+            Some(p) => t.project.as_deref().is_some_and(|tp| tp == p || index.ancestors(tp).iter().any(|a| a == p)),
+        })
+        .count()
+}
+
+/// The `flags` reading (wsp-745): `flag --person --json`'s hands and `yours
+/// --json`'s inputs for every project, taken with the builders the two verbs
+/// print through, so [`wsp_view::flag::person_json`] and
+/// [`wsp_view::flag::yours_json`] draw what each prints.
+pub fn flags_reading(store: &Store) -> wsp_view::flag::Flags {
+    let index = crate::resolve::Index::new(store.projects());
+    let items = yours_in(store, None);
+    let mut flags = yours_reading(store, None, &index, &items, review_count(store, None, &index));
+    // `flag --person`'s hands: each raised to the person, replies left out,
+    // oldest first, as its record (`cmd_agent::list_flags` prints the same).
+    flags.person = message::raised_to_the_person(store).iter().map(Message::to_json).collect();
+    flags
+}
+
+/// How long a closed question stays in `yours --json`'s `closed`.
+const CLOSED_FOR: i64 = 600;
+
+/// The person's questions closed in the last [`CLOSED_FOR`] seconds, newest
+/// first, each with `closed: {how, by, at, answer}`.
+pub fn recently_closed(store: &Store) -> Vec<(Message, serde_json::Value)> {
+    let mut out: Vec<(Message, serde_json::Value)> = store
+        .messages()
+        .into_values()
+        .filter(|m| m.shape() == Some(Shape::Question) && m.for_person && !m.is_open())
+        .filter_map(|m| {
+            let closed = m.closed_json()?;
+            let at = closed["at"].as_str().unwrap_or_default().to_string();
+            (util::epoch_of(&at) > 0 && util::since(&at) <= CLOSED_FOR).then(|| (m, closed))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1["at"].as_str().cmp(&a.1["at"].as_str()));
+    out
+}
+
+/// A JSON document from a file, or from the stream for `-` (or a bare flag).
+fn json_source(src: &str) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let raw = match src {
+        "-" | "true" => {
+            if util::stdin_is_tty() {
+                return Err("nothing is piped in — `-` reads it from a stream".into());
+            }
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).map_err(|e| format!("cannot read stdin: {e}"))?;
+            s
+        }
+        path => std::fs::read_to_string(util::expand(path)).map_err(|e| format!("cannot read {path}: {e}"))?,
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("not JSON: {e}"))
+}
+
+/// The answer `wsp answer` was given as `--choice`/`--other`, as a JSON value
+/// for [`message::answer_choice`] to check.
+///
+/// One `--choice` that is `-`, bare, or a file that exists is the JSON form
+/// (`{answers}` or `{behavior, message}`), which is what compound writes.
+/// Otherwise it is the shell's: `--choice 'Question=Label'`, repeated for
+/// another question or for a multi's other labels, `--other 'Question=words'`
+/// for a free-text Other, and on a plan or permission `--choice allow|deny`.
+/// A question is named by its text or its header; with a single question the
+/// `Question=` may be left off.
+fn choice_given(args: &Args, q: &Message) -> Result<serde_json::Value, String> {
+    let picks = args.each("choice");
+    let others = args.each("other");
+    if let [one] = picks.as_slice() {
+        if others.is_empty() && (matches!(one.as_str(), "-" | "true") || std::path::Path::new(&util::expand(one)).is_file()) {
+            return json_source(one);
+        }
+    }
+    let Some(c) = &q.choices else {
+        return Err("that question has no choices — answer it in words".into());
+    };
+    if c.kind() != "ask" {
+        return match (picks.as_slice(), others.is_empty()) {
+            ([one], true) if matches!(one.as_str(), "allow" | "deny") => Ok(serde_json::json!({ "behavior": one })),
+            _ => Err(format!("a {} is answered with `--choice allow` or `--choice deny`, or a JSON file", c.kind())),
+        };
+    }
+    let qs: Vec<(String, String)> = c.json()["questions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|q| (q["question"].as_str().unwrap_or_default().to_string(), q["header"].as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let named = |k: &str| -> Option<String> {
+        let k = k.trim();
+        qs.iter().find(|(q, h)| q == k || (!h.is_empty() && h.eq_ignore_ascii_case(k))).map(|(q, _)| q.clone())
+    };
+    let which = |given: &str| -> Result<(String, String), String> {
+        if let Some((k, v)) = given.split_once('=') {
+            if let Some(q) = named(k) {
+                return Ok((q, v.trim().to_string()));
+            }
+        }
+        match qs.as_slice() {
+            [(only, _)] => Ok((only.clone(), given.trim().to_string())),
+            _ => Err(format!("`{given}` names no question — {}; write Question=Label", c.options_line())),
+        }
+    };
+    let mut answers = serde_json::Map::new();
+    for given in &picks {
+        let (question, label) = which(given)?;
+        let entry = answers.entry(question).or_insert_with(|| serde_json::json!({ "pick": [] }));
+        match entry.get_mut("pick").and_then(serde_json::Value::as_array_mut) {
+            Some(list) => list.push(label.into()),
+            None => return Err("a question is answered by a label or an Other, not both".into()),
+        }
+    }
+    for given in &others {
+        let (question, words) = which(given)?;
+        if answers.insert(question, serde_json::json!({ "other": words })).is_some() {
+            return Err("a question is answered by a label or an Other, not both".into());
+        }
+    }
+    Ok(serde_json::json!({ "answers": answers }))
+}
+
+/// The person's items in one project and every project under it, or in all.
+pub fn yours_in(store: &Store, project: Option<&str>) -> Vec<Message> {
+    let index = crate::resolve::Index::new(store.projects());
+    message::for_the_person(store).into_iter().filter(|q| yours_scope(store, q, project, &index)).collect()
+}
+
+/// Is this item in the project, or any project under it? Everything is, with
+/// no project asked for.
+fn yours_scope(store: &Store, q: &Message, project: Option<&str>, index: &crate::resolve::Index) -> bool {
+    match project {
+        None => true,
+        Some(p) => project_of(store, &q.about)
+            .is_some_and(|mine| mine == p || index.ancestors(&mine).iter().any(|a| a == p)),
+    }
+}
+
+/// Every person item as `(project, headline)`, oldest first — what the brief
+/// composes its one line from.
+pub fn census(store: &Store) -> Vec<(Option<String>, String)> {
+    message::for_the_person(store).iter().map(|q| (project_of(store, &q.about), q.title().to_string())).collect()
+}
+
+/// `wsp yours [-p proj] [--json]` — what waits on the person.
+///
+/// The questions only the person may answer, oldest first — the questions
+/// `wsp flag --person` lists, read off the same predicate — and then how many
+/// `review` rows wait on `wsp done` as one count. Review rows are not items:
+/// there are hundreds and almost none needs a judgement, and listing them is
+/// the attention pass's failure — the few that matter buried. A review row
+/// that needs a judgement is raised as an item by whoever saw it.
+pub fn yours(store: &Store, args: &Args) -> i32 {
+    let index = crate::resolve::Index::new(store.projects());
+    let project = match args.get("project") {
+        Some(p) => match index.find(&p) {
+            Some(found) => Some(found.id.clone()),
+            None => {
+                eprintln!("wsp: no project matching `{p}`");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    if args.has("closed") {
+        // The listing is the look: what the run closed is no longer unseen.
+        let rows = crate::auto_close::closed_rows(store);
+        let unseen = crate::auto_close::unseen(store);
+        if args.json() {
+            let out: Vec<_> = rows.iter().map(|(at, id)| json!({ "at": at, "id": id, "unseen": unseen.iter().any(|u| u.1 == *id && u.0 == *at) })).collect();
+            println!("{}", serde_json::to_string_pretty(&json!({ "closed_by_the_run": out })).unwrap_or_default());
+        } else if rows.is_empty() {
+            println!("{}", Paint::new().dim("the run has closed no rows"));
+        }
+        if !args.json() {
+            for (at, id) in &rows {
+                let new = if unseen.iter().any(|u| u.1 == *id && u.0 == *at) { "*" } else { " " };
+                println!("{new} {at}  {id}  {}", store.task(id).map(|t| t.title).unwrap_or_default());
+            }
+        }
+        crate::auto_close::looked(store);
+        return 0;
+    }
+    let items = yours_in(store, project.as_deref());
+    let review = review_count(store, project.as_deref(), &index);
+
+    if args.json() {
+        let state = crate::mirror::state_of(store, crate::mirror::LOCAL);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&wsp_view::asks::yours(&state, util::epoch_secs(), project.as_deref())).unwrap_or_default()
+        );
+        return 0;
+    }
+    let p = Paint::new();
+    if items.is_empty() {
+        println!("{}", p.dim("nothing waits on the person"));
+    }
+    for q in &items {
+        println!("{} {}  {}", p.red("?"), p.bold(&q.id), q.title());
+        for line in q.body().lines() {
+            println!("  {line}");
+        }
+        if let Some(c) = &q.choices {
+            match c.kind() {
+                "set" => println!("  {}", p.dim(&format!("set · {}", answered_of(c)))),
+                _ => println!("  {}", p.dim(&format!("{} · {}", c.kind(), c.options_line()))),
+            }
+        }
+        let mut parts = vec![format!("from {}", q.from.byline())];
+        if let Some(u) = unblocks(store, q) {
+            parts.push(format!("holds {u}"));
+        }
+        let held = util::since(&q.at);
+        if held > 0 {
+            parts.push(util::duration_human(held));
+        }
+        println!("  {}", p.dim(&parts.join(" · ")));
+    }
+    if !items.is_empty() {
+        println!("{}", p.dim("wsp answer <id> \"…\" — it lands as a decision on the row, and whoever waited is told"));
+        if items.iter().any(|q| q.choices.is_some()) {
+            println!("{}", p.dim("one with options takes `--choice 'Question=Label'` (or `--other 'Question=words'`)"));
+        }
+    }
+    for line in crate::retro_yours::yours_lines(store) {
+        println!("{}", p.dim(&line));
+    }
+    if review > 0 {
+        println!("{}", p.dim(&format!("{review} at review, waiting on `wsp done` — not items")));
+    }
+    let closed = crate::auto_close::unseen(store).len();
+    if closed > 0 {
+        println!("{}", p.dim(&format!("{closed} row(s) closed by the run since you last looked — `wsp yours --closed` lists them")));
+    }
+    0
+}
+
+/// An answer about a list, one of its groups, or a member of a running list
+/// is told to the list's seat: a barrier held on the person is now the seat's
+/// to read again. A member's item holds its group ([`message::holding_group`]),
+/// so its answer is news to the seat as much as to the member that asked.
+fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
+    let (list, group) = match &closed.question.about {
+        About::Group { scope, group } => (scope.clone(), Some(*group)),
+        About::Scope(scope) => (scope.clone(), None),
+        About::Task(t) => match crate::worklist::Running::read(store).of(t) {
+            Some(at) => (at.list.clone(), Some(at.group)),
+            None => return,
+        },
+        About::Nothing => return,
+    };
+    if store.worklist(&list).is_none() {
+        return;
+    }
+    let governors = store.governors();
+    let index = crate::resolve::Index::new(store.projects());
+    let Some(seat) = crate::governors::seat_for(&governors, &index, Some(&list), None, None) else { return };
+    let what = match (&closed.question.about, group) {
+        (About::Task(t), Some(g)) => format!("{t}, a member of group {g} of {list}"),
+        (_, Some(g)) => format!("barrier {g} of {list}"),
+        _ => list.clone(),
+    };
+    let text = format!(
+        "the person answered {id} about {what}:\n\n{answer}\n\n         nothing more of theirs holds it unless `wsp yours` says so — read the answer, then go, hold or follow up as the stop says",
+        id = closed.question.id,
+        answer = closed.question.via.last().map(|h| h.note.as_str()).unwrap_or_default(),
+    );
+    let r = crate::wake::say(store, &seat.scope, &text, Some(&closed.question.id));
+    if !args.json() {
+        println!("  {}", r.said(&format!("the {} seat", r.scope), &Paint::new()));
+    }
+}
+
+/// `wsp ack <message-id>` — *I have this and I am not passing it on.*
+///
+/// A notification's disposition, and it is a real act rather than a dismissal:
+/// it is what makes the chain auditable, and `wsp-095` Part 6 is explicit that
+/// it costs one keystroke and **is not an answer**. The shape refuses it on a
+/// question, which is the whole of that Part in one call.
+///
+/// The population this is for today is replies: [`answer`] mints one per
+/// question closed, addressed to whoever asked, and it stands open until the
+/// party it was addressed to says it has read it. Nothing acknowledges on
+/// somebody else's behalf — a delivery receipt is not a reading, and treating it
+/// as one is the same substitution that made clearing look like answering.
+pub fn ack(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.first().cloned() else {
+        eprintln!("usage: wsp ack <message-id>");
+        return 2;
+    };
+    let m = match find(store, &needle) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let (me, _) = whoami(store);
+    match message::acknowledge(store, &m.id, &me) {
+        Ok(m) => {
+            if args.json() {
+                println!("{}", json!({ "id": m.id, "state": m.state_raw }));
+            } else {
+                let p = Paint::new();
+                println!("{} {}  {}", p.dim("·"), p.bold(&m.id), p.dim("acknowledged"));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("wsp: {e}");
+            if m.shape() == Some(Shape::Question) {
+                eprintln!("     `wsp answer {} \"…\"` is what closes a question", m.id);
+            }
+            1
+        }
+    }
+}
+
+// ---- what is up -----------------------------------------------------------
+
+/// `wsp ask` with nothing to ask: the level, read whole.
+///
+/// A full read rather than a feed, for `robustness-075`'s reason restated in
+/// `wsp-095` Part 13: **a poll is self-healing and a stream is not**, and a
+/// level-set read answers *"nothing is up"* positively — which is the difference
+/// between a watcher that is quiet and one that is broken.
+fn open(store: &Store, args: &Args) -> i32 {
+    let all = message::all(store);
+    // The two halves of `Message::wants_answering`, which is the population
+    // `wsp watch unanswered` reports off the same predicate — split here
+    // because a person reads sections and a level set does not have any.
+    let questions: Vec<&Message> = all
+        .iter()
+        .filter(|m| m.wants_answering())
+        .filter(|m| m.shape() == Some(Shape::Question) && m.is_open())
+        .collect();
+    // Records this build cannot read. They are listed rather than counted and
+    // rather than dropped: see `Message::needs_attention` — reporting "nothing
+    // is up" when the honest answer is "there is something here I cannot read"
+    // is silence wearing a safe-looking name, and the installed binary is
+    // routinely not the tree.
+    let unreadable: Vec<&Message> = all
+        .iter()
+        .filter(|m| m.wants_answering())
+        .filter(|m| m.shape().is_none() || m.state().is_none())
+        .collect();
+    let replies: Vec<&Message> =
+        all.iter().filter(|m| m.reply_to.is_some() && m.is_open()).collect();
+
+    if args.json() {
+        let out = |v: &Vec<&Message>| v.iter().map(|m| m.to_json()).collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "open": out(&questions),
+                "replies": out(&replies),
+                "unreadable": out(&unreadable),
+            }))
+            .unwrap_or_default()
+        );
+        return 0;
+    }
+
+    let p = Paint::new();
+    if questions.is_empty() && replies.is_empty() && unreadable.is_empty() {
+        println!("{}", p.dim("nothing open"));
+        return 0;
+    }
+    for m in &questions {
+        println!("{} {}  {}", p.red("?"), p.bold(&m.id), m.title());
+        // The rest of it, because a list that shows a question's first line is
+        // a list that hides the choice it asks (`wsp-170`).
+        for line in m.body().lines() {
+            println!("  {line}");
+        }
+        if let Some(c) = m.choices.as_ref().filter(|c| c.kind() == "set") {
+            println!("  {}", p.dim(&format!("set · {}", answered_of(c))));
+        }
+        println!("  {}", p.dim(&waiting_line(m)));
+    }
+    // Every reply, and not only the ones addressed to this caller. The level
+    // set is *what is up on this machine*, and a read that answered differently
+    // per caller would stop being the self-healing full read `wsp-095` Part 13
+    // asks for — so the addressee is named on the row instead of filtered on.
+    // Routing a per-seat view is `seats_for`, and it is not in this change.
+    for m in &replies {
+        println!("{} {}  {}", p.dim("←"), p.bold(&m.id), m.title());
+        println!("  {}", p.dim(&waiting_line(m)));
+        println!("  {}", p.dim(&format!("wsp ack {} when whoever asked has read it", m.id)));
+    }
+    for m in &unreadable {
+        println!("{} {}  {}", p.red("!"), p.bold(&m.id), m.title());
+        println!(
+            "  {}",
+            p.dim(&format!(
+                "shape `{}` state `{}` — this build does not know those words; a newer one wrote them",
+                m.shape_raw, m.state_raw
+            ))
+        );
+    }
+    if !questions.is_empty() {
+        println!("{}", p.dim("wsp answer <id> \"…\" closes one and reaches whoever asked"));
+    }
+    0
+}
+
+/// Which pane the answer is typed into.
+///
+/// **The task first, and the pane it was asked from second**, which is the
+/// whole reason [`crate::message::Waiting`] holds both: *the pane can go and
+/// the task cannot.* A pane id is the most perishable identifier backend has — it
+/// dies with its workspace and one cascade of `pane.exited` once cleared every
+/// binding on this machine at a stroke — so a question open long enough to be
+/// worth answering is a question whose pane may have been reused. Reading the
+/// pane straight off the record types the answer at whoever is standing there
+/// now.
+///
+/// So the binding is asked first: whoever holds the work is who is sitting
+/// still on it, including when that is a respawned agent rather than the one
+/// that asked. It has already read the answer in its brief by then, because the
+/// log line was written before this ran — this only saves it the poll.
+///
+/// The recorded pane is the fallback and not the other way round, because a
+/// seat holds no task and its pane is the only address it has.
+fn route(store: &Store, waiting: Option<&Waiting>) -> String {
+    let Some(w) = waiting else { return String::new() };
+    if !w.task.is_empty() {
+        if let Some(pane) = store.panes_for_task(&w.task).into_iter().next() {
+            return pane;
+        }
+    }
+    w.pane.clone()
+}
+
+/// Who is sitting still, and for how long — the cost of an open question, which
+/// is the thing that distinguishes it from a notification.
+fn waiting_line(m: &Message) -> String {
+    let mut parts = vec![format!("from {}", m.from.byline())];
+    if let Some(w) = &m.waiting {
+        match (w.pane.as_str(), w.task.as_str()) {
+            ("", "") => {}
+            ("", t) => parts.push(format!("waiting on {t}")),
+            (pane, "") => parts.push(format!("waiting in {pane}")),
+            (pane, t) => parts.push(format!("waiting in {pane} · {t}")),
+        }
+    }
+    if let Some(t) = m.about.task() {
+        parts.push(format!("about {t}"));
+    }
+    if m.shape() == Some(Shape::Question) {
+        parts.push(match m.route() {
+            message::Route::Person => "for the person".into(),
+            message::Route::Seat(scope) => format!("for the {scope} seat"),
+            message::Route::Unrouted => "unrouted — the person's, nobody else has it".into(),
+        });
+    }
+    let held = util::since(&m.at);
+    if held > 0 {
+        parts.push(util::duration_human(held));
+    }
+    parts.join(" · ")
+}
+
+// ---- delivery -------------------------------------------------------------
+
+/// Where the words went, as a sentence. A verb whose whole effect is on
+/// somebody else's screen has to name the screen, or it reads as having done
+/// nothing.
+fn landed_line(landed: &Landed) -> String {
+    match landed {
+        Landed::Task(id) => format!("on {id}'s log"),
+        Landed::List(id) => format!("on the {id} list's log"),
+        Landed::RecordOnly(why) => format!("on the message record only — {why}"),
+    }
+}
+
+/// Take the answer to whoever asked.
+///
+/// The reply carries its own byline, because the one channel wsp does not
+/// control is a human keyboard: **attributed text is a seat or an agent and
+/// unattributed text is a person**, and that inversion only works if every
+/// message wsp sends says who sent it. The seat had already adopted the rule by
+/// hand before the transport could carry it.
+fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
+    let p = Paint::new();
+    let pane = route(store, closed.reply.waiting.as_ref());
+    let receipt = |told: bool, held: bool, why: &str| {
+        if args.json() {
+            println!(
+                "{}",
+                json!({
+                    "id": closed.question.id,
+                    "state": closed.question.state_raw,
+                    "reply": closed.reply.id,
+                    "landed": landed_line(&closed.landed),
+                    "choice": closed.question.answer_choice(),
+                    "told": told,
+                    "held": held,
+                    "why": why,
+                })
+            );
+        } else if !why.is_empty() {
+            println!("  {}", p.dim(why));
+        }
+    };
+
+    // **A live `wsp ask --wait` is the delivery** (`wsp-300`). The asker is
+    // blocked in a tool call, and that call returns with the answer; typing it
+    // at the composer as well would be the second copy, and into a working
+    // agent, which `wsp-095` Part 5 refuses. Read off the question as it was
+    // closed, under the lock, against [`message::release`]. A waiter that has
+    // gone (Esc killed the call) is no delivery, and the asker is told the old
+    // way.
+    if let Some(w) = closed.question.awaited.as_ref().filter(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)) {
+        receipt(false, false, &format!("{} is blocked in `wsp ask --wait` (pid {}) — the answer returns through its tool call, and nothing is typed", asker(closed), w.pid));
+        return 0;
+    }
+    if pane.is_empty() {
+        receipt(false, false, "nobody to tell — the answer is on the record and in the log");
+        return 0;
+    }
+    // **A question a hook is holding is answered by the hook** (`wsp-301`): it
+    // polls the record and prints the decision into the tool call that asked.
+    // Typing the reply at the pane as well would put the answer into a dialog,
+    // or into the composer at the next idle, a second time.
+    if held_by_a_hook(&closed.question) {
+        receipt(false, false, "the hook holding the agent's dialog carries the answer — nothing is typed at the pane");
+        return 0;
+    }
+    // Asked of every backend wsp can spawn onto (`compound-091`), not backend
+    // alone — the same fold `wsp tell` makes since `compound-077` and for the
+    // same reason: a seat is a backend pane, a compound seat, or nothing this
+    // machine knows, and only the census that made it can say which. This verb
+    // used to gate on `backend::available()` and then scan `backend::panes()`, so
+    // an answer addressed to a compound-hosted agent was filed as "no backend
+    // socket" and never delivered, on a machine where the agent was running.
+    let backends = crate::place::local_backends();
+    let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
+        receipt(false, false, &format!("nothing answers for {pane} any more — the answer is written"));
+        return 0;
+    };
+    if found.agent.kind.trim().is_empty() {
+        receipt(false, false, &format!("{pane} holds no agent — the answer is written"));
+        return 0;
+    }
+    // **Under `WSP_ORDERS=store` the answer is an order at once** (wsp-124),
+    // whether the asker is busy or not: the machine's queue replaces the held
+    // hop, and the daemon types it when the asker reads idle. The `Sent` hop
+    // is written when the order is acknowledged, here or by
+    // [`settle_ordered_through`] on the tick. An order that cannot be sent
+    // goes the files way below.
+    if crate::orders::mode() == crate::orders::Mode::Store {
+        if let Some(code) = deliver_as_order(store, closed, args, &pane, found.state, &receipt) {
+            return code;
+        }
+    }
+    // **Busy is later, not never — `wsp-204`.** The one state a message must
+    // not be sent into is a permission dialog, where the text is typed *at the
+    // dialog* and can select an answer nobody chose; and a seat mid-turn or
+    // still coming up refuses the keystrokes outright (`not ready — working`).
+    // All three used to end here with the answer on the log alone, and an asker
+    // that goes idle on an answered question is sitting still for nothing until
+    // a person relays it by hand. So the reply is held on its own record and
+    // the daemon's repair tick types it at the first idle — [`deliver_held`].
+    // Asked of the port's own `State` rather than backend's screen-scraped one,
+    // so the gate holds for whichever backend answered.
+    if !found.state.will_take_a_prompt() {
+        let why = match crate::waiting::on_screen(found.state) {
+            Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
+            None => crate::wake::held_because(found.state).unwrap_or("not taking a prompt").to_string(),
+        };
+        return hold(store, closed, &pane, &why, &receipt);
+    }
+
+    let text = wire(closed);
+    let how = crate::agent_commands::of(&found.agent.kind);
+    let sent = crate::cmd_agent::Sent::new(&pane, &asker(closed), &pane, &pane, &text, args);
+    if let Some(ago) = sent.already_sent(store) {
+        if !args.has("again") {
+            return crate::cmd_agent::twice(&sent, ago, &p);
+        }
+    }
+    let out = how.tell(place.as_ref(), &crate::place::Seat::new(&pane), &text);
+    // The census row said idle and the backend said busy: the turn started in
+    // between. The same hold, for the same reason, rather than a refusal.
+    if let Err(crate::place::Refusal::NotReady(state)) = out {
+        let why = crate::wake::held_because(state).unwrap_or("not taking a prompt");
+        return hold(store, closed, &pane, why, &receipt);
+    }
+    // `delivered` owns the honest-reporting rule and the `agent-told` event, so
+    // this reuses it whole rather than reimplementing either. Its non-zero exit
+    // on `NotTaken` is right for `wsp tell`, where the sentence is the only
+    // thing that happened; here the record is already written, so a rescue is
+    // worth printing and is not a failure of the verb.
+    match crate::cmd_agent::delivered(store, out, &sent) {
+        0 => 0,
+        _ => {
+            eprintln!("     the answer is on the record whatever the composer does");
+            0
+        }
+    }
+}
+
+/// The event an answer sent as an order leaves (wsp-124): the reply, the order
+/// and the asker's pane, which [`settle_ordered_through`] reads to write the
+/// reply's `Sent` hop once the order is acknowledged.
+const ANSWER_ORDERED: &str = "answer-ordered";
+
+/// The event that says an [`ANSWER_ORDERED`] order's hop is written.
+const ANSWER_SETTLED: &str = "answer-order-settled";
+
+/// The order key of an answer: one reply is one order, however often it is sent.
+fn answer_key(reply: &str) -> String {
+    format!("answer:{reply}")
+}
+
+/// [`deliver`] under `store`: the answer sent as an order. To an asker that
+/// takes a prompt, today's wait for its answer and the receipt it comes to;
+/// to a busy one, the order queued and the receipt of a hold. `None` when no
+/// order could be sent.
+fn deliver_as_order(
+    store: &Store,
+    closed: &message::Closed,
+    args: &Args,
+    pane: &str,
+    state: crate::place::State,
+    receipt: &dyn Fn(bool, bool, &str),
+) -> Option<i32> {
+    let p = Paint::new();
+    let text = wire(closed);
+    let sent = crate::cmd_agent::Sent::new(pane, &asker(closed), pane, pane, &text, args);
+    if let Some(ago) = sent.already_sent(store) {
+        if !args.has("again") {
+            return Some(crate::cmd_agent::twice(&sent, ago, &p));
+        }
+    }
+    let seat = wsp_store_contract::SeatId(pane.to_string());
+    let by = crate::orders::principal(&sender(store));
+    let id = match crate::orders::send_keyed(store, &seat, &text, &by, false, &answer_key(&closed.reply.id)) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::store::log_line(store, &format!("answer to {} for {pane}: not sent as an order ({e}); the files way", closed.question.id));
+            return None;
+        }
+    };
+    note_ordered(store, closed, &id, pane);
+    if !state.will_take_a_prompt() {
+        let why = match crate::waiting::on_screen(state) {
+            Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
+            None => crate::wake::held_because(state).unwrap_or("not taking a prompt").to_string(),
+        };
+        receipt(false, true, &format!("{pane}: {why} — sent as order {}, typed there by the daemon when it is next idle", id.0));
+        return Some(0);
+    }
+    let now = match crate::orders::answer(store, &id, crate::orders::TELL_WAIT) {
+        Ok(Some(o)) => Some(o),
+        _ => crate::orders::order(store, &id).ok().flatten(),
+    };
+    let Some(outcome) = now.as_ref().and_then(crate::orders::said) else {
+        receipt(false, true, &format!("{pane}: not answered yet — sent as order {}, typed there by the daemon", id.0));
+        return Some(0);
+    };
+    if let Some(o) = now.as_ref() {
+        settle_one(store, &closed.reply.id, pane, o);
+    }
+    Some(match crate::cmd_agent::delivered(store, outcome, &sent) {
+        0 => 0,
+        _ => {
+            eprintln!("     the answer is on the record whatever the composer does");
+            0
+        }
+    })
+}
+
+/// Write down that `closed`'s reply went to `pane` as order `id`: what
+/// [`settle_ordered_through`] reads. No hop: the reply holds nothing.
+fn note_ordered(store: &Store, closed: &message::Closed, id: &wsp_store_contract::OrderId, pane: &str) {
+    store.log_event(
+        ANSWER_ORDERED,
+        json!({ "reply": closed.reply.id, "question": closed.question.id, "order": id.0, "pane": pane, "at": util::epoch_secs() }),
+    );
+}
+
+/// The reply's hop for its order as it stands, and whether one was written:
+/// `Sent` once the order is acknowledged, `Noted` when it failed or was
+/// cancelled. Each written once, under [`ANSWER_SETTLED`].
+fn settle_one(store: &Store, reply: &str, pane: &str, o: &wsp_store_contract::Order) -> Option<String> {
+    use wsp_store_contract::OrderState as S;
+    let (act, note) = match o.state {
+        S::Acknowledged | S::Done => (message::Act::Sent, format!("typed at {pane} as order {} — delivered, acknowledged by the seat", o.id.0)),
+        S::Failed => (
+            message::Act::Noted,
+            format!("{pane} was not told: {} (order {})", o.why.as_deref().unwrap_or("the order failed"), o.id.0),
+        ),
+        S::Cancelled => (message::Act::Noted, format!("{pane} was not told: order {} was cancelled", o.id.0)),
+        S::Queued | S::Typed | S::Delivered => return None,
+    };
+    settle(store, reply, pane, &o.id.0, act, &note)
+}
+
+/// Write the hop and the event that says it is written.
+fn settle(store: &Store, reply: &str, pane: &str, order: &str, act: message::Act, note: &str) -> Option<String> {
+    let _ = message::unheld(store, reply, pane, act, note);
+    store.log_event(ANSWER_SETTLED, json!({ "reply": reply, "order": order, "act": act.as_str(), "at": util::epoch_secs() }));
+    Some(note.to_string())
+}
+
+type ReadOrder<'a> =
+    dyn Fn(&wsp_store_contract::OrderId) -> Result<Option<wsp_store_contract::Order>, crate::orders::Error> + 'a;
+
+/// Every answer sent as an order and not yet settled, its hop written where
+/// the order now says (wsp-124): `Sent` once it is acknowledged, `Noted` when
+/// it failed, was cancelled, or its asker's pane is gone. The orders machine
+/// and the daemon's worker deliver it; this only writes down what they did.
+/// `read` reads an order, so a test can be the store. Returns a line per hop.
+fn settle_ordered_through(store: &Store, seats: &dyn crate::cycle::Seats, read: &ReadOrder) -> Vec<String> {
+    let done: std::collections::BTreeSet<String> = store
+        .events_of(ANSWER_SETTLED)
+        .iter()
+        .filter_map(|e| e.get("order").and_then(serde_json::Value::as_str).map(str::to_string))
+        .collect();
+    let mut said = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for e in store.events_of(ANSWER_ORDERED) {
+        let field = |k: &str| e.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+        let (reply, order, pane) = (field("reply"), field("order"), field("pane"));
+        if order.is_empty() || done.contains(&order) || !seen.insert(order.clone()) {
+            continue;
+        }
+        let id = wsp_store_contract::OrderId(order.clone());
+        let line = match read(&id) {
+            Ok(Some(o)) => match settle_one(store, &reply, &pane, &o) {
+                Some(note) => Some(note),
+                None if seats.absent(&pane) => {
+                    settle(store, &reply, &pane, &order, message::Act::Noted, &format!("{pane} is gone — the answer is on the record and in the log (order {order})"))
+                }
+                None => None,
+            },
+            Ok(None) => settle(store, &reply, &pane, &order, message::Act::Noted, &format!("no store holds order {order} — the answer is on the record and in the log")),
+            Err(_) => None,
+        };
+        if let Some(note) = line {
+            said.push(format!("answer {reply} sent as order {order}: {note}"));
+        }
+    }
+    said
+}
+
+/// Whether a hook is waiting on this question to print the agent's decision
+/// (`choices.via` is `hook`), as against one raised from the CLI.
+fn held_by_a_hook(q: &Message) -> bool {
+    q.choices.as_ref().is_some_and(|c| c.json().get("via").and_then(|v| v.as_str()) == Some("hook"))
+}
+
+/// Hold the reply for `pane` and say so. The exit is 0: the answer is written,
+/// and it is owed rather than lost.
+fn hold(
+    store: &Store,
+    closed: &message::Closed,
+    pane: &str,
+    why: &str,
+    receipt: &dyn Fn(bool, bool, &str),
+) -> i32 {
+    match message::held(store, &closed.reply.id, pane, why) {
+        Ok(_) => receipt(false, true, &format!("{pane}: {why} — held, and typed there when it is next idle")),
+        Err(e) => receipt(false, false, &format!("{pane}: {why}, and the answer could not be held: {e}")),
+    }
+    0
+}
+
+/// Every answer held for a busy asker, typed now where the asker is idle — the
+/// daemon's half of `wsp-204`, on [`crate::repair::tick`]'s timer.
+///
+/// Returns what it did, a sentence each, for `cycle.log`. **A reply still
+/// waiting says nothing**: this runs every minute, and a line per minute per
+/// busy asker would bury the log it is written to.
+pub fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Vec<String> {
+    let mut said = deliver_held_through(store, seats, &type_at);
+    // Answers sent as orders (wsp-124) hold nothing here: the machine queues
+    // them, and this writes their hops once the orders settle.
+    if crate::orders::mode() == crate::orders::Mode::Store {
+        said.extend(settle_ordered_through(store, seats, &|id| crate::orders::order(store, id)));
+    }
+    said
+}
+
+/// The typing, over every backend here: `None` where nothing answers for the
+/// pane or nothing in it is an agent, which a later tick asks again.
+pub fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
+    let backends = crate::place::local_backends();
+    let (place, found) = crate::cmd_agent::locate_seat(&backends, pane)?;
+    if found.agent.kind.trim().is_empty() {
+        return None;
+    }
+    let how = crate::agent_commands::of(&found.agent.kind);
+    Some(how.tell(place.as_ref(), &crate::place::Seat::new(pane), text))
+}
+
+/// How long a held answer is asked about again after a delivery that did not
+/// complete (`wsp-469`). A quarter of an hour is the compound backend's pending
+/// window for one tell (`DELIVER_PENDING_FOR`); past it the failure is ended and said.
+const HELD_RETRY_FOR: i64 = 900;
+
+/// Seconds since the reply was last held.
+fn held_for(reply: &Message) -> i64 {
+    let since = reply.via.last().map(|h| util::epoch_of(&h.at)).unwrap_or(0);
+    (util::epoch_secs() - since).max(0)
+}
+
+/// Whether a refusal from the typing is one a later tick may ask again, for an
+/// answer held `held` seconds: the backend not answering in time or at all.
+/// A `Failed` (the supervisor already retried), a gone seat, an unsupported
+/// seat, and text typed and not taken are final, and typing again would put a
+/// second copy behind the first.
+fn retry_held(e: &crate::place::Refusal, held: i64) -> bool {
+    use crate::place::Refusal;
+    matches!(e, Refusal::Backend(_) | Refusal::Unreachable(_)) && held < HELD_RETRY_FOR
+}
+
+type TypeAt<'a> = dyn Fn(&str, &str) -> Option<crate::place::Result<crate::place::Delivery>> + 'a;
+
+/// [`deliver_held`] with the typing passed in, so a test can be the pane.
+///
+/// **The gate is [`crate::cycle::Seats::state`] reading `Idle`, and nothing
+/// wider**, for the reason the verb holds at all: a permission dialog takes the
+/// text into the dialog, and a seat mid-turn or starting refuses it. A pane
+/// that is positively gone ends the hold with a note, because no idle is ever
+/// coming; one that cannot be read is asked again next tick, because an
+/// absence is not a fact.
+///
+/// **Typed once.** `Started` and `Unconfirmed` alike end the hold with an
+/// [`message::Act::Sent`] hop: the verb has never retyped an unconfirmed
+/// answer, and a second typing into a composer still holding the first appends
+/// to it. The answer is on the asker's task log either way.
+fn deliver_held_through(store: &Store, seats: &dyn crate::cycle::Seats, type_at: &TypeAt) -> Vec<String> {
+    let mut said = Vec::new();
+    for reply in message::held_replies(store) {
+        let Some(question) = reply.reply_to.as_deref().and_then(|id| store.message(id)) else {
+            continue;
+        };
+        let since = reply.via.last().map(|h| util::local_hm(util::epoch_of(&h.at))).unwrap_or_default();
+        let pane = route(store, reply.waiting.as_ref());
+        let end = |act: message::Act, note: &str| {
+            let _ = message::unheld(store, &reply.id, &pane, act, note);
+        };
+        if pane.is_empty() {
+            end(message::Act::Noted, "nobody to tell — the answer is on the record and in the log");
+            said.push(format!("answer to {} held since {since}: nobody to tell, so it stays on the log", question.id));
+            continue;
+        }
+        if seats.absent(&pane) {
+            end(message::Act::Noted, &format!("{pane} is gone — the answer is on the record and in the log"));
+            said.push(format!("answer to {} held for {pane} since {since}: the pane is gone, so it stays on the log", question.id));
+            continue;
+        }
+        if seats.state(&pane) != Some(crate::place::State::Idle) {
+            continue;
+        }
+        let landed = match message::homes_to(store, &question) {
+            Some(list) if store.task(&list).is_none() => Landed::List(list),
+            Some(task) => Landed::Task(task),
+            None => Landed::RecordOnly(String::new()),
+        };
+        let closed = message::Closed { question: question.clone(), reply: reply.clone(), landed };
+        match type_at(&pane, &wire(&closed)) {
+            // Nothing there to type at, or it turned busy between the reading
+            // and the type: the hold stands, and the next tick asks again.
+            None | Some(Err(crate::place::Refusal::NotReady(_))) => {}
+            Some(Ok(how)) => {
+                let turn = match how {
+                    crate::place::Delivery::Started => "a turn started on it",
+                    crate::place::Delivery::Acked => "delivered, acknowledged by the seat",
+                    crate::place::Delivery::Unconfirmed => "no turn seen yet",
+                };
+                end(message::Act::Sent, &format!("typed at {pane} — {turn}"));
+                said.push(format!(
+                    "answer to {} held for {pane} since {since}, typed now it is idle — {turn}",
+                    question.id
+                ));
+            }
+            // **A delivery that is still pending is not a delivery that failed**
+            // (`wsp-469`). compound's `deliver` gives a tick 30 s and answers
+            // "still pending, asked again next tick under the same id"; this arm
+            // used to end the hold on that answer too, so the tick that said
+            // "asked again next tick" had just dropped the answer and no later
+            // tick asked. The hold stands while the refusal is the backend's
+            // own word and the answer is young (`HELD_RETRY_FOR`); the line is
+            // written each time, which is a bounded few.
+            Some(Err(e)) if retry_held(&e, held_for(&reply)) => {
+                said.push(format!(
+                    "answer to {} held for {pane} since {since}: not typed yet — {e}; the hold stands and the next tick asks again",
+                    question.id
+                ));
+            }
+            Some(Err(e)) => {
+                end(message::Act::Noted, &format!("{pane} was not told: {e}"));
+                said.push(format!(
+                    "answer to {} held for {pane} since {since}: NOT TOLD — {e}; it is on {}'s log and `wsp tell {pane} --anyway -` types it",
+                    question.id,
+                    question.about.task().unwrap_or("the list")
+                ));
+            }
+        }
+    }
+    said
+}
+
+/// How the asker sees it, and the first line is the byline.
+fn wire(closed: &message::Closed) -> String {
+    let mut out = format!(
+        "[{}, answering your question {}]\n\n{}",
+        whose(closed),
+        closed.question.id,
+        closed.reply.text.trim()
+    );
+    out.push_str(&format!("\n\nyou asked: {}", closed.question.title()));
+    match &closed.landed {
+        Landed::Task(id) => out.push_str(&format!("\nthis is also on {id}'s log, so it survives this pane")),
+        Landed::List(id) => out.push_str(&format!("\nthis is also on the {id} list's log, so it survives this pane")),
+        Landed::RecordOnly(_) => {}
+    }
+    out.push_str(&format!("\n`wsp ack {}` when you have read it", closed.reply.id));
+    out
+}
+
+fn whose(closed: &message::Closed) -> String {
+    closed.reply.from.byline()
+}
+
+/// Who the answer is for, as a receipt names it — the asker, by the byline it
+/// asked under, and never [`whose`]. `wsp-204`: the receipt was handed the
+/// answerer, so a refusal read `wsp-process seat was not told` about cpd-380,
+/// and pointed its reader at the one seat that had done its part.
+fn asker(closed: &message::Closed) -> String {
+    closed.question.from.byline()
+}
+
+/// The receipt's words for the seat an ask reached: *asked of the `x` governor ·
+/// room*, and *asked of ed's primary* for `primary:ed` (`wsp-485`), which is
+/// filed under no room here. Kept beside the ask rather than taken from
+/// `cmd_govern::seat_words`, so this module takes no new upward edge.
+fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s: &crate::governors::Seat) -> String {
+    match crate::governors::user_of_primary(&s.scope) {
+        Some(user) => format!("asked of {user}'s primary"),
+        None => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(governors, s)),
+    }
+}
+
+/// Who a question is addressed to, in one line of receipt.
+///
+/// The same walk `wsp flag` prints and deliberately **not** the same sentence.
+/// A flag's line ends *"x there lowers it"*, which is the correct instruction
+/// for a hand and the exact wrong one for a question: lowering is not a
+/// disposition, and a surface that offered it would reproduce `worklist-004`
+/// every time somebody reached for the keystroke. So the walk is shared and the
+/// closing clause is not — the routing is one rule and what may close a record
+/// is a property of its shape.
+fn addressed(store: &Store, task: &crate::model::Task) -> String {
+    let governors = store.governors();
+    match crate::cmd_govern::answering_seat(store, task) {
+        Some(s) => asked_of(&governors, &s),
+        None => "asked of every panel — no governor above it".into(),
+    }
+}
+
+// ---- who am I, and which record did you mean -------------------------------
+
+/// This caller as a [`Party`], and the pane it is in if it is in one.
+///
+/// A seat is a seat before it is a pane, because that is what the other end
+/// needs to read: an answer from *the wsp seat* is a different thing to weigh
+/// than one from a pane id nobody can place. The pane is still returned beside
+/// it, because a question asked from a seat still has to be answered back into
+/// the workspace the seat is sitting in.
+pub fn whoami(store: &Store) -> (Party, Option<String>) {
+    // Off `my_pane()` and not `WSP_BACKEND_WORKSPACE_ID`: after `compound-092` there
+    // is no workspace to ask, only the seat, and `my_pane()` is already the
+    // one place that picks it — a supervisor's `WSP_SEAT_ID` first, backend's
+    // `WSP_BACKEND_PANE_ID` after — so a caller outside backend is not told it is
+    // nobody just because this file used to reach for backend's own variable.
+    let pane = crate::place::my_pane();
+    let scope = pane
+        .as_deref()
+        .and_then(|p| crate::place::governs(&store.governors(), &crate::place::Seat::new(p)));
+    match (scope, &pane) {
+        (Some(scope), _) => (Party::seat(&scope), pane.clone()),
+        (None, Some(p)) => (
+            // The workspace here is a byline's, for a panel to jump to — not a
+            // decision, so backend's own variable is still the honest source for
+            // it, and empty (as it is under any other backend) is correct.
+            Party::pane(p, ""),
+            pane.clone(),
+        ),
+        // Outside backend entirely, which is a person at a shell. The fallback is
+        // the honest one rather than a convenience: unattributed is a human.
+        (None, None) => (a_person(), None),
+    }
+}
+
+/// Who is running this verb, as one token for a record's `by`: the post a
+/// seat holds, else the pane, else `person` — [`whoami`]'s reading, where a
+/// caller outside any pane is a person at a shell.
+///
+/// The seat is read off the environment in `my_pane()`'s order rather than
+/// through it: building its backends opens the default store, which a verb
+/// writing one log line has no other reason to touch.
+pub fn caller(store: &Store) -> String {
+    Caller::here(store).by
+}
+
+/// Who a write is made for, given explicitly rather than read off this
+/// process's environment (wsp-175): a verb run here is [`Caller::here`], and a
+/// record that arrived from the hub is [`Caller::hub`], written by the same
+/// functions with the hub's user named instead of the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// The token a record's `by` names: a post, a pane, `person`, or the hub's user.
+    pub by: String,
+    /// The write came in over the hub, not from a verb run here.
+    pub via_hub: bool,
+}
+
+impl Caller {
+    /// This process: the post its seat holds, else the pane, else `person`.
+    pub fn here(store: &Store) -> Caller {
+        let pane = crate::place::seat_from_env().map(|s| s.to_string());
+        let by = match pane {
+            Some(p) => crate::place::governs(&store.governors(), &crate::place::Seat::new(p.as_str())).unwrap_or(p),
+            None => crate::cmd_whoami::person(),
+        };
+        Caller { by, via_hub: false }
+    }
+
+    /// `user`, whose write the hub delivered.
+    pub fn hub(user: &str) -> Caller {
+        Caller { by: user.to_string(), via_hub: true }
+    }
+
+    /// `by <who>`, and ` via the hub` for a write that came in over it.
+    pub fn byline(&self) -> String {
+        match self.via_hub {
+            true => format!("by {} via the hub", self.by),
+            false => format!("by {}", self.by),
+        }
+    }
+}
+
+/// Who is speaking, as an address a reply can be sent to (`wsp-521`): the same
+/// words [`crate::address`] reads, so the footer on a tell is itself something
+/// `wsp tell` accepts.
+///
+/// `primary` and `governor:<scope>` for a governor's seat, `seat:<row>` for a
+/// pane bound to a row, the pane id bare for one that holds neither (which
+/// `tell` also takes), and `person` for a caller outside any pane. Pure over
+/// the records and the pane, so the three callers — a seat, the primary and a
+/// shell — are proved without an environment.
+pub fn sender_of(
+    governors: &std::collections::BTreeMap<String, serde_json::Value>,
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    pane: Option<&str>,
+) -> String {
+    sender_as(governors, bindings, pane, None)
+}
+
+/// [`sender_of`] with the engineer a person at a shell is logged in as (wsp-165):
+/// `person:<engineer>` for a caller outside any pane, `person` without one.
+pub fn sender_as(
+    governors: &std::collections::BTreeMap<String, serde_json::Value>,
+    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
+    pane: Option<&str>,
+    engineer: Option<&str>,
+) -> String {
+    let Some(pane) = pane.filter(|p| !p.is_empty()) else {
+        return crate::cmd_whoami::person_named(engineer);
+    };
+    if let Some(scope) = crate::place::governs(governors, &crate::place::Seat::new(pane)) {
+        return match crate::governors::is_primary(&scope) {
+            true => crate::governors::PRIMARY.into(),
+            false => format!("governor:{scope}"),
+        };
+    }
+    match bindings.get(pane).and_then(|b| b.get("task_id")).and_then(|t| t.as_str()).filter(|t| !t.is_empty()) {
+        Some(row) => format!("seat:{row}"),
+        None => pane.to_string(),
+    }
+}
+
+/// [`sender_of`] for this process: the pane it is in, read the way [`caller`]
+/// reads it.
+pub fn sender(store: &Store) -> String {
+    let pane = crate::place::seat_from_env()
+        .map(|s| s.to_string());
+    let engineer = pane.is_none().then(crate::cmd_whoami::engineer).flatten();
+    sender_as(&store.governors(), &store.bindings(), pane.as_deref(), engineer.as_deref())
+}
+
+/// The person at a shell as a record's party: named when an engineer is logged in (wsp-165).
+fn a_person() -> Party {
+    match crate::cmd_whoami::engineer() {
+        Some(name) => Party::engineer(&name),
+        None => Party::Human(None),
+    }
+}
+
+/// The record a needle names: an id, or an unambiguous prefix of one.
+///
+/// A message id is minted from a clock and a pid and nobody types one whole.
+/// The prefix is refused when it matches two, rather than resolved to the
+/// first: answering the wrong question is the failure this file exists to stop,
+/// and it would be silent.
+fn find(store: &Store, needle: &str) -> Result<Message, i32> {
+    if let Some(m) = store.message(needle) {
+        return Ok(m);
+    }
+    let hits: Vec<Message> =
+        message::all(store).into_iter().filter(|m| m.id.starts_with(needle)).collect();
+    match hits.len() {
+        1 => Ok(hits.into_iter().next().unwrap_or_else(|| unreachable!())),
+        0 => {
+            eprintln!("wsp: no message `{needle}` — `wsp ask` lists what is open");
+            Err(1)
+        }
+        n => {
+            eprintln!("wsp: `{needle}` names {n} messages:");
+            for m in hits.iter().take(8) {
+                eprintln!("     {}  {}", m.id, m.title());
+            }
+            Err(2)
+        }
+    }
+}
+
+/// The verbs this module answers to, each with the help it carries. `main` and
+/// the help text are assembled from these; nothing in `main.rs` names them.
+pub const VERBS: &[crate::verbs::Verb] = &[
+    // The return path. `flag` and `tell` are one-directional and stay that
+    // way; these three are the case where something is owed back, and the
+    // answer is a record before it is a sentence in somebody's pane.
+    crate::verbs::Verb {
+        names: &["ask"],
+        run: ask,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 210,
+                text: r##"  wsp ask|flag <id> --caption "…"   the line a glance names it by, under 60;
+                                    without one a flag's --title, else the
+                                    first clause with any `Ed:` off"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 230,
+                text: r##"  wsp ask <id> ["…"|-|--from F]     a question about a task, with a return path:
+                                    the answer comes back to you and lands on a
+                                    task's log. `wsp tell` is still for prose"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 240,
+                text: r##"  wsp ask <list> [--group N] "…"    …about a worklist, from a barrier check that
+                                    holds no task: its governor is asked, and
+                                    the answer lands on the list's log"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 250,
+                text: r##"  wsp ask                           what is open, who is waiting, and how long"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 280,
+                text: r##"  wsp ask --cancel <mid> ["why"]    the person's dismissal of any ask, one only
+                                    the person may close included: closed as
+                                    cancelled by the person, and the asker told
+                                    as an answer would tell it. A row going to
+                                    review, done, parked or the archive, an
+                                    agent closing, or a barrier passing closes
+                                    what it raised by itself, with the reason"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 290,
+                text: r##"  wsp ask <id> --person --choices F|-   a question with options (F: JSON {kind:
+                                    ask|plan|permission, questions:[{question,
+                                    header, multi, options:[{label,
+                                    description, preview?}]}], plan?, tool?,
+                                    command?}); the text may be left out, and a
+                                    surface that ignores choices still reads it"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 291,
+                text: r##"  wsp ask <id> --person --set F|-   a set of 2-30 questions, one ask (F: JSON
+                                    {title, intro?, questions:[{header, question,
+                                    multi, options (2-4), recommended?, why?}]});
+                                    `wsp answer <mid> --question H|N --choice L
+                                    [--other W] [--note W]` saves one (a decision
+                                    on the row each), the last answer ends it
+                                    (`--finish` is refused while any is open); the
+                                    asker is told once, at the end; `wsp ask <mid>` reads it so far"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 320,
+                text: r##"  wsp ask <id> --person --wait [--timeout S] [--choices F|-] ["…"]
+                                    ask inside the turn: blocks, prints the
+                                    answer (label, free text, `talk: …`,
+                                    `allow`/`deny: …`), exit 0; exit 3 with the
+                                    reason on stderr if abandoned or timed out
+                                    (the question stays open on a timeout);
+                                    ends itself at 540s, under the tool call's
+                                    600s, with exit 3 "still waiting" — run
+                                    `wsp ask <mid> --wait` again at once"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 330,
+                text: r##"  wsp ask <mid> --wait [--timeout S]  wait again on one that stayed open"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 340,
+                text: r##"  wsp ask <id|list> --person "…"    a question only the person may answer: it is
+                                    in `wsp yours`, holds the barrier of the
+                                    group it names, and a seat or an agent may
+                                    raise one and never close one"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["answer"],
+        run: answer,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 260,
+                text: r##"  wsp answer <mid> "…"|-|--from F   close one: the log first, then whoever asked"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 270,
+                text: r##"  wsp answer <mid> --abandon "…"    the other ending, and it also goes home"##,
+            },
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 300,
+                text: r##"  wsp answer <mid> --choice 'Q=Label' [--choice …] [--other 'Q=words']
+                                    answer one that has options: a label or an
+                                    Other, refused with the options named
+                                    otherwise; `--choice allow|deny "…"` on a
+                                    plan or permission; `--choice F|-` takes
+                                    {answers:{Q: label|{pick}|{other}}} or
+                                    {behavior, message?, rule?, mode?}"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["yours"],
+        run: yours,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 350,
+                text: r##"  wsp yours [-p <proj>] [--json]    what waits on the person, and how many rows
+                                    wait at review (a count, not items), and how
+                                    many the run closed since you looked;
+                                    --closed lists those and counts as looking"##,
+            },
+        ],
+    },
+    crate::verbs::Verb {
+        names: &["ack"],
+        run: ack,
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Plumbing,
+                order: 310,
+                text: r##"  wsp ack <mid>                     an answer read, or a notification taken on"##,
+            },
+        ],
+    },
+];
+
+/// Tell a governor's seat a question was filed for it (`wsp submit`'s asks), kept
+/// here because this module already reaches the seat layer and `cmd_submit` may not.
+pub fn say_to_governor(store: &Store, scope: &str, q: &Message) {
+    let _ = crate::wake::say(store, scope, &for_a_governor(q), Some(&q.id));
+}
+
+// ---------------------------------------------------------------- tells through the hub (wsp-470)
+//
+// A `wsp tell` to an address this spoke cannot deliver itself — `seat:<row>` of
+// a row another user's spoke holds, `governor:<list>` of a list driven
+// elsewhere, `primary:<user>` of another user ([`crate::address`]'s remote
+// form) — goes to the hub as a message ([`tell_via_hub`]). So does a reply:
+// `--re` naming a message the hub delivered here sends it back through the hub
+// whatever its address reads as here, and the hub routes it to that message's
+// sender. An address resolved here never reaches the hub.
+//
+// The receiving spoke's sync worker takes what the hub queued for its user and
+// hands each to the seat its address names here ([`receive`]), as a tell from
+// the sending seat named with its user (`seat:wsp-9@ed`), or `person:<user>`
+// from a shell, through the orders machine. What was received is kept in
+// `$WSP_STATE/hub/inbox.json` by the hub's id, so a message taken again after
+// a lost ack is not told twice, and a reply's `--re` is known.
+
+fn inbox_path(store: &Store) -> std::path::PathBuf {
+    store.state.join("hub").join("inbox.json")
+}
+
+fn inbox(store: &Store) -> serde_json::Map<String, serde_json::Value> {
+    let text = std::fs::read_to_string(inbox_path(store)).unwrap_or_default();
+    match serde_json::from_str(&text) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// The record of a message the hub delivered here, by the hub's id.
+pub fn received(store: &Store, id: &str) -> Option<serde_json::Value> {
+    inbox(store).remove(id)
+}
+
+fn note_received(store: &Store, id: &str, record: serde_json::Value) -> std::io::Result<()> {
+    store.locked(|| {
+        let mut all = inbox(store);
+        all.insert(id.to_string(), record);
+        let path = inbox_path(store);
+        let dir = path.parent().expect("under the state dir");
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(".inbox.json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, serde_json::Value::Object(all).to_string())?;
+        std::fs::rename(&tmp, &path)
+    })
+}
+
+/// Who a message from another user's spoke is from, as the receiving seat reads
+/// it: the sender's address named with its user (`seat:wsp-9@ed`).
+pub fn hub_speaker(m: &wsp_api::HubMessage) -> String {
+    format!("{}@{}", m.from.trim(), m.from_user)
+}
+
+/// The address a reply to `m` names: the sender's own address where it is one
+/// that names a post, else the sender's user's primary (a shell, a bare pane).
+/// The hub routes the reply by its `--re` either way; this is what the sender's
+/// spoke resolves it to.
+pub fn reply_address(m: &wsp_api::HubMessage) -> String {
+    match crate::address::parse(&m.from) {
+        Some(crate::address::Address::Primary) | Some(crate::address::Address::List(_)) | None => {
+            crate::governors::primary_of(&m.from_user)
+        }
+        Some(_) => m.from.trim().to_string(),
+    }
+}
+
+/// `m` as the seat reads it: who says it, the words, and the reply footer
+/// naming the address and the hub's id.
+pub fn hub_dressed(m: &wsp_api::HubMessage) -> String {
+    let who = hub_speaker(m);
+    format!("{who} says: {} [from {who} · reply: wsp tell {} --re {} -]", m.text.trim_end(), reply_address(m), m.id)
+}
+
+/// The principal a delivered message is from: the sending seat named with its
+/// user, or the user for a message sent from a shell.
+pub fn hub_sender(m: &wsp_api::HubMessage) -> wsp_store_contract::Principal {
+    match m.seat.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pane) => wsp_store_contract::Principal::Seat(wsp_store_contract::SeatId(format!("{pane}@{}", m.from_user))),
+        None => wsp_store_contract::Principal::Person(m.from_user.clone()),
+    }
+}
+
+/// Hand a message the hub delivered to the seat its address names here,
+/// through `hand`. `Ok(true)` when told now, `Ok(false)` when it was told
+/// before (so it is only acknowledged), `Err` when no one seat here answers to
+/// its address now (the hub keeps it queued).
+pub fn receive(store: &Store, m: &wsp_api::HubMessage, hand: &crate::hub_sync::Hand) -> Result<bool, String> {
+    if received(store, &m.id).is_some() {
+        return Ok(false);
+    }
+    let addr = crate::address::parse(&m.to).ok_or_else(|| format!("`{}` is no address", m.to))?;
+    // The hub routed it to `m.user`, the user this spoke's connection is: what
+    // `primary:<user>` is read against, whatever `hubs.json` says now.
+    let book = crate::address::Book { login: Some(m.user.clone()), ..crate::address::Book::read(store) };
+    let found = crate::address::resolve(&addr, &book)?;
+    let n = match found.as_slice() {
+        [n] if !n.remote => n,
+        [n] => return Err(format!("{} is not on this machine either", n.what)),
+        many => return Err(format!("`{}` names {} seats here", m.to, many.len())),
+    };
+    let text = hub_dressed(m);
+    let order = hand(&wsp_store_contract::SeatId(n.pane.clone()), &text, &hub_sender(m), &format!("hub:{}", m.id))?;
+    let who = hub_speaker(m);
+    let record = serde_json::json!({
+        "from_user": m.from_user, "from": m.from, "seat": m.seat, "to": m.to, "pane": n.pane,
+        "order": order, "re": m.re, "at": crate::util::epoch_secs(),
+    });
+    note_received(store, &m.id, record).map_err(|e| format!("the inbox was not written: {e}"))?;
+    store.log_event(
+        "agent-told",
+        serde_json::json!({
+            "target": m.to, "pane": n.pane, "chars": m.text.len(), "id": m.id, "from": who, "re": m.re,
+            "text": m.text, "via": "hub", "order": order, "at": crate::util::epoch_secs(), "turn": false,
+        }),
+    );
+    crate::store::log_line(store, &format!("told {}: from {who} through the hub ({}), {order}", n.what, m.id));
+    Ok(true)
+}
+
+/// The address a tell sends to the hub, or `None` for one delivered here: a
+/// reply (`re`) to a message the hub delivered here goes back through it; an
+/// address that resolves to its remote form is routed by it; anything else,
+/// an address that resolves here or a refusal, is this spoke's.
+pub fn hub_bound(book: &crate::address::Book, needle: &str, re: Option<&str>, received: &dyn Fn(&str) -> bool) -> Option<String> {
+    if re.is_some_and(received) && crate::address::parse(needle).is_some() {
+        return Some(needle.trim().to_string());
+    }
+    let addr = crate::address::parse(needle)?;
+    match crate::address::resolve(&addr, book) {
+        Ok(found) if found.len() == 1 && found[0].remote => Some(found[0].pane.clone()),
+        _ => None,
+    }
+}
+
+/// [`hub_bound`]'s message sent to the hub the login in `home` names: `None`
+/// for a tell delivered here (nothing is dialled), else the hub's id for it,
+/// the user it was routed to and the address, or why it did not take it.
+#[allow(clippy::too_many_arguments)]
+pub fn hub_tell(
+    store: &Store,
+    home: &std::path::Path,
+    book: &crate::address::Book,
+    needle: &str,
+    text: &str,
+    re: Option<&str>,
+    from: &str,
+    seat: Option<String>,
+) -> Option<Result<(String, String, String), String>> {
+    let to = hub_bound(book, needle, re, &|id| received(store, id).is_some())?;
+    let msg = wsp_api::MsgSend { to: to.clone(), from: from.to_string(), seat, text: text.to_string(), re: re.map(str::to_string) };
+    let sent = crate::hub_sync::dial(home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()));
+    Some(sent.map(|(id, user)| (id, user, to)))
+}
+
+/// `wsp tell <address>` through the hub, when the address is another user's
+/// spoke's or the tell replies to a message the hub delivered: the exit code,
+/// or `None` to deliver it here as before. Without a hub login nothing goes
+/// to the hub.
+pub fn tell_via_hub(store: &Store, args: &Args, needle: &str, text: &str, re: Option<&str>, from: &str) -> Option<i32> {
+    crate::address::parse(needle)?;
+    let home = wsp_client::hub_home()?;
+    if !home.join(wsp_client::HUBS_FILE).exists() {
+        return None;
+    }
+    let seat = crate::place::seat_from_env().map(|s| s.to_string());
+    let book = crate::address::Book::read(store);
+    match hub_tell(store, &home, &book, needle, text, re, from, seat)? {
+        Ok((id, user, to)) => {
+            store.log_event(
+                "agent-told",
+                serde_json::json!({
+                    "target": to, "pane": "", "chars": text.len(), "id": id, "from": from, "re": re, "text": text,
+                    "via": "hub", "user": user, "at": crate::util::epoch_secs(), "turn": false,
+                }),
+            );
+            crate::store::log_line(store, &format!("told {to} through the hub: queued for {user} ({id}), from {from}"));
+            match args.json() {
+                true => println!("{}", serde_json::json!({ "target": to, "id": id, "user": user, "via": "hub", "queued": true, "re": re })),
+                false => println!("{}", Paint::new().dim(&format!("→ {to} · through the hub, queued for {user} · {id}"))),
+            }
+            Some(0)
+        }
+        Err(why) => {
+            eprintln!("wsp: `{needle}` is another user's, and the hub did not take it: {why}");
+            Some(1)
+        }
+    }
+}
+
+/// A governor record putting `pane` in `scope`'s seat, for another module's test.
+#[cfg(test)]
+pub fn tests_govern(store: &Store, scope: &str, pane: &str) {
+    store.set_governor(scope, serde_json::json!({ "workspace": "w9", "pane": pane, "since": "2026-11-23" }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `wsp-485`: the receipt for an ask reaching `primary:ed` names ed's primary
+    /// and has no empty room after it.
+    #[test]
+    fn the_receipt_for_an_ask_to_a_users_primary_has_no_empty_room() {
+        let seat = crate::governors::Seat {
+            scope: "primary:ed".into(),
+            pane: String::new(),
+            since: String::new(),
+            session: String::new(),
+            cwd: String::new(),
+            kind: String::new(),
+            vacant: false,
+        };
+        let said = asked_of(&Default::default(), &seat);
+        assert_eq!(said, "asked of ed's primary");
+    }
+    use crate::model::Task;
+
+    /// An item as `yours --json` prints it, through the builder and wsp-view's projection.
+    fn item_json(store: &Store, q: &Message) -> serde_json::Value {
+        wsp_view::flag::item_json(&item_of(store, q))
+    }
+
+    /// A closed question as `yours --json`'s `closed` prints it.
+    fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
+        wsp_view::flag::closed_json(&wsp_view::flag::Closed { item: item_of(store, q), closed })
+    }
+
+    fn scratch(tag: &str) -> Store {
+        crate::testkit::store(&format!("ans-{tag}"))
+    }
+
+    fn task(store: &Store, id: &str) -> Task {
+        let mut t = Task::new("the work", id);
+        t.project = Some("worklist".into());
+        t.body = String::from("## Overview\nthe brief\n\n## Log\n- 2026-08-19 claimed\n");
+        store.save_task(&t).unwrap();
+        t
+    }
+
+    fn a_question(store: &Store, about: &str) -> Message {
+        let q = Message::question(
+            Party::seat("worklist"),
+            Kind::Note,
+            "does the barrier reading hold?",
+            Waiting::new("w3R:p1", ""),
+        )
+        .about(About::Task(about.to_string()));
+        message::raise(store, &q).unwrap();
+        q
+    }
+
+    /// A message id is minted from a clock and a pid and **nobody types one
+    /// whole**, so a prefix has to resolve — and a prefix that names two has to
+    /// refuse rather than pick. Answering the wrong question is the failure
+    /// this file exists to stop, and resolving to the first match would do it
+    /// silently: the asker of the other question goes on sitting still while
+    /// its record says somebody dealt with it.
+    #[test]
+    fn a_prefix_naming_two_questions_is_refused_rather_than_resolved() {
+        let store = scratch("prefix");
+        task(&store, "wsp-095");
+        let one = a_question(&store, "wsp-095");
+        let two = a_question(&store, "wsp-095");
+        assert_ne!(one.id, two.id, "two questions are two records, keyed by their own ids");
+
+        assert_eq!(find(&store, &one.id).map(|m| m.id), Ok(one.id.clone()), "an id resolves whole");
+        assert_eq!(find(&store, "m-").err(), Some(2), "a prefix that names both is refused");
+        assert_eq!(find(&store, "m-nothing").err(), Some(1), "and one that names none says so");
+    }
+
+    /// **The inversion `wsp-095` Part 4 is for**: today, unattributed text
+    /// reads as Ed, so attributed text has to be a seat or an agent and
+    /// unattributed text a person. wsp cannot make backend attribute a keystroke
+    /// — that is backend's — so what wsp can do is carry the sender *in the
+    /// payload*, and this is the one place the payload is composed.
+    ///
+    /// The dated instance: `worklist-004`'s question was answered by text that
+    /// appeared in its composer from an unattributed sender, and the answer was
+    /// wrong — following it would have destroyed another lane's test fixture.
+    /// The reader could not weigh it because it could not tell who was
+    /// speaking.
+    #[test]
+    fn what_reaches_the_asker_opens_by_saying_who_is_speaking() {
+        let store = scratch("wire");
+        task(&store, "wsp-095");
+        let q = a_question(&store, "wsp-095");
+        let closed = message::answer(
+            &store,
+            &q.id,
+            &Party::seat("wsp"),
+            "it holds — cmd_checkout::ahead() reads the branch off the tree",
+        )
+        .unwrap();
+
+        let text = wire(&closed);
+        let first = text.lines().next().unwrap_or_default();
+        assert!(first.contains("wsp seat"), "the byline is the first thing read: {first}");
+        assert!(first.contains(&q.id), "…and it names the question, so the answer is not free-floating");
+        assert!(text.contains("cmd_checkout::ahead()"), "the answer itself is in there");
+        assert!(
+            text.contains("wsp-095's log"),
+            "and it says the words survive this pane, which is the property Ed was supplying by hand",
+        );
+    }
+
+    /// `wsp-170`: the verb a cut question points at exists, takes the id the
+    /// line printed, and a short question is never cut at all.
+    #[test]
+    fn a_question_is_typed_whole_when_short_and_a_message_id_prints_it_whole() {
+        let store = scratch("whole");
+        task(&store, "wsp-095");
+        let text = "first paragraph\n\nsecond paragraph\n\nA or B?";
+        let q = Message::question(Party::seat("worklist"), Kind::Note, text, Waiting::new("", "wsp-095"))
+            .about(About::Task("wsp-095".into()));
+        message::raise(&store, &q).unwrap();
+
+        let typed = for_a_governor(&q);
+        assert!(typed.contains(text), "a short question is typed as asked: {typed}");
+        assert!(!typed.contains("prints the whole question"), "and says nothing was cut: {typed}");
+
+        let args = crate::base::args::Args::parse(["ask", q.id.as_str()].iter().map(|s| s.to_string()).collect());
+        assert_eq!(ask(&store, &args), 0, "a message id and nothing to say shows the question");
+        let args = crate::base::args::Args::parse(["ask", "m-nothing"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(ask(&store, &args), 1, "an id that names nothing says so");
+    }
+
+    /// `wsp-230`. A barrier check holds no task, so it asks about the list it
+    /// is checking: the question reaches that list's governor, naming the
+    /// barrier, and the answer is written on the list's log — the one durable
+    /// home a seat with no row has — before it is taken back to the asker.
+    #[test]
+    fn a_check_asks_about_its_list_and_the_governor_is_asked_and_the_answer_lands_on_the_list() {
+        let _env = util::isolated("ask-list");
+        let store = scratch("ask-list");
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("run", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+
+        // The check's own seat, which is who is waiting: said here rather than
+        // inherited from whatever seat runs the suite.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
+        let args = crate::base::args::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
+        let code = ask(&store, &args);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert_eq!(code, 0, "a worklist is somewhere for the answer to live");
+        let q = message::open_questions(&store).pop().expect("the question");
+        assert_eq!(q.about, About::Group { scope: "run".into(), group: 1 });
+        let spooled = std::fs::read_to_string(store.state.join("watches.json")).unwrap_or_default();
+        assert!(spooled.contains("barrier 1 of run") && spooled.contains(&q.id), "held for the run's seat: {spooled}");
+
+        let closed = message::answer(&store, &q.id, &Party::seat("run"), "yes, all of it").unwrap();
+        assert_eq!(closed.landed, Landed::List("run".into()));
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("answered by") && log.contains("yes, all of it"), "{log}");
+        assert!(wire(&closed).contains("the run list's log"), "{}", wire(&closed));
+    }
+
+    /// A question needs a subject **because the subject is what gives the
+    /// answer somewhere to live**, and the refusal is at the point of asking
+    /// rather than at the point of answering. Discovered late, this is an agent
+    /// sitting still while somebody works out that its question has no return
+    /// address; refused early, it is one sentence.
+    #[test]
+    fn a_question_about_nothing_is_refused_where_it_is_cheap() {
+        let store = scratch("subject");
+        let args = crate::base::args::Args::parse(
+            ["ask", "nothing-095", "can I land this?"].iter().map(|s| s.to_string()).collect(),
+        );
+        assert_eq!(ask(&store, &args), 1, "no such task, so there is nowhere for an answer to go");
+        assert!(message::all(&store).is_empty(), "and nothing was written on the way to finding out");
+    }
+
+    /// `Waiting` holds a pane **and** a task because *the pane can go and the
+    /// task cannot*, and this is the one call that spends the second field. A
+    /// pane id is the most perishable identifier backend has — one cascade of
+    /// `pane.exited` once cleared every binding on this machine at a stroke —
+    /// so a question open long enough to be worth answering is one whose pane
+    /// may since have been reused. Typing an answer at whoever is standing
+    /// there now is a wrong delivery that reports success.
+    #[test]
+    fn an_answer_goes_to_whoever_holds_the_work_now_and_not_to_a_pane_that_moved() {
+        let store = scratch("route");
+        task(&store, "worklist-014");
+        store.set_binding("w9Z:p1", serde_json::json!({ "task_id": "worklist-014" }));
+
+        assert_eq!(
+            route(&store, Some(&Waiting::new("w4N:p1", "worklist-014"))),
+            "w9Z:p1",
+            "the binding is asked first, because it is the field that survives a respawn",
+        );
+        assert_eq!(
+            route(&store, Some(&Waiting::new("w3R:p1", ""))),
+            "w3R:p1",
+            "a seat holds no task, so its pane is the only address it has",
+        );
+        assert_eq!(
+            route(&store, Some(&Waiting::new("w4N:p1", "worklist-020"))),
+            "w4N:p1",
+            "a task nothing is bound to falls back rather than answering nobody",
+        );
+        assert_eq!(route(&store, None), "", "and nothing named is nobody to tell");
+    }
+
+    /// A pane whose state a test sets, and which says whether it is gone.
+    struct Pane {
+        state: std::cell::Cell<Option<crate::place::State>>,
+        gone: bool,
+    }
+
+    impl crate::cycle::Seats for Pane {
+        fn state(&self, _: &str) -> Option<crate::place::State> {
+            self.state.get()
+        }
+        fn absent(&self, _: &str) -> bool {
+            self.gone
+        }
+    }
+
+    /// cpd-380's question, answered by the wsp-process seat while cpd-380 was
+    /// mid-turn — the verb's half: the reply held on its record.
+    fn answered_mid_turn(store: &Store) -> message::Closed {
+        task(store, "wsp-149");
+        let q = Message::question(
+            Party::pane("cpd-380", ""),
+            Kind::Note,
+            "does the barrier hold?",
+            Waiting::new("cpd-380", ""),
+        )
+        .about(About::Task("wsp-149".into()));
+        message::raise(store, &q).unwrap();
+        let closed = message::answer(store, &q.id, &Party::seat("wsp-process"), "it holds").unwrap();
+        message::held(store, &closed.reply.id, "cpd-380", "the seat is mid-turn").unwrap();
+        closed
+    }
+
+    /// **`wsp-204`, the row itself.** An answer to an asker that is mid-turn
+    /// used to reach the log and not the pane, and the asker went idle on a
+    /// question that had been answered until a person relayed it by `wsp tell`.
+    /// Held, it waits out the turn without a keystroke at the pane, is typed
+    /// once at the first idle, and is not typed again.
+    #[test]
+    fn an_answer_to_a_working_asker_is_typed_at_its_next_idle_and_only_once() {
+        let store = scratch("held");
+        let closed = answered_mid_turn(&store);
+        let typed = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let type_at = |pane: &str, text: &str| {
+            typed.borrow_mut().push((pane.to_string(), text.to_string()));
+            Some(Ok(crate::place::Delivery::Started))
+        };
+        let pane = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
+
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty(), "a turn in flight says nothing");
+        assert!(typed.borrow().is_empty(), "and nothing is typed into it");
+        assert_eq!(message::held_replies(&store).len(), 1, "the answer is still owed");
+
+        pane.state.set(Some(crate::place::State::Idle));
+        let said = deliver_held_through(&store, &pane, &type_at);
+        assert_eq!(typed.borrow().len(), 1, "the first idle is the delivery");
+        let (at, text) = typed.borrow()[0].clone();
+        assert_eq!(at, "cpd-380", "typed at the asker, not at whoever answered");
+        assert!(text.contains("wsp-process seat") && text.contains(&closed.question.id), "the byline rides it: {text}");
+        assert!(said[0].contains("typed now it is idle"), "and cycle.log is told: {said:?}");
+        assert!(message::held_replies(&store).is_empty(), "the hold ends with the typing");
+
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty());
+        assert_eq!(typed.borrow().len(), 1, "a delivered answer is never typed twice");
+    }
+
+    /// No idle is ever coming to a pane that is gone, so the hold ends with a
+    /// sentence rather than being asked about every minute for ever — and a
+    /// pane nobody can read is *not* gone, so that one keeps it.
+    #[test]
+    fn a_held_answer_whose_asker_is_gone_stays_on_the_log_and_is_not_typed() {
+        let store = scratch("held-gone");
+        answered_mid_turn(&store);
+        let type_at = |_: &str, _: &str| -> Option<crate::place::Result<crate::place::Delivery>> {
+            panic!("nothing is typed at a pane that is not there")
+        };
+
+        let unreadable = Pane { state: std::cell::Cell::new(None), gone: false };
+        assert!(deliver_held_through(&store, &unreadable, &type_at).is_empty());
+        assert_eq!(message::held_replies(&store).len(), 1, "an absence is not a fact, so it is still owed");
+
+        let gone = Pane { state: std::cell::Cell::new(None), gone: true };
+        let said = deliver_held_through(&store, &gone, &type_at);
+        assert!(said[0].contains("the pane is gone"), "{said:?}");
+        assert!(message::held_replies(&store).is_empty(), "and the hold is over");
+    }
+
+    /// **wsp-124, an answer to a busy asker under `store`.** The answer is one
+    /// order, queued while the asker works; nothing is held, so the files
+    /// tick types nothing; the worker types it once the asker reads idle, and
+    /// the reply's `Sent` hop is written then and not before, once.
+    #[test]
+    fn under_store_an_answer_to_a_busy_asker_is_one_order_and_sent_once_it_is_acknowledged() {
+        use wsp_store_contract::{Command, OrderState, SeatId, SeatState};
+        let store = scratch("ordered");
+        task(&store, "wsp-149");
+        let q = Message::question(Party::pane("cpd-380", ""), Kind::Note, "does the barrier hold?", Waiting::new("cpd-380", ""))
+            .about(About::Task("wsp-149".into()));
+        message::raise(&store, &q).unwrap();
+        let closed = message::answer(&store, &q.id, &Party::seat("wsp-process"), "it holds").unwrap();
+
+        let db = crate::orders::tests::db(&store.state.join("orders-db"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&db, "cpd-380", SeatState::Working);
+        let send = Command::OrderSend { to: SeatId("cpd-380".into()), text: wire(&closed), first: false };
+        let id = crate::orders::send_in(&db, send, &crate::orders::tests::ed()).unwrap();
+        note_ordered(&store, &closed, &id, "cpd-380");
+        let read = |id: &wsp_store_contract::OrderId| crate::orders::order_in(&db, id);
+        let sent_hops = || {
+            store.message(&closed.reply.id).unwrap().via.iter().filter(|h| h.act == message::Act::Sent).count()
+        };
+
+        let typed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = typed.clone();
+        let ask: Box<crate::deliver::Ask> = Box::new(move |_, o, _| {
+            log.lock().unwrap().push(o.0.clone());
+            Ok(crate::place::Delivery::Acked)
+        });
+        let mut worker = crate::deliver::Worker::new(db.clone(), "wsp", ask);
+        let busy = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
+
+        worker.pass();
+        assert!(typed.lock().unwrap().is_empty(), "nothing is typed at a working asker");
+        assert!(message::held_replies(&store).is_empty(), "the machine's queue holds it, not a held hop");
+        let no_typing = |_: &str, _: &str| -> Option<crate::place::Result<crate::place::Delivery>> {
+            panic!("the files tick types nothing for an answer sent as an order")
+        };
+        assert!(deliver_held_through(&store, &busy, &no_typing).is_empty());
+        assert!(settle_ordered_through(&store, &busy, &read).is_empty(), "a queued order writes no hop");
+        assert_eq!(sent_hops(), 0, "not Sent before it is delivered");
+        assert_eq!(crate::orders::orders_of_in(&db, &SeatId("cpd-380".into()), &[]).unwrap().len(), 1, "one order");
+
+        crate::orders::tests::seat(&db, "cpd-380", SeatState::Idle);
+        worker.pass();
+        assert_eq!(*typed.lock().unwrap(), vec![id.0.clone()], "typed once the asker reads idle, under the order's id");
+        assert_eq!(crate::orders::order_in(&db, &id).unwrap().unwrap().state, OrderState::Acknowledged);
+        let idle = Pane { state: std::cell::Cell::new(Some(crate::place::State::Idle)), gone: false };
+        let said = settle_ordered_through(&store, &idle, &read);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("acknowledged"), "{said:?}");
+        assert_eq!(sent_hops(), 1, "the Sent hop, once acknowledged");
+
+        assert!(settle_ordered_through(&store, &idle, &read).is_empty(), "settled once");
+        assert_eq!(sent_hops(), 1);
+    }
+
+    /// An answer's order that fails, or whose asker goes, ends with a `Noted`.
+    #[test]
+    fn under_store_an_answer_whose_asker_goes_is_noted_and_not_sent() {
+        use wsp_store_contract::{Command, SeatId, SeatState};
+        let store = scratch("ordered-gone");
+        let closed = answered_mid_turn(&store);
+        // The files hold the fixture made: ended, as the store path never makes one.
+        message::unheld(&store, &closed.reply.id, "cpd-380", message::Act::Noted, "fixture").unwrap();
+        let db = crate::orders::tests::db(&store.state.join("orders-db"), wsp_server::Mode::Owned);
+        crate::orders::tests::seat(&db, "cpd-380", SeatState::Working);
+        let send = Command::OrderSend { to: SeatId("cpd-380".into()), text: wire(&closed), first: false };
+        let id = crate::orders::send_in(&db, send, &crate::orders::tests::ed()).unwrap();
+        note_ordered(&store, &closed, &id, "cpd-380");
+        let read = |id: &wsp_store_contract::OrderId| crate::orders::order_in(&db, id);
+        let gone = Pane { state: std::cell::Cell::new(None), gone: true };
+        let said = settle_ordered_through(&store, &gone, &read);
+        assert!(said.len() == 1 && said[0].contains("is gone"), "{said:?}");
+        let last = store.message(&closed.reply.id).unwrap().via.last().cloned().unwrap();
+        assert_eq!(last.act, message::Act::Noted);
+        assert!(settle_ordered_through(&store, &gone, &read).is_empty(), "noted once");
+    }
+
+    /// **`wsp-469`, the replay.** A seat asks the person with `--wait`; the tool
+    /// timeout would end the wait at 600 s, so the wait ends itself at 540 s with
+    /// the question open and nobody marked on it; the person answers five
+    /// minutes later while the seat is mid-turn, and the answer is held; the
+    /// first tick that reads the seat idle finds the backend's delivery still
+    /// pending, and the hold *stands*, so the tick after types it, once.
+    #[test]
+    fn a_wait_ends_before_the_tool_timeout_and_the_answer_after_it_is_typed_once_the_seat_reads_idle() {
+        let _env = util::isolated("slice-replay");
+        let store = scratch("slice-replay");
+        task(&store, "wsp-149");
+        let args = crate::base::args::Args::synth("ask", &[], &[]);
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        assert_eq!(wait_and_report(&store, &q.id, None, &args, &clock), 3, "no answer: the wait ends, not the tool call");
+        assert_eq!(clock.now.get(), 540_000, "at the slice, under the 600 s the tool call is ended at");
+        let after = store.message(&q.id).unwrap();
+        assert!(after.is_open() && after.awaited.is_none(), "still open, and nobody is marked as waiting on it");
+
+        // Five minutes on, with the seat mid-turn (it had not yet asked again).
+        let closed = message::answer(&store, &q.id, &Party::Human(None), "yes, land").unwrap();
+        assert!(closed.question.awaited.is_none(), "no live waiter to carry the answer");
+        message::held(&store, &closed.reply.id, "cpd-893", "the seat is mid-turn").unwrap();
+        let pane = Pane { state: std::cell::Cell::new(Some(crate::place::State::Working)), gone: false };
+        let tries = std::cell::Cell::new(0);
+        let typed = std::cell::RefCell::new(Vec::<String>::new());
+        let type_at = |_: &str, text: &str| {
+            tries.set(tries.get() + 1);
+            if tries.get() == 1 {
+                return Some(Err(crate::place::Refusal::Backend(
+                    "cpd-893: delivery still pending after 30s, asked again next tick under the same id".into(),
+                )));
+            }
+            typed.borrow_mut().push(text.to_string());
+            Some(Ok(crate::place::Delivery::Started))
+        };
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty(), "working: nothing typed, nothing said");
+        pane.state.set(Some(crate::place::State::Idle));
+        let said = deliver_held_through(&store, &pane, &type_at);
+        assert!(said[0].contains("the hold stands"), "a pending delivery is said, not hidden: {said:?}");
+        assert_eq!(message::held_replies(&store).len(), 1, "and it is not dropped: the next tick asks again");
+        let said = deliver_held_through(&store, &pane, &type_at);
+        assert!(said[0].contains("typed now it is idle"), "{said:?}");
+        assert_eq!(typed.borrow().len(), 1);
+        assert!(typed.borrow()[0].contains("yes, land"));
+        assert!(message::held_replies(&store).is_empty());
+        assert!(deliver_held_through(&store, &pane, &type_at).is_empty());
+        assert_eq!(typed.borrow().len(), 1, "once");
+    }
+
+    /// An answer that lands at the slice's deadline is returned by the wait, and
+    /// a longer `--timeout` is cut to the slice while a shorter one is its own.
+    #[test]
+    fn the_slice_returns_an_answer_at_its_deadline_and_cuts_only_a_longer_timeout() {
+        let _env = util::isolated("slice-bound");
+        let store = scratch("slice-bound");
+        task(&store, "wsp-149");
+        let args = crate::base::args::Args::synth("ask", &[], &[]);
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        clock.at(540_000, || {
+            message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
+        });
+        assert_eq!(wait_and_report(&store, &q.id, None, &args, &clock), 0, "an answer at the deadline is not lost");
+
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        wait_and_report(&store, &q.id, Some(3_600), &args, &clock);
+        assert_eq!(clock.now.get(), 540_000, "an hour is cut to the slice");
+        let q = waited_on(&store, "wsp-149", None);
+        let clock = Fake::new();
+        wait_and_report(&store, &q.id, Some(60), &args, &clock);
+        assert_eq!(clock.now.get(), 60_000, "a shorter timeout is the caller's own");
+    }
+
+    /// Only the backend's own word is asked about again, and only while the
+    /// answer is young; a supervisor's `failed` and text typed and not taken
+    /// are final.
+    #[test]
+    fn only_a_backend_that_did_not_answer_is_retried_and_only_for_a_while() {
+        use crate::place::{Refusal, Seat};
+        assert!(retry_held(&Refusal::Backend("pending".into()), 30));
+        assert!(retry_held(&Refusal::Unreachable("no socket".into()), 30));
+        assert!(!retry_held(&Refusal::Backend("pending".into()), HELD_RETRY_FOR), "and not for ever");
+        assert!(!retry_held(&Refusal::Failed("sup gave up".into()), 30));
+        assert!(!retry_held(&Refusal::NoSeat(Seat::new("cpd-1")), 30));
+        assert!(!retry_held(&Refusal::NotTaken, 30), "typed already: a retry is a second copy");
+    }
+
+    /// The receipt names the party the answer is *for*. It named the answerer,
+    /// and `wsp-process seat was not told` sent a reader to the wrong pane.
+    #[test]
+    fn a_receipt_about_an_answer_names_the_asker_and_not_the_answerer() {
+        let store = scratch("asker");
+        let closed = answered_mid_turn(&store);
+        assert_eq!(asker(&closed), "cpd-380");
+        assert_eq!(whose(&closed), "wsp-process seat", "the byline is still the answerer's");
+    }
+
+
+    fn for_the_person_about(store: &Store, from: Party, about: About) -> Message {
+        let q = Message::question(from, Kind::Note, "accept +190 ms startup, or file rows?", Waiting::new("w3R:p1", ""))
+            .about(about)
+            .for_the_person();
+        message::raise(store, &q).unwrap();
+        q
+    }
+
+    /// `wsp-233`'s item is a question with one stored word on it, and it has to
+    /// survive the file: an item that came back as an ordinary question would
+    /// be one a governor could close.
+    #[test]
+    fn a_question_for_the_person_comes_back_for_the_person_and_only_it_is_listed() {
+        let store = scratch("yours-round");
+        task(&store, "wsp-095");
+        let mine = for_the_person_about(&store, Party::seat("worklist"), About::Task("wsp-095".into()));
+        let theirs = a_question(&store, "wsp-095");
+        message::sent(&store, &theirs.id, "wsp").unwrap();
+
+        let back = store.message(&mine.id).unwrap();
+        assert!(back.for_person, "the word survives messages.json");
+        assert_eq!(back.to_json()["for"], "person");
+        assert!(!store.message(&theirs.id).unwrap().for_person, "and an ordinary question does not grow one");
+        let listed: Vec<String> = message::for_the_person(&store).into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![mine.id], "the person's list is the person's questions and nothing else");
+    }
+
+    /// **A governor can add to it but never answer for Ed** — the line the
+    /// 2026-10-07/08 session kept drawing by hand. The record refuses a seat
+    /// whichever verb reaches it, answer or abandon, and leaves it open.
+    #[test]
+    fn a_seat_may_raise_the_persons_question_and_is_refused_when_it_closes_one() {
+        let store = scratch("yours-seat");
+        task(&store, "wsp-095");
+        let q = for_the_person_about(&store, Party::seat("worklist"), About::Task("wsp-095".into()));
+
+        for refused in [
+            message::answer(&store, &q.id, &Party::seat("worklist"), "accepted"),
+            message::abandon(&store, &q.id, &Party::seat("worklist"), "not needed"),
+        ] {
+            assert!(matches!(refused, Err(message::Refused::NotThePersons(_))), "{refused:?}");
+        }
+        assert!(store.message(&q.id).unwrap().is_open(), "still the person's, still open");
+        assert!(message::answer(&store, &q.id, &Party::Human(None), "accepted: +190 ms is the cost of gpui").is_ok());
+    }
+
+    /// wsp itself is the one party besides the person that may end one, and
+    /// only by giving up: a held hook (`wsp-301`) that stopped waiting says so
+    /// on the question, and the list reads `timeout`. It answers for nobody.
+    #[test]
+    fn wsp_may_abandon_the_persons_question_and_never_answer_it() {
+        let store = scratch("yours-wsp");
+        task(&store, "wsp-095");
+        let q = for_the_person_about(&store, Party::pane("cpd-1", ""), About::Task("wsp-095".into()));
+        assert!(matches!(message::answer(&store, &q.id, &Party::wsp(), "yes"), Err(message::Refused::NotThePersons(_))));
+        assert!(store.message(&q.id).unwrap().is_open());
+        message::abandon(&store, &q.id, &Party::wsp(), "no answer in 600 s").unwrap();
+        let closed = store.message(&q.id).unwrap().closed_json().unwrap();
+        assert_eq!((closed["how"].as_str(), closed["by"].as_str()), (Some("abandoned"), Some("timeout")));
+    }
+
+    /// The verb's half of the refusal, which only the caller's environment can
+    /// tell: a seat and an agent's pane are refused, a person at a shell is
+    /// not, and the person typing into an agent's pane says so in a word an
+    /// agent would have to choose falsely.
+    #[test]
+    fn only_a_caller_that_is_no_seat_and_no_agent_or_says_it_is_the_person_may_answer() {
+        let c = |seat, agent, as_person| Answerer { seat, agent, as_person };
+        assert!(the_person(&c(false, false, false)).is_ok(), "a person at a shell");
+        assert!(the_person(&c(true, false, false)).unwrap_err().contains("governor seat"));
+        assert!(the_person(&c(false, true, false)).unwrap_err().contains("agent's pane"));
+        assert!(the_person(&c(true, false, true)).is_ok(), "`--as-person`: Ed typing `!` into a seat's pane");
+    }
+
+    /// `wsp-608`, Ed's decision on question 3: a member's question about its
+    /// own row is answered by the governor it is routed to, as a raised hand
+    /// is — the barrier names that seat, so that seat may close it, and it is
+    /// recorded as the seat, not as the person. The primary governs nothing
+    /// here and still needs `--as-person`.
+    #[test]
+    fn the_governor_a_members_question_is_routed_to_answers_it_and_the_primary_still_says_as_person() {
+        let _env = util::isolated("ask-gov-answers");
+        let store = scratch("ask-gov-answers");
+        task(&store, "m-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
+        let raise = |text: &str| {
+            let q = Message::question(Party::pane("cpd-4845", ""), Kind::Note, text, Waiting::new("cpd-4845", "m-1"))
+                .about(About::Task("m-1".into()))
+                .for_the_person();
+            message::raise(&store, &q).unwrap();
+            q
+        };
+        let q = raise("m-1: ready at 340f83ed2f, and the verifier lands it");
+        assert_eq!(crate::waiting::route(&store, &q), crate::waiting::On::Seat("ux-next".into()), "the barrier names ux-next");
+
+        // The primary: refused without `--as-person`, as before.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &[q.id.as_str(), "noted"], &[])), 1);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert!(store.message(&q.id).unwrap().is_open(), "the primary did not close it");
+
+        // The governor it is routed to: closes it, as itself.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &[q.id.as_str(), "noted: nothing for the person"], &[])), 0);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        let m = store.message(&q.id).unwrap();
+        assert!(!m.is_open(), "the governor closed it");
+        assert_eq!(m.closed_json().unwrap()["by"].as_str(), Some("seat"), "recorded as the seat, not the person: {:?}", m.closed_json());
+
+        // A seat that is not the route's is still refused: the primary's own
+        // question about m-1 is the person's, not ux-next's.
+        let primarys = Message::question(Party::seat(crate::governors::PRIMARY), Kind::Note, "keep the bump?", Waiting::new("cpd-1", ""))
+            .about(About::Task("m-1".into()))
+            .for_the_person();
+        message::raise(&store, &primarys).unwrap();
+        std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &[primarys.id.as_str(), "yes"], &[])), 1);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert!(store.message(&primarys.id).unwrap().is_open());
+        // And the primary, saying it is the person, may close the member's.
+        let again = raise("another report");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
+        assert_eq!(answer(&store, &answer_args(&again.id, &[], &["read it"])), 0);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert!(!store.message(&again.id).unwrap().is_open());
+    }
+
+    /// An agent in a pane wsp never bound still reads as an agent: the guard
+    /// is meant for the governor in the conversation, and that one may be a
+    /// hand-started session or a subagent no binding knows about.
+    #[test]
+    fn an_agent_in_a_pane_wsp_never_bound_is_still_an_agent() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| set.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(*v))
+        };
+        assert!(an_agent_process(env(&[("CLAUDECODE", "1")])), "a Claude session");
+        assert!(an_agent_process(env(&[("OPENCODE", "1")])), "an opencode session");
+        assert!(!an_agent_process(env(&[("CLAUDECODE", "")])), "an emptied marker is a person");
+        assert!(!an_agent_process(env(&[("HOME", "/Users/ed")])), "a person at a shell");
+    }
+
+    /// Answered **in place**: on the row the question is about, as a decision,
+    /// because what the person settles binds every later agent on that row and
+    /// a decision is what a brief carries. The asker's own row, a different
+    /// one, still gets its line, as an answer always has.
+    #[test]
+    fn the_persons_answer_lands_as_a_decision_on_the_row_it_is_about() {
+        let store = scratch("yours-decide");
+        task(&store, "compound-392");
+        task(&store, "compound-397");
+        let q = Message::question(
+            Party::pane("w9:p1", "w9"),
+            Kind::Note,
+            "the wire's new message is a VERSION bump — keep it?",
+            Waiting::new("w9:p1", "compound-397"),
+        )
+        .about(About::Task("compound-392".into()))
+        .for_the_person();
+        message::raise(&store, &q).unwrap();
+
+        let closed = message::answer(&store, &q.id, &Party::Human(None), "keep the bump; old hosts refuse cleanly").unwrap();
+        assert_eq!(closed.landed, Landed::Task("compound-392".into()));
+        let decided = crate::model::decisions(&store.task("compound-392").unwrap().body);
+        assert_eq!(decided.len(), 1, "one decision: {decided:?}");
+        assert!(decided[0].1.contains("keep the bump") && decided[0].1.contains(&q.id), "{decided:?}");
+        let asker = store.task("compound-397").unwrap();
+        assert!(asker.body.contains("keep the bump"), "the asker's own row still hears it");
+        assert!(crate::model::decisions(&asker.body).is_empty(), "…as a line, not a decision about work it is not");
+        assert!(message::for_the_person(&store).is_empty(), "and the item is gone from the list");
+    }
+
+    /// About a group, the person's answer is the list's: a line on its log,
+    /// where the run's history is read — even when a member holding a task
+    /// asked, which on an ordinary question would land it on that task alone.
+    /// The member still hears it on its own row.
+    #[test]
+    fn the_persons_answer_about_a_group_lands_on_the_list_though_a_member_asked() {
+        let store = scratch("yours-list");
+        task(&store, "m-1");
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        let q = Message::question(Party::pane("w9:p1", "w9"), Kind::Note, "+190 ms: accept, or file rows?", Waiting::new("w9:p1", "m-1"))
+            .about(About::Group { scope: "run".into(), group: 1 })
+            .for_the_person();
+        message::raise(&store, &q).unwrap();
+
+        let closed = message::answer(&store, &q.id, &Party::Human(None), "accepted; gpui costs that").unwrap();
+        assert_eq!(closed.landed, Landed::List("run".into()));
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("answered by a person") && log.contains("accepted; gpui costs that"), "{log}");
+        assert!(store.task("m-1").unwrap().body.contains("accepted; gpui costs that"), "the member asked, and hears it");
+    }
+
+    /// `wsp-275`'s done-when, at the verb: a plain ask on a member of a running
+    /// list goes to the list's governor and is not the person's; `--person`, and
+    /// a plain ask on a row no seat answers for, are — in `wsp yours` and in
+    /// `wsp flag --person` alike, because the flight view's badge is one count.
+    /// And `for` names the route on all three, where compound-490's plain ask
+    /// to ux-next read `for: null` and the two verbs disagreed about it.
+    #[test]
+    fn every_ask_names_whose_answer_it_waits_on_and_yours_and_flag_person_agree() {
+        let _env = util::isolated("ask-route");
+        let store = scratch("ask-route");
+        task(&store, "m-1");
+        task(&store, "lone-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let asked = |id: &str, text: &str, flags: &[(&str, &str)]| -> String {
+            let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
+            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &[id, text], flags)), 0);
+            message::all(&store).into_iter().map(|m| m.id).find(|m| !before.contains(m)).expect("a new question")
+        };
+        let governed = asked("m-1", "could you paste the panic?", &[]);
+        let persons = asked("m-1", "keep the bump?", &[("person", "")]);
+        let lone = asked("lone-1", "which crate?", &[]);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+
+        let route = |id: &str| store.message(id).unwrap().to_json()["for"].clone();
+        assert_eq!(route(&governed), serde_json::json!({ "seat": "ux-next" }), "the list's governor answers it");
+        assert_eq!(route(&persons), "person");
+        assert_eq!(route(&lone), "person", "no seat answers for lone-1, so the person does");
+        assert!(store.message(&governed).unwrap().handed_to("ux-next"), "and the seat was handed it");
+
+        let ids = |v: Vec<Message>| -> Vec<String> {
+            let mut v: Vec<String> = v.into_iter().map(|m| m.id).collect();
+            v.sort();
+            v
+        };
+        let mut want = vec![persons.clone(), lone.clone()];
+        want.sort();
+        assert_eq!(ids(yours_in(&store, None)), want, "yours: the person's two and not the governor's");
+        assert_eq!(ids(message::raised_to_the_person(&store)), want, "flag --person: the same ids");
+    }
+
+    /// The primary interface's question is the person's (`wsp-279`), even about
+    /// a row a seated governor answers for: it is where the person sits, and
+    /// the governor is not who it asks.
+    #[test]
+    fn a_question_from_the_primary_interface_waits_on_the_person() {
+        let _env = util::isolated("ask-primary");
+        let store = scratch("ask-primary");
+        task(&store, "m-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
+
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+
+        let q = message::all(&store).into_iter().next().expect("raised");
+        assert_eq!(q.to_json()["for"], "person", "the person's, not ux-next's: {}", q.to_json());
+        assert_eq!(q.from.scope(), Some(crate::governors::PRIMARY), "and it says who asked");
+    }
+
+    /// `wsp-276`'s done-when: an authored caption is the question's line in
+    /// `ask --json` and `yours --json`, and survives the file; with none it is
+    /// the first clause, `from: "derived"`; and one past sixty is refused
+    /// before anything is raised.
+    #[test]
+    fn a_question_carries_its_authored_caption_or_its_first_clause() {
+        let _env = util::isolated("ask-caption");
+        let store = scratch("ask-caption");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-977");
+        let asked = |text: &str, flags: &[(&str, &str)]| -> Option<Message> {
+            let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
+            let code = ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", text], flags));
+            let new = message::all(&store).into_iter().find(|m| !before.contains(&m.id));
+            assert_eq!(code == 0, new.is_some(), "exit {code}");
+            new
+        };
+        let long = "Ed: the window you run (target/debug/host, pid 63635) was relaunched from the same shell. Could you paste the lines?";
+        let authored = asked(long, &[("caption", "could you paste the panic lines from the window's tab?")]).unwrap();
+        let derived = asked(long, &[]).unwrap();
+        let refused = asked(long, &[("caption", &"x".repeat(61))]);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+
+        let caption = |m: &Message| store.message(&m.id).unwrap().to_json()["caption"].clone();
+        assert_eq!(caption(&authored), json!({ "text": "could you paste the panic lines from the window's tab?", "from": "authored" }));
+        assert_eq!(caption(&derived), json!({ "text": "The window you run was relaunched from the same shell", "from": "derived" }));
+        assert!(refused.is_none(), "a caption past sixty raised a question anyway");
+
+        let item = item_json(&store, &store.message(&authored.id).unwrap());
+        assert_eq!(item["caption"]["from"], "authored", "yours --json carries it: {item}");
+    }
+
+    /// A question raised before `ask` wrote a route is read off its `Sent` hop,
+    /// and one no seat was handed says so beside its null, and stays the
+    /// person's — nobody else has it.
+    #[test]
+    fn a_question_from_before_routes_is_the_seats_it_was_handed_or_says_it_is_unrouted() {
+        let store = scratch("ask-legacy");
+        task(&store, "wsp-095");
+        let handed = a_question(&store, "wsp-095");
+        message::sent(&store, &handed.id, "worklist").unwrap();
+        let lost = a_question(&store, "wsp-095");
+
+        let handed = store.message(&handed.id).unwrap();
+        assert_eq!(handed.to_json()["for"], serde_json::json!({ "seat": "worklist" }));
+        assert!(handed.to_json().get("unrouted").is_none() && !handed.is_the_persons());
+        let lost = store.message(&lost.id).unwrap().to_json();
+        assert!(lost["for"].is_null() && lost["unrouted"] == message::UNROUTED, "{lost}");
+        let listed: Vec<String> = message::for_the_person(&store).into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![lost["id"].as_str().unwrap().to_string()]);
+    }
+
+    /// The barrier gate's population: about that group exactly. A question
+    /// about the whole list names no barrier, and a gate that guessed one would
+    /// stop a run on a question that was never about it.
+    #[test]
+    fn a_question_for_the_person_holds_the_barrier_of_the_group_it_names_and_no_other() {
+        let store = scratch("yours-gate");
+        let list = || "gpui-migration".to_string();
+        let g13 = for_the_person_about(&store, Party::seat("gpui-migration"), About::Group { scope: list(), group: 13 });
+        for_the_person_about(&store, Party::seat("gpui-migration"), About::Scope(list()));
+        let held: Vec<String> = message::holding_group(&store, "gpui-migration", 13).into_iter().map(|m| m.id).collect();
+        assert_eq!(held, vec![g13.id.clone()]);
+        assert!(message::holding_group(&store, "gpui-migration", 12).is_empty());
+        assert!(message::holding_group(&store, "ux-build", 13).is_empty());
+        message::answer(&store, &g13.id, &Party::Human(None), "read parity.md §1–§7").unwrap();
+        assert!(message::holding_group(&store, "gpui-migration", 13).is_empty(), "answered, it holds nothing");
+    }
+
+    /// Per project, through the tree: an item about a row in a child project
+    /// is in its parent's list, and not in a sibling's.
+    #[test]
+    fn the_persons_list_is_read_per_project_and_through_its_children() {
+        let store = scratch("yours-project");
+        store.save_project(&crate::model::Project::new("meta")).unwrap();
+        let mut child = crate::model::Project::new("worklist");
+        child.parent = Some("meta".into());
+        store.save_project(&child).unwrap();
+        store.save_project(&crate::model::Project::new("render")).unwrap();
+        task(&store, "worklist-001");
+        let q = for_the_person_about(&store, Party::seat("worklist"), About::Task("worklist-001".into()));
+
+        let ids = |p: Option<&str>| yours_in(&store, p).into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(Some("worklist")), vec![q.id.clone()]);
+        assert_eq!(ids(Some("meta")), vec![q.id.clone()], "a parent sees its child's");
+        assert!(ids(Some("render")).is_empty(), "a sibling does not");
+        assert_eq!(unblocks(&store, &q).as_deref(), Some("worklist-001"), "a row in no running list unblocks itself");
+        let v = item_json(&store, &q);
+        assert_eq!(v["project"], "worklist");
+        assert_eq!(v["asked"], "accept +190 ms startup, or file rows?");
+        assert_eq!(v["about"]["task"], "worklist-001");
+    }
+
+    // ---- choices (wsp-299) -------------------------------------------------
+
+    fn two_questions() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "ask",
+            "questions": [
+                { "question": "Which figure is the headline?", "header": "Headline",
+                  "options": [{ "label": "Output tokens", "description": "what it wrote" }, { "label": "USD" }] },
+                { "question": "Which views show the split?", "header": "Views", "multi": true,
+                  "options": [{ "label": "Card" }, { "label": "Inspector" }, { "label": "Rail, wide" }] },
+            ],
+        })
+    }
+
+    fn a_permission() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "permission", "tool": "Bash", "command": "scripts/seed.sh save", "via": "hook",
+            "input": { "command": "scripts/seed.sh save", "description": "save the seed" },
+            "suggestions": [{ "type": "setMode", "mode": "acceptEdits" }],
+        })
+    }
+
+    /// A question for the person carrying `choices`, raised the way the verb
+    /// raises it and read back from the store.
+    fn asked_with(store: &Store, about: &str, choices: &serde_json::Value) -> Message {
+        let mut q = Message::question(
+            Party::pane("w9:p1", "w9"),
+            Kind::Note,
+            "Which figure is the headline?",
+            Waiting::new("w9:p1", about),
+        )
+        .about(About::Task(about.into()))
+        .for_the_person();
+        q.choices = Some(Choices::parse(choices).unwrap());
+        message::raise(store, &q).unwrap();
+        store.message(&q.id).unwrap()
+    }
+
+    fn answer_args(mid: &str, flags: &[(&str, &str)], typed: &[&str]) -> crate::base::args::Args {
+        let mut rest = vec![mid];
+        rest.extend_from_slice(typed);
+        let mut f = flags.to_vec();
+        // The tests run under an agent, and this is the person typing in it.
+        f.push(("as-person", ""));
+        crate::base::args::Args::synth("answer", &rest, &f)
+    }
+
+    #[test]
+    fn ask_with_choices_raises_a_question_that_carries_them() {
+        let env = util::isolated("ask-choices");
+        let store = scratch("ask-choices");
+        task(&store, "lone-1");
+        // An asker has to be somewhere, and this agent's own seat is not it.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let file = env.path("choices.json");
+        std::fs::write(&file, two_questions().to_string()).unwrap();
+        let f = file.to_string_lossy().to_string();
+
+        let bad = env.path("bad.json");
+        std::fs::write(&bad, r#"{"kind":"poll"}"#).unwrap();
+        let bad = bad.to_string_lossy().to_string();
+        let n = |store: &Store| message::all(store).len();
+        // (what, flags, the sentence typed, the exit)
+        for (what, flags, typed, code) in [
+            ("a file that is not there", vec![("person", ""), ("choices", "/nonexistent/c.json")], "", 2),
+            ("a file that is not JSON", vec![("person", ""), ("choices", "/dev/null")], "", 2),
+            ("a kind it does not know", vec![("person", ""), ("choices", bad.as_str())], "", 2),
+        ] {
+            let before = n(&store);
+            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", typed], &flags)), code, "{what}");
+            assert_eq!(n(&store), before, "{what}: nothing was raised");
+        }
+
+        // Without a sentence the questions are it, and the choices ride along.
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("choices", f.as_str())])), 0);
+        let q = message::all(&store).pop().expect("raised");
+        assert_eq!(q.text, "Which figure is the headline? Which views show the split?");
+        assert!(q.for_person);
+        let j = q.to_json();
+        assert_eq!(j["choices"]["kind"], "ask");
+        assert_eq!(j["choices"]["via"], "ask", "raised from the CLI");
+        assert_eq!(j["choices"]["questions"][1]["multi"], true);
+        assert_eq!(item_json(&store, &q)["choices"], j["choices"], "yours --json prints them");
+        assert_eq!(q.caption().text.chars().count() < 60, true, "the caption rule is unchanged: {:?}", q.caption());
+
+        // Choices are the person's: a question a seat answers takes none.
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["lone-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        let before = n(&store);
+        let code = ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick"], &[("choices", f.as_str())]));
+        assert_eq!((code, n(&store)), (2, before), "a seat's question takes no choices");
+
+        // A sentence of its own stands, and a question without choices says null.
+        assert_eq!(
+            ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick one"], &[("person", ""), ("choices", f.as_str())])),
+            0
+        );
+        assert_eq!(message::all(&store).pop().unwrap().text, "pick one");
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
+        let plain = message::all(&store).pop().unwrap();
+        assert!(plain.choices.is_none() && plain.to_json()["choices"].is_null());
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+    }
+
+    #[test]
+    fn a_shell_choice_is_read_against_the_question() {
+        let store = scratch("choice-given");
+        task(&store, "lone-1");
+        let q = asked_with(&store, "lone-1", &two_questions());
+        let perm = asked_with(&store, "lone-1", &a_permission());
+        let one = asked_with(
+            &store,
+            "lone-1",
+            &serde_json::json!({ "kind": "ask", "questions": [{ "question": "Land now?", "options": [{ "label": "Yes" }, { "label": "Wait" }] }] }),
+        );
+        let given = |m: &Message, flags: &[(&str, &str)]| choice_given(&answer_args(&m.id, flags, &[]), m);
+        let h = "Which figure is the headline?";
+        let v = "Which views show the split?";
+
+        // (what, the question, the flags, the answer handed on)
+        for (what, m, flags, want) in [
+            (
+                "a question by header, a multi by repeating it",
+                &q,
+                vec![("choice", "Headline=USD"), ("choice", "Views=Card"), ("choice", "Views=Rail, wide")],
+                serde_json::json!({ "answers": { h: { "pick": ["USD"] }, v: { "pick": ["Card", "Rail, wide"] } } }),
+            ),
+            (
+                "a question by its text, and an Other for the other",
+                &q,
+                vec![("choice", "Headline=Output tokens"), ("other", "Which views show the split?=none of them")],
+                serde_json::json!({ "answers": { h: { "pick": ["Output tokens"] }, v: { "other": "none of them" } } }),
+            ),
+            ("a single question needs no name", &one, vec![("choice", "Wait")], serde_json::json!({ "answers": { "Land now?": { "pick": ["Wait"] } } })),
+            ("a label with an equals sign in it", &one, vec![("choice", "a=b")], serde_json::json!({ "answers": { "Land now?": { "pick": ["a=b"] } } })),
+            ("allow on a permission", &perm, vec![("choice", "allow")], serde_json::json!({ "behavior": "allow" })),
+            ("deny on a permission", &perm, vec![("choice", "deny")], serde_json::json!({ "behavior": "deny" })),
+        ] {
+            assert_eq!(given(m, &flags).expect(what), want, "{what}");
+        }
+        for (what, m, flags, says) in [
+            ("two questions and no name", &q, vec![("choice", "USD")], "names no question"),
+            ("a label and an Other for one question", &one, vec![("choice", "Yes"), ("other", "Land now?=maybe")], "not both"),
+            ("an Other and a label for one question", &one, vec![("other", "Land now?=maybe"), ("choice", "Yes")], "not both"),
+            ("a word that is not allow or deny", &perm, vec![("choice", "maybe")], "allow` or `--choice deny"),
+            ("--other on a permission", &perm, vec![("other", "x")], "allow` or `--choice deny"),
+        ] {
+            let got = given(m, &flags).expect_err(what);
+            assert!(got.contains(says), "{what}: {got}");
+        }
+        // A question with none to choose from.
+        task(&store, "lone-2");
+        let plain = a_question_for(&store, "lone-2");
+        assert!(given(&plain, &[("choice", "x")]).unwrap_err().contains("no choices"));
+    }
+
+    fn a_question_for(store: &Store, about: &str) -> Message {
+        let q = Message::question(Party::pane("w9:p1", "w9"), Kind::Note, "plain?", Waiting::new("w9:p1", about))
+            .about(About::Task(about.into()))
+            .for_the_person();
+        message::raise(store, &q).unwrap();
+        q
+    }
+
+    #[test]
+    fn a_structured_answer_closes_the_question_and_is_read_by_yours() {
+        let env = util::isolated("answer-choice");
+        let store = scratch("answer-choice");
+        task(&store, "lone-1");
+        let q = asked_with(&store, "lone-1", &two_questions());
+        let h = "Which figure is the headline?";
+        let v = "Which views show the split?";
+
+        // Refused: still open, and the sentence names the options.
+        for flags in [
+            vec![("choice", "Headline=Euro"), ("choice", "Views=Card")],
+            vec![("choice", "Headline=USD")],
+            vec![("choice", "Headline=USD"), ("choice", "Headline=Output tokens"), ("choice", "Views=Card")],
+        ] {
+            assert_eq!(answer(&store, &answer_args(&q.id, &flags, &[])), 1, "{flags:?}");
+            assert!(store.message(&q.id).unwrap().is_open(), "{flags:?}: still the person's");
+        }
+        assert_eq!(answer(&store, &answer_args(&q.id, &[("choice", "Headline=USD"), ("choice", "Views=Card")], &["and a sentence"])), 1);
+        assert!(yours_in(&store, None).len() == 1 && recently_closed(&store).is_empty());
+
+        let flags = [("choice", "Headline=USD"), ("choice", "Views=Card"), ("choice", "Views=Inspector")];
+        assert_eq!(answer(&store, &answer_args(&q.id, &flags, &[])), 0);
+        let done = store.message(&q.id).unwrap();
+        assert!(!done.is_open());
+        let stored = serde_json::json!({ "answers": { h: { "pick": ["USD"] }, v: { "pick": ["Card", "Inspector"] } } });
+        assert_eq!(done.answer_choice(), Some(&stored), "the hop keeps the structure");
+        assert_eq!(done.closing().unwrap().note, "Headline: USD; Views: Card, Inspector", "…and the sentence");
+        let decided = crate::model::decisions(&store.task("lone-1").unwrap().body);
+        assert!(decided[0].1.contains("Headline: USD; Views: Card, Inspector"), "{decided:?}");
+        assert_eq!(message::all(&store).iter().find(|m| m.reply_to.as_deref() == Some(q.id.as_str())).unwrap().text, "Headline: USD; Views: Card, Inspector");
+
+        // The person's list is empty, and `closed` holds it for ten minutes.
+        assert!(yours_in(&store, None).is_empty());
+        let closed = recently_closed(&store);
+        assert_eq!(closed.len(), 1);
+        let item = closed_json(&store, &closed[0].0, closed[0].1.clone());
+        assert_eq!(item["id"], q.id.as_str());
+        assert_eq!(item["choices"]["kind"], "ask");
+        assert_eq!((item["closed"]["how"].as_str(), item["closed"]["by"].as_str()), (Some("answered"), Some("person")));
+        assert_eq!(item["closed"]["answer"], stored);
+        assert!(item["closed"]["at"].as_str().is_some_and(|a| a.starts_with("20")));
+
+        // Ten minutes on it is gone from the list, and an older close never was in it.
+        let mut old = store.message(&q.id).unwrap();
+        old.via.last_mut().unwrap().at = "2020-01-01T00:00:00Z".into();
+        store.save_message(&old).unwrap();
+        assert!(recently_closed(&store).is_empty());
+        drop(env);
+    }
+
+    #[test]
+    fn a_question_a_hook_holds_is_answered_by_the_hook_and_not_typed_at_the_pane() {
+        let _env = util::isolated("held-by-hook");
+        let store = scratch("held-by-hook");
+        task(&store, "lone-1");
+        let hooked = asked_with(&store, "lone-1", &a_permission());
+        let cli = asked_with(&store, "lone-1", &two_questions());
+        assert!(held_by_a_hook(&hooked) && !held_by_a_hook(&cli));
+        assert!(!held_by_a_hook(&a_question(&store, "lone-1")), "a question with no choices is nobody's hook");
+    }
+
+    #[test]
+    fn plan_and_permission_answers_are_decisions_and_an_abandon_takes_no_choice() {
+        let _env = util::isolated("answer-decision");
+        let store = scratch("answer-decision");
+        task(&store, "lone-1");
+        let plan = asked_with(&store, "lone-1", &serde_json::json!({ "kind": "plan", "plan": "# steps\n1. do it" }));
+        let perm = asked_with(&store, "lone-1", &a_permission());
+        let words = asked_with(&store, "lone-1", &two_questions());
+
+        // A plan's rejection takes its reason; plain words on a wider ask or
+        // on a permission are refused; abandoning takes no choice.
+        assert_eq!(answer(&store, &answer_args(&plan.id, &[("choice", "deny")], &[])), 1);
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[], &["yes"])), 1);
+        assert_eq!(answer(&store, &answer_args(&words.id, &[], &["USD"])), 1);
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[("choice", "allow"), ("abandon", "")], &["x"])), 2);
+        for m in [&plan, &perm, &words] {
+            assert!(store.message(&m.id).unwrap().is_open(), "{}", m.id);
+        }
+
+        assert_eq!(answer(&store, &answer_args(&plan.id, &[("choice", "deny")], &["add a rollback step"])), 0);
+        assert_eq!(
+            store.message(&plan.id).unwrap().answer_choice(),
+            Some(&serde_json::json!({ "behavior": "deny", "message": "add a rollback step" }))
+        );
+        assert_eq!(store.message(&plan.id).unwrap().closing().unwrap().note, "denied: add a rollback step");
+
+        // A rule that was offered rides in the JSON form; one that was not is refused.
+        let file = _env.path("allow.json");
+        std::fs::write(&file, r#"{"behavior":"allow","rule":{"type":"addRules"}}"#).unwrap();
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[("choice", file.to_str().unwrap())], &[])), 1);
+        std::fs::write(&file, r#"{"behavior":"allow","rule":{"type":"setMode","mode":"acceptEdits"}}"#).unwrap();
+        assert_eq!(answer(&store, &answer_args(&perm.id, &[("choice", file.to_str().unwrap())], &[])), 0);
+        assert_eq!(
+            store.message(&perm.id).unwrap().answer_choice(),
+            Some(&serde_json::json!({ "behavior": "allow", "rule": { "type": "setMode", "mode": "acceptEdits" } }))
+        );
+
+        // Plain words on a single-question ask are its label, or an Other.
+        task(&store, "lone-2");
+        let one = asked_with(
+            &store,
+            "lone-2",
+            &serde_json::json!({ "kind": "ask", "questions": [{ "question": "Land now?", "options": [{ "label": "Yes" }, { "label": "Wait" }] }] }),
+        );
+        assert_eq!(answer(&store, &answer_args(&one.id, &[], &["not yet; the verifier is red"])), 0);
+        assert_eq!(
+            store.message(&one.id).unwrap().answer_choice(),
+            Some(&serde_json::json!({ "answers": { "Land now?": { "other": "not yet; the verifier is red" } } }))
+        );
+
+        // And a question with no choices refuses a choice.
+        task(&store, "lone-3");
+        let plain = a_question_for(&store, "lone-3");
+        assert_eq!(answer(&store, &answer_args(&plain.id, &[("choice", "allow")], &[])), 2);
+        assert!(store.message(&plain.id).unwrap().is_open());
+        assert_eq!(answer(&store, &answer_args(&plain.id, &[], &["words"])), 0);
+        let closed = recently_closed(&store);
+        let plain_closed = closed.iter().find(|(m, _)| m.id == plain.id).unwrap();
+        assert_eq!(plain_closed.1["answer"], serde_json::json!({ "text": "words" }), "a plain answer is its words");
+    }
+
+    #[test]
+    fn a_record_from_before_choices_reads_as_it_did_and_is_written_as_it_was() {
+        let store = scratch("choices-compat");
+        task(&store, "lone-1");
+        let old = serde_json::json!({
+            "id": "m-old", "shape": "question", "kind": "note", "state": "open", "at": "2026-10-01T00:00:00Z",
+            "text": "before choices", "from": { "pane": "w9:p1" }, "for": "person",
+            "waiting": { "pane": "w9:p1", "task": "lone-1" }, "about": { "task": "lone-1" },
+        });
+        let m = Message::from_json("m-old", &old);
+        assert!(m.choices.is_none() && m.via.is_empty());
+        let back = m.to_json();
+        assert!(back["choices"].is_null());
+        assert_eq!(Message::from_json("m-old", &back), m, "and it round-trips");
+        // A hop with no structure writes no `choice` key, so a previous build
+        // reading a newer file finds the hops it knew.
+        message::raise(&store, &m).unwrap();
+        message::answer(&store, "m-old", &Party::Human(None), "ok").unwrap();
+        let hops = store.message("m-old").unwrap().to_json()["via"].clone();
+        assert!(hops[0].get("choice").is_none(), "{hops}");
+        assert_eq!(store.message("m-old").unwrap().closed_json().unwrap()["answer"], serde_json::json!({ "text": "ok" }));
+    }
+
+    // ---- `wsp ask --wait` (wsp-300) -----------------------------------------
+
+    /// Time that moves only when the wait sleeps, and runs what is due **when
+    /// it is looked at** — so an event at the deadline lands after the wait's
+    /// last read and before its release, which is the race the release closes.
+    struct Fake<'a> {
+        now: std::cell::Cell<u64>,
+        due: std::cell::RefCell<Vec<(u64, Box<dyn FnOnce() + 'a>)>>,
+    }
+
+    impl<'a> Fake<'a> {
+        fn new() -> Fake<'a> {
+            Fake { now: std::cell::Cell::new(0), due: Default::default() }
+        }
+        fn at(&self, ms: u64, f: impl FnOnce() + 'a) {
+            self.due.borrow_mut().push((ms, Box::new(f)));
+        }
+    }
+
+    impl Clock for Fake<'_> {
+        fn now_ms(&self) -> u64 {
+            let now = self.now.get();
+            let ready: Vec<_> = {
+                let mut due = self.due.borrow_mut();
+                let (ready, later) = std::mem::take(&mut *due).into_iter().partition(|(t, _)| *t <= now);
+                *due = later;
+                ready
+            };
+            for (_, f) in ready {
+                f();
+            }
+            now
+        }
+        fn sleep_ms(&self, ms: u64) {
+            self.now.set(self.now.get() + ms);
+        }
+    }
+
+    /// A pid that has exited, for a waiter that was killed.
+    fn a_dead_pid() -> u32 {
+        let mut c = wsp_base::calls::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    fn one_question() -> serde_json::Value {
+        serde_json::json!({ "kind": "ask", "questions": [
+            { "question": "Land now?", "header": "Land", "options": [{ "label": "Land now" }, { "label": "Wait" }] }] })
+    }
+
+    /// A question for the person with a waiter on it, raised as the verb does.
+    fn waited_on(store: &Store, about: &str, choices: Option<&serde_json::Value>) -> Message {
+        let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "Land now?", Waiting::new("cpd-893", about))
+            .about(About::Task(about.into()))
+            .for_the_person();
+        q.choices = choices.map(|c| Choices::parse(c).unwrap());
+        q.awaited = Some(message::Awaited::here());
+        message::raise(store, &q).unwrap();
+        store.message(&q.id).unwrap()
+    }
+
+    /// The newest question in the store; the reply an answer mints is newer still.
+    fn last_question(store: &Store) -> Message {
+        message::all(store).into_iter().filter(|m| !m.is_reply()).last().expect("a question")
+    }
+
+    fn the_person_answers(store: &Store, mid: &str, how: &[(&str, &str)]) {
+        assert_eq!(answer(store, &answer_args(mid, how, &[])), 0);
+    }
+
+    #[test]
+    fn a_wait_ends_as_the_question_does_and_a_timeout_leaves_it_open() {
+        let _env = util::isolated("wait-ends");
+        let store = scratch("wait-ends");
+        task(&store, "lone-1");
+        // (what, timeout s, what the person does and when in ms, what the wait returns, when it returned)
+        enum Do {
+            Nothing,
+            Answer(u64),
+            Abandon(u64),
+        }
+        for (what, timeout, act, ends, at) in [
+            ("answered, no timeout", None, Do::Answer(3_000), "answered", 3_000),
+            ("answered inside its timeout", Some(10), Do::Answer(3_000), "answered", 3_000),
+            ("abandoned", Some(10), Do::Abandon(2_000), "abandoned", 2_000),
+            ("nobody answers", Some(5), Do::Nothing, "timeout", 5_000),
+            ("a timeout shorter than one poll", Some(1), Do::Nothing, "timeout", 1_000),
+            // The answer lands after the last read and before the release: the
+            // release returns it rather than reporting a timeout over it.
+            ("answered at the deadline", Some(5), Do::Answer(5_000), "answered", 5_000),
+            ("answered a moment after", Some(5), Do::Answer(5_001), "timeout", 5_000),
+        ] {
+            let q = waited_on(&store, "lone-1", Some(&one_question()));
+            let clock = Fake::new();
+            match act {
+                Do::Nothing => {}
+                Do::Answer(t) => clock.at(t, || the_person_answers(&store, &q.id, &[("choice", "Land=Wait")])),
+                Do::Abandon(t) => clock.at(t, || {
+                    message::abandon(&store, &q.id, &Party::Human(None), "not now").unwrap();
+                }),
+            }
+            let got = wait_for(&store, &q.id, timeout, &clock).unwrap();
+            let word = match &got {
+                Ended::Answered(_) => "answered",
+                Ended::Abandoned(_) => "abandoned",
+                Ended::TimedOut => "timeout",
+            };
+            assert_eq!(word, ends, "{what}");
+            // The clock stops where the wait did, to the poll: never later.
+            assert!((at..=at + POLL_MS).contains(&clock.now.get()), "{what}: returned at {}", clock.now.get());
+            let after = store.message(&q.id).unwrap();
+            match got {
+                Ended::TimedOut => {
+                    assert!(after.is_open(), "{what}: the question stays open");
+                    assert!(after.awaited.is_none(), "{what}: and nobody is waiting on it now");
+                }
+                _ => assert!(!after.is_open(), "{what}"),
+            }
+            // Leave nothing open for the next row to find.
+            let _ = message::abandon(&store, &q.id, &Party::Human(None), "next row");
+        }
+    }
+
+    #[test]
+    fn a_wait_prints_the_answer_as_the_agent_reads_it() {
+        let two = serde_json::json!({ "kind": "ask", "questions": [
+            { "question": "Which figure is the headline?", "header": "Headline", "options": [{ "label": "Output tokens" }, { "label": "USD" }] },
+            { "question": "Which views show the split?", "header": "Views", "multi": true,
+              "options": [{ "label": "Card" }, { "label": "Inspector" }, { "label": "Rail, wide" }] }] });
+        let plan = serde_json::json!({ "kind": "plan", "plan": "# steps" });
+        let perm = serde_json::json!({ "kind": "permission", "tool": "Bash", "command": "make", "suggestions": [] });
+        let store = scratch("wait-told");
+        task(&store, "lone-1");
+        // (what, the question's choices, the answer given, what the agent reads)
+        for (what, choices, given, read) in [
+            ("one pick, bare", Some(one_question()), serde_json::json!({ "answers": { "Land now?": "Wait" } }), "Wait"),
+            ("an Other, bare", Some(one_question()), serde_json::json!({ "answers": { "Land now?": "after lunch" } }), "after lunch"),
+            (
+                "two questions, a multi joined as the pane joins it",
+                Some(two.clone()),
+                serde_json::json!({ "answers": { "Which figure is the headline?": "USD", "Which views show the split?": { "pick": ["Card", "Rail, wide"] } } }),
+                "Headline: USD\nViews: Card, Rail, wide",
+            ),
+            (
+                "talking instead of choosing",
+                Some(one_question()),
+                serde_json::json!({ "behavior": "deny", "message": "ask me in person" }),
+                "talk: ask me in person",
+            ),
+            ("a plan allowed", Some(plan.clone()), serde_json::json!({ "behavior": "allow", "mode": "acceptEdits" }), "allow"),
+            ("a plan sent back", Some(plan), serde_json::json!({ "behavior": "deny", "message": "add a rollback" }), "deny: add a rollback"),
+            ("a permission denied", Some(perm), serde_json::json!({ "behavior": "deny" }), "deny"),
+        ] {
+            let q = waited_on(&store, "lone-1", choices.as_ref());
+            message::answer_choice(&store, &q.id, &Party::Human(None), "", &given).unwrap();
+            assert_eq!(told(&store.message(&q.id).unwrap()), read, "{what}");
+        }
+        // No choices: the words.
+        let q = waited_on(&store, "lone-1", None);
+        message::answer(&store, &q.id, &Party::Human(None), "yes, after the verify").unwrap();
+        assert_eq!(told(&store.message(&q.id).unwrap()), "yes, after the verify");
+    }
+
+    #[test]
+    fn a_wait_ends_with_the_exit_the_agent_branches_on() {
+        let _env = util::isolated("wait-exit");
+        let store = scratch("wait-exit");
+        task(&store, "lone-1");
+        let args = crate::base::args::Args::synth("ask", &[], &[]);
+        let q = waited_on(&store, "lone-1", None);
+        let answered = || {
+            message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
+            store.message(&q.id).unwrap()
+        };
+        let a = answered();
+        assert_eq!(report_wait(&store, &q.id, &Ended::Answered(a), None, &args), 0);
+        let q = waited_on(&store, "lone-1", None);
+        message::abandon(&store, &q.id, &Party::Human(None), "dropped").unwrap();
+        assert_eq!(report_wait(&store, &q.id, &Ended::Abandoned(store.message(&q.id).unwrap()), None, &args), 3);
+        assert_eq!(report_wait(&store, &q.id, &Ended::TimedOut, Some(30), &args), 3);
+    }
+
+    /// The row's hardest requirement: the answer returns through the tool call
+    /// and is typed nowhere, and only when nobody is waiting is it typed.
+    #[test]
+    fn an_answer_to_a_live_wait_is_not_delivered_to_the_composer_and_to_a_dead_one_it_is() {
+        let _env = util::isolated("wait-once");
+        let store = scratch("wait-once");
+        task(&store, "lone-1");
+        let live = waited_on(&store, "lone-1", None);
+        let c = message::answer(&store, &live.id, &Party::Human(None), "ok").unwrap();
+        assert!(c.question.awaited.as_ref().is_some_and(|w| crate::host::Host::is_alive(&crate::host::LOCAL, w.pid)), "the close carries the waiter it found");
+        // `deliver` returns on it before it looks for a pane to type at; with
+        // no backend here, the other road would have reported the pane gone.
+        assert_eq!(deliver(&store, &c, &answer_args(&live.id, &[("json", "")], &[])), 0);
+        assert!(message::held_replies(&store).is_empty(), "and nothing is held to be typed at the next idle");
+
+        // A waiter that was killed leaves its mark and no process.
+        let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "again?", Waiting::new("cpd-893", "lone-1"))
+            .about(About::Task("lone-1".into()))
+            .for_the_person();
+        q.awaited = Some(message::Awaited { pid: a_dead_pid(), at: util::now_iso() });
+        message::raise(&store, &q).unwrap();
+        let c = message::answer(&store, &q.id, &Party::Human(None), "ok").unwrap();
+        assert!(!crate::host::Host::is_alive(&crate::host::LOCAL, c.question.awaited.as_ref().unwrap().pid));
+    }
+
+    #[test]
+    fn ask_wait_raises_marks_the_wait_and_returns_the_answer_without_typing_it() {
+        let env = util::isolated("ask-wait");
+        let store = scratch("ask-wait");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let file = env.path("choices.json");
+        std::fs::write(&file, one_question().to_string()).unwrap();
+        let f = file.to_string_lossy().to_string();
+
+        // Refused before anything is raised.
+        let n = |store: &Store| message::all(store).len();
+        let before = n(&store);
+        for (what, flags) in [
+            ("--wait on a question a seat answers", vec![("wait", "")]),
+            ("--timeout with nothing to time out", vec![("person", ""), ("timeout", "30")]),
+            ("--timeout of nothing", vec![("person", ""), ("wait", ""), ("timeout", "0")]),
+            ("--timeout of words", vec![("person", ""), ("wait", ""), ("timeout", "soon")]),
+        ] {
+            let args = crate::base::args::Args::synth("ask", &["lone-1", "go?"], &flags);
+            assert_eq!(ask_with(&store, &args, &Fake::new()), 2, "{what}");
+            assert_eq!(n(&store), before, "{what}: nothing was raised");
+        }
+
+        // The wait: at +2s the question is marked and shows on the seat's
+        // row, at +4s the person answers, and the verb returns 0.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let clock = Fake::new();
+        clock.at(2_000, || {
+            let q = last_question(&store);
+            let wip = crate::waiting::Asks::read(&store).awaited("cpd-893", "lone-1").map(|w| w.json());
+            seen.borrow_mut().push((q.awaited.is_some(), q.to_json()["choices"]["held"].clone(), wip));
+        });
+        clock.at(4_000, || {
+            let q = last_question(&store);
+            the_person_answers(&store, &q.id, &[("choice", "Land=Land now")]);
+        });
+        let args = crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("wait", ""), ("timeout", "60"), ("choices", f.as_str())]);
+        assert_eq!(ask_with(&store, &args, &clock), 0);
+
+        let (marked, held, wip) = seen.borrow()[0].clone();
+        assert!(marked, "the question says a wait is standing on it");
+        assert_eq!(held["timeout"], 60, "D3: held carries the timeout");
+        assert!(held["at"].as_str().is_some_and(|a| !a.is_empty()));
+        let wip = wip.expect("D9: the seat reads as waiting");
+        assert_eq!((wip["why"].as_str(), wip["on"].as_str(), wip["id"].as_str().is_some()), (Some("question"), Some("person"), true));
+
+        let q = last_question(&store);
+        assert!(!q.is_open());
+        assert_eq!(told(&q), "Land now");
+        assert!(message::held_replies(&store).is_empty(), "the answer was not left to be typed");
+        assert!(crate::waiting::Asks::read(&store).awaited("cpd-893", "lone-1").is_none(), "and the seat waits no more");
+
+        // A timeout: exit 3, the question open and unmarked, and the retry is
+        // `wsp ask <mid> --wait`, which finds the answer that came meanwhile.
+        let clock = Fake::new();
+        let args = crate::base::args::Args::synth("ask", &["lone-1", "once more?"], &[("person", ""), ("wait", ""), ("timeout", "3")]);
+        assert_eq!(ask_with(&store, &args, &clock), 3);
+        assert_eq!(clock.now.get(), 3_000);
+        let q = last_question(&store);
+        assert!(q.is_open() && q.awaited.is_none());
+
+        message::answer(&store, &q.id, &Party::Human(None), "yes").unwrap();
+        // A reply held for the busy asker, as `deliver` held it before waiting
+        // existed: the retry returns the answer and ends the hold.
+        let reply = message::all(&store).into_iter().find(|m| m.reply_to.as_deref() == Some(q.id.as_str())).expect("the reply");
+        message::held(&store, &reply.id, "cpd-893", "working").unwrap();
+        assert_eq!(message::held_replies(&store).len(), 1);
+        let retry = crate::base::args::Args::synth("ask", &[q.id.as_str()], &[("wait", "")]);
+        assert_eq!(ask_with(&store, &retry, &Fake::new()), 0);
+        assert!(message::held_replies(&store).is_empty(), "returned once, through the call, and not typed after");
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+    }
+
+    #[test]
+    fn a_question_with_a_waiter_round_trips_and_one_without_is_as_it_was() {
+        let store = scratch("wait-record");
+        task(&store, "lone-1");
+        let q = waited_on(&store, "lone-1", None);
+        let back = store.message(&q.id).unwrap();
+        assert_eq!(back.awaited, q.awaited);
+        assert_eq!(Message::from_json(&q.id, &back.to_json()), back);
+        let plain = a_question_for(&store, "lone-1");
+        assert!(plain.to_json().get("awaited").is_none(), "no key unless somebody waited");
+    }
+
+    // ---- stale asks close, and the person can cancel (wsp-308) ---------------
+
+    /// Raised the way each kind is, about `lone-1`, for `cancel` to be driven on.
+    fn every_kind(store: &Store) -> Vec<(&'static str, Message)> {
+        let kinds: Vec<(&'static str, Message)> = vec![
+            ("person", waited_on(store, "lone-1", None)),
+            ("choices", waited_on(store, "lone-1", Some(&one_question()))),
+            ("governor", {
+                let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "keep it?", Waiting::new("cpd-893", "lone-1"))
+                    .about(About::Task("lone-1".into()));
+                q.for_seat = Some("worklist".into());
+                message::raise(store, &q).unwrap();
+                q
+            }),
+            ("barrier", {
+                let mut q = Message::question(Party::pane("cpd-894", ""), Kind::Note, "hold it?", Waiting::new("cpd-894", ""))
+                    .about(About::Group { scope: "the-run".into(), group: 1 });
+                q.for_seat = Some("worklist".into());
+                message::raise(store, &q).unwrap();
+                q
+            }),
+        ];
+        kinds
+    }
+
+    fn ask_cancel(mid: &str, why: &[&str], as_person: bool) -> crate::base::args::Args {
+        let mut flags = vec![("cancel", "")];
+        if as_person {
+            flags.push(("as-person", ""));
+        }
+        let mut rest = vec![mid];
+        rest.extend_from_slice(why);
+        crate::base::args::Args::synth("ask", &rest, &flags)
+    }
+
+    /// **The person's dismissal of any ask**, a person's own included: closed
+    /// as cancelled by the person, with their words after it when they gave
+    /// some, and the asker told the way an answer tells it — a reply addressed
+    /// to whoever waited.
+    #[test]
+    fn the_person_cancels_any_kind_of_ask_and_the_asker_is_told() {
+        let _env = util::isolated("cancel-kinds");
+        let store = scratch("cancel-kinds");
+        task(&store, "lone-1");
+        let person = Answerer { seat: false, agent: false, as_person: false };
+        for (why, said) in [(&[][..], "cancelled by the person"), (&["no longer needed"][..], "cancelled by the person: no longer needed")] {
+            for (kind, q) in every_kind(&store) {
+                assert_eq!(cancel_as(&store, &ask_cancel(&q.id, why, false), &person), 0, "{kind}");
+                let after = store.message(&q.id).unwrap();
+                assert_eq!(after.state_raw, "abandoned", "{kind}");
+                let c = after.closed_json().unwrap();
+                assert_eq!(
+                    (c["how"].as_str(), c["by"].as_str(), c["kind"].as_str(), c["reason"].as_str()),
+                    (Some("abandoned"), Some("person"), Some("cancelled"), Some(said)),
+                    "{kind}"
+                );
+                let reply = message::replies_for(&store, "lone-1").into_iter().find(|r| r.reply_to.as_deref() == Some(q.id.as_str()));
+                let told = message::all(&store).into_iter().any(|m| m.reply_to.as_deref() == Some(q.id.as_str()) && m.text == said);
+                assert!(told || reply.is_some(), "{kind}: the asker was told with a reply that says `{said}`");
+            }
+        }
+    }
+
+    /// A notification is cancelled too, and there is nobody to tell.
+    #[test]
+    fn the_person_cancels_a_notification() {
+        let _env = util::isolated("cancel-note");
+        let store = scratch("cancel-note");
+        task(&store, "lone-1");
+        let n = Message::new(Party::pane("cpd-893", ""), Kind::Note, "heads up").about(About::Task("lone-1".into()));
+        message::raise(&store, &n).unwrap();
+        let person = Answerer { seat: false, agent: false, as_person: false };
+        assert_eq!(cancel_as(&store, &ask_cancel(&n.id, &[], false), &person), 0);
+        let c = store.message(&n.id).unwrap().closed_json().unwrap();
+        assert_eq!((c["kind"].as_str(), c["by"].as_str(), c["reason"].as_str()), (Some("cancelled"), Some("person"), Some("cancelled by the person")));
+    }
+
+    /// An agent or a seat is refused — on a person's question, which they may
+    /// never close, and on the others, because cancelling is the person's act:
+    /// an agent that no longer needs an answer abandons its own question. The
+    /// refusal leaves everything open, and `--as-person` is the person typing in
+    /// an agent's pane.
+    #[test]
+    fn an_agent_is_refused_the_cancel_and_the_person_in_its_pane_may() {
+        let _env = util::isolated("cancel-refused");
+        let store = scratch("cancel-refused");
+        task(&store, "lone-1");
+        for (kind, q) in every_kind(&store) {
+            for caller in [Answerer { seat: false, agent: true, as_person: false }, Answerer { seat: true, agent: false, as_person: false }] {
+                assert_eq!(cancel_as(&store, &ask_cancel(&q.id, &["never mind"], false), &caller), 1, "{kind} {caller:?}");
+                assert!(store.message(&q.id).unwrap().is_open(), "{kind}: still open");
+            }
+            // The messages themselves refuse an agent's pane, a seat and a
+            // handle on a person's question, whichever verb reached them.
+            if q.for_person {
+                for by in [Party::pane("cpd-893", ""), Party::seat("worklist"), Party::Agent("a".into())] {
+                    assert!(matches!(message::abandon(&store, &q.id, &by, "x"), Err(message::Refused::NotThePersons(_))), "{kind} {by:?}");
+                }
+            }
+            let typing = Answerer { seat: false, agent: true, as_person: true };
+            assert_eq!(cancel_as(&store, &ask_cancel(&q.id, &[], true), &typing), 0, "{kind}: the person in the pane");
+        }
+        assert_eq!(cancel_as(&store, &ask_cancel("m-nope", &[], false), &Answerer::default()), 1, "no such message");
+    }
+
+    /// **A `--wait` is not left blocked** by any of the endings that are not an
+    /// answer: the row it was about going to review, the agent that asked being
+    /// let go, and the person cancelling. Each returns the abandonment with its
+    /// reason, and the verb's exit says why it was not an answer (3).
+    #[test]
+    fn a_wait_is_released_with_the_abandonment_when_the_ask_goes_stale_or_is_cancelled() {
+        let _env = util::isolated("wait-stale");
+        let store = scratch("wait-stale");
+        task(&store, "lone-1");
+        for (what, reason, kind) in [
+            ("row to review", "row went to review", "lapsed"),
+            ("agent closed", "agent closed", "seat-gone"),
+            ("cancelled", "cancelled by the person: not now", "cancelled"),
+        ] {
+            let q = waited_on(&store, "lone-1", None);
+            store.set_binding("cpd-893", serde_json::json!({ "task_id": "lone-1" }));
+            let clock = Fake::new();
+            clock.at(2_000, || match what {
+                "row to review" => {
+                    let mut t = store.task("lone-1").unwrap();
+                    t.set_status(crate::model::Status::Review);
+                    store.save_task(&t).unwrap();
+                }
+                "agent closed" => assert!(store.clear_binding("cpd-893")),
+                _ => assert_eq!(
+                    cancel_as(&store, &ask_cancel(&q.id, &["not now"], false), &Answerer::default()),
+                    0
+                ),
+            });
+            let got = wait_for(&store, &q.id, Some(10), &clock).unwrap();
+            let Ended::Abandoned(closed) = &got else { panic!("{what}: {got:?}") };
+            assert!((2_000..=2_000 + POLL_MS).contains(&clock.now.get()), "{what}: released at {}", clock.now.get());
+            let c = closed.closed_json().unwrap();
+            assert_eq!((c["kind"].as_str(), c["reason"].as_str()), (Some(kind), Some(reason)), "{what}");
+            assert_eq!(report_wait(&store, &q.id, &got, Some(10), &answer_args(&q.id, &[("json", "")], &[])), 3, "{what}");
+            // Back to a clean row for the next case.
+            let mut t = store.task("lone-1").unwrap();
+            t.set_status(crate::model::Status::Doing);
+            store.save_task(&t).unwrap();
+        }
+    }
+
+    /// `wsp-098`: a decision waiting on a named party is an ask from the person
+    /// with `of` and `then`; refused without `--then`; `wsp answer --as` closes
+    /// it naming the answerer and the person as the relayer.
+    #[test]
+    fn an_ask_of_a_named_party_is_recorded_and_answered_as_them() {
+        let _env = util::isolated("ask-of");
+        let store = scratch("ask-of");
+        task(&store, "lone-1");
+        let n = |store: &Store| message::all(store).len();
+
+        let bare = crate::base::args::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed")]);
+        assert_eq!(ask(&store, &bare), 2, "no --then is refused");
+        assert_eq!(n(&store), 0, "and nothing is recorded");
+
+        let asked = crate::base::args::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "Ed"), ("then", "merge the bump")]);
+        assert_eq!(ask(&store, &asked), 0);
+        let q = message::all(&store).pop().unwrap();
+        assert_eq!((q.of.as_deref(), q.then.as_deref()), (Some("ed"), Some("merge the bump")));
+        assert_eq!(q.from, Party::Human(None), "an ask from the person");
+        assert!(q.is_open() && q.answered_by.is_none());
+        assert_eq!(q.about, About::Task("lone-1".into()));
+
+        let plain = answer_args(&q.id, &[], &["yes"]);
+        assert_eq!(answer(&store, &plain), 2, "an --of ask is answered --as its party");
+        let wrong = answer_args(&q.id, &[("as", "bob")], &["yes"]);
+        assert_eq!(answer(&store, &wrong), 2);
+        assert!(store.message(&q.id).unwrap().is_open());
+
+        assert_eq!(answer(&store, &answer_args(&q.id, &[("as", "ed")], &["yes, keep it"])), 0);
+        let after = store.message(&q.id).unwrap();
+        assert_eq!(after.state_raw, "answered");
+        assert_eq!((after.answered_by.as_deref(), after.relayed_by.as_deref()), (Some("ed"), Some("person")));
+        let j = after.to_json();
+        assert_eq!((j["of"].as_str(), j["answered_by"].as_str(), j["relayed_by"].as_str()), (Some("ed"), Some("ed"), Some("person")));
+        assert_eq!(after.closing().map(|h| h.by.clone()), Some(Party::Human(None)));
+    }
+
+    /// The answered `--of` ask's action, run as the button would, ends it; and a
+    /// `seen` mark while it is open never pre-empts the step (`wsp-098`).
+    #[test]
+    fn the_done_action_of_an_answered_ask_of_runs_and_ends_the_item() {
+        use crate::classify::{self, Item};
+        let _env = util::isolated("ask-of-done");
+        let store = scratch("ask-of-done");
+        task(&store, "lone-1");
+        let asked = crate::base::args::Args::synth("ask", &["lone-1", "keep the bump?"], &[("of", "ed"), ("then", "merge the bump")]);
+        assert_eq!(ask(&store, &asked), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        let attention = |store: &Store| {
+            let msgs = store.messages();
+            let a = crate::mirror::asks(&msgs, &Default::default()).into_iter().find_map(|e| match e {
+                wsp_store_contract::Entity::Ask(a) => Some(a),
+                _ => None,
+            });
+            classify::of(Item::Ask(&a.unwrap()))
+        };
+        // looking at the card while open is not the step
+        let mut m = store.message(&id).unwrap();
+        m.seen = true;
+        store.save_message(&m).unwrap();
+        assert_eq!(answer(&store, &answer_args(&id, &[("as", "ed")], &["yes"])), 0);
+        let a = attention(&store).expect("seen while open: still needs-you once answered");
+        assert_eq!(a.text, "merge the bump");
+        // run the action's verb and args
+        let j = a.action.unwrap().json();
+        assert_eq!(j["verb"], "answer");
+        let typed: Vec<String> = j["args"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        let refs: Vec<&str> = typed.iter().map(String::as_str).collect();
+        let flags: Vec<(&str, &str)> = vec![("step-done", ""), ("as-person", "")];
+        let positional: Vec<&str> = refs.iter().copied().filter(|x| !x.starts_with("--")).collect();
+        assert_eq!(answer(&store, &crate::base::args::Args::synth("answer", &positional, &flags)), 0);
+        assert!(store.message(&id).unwrap().step_done_at.is_some());
+        assert_eq!(attention(&store), None, "neither once its step is done");
+    }
+
+    // ---- sets (wsp-682) ----------------------------------------------------
+
+    fn a_set() -> serde_json::Value {
+        let q = |h: &str, rec: Option<&str>| {
+            let mut v = serde_json::json!({ "header": h, "question": format!("About {h}?"),
+                "options": [{ "label": "A", "description": "first" }, { "label": "B" }, { "label": "C" }] });
+            if let Some(r) = rec {
+                v["recommended"] = r.into();
+                v["why"] = "because".into();
+            }
+            v
+        };
+        serde_json::json!({ "title": "Plan decisions", "intro": "settles it", "questions": [q("One", Some("A")), q("Two", None), q("Three", Some("B"))] })
+    }
+
+    fn file_set(env: &util::Isolated, name: &str, v: &serde_json::Value) -> String {
+        let f = env.path(name);
+        std::fs::write(&f, v.to_string()).unwrap();
+        f.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn a_set_is_checked_when_it_is_filed() {
+        let env = util::isolated("set-file");
+        let store = scratch("set-file");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut one = a_set();
+        one["questions"] = serde_json::json!([a_set()["questions"][0].clone()]);
+        cases.push(("one question", one));
+        let mut many = a_set();
+        let q0 = a_set()["questions"][0].clone();
+        many["questions"] = (0..31).map(|i| { let mut q = q0.clone(); q["header"] = format!("H{i}").into(); q }).collect();
+        cases.push(("31 questions", many));
+        let mut few = a_set();
+        few["questions"][0]["options"] = serde_json::json!([{ "label": "A" }]);
+        cases.push(("one option", few));
+        let mut lots = a_set();
+        lots["questions"][0]["options"] = serde_json::json!([{ "label": "A" }, { "label": "B" }, { "label": "C" }, { "label": "D" }, { "label": "E" }]);
+        cases.push(("five options", lots));
+        let mut dup = a_set();
+        dup["questions"][1]["header"] = "One".into();
+        cases.push(("a repeated header", dup));
+        let mut long = a_set();
+        long["questions"][0]["header"] = "x".repeat(41).into();
+        cases.push(("a header over 40", long));
+        let mut rec = a_set();
+        rec["questions"][0]["recommended"] = "Z".into();
+        cases.push(("recommended not a label", rec));
+        let mut why = a_set();
+        why["questions"][1]["why"] = "no mark to explain".into();
+        cases.push(("why without recommended", why));
+        let before = message::all(&store).len();
+        for (what, v) in &cases {
+            let f = file_set(&env, "bad.json", v);
+            let a = crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())]);
+            assert_eq!(ask(&store, &a), 2, "{what}");
+        }
+        assert_eq!(message::all(&store).len(), before, "nothing was raised");
+
+        let f = file_set(&env, "set.json", &a_set());
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        let q = message::all(&store).pop().unwrap();
+        assert_eq!(q.text, "Plan decisions: One, Two, Three", "the title and the headers");
+        let c = q.choices.as_ref().unwrap();
+        assert_eq!((c.kind(), c.set_progress()), ("set", (0, 3)));
+        // Not beside --choices.
+        let both = [("person", ""), ("set", f.as_str()), ("choices", f.as_str())];
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &both)), 2);
+    }
+
+    #[test]
+    fn a_set_is_answered_a_question_at_a_time_and_ends_on_the_last() {
+        let env = util::isolated("set-answer");
+        let store = scratch("set-answer");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let f = file_set(&env, "set.json", &a_set());
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        let decisions = |store: &Store| store.task("lone-1").unwrap().body.matches("(set ").count();
+
+        // A bare answer or words is refused: a set is per question.
+        assert_eq!(answer(&store, &answer_args(&id, &[], &["words"])), 2);
+        assert_eq!(answer(&store, &answer_args(&id, &[("choice", "A")], &[])), 2);
+        // A label that is not one, a pick and an Other together, a second pick.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "Z")], &[])), 2);
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "A"), ("other", "w")], &[])), 2);
+        assert_eq!(decisions(&store), 0, "a refusal records nothing");
+
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "B"), ("note", "n1")], &[])), 0);
+        let q = store.message(&id).unwrap();
+        assert!(q.is_open());
+        assert_eq!(q.choices.as_ref().unwrap().set_progress(), (1, 3));
+        let a = &q.choices.as_ref().unwrap().json()["answers"]["One"];
+        assert_eq!((a["pick"][0].as_str(), a["note"].as_str()), (Some("B"), Some("n1")));
+        let first = a["decision"].as_str().unwrap().to_string();
+        let body = store.task("lone-1").unwrap().body;
+        assert!(body.contains("One: B · note: n1 (set") && body.contains("recommended: A"), "{body}");
+        assert!(body.contains("1 of 3 answered"), "the row's log says how far");
+
+        // Saving it again replaces it, and the new decision supersedes the old.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "1"), ("choice", "A")], &[])), 0);
+        let q = store.message(&id).unwrap();
+        let again = q.choices.as_ref().unwrap().json()["answers"]["One"]["decision"].as_str().unwrap().to_string();
+        assert_ne!(first, again);
+        assert!(store.task("lone-1").unwrap().body.contains(&format!("supersedes {first}")) || store.task("lone-1").unwrap().body.contains(&first));
+        assert_eq!(q.choices.as_ref().unwrap().set_progress(), (1, 3));
+
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("other", "my own")], &[])), 0);
+        assert!(store.message(&id).unwrap().is_open(), "two of three");
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Three"), ("choice", "C")], &[])), 0);
+        let done = store.message(&id).unwrap();
+        assert!(!done.is_open(), "the last answer ends it");
+        let told = told(&done);
+        assert!(told.contains("3 of 3 answered") && told.contains("Two: Other — my own") && told.contains("Three: C · differs from recommended (B)") && told.contains("One: A · as recommended"), "{told}");
+        // Once: one reply to the asker.
+        assert_eq!(message::all(&store).iter().filter(|m| m.reply_to.as_deref() == Some(id.as_str())).count(), 1);
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "B")], &[])), 1, "a closed set takes no more");
+    }
+
+    #[test]
+    fn finish_is_refused_while_a_set_question_is_open_and_the_last_answer_ends_it() {
+        let env = util::isolated("set-finish");
+        let store = scratch("set-finish");
+        task(&store, "lone-1");
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let f = file_set(&env, "set.json", &a_set());
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("set", f.as_str())])), 0);
+        let id = message::all(&store).pop().unwrap().id;
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Two"), ("choice", "C")], &[])), 0);
+        assert_eq!(answer(&store, &answer_args(&id, &[("finish", "true")], &["enough for today"])), 1);
+        assert!(store.message(&id).unwrap().is_open(), "refused: the set stays open");
+        let why = open_questions(store.message(&id).unwrap().choices.as_ref().unwrap()).unwrap();
+        assert!(why.contains("1 of 3 answered") && why.contains("One, Three"), "{why}");
+        assert_eq!(store.message(&id).unwrap().choices.as_ref().unwrap().set_progress(), (1, 3));
+        // `--finish` with a save still saves, and still stays open.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "One"), ("choice", "A"), ("finish", "true")], &[])), 1);
+        let q = store.message(&id).unwrap();
+        assert!(q.is_open());
+        assert_eq!(q.choices.as_ref().unwrap().set_progress(), (2, 3));
+        // The last save ends it, with or without `--finish`.
+        assert_eq!(answer(&store, &answer_args(&id, &[("question", "Three"), ("choice", "C")], &[])), 0);
+        let done = store.message(&id).unwrap();
+        assert!(!done.is_open());
+        assert!(told(&done).contains("3 of 3 answered"));
+    }
+}

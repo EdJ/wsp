@@ -30,7 +30,7 @@ pub(crate) use keys::{apply_input, Effect, Input, View};
 // live loop takes now goes through `apply_input`, so the only callers left are
 // the tests that predate it and are about a key alone.
 /// `wsp panel` and its subcommands.
-pub fn verb(store: &crate::store::Store, args: &crate::Args) -> i32 {
+pub fn verb(store: &crate::store::Store, args: &crate::base::args::Args) -> i32 {
     match args.rest.first().map(|s| s.as_str()) {
         Some("storyboard") => crate::story::run(args),
         // `--full` is the panel `Z` opens in a tab: the same panel, at the

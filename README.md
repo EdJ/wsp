@@ -175,7 +175,7 @@ wsp worklist resume          # back to where it was parked, any barrier still ow
 Ed, 2026-09-30 and 2026-10-04 (`wsp-134`, and `wsp-144` d1): **the process is
 fixed, so wsp runs it.** For a group with an `agent:` line, wsp takes every
 step. It takes a step on the verb that makes it due, and on the daemon's tick
-for anything no verb announces (`src/cycle.rs`, `src/repair.rs`):
+for anything no verb announces (`crates/engine/src/cycle.rs`, `crates/engine/src/repair.rs`):
 
 | when | wsp | the agent |
 |---|---|---|
@@ -489,7 +489,7 @@ When a custodian is talked to directly about work that is not its project's,
 it does not take the work on. It names the primary interface, or with Ed's yes
 it passes the request on itself with `wsp govern primary --tell`, and then it
 goes back to its own project. That is one sentence added to the custodial work
-order (`Handover::Custodian` in `src/cmd_spawn.rs`), and it is there now. What it removes is what
+order (`Handover::Custodian` in `crates/engine/src/cmd_spawn.rs`), and it is there now. What it removes is what
 happened on gpui-migration: exceptions made on Ed's say-so that then rode in
 one custodian's thread for the rest of the run.
 
@@ -2512,7 +2512,7 @@ its `needs_you` is `false`, and it is not counted in its governor's
 `members_waiting` or in the top-level `waiting`, which count the seats somebody
 has to answer. The run neither tells it to finish nor ends it while it waits.
 A shell running for under five seconds (a hook, the status line) or over an
-hour (a server left running) does not count, and `src/waiting.rs` says why.
+hour (a server left running) does not count, and `crates/engine/src/waiting.rs` says why.
 
 ### Looking at a pane
 
@@ -2698,7 +2698,7 @@ and the plan reach it there.
 **The pane answering first closes the question** (`wsp-302`). Claude Code does
 not signal a held hook when the pane's dialog is answered; it ran on to its own
 timeout in the spike. So the agent's other hooks close it, through `wsp report`
-(`src/hold_close.rs`), for the hook's own `session_id` and only for a question
+(`crates/engine/src/hold_close.rs`), for the hook's own `session_id` and only for a question
 the hold raised: `PostToolUse` is an **answered** hop, `answered in pane`, with
 the pane's answers (the multi-select string matched against the question's
 labels, in order, and never split; what the labels do not account for is kept as
@@ -2946,7 +2946,7 @@ is the whole of opting in.
 Nothing is shipped enabled, and `wsp doctor` says so while `hooks/` is empty —
 what may interrupt you at 3am is not a tool's decision, but a delivery path with
 nothing at the end of it should not read as working. The argument for all of it
-is in `src/attention.rs`.
+is in `crates/engine/src/attention.rs`.
 
 The same level set reaches the surface that is on screen the whole time. Ed,
 2026-08-17: *"when the agent raises questions to the user, we don't see a flag
@@ -4821,7 +4821,7 @@ kept and moved forward in place (`checkout --detach --force`, `clean -fdq`),
 never cloned. `wsp check --barrier-tree` says where it stands. A second look at
 the same tip reruns nothing: every step is in the ledger.
 
-**The cold build** (`src/cold.rs`). `wsp cold <list|project> [--plan] [--at
+**The cold build** (`crates/engine/src/cold.rs`). `wsp cold <list|project> [--plan] [--at
 COMMIT] [--keep]` runs the project's `at barrier` steps then its `at end` steps,
 for each repository the list's members landed in, at the trunk tip, in a fresh
 `git worktree add --detach` under `cold/<label>-<n>/` with no `target/`, `WSP_*`
@@ -4882,7 +4882,7 @@ four kinds, after the prose:
 ```
 
 **`ran`, `drove` and `read` are derived, not asked for.** When wsp ends the
-verifier's seat it reads the seat's Claude Code transcript (`src/did.rs`) over
+verifier's seat it reads the seat's Claude Code transcript (`crates/engine/src/did.rs`) over
 the same window the pass's cost is read over, and writes them. A verifier that
 did nothing writes `ran: none`; an entry with **no `ran` line was never read**
 (it is older than this, or the kind's record is not one wsp reads — only Claude

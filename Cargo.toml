@@ -9,7 +9,7 @@ name = "wsp"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/wire", "crates/trees", "crates/base", "crates/store", "crates/store-contract", "crates/objects", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager", "crates/api", "crates/server", "crates/client", "crates/view", "crates/machines", "crates/hub"]
+members = ["crates/wire", "crates/trees", "crates/engine", "crates/base", "crates/store", "crates/store-contract", "crates/objects", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager", "crates/api", "crates/server", "crates/client", "crates/view", "crates/machines", "crates/hub"]
 
 [dependencies]
 serde_json = "1"
@@ -17,6 +17,8 @@ wsp-base = { path = "crates/base" }
 wsp-store = { path = "crates/store" }
 wsp-wire = { path = "crates/wire" }
 wsp-trees = { path = "crates/trees" }
+# The engine and the seats (wsp-440), re-exported module by module at their old paths in main.rs.
+wsp-engine = { path = "crates/engine" }
 wsp-host-api = { path = "crates/host-api" }
 wsp-store-contract = { path = "crates/store-contract" }
 wsp-objects = { path = "crates/objects" }
@@ -36,6 +38,7 @@ wsp-client = { path = "crates/client", features = ["test-support"] }
 wsp-store = { path = "crates/store", features = ["test-support"] }
 wsp-wire = { path = "crates/wire", features = ["test-support"] }
 wsp-trees = { path = "crates/trees", features = ["test-support"] }
+wsp-engine = { path = "crates/engine", features = ["test-support"] }
 wsp-host-api = { path = "crates/host-api" }
 # repair's reseat test posts its played hook's turn to the manager, as a real hook does.
 wsp-host = { path = "crates/host" }

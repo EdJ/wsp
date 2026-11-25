@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use crate::cmd_attempts::{attempts_of, priced, Row};
 use crate::store::Store;
 use crate::util::{self, Paint};
-use crate::Args;
+use crate::base::args::Args;
 
 /// What one seat spent. `None` is unmeasured.
 #[derive(Clone, Debug, Default, PartialEq)]

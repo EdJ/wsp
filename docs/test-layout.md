@@ -314,7 +314,7 @@ the real ones, and this table is the list of what has to move with them. Sorted 
 | `stuck.rs` | 9 | 0.7 | 0 | c | seats | 1 | A shell command that is waiting on itself, or on a terminal: wsp-397 | state-core crates (components.md: `wsp-seats`) |
 | `memory.rs` | 11 | 0.6 | 0 | c | base | 2 | Resident memory held by idle agent panes, and a warning past a threshold | `wsp-base`/`wsp-wire`; `cmd_spawn::local_backends`; also uses `place`, so its home is `wsp-wire`, not `wsp-base` |
 | `waits.rs` | 13 | 0.6 | 0 | c | engine | 1 | What a planned list waits on (wsp-383): one answer, for each planned | state-core crates (components.md: `wsp-engine`) |
-| `disk.rs` | 5 | 0.5 | 0 | c | base | 7 | Free space on the volumes holding the project roots, and a warning… | `wsp-base`/`wsp-wire`; `cmd_sandbox::strays`, `scratch::find`, `cycle::log_line` (up) and `Store`/`Status` |
+| `disk.rs` | 5 | 0.5 | 0 | c | base | 7 | Free space on the volumes holding the project roots, and a warning… | `wsp-base`/`wsp-wire`; `scratch::find`, `cycle::log_line` (up) and `Store`/`Status` |
 | `waiting.rs` | 12 | 0.5 | 0 | c | engine | 0 | Whether a seat is waiting on somebody, and on whom. wsp-172 | state-core crates (components.md: `wsp-engine`) |
 | `cmd_attend.rs` | 7 | 0.4 | 0 | c | engine | 3 | wsp attend <task> — one unattended attention-harness attempt, from the | state-core crates (components.md: `wsp-engine`) |
 | `daemon.rs` | 14 | 0.4 | 0 | c | top | 0 | The only long-lived piece | stays in the binary; binary's own layer; state-core replaces the daemon |

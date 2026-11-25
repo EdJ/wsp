@@ -221,7 +221,7 @@ impl Scope {
 
     /// Read a scope off the command line: a positional, then `-p`, then
     /// whatever the pane is standing in.
-    pub(crate) fn of(store: &Store, args: &crate::Args, index: &Index) -> Result<Scope, i32> {
+    pub(crate) fn of(store: &Store, args: &crate::base::args::Args, index: &Index) -> Result<Scope, i32> {
         let named = args.rest.first().cloned().or_else(|| args.get("project"));
         if let Some(name) = named {
             return match Scope::named(&name, index) {

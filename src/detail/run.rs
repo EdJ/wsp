@@ -13,7 +13,7 @@ use crate::util;
 use super::render::{frame, Ctx};
 use super::{get_focus, Focus, Placed};
 
-pub fn run(store: &Store, args: &crate::Args) -> i32 {
+pub fn run(store: &Store, args: &crate::base::args::Args) -> i32 {
     let ws = args
         .get("workspace")
         .unwrap_or_else(|| "-".into());

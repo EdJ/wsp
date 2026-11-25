@@ -10,7 +10,7 @@ Worktrees, build trees and the throttled cargo (`docs/components.md`, cut `c6`).
 
 ## Does not hold
 
-`build_output`, `leg_tree`, `cold`, `affected` — the layering map puts them in `engine`; they stay in `wsp`. `disk` stays in base's row.
+`build_output`, `leg_tree`, `cold`, `affected` — the layering map puts them in `engine`; they are in `wsp-engine` (wsp-440). `disk` stays in base's row.
 
 ## Notes
 
