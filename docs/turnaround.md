@@ -736,3 +736,38 @@ from the rows' logs and transcripts, so it can move the ranks that rest on the 2
 - **10 and 2:** the barrier share and the by-hand suites. They are 3 of 16 groups today, and wsp-517 would change both.
 
 It cannot move S, T, 7 or 5's load figure. Those come from the timings above, not from the rows.
+
+### Cut A, measured (wsp-527)
+
+Written by wsp-527 on 2026-11-25. A check step whose command is one plain `cargo test` now runs as `cargo nextest run`
+with the same package, targets and filters (and `--no-tests=pass`, so a filter that matches nothing still passes, as it
+does under `cargo test`), wherever the host that runs the job answers `cargo nextest --version`. Where it does not
+answer, the step runs as written. The job's first line says which runner ran, and the step's line repeats it:
+`✓ unit · cargo test -p wsp-engine --lib cycle:: · by cargo nextest run · 3s`. The step's command is unchanged, and so
+is its green key, so a green from either runner counts for the other at the same inputs. `crates/engine/src/check.rs`
+(`by_nextest`, `runner_script`, `via_of`) does this, and the barrier, the verifier's check and a row's check all go
+through it. Commands that nextest does not read the same way run as written: `-- --list`, `-- --nocapture`, `--doc`,
+`--no-run`, `-q`/`-v`, and any pipe, `$` or quote. `wsp verify`'s own cargo runs read libtest's report and stay on
+`cargo test`: follow-up wsp-536.
+
+cargo-nextest 0.9.152 is installed on the Linux host now, so the person had nothing to install.
+
+**Timings.** The Linux host, the tree at c0c669b, every target built before the first run. Three runs each, before
+(`cargo test`) and after (`cargo nextest run`), alternating. Each run went through the seat's cargo shim, as a seat's
+run does (a manager job, `nice -n 12`, `CARGO_BUILD_JOBS=3`). Load1 was 0.69 to 3.39 at each start. Script and logs:
+`~/.local/state/wsp/scratch/wsp-527/measure.sh`, `times`.
+
+| What | cargo test (s) | cargo nextest run (s) | Done-when |
+|---|---|---|---|
+| `-p wsp-engine --lib cycle::` (186 tests) | 12.08, 11.96, 11.98 | 4.07, 4.07, 4.08 | ≤ 4.5 s: held |
+| `-p wsp-engine --lib` (2299 tests) | 138.1, 138.1, 133.5 | 25.7, 25.8, 25.5 | ≤ 30 s: held |
+| `--workspace` (4143 run, 12 ignored) | 326.5, 331.9, 330.4 | 53.8, 53.7, 54.6 | from 334 s |
+
+Every nextest run passed. The second `cargo test` run of the engine binary exited 101. The third run overwrote its log,
+so the failing test is not named; it passed in the other two runs. The `--workspace` nextest runs reported 2 tests
+slow (over 30 s) and none terminated.
+
+**The count.** `cargo nextest list --workspace` lists 4152 tests at 287f379, the same 4152 that `cargo test --workspace
+-- --list` lists, 12 of them ignored. With this row's three new tests, both runners count 4155. Doctests: wsp-engine
+sets `doctest = false`, so a plain `cargo test` runs none of its 6 doc blocks; they run only under an explicit `--doc`,
+and such a step stays on `cargo test`. No other crate has any doctest. No doctest is lost.
