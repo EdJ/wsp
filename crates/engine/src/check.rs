@@ -1304,8 +1304,29 @@ impl<'a> Jobs<'a> {
     /// `job.run` for `step` in `dir`: class `check`, at the place, `sh -c` its
     /// command with wsp's own environment taken off on the argv (the rule of
     /// `seat.spawn`) save `$WSP_SCRATCH`, set to [`scratch_of`] `dir`, bounded
-    /// by its limit and [`hung_after`].
+    /// by its limit and [`hung_after`]. The command is [`runner_script`]'s
+    /// where it wraps one, which may send a job of its own first
+    /// ([`Jobs::metadata`]).
     pub fn run_of(&self, step: &Step, dir: &Path) -> JobRun {
+        let script = runner_script(&step.command, |cd| self.metadata(step, dir, cd));
+        self.sh_job(step, dir, script.unwrap_or_else(|| step.command.clone()))
+    }
+
+    /// What `cargo metadata` says in the step's tree, read as a job of the
+    /// step's at its place, so on the host and with the cargo the step runs
+    /// with (wsp spawns none itself); `None` where that job does not pass.
+    fn metadata(&self, step: &Step, dir: &Path, cd: Option<&str>) -> Option<String> {
+        let cd = cd.map(|d| format!("cd {d} && ")).unwrap_or_default();
+        let step = Step { name: format!("{}-metadata", step.name), ..step.clone() };
+        let run = self.sh_job(&step, dir, format!("{cd}cargo metadata --no-deps --format-version 1 2>/dev/null"));
+        let mut said = String::new();
+        self.hold(&run.key);
+        let ended = self.host.run_job(&run, &mut |o: &JobOutput| said.push_str(&o.text));
+        self.hold(&run.key);
+        (ended.ok()?.exit == Some(0)).then_some(said)
+    }
+
+    fn sh_job(&self, step: &Step, dir: &Path, script: String) -> JobRun {
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let name: String = step.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(40).collect();
         let job = format!("{}:{name}@{}.{n}", self.place.kind.word(), self.run);
@@ -1318,7 +1339,7 @@ impl<'a> Jobs<'a> {
         argv.push("--".to_string());
         argv.push(format!("WSP_SCRATCH={}", scratch_of(dir).display()));
         argv.extend(["sh", "-c"].map(String::from));
-        argv.push(runner_script(&step.command, dir).unwrap_or_else(|| step.command.clone()));
+        argv.push(script);
         JobRun {
             key: crate::host::job_key(&self.place.row, 0, &job),
             class: JobClass::Check,
@@ -1599,7 +1620,8 @@ fn scratch_in(own: Option<std::ffi::OsString>, dir: &Path) -> PathBuf {
 // then each test's own. A plain `cargo test` step is run through nextest where
 // the host that runs it has it, and through `cargo test` as written where it
 // does not. nextest runs no doctests, so a step that would is followed by
-// `cargo test --doc` for the packages that have them. The job says which on its first line and the step's line repeats
+// `cargo test --doc` for the packages that have them, read by `cargo metadata`
+// in a job of its own. The job says which on its first line and the step's line repeats
 // it. The step's command, and so its green, is the one written: a green from
 // one runner counts for the other at the same inputs.
 
@@ -1609,6 +1631,9 @@ pub const BY_NEXTEST: &str = "wsp: run by cargo nextest run (one process per tes
 pub const BY_NEXTEST_AND_DOC: &str = "wsp: run by cargo nextest run (one process per test), then cargo test --doc";
 /// The first line a step's job writes when nextest is not on its host.
 pub const BY_CARGO_TEST: &str = "wsp: run by cargo test (no cargo-nextest on this host)";
+/// The first line when the step runs as written for want of its doctest
+/// libraries.
+pub const BY_CARGO_TEST_UNREAD: &str = "wsp: run by cargo test (cargo metadata did not say which libraries have doctests)";
 
 /// Flags without a value that mean the same to both.
 const SAME: &[&str] = &["--lib", "--bins", "--tests", "--workspace", "--all", "--all-features", "--no-default-features", "-r", "--release"];
@@ -1716,26 +1741,24 @@ pub fn by_nextest(command: &str) -> Option<ByNextest> {
     Some(ByNextest { run: out.join(" "), dir: dir.map(String::from), doc: (!narrowed).then_some(doc) })
 }
 
-/// The packages `doc` selects whose library has doctests on, read from
-/// `cargo metadata` in `dir`: an explicit `--doc` runs the blocks of a
+/// The packages `doc` selects whose library has doctests on, read from what
+/// `cargo metadata` said: an explicit `--doc` runs the blocks of a
 /// `doctest = false` library and fails where there is no library, so only
 /// these are named to it. `None` where that cannot be told.
-fn doctested(dir: &Path, doc: &Doc) -> Option<Vec<String>> {
-    let out = std::process::Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(dir)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+fn doctested(metadata: &str, doc: &Doc) -> Option<Vec<String>> {
+    let meta: serde_json::Value = serde_json::from_str(metadata).ok()?;
     let packages = meta["packages"].as_array()?;
     let ids = meta[if doc.workspace { "workspace_members" } else { "workspace_default_members" }].as_array()?;
     let name_of = |p: &serde_json::Value| p["name"].as_str().map(String::from);
+    // A spec that is no member's name (a glob, `name@version`) is not read here.
+    let named = |n: &String| packages.iter().find(|p| p["name"].as_str() == Some(n));
+    if !doc.exclude.iter().all(|n| named(n).is_some()) {
+        return None;
+    }
     let selected: Vec<&serde_json::Value> = if doc.packages.is_empty() {
         packages.iter().filter(|p| ids.contains(&p["id"])).collect()
     } else {
-        // A spec that is no member's name (a glob, `name@version`) is not read here.
-        doc.packages.iter().map(|n| packages.iter().find(|p| p["name"].as_str() == Some(n))).collect::<Option<_>>()?
+        doc.packages.iter().map(named).collect::<Option<_>>()?
     };
     Some(
         selected
@@ -1747,18 +1770,20 @@ fn doctested(dir: &Path, doc: &Doc) -> Option<Vec<String>> {
     )
 }
 
-/// What a step's job runs in `sh -c` for `command` in `tree`: [`by_nextest`]'s
-/// form (and the doctests after it) where `cargo nextest` answers on the host,
+/// What a step's job runs in `sh -c` for `command`: [`by_nextest`]'s form
+/// (and the doctests after it) where `cargo nextest` answers on the host,
 /// `command` as written where it does not, each after its line ([`BY_NEXTEST`],
-/// [`BY_NEXTEST_AND_DOC`], [`BY_CARGO_TEST`]). `None` for a command that runs
-/// as written: one [`by_nextest`] leaves alone, or whose doctests cannot be
-/// told.
-pub fn runner_script(command: &str, tree: &Path) -> Option<String> {
+/// [`BY_NEXTEST_AND_DOC`], [`BY_CARGO_TEST`]). `metadata` gives what `cargo
+/// metadata` says under the command's `cd`, and is asked only where doctests
+/// would follow; where it cannot tell, `command` runs as written
+/// ([`BY_CARGO_TEST_UNREAD`]). `None` for one [`by_nextest`] leaves alone.
+pub fn runner_script(command: &str, metadata: impl FnOnce(Option<&str>) -> Option<String>) -> Option<String> {
     let ByNextest { run, dir, doc } = by_nextest(command)?;
     let (mut run, mut line) = (run, BY_NEXTEST);
     if let Some(doc) = doc {
-        let at = dir.as_ref().map_or_else(|| tree.to_path_buf(), |d| tree.join(d));
-        let packages = doctested(&at, &doc)?;
+        let Some(packages) = metadata(dir.as_deref()).and_then(|m| doctested(&m, &doc)) else {
+            return Some(format!("echo '{BY_CARGO_TEST_UNREAD}'; {}", command.trim()));
+        };
         if !packages.is_empty() {
             let named: String = packages.iter().map(|p| format!(" -p {p}")).collect();
             let rest: String = doc.rest.iter().map(|w| format!(" {w}")).collect();
@@ -1783,7 +1808,7 @@ pub fn via_of(log: &Path) -> Option<&'static str> {
     match first.trim() {
         BY_NEXTEST => Some("cargo nextest run"),
         BY_NEXTEST_AND_DOC => Some("cargo nextest run + cargo test --doc"),
-        BY_CARGO_TEST => Some("cargo test"),
+        BY_CARGO_TEST | BY_CARGO_TEST_UNREAD => Some("cargo test"),
         _ => None,
     }
 }
@@ -3728,6 +3753,15 @@ mod tests {
             assert_eq!(asked(&said).len(), 1, "{said}");
             assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo nextest run")), "{none}");
         }
+        // A glob is not read, and no metadata is no answer: as written, and said.
+        let unread = |command: &str, argv: &str| {
+            let (said, ran) = run(command);
+            assert_eq!(asked(&said), [argv], "{said}");
+            assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo test")), "{said}");
+        };
+        unread("cargo test --workspace --exclude o*", "test --workspace --exclude o*");
+        std::fs::remove_file(dir.join("metadata.json")).unwrap();
+        unread("cargo test", "test");
         std::fs::remove_file(dir.join("has-nextest")).unwrap();
         let (said, ran) = run(command);
         assert_eq!(asked(&said), ["test -p on --lib cycle::"], "{said}");

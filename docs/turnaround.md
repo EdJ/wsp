@@ -744,7 +744,7 @@ with the same package, targets and filters (and `--no-tests=pass`, so a filter t
 does under `cargo test`), wherever the host that runs the job answers `cargo nextest --version`. Where it does not
 answer, the step runs as written. nextest runs no doctests, so a command with no target selection is followed by
 `cargo test --doc` with the same features, profile and filter, for the selected packages whose library has doctests on
-(`cargo metadata`; an explicit `--doc` would run those of a `doctest = false` crate and fail on a package with no
+(`cargo metadata`, run as a job on the step's host; an explicit `--doc` would run those of a `doctest = false` crate and fail on a package with no
 library). The job's first line says what ran, and the step's line repeats it:
 `✓ unit · cargo test -p wsp-engine --lib cycle:: · by cargo nextest run · 3s`. The step's command is unchanged, and so
 is its green key, so a green from either runner counts for the other at the same inputs. `crates/engine/src/check.rs`
