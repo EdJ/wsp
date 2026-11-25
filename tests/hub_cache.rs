@@ -150,7 +150,7 @@ impl Spoke {
         .into();
         bare(&outer, &home).arg("init").output().unwrap();
         let name = format!("hc{tag}{}", std::process::id());
-        let out = bare(&outer, &home).args(["sandbox", "--fake", "--json", "--name", &name]).output().unwrap();
+        let out = bare(&outer, &home).args(["sandbox", "--fake", "--json", "--name", &name]).env("WSP_SANDBOX_TETHER", std::process::id().to_string()).output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("sandbox json: {e}: {}", String::from_utf8_lossy(&out.stderr)));
         let env: BTreeMap<String, String> = v["env"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
@@ -246,13 +246,24 @@ impl Spoke {
     }
 }
 
-impl Drop for Spoke {
-    fn drop(&mut self) {
+impl Spoke {
+    /// Its daemon, then its sandbox. Idempotent: the rig calls it before it
+    /// removes the directory, and `Drop` calls it again.
+    fn teardown(&mut self) {
         if let Some(mut d) = self.daemon.take() {
             let _ = d.kill();
             let _ = d.wait();
         }
-        let _ = bare(&self.outer, &self.home).args(["sandbox", "rm", &self.name]).output();
+        let name = std::mem::take(&mut self.name);
+        if !name.is_empty() {
+            let _ = bare(&self.outer, &self.home).args(["sandbox", "rm", &name]).output();
+        }
+    }
+}
+
+impl Drop for Spoke {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -337,12 +348,12 @@ impl Drop for Rig {
         if let Some(r) = self.running.take() {
             r.stop();
         }
-        // The spokes drop first (their daemons), then the directory.
-        let dir = self.dir.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            let _ = std::fs::remove_dir_all(dir);
-        });
+        // The spokes first (their daemons and fakes), then the directory. Not a
+        // detached thread on a timer: it raced spoke b's `sandbox rm`, which then
+        // found no state to read its fake from and left it at ppid 1 (wsp-778).
+        self.a.teardown();
+        self.b.teardown();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

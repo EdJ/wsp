@@ -670,7 +670,8 @@ fn serve(args: &Args) -> i32 {
         return 2;
     };
     let stage = args.get("stage").map(PathBuf::from);
-    match crate::fake::serve_forever(Path::new(&socket), stage.as_deref()) {
+    let tether = args.get("tether").and_then(|t| t.trim().parse::<u32>().ok()).filter(|&p| p > 1);
+    match crate::fake::serve_forever(Path::new(&socket), stage.as_deref(), tether) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("wsp: cannot serve a fake on {socket}: {e}");
@@ -705,8 +706,14 @@ fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
         .arg("--socket")
         .arg(&socket)
         .arg("--stage")
-        .arg(stage)
-        .stdin(Stdio::null())
+        .arg(stage);
+    // A run that asks for it ties the fake to itself (wsp-778): a test binary
+    // that is killed, or panics past its teardown, cannot tear a fake down, and
+    // the fake's parent is this process, which has always exited by then.
+    if let Some(pid) = tether() {
+        c.arg("--tether").arg(pid.to_string());
+    }
+    c.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     forget(&mut c);
@@ -717,6 +724,14 @@ fn fake_command(sb: &Sandbox, stage: &Path) -> Command {
     c.env("WSP_BACKEND_SOCKET_PATH", &socket);
     c
 }
+
+/// The pid `WSP_SANDBOX_TETHER` names, the process whose death ends a fake.
+fn tether() -> Option<u32> {
+    std::env::var(TETHER_ENV).ok()?.trim().parse::<u32>().ok().filter(|&p| p > 1)
+}
+
+/// What a test harness sets to its own pid so the fakes it starts die with it.
+pub const TETHER_ENV: &str = "WSP_SANDBOX_TETHER";
 
 /// Start the fake and wait until its socket answers.
 ///
