@@ -446,6 +446,10 @@ fn b_offline_across_a_thousand_changes_reconnects_with_one_heads_diff_not_a_thou
     };
     let id = "wsp-9001";
     let subject = Subject::Row(RowId(id.into()));
+    // The hub fsyncs every object it keeps (~50ms each), so only the head is put; the ref moves,
+    // which are the thousand changes the hub streams, stay one per change.
+    let mut chain = Vec::new();
+    let mut blobs = Vec::new();
     let mut parent = None;
     for n in 1..=1000 {
         let mut row = row.clone();
@@ -453,12 +457,17 @@ fn b_offline_across_a_thousand_changes_reconnects_with_one_heads_diff_not_a_thou
         row.title = format!("Revision {n}");
         let obj = Object::Record { workspace: workspace.clone(), subject: subject.clone(), entity: Entity::Row(row), parent, by: by.clone(), at: At(n) };
         let (oid, bytes) = wsp_objects::encode(&obj);
-        hub.sync_put(vec![wsp_api::Blob { id: oid, bytes }]).unwrap();
-        let moved = hub.refs_move(RefMove { workspace: ws.clone(), subject: subject.clone(), from: parent, to: oid }).unwrap();
-        assert!(matches!(moved, wsp_api::Move::Moved { .. }), "{moved:?}");
+        if n == 1000 {
+            blobs.push(wsp_api::Blob { id: oid, bytes });
+        }
+        chain.push((parent, oid));
         parent = Some(oid);
     }
-
+    hub.sync_put(blobs).unwrap();
+    for (from, to) in chain {
+        let moved = hub.refs_move(RefMove { workspace: ws.clone(), subject: subject.clone(), from, to }).unwrap();
+        assert!(matches!(moved, wsp_api::Move::Moved { .. }), "{moved:?}");
+    }
     // B back: the frames on its wire from here on.
     let mark = rig.b.proxy.wire().len();
     let running = rig.running.as_ref().unwrap().addrs()[0];
