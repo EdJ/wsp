@@ -630,7 +630,16 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
             // was most of what an idle pass cost. See `Store::steady`.
             let emits = store.steady(|| {
                 let mut source = attention::machine_source(store);
-                attention::tick(store, &mut pass, &mut source, now)
+                let emits = attention::tick(store, &mut pass, &mut source, now);
+                // The third audience, and the one that spends tokens. `tick`
+                // put every edge on the event log for a hook to read at no
+                // cost to anybody; this decides which of them are worth
+                // re-invoking a governor for, and tells the ones that are. See
+                // `crate::wake` — and note that it writes its spool before it
+                // attempts anything, because the at-most-once the event log is
+                // content with is not affordable for a reader that is asleep.
+                crate::wake::wake(store, &emits, now);
+                emits
             });
             if verbose {
                 for e in &emits {
@@ -1626,7 +1635,9 @@ mod idle_tick {
             let mut pass = attention::Pass::new();
             store.steady(|| {
                 let mut source = attention::machine_source(store);
-                attention::tick(store, &mut pass, &mut source, crate::util::epoch_secs())
+                let now = crate::util::epoch_secs();
+                let emits = attention::tick(store, &mut pass, &mut source, now);
+                crate::wake::wake(store, &emits, now);
             });
             by.push(("attention".to_string(), p() - a));
             for (name, _) in crate::readings::PERIODS {

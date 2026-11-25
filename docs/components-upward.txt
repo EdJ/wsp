@@ -2,7 +2,6 @@
 # The layering test (tests/layering.rs) fails on an upward use not here and on a line the code no longer has.
 # This file only shrinks: delete a line or a symbol when the code stops using it; never add one.
 attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume  # engine -> seats
-attention -> wake: wake  # engine -> seats
 cmd_message -> agent_commands: of  # engine -> seats
 cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message  # engine -> seats
 cmd_message -> cmd_govern: answering_seat, room_of, whereabouts  # engine -> seats
@@ -17,7 +16,6 @@ cycle -> cmd_agent: did_of_seat, notice  # engine -> seats
 cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate  # engine -> seats
 cycle -> room: Gate  # engine -> seats
 cycle -> wake: messages_held, say, settle_held  # engine -> seats
-disk -> cmd_sandbox: strays  # engine -> seats
 leg_seat -> cmd_agent: ran_in_seat, spawned_at  # engine -> seats
 repair -> agent_commands: opencode_finished_at  # engine -> seats
 repair -> cmd_agent: stuck_of_seat  # engine -> seats

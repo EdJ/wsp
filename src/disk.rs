@@ -169,8 +169,45 @@ pub(crate) fn reclaimable(store: &Store) -> Vec<(PathBuf, &'static str)> {
             }
         }
     }
-    out.extend(crate::cmd_sandbox::strays(store).into_iter().map(|p| (p, "sandbox tree")));
+    out.extend(strays(store).into_iter().map(|p| (p, "sandbox tree")));
     out
+}
+
+/// The worktrees the sandbox at `dir` made in real repositories, as `(repo,
+/// tree)` (`wsp-373`). A sandbox's store is seeded with the real projects, so a
+/// task started in it gets its tree under the project's real root —
+/// `~/claude/wsp/.worktrees/demo-001` — and `rm` removed the sandbox directory
+/// and left three of them, 25 GB each by `du`. A tree is a sandbox's when its
+/// row is a task of the sandbox's store and is not one of the real store's.
+pub(crate) fn strays_of(real: &Store, dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let home = dir.join("wsp");
+    if !home.is_dir() {
+        return Vec::new();
+    }
+    let sb = Store::at(home, dir.join("state"));
+    let rows: std::collections::BTreeSet<String> = sb.tasks().into_iter().map(|t| t.id).collect();
+    let mut out = Vec::new();
+    for repo in crate::check_tree::repos(&sb) {
+        let Ok(entries) = std::fs::read_dir(repo.join(WORKTREES)) else { continue };
+        let mut trees: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.join(".git").exists()).collect();
+        trees.sort();
+        for tree in trees {
+            let name = tree.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let row = crate::leg_tree::row_of(name);
+            if rows.contains(row) && real.task(row).is_none() {
+                out.push((repo.clone(), tree));
+            }
+        }
+    }
+    out
+}
+
+/// Every sandbox's [`strays_of`], as paths, for the disk reading.
+pub(crate) fn strays(real: &Store) -> Vec<PathBuf> {
+    let root = real.state.join("sandbox");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs.iter().flat_map(|d| strays_of(real, d)).map(|(_, t)| t).collect()
 }
 
 /// What removing `path` gives back: its **private** size, the bytes no other
