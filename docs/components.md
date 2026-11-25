@@ -366,6 +366,241 @@ dependency**, with one amendment: **D2 (docs/state-core.md section 6) admits `ru
 workspace's members are not dependencies in the sense of that rule, and the commit should say so.
 A single binary linked from the members costs nothing at start-up (`robustness-077`).
 
+### Phase 3 sets, measured
+
+Counted at trunk `1a16d54` (wsp-533) with `tests/layering.rs`'s own parser and line rule (`crate::` paths and `use
+crate::{…}` in non-test code, up to the first `#[cfg(test)] mod`). A line is one (from module, to module) pair, as
+`docs/components-upward.txt` writes it; symbols are distinct per target module (`*` is a use of the module itself).
+
+**core -> spoke is not at 5 lines or fewer: it is 13 lines, so by decision 5 the spoke cut (wsp-534) does not go ahead
+as the code stands; spoke -> core, the edge that cut would keep, is 14 lines (33 symbols).**
+
+- **spoke** (8): `cmd_hub`, `cmd_login`, `cmd_publish`, `cmd_whoami`, `hub_cache`, `hub_journal`, `hub_lease`,
+  `hub_sync`.
+- **seats** (19, the map's `seats` row): `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`,
+  `cmd_install`, `cmd_machine`, `cmd_project`, `cmd_resume`, `cmd_role`, `cmd_sandbox`, `cmd_spawn`, `cmd_stamp`,
+  `cmd_watch`, `kind_attention`, `kind_data`, `memory`, `room`, `wake`.
+- **core** (75): the map's `engine` row less the spoke modules: `address`, `affected`, `after`, `artefact`, `attempt`,
+  `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `by_merge`, `check`,
+  `classify`, `closing`, `cmd_allocate`, `cmd_initiative`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_submit`,
+  `cmd_task`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`,
+  `follow_up`, `history`, `hold`, `hold_close`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `liveness`,
+  `local_trust`, `mirror`, `orders`, `outputs`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`,
+  `pieces`, `reconcile`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `scope`, `scratch`, `size_check`,
+  `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`,
+  `verifier_packet`, `waiting`, `waits`, `worklist`.
+
+**One module moved from the list this was ordered with.** The order named seven spoke modules; `cmd_publish` is
+counted with them as an eighth, because it is plainly a hub client (it takes each new id from the hub with
+`ids.alloc`, and its `dial` is the hub client `hub_lease` connects with). With the seven alone, core -> spoke is 13
+lines and spoke -> core 15; the answer to decision 5 is the same. All seven listed are hub clients. `door` (the import
+of the hub's objects into the files) and `reconcile` (the merge after a `stale`) serve the sync but do not dial the
+hub, and stay in core.
+
+| direction | lines | distinct symbols | lines with the seven listed |
+|---|---|---|---|
+| core -> seats | 26 | 57 | 26 |
+| seats -> core | 113 | 227 | 113 |
+| core -> spoke | 13 | 24 | 13 |
+| spoke -> core | 14 | 33 | 15 |
+| seats -> spoke | 2 | 4 | 2 |
+| spoke -> seats | 0 | 0 | 0 |
+
+**core -> seats**: 26 lines, 57 symbols.
+
+```
+attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume
+cmd_message -> agent_commands: of
+cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message
+cmd_message -> cmd_govern: answering_seat, room_of, whereabouts
+cmd_message -> wake: held_because, say
+cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, worked_line
+cmd_task -> cmd_resume: thread_for_task
+cmd_task -> cmd_spawn: kind_or_default
+cmd_worklist -> cmd_agent: claim_where, named_project
+cmd_worklist -> cmd_govern: slots
+cycle -> agent_commands: SETTLED_AFTER
+cycle -> cmd_agent: did_of_seat, notice
+cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate
+cycle -> room: Gate
+cycle -> wake: messages_held, say, settle_held
+leg_seat -> cmd_agent: ran_in_seat, spawned_at
+repair -> agent_commands: opencode_finished_at
+repair -> cmd_agent: stuck_of_seat
+repair -> cmd_govern: *
+repair -> cmd_spawn: seat_kind
+repair -> wake: owed_to, scopes_owed
+stage -> cmd_agent: sentence
+stage -> cmd_govern: needs_a_person
+stand_down -> cmd_govern: *
+stand_down -> wake: owed_to
+waits -> room: Counted, Gate, working_now
+```
+
+**seats -> core**: 113 lines, 227 symbols.
+
+```
+agent_commands -> did: Did
+cmd_agent -> address: Address, Book, claim_holder, parse, resolve
+cmd_agent -> attempt: attempts_of
+cmd_agent -> attention: health, orphans
+cmd_agent -> barrier: ran_on, seat_label, seats
+cmd_agent -> classify: Holder, Item, Kind, Seat, of
+cmd_agent -> cmd_mandate: from_map
+cmd_agent -> cmd_message: asked_of_the_person, sender, tell_via_hub, whoami
+cmd_agent -> cmd_migrate: is_dated
+cmd_agent -> cmd_task: *
+cmd_agent -> cycle: BLOCKED_ESCALATES_AFTER, OWNED, OWNED_GROUP, OWNED_LIST, blocked_since, poke_task, silent
+cmd_agent -> did: Did
+cmd_agent -> disk: health, loud, loud_of
+cmd_agent -> ending: handed_to_legs
+cmd_agent -> fold: did_since, stall, state_since
+cmd_agent -> follow_up: json_of, line, unheld
+cmd_agent -> leg_tree: row_of
+cmd_agent -> legs: Standing, State, seat_label, seated, tally
+cmd_agent -> liveness: a_backend_answered, dead, health, running
+cmd_agent -> local_trust: dialog_fix
+cmd_agent -> mirror: LOCAL, api_health, binding_of, claim_of, finished_item, finished_rows, holders_of, list_of, message_of, seated_of, spawned_of, state_of, task_of, wip_reads_in_full
+cmd_agent -> orders: Error, Mode, TELL_WAIT, all, all_in, answer, health, mode, order, orders_of, principal, said, send, typed_since, typed_since_in
+cmd_agent -> packet: clause
+cmd_agent -> pickup: started_lately, wip_lines
+cmd_agent -> pieces: Standing, State, addressed, seat_label, seated, tally
+cmd_agent -> refusals: TEST_DOOR, refusing
+cmd_agent -> repair: run_said, stuck_seats
+cmd_agent -> stuck: Kind, Stall, classify, waits_on_itself_line
+cmd_agent -> tell_log: show
+cmd_agent -> verification: SECTION, ran_on_by_seat, seat_label, seated, seats, verified
+cmd_agent -> waiting: Asks, Facts, Kind, SeatWait, Shells, Wait, Why, on_screen, reading, seat_wait
+cmd_agent -> worklist: Running, Settlement, homes, passed_by_running
+cmd_attend -> check: *
+cmd_attend -> packet: build, of
+cmd_attend -> worklist: verified_by_a_run
+cmd_brief -> artefact: BRIEF_LINE
+cmd_brief -> barrier: seat_label, seat_of
+cmd_brief -> cmd_mandate: *
+cmd_brief -> cmd_message: census
+cmd_brief -> cmd_task: paint_prio
+cmd_brief -> leg_seat: brief_lines, has_packet
+cmd_brief -> liveness: a_backend_answered, dead, running
+cmd_brief -> piece_seat: brief_lines
+cmd_brief -> split: NOT_A_SUBTASK, route
+cmd_brief -> verification: seats
+cmd_brief -> worklist: Placing, Position, Running, running_position
+cmd_govern -> address: logged_in_user
+cmd_govern -> cycle: Fleet, STARTED_BY
+cmd_govern -> repair: Occupancy, reading
+cmd_govern -> verification: verified_in
+cmd_govern -> worklist: Running, home_of_scope
+cmd_install -> artefact: hash_of
+cmd_machine -> cycle: Fleet
+cmd_machine -> mirror: LOCAL, state_of
+cmd_project -> cmd_initiative: all, tree_lines
+cmd_project -> cmd_task: Prose, edit_prose, paint_prio
+cmd_project -> record_workspace: of_new
+cmd_project -> worklist: home_of_scope
+cmd_role -> barrier: seats
+cmd_role -> check: key_text
+cmd_role -> cmd_task: done
+cmd_role -> cycle: Fleet
+cmd_role -> verification: latest, seats, verified
+cmd_role -> worklist: Running
+cmd_sandbox -> disk: strays_of
+cmd_sandbox -> local_trust: clear
+cmd_spawn -> address: claim_holder
+cmd_spawn -> attention: seat_gone
+cmd_spawn -> barrier: mark_ended, name_seat, seat_label, seat_of, subject
+cmd_spawn -> closing: Kind, baton_path, clear_verdict, verdict_path
+cmd_spawn -> cmd_allocate: allocated_elsewhere, elsewhere_said
+cmd_spawn -> cmd_message: type_at
+cmd_spawn -> cycle: Fleet, OWNED_LIST, RESEAT_ASKED, RUN_STEP, Seats, check_order, overrule, sent_back_order, verifier_order_line
+cmd_spawn -> disk: hold
+cmd_spawn -> duplicate: moved_note
+cmd_spawn -> ending: stop_in_tree
+cmd_spawn -> exit: Kind
+cmd_spawn -> leg_seat: *
+cmd_spawn -> leg_tree: Prepared, discard, prepare, record
+cmd_spawn -> legs: lasts, legs
+cmd_spawn -> local_trust: trust
+cmd_spawn -> orders: Error, Mode, answer, mode, send
+cmd_spawn -> packet: at_leg_spawn, at_spawn, give_leg, leg_order, order_in
+cmd_spawn -> piece_seat: Prepared, Standing, attach, open, order_line, prepare, record_tree, tier_of, unopen
+cmd_spawn -> pieces: record
+cmd_spawn -> repair: Occupancy, reading
+cmd_spawn -> scratch: path
+cmd_spawn -> stuck: waits_on_itself_line
+cmd_spawn -> verification: name_seat, seat_label, seats
+cmd_spawn -> waiting: Shells, TurnEnd, read_last_turn
+cmd_spawn -> worklist: Running, running_position
+cmd_watch -> address: logged_in_user
+cmd_watch -> attention: forget_level
+cmd_watch -> disk: LOW, read
+cmd_watch -> liveness: a_backend_answered, loud, running
+cmd_watch -> verification: stalled_at_cap
+cmd_watch -> waiting: Asks, Why
+cmd_watch -> worklist: *, Running
+room -> barrier: NOT_UP_AFTER, moot, seat_label, seats
+room -> cycle: STARTED_BY, Seats
+room -> ending: exited_seats
+room -> inner: run_inside
+room -> legs: State, label, legs
+room -> pieces: State, record
+room -> repair: undelivered_reason
+room -> verification: Ending, State, passes, seat_label, seats
+room -> worklist: open_list_of
+wake -> address: Address, Book, logged_in_user, parse
+wake -> cmd_message: hub_tell
+wake -> cycle: Fleet, Seats
+wake -> fold: turn_began_since
+wake -> refusals: *, Door, accepted, door, refuse
+wake -> repair: Occupancy, reading, will_seat
+```
+
+**core -> spoke**: 13 lines, 24 symbols.
+
+```
+address -> hub_cache: Cache
+address -> hub_lease: Book
+cmd_message -> cmd_whoami: engineer, person, person_named
+cmd_message -> hub_sync: Hand, dial
+cmd_task -> cmd_whoami: sign
+cmd_task -> hub_cache: is_head, show_line
+cmd_task -> hub_journal: refusal, show_line
+cmd_task -> hub_lease: before_claim
+cmd_task -> hub_sync: fetch
+cmd_worklist -> hub_lease: driven_by, running_elsewhere
+cycle -> hub_lease: Book, Drives, Member, drive, lease_member, running_elsewhere, token_of, unused, verdict_held
+door -> cmd_publish: highest_local
+verification -> hub_journal: refusal
+```
+
+**spoke -> core**: 14 lines, 33 symbols.
+
+```
+hub_cache -> cmd_message: Caller
+hub_cache -> cmd_task: *
+hub_cache -> door: *, Heads, task_of_record, user_of
+hub_cache -> repair: landed_line
+hub_lease -> address: logged_in_user
+hub_lease -> cmd_allocate: allocated_elsewhere, allocated_to, elsewhere_said
+hub_lease -> repair: commit_of, landed_line, ready
+hub_lease -> verification: blocked, tell_governor, verified
+hub_sync -> cmd_message: receive
+hub_sync -> door: *, Applied, Door, Heads, Refusal, list_digest, user_of
+hub_sync -> mirror: by_shared_workspace, list_texts_of, lists, shared_row
+hub_sync -> orders: Mode, mode, send_keyed
+hub_sync -> reconcile: *, Lease, Merging, NoLease, Objects
+hub_sync -> verification: tell_governor
+```
+
+**seats -> spoke**: 2 lines, 4 symbols.
+
+```
+cmd_agent -> hub_lease: before_claim, let_go, stamp
+cmd_agent -> hub_sync: health
+```
+
+**spoke -> seats**: 0 lines, 0 symbols.
+
 ## 6. The maps, and how the brief points at them
 
 **Per crate: `crates/<name>/MAP.md`, under 60 lines**, written in the cut row and kept in the same commit as any
