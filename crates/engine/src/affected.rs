@@ -208,8 +208,11 @@ fn derived_step(name: &str, command: &str) -> Step {
 // bin crate's 2,700-test binary and every `tests/` binary whatever changed. A
 // member's check and its verifier run the narrower command where the change
 // allows; the barrier's full suite, once per group, is untouched and still
-// catches what a narrowed step leaves out (a reverse dependent, an integration
-// test). A change to a `Cargo.toml`, `Cargo.lock`, a `build.rs`, `tests/`, a
+// catches what a narrowed step leaves out (an integration test a filter
+// skips). A changed crate's reverse dependents, as [`reached`] walks them over
+// the manifests' path dependencies, run with it (`wsp-522`): since `wsp-440`
+// nearly all the code is in `wsp-engine`, and its edits must still run the
+// root package's tests. A change to a `Cargo.toml`, `Cargo.lock`, a `build.rs`, `tests/`, a
 // shared hub ([`HUBS`]), a path outside `src/` and `crates/`, or one that spans
 // both, narrows nothing.
 
@@ -218,8 +221,10 @@ fn derived_step(name: &str, command: &str) -> Step {
 pub enum Reach {
     /// Anything: nothing is narrowed, and this says why.
     Whole(String),
-    /// Only these crates under `crates/`, by package name.
-    Crates(Vec<String>),
+    /// Only these crates under `crates/` changed (the first list, by package
+    /// name), and these are their reverse dependents, nearest first: the
+    /// crates whose tests the change reaches beside their own.
+    Crates(Vec<String>, Vec<String>),
     /// Only these modules of the root package's `src/`.
     Bin(Vec<String>),
 }
@@ -296,10 +301,138 @@ pub fn reach(changed: &[String], read: &dyn Fn(&str) -> Option<String>) -> Reach
     modules.dedup();
     match (crates.is_empty(), modules.is_empty()) {
         (true, true) => Reach::Whole("no source changed".into()),
-        (false, true) => Reach::Crates(crates),
+        (false, true) => match members(read) {
+            Ok(ws) => {
+                let dependents = reached(&ws, changed).into_iter().map(|(n, _)| n).filter(|n| !crates.contains(n)).collect();
+                Reach::Crates(crates, dependents)
+            }
+            Err(why) => Reach::Whole(why),
+        },
         (true, false) => Reach::Bin(modules),
         (false, false) => Reach::Whole("the change spans crates/ and src/".into()),
     }
+}
+
+/// The workspace's crates as [`reached`] reads them, from the manifests at the
+/// commit: the root package (if any) and each `[workspace] members` entry, with
+/// the workspace crates each names by `path` in any dependency table (normal,
+/// dev, build or a target's). A globbed or unreadable member says why its
+/// reverse dependents cannot be told.
+fn members(read: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Crate>, String> {
+    let root = read("Cargo.toml").ok_or("the root Cargo.toml cannot be read")?;
+    let mut dirs: Vec<String> = Vec::new();
+    if name_in(&root, "[package]").is_some() {
+        dirs.push(String::new());
+    }
+    for m in list_in(&root, "[workspace]", "members") {
+        let m = m.trim_end_matches('/').to_string();
+        if !plain_path(&m) || m.split('/').any(|s| s == ".." || s == ".") {
+            return Err(format!("the workspace member {m} is no plain path"));
+        }
+        if !dirs.contains(&m) {
+            dirs.push(m);
+        }
+    }
+    let mut found = Vec::new();
+    for dir in &dirs {
+        let manifest = if dir.is_empty() { Some(root.clone()) } else { read(&format!("{dir}/Cargo.toml")) };
+        let manifest = manifest.ok_or_else(|| format!("{dir}/Cargo.toml cannot be read"))?;
+        let name = name_in(&manifest, "[package]").ok_or_else(|| format!("{dir}/Cargo.toml has no package to name"))?;
+        found.push((dir.clone(), name, path_deps(&manifest)));
+    }
+    let names: Vec<(String, String)> = found.iter().map(|(d, n, _)| (d.clone(), n.clone())).collect();
+    Ok(found
+        .into_iter()
+        .map(|(dir, name, deps)| {
+            let mut deps: Vec<String> =
+                deps.iter().filter_map(|p| joined(&dir, p)).filter_map(|d| names.iter().find(|(nd, _)| *nd == d).map(|(_, n)| n.clone())).filter(|n| *n != name).collect();
+            deps.sort();
+            deps.dedup();
+            Crate { name, dir, deps }
+        })
+        .collect())
+}
+
+/// The strings of a `key = [ … ]` array in a manifest's `table`, which may span lines.
+fn list_in(manifest: &str, table: &str, key: &str) -> Vec<String> {
+    let mut inside = false;
+    let mut text: Option<String> = None;
+    for l in manifest.lines().map(|l| l.split('#').next().unwrap_or("").trim()) {
+        if let Some(t) = text.as_mut() {
+            t.push_str(l);
+            t.push(' ');
+        } else if l.starts_with('[') {
+            inside = l == table;
+        } else if inside {
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == key {
+                    text = Some(format!("{} ", v.trim()));
+                }
+            }
+        }
+        if text.as_ref().is_some_and(|t| t.contains(']')) {
+            break;
+        }
+    }
+    let Some(t) = text else { return Vec::new() };
+    let body = t.trim().trim_start_matches('[');
+    let body = body.split(']').next().unwrap_or("");
+    body.split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+/// The `path = "…"` values of a manifest's dependency tables: inline
+/// (`x = { path = "…" }`) or a table of its own (`[dependencies.x]`).
+fn path_deps(manifest: &str) -> Vec<String> {
+    let mut inside = false;
+    let mut out = Vec::new();
+    for l in manifest.lines().map(str::trim) {
+        if l.starts_with('[') {
+            let head = l.trim_matches(|c| c == '[' || c == ']');
+            inside = head.split('.').any(|part| matches!(part, "dependencies" | "dev-dependencies" | "build-dependencies"));
+            continue;
+        }
+        if !inside || l.starts_with('#') {
+            continue;
+        }
+        if let Some(p) = path_value(l) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The value of a `path = "…"` key on one manifest line, the whole line's key
+/// or one inside an inline table.
+fn path_value(line: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(at) = line[from..].find("path") {
+        let start = from + at;
+        from = start + 4;
+        if !(start == 0 || line[..start].ends_with(|c: char| c == '{' || c == ',' || c.is_whitespace())) {
+            continue;
+        }
+        let rest = line[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else { continue };
+        return rest.split('"').next().map(str::to_string);
+    }
+    None
+}
+
+/// `rel` read from the crate directory `dir`, as a path from the workspace
+/// root; `None` where it leaves the repository.
+fn joined(dir: &str, rel: &str) -> Option<String> {
+    let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// A step's command made narrower, and why.
@@ -307,6 +440,9 @@ pub fn reach(changed: &[String], read: &dyn Fn(&str) -> Option<String>) -> Reach
 pub struct Narrowed {
     pub command: String,
     pub why: String,
+    /// The packages whose whole tests the narrowed command runs, nothing
+    /// added: a derived `cargo test -p <one of them>` beside it is run twice.
+    pub covers: Vec<String>,
 }
 
 /// Flags that already pick the targets: a step carrying one is left alone.
@@ -336,7 +472,8 @@ fn in_bin(filter: &str, read: &dyn Fn(&str) -> Option<String>, in_tests: &dyn Fn
 /// as it is: anything but one plain `cargo test` or `cargo nextest run`, a step
 /// that already picks its targets, or a reach of the whole.
 ///
-/// - Only crates changed: an unfiltered step runs those crates' tests.
+/// - Only crates changed: an unfiltered step runs those crates' tests and
+///   their reverse dependents'.
 /// - Only `src/` modules changed: an unfiltered `--workspace` step runs the bin
 ///   crate's tests, not the other crates'.
 /// - Either way, a filtered step whose filters can match only the bin's own
@@ -402,23 +539,34 @@ pub fn narrow(command: &str, reach: &Reach, root: Option<&Root>, read: &dyn Fn(&
         }
         let picks = ["-p".to_string(), root.package.clone(), "--bin".into(), bin.clone()];
         let what = match reach {
-            Reach::Crates(c) => format!("only {} changed", c.join(", ")),
+            Reach::Crates(c, _) => format!("only {} changed", c.join(", ")),
             Reach::Bin(m) => format!("only src/ modules changed ({})", m.join(", ")),
             Reach::Whole(_) => unreachable!(),
         };
-        return Some(Narrowed { command: rest(&picks), why: format!("{what}, and the filter matches no tests/ file: the {bin} binary's tests only") });
+        return Some(Narrowed {
+            command: rest(&picks),
+            why: format!("{what}, and the filter matches no tests/ file: the {bin} binary's tests only"),
+            covers: Vec::new(),
+        });
     }
     match reach {
-        Reach::Crates(c) => {
-            let picks: Vec<String> = c.iter().flat_map(|n| ["-p".to_string(), n.clone()]).collect();
+        Reach::Crates(c, d) => {
+            let all: Vec<String> = c.iter().chain(d).cloned().collect();
+            let picks: Vec<String> = all.iter().flat_map(|n| ["-p".to_string(), n.clone()]).collect();
             let of = if workspace { "the workspace's" } else { "the root package's" };
-            Some(Narrowed { command: rest(&picks), why: format!("only {} changed: its tests in place of {of}", c.join(", ")) })
+            let theirs = if d.is_empty() { String::new() } else { format!(" and its reverse dependents' ({})", d.join(", ")) };
+            Some(Narrowed {
+                command: rest(&picks),
+                why: format!("only {} changed: its tests{theirs} in place of {of}", c.join(", ")),
+                covers: if kept.is_empty() { all } else { Vec::new() },
+            })
         }
         Reach::Bin(m) if workspace => {
             let root = root?;
             Some(Narrowed {
                 command: rest(&["-p".to_string(), root.package.clone()]),
                 why: format!("only src/ modules changed ({}): the bin crate's tests, not the other crates'", m.join(", ")),
+                covers: if kept.is_empty() { vec![root.package.clone()] } else { Vec::new() },
             })
         }
         _ => None,
@@ -426,10 +574,10 @@ pub fn narrow(command: &str, reach: &Reach, root: Option<&Root>, read: &dyn Fn(&
 }
 
 /// [`narrow`] over a check's steps, the one entry a check calls: each step
-/// narrowed where `changed` allows, a crate the graph reached only as a
-/// reverse dependent (a derived step, `Of::Rule` with no globs, at another
-/// package) dropped for the barrier, and a command the narrowing made twice
-/// run once. The lines say which steps changed and why; none when nothing did.
+/// narrowed where `changed` allows, a derived step (`Of::Rule` with no globs,
+/// `cargo test -p <pkg>`) at a package the reach leaves out dropped for the
+/// barrier, one whose package a narrowed step already runs whole dropped as
+/// run there, and a command the narrowing made twice run once. The lines say which steps changed and why; none when nothing did.
 pub fn narrow_steps(steps: Vec<Step>, changed: &[String], read: &dyn Fn(&str) -> Option<String>, in_tests: &dyn Fn(&str) -> bool) -> (Vec<Step>, Vec<String>) {
     if changed.is_empty() {
         return (steps, Vec::new());
@@ -440,22 +588,37 @@ pub fn narrow_steps(steps: Vec<Step>, changed: &[String], read: &dyn Fn(&str) ->
     }
     let root = root_of(read);
     let reached = |pkg: &str| match &reach {
-        Reach::Crates(c) => c.iter().any(|n| n == pkg),
+        Reach::Crates(c, d) => c.iter().chain(d).any(|n| n == pkg),
         Reach::Bin(_) => root.as_ref().is_some_and(|r| r.package == pkg),
         Reach::Whole(_) => true,
     };
+    let derived_pkg = |s: &Step| -> Option<String> {
+        (s.of == Of::Rule && s.on.is_empty()).then(|| s.command.strip_prefix("cargo test -p ").filter(|p| !p.contains(' ')).map(str::to_string)).flatten()
+    };
+    let narrowed: Vec<Option<Narrowed>> = steps.iter().map(|s| narrow(&s.command, &reach, root.as_ref(), read, in_tests)).collect();
+    // Each package a narrowed step (not a derived one) runs whole, with that step's command.
+    let covers: Vec<(String, String)> = steps
+        .iter()
+        .zip(&narrowed)
+        .filter(|(s, _)| derived_pkg(s).is_none())
+        .filter_map(|(_, n)| n.as_ref())
+        .flat_map(|n| n.covers.iter().map(|c| (c.clone(), n.command.clone())))
+        .collect();
+    let covered = |pkg: &str| covers.iter().find(|(c, _)| c == pkg).map(|(_, by)| by.as_str());
     let mut out: Vec<Step> = Vec::new();
     let mut said = Vec::new();
-    for mut s in steps {
-        if s.of == Of::Rule && s.on.is_empty() {
-            if let Some(pkg) = s.command.strip_prefix("cargo test -p ").filter(|p| !p.contains(' ')) {
-                if !reached(pkg) {
-                    said.push(format!("{} · `{}` left to the barrier — {pkg} is only a reverse dependent of what changed", s.name, s.command));
-                    continue;
-                }
+    for (mut s, n) in steps.into_iter().zip(narrowed) {
+        if let Some(pkg) = derived_pkg(&s) {
+            if !reached(&pkg) {
+                said.push(format!("{} · `{}` left to the barrier — {pkg} is not reached by what changed", s.name, s.command));
+                continue;
+            }
+            if let Some(by) = covered(&pkg).filter(|by| *by != s.command) {
+                said.push(format!("{} · `{}` dropped — `{by}` runs {pkg}'s tests", s.name, s.command));
+                continue;
             }
         }
-        if let Some(n) = narrow(&s.command, &reach, root.as_ref(), read, in_tests) {
+        if let Some(n) = n {
             said.push(format!("{} · `{}` → `{}` — {}", s.name, s.command, n.command, n.why));
             s.command = n.command;
         }
@@ -757,12 +920,18 @@ mod tests {
     }
 
     /// A wsp-shaped workspace for the narrowing rule: the root package `wsp`
-    /// with its bin, and the crates `wire` and `store`.
+    /// with its bin, over the crates `engine`, `wire` and `store` (engine on
+    /// wire and store, wire on store), and `tool`, which nothing depends on.
     fn wsp_files(path: &str) -> Option<String> {
         match path {
-            "Cargo.toml" => Some("[package]\nname = \"wsp\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"wsp\"\npath = \"src/main.rs\"\n".into()),
-            "crates/wire/Cargo.toml" => Some("[package]\nname = \"wsp-wire\"\n".into()),
-            "crates/store/Cargo.toml" => Some("[package]\nname = \"wsp-store\"\n".into()),
+            "Cargo.toml" => Some(
+                "[package]\nname = \"wsp\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"wsp\"\npath = \"src/main.rs\"\n\n[workspace]\nmembers = [\n  \"crates/wire\",\n  \"crates/store\", # the records\n  \"crates/engine\", \"crates/tool\",\n]\n\n[dependencies]\nserde_json = \"1\"\nwsp-wire = { path = \"crates/wire\" }\nwsp-engine = { path = \"crates/engine\" }\n\n[dev-dependencies]\nwsp-store = { path = \"crates/store\", features = [\"test-support\"] }\n\n[profile.release]\nstrip = true\n"
+                    .into(),
+            ),
+            "crates/engine/Cargo.toml" => Some("[package]\nname = \"wsp-engine\"\n\n[dependencies]\nwsp-wire = { path = \"../wire\" }\n\n[dependencies.wsp-store]\npath = \"../store\"\n".into()),
+            "crates/wire/Cargo.toml" => Some("[package]\nname = \"wsp-wire\"\n\n[target.'cfg(unix)'.dependencies]\nwsp-store = { version = \"0.1\", path = \"../store\" }\n\n[dev-dependencies]\nwsp-wire = { path = \".\", features = [\"test-support\"] }\n".into()),
+            "crates/store/Cargo.toml" => Some("[package]\nname = \"wsp-store\"\n# manifest_path = \"../wire\" is no dependency\n".into()),
+            "crates/tool/Cargo.toml" => Some("[package]\nname = \"wsp-tool\"\n\n[dependencies]\nwsp-store = { path = \"../store\" }\n".into()),
             "src/main.rs" | "src/cycle.rs" | "src/readonly.rs" => Some(String::new()),
             _ => None,
         }
@@ -777,23 +946,72 @@ mod tests {
     }
 
     #[test]
-    fn a_change_to_one_crate_runs_that_crates_tests_only() {
+    fn a_change_to_the_engine_runs_its_tests_and_the_root_packages() {
         let steps = vec![
             step("all", "cargo test --workspace", Of::Task),
-            derived_step("crate:wsp-wire", "cargo test -p wsp-wire"),
+            derived_step("crate:wsp-engine", "cargo test -p wsp-engine"),
             derived_step("crate:wsp", "cargo test -p wsp"),
+            derived_step("crate:wsp-tool", "cargo test -p wsp-tool"),
             step("count", "cargo test --workspace -- --list | grep -c ': test'", Of::Task),
         ];
         let none = |_: &str| false;
-        let (got, said) = narrow_steps(steps, &paths(&["crates/wire/src/lib.rs", "docs/x.md"]), &wsp_files, &none);
+        let changed = paths(&["crates/engine/src/affected.rs", "docs/x.md"]);
+        assert_eq!(reach(&changed, &wsp_files), Reach::Crates(paths(&["wsp-engine"]), paths(&["wsp"])));
+        let (got, said) = narrow_steps(steps, &changed, &wsp_files, &none);
         assert_eq!(
             commands(&got),
-            ["cargo test -p wsp-wire", "cargo test --workspace -- --list | grep -c ': test'"],
-            "the workspace step is the crate's, the reverse dependent is the barrier's, and a piped command is left alone"
+            ["cargo test -p wsp-engine -p wsp", "cargo test --workspace -- --list | grep -c ': test'"],
+            "the workspace step is the engine's and its reverse dependent's (the root package, its tests/ binaries with it), the derived steps it covers run once, \
+             a crate it does not reach is the barrier's, and a piped command is left alone"
         );
+        assert_eq!(said.len(), 4, "{said:?}");
+        assert!(said[0].contains("`cargo test --workspace` → `cargo test -p wsp-engine -p wsp`") && said[0].contains("only wsp-engine changed"), "{said:?}");
+        assert!(said[0].contains("reverse dependents' (wsp)"), "{said:?}");
+        assert!(said[1].contains("crate:wsp-engine") && said[1].contains("runs wsp-engine's tests"), "{said:?}");
+        assert!(said[2].contains("crate:wsp ") && said[2].contains("runs wsp's tests"), "{said:?}");
+        assert!(said[3].contains("left to the barrier") && said[3].contains("wsp-tool is not reached"), "{said:?}");
+    }
+
+    #[test]
+    fn a_change_to_a_crate_nothing_depends_on_runs_that_crates_tests_only() {
+        let none = |_: &str| false;
+        let changed = paths(&["crates/tool/src/main.rs"]);
+        assert_eq!(reach(&changed, &wsp_files), Reach::Crates(paths(&["wsp-tool"]), Vec::new()));
+        let steps = vec![step("all", "cargo test --workspace", Of::Task), derived_step("crate:wsp-tool", "cargo test -p wsp-tool"), derived_step("crate:wsp", "cargo test -p wsp")];
+        let (got, said) = narrow_steps(steps, &changed, &wsp_files, &none);
+        assert_eq!(commands(&got), ["cargo test -p wsp-tool"]);
         assert_eq!(said.len(), 2, "{said:?}");
-        assert!(said[0].contains("`cargo test --workspace` → `cargo test -p wsp-wire`") && said[0].contains("only wsp-wire changed"), "{said:?}");
-        assert!(said[1].contains("left to the barrier") && said[1].contains("wsp is only a reverse dependent"), "{said:?}");
+        assert!(said[0].contains("its tests in place of the workspace's") && !said[0].contains("reverse"), "{said:?}");
+        assert!(said[1].contains("wsp is not reached"), "{said:?}");
+    }
+
+    #[test]
+    fn a_crate_low_in_the_graph_reaches_every_dependent_nearest_first() {
+        assert_eq!(reach(&paths(&["crates/store/src/lib.rs"]), &wsp_files), Reach::Crates(paths(&["wsp-store"]), paths(&["wsp", "wsp-engine", "wsp-tool", "wsp-wire"])));
+        assert_eq!(reach(&paths(&["crates/wire/src/lib.rs"]), &wsp_files), Reach::Crates(paths(&["wsp-wire"]), paths(&["wsp", "wsp-engine"])));
+        let none = |_: &str| false;
+        let n = narrow("cargo test --release", &Reach::Crates(paths(&["wsp-wire"]), paths(&["wsp"])), None, &wsp_files, &none).unwrap();
+        assert_eq!(n.command, "cargo test -p wsp-wire -p wsp --release");
+        assert!(n.covers.is_empty(), "a flag beside the picks runs something else than a derived step would");
+        let globbed = |p: &str| if p == "Cargo.toml" { Some("[workspace]\nmembers = [\"crates/*\"]\n".to_string()) } else { wsp_files(p) };
+        assert!(matches!(reach(&paths(&["crates/wire/src/lib.rs"]), &globbed), Reach::Whole(w) if w.contains("crates/*")));
+    }
+
+    #[test]
+    fn the_real_workspace_runs_the_root_packages_tests_for_an_engine_change() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        match reach(&paths(&["crates/engine/src/affected.rs"]), &read) {
+            Reach::Crates(c, d) => {
+                assert_eq!(c, ["wsp-engine"]);
+                assert!(d.iter().any(|n| n == "wsp"), "{d:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match reach(&paths(&["crates/trees/src/lib.rs"]), &read) {
+            Reach::Crates(_, d) => assert!(d.iter().any(|n| n == "wsp") && d.iter().any(|n| n == "wsp-engine"), "{d:?}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -844,8 +1062,14 @@ mod tests {
             assert_eq!(commands(&got), ["cargo test --workspace", "cargo test readonly::tests"], "{changed:?}");
             assert!(said.is_empty(), "{changed:?}: {said:?}");
         }
-        assert_eq!(reach(&paths(&["crates/wire/src/a.rs", "crates/store/src/b.rs"]), &wsp_files), Reach::Crates(paths(&["wsp-store", "wsp-wire"])));
-        assert_eq!(narrow("cargo test --workspace", &Reach::Crates(paths(&["wsp-store", "wsp-wire"])), None, &wsp_files, &none).unwrap().command, "cargo test -p wsp-store -p wsp-wire");
+        assert_eq!(
+            reach(&paths(&["crates/wire/src/a.rs", "crates/store/src/b.rs"]), &wsp_files),
+            Reach::Crates(paths(&["wsp-store", "wsp-wire"]), paths(&["wsp", "wsp-engine", "wsp-tool"]))
+        );
+        assert_eq!(
+            narrow("cargo test --workspace", &Reach::Crates(paths(&["wsp-store", "wsp-wire"]), Vec::new()), None, &wsp_files, &none).unwrap().command,
+            "cargo test -p wsp-store -p wsp-wire"
+        );
     }
 
     #[test]
