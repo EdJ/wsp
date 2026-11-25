@@ -739,23 +739,20 @@ It cannot move S, T, 7 or 5's load figure. Those come from the timings above, no
 
 ### Cut A, measured (wsp-527)
 
-Written by wsp-527 on 2026-11-25. A check step whose command is one plain `cargo test` that names its targets
-(`--lib`, `--bins`, `--bin`, `--tests` or `--test`) now runs as `cargo nextest run` with the same package, targets and
-filters (and `--no-tests=pass`, so a filter that matches nothing still passes, as it does under `cargo test`), wherever
-the host that runs the job answers `cargo nextest --version`. Where it does not answer, the step runs as written. The
-job's first line says which runner ran, and the step's line repeats it:
+Written by wsp-527 on 2026-11-25. A check step whose command is one plain `cargo test` now runs as `cargo nextest run`
+with the same package, targets and filters (and `--no-tests=pass`, so a filter that matches nothing still passes, as it
+does under `cargo test`), wherever the host that runs the job answers `cargo nextest --version`. Where it does not
+answer, the step runs as written. nextest runs no doctests, so a command with no target selection is followed by
+`cargo test --doc` with the same features, profile and filter, for the selected packages whose library has doctests on
+(`cargo metadata`; an explicit `--doc` would run those of a `doctest = false` crate and fail on a package with no
+library). The job's first line says what ran, and the step's line repeats it:
 `✓ unit · cargo test -p wsp-engine --lib cycle:: · by cargo nextest run · 3s`. The step's command is unchanged, and so
 is its green key, so a green from either runner counts for the other at the same inputs. `crates/engine/src/check.rs`
 (`by_nextest`, `runner_script`, `via_of`) does this, and the barrier, the verifier's check and a row's check all go
-through it.
-
-A command with no target selection (`cargo test`, `cargo test --workspace`, `cargo test -p <crate> <filter>`) runs
-doctests, and nextest runs none, so it stays on `cargo test` and keeps the one lock per process. Following nextest with
-`cargo test --doc` would not be the same: an explicit `--doc` runs the doc blocks of a `doctest = false` crate, and fails
-on a package with no library. A step takes nextest by naming its targets (`--tests` for all but the doctests and the
-example builds). Only flags known to read alike are passed on, with cargo's `--profile`, `-j` and `-m` written as
-nextest's `--cargo-profile`, `--build-jobs` and `--manifest-path`; any other flag, pipe, `$` or quote runs as written.
-`wsp verify`'s own cargo runs read libtest's report and stay on `cargo test`: follow-up wsp-536.
+through it. The flags passed on are an allow-list (package, workspace, exclude, features, `--lib`, `--bins`, `--test`,
+`--tests`, `--release`, the filter and what follows `--`), with cargo's `--profile` written as `--cargo-profile`.
+Anything else, and any pipe, `$` or quote, runs as written. `wsp verify`'s own cargo runs read libtest's report and stay
+on `cargo test`: follow-up wsp-536.
 
 cargo-nextest 0.9.152 is installed on the Linux host now, so the person had nothing to install.
 
@@ -775,5 +772,6 @@ so the failing test is not named; it passed in the other two runs. The `--worksp
 slow (over 30 s) and none terminated.
 
 **The count.** `cargo nextest list --workspace` lists 4152 tests at 287f379, the same 4152 that `cargo test --workspace
--- --list` lists, 12 of them ignored. With this row's three new tests, both runners count 4155. Doctests: nextest runs none. A check step that would run them under
-`cargo test` is left on `cargo test` (above), so no step loses one.
+-- --list` lists, 12 of them ignored. With this row's three new tests, both runners count 4155. Doctests: nextest runs none, and the `cargo test --doc` that follows it (above) runs the ones
+`cargo test` would have, so no step loses one. The `--workspace` times below are nextest's alone; the doctest run that
+follows a `--workspace` step here (18 libraries, no Rust blocks, all passing) took 2.7 s with the targets built.

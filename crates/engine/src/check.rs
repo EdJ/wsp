@@ -1318,7 +1318,7 @@ impl<'a> Jobs<'a> {
         argv.push("--".to_string());
         argv.push(format!("WSP_SCRATCH={}", scratch_of(dir).display()));
         argv.extend(["sh", "-c"].map(String::from));
-        argv.push(runner_script(&step.command).unwrap_or_else(|| step.command.clone()));
+        argv.push(runner_script(&step.command, dir).unwrap_or_else(|| step.command.clone()));
         JobRun {
             key: crate::host::job_key(&self.place.row, 0, &job),
             class: JobClass::Check,
@@ -1596,47 +1596,63 @@ fn scratch_in(own: Option<std::ffi::OsString>, dir: &Path) -> PathBuf {
 // Every test that touches a store holds `util::ENV`, one lock per process, so
 // libtest's threads queue on it: `cycle::` took 11.85 s on 32 threads and on
 // one. `cargo nextest run` gives each test its own process, and the lock is
-// then each test's own. A plain `cargo test` step that names its targets (so
-// runs no doctests) is run through nextest where
+// then each test's own. A plain `cargo test` step is run through nextest where
 // the host that runs it has it, and through `cargo test` as written where it
-// does not; the job says which on its first line and the step's line repeats
+// does not. nextest runs no doctests, so a step that would is followed by
+// `cargo test --doc` for the packages that have them. The job says which on its first line and the step's line repeats
 // it. The step's command, and so its green, is the one written: a green from
 // one runner counts for the other at the same inputs.
 
 /// The first line a step's job writes when nextest ran it.
 pub const BY_NEXTEST: &str = "wsp: run by cargo nextest run (one process per test)";
+/// The first line when nextest ran it and `cargo test --doc` its doctests.
+pub const BY_NEXTEST_AND_DOC: &str = "wsp: run by cargo nextest run (one process per test), then cargo test --doc";
 /// The first line a step's job writes when nextest is not on its host.
 pub const BY_CARGO_TEST: &str = "wsp: run by cargo test (no cargo-nextest on this host)";
 
-/// Target selections under which `cargo test` runs no doctests. nextest runs
-/// none ever, so only a command carrying one loses nothing by it.
-const NO_DOCTESTS: &[&str] = &["--lib", "--bins", "--bin", "--tests", "--test"];
-
 /// Flags without a value that mean the same to both.
-const SAME: &[&str] = &[
-    "--lib", "--bins", "--tests", "--workspace", "--all", "--all-features", "--no-default-features", "-r", "--release",
-    "--frozen", "--locked", "--offline", "--ignore-rust-version", "--future-incompat-report", "--no-fail-fast",
-];
+const SAME: &[&str] = &["--lib", "--bins", "--tests", "--workspace", "--all", "--all-features", "--no-default-features", "-r", "--release"];
 
 /// Flags with a value, as `cargo test` and then nextest spell them: nextest's
-/// own `--profile` and `-j` are its run profile and its test threads.
+/// own `--profile` is its run profile.
 const VALUED: &[(&str, &str)] = &[
-    ("-p", "-p"), ("--package", "--package"), ("--exclude", "--exclude"), ("--bin", "--bin"), ("--test", "--test"),
-    ("-F", "-F"), ("--features", "--features"), ("--target", "--target"), ("--target-dir", "--target-dir"),
-    ("--manifest-path", "--manifest-path"), ("-m", "--manifest-path"), ("--config", "--config"), ("--color", "--color"),
-    ("--profile", "--cargo-profile"), ("-j", "--build-jobs"), ("--jobs", "--build-jobs"),
+    ("-p", "-p"), ("--package", "--package"), ("--exclude", "--exclude"), ("--test", "--test"),
+    ("-F", "-F"), ("--features", "--features"), ("--profile", "--cargo-profile"),
 ];
+
+/// The target selections among them: under one, `cargo test` runs no doctests.
+const NARROWS: &[&str] = &["--lib", "--bins", "--tests", "--test"];
 
 /// Arguments after `--` that nextest takes as libtest does.
 const NEXTEST_AFTER_DASHES: &[&str] = &["--exact", "--ignored", "--include-ignored"];
 
-/// `command` as `cargo nextest run` with the same package, targets and
+/// A `cargo test` as nextest reads it ([`by_nextest`]).
+#[derive(Debug, PartialEq)]
+pub struct ByNextest {
+    /// The `cargo nextest run`, without any `cd`.
+    pub run: String,
+    /// The step's leading `cd <dir>`.
+    pub dir: Option<String>,
+    /// The doctests the command would also have run: `None` under a target
+    /// selection.
+    pub doc: Option<Doc>,
+}
+
+/// What a `cargo test --doc` following nextest has to carry.
+#[derive(Debug, Default, PartialEq)]
+pub struct Doc {
+    pub workspace: bool,
+    pub packages: Vec<String>,
+    pub exclude: Vec<String>,
+    /// The features, profile, filter and arguments after `--`, as written.
+    pub rest: Vec<String>,
+}
+
+/// `command` read for `cargo nextest run` with the same package, targets and
 /// filters, where it is one plain `cargo test` (a leading `cd <dir> &&`
-/// kept) that names its targets ([`NO_DOCTESTS`]) and whose every argument is
-/// one known to read alike ([`SAME`], [`VALUED`]); `None` otherwise. A
-/// command with no target selection runs its doctests, so it stays as written.
-/// A filter matching nothing passes, as it does under `cargo test`.
-pub fn by_nextest(command: &str) -> Option<String> {
+/// kept) whose every argument is one known to read alike ([`SAME`],
+/// [`VALUED`]); `None` otherwise.
+pub fn by_nextest(command: &str) -> Option<ByNextest> {
     let (dir, rest) = split_cd(command);
     let rest = rest.trim();
     if rest.contains('\n') || rest.chars().any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$' | '(' | '\'' | '"' | '\\')) {
@@ -1644,37 +1660,41 @@ pub fn by_nextest(command: &str) -> Option<String> {
     }
     let words: Vec<&str> = rest.split_whitespace().collect();
     let ["cargo", "test", args @ ..] = words.as_slice() else { return None };
+    // A filter matching nothing passes, as it does under `cargo test`.
     let mut out: Vec<String> = ["cargo", "nextest", "run", "--no-tests=pass"].map(String::from).to_vec();
-    let (mut targets, mut filters, mut after_dashes) = (false, 0, false);
+    let mut doc = Doc::default();
+    let (mut narrowed, mut filters, mut after_dashes) = (false, 0, false);
     let mut args = args.iter().copied();
     while let Some(w) = args.next() {
         if after_dashes {
+            let mut took = vec![w.to_string()];
             if w == "--skip" {
-                out.extend([w.to_string(), args.next()?.to_string()]);
-            } else if !w.starts_with('-') || NEXTEST_AFTER_DASHES.contains(&w) {
-                out.push(w.to_string());
-            } else {
+                took.push(args.next()?.to_string());
+            } else if w.starts_with('-') && !NEXTEST_AFTER_DASHES.contains(&w) {
                 return None;
             }
+            out.extend(took.clone());
+            doc.rest.extend(took);
             continue;
         }
-        if w == "--" {
-            after_dashes = true;
+        if w == "--" || !w.starts_with('-') {
+            after_dashes = w == "--";
+            filters += usize::from(!after_dashes);
             out.push(w.to_string());
-            continue;
-        }
-        if !w.starts_with('-') {
-            filters += 1;
-            out.push(w.to_string());
+            doc.rest.push(w.to_string());
             continue;
         }
         let (flag, value) = match w.split_once('=') {
             Some((f, v)) if f.starts_with("--") => (f, Some(v)),
             _ => (w, None),
         };
-        targets |= NO_DOCTESTS.contains(&flag);
+        narrowed |= NARROWS.contains(&flag);
         if value.is_none() && SAME.contains(&flag) {
             out.push(w.to_string());
+            match flag {
+                "--workspace" | "--all" => doc.workspace = true,
+                _ => doc.rest.push(w.to_string()),
+            }
             continue;
         }
         let (_, to) = VALUED.iter().find(|(from, _)| *from == flag)?;
@@ -1683,26 +1703,74 @@ pub fn by_nextest(command: &str) -> Option<String> {
             None => args.next().filter(|v| !v.starts_with('-'))?,
         };
         out.extend([to.to_string(), value.to_string()]);
+        match flag {
+            "-p" | "--package" => doc.packages.push(value.to_string()),
+            "--exclude" => doc.exclude.push(value.to_string()),
+            _ => doc.rest.extend([flag.to_string(), value.to_string()]),
+        }
     }
     // `cargo test` takes one filter before `--`; two are its error to report.
-    if !targets || filters > 1 {
+    if filters > 1 {
         return None;
     }
-    let run = out.join(" ");
-    Some(match dir {
-        Some(d) => format!("cd {d} && {run}"),
-        None => run,
-    })
+    Some(ByNextest { run: out.join(" "), dir: dir.map(String::from), doc: (!narrowed).then_some(doc) })
 }
 
-/// What a step's job runs in `sh -c` for `command`: [`by_nextest`]'s form
-/// where `cargo nextest` answers on the host, `command` as written where it
-/// does not, each after its line ([`BY_NEXTEST`], [`BY_CARGO_TEST`]). `None`
-/// for a command [`by_nextest`] leaves alone, which runs as written.
-pub fn runner_script(command: &str) -> Option<String> {
-    let nextest = by_nextest(command)?;
+/// The packages `doc` selects whose library has doctests on, read from
+/// `cargo metadata` in `dir`: an explicit `--doc` runs the blocks of a
+/// `doctest = false` library and fails where there is no library, so only
+/// these are named to it. `None` where that cannot be told.
+fn doctested(dir: &Path, doc: &Doc) -> Option<Vec<String>> {
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let packages = meta["packages"].as_array()?;
+    let ids = meta[if doc.workspace { "workspace_members" } else { "workspace_default_members" }].as_array()?;
+    let name_of = |p: &serde_json::Value| p["name"].as_str().map(String::from);
+    let selected: Vec<&serde_json::Value> = if doc.packages.is_empty() {
+        packages.iter().filter(|p| ids.contains(&p["id"])).collect()
+    } else {
+        // A spec that is no member's name (a glob, `name@version`) is not read here.
+        doc.packages.iter().map(|n| packages.iter().find(|p| p["name"].as_str() == Some(n))).collect::<Option<_>>()?
+    };
+    Some(
+        selected
+            .into_iter()
+            .filter(|p| p["targets"].as_array().is_some_and(|t| t.iter().any(|t| t["doctest"].as_bool() == Some(true))))
+            .filter_map(name_of)
+            .filter(|n| !doc.exclude.contains(n))
+            .collect(),
+    )
+}
+
+/// What a step's job runs in `sh -c` for `command` in `tree`: [`by_nextest`]'s
+/// form (and the doctests after it) where `cargo nextest` answers on the host,
+/// `command` as written where it does not, each after its line ([`BY_NEXTEST`],
+/// [`BY_NEXTEST_AND_DOC`], [`BY_CARGO_TEST`]). `None` for a command that runs
+/// as written: one [`by_nextest`] leaves alone, or whose doctests cannot be
+/// told.
+pub fn runner_script(command: &str, tree: &Path) -> Option<String> {
+    let ByNextest { run, dir, doc } = by_nextest(command)?;
+    let (mut run, mut line) = (run, BY_NEXTEST);
+    if let Some(doc) = doc {
+        let at = dir.as_ref().map_or_else(|| tree.to_path_buf(), |d| tree.join(d));
+        let packages = doctested(&at, &doc)?;
+        if !packages.is_empty() {
+            let named: String = packages.iter().map(|p| format!(" -p {p}")).collect();
+            let rest: String = doc.rest.iter().map(|w| format!(" {w}")).collect();
+            run = format!("{run} && cargo test --doc{named}{rest}");
+            line = BY_NEXTEST_AND_DOC;
+        }
+    }
+    if let Some(d) = dir {
+        run = format!("cd {d} && {run}");
+    }
     Some(format!(
-        "if cargo nextest --version >/dev/null 2>&1; then echo '{BY_NEXTEST}'; {nextest}; else echo '{BY_CARGO_TEST}'; {}; fi",
+        "if cargo nextest --version >/dev/null 2>&1; then echo '{line}'; {run}; else echo '{BY_CARGO_TEST}'; {}; fi",
         command.trim()
     ))
 }
@@ -1714,6 +1782,7 @@ pub fn via_of(log: &Path) -> Option<&'static str> {
     let first = BufReader::new(std::fs::File::open(log).ok()?).lines().next()?.ok()?;
     match first.trim() {
         BY_NEXTEST => Some("cargo nextest run"),
+        BY_NEXTEST_AND_DOC => Some("cargo nextest run + cargo test --doc"),
         BY_CARGO_TEST => Some("cargo test"),
         _ => None,
     }
@@ -3550,34 +3619,30 @@ mod tests {
 
     #[test]
     fn a_plain_cargo_test_reads_as_nextest_with_its_package_and_filters_and_anything_else_stays() {
-        let n = |c: &str| by_nextest(c);
-        let run = |rest: &str| Some(format!("cargo nextest run --no-tests=pass {rest}"));
-        assert_eq!(n("cargo test -p wsp-engine --lib cycle::"), run("-p wsp-engine --lib cycle::"));
-        assert_eq!(n("cargo test --workspace --tests --no-fail-fast"), run("--workspace --tests --no-fail-fast"));
-        assert_eq!(n("cargo test --test layering --features=a,b"), run("--test layering --features a,b"));
-        // cargo's `--profile` and `-j` are the build's; nextest's are not.
-        assert_eq!(n("cargo test --lib --profile slim"), run("--lib --cargo-profile slim"));
-        assert_eq!(n("cargo test --lib --profile=slim -j 2"), run("--lib --cargo-profile slim --build-jobs 2"));
-        assert_eq!(n("cargo test --lib --jobs=2 -m x/Cargo.toml"), run("--lib --build-jobs 2 --manifest-path x/Cargo.toml"));
-        assert_eq!(
-            n("cd web && cargo test --lib census:: -- --exact --skip slow"),
-            Some("cd web && cargo nextest run --no-tests=pass --lib census:: -- --exact --skip slow".to_string())
-        );
+        let run = |c: &str| by_nextest(c).map(|n| n.run);
+        let to = |rest: &str| Some(format!("cargo nextest run --no-tests=pass {rest}"));
+        assert_eq!(run("cargo test -p wsp-engine --lib cycle::"), to("-p wsp-engine --lib cycle::"));
+        assert_eq!(run("cargo test --test layering --features=a,b"), to("--test layering --features a,b"));
+        // cargo's `--profile` is the build's; nextest's is not.
+        assert_eq!(run("cargo test --lib --profile slim"), to("--lib --cargo-profile slim"));
+        assert_eq!(run("cargo test --lib --profile=slim"), to("--lib --cargo-profile slim"));
+        let n = by_nextest("cd web && cargo test --lib census:: -- --exact --skip slow").unwrap();
+        assert_eq!((n.dir.as_deref(), n.doc), (Some("web"), None), "a target selection has no doctests to follow");
+        assert_eq!(Some(n.run), to("--lib census:: -- --exact --skip slow"));
+        // No target selection: its doctests follow, same packages, features and filter.
+        let doc = by_nextest("cargo test --workspace --exclude x -F a --profile slim census:: -- --skip slow").unwrap().doc.unwrap();
+        assert_eq!((doc.workspace, doc.exclude), (true, vec!["x".to_string()]));
+        assert_eq!(doc.rest, ["-F", "a", "--profile", "slim", "census::", "--", "--skip", "slow"]);
+        assert_eq!(by_nextest("cargo test -p a -p b --release").unwrap().doc.unwrap().packages, ["a", "b"]);
         for kept in [
-            // No target selection: `cargo test` runs doctests, nextest none.
-            "cargo test",
-            "cargo test --workspace",
-            "cargo test -p wsp-engine cycle::",
-            "cargo test --release",
-            // Not known to read alike.
-            "cargo test --lib --message-format short",
+            "cargo test --lib -j 2",
             "cargo test --lib -j8",
+            "cargo test --lib --message-format short",
             "cargo test --lib -q",
-            "cargo test --lib --timings",
-            "cargo test --lib -Z unstable-options",
             "cargo test --lib --no-run",
             "cargo test --all-targets",
-            "cargo test --examples",
+            "cargo test --bench b",
+            "cargo test --example e",
             "cargo test --lib -p",
             "cargo test --lib one two",
             "cargo test --lib -- --list",
@@ -3589,8 +3654,7 @@ mod tests {
             "cargo nextest run -p x",
             "npm test",
         ] {
-            assert_eq!(n(kept), None, "{kept}");
-            assert_eq!(runner_script(kept), None, "{kept}");
+            assert_eq!(by_nextest(kept), None, "{kept}");
         }
     }
 
@@ -3604,8 +3668,10 @@ mod tests {
 
     /// wsp-527's done-when: one check step through [`run_step`], on a host
     /// where `cargo nextest` answers and one where it does not, by a `cargo`
-    /// that says what it was asked; each run's line names its runner, and both
-    /// are green. A step with no target selection is asked as written.
+    /// that says what it was asked; the `Ran` records the runner, its line names
+    /// it, and both are green. A step with no target selection runs the
+    /// doctests of the packages that have them after nextest, and is red when
+    /// they fail.
     #[test]
     fn a_check_step_runs_by_nextest_where_the_host_has_it_and_by_cargo_test_where_not_and_its_line_says_which() {
         use std::os::unix::fs::PermissionsExt;
@@ -3615,34 +3681,58 @@ mod tests {
         let log = dir.join(log.file_name().unwrap());
         let old = PathBack(std::env::var_os("PATH").unwrap_or_default());
         let cargo = dir.join("cargo");
-        // `nextest --version` answers as the marker file says; anything else
-        // prints its argv. A test beside this one gets the real cargo.
+        // `nextest --version` answers as the marker file says, `metadata` with
+        // one library that has doctests, one with them off and one binary;
+        // anything else prints its argv. A test beside this one gets the real
+        // cargo.
         let fake = format!(
             "#!/bin/sh\ncase \"$(pwd -P)\" in '{dir}'*) ;; *) PATH='{path}' exec cargo \"$@\" ;; esac\n\
-             if [ \"$1 $2\" = 'nextest --version' ]; then [ -f has-nextest ]; exit $?; fi\necho \"argv: $*\"\n",
+             if [ \"$1 $2\" = 'nextest --version' ]; then [ -f has-nextest ]; exit $?; fi\n\
+             if [ $1 = metadata ]; then cat metadata.json; exit; fi\necho \"argv: $*\"\n\
+             if [ \"$1 $2\" = 'test --doc' ] && [ -f doc-fails ]; then exit 101; fi\n",
             dir = dir.display(),
             path = old.0.to_string_lossy(),
         );
         std::fs::write(&cargo, fake).unwrap();
         std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let package = |n: &str, doctest: bool| serde_json::json!({"id": n, "name": n, "targets": [{"doctest": doctest}]});
+        let meta = serde_json::json!({
+            "packages": [package("on", true), package("off", false), package("bin", false)],
+            "workspace_members": ["on", "off", "bin"],
+            "workspace_default_members": ["off"],
+        });
+        std::fs::write(dir.join("metadata.json"), meta.to_string()).unwrap();
         std::env::set_var("PATH", format!("{}:{}", dir.display(), old.0.to_string_lossy()));
-        let run = |command: &str| -> (String, String) {
+        let run = |command: &str| -> (String, Ran) {
             let ran = run_step(&dir, &sh(command, 30), &log, &Runner::Inproc);
-            assert_eq!(ran.done, Done::Passed, "{}", ran.tail);
-            (std::fs::read_to_string(&log).unwrap(), account(&[ran]))
+            (std::fs::read_to_string(&log).unwrap(), ran)
         };
-        let command = "cargo test -p wsp-engine --lib cycle::";
+        let line = |ran: &Ran| account(std::slice::from_ref(ran));
+        let asked = |said: &str| said.lines().filter_map(|l| l.strip_prefix("argv: ")).map(String::from).collect::<Vec<_>>();
+        let command = "cargo test -p on --lib cycle::";
         std::fs::write(dir.join("has-nextest"), "").unwrap();
-        let (said, line) = run(command);
-        assert!(said.contains("argv: nextest run --no-tests=pass -p wsp-engine --lib cycle::"), "{said}");
-        assert!(line.starts_with(&format!("✓ s · {command} · by cargo nextest run · ")), "{line}");
-        let (said, line) = run("cargo test -p wsp-engine");
-        assert_eq!(said.trim(), "argv: test -p wsp-engine", "its doctests are cargo test's to run");
-        assert!(!line.contains(" · by "), "{line}");
+        let (said, ran) = run(command);
+        assert_eq!(asked(&said), ["nextest run --no-tests=pass -p on --lib cycle::"], "{said}");
+        assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo nextest run")));
+        assert!(line(&ran).starts_with(&format!("✓ s · {command} · by cargo nextest run · ")), "{}", line(&ran));
+        // The workspace's doctests: only the library that has them on.
+        std::fs::write(dir.join("doc-fails"), "").unwrap();
+        let (said, ran) = run("cargo test --workspace");
+        assert_eq!(asked(&said), ["nextest run --no-tests=pass --workspace", "test --doc -p on"], "{said}");
+        assert_eq!(ran.done, Done::Failed { exit: Some(101), timed_out: false }, "a failing doctest is a failing step");
+        assert_eq!(ran.via, Some("cargo nextest run + cargo test --doc"));
+        std::fs::remove_file(dir.join("doc-fails")).unwrap();
+        // None of what it selects has them: nextest alone.
+        for none in ["cargo test", "cargo test -p off -p bin"] {
+            let (said, ran) = run(none);
+            assert_eq!(asked(&said).len(), 1, "{said}");
+            assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo nextest run")), "{none}");
+        }
         std::fs::remove_file(dir.join("has-nextest")).unwrap();
-        let (said, line) = run(command);
-        assert!(said.contains("argv: test -p wsp-engine --lib cycle::") && !said.contains("nextest run"), "{said}");
-        assert!(line.starts_with(&format!("✓ s · {command} · by cargo test · ")), "{line}");
+        let (said, ran) = run(command);
+        assert_eq!(asked(&said), ["test -p on --lib cycle::"], "{said}");
+        assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo test")));
+        assert!(line(&ran).starts_with(&format!("✓ s · {command} · by cargo test · ")), "{}", line(&ran));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
