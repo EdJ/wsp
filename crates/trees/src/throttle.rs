@@ -1352,7 +1352,7 @@ fn note_full_suite(ctx: &Ctx) {
     });
     let _ = crate::store::write_atomic(&path, &rec.to_string());
     (ctx.say)(
-        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo test <module>::`); the full suite runs once per group, at the barrier.",
+        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo nextest run -p <crate> <module>::`, one process per test, or `cargo test -p <crate> <module>::` where cargo-nextest is not installed); the full suite runs once per group, at the barrier.",
     );
 }
 
