@@ -225,6 +225,8 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
     wsp_base::calls::phase("repair:done-lists-held");
     crate::cycle::hand_on_what_done_lists_held(store);
     wsp_base::calls::phase("cycle");
+    // The branch tips are read once per repository for this loop (`wsp-769`).
+    let reads = worklist::tick_reads();
     for w in store.worklists().into_iter().filter(|w| w.status().is_running()) {
         // **A landing nobody recorded is written down before the step**, so
         // the pass the step opens on that member reads the commit. After it,
@@ -242,7 +244,9 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
             }
             landed_at_doing(store, &w, at, &before);
         }
-        let _ = crate::cycle::step(store, &w, seats);
+        if !crate::cycle::step(store, &w, seats).is_empty() {
+            worklist::refs_moved();
+        }
         let pos = worklist::position(store, &w, Reading::Landed);
         let Some(at) = pos.at else { continue };
         let groups = w.groups();
@@ -256,6 +260,7 @@ pub(crate) fn tick(store: &Store, seats: &dyn Seats, pass: &mut Pass) {
         skipped(store, &w, at, &pos);
         landed_for_an_idle_seat(store, seats, &w, at, &pos);
     }
+    drop(reads);
     // A reason a send-back could not type to its pane, typed once the seat reads idle.
     wsp_base::calls::phase("repair:tells");
     retry_undelivered_tells(store, seats);
@@ -2340,7 +2345,9 @@ fn landed_for_an_idle_seat(store: &Store, seats: &dyn Seats, w: &Worklist, at: u
             continue;
         }
         let id = &s.id;
-        match land_for_the_run(id) {
+        let landed = land_for_the_run(id);
+        worklist::refs_moved();
+        match landed {
             Ok(()) => {
                 stamp(store, &format!("{} group {at}: {id} was not landed {} min after it was told — {cause} — so the run landed it", w.id, (now - told_at) / 60));
                 crate::cycle::tell_logged(store, w, &format!(
