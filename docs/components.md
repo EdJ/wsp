@@ -163,7 +163,7 @@ not a structure problem (row `c0-fixtures` below).
 `disk` and `memory` moved with the phase 2 crate (wsp-440); since wsp-432 the layering table maps them where they
 live, `disk` to `engine` and `memory` to `seats`, and neither reaches above its row but `disk -> cmd_sandbox` (inside
 the phase 2 crate). Dependencies are `serde_json` only (and `rusqlite`, in `wsp-store-sqlite` alone: D2); the members are path dependencies in the workspace.
-The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
+At the phase 2 cut (wsp-440) it is 4142 before and 4144 after: the move keeps every test, splits one in two (cycle's wsp-030 boundaries, its timeline half to `timeline.rs`) and adds the layering test of the new crate's links. The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
 the two layering tests); the 2534 above is the figure of 5 Nov.
 
 ### The contract of each, and who writes what
