@@ -5599,4 +5599,38 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert!(!p.due(now), "and not again a second later");
         assert!(p.due(now + EVERY), "but after its interval");
     }
+}#[cfg(test)]
+mod fd_tests {
+    fn fds() -> usize {
+        std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// wsp-770: a test's in-process manager ended with its state, so a suite
+    /// of them does not hold ~10 fds each until the process ends (a 256-fd
+    /// seat ran out: `unable to open database file`). Under the env lock only
+    /// tests that took [`util::isolated`] start one, so the count is exact.
+    #[test]
+    fn an_in_process_manager_ends_with_the_state_it_served() {
+        let first = wsp_base::util::isolated("fd-manager-a");
+        wsp_wire::host_inproc::reach(&first.state()).unwrap();
+        assert!(wsp_wire::host_inproc::running_count() >= 1);
+        drop(first);
+        let second = wsp_base::util::isolated("fd-manager-b");
+        wsp_wire::host_inproc::reach(&second.state()).unwrap();
+        assert_eq!(wsp_wire::host_inproc::running_count(), 1, "the first state's manager was stopped");
+    }
+
+    /// wsp-770: the orders test db closes its fds when dropped.
+    #[test]
+    fn the_orders_test_db_closes_its_fds_when_dropped() {
+        let dir = std::env::temp_dir().join(format!("wsp-fd-db-{}", std::process::id()));
+        let before = fds();
+        for _ in 0..60 {
+            drop(crate::orders::tests::db(&dir, wsp_server::Mode::default()));
+        }
+        let after = fds();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Other tests run beside this one, so allow their few; a leak is 60+.
+        assert!(after < before + 40, "fds {before} -> {after}");
+    }
 }
