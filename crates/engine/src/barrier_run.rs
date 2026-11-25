@@ -908,7 +908,8 @@ mod tests {
             tail: tail.into(),
             first: None,
             reused: None,
-            build: None, via: None,
+            build: None,
+            via: None,
         }
     }
 

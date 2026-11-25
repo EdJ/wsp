@@ -941,6 +941,8 @@ pub fn weight(tool: &str, args: &[String]) -> Weight {
         return Weight::Heavy;
     }
     match subcommand(args) {
+        // A probe for nextest builds nothing, and a check step makes one (wsp-527).
+        Some("nextest") if args.iter().any(|a| a == "--version" || a == "-V") => Weight::Light,
         Some(s) if HEAVY.contains(&s) => Weight::Heavy,
         Some("run" | "r") => Weight::Runs,
         _ => Weight::Light,
@@ -2742,6 +2744,8 @@ mod tests {
         assert_eq!(weight("cargo", &s(&["-q", "check"])), Weight::Heavy);
         assert_eq!(weight("cargo", &s(&["run"])), Weight::Runs, "a run may stay up for hours and would hold the tree");
         assert_eq!(weight("cargo", &s(&["metadata"])), Weight::Light);
+        assert_eq!(weight("cargo", &s(&["nextest", "--version"])), Weight::Light);
+        assert_eq!(weight("cargo", &s(&["nextest", "run", "x::"])), Weight::Heavy);
         assert_eq!(weight("cargo", &s(&["--version"])), Weight::Light);
         assert_eq!(weight("make", &s(&["all"])), Weight::Heavy, "a declared tool is heavy whatever it is asked");
     }

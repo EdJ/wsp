@@ -468,7 +468,8 @@ mod tests {
             tail: String::new(),
             first: None,
             reused: None,
-            build: None, via: None,
+            build: None,
+            via: None,
         };
         let red = [Built { project: "pj".into(), sha: "a".repeat(40), ran: vec![ran], could_not: None }];
         record(&store, "run", &red, 1, Path::new("/x.log"));
