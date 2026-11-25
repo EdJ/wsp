@@ -3598,8 +3598,8 @@ mod manager_tests {
         let mut cfg = Config::new(&rig.exec, "test-host");
         cfg.port = 0;
         cfg.tree_root = rig.root.clone();
-        // Not shorter: a shim that starts under load and is not heard for 3 beats is dropped, and its job TERMed (exit 143).
-        cfg.beat = Duration::from_millis(1000);
+        // Not shorter: a shim that starts under load and is not heard for 3 beats is dropped, and its job TERMed (exit 143). 2s: the checks under load have lost a shim for 3s at 1s.
+        cfg.beat = Duration::from_millis(2000);
         let since = Instant::now();
         loop {
             match Manager::start(cfg.clone()) {
