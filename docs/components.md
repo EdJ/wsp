@@ -377,6 +377,11 @@ crate::{…}` in non-test code, up to the first `#[cfg(test)] mod`). A line is o
 **core -> spoke is not at 5 lines or fewer: it is 13 lines, so by decision 5 the spoke cut (wsp-534) does not go ahead
 as the code stands; spoke -> core, the edge that cut would keep, is 14 lines (33 symbols).**
 
+Re-counted for wsp-534 at trunk `abf65ef`, the same way: core -> spoke is **14 lines, 31 symbols** (spoke -> core 14
+lines, 33 symbols), over decision 5's 5, so `wsp-spoke` was not cut and no code changed. The new line is
+`cycle -> hub_journal`; 5 of the new symbols are from `cycle`'s `test-support` module, which the parser reads as product
+code (no line depends on it).
+
 - **spoke** (8): `cmd_hub`, `cmd_login`, `cmd_publish`, `cmd_whoami`, `hub_cache`, `hub_journal`, `hub_lease`,
   `hub_sync`.
 - **seats** (19, the map's `seats` row): `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`,
