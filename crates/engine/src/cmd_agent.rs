@@ -8856,6 +8856,8 @@ mod tests {
         assert!(DeliveryColumns::read(&reads, None, now_ms()).unsent.is_empty(), "typed this tick is not unsent yet");
 
         let mut stored = wip_world();
+        // The same rows, not a second build's: its stamps can be a second later.
+        stored.tasks = files.tasks.clone();
         stored.agents[0].state = State::Idle;
         stored.unsent = cols.unsent;
         stored.dropped = cols.dropped;

@@ -11,7 +11,7 @@
 //! kills the ones it started ([`Sweep`]).
 
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -549,25 +549,45 @@ fn a_turn_with_no_order_reads_working_while_open_and_idle_at_its_stop() {
     m.stop();
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
-/// The manager as its own process, so it can be killed with SIGKILL. Its
-/// handshake is the test's WAIT, as [`start`]'s is: a slow fake under load is
-/// waited on, not refused at the manager's 5 s.
-fn run_manager(dir: &Path, sup: &Path, port: u16) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_wsp-manager"))
+/// The manager as its own process, so it can be killed with SIGKILL, and the
+/// port it bound. Its handshake is the test's WAIT, as [`start`]'s is: a slow
+/// fake under load is waited on, not refused at the manager's 5 s.
+///
+/// Port 0, read back from the manager's log, on a restart too: a port picked
+/// here and let go can be taken before the manager binds it (wsp-548).
+fn run_manager(dir: &Path, sup: &Path) -> (Child, u16) {
+    let log = dir.join(wsp_manager::LOG_DIR).join(wsp_manager::log::FILE);
+    let ports = || -> Vec<u16> {
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        text.lines()
+            .filter(|l| l.contains(" started: "))
+            .filter_map(|l| l.split("127.0.0.1:").nth(1)?.split([' ', ',']).next()?.parse().ok())
+            .collect()
+    };
+    let before = ports().len();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wsp-manager"))
         .arg("--exec-dir")
         .arg(dir)
-        .args(["--host", "test-host", "--port", &port.to_string(), "--no-tailnet", "--compound-sup"])
+        .args(["--host", "test-host", "--port", "0", "--no-tailnet", "--compound-sup"])
         .arg(sup)
         .args(["--handshake-secs", &WAIT.as_secs().to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("wsp-manager runs")
+        .expect("wsp-manager runs");
+    let until = Instant::now() + WAIT;
+    loop {
+        if let Some(port) = ports().get(before) {
+            return (child, *port);
+        }
+        let exited = child.try_wait().unwrap();
+        if exited.is_some() || Instant::now() >= until {
+            let _ = child.kill();
+            panic!("the manager did not start ({exited:?}): {}", fs::read_to_string(&log).unwrap_or_default());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Dial until the manager answers.
@@ -588,8 +608,8 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
     let (dir, sup) = place("kill");
     let mut sweep = Sweep::new(&dir);
     let run = dir.join(wsp_manager::seats::RUN_DIR);
-    let port = free_port();
-    sweep.manager = Some(run_manager(&dir, &sup, port));
+    let (manager, port) = run_manager(&dir, &sup);
+    sweep.manager = Some(manager);
     let (mut c, _) = reach(port, &dir);
     c.subscribe(None);
     let s = started(c.ask(spawn_msg("wsp-4", 1, "cpd-k", &dir)), "started");
@@ -610,7 +630,8 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
     m.wait().unwrap();
     assert!(alive(s.pid), "the seat outlives its manager");
 
-    sweep.manager = Some(run_manager(&dir, &sup, port));
+    let (manager, port) = run_manager(&dir, &sup);
+    sweep.manager = Some(manager);
     let (mut back, hello) = reach(port, &dir);
     assert_eq!(hello.seats.iter().map(|e| (e.seat.0.as_str(), e.epoch)).collect::<Vec<_>>(), vec![("cpd-k", s.epoch)]);
     let Message::SeatsList(list) = back.ask(Message::Seats(Seats {})) else { panic!("seats.list") };
@@ -648,8 +669,8 @@ fn a_manager_killed_mid_order_restarts_with_its_seat_and_answers_the_order_once(
 fn a_seat_whose_socket_is_gone_under_a_reused_pid_is_ended_not_starting() {
     let (dir, sup) = place("reused");
     let mut sweep = Sweep::new(&dir);
-    let port = free_port();
-    sweep.manager = Some(run_manager(&dir, &sup, port));
+    let (manager, port) = run_manager(&dir, &sup);
+    sweep.manager = Some(manager);
     let (mut c, _) = reach(port, &dir);
     c.subscribe(None);
     let a = started(c.ask(spawn_msg("wsp-94", 1, "cpd-ra", &dir)), "started");
@@ -669,7 +690,8 @@ fn a_seat_whose_socket_is_gone_under_a_reused_pid_is_ended_not_starting() {
     m.kill().unwrap();
     m.wait().unwrap();
     fs::remove_file(&b.sockets[0]).unwrap();
-    sweep.manager = Some(run_manager(&dir, &sup, port));
+    let (manager, port) = run_manager(&dir, &sup);
+    sweep.manager = Some(manager);
     let (mut back, hello) = reach(port, &dir);
     assert!(hello.seats.is_empty(), "nothing adopted: {:?}", hello.seats);
     let Message::SeatsList(list) = back.ask(Message::Seats(Seats {})) else { panic!("seats.list") };
