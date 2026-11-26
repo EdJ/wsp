@@ -15,8 +15,9 @@ The `engine` row of the layering map, 88 modules: the run (`worklist`, `cycle`, 
 ## Does not hold
 
 The seats (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `cmd_govern`, `cmd_watch`, `memory`, …): `wsp-seats`,
-built on this crate, which never names it (`tests/layering.rs`). `timeline`, `surface` and `top` (`cmd_report`,
-`panel`, `daemon`, `main`, …) stay in `wsp`. Neither reaches back (`docs/components-upward.txt` has no line out of it).
+built on this crate, which never names it (`tests/layering.rs`); see `crates/seats/MAP.md`.
+`timeline`, `surface` and `top` (`cmd_report`, `panel`, `daemon`, `main`, …) stay in `wsp`. Neither reaches back
+(`docs/components-upward.txt` has no line out of it).
 
 ## Hooks the binary fills
 
@@ -50,5 +51,7 @@ built on this crate, which never names it (`tests/layering.rs`). `timeline`, `su
 
 ## Tests
 
-`cargo test -p wsp-engine` (about 2300). `wsp-store-sqlite` is a dev-dependency only: orders, fold and mirror tests
-open a real `state.db`. `cargo test --test layering` holds the crate's links and its upward lines.
+`cargo test -p wsp-engine` (1548 tests, 1 of them ignored, at abf65ef; `tests/dependent.rs` adds one where
+`test-support` is on; the seats' tests are counted in `crates/seats/MAP.md`). `wsp-store-sqlite` is a dev-dependency
+only: orders, fold and mirror tests open a real `state.db`. `cargo test --test layering` holds the crate's links and
+its upward lines.
