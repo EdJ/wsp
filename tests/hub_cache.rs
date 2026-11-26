@@ -275,14 +275,18 @@ fn a_row_spoke_a_adds_is_a_head_in_spoke_bs_ls_within_two_turns_and_whole_once_i
 
     // A allocates it to bob: it is B's own, whole.
     rig.a.ok(&["allocate", &id, "bob"]);
-    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    // While the turn swaps the head for the whole row, `show` may find neither for a moment.
+    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| {
+        let (ok, out) = s.run(&["show", &id]);
+        ok && !out.contains("head only")
+    });
     let whole = rig.b.ok(&["show", &id]);
     assert!(whole.contains("Written on A"), "{whole}");
     assert!(!std::fs::read_to_string(rig.b.state().join("hub/heads.json")).unwrap_or_default().contains(&id));
 
     // A second row, fetched by hand.
     let second = rig.a.add("Another on A");
-    rig.b.wait("the second row in B's ls", Duration::from_secs(30), |s| s.ls().contains(&second));
+    rig.b.wait("the second row in B's ls", Duration::from_secs(30), |s| s.ls().contains(&second) && s.run(&["show", &second]).0);
     assert!(rig.b.ok(&["show", &second]).contains("head only"));
     let fetched = rig.b.ok(&["show", &second, "--fetch"]);
     assert!(!fetched.contains("head only"), "--fetch brings it whole: {fetched}");
