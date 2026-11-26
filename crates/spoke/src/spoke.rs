@@ -5,8 +5,8 @@
 //! `main` filled with a [`Spoke`]. Each answer is the standalone one for a
 //! private row or list, for a spoke with no login, and, for new shared work,
 //! while the hub connection is switched off ([`crate::hub_switch`]): then no
-//! lease is taken, no shared list is advanced from here, nothing new is filed
-//! shared and nothing is dialled, while what is kept here (the cache, the
+//! lease is taken, no shared list is advanced from here, a row filed shared
+//! takes a provisional local id ([`crate::hub_ids`]) and nothing is dialled, while what is kept here (the cache, the
 //! journal, who holds what) stays readable.
 
 use std::collections::BTreeSet;
@@ -122,15 +122,26 @@ impl SharedWork for Spoke {
         whoami_at(&url, credential, ca.as_deref())
     }
 
-    fn may_file_shared(&self, store: &Store) -> Result<(), String> {
-        crate::hub_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())?;
-        match hub_switch::off(store) {
-            true => Err("the hub connection is disabled here (`wsp hub enable` turns it back on)".into()),
-            false => Ok(()),
-        }
+    /// A login is what filing shared needs. Switched off, a row filed shared
+    /// is provisional (a local id, nothing pushed) until the next connection.
+    fn may_file_shared(&self, _store: &Store) -> Result<(), String> {
+        crate::hub_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn new_row_id(&self, store: &Store, project: Option<&str>, workspace: &wsp_engine::model::WorkspaceId, parent: Option<&str>) -> Result<Option<String>, String> {
+        crate::hub_ids::new_row_id(store, project, workspace, parent)
+    }
+
+    fn marks(&self, store: &Store) -> std::collections::BTreeMap<String, String> {
+        crate::hub_ids::Book::read(store).rows.into_keys().map(|r| (r, "not yet published".to_string())).collect()
     }
 
     fn before_claim(&self, store: &Store, row: &str) -> Result<Option<Held>, String> {
+        // A provisional row is on a local id the hub does not know: no lease
+        // until it has its hub id (the rename leases a claimed row then).
+        if crate::hub_ids::is_provisional(store, row) {
+            return Ok(None);
+        }
         if is_shared_row(store, row) && switched_off(store) {
             return Err(off_said(&format!("{row} is shared")));
         }
@@ -212,6 +223,9 @@ impl SharedWork for Spoke {
     }
 
     fn lease_member(&self, store: &Store, row: &str) -> Member {
+        if crate::hub_ids::is_provisional(store, row) {
+            return Member::Free;
+        }
         if is_shared_row(store, row) && switched_off(store) {
             return Member::NotYet(off_said(&format!("{row} is shared")));
         }
@@ -253,6 +267,9 @@ impl SharedWork for Spoke {
         let mut out: Vec<String> = head.into_iter().chain(hub_journal::show_line(store, row)).collect();
         if stale {
             out.push("not live: the hub connection is disabled here, so this head is as it was last synced".into());
+        }
+        if crate::hub_ids::is_provisional(store, row) {
+            out.push("not yet published: a local id until the hub gives this row its own, at the next connection; nothing of it is sent before then".into());
         }
         out
     }

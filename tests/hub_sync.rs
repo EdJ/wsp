@@ -210,6 +210,12 @@ impl Rig {
         self.wait("the worker's first turn", Duration::from_secs(60), |r| r.turns() >= 1);
     }
 
+    /// The id `id` names now: itself, or the hub's id it was renamed to.
+    fn current_id(&self, id: &str) -> String {
+        let out = self.ok(&["show", id, "--json"]);
+        serde_json::from_str::<Value>(&out).ok().and_then(|v| v["id"].as_str().map(str::to_string)).unwrap_or_else(|| id.to_string())
+    }
+
     /// Add a row titled `title`, in `ws` (`None` is the private workspace); its id.
     fn add(&self, title: &str, ws: Option<&str>) -> String {
         let mut args = vec!["add", title, "-p", "alpha"];
@@ -282,7 +288,9 @@ fn with_the_hub_stopped_the_worker_says_so_once_keeps_running_and_syncs_when_it_
     rig.wait("the first row on the hub", Duration::from_secs(30), |r| r.hub_head(&first).is_some());
 
     rig.stop_hub();
+    // Filed while the hub is away: a provisional local id, said so by `show`.
     let second = rig.add("During the outage", Some(WORKSPACE));
+    assert!(rig.ok(&["show", &second]).contains("not yet published"), "a row filed during the outage is provisional");
     let from = rig.turns();
     // Several tries: the change, then 1 s and 2 s of backoff.
     rig.wait("three turns with the hub down", Duration::from_secs(30), |r| r.turns() >= from + 3);
@@ -293,7 +301,12 @@ fn with_the_hub_stopped_the_worker_says_so_once_keeps_running_and_syncs_when_it_
     assert!(rig.threads().iter().any(|t| t == "hub-sync"), "the worker ended: {:?}", rig.threads());
 
     rig.start_hub();
-    rig.wait("the second row on the hub", Duration::from_secs(60), |r| r.hub_head(&second).is_some());
+    // At the reconnect it takes the hub's id (the old one still finds it),
+    // and is pushed under that id.
+    rig.wait("the second row on the hub", Duration::from_secs(60), |r| {
+        let id = r.current_id(&second);
+        id != second && r.hub_head(&id).is_some()
+    });
     // The turn that moved the ref writes `sync.json` when it ends.
     rig.wait("the link up", Duration::from_secs(10), |r| r.status()["link"] == "up");
     let said = rig.said();

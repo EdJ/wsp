@@ -127,7 +127,7 @@ pub fn plan(store: &Store, target: &str) -> Result<Plan, String> {
 /// reading, which renumbers a private row out of a shared id's way too.
 pub use wsp_engine::door::highest_local;
 
-fn taken_here(store: &Store, id: &str, ids: &BTreeMap<String, String>) -> bool {
+pub fn taken_here(store: &Store, id: &str, ids: &BTreeMap<String, String>) -> bool {
     store.task_path(id).exists() || ids.contains_key(id) || store.archived_tasks().iter().any(|t| t.id == id)
 }
 
@@ -140,12 +140,43 @@ pub fn allocate(
     code: &str,
     n: usize,
 ) -> Result<Vec<String>, String> {
+    allocate_or(store, client, ws, code, n).map_err(|e| match e {
+        Alloc::Hub(e) => say(*e),
+        Alloc::Exhausted(why) => why,
+    })
+}
+
+/// Why [`allocate_or`] gave no ids: the hub's error (a refusal, or no answer),
+/// or ids it kept handing out that this store already has.
+#[derive(Debug)]
+pub enum Alloc {
+    Hub(Box<HubError>),
+    Exhausted(String),
+}
+
+impl Alloc {
+    /// The hub did not answer (as against refusing): try again later.
+    pub fn unreachable(&self) -> bool {
+        matches!(self, Alloc::Hub(e) if crate::hub_sync::unreachable(e))
+    }
+
+    pub fn said(self) -> String {
+        match self {
+            Alloc::Hub(e) => say(*e),
+            Alloc::Exhausted(why) => why,
+        }
+    }
+}
+
+/// [`allocate`] with the hub's error kept, so a caller can tell a refusal from
+/// a hub that did not answer.
+pub fn allocate_or(store: &Store, client: &mut Client, ws: &HubWorkspace, code: &str, n: usize) -> Result<Vec<String>, Alloc> {
     let ids = store.renamed_ids();
     let mut past = highest_local(store, code);
     let mut got: Vec<String> = Vec::new();
     for _ in 0..ROUNDS {
         let want = (n - got.len()) as u32;
-        let back = client.ids_alloc(ws, code, want, Some(past)).map_err(say)?;
+        let back = client.ids_alloc(ws, code, want, Some(past)).map_err(|e| Alloc::Hub(Box::new(e)))?;
         for id in back {
             if let Some(num) = id.rsplit_once('-').and_then(|(_, n)| n.parse::<u64>().ok()) {
                 past = past.max(num);
@@ -158,7 +189,7 @@ pub fn allocate(
             return Ok(got);
         }
     }
-    Err(format!("the hub kept handing out ids this store already has under {code}"))
+    Err(Alloc::Exhausted(format!("the hub kept handing out ids this store already has under {code}")))
 }
 
 fn say(e: HubError) -> String {
@@ -184,27 +215,50 @@ pub fn dial(home: &Path) -> Result<Client, String> {
 pub fn publish(store: &Store, target: &str, ws: &WorkspaceId, home: &Path) -> Result<Vec<(String, String)>, String> {
     let plan = plan(store, target)?;
     let mut client = dial(home)?;
+    let map = allocate_map(store, &mut client, ws, &plan).map_err(Alloc::said)?;
+    renumber_with(store, &mut client, ws, &plan, map)
+}
+
+/// The hub's new ids for every row of `plan`, by its project's counter: old →
+/// new. Every code before any write, so a refusal changes nothing.
+pub fn allocate_map(store: &Store, client: &mut Client, ws: &WorkspaceId, plan: &Plan) -> Result<BTreeMap<String, String>, Alloc> {
     let hub_ws = HubWorkspace(ws.to_string());
     let mut by_code: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for (id, code) in &plan.rows {
         by_code.entry(code.clone()).or_default().push(id);
     }
-    // The hub first, and every code before any write: a refusal changes nothing.
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for (code, olds) in &by_code {
-        let fresh = allocate(store, &mut client, &hub_ws, code, olds.len())?;
+        let fresh = allocate_or(store, client, &hub_ws, code, olds.len())?;
         for (old, new) in olds.iter().zip(fresh) {
             map.insert(old.to_string(), new);
         }
     }
+    Ok(map)
+}
+
+/// Renames `plan`'s rows by `map` (pieces keep their number under their row's
+/// new id) and files them in `ws`; a claimed row is leased at its new id
+/// first, and a refusal leaves every row as it was. The claim and the seat's
+/// binding follow the row, the lease in the claim. Safe to run again with the
+/// same `map` after a crash part-way: a row already renamed is found under its
+/// new id, and its claim is leased there.
+pub fn renumber_with(
+    store: &Store,
+    client: &mut Client,
+    ws: &WorkspaceId,
+    plan: &Plan,
+    mut map: BTreeMap<String, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let hub_ws = HubWorkspace(ws.to_string());
     // A claimed row goes under a hub lease at its new id, before any write.
     let claims = store.claims();
     let mut leased: Vec<(String, String, crate::hub_lease::Held)> = Vec::new();
     for (old, _) in &plan.rows {
-        if !claims.contains_key(old) {
+        if !claims.contains_key(old) && !claims.contains_key(&map[old]) {
             continue;
         }
-        match crate::hub_lease::take(&mut client, &hub_ws.0, &map[old]) {
+        match crate::hub_lease::take(client, &hub_ws.0, &map[old]) {
             Ok(held) => leased.push((old.clone(), map[old].clone(), held)),
             Err(why) => {
                 for (_, new, held) in &leased {
@@ -221,11 +275,11 @@ pub fn publish(store: &Store, target: &str, ws: &WorkspaceId, home: &Path) -> Re
         map.insert(piece.clone(), new.clone());
         made.push((piece.clone(), new));
     }
-    let lists: Vec<String> = plan.list.into_iter().collect();
+    let lists: Vec<String> = plan.list.iter().cloned().collect();
     store.renumber_into(&map, ws, &lists).map_err(|e| format!("the hub gave the ids, but the renumbering failed part-way: {e}"))?;
     // The claim, and the seat's binding, follow the row to its new id, with the lease in it.
     for (old, new, held) in &leased {
-        let Some(mut claim) = claims.get(old).cloned() else { continue };
+        let Some(mut claim) = claims.get(old).or_else(|| claims.get(new)).cloned() else { continue };
         crate::hub_lease::stamp(&mut claim, held);
         store.locked(|| {
             store.clear_claim(old);

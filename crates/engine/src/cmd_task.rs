@@ -166,7 +166,10 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         }
     };
 
-    let id = match store.alloc_task_id(project.as_deref()) {
+    // A shared row's id is the shared side's to give (its counter is one for
+    // everybody filing into the project); a private row's is the local
+    // counter's. Before anything is written, so a refusal leaves nothing.
+    let id = match new_row_id(store, project.as_deref(), &workspace, parent.as_ref().map(|p| p.id.as_str())) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("wsp: cannot allocate id: {e}");
@@ -243,6 +246,16 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
 /// The write `add` ends in, for a task already made: its file, the event and
 /// the commit, for `caller`. A caller from the hub (wsp-175) also has the row's
 /// log say so, `added by <user> via the hub`; one here writes what it always has.
+/// The id a new row in `workspace` takes: the shared-work add-on's when it
+/// gives one (a shared row's comes from the hub's counter), else the local
+/// counter's. Reserved either way; `Err` is why not, with nothing written.
+pub fn new_row_id(store: &Store, project: Option<&str>, workspace: &crate::model::WorkspaceId, parent: Option<&str>) -> Result<String, String> {
+    match crate::addon::get().new_row_id(store, project, workspace, parent)? {
+        Some(id) => Ok(id),
+        None => store.alloc_task_id(project).map_err(|e| e.to_string()),
+    }
+}
+
 pub fn file_new(store: &Store, t: &mut Task, caller: &crate::cmd_message::Caller) -> std::io::Result<()> {
     if caller.via_hub {
         t.log(&format!("added {}", caller.byline()));
@@ -370,7 +383,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if let Some(s) = &scope {
         println!("{}", p.dim(&scope_line(s, &tasks)));
     }
-    print_tasks(&tasks, &all, &p, scope.is_none());
+    print_tasks(&tasks, &all, &p, scope.is_none(), &crate::addon::get().marks(store));
     // Follow-ups nothing will run (`wsp-345`): found by a closed row, on no
     // list and under no seat. Named under the rows, whatever the scope, since
     // a row nobody runs is lost wherever it is filed.
@@ -708,7 +721,7 @@ pub fn inbox(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     println!("{}", p.dim(&format!("inbox  ({})", tasks.len())));
-    print_tasks(&tasks, &store.tasks(), &p, false);
+    print_tasks(&tasks, &store.tasks(), &p, false, &crate::addon::get().marks(store));
     0
 }
 
@@ -727,15 +740,15 @@ pub fn paint_prio(p: &Paint, prio: Priority) -> String {
 /// the count on a parent is not a fact about the list — see
 /// [`crate::resolve::open_under_review`], where `wsp ls -s review` printing
 /// `(1 open)` over four is the case they were one argument for.
-fn print_tasks(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) {
-    for l in task_lines(shown, all, p, show_project) {
+fn print_tasks(shown: &[Task], all: &[Task], p: &Paint, show_project: bool, marks: &std::collections::BTreeMap<String, String>) {
+    for l in task_lines(shown, all, p, show_project, marks) {
         println!("{l}");
     }
 }
 
 /// The rows, as text. Separate from printing them so the count on a parent is
 /// something a test can read — which is what this exists for.
-fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Vec<String> {
+fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool, marks: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let idw = shown.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
     // Children under their parent, indented. The parent carries what is still
     // open beneath it, because a one-line parent that says nothing about its
@@ -759,11 +772,16 @@ fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Ve
             other => p.dim(&util::pad(other.as_str(), 8)),
         };
         let prio = paint_prio(p, t.priority());
-        let project = if show_project {
+        let mut project = if show_project {
             p.dim(&format!("  [{}]", t.project.clone().unwrap_or_else(|| "inbox".into())))
         } else {
             String::new()
         };
+        // What the shared-work add-on wants seen at a glance (a shared row
+        // still on a local id): one dim word after the rest.
+        if let Some(m) = marks.get(&t.id) {
+            project.push_str(&p.dim(&format!("  ({m})")));
+        }
         out.push(format!(
             "  {} {} {} {}{}{}{}",
             p.dim(&util::pad(&t.id, idw)),
@@ -4763,6 +4781,49 @@ pub mod tests {
         assert_eq!(store.tasks().len(), 1);
     }
 
+    /// A shared-work add-on that lets shared rows be filed and gives each one
+    /// the id it is scripted with, or refuses.
+    struct Ids(Result<&'static str, &'static str>);
+
+    impl crate::addon::SharedWork for Ids {
+        fn may_file_shared(&self, _: &Store) -> Result<(), String> {
+            Ok(())
+        }
+        fn new_row_id(&self, _: &Store, _: Option<&str>, ws: &crate::model::WorkspaceId, _: Option<&str>) -> Result<Option<String>, String> {
+            if ws.is_private() {
+                return Ok(None);
+            }
+            self.0.map(|id| Some(id.to_string())).map_err(str::to_string)
+        }
+    }
+
+    /// `wsp add` takes a new row's id from the shared-work add-on where it gives
+    /// one (a shared row's from the hub), writes nothing when it refuses, and
+    /// takes the local counter for a private row and with no add-on.
+    #[test]
+    fn add_takes_a_shared_rows_id_from_the_addon_and_writes_nothing_when_it_refuses() {
+        let _iso = crate::util::isolated("add-ids");
+        let store = scratch("add-ids");
+        store.save_project(&crate::model::Project::new("pp")).unwrap();
+        {
+            let _a = crate::addon::scoped(std::sync::Arc::new(Ids(Ok("pp-042"))));
+            assert_eq!(add(&store, &parse(&["add", "shared work", "-p", "pp", "--workspace", "shared:team"])), 0);
+            let t = store.task("pp-042").expect("filed under the add-on's id");
+            assert_eq!((t.title.as_str(), t.workspace.to_string().as_str()), ("shared work", "shared:team"));
+            assert_eq!(add(&store, &parse(&["add", "my own", "-p", "pp"])), 0);
+            assert!(store.tasks().iter().any(|t| t.title == "my own" && t.id != "pp-042" && t.workspace.is_private()), "a private row takes the local counter");
+        }
+        let before = store.tasks().len();
+        {
+            let _a = crate::addon::scoped(std::sync::Arc::new(Ids(Err("you are not a member of shared:team"))));
+            assert_eq!(add(&store, &parse(&["add", "refused", "-p", "pp", "--workspace", "shared:team"])), 1);
+            assert_eq!(store.tasks().len(), before, "a refusal writes nothing");
+        }
+        let _a = crate::addon::scoped(std::sync::Arc::new(crate::addon::Standalone));
+        assert_eq!(add(&store, &parse(&["add", "alone", "-p", "pp"])), 0);
+        assert!(store.tasks().iter().any(|t| t.title == "alone"));
+    }
+
     #[test]
     fn only_adds_own_flags_on_the_end_of_a_title_are_read_as_swallowed() {
         assert_eq!(flag_in_title("Agents view --parent compound-403").as_deref(), Some("--parent compound-403"));
@@ -4972,7 +5033,7 @@ pub mod tests {
         let all = store.tasks();
         let shown: Vec<Task> =
             all.iter().filter(|t| t.status() == Status::Review).cloned().collect();
-        let lines = task_lines(&shown, &all, &Paint::plain(), false);
+        let lines = task_lines(&shown, &all, &Paint::plain(), false, &Default::default());
 
         let parent_line = lines.iter().find(|l| l.contains("fork-003")).expect("the parent");
         assert!(

@@ -11,6 +11,7 @@ pub mod cmd_publish;
 #[allow(dead_code)]
 pub mod hub_cache;
 pub mod hub_client;
+pub mod hub_ids;
 pub mod hub_journal;
 pub mod hub_lease;
 pub mod hub_switch;

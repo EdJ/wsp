@@ -6,8 +6,9 @@
 //!
 //! 1. **No new shared work.** The switch is written first. From then on the
 //!    spoke takes no lease (a claim, `wsp start` or a spawn of a shared row is
-//!    refused, naming `wsp hub enable`), advances no shared list, files nothing
-//!    new into a shared workspace and sends no message to the hub; core reads
+//!    refused, naming `wsp hub enable`), advances no shared list, files a new
+//!    shared row only on a provisional local id ([`crate::hub_ids`]) and sends
+//!    no message to the hub; core reads
 //!    it as standalone ([`wsp_engine::addon::SharedWork::active`] is false).
 //! 2. **Agents in flight on shared rows are parked** with `wsp park`'s own
 //!    write ([`wsp_engine::cmd_task::park`]), the reason naming the disconnect, and
@@ -549,6 +550,7 @@ pub fn status_lines(store: &Store) -> Vec<String> {
     if let Some(why) = &s.unreachable {
         out.push(format!("the hub did not answer the disable: {why}"));
     }
+    out.extend(crate::hub_ids::status_line(store));
     let held = held_leases(store);
     if !held.is_empty() {
         out.push(format!("leases held here: {}", held.join(" ")));
@@ -611,6 +613,7 @@ pub fn status_json(store: &Store) -> Value {
         "not_released": s.not_released,
         "unreachable": s.unreachable,
         "leases": held_leases(store),
+        "waiting_for_hub_id": crate::hub_ids::Book::read(store).rows.into_keys().collect::<Vec<_>>(),
         "link": sync_status(store)["link"],
         "refused_login": (sync_status(store)["link"].as_str() == Some("refused")).then(|| sync_status(store)["why"].clone()),
         "not_synced": sync_status(store)["refused"],
@@ -743,7 +746,12 @@ mod tests {
         let why = spoke.before_claim(&r.store, "s-2").unwrap_err();
         assert!(why.contains("wsp hub enable"), "{why}");
         assert_eq!(spoke.before_claim(&r.store, "p-1"), Ok(None), "private is as ever");
-        assert!(spoke.may_file_shared(&r.store).unwrap_err().contains("disabled"));
+        // Filing shared is allowed (a login is there) and is provisional while
+        // off: a local id, nothing pushed until the next connection (the
+        // owner's decision on shared ids, which replaced the refusal here).
+        assert!(spoke.may_file_shared(&r.store).is_ok());
+        let id = spoke.new_row_id(&r.store, None, &"shared:team".parse().unwrap(), None).unwrap().expect("an id");
+        assert!(crate::hub_ids::is_provisional(&r.store, &id), "off is offline: provisional");
         let mut w = wsp_engine::model::Worklist::new("run", "run");
         w.workspace = "shared:team".parse().unwrap();
         assert!(matches!(spoke.drive(&r.store, &w), wsp_engine::addon::Drives::NotYet(_)), "no shared list advanced from here");

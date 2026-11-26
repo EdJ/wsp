@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::Value;
 use wsp_store_contract::{Principal, SeatId, Token};
 
-use crate::model::Worklist;
+use crate::model::{WorkspaceId, Worklist};
 use crate::store::Store;
 
 /// A lease the add-on took for a row: its fencing token and when it runs out,
@@ -163,6 +163,23 @@ pub trait SharedWork: Send + Sync {
     /// Never reads a seat's own token.
     fn whoami(&self) -> WhoAmI {
         WhoAmI::NotLoggedIn
+    }
+
+    /// The id a new row filed into `workspace` takes, asked once its
+    /// workspace is known and before anything is written: `None` is "use the
+    /// local counter" (the standalone answer, and a private row's); `Some` is
+    /// an id the add-on has reserved (an empty file at its path, as the local
+    /// counter leaves one); `Err` is a refusal, and nothing is written.
+    /// `parent` is the row's parent, when it has one.
+    fn new_row_id(&self, _store: &Store, _project: Option<&str>, _workspace: &WorkspaceId, _parent: Option<&str>) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// A short word `wsp ls` puts after a row's title, by row: what the add-on
+    /// wants seen at a glance (a shared row with a local id the hub has not
+    /// yet given its own). Empty standalone.
+    fn marks(&self, _store: &Store) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 
     /// Whether a new record may be filed into a shared workspace, asked by

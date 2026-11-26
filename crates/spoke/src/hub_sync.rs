@@ -81,7 +81,7 @@ pub fn push_record(store: &Store, subject: &Subject, workspace: WorkspaceId, by:
     let t = store.task(&id.0)?;
     // A private row never leaves; a row kept as a head only (wsp-465) is the
     // hub's, and its stub is nothing to send back.
-    if t.workspace.is_private() || hub_cache::is_head(store, &id.0) {
+    if t.workspace.is_private() || hub_cache::is_head(store, &id.0) || crate::hub_ids::is_provisional(store, &id.0) {
         return None;
     }
     let text = std::fs::read_to_string(store.task_path(&id.0)).ok()?;
@@ -516,7 +516,7 @@ pub fn health(
 }
 
 /// A request that failed because the hub is not there, as against one it refused.
-fn unreachable(e: &hub_client::Error) -> bool {
+pub fn unreachable(e: &hub_client::Error) -> bool {
     matches!(e, hub_client::Error::Timeout | hub_client::Error::Lost(_) | hub_client::Error::Silent(_))
 }
 
@@ -904,6 +904,19 @@ impl Worker {
     fn sync_all(&mut self, store: &Store) -> Result<Turned, String> {
         self.refused.clear();
         self.open_feed(store)?;
+        // Rows filed shared while the hub was not reached take its ids now,
+        // before anything is pushed (not in the flush a disable runs: off is
+        // offline).
+        if !crate::hub_switch::off(store) {
+            let settled = crate::hub_ids::settle(store, self.client()?);
+            for (old, new) in &settled.renamed {
+                wsp_engine::store::log_line(store, &format!("hub-sync: {old} took the hub's id {new}; {old} still finds it"));
+            }
+            for (ws, why) in settled.waiting {
+                self.refused.insert(ws.clone(), format!("rows filed here wait for a hub id: {why}"));
+                self.say_once(store, format!("hub-sync: rows filed into {ws} while away keep their local ids: {why}"));
+            }
+        }
         let mut workspaces: BTreeMap<String, Vec<wsp_engine::model::Task>> =
             wsp_engine::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
         for w in Stream::read(store).workspaces {
@@ -1016,7 +1029,10 @@ impl Worker {
         let mut local = Refs::new(wid.clone());
         let mut pushing: BTreeMap<Subject, (ObjectId, Option<ObjectId>)> = BTreeMap::new();
         let mut subjects: Vec<(Subject, Option<ObjectId>)> = Vec::new();
-        for t in tasks.iter().filter(|t| !cache.is_head(&t.id) && store.task(&t.id).is_some()) {
+        // A provisional row (a local id the hub has not given) is neither
+        // pushed nor synced: the subject is not its own until it is renamed.
+        let provisional = crate::hub_ids::Book::read(store).rows;
+        for t in tasks.iter().filter(|t| !cache.is_head(&t.id) && store.task(&t.id).is_some() && !provisional.contains_key(&t.id)) {
             subjects.push((Subject::Row(RowId(t.id.clone())), file_digest(store, &t.id)));
         }
         for w in store.worklists().iter().filter(|w| w.workspace.to_string() == ws) {
