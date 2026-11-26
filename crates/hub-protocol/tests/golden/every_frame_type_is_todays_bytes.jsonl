@@ -1,0 +1,12 @@
+{"type":"hello","token":"s3cret","by":"person:ann","client":"wsp 0.1.0","protocol":1}
+{"type":"hello","token":"t","by":"wsp:start-check","client":"with \"quotes\" and a\nnewline","protocol":2}
+{"type":"welcome","server":"wsp-hub","protocol":1,"head":411,"by":"person:ann"}
+{"type":"welcome","server":"wsp-hub","protocol":1,"head":0}
+{"type":"refused","code":"unauthorised","text":"the token is revoked"}
+{"type":"refused","code":"malformed","text":""}
+{"type":"request","v":1,"id":1,"by":"person:ann","verb":"whoami","args":{}}
+{"type":"reply","id":1,"ok":"subscribed","events":[]}
+{"type":"feed","beat":{"beat":411,"at":1763400000000}}
+{"type":"login","method":"github","client":"wsp 0.1.0","protocol":1}
+{"type":"login_prompt","url":"https://github.com/login/device","code":"ABCD-1234","expires_secs":900}
+{"type":"login_done","user":"ann","token":"t"}

@@ -186,6 +186,7 @@ fn api_code(c: Code) -> api::Code {
 /// Returns the line's JSON.
 fn wire(f: &Frame) -> Value {
     let ours = serde_json::to_string(f).unwrap();
+    golden(&ours);
     let Some(theirs_value) = api_frame(f) else {
         assert_eq!(ours, login_line(f), "the login frame's pinned bytes");
         let read_here: Frame = serde_json::from_str(&ours).unwrap();
@@ -201,6 +202,40 @@ fn wire(f: &Frame) -> Value {
     assert_eq!(&read_here, f, "this crate reads today's line: {theirs}");
     assert_eq!(serde_json::to_string(&read_here).unwrap(), ours, "written again the same");
     serde_json::from_str(&ours).unwrap()
+}
+
+/// Today's bytes, frozen: each test's frames, in the order it writes them,
+/// are the lines of `tests/golden/<test>.jsonl`, so the proof survives the
+/// day `wsp-api` no longer has the hub's frames to compare with. The files
+/// were written from today's `wsp-api` (each line is held to its bytes above)
+/// with `WSP_WIRE_BLESS=1`.
+fn golden(line: &str) {
+    use std::cell::RefCell;
+    use std::io::Write;
+    thread_local! {
+        static AT: RefCell<(String, usize, Option<Vec<String>>)> = const { RefCell::new((String::new(), 0, None)) };
+    }
+    let test = std::thread::current().name().unwrap_or("main").replace("::", "-");
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(format!("{test}.jsonl"));
+    let bless = std::env::var("WSP_WIRE_BLESS").is_ok_and(|v| v == "1");
+    AT.with(|at| {
+        let mut at = at.borrow_mut();
+        if at.0 != test {
+            *at = (test.clone(), 0, None);
+        }
+        let i = at.1;
+        at.1 += 1;
+        if bless {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let mut f = std::fs::OpenOptions::new().create(true).write(true).append(i > 0).truncate(i == 0).open(&file).unwrap();
+            writeln!(f, "{line}").unwrap();
+            return;
+        }
+        let lines = at.2.get_or_insert_with(|| {
+            std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e} (WSP_WIRE_BLESS=1 writes it)", file.display())).lines().map(str::to_string).collect()
+        });
+        assert_eq!(lines.get(i).map(String::as_str), Some(line), "{}:{}: today's frozen bytes", file.display(), i + 1);
+    });
 }
 
 /// The bytes of the login frames in `frames()`, pinned as literals: this
