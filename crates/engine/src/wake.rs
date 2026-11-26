@@ -273,6 +273,7 @@ fn wake_by(store: &Store, emits: &[Emit], at: i64, primaries: &Primaries) {
     }
     // And the tells held for seats that could not be reached, now that the pass
     // has looked at the fleet once more.
+    crate::seat_block::sync_now(store);
     flush_held_tells_now(store);
 }
 

@@ -120,6 +120,7 @@ pub mod tell_log;
 pub mod untaken;
 pub mod verification;
 pub mod verifier_packet;
+pub mod seat_block;
 pub mod waiting;
 pub mod waits;
 pub mod wake;
