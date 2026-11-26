@@ -392,10 +392,7 @@ impl Reads for MemStore {
         let lists = s
             .lists
             .into_iter()
-            .map(|(id, l)| match l.state {
-                ListState::Finished if !l.fields.contains_key(WIP_SEATED) => (id, List { fields: bodiless(l.fields), ..l }),
-                _ => (id, l),
-            })
+            .filter(|(_, l)| l.state != ListState::Finished || l.fields.contains_key(WIP_SEATED))
             .collect();
         let asks = s.asks.into_iter().filter(|(_, a)| a.state == AskState::Raised).collect();
         let seats = s.seats.into_iter().filter(|(_, seat)| !wip_drops_seat(seat)).collect();

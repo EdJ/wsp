@@ -92,7 +92,8 @@ impl Reads for SqliteStore {
 
     /// Cut down in SQL, over the entity rows, so the full domain is never decoded into Rust: one
     /// statement, so the cut and the head are of one moment, as `snapshot()`'s are. Seats that
-    /// are gone, ending or lost, or that the census reads as gone, are left out (wsp-373).
+    /// are gone, ending or lost, or that the census reads as gone, are left out (wsp-373), and
+    /// so are finished lists no seat sits on (wsp-783).
     fn wip_snapshot(&self) -> Result<(State, EventId)> {
         let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
         let done = word(serde_json::json!(RowState::Done));
@@ -109,11 +110,10 @@ impl Reads for SqliteStore {
                                     CASE WHEN json_extract(json, '$.state') = ?1
                                          THEN json_remove(json, ?3, ?4) ELSE json(json) END)
                                  FROM entity WHERE map = 'rows'),
-                        'lists', (SELECT json_group_object(key,
-                                     CASE WHEN json_extract(json, '$.state') = ?5
-                                               AND json_extract(json, ?6) IS NULL
-                                          THEN json_remove(json, ?3, ?4) ELSE json(json) END)
-                                  FROM entity WHERE map = 'lists'),
+                        'lists', (SELECT json_group_object(key, json(json)) FROM entity
+                                  WHERE map = 'lists'
+                                    AND (json_extract(json, '$.state') <> ?5
+                                         OR json_extract(json, ?6) IS NOT NULL)),
                         'seats', (SELECT json_group_object(key, json(json)) FROM entity
                                   WHERE map = 'seats'
                                     AND json_extract(json, '$.state') NOT IN ('gone', 'ending', 'lost')

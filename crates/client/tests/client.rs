@@ -489,6 +489,109 @@ fn rows_whole_on_a_store_past_the_line_come_back_every_one_through_the_pages() {
     let _ = fs::remove_dir_all(&d);
 }
 
+/// `wip` on a store shaped like the live one of wsp-783 (thousands of done
+/// rows, a couple of hundred finished lists, a few hundred open rows with long
+/// bodies), sized so the cut before wsp-783 (finished lists kept as heads) is
+/// past the line. The cut leaves those lists out, and what is still past the
+/// line comes in parts: every reply line is under `MAX_LINE`, and
+/// `Client::wip` reads back exactly the store's cut. A part is read from the
+/// cut its connection began on though the head moves meanwhile, and a part of
+/// a cut nobody holds is `stale`.
+#[test]
+fn wip_on_a_store_past_the_line_comes_in_parts_each_under_it_and_reads_back_whole() {
+    let d = dir("wip-parts");
+    let store = mirror_store();
+    let head = format!("{{\"id\":\"x\",\"pad\":\"{}\"}}", "h".repeat(2000));
+    let mut put: Vec<Entity> = (0..3000)
+        .map(|i| {
+            let mut r = row(&format!("done-{i:04}"), "landed");
+            r.state = RowState::Done;
+            r.seat = None;
+            r.fields.insert("head".into(), head.clone());
+            r.fields.insert("body".into(), "a finished body ".repeat(200));
+            Entity::Row(r)
+        })
+        .collect();
+    let body = "an open body ".repeat(2500);
+    put.extend((0..400).map(|i| {
+        let mut r = row(&format!("open-{i:03}"), "at review");
+        r.state = RowState::Review;
+        r.fields.insert("body".into(), body.clone());
+        Entity::Row(r)
+    }));
+    let shown = "g".repeat(60 * 1024);
+    put.extend((0..200).map(|i| {
+        let id = ListId(format!("old-{i:03}"));
+        let groups = (1..=6)
+            .map(|n| Group { id: GroupId { list: id.clone(), n }, state: ListState::Passed, members: vec![RowId(format!("done-{n:04}"))], attempt: 1, fields: Default::default() })
+            .collect();
+        let fields = [("body", "# the list's file".to_string()), ("show_groups", shown.clone()), ("status", "done".into())];
+        Entity::List(List { workspace: Default::default(), id, state: ListState::Finished, groups, fields: fields.into_iter().map(|(k, v)| (k.into(), v)).collect() })
+    }));
+    for (i, chunk) in put.chunks(200).enumerate() {
+        apply(&store, chunk.to_vec(), vec![], &format!("seed-{i}"));
+    }
+
+    // Before wsp-783 the cut kept every finished list, less its text: past the line.
+    let (whole, _) = store.snapshot().unwrap();
+    let (cut, at) = store.wip_snapshot().unwrap();
+    let mut before = cut.clone();
+    for (id, l) in &whole.lists {
+        let mut l = l.clone();
+        heads_only(&mut l.fields);
+        before.lists.entry(id.clone()).or_insert(l);
+    }
+    assert!(before.json_len() > wsp_api::MAX_LINE, "the seed is {} bytes as the old cut, not past the line", before.json_len());
+    assert!(cut.lists.is_empty(), "every finished list nobody sits on is left out");
+    assert!(cut.json_len() > wsp_api::MAX_LINE, "the seed must still be past the line to need parts");
+
+    // A long beat: a debug build reads a part slower than the tests' 150 ms beats allow.
+    let mut cfg = Config::new(&d);
+    cfg.port = 0;
+    cfg.beat = Duration::from_secs(10);
+    let server = Server::start(Arc::new(store.handle()), cfg).unwrap();
+    let mut c = dial(&d);
+    c.set_timeout(WAIT);
+    let line = |r: &Reply| serde_json::to_vec(&wsp_api::Frame::Reply(r.clone())).unwrap().len() + 1;
+
+    let first = c.request("wip", json!({})).unwrap();
+    assert!(line(&first) < wsp_api::MAX_LINE, "the first part is {} bytes", line(&first));
+    let Outcome::Ok(Answer::Wip { state, at: on, parts: Some(parts) }) = first.outcome else { panic!("{:?}", first.outcome) };
+    assert_eq!(on, at);
+    assert!(parts > 1, "{parts} parts");
+    let mut read = state;
+    // The head moves after the read began: the connection still holds the cut it began on.
+    apply(&store, vec![Entity::Row(row("late", "after the first part"))], vec![], "late");
+    for part in 1..parts {
+        let r = c.request("wip", json!({ "at": at.0, "part": part })).unwrap();
+        assert!(line(&r) < wsp_api::MAX_LINE, "part {part} is {} bytes", line(&r));
+        let Outcome::Ok(Answer::Wip { state, at: on, parts: n }) = r.outcome else { panic!("part {part}: {:?}", r.outcome) };
+        assert_eq!((on, n), (at, Some(parts)), "part {part} is of the cut at {at:?}");
+        read.absorb(state);
+    }
+    assert_eq!(read, cut, "the parts absorbed are the cut");
+
+    // Once the cache has moved to the late head, a part of the old cut nobody holds is stale.
+    let Outcome::Ok(Answer::Wip { at: moved, .. }) = c.request("wip", json!({})).unwrap().outcome else { panic!("no wip") };
+    assert!(moved > at, "the late row moved the head");
+    let stale = c.request("wip", json!({ "at": at.0, "part": 1 })).unwrap();
+    match stale.outcome {
+        Outcome::Err(f) => assert_eq!(f.code, Code::Stale, "{f:?}"),
+        Outcome::Ok(_) => panic!("a part of a let-go cut was answered"),
+    }
+
+    // Through the client the whole read is transparent: the store's cut now, the late row in it.
+    let (got, now) = c.wip().unwrap();
+    assert!(got.rows.contains_key(&RowId("late".into())));
+    assert_eq!((got, now), store.wip_snapshot().unwrap(), "Client::wip reads the cut whole");
+    match c.request("wip", json!({ "at": now.0, "part": 99 })).unwrap().outcome {
+        Outcome::Err(f) => assert_eq!(f.code, Code::Invalid, "{f:?}"),
+        Outcome::Ok(_) => panic!("part 99 was answered"),
+    }
+    server.stop();
+    let _ = fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_request_after_a_lost_connection_dials_again() {
     let d = dir("redial");

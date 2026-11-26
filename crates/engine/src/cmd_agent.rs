@@ -4860,10 +4860,11 @@ fn wip_reads_api() -> bool {
 fn api_state(store: &Store) -> Result<wsp_store_contract::State, String> {
     let mut client = wsp_client::Client::dial(&store.state, wsp_store_contract::Principal::Wsp("wip".into()), API_BUDGET)
         .map_err(|e| e.to_string())?;
-    match client.request("wip", json!({})).map_err(|e| e.to_string())?.outcome {
-        wsp_api::Outcome::Ok(wsp_api::Answer::Wip { state, .. }) => Ok(state),
-        wsp_api::Outcome::Ok(_) => Err("`wip` was answered with another verb's answer".into()),
-        wsp_api::Outcome::Err(f) => Err(format!("`wip` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
+    // Through the client's `wip`, which reads a cut past one line in its parts (wsp-783).
+    match client.wip() {
+        Ok((state, _)) => Ok(state),
+        Err(wsp_client::Error::Failed(f)) => Err(format!("`wip` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

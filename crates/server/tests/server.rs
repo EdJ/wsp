@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use wsp_api::{
-    Answer, ApiToken, Call, Code, ConnError, Connection, Feed, Frame, Hello, Listen, NoArgs, Outcome, Refused, Reply,
+    Answer, ApiToken, Call, Code, ConnError, Connection, Feed, Frame, Hello, Listen, NoArgs, Outcome, WipArgs, Refused, Reply,
     ReqId, Request, Subscribe, Verb, LISTEN_FILE, MAX_EVENTS_BYTES, MAX_LINE, PROTOCOL, TOKEN_FILE,
 };
 use wsp_server::tcp::Tcp;
@@ -492,9 +492,6 @@ fn a_reply_past_the_line_is_too_large_and_rows_in_pages_are_every_row() {
     let _ = fs::remove_dir_all(&d);
 }
 
-/// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
-/// on rows not done and lists not finished, raised asks only, and `state` beside
-/// it unchanged.
 /// wsp-378: 1000 events of today's log were 19.4 MB, past `MAX_LINE`. A page
 /// stops at `MAX_EVENTS_BYTES` as well, says where in `through`, and paging
 /// from 0 by it reads every event once, each page one line a carrier reads.
@@ -551,6 +548,9 @@ fn events_pages_are_capped_by_bytes_and_paging_by_through_reads_every_event_once
     let _ = fs::remove_dir_all(&d);
 }
 
+/// `wip` (wsp-695) over the wire: the store's `wip_snapshot` whole, bodies only
+/// on rows not done, finished lists no seat sits on left out (wsp-783), raised
+/// asks only, and `state` beside it unchanged.
 #[test]
 fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     let d = dir("wip");
@@ -589,7 +589,7 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     let mut c = connect(&d);
     let (full, at) = store.snapshot().unwrap();
 
-    let Answer::Wip { state, at: wip_at } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    let Answer::Wip { state, at: wip_at, .. } = c.read(Verb::Wip(WipArgs::default())) else { panic!("not a wip answer") };
     assert_eq!((state.clone(), wip_at), store.wip_snapshot().unwrap());
     assert_eq!(wip_at, at);
     assert_eq!(state.rows.len(), full.rows.len(), "every row is kept");
@@ -598,11 +598,10 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
     assert_eq!(fields("wsp-3").get("prose").map(String::as_str), Some("more of it"));
     for body in WIP_BODIES {
         assert_eq!(fields("wsp-4").get(body), None, "a done row loses {body}");
-        assert_eq!(state.lists[&ListId("s3".into())].fields.get(body), None, "a finished list loses {body}");
     }
+    assert!(!state.lists.contains_key(&ListId("s3".into())), "a finished list nobody sits on is left out");
     assert_eq!(state.lists[&ListId("s2".into())], full.lists[&ListId("s2".into())], "a running list is whole");
     assert_eq!(fields("wsp-4").get("head").map(String::as_str), Some("a head"), "a done row keeps its head");
-    assert_eq!(state.lists[&ListId("s3".into())].fields.get("name").map(String::as_str), Some("the list"));
     assert_eq!(state.asks.keys().cloned().collect::<Vec<_>>(), vec![AskId("a-1".into())], "raised asks only");
     assert_eq!((state.seats.clone(), state.claims.clone()), (full.seats.clone(), full.claims.clone()));
     assert!(state.orders.is_empty() && state.machines.is_empty());
@@ -641,7 +640,7 @@ impl wsp_server::Views for FakeViews {
 /// The first request's reply on a fresh connection, as the bytes on the wire.
 fn wip_line(dir: &Path) -> Vec<u8> {
     let mut c = connect(dir);
-    let id = c.send(Call::Verb(Verb::Wip(NoArgs {})));
+    let id = c.send(Call::Verb(Verb::Wip(WipArgs::default())));
     assert_eq!(id, ReqId(1));
     c.conn.recv_line(WAIT).unwrap().expect("a reply")
 }
@@ -662,21 +661,21 @@ fn wip_is_cut_once_per_head_and_the_same_head_answers_the_same_bytes() {
     let again = wip_line(&d);
     assert_eq!(first, again, "the same head answers the same bytes");
     assert_eq!(kept.cuts.load(Ordering::SeqCst), 1, "the second wip is answered from the cache");
-    let Ok(Frame::Reply(Reply { outcome: Outcome::Ok(Answer::Wip { state, at }), .. })) = serde_json::from_slice(&first) else {
+    let Ok(Frame::Reply(Reply { outcome: Outcome::Ok(Answer::Wip { state, at, .. }), .. })) = serde_json::from_slice(&first) else {
         panic!("not a wip reply: {}", String::from_utf8_lossy(&first))
     };
     assert_eq!((state, at), store.wip_snapshot().unwrap(), "the cached answer is the store's cut");
 
     // A connection that stays open is answered from the same cache.
     let mut c = connect(&d);
-    let Answer::Wip { at: on_c, .. } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    let Answer::Wip { at: on_c, .. } = c.read(Verb::Wip(WipArgs::default())) else { panic!("not a wip answer") };
     assert_eq!((on_c, kept.cuts.load(Ordering::SeqCst)), (at, 1));
 
     // The head moves: the next wip cuts afresh and carries the new row.
     apply(&store, vec![Entity::Row(row("wsp-77", "landed since"))], vec![], "more");
     let head = store.head().unwrap();
     assert!(head > at);
-    let Answer::Wip { state, at: moved } = c.read(Verb::Wip(NoArgs {})) else { panic!("not a wip answer") };
+    let Answer::Wip { state, at: moved, .. } = c.read(Verb::Wip(WipArgs::default())) else { panic!("not a wip answer") };
     assert_eq!(kept.cuts.load(Ordering::SeqCst), 2, "a moved head is a fresh cut");
     assert_eq!(moved, head);
     assert!(state.rows.contains_key(&RowId("wsp-77".into())), "the fresh cut holds what landed");
@@ -717,7 +716,7 @@ fn a_moved_head_is_cut_before_the_next_wip_asks_once_one_has() {
     let next = wip_line(&d);
     assert_eq!(cuts(), 2, "the wip after the move is answered from the cache");
     assert_ne!(next, first);
-    let Ok(Frame::Reply(Reply { outcome: Outcome::Ok(Answer::Wip { state, at }), .. })) = serde_json::from_slice(&next) else {
+    let Ok(Frame::Reply(Reply { outcome: Outcome::Ok(Answer::Wip { state, at, .. }), .. })) = serde_json::from_slice(&next) else {
         panic!("not a wip reply: {}", String::from_utf8_lossy(&next))
     };
     assert_eq!(at, head);

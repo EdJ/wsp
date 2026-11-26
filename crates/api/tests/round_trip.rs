@@ -428,7 +428,7 @@ fn requests() -> Vec<Frame> {
         Verb::Subscribe(Subscribe {
             from: Some(EventId(400)),
         }),
-        Verb::Wip(NoArgs {}),
+        Verb::Wip(WipArgs::default()),
         Verb::Throttle(NoArgs {}),
         Verb::Spend(NoArgs {}),
         Verb::Show {
@@ -736,6 +736,7 @@ fn answers() -> Vec<Frame> {
             Answer::Wip {
                 state: a_state(),
                 at: EventId(411),
+                parts: None,
             },
             vec![],
         ),
@@ -1488,4 +1489,39 @@ fn the_sync_verbs_spelling_is_pinned() {
         serde_json::to_value(ok(6, Answer::Ids(vec!["wsp-185".into()]), vec![])).unwrap()["ok"],
         json!({"ids": ["wsp-185"]})
     );
+}
+
+/// wsp-783: `wip`'s args and its answer's `parts` on the wire. `wip {}`,
+/// `null` and no `args` read as no part asked; a part is `{at, part}`; and a
+/// cut that fits a line is answered with no `parts` key at all, the bytes an
+/// older client reads, while a part says how many there are.
+#[test]
+fn wip_parts_are_spelled_and_left_out_when_unset() {
+    let request = |args: Option<Value>| {
+        let mut v = json!({"type": "request", "v": PROTOCOL, "id": 3, "by": "wsp:wip", "verb": "wip"});
+        if let Some(a) = args {
+            v["args"] = a;
+        }
+        match serde_json::from_value::<Frame>(v).unwrap() {
+            Frame::Request(Request { call: Call::Verb(Verb::Wip(args)), .. }) => args,
+            other => panic!("not a wip request: {other:?}"),
+        }
+    };
+    assert_eq!(request(None), WipArgs::default());
+    assert_eq!(request(Some(Value::Null)), WipArgs::default());
+    assert_eq!(request(Some(json!({}))), WipArgs::default());
+    assert_eq!(request(Some(json!({"at": 411, "part": 2}))), WipArgs { at: Some(EventId(411)), part: Some(2) });
+    assert_eq!(serde_json::to_value(WipArgs::default()).unwrap(), json!({}));
+    assert_eq!(serde_json::to_value(WipArgs { at: Some(EventId(411)), part: Some(2) }).unwrap(), json!({"at": 411, "part": 2}));
+
+    let whole = serde_json::to_value(Answer::Wip { state: State::default(), at: EventId(411), parts: None }).unwrap();
+    assert!(whole["wip"].get("parts").is_none(), "a whole cut carries no parts: {whole}");
+    let part = Answer::Wip { state: State::default(), at: EventId(411), parts: Some(3) };
+    let v = serde_json::to_value(&part).unwrap();
+    assert_eq!(v["wip"]["parts"], json!(3), "{v}");
+    assert_eq!(serde_json::from_value::<Answer>(v).unwrap(), part);
+    // An older server's answer, with no `parts`, reads as a whole cut.
+    let mut old = whole.clone();
+    old["wip"].as_object_mut().unwrap().remove("parts");
+    assert!(matches!(serde_json::from_value::<Answer>(old).unwrap(), Answer::Wip { parts: None, .. }));
 }
