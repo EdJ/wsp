@@ -479,6 +479,10 @@ impl TestHub {
         let mut root = self.admin();
         for w in workspaces {
             apply(&mut root, IdentityCommand::HubWorkspaceAdd { name: SharedName(w.to_string()) });
+            // The admin is a member too: a hub shows an admin a workspace's
+            // data (its leases, its events) only where it is a member, and
+            // [`TestHub::lease_of`] and [`TestHub::events_after`] read as it.
+            apply(&mut root, IdentityCommand::HubMemberSet { workspace: SharedName(w.to_string()), user: user("root"), member: true });
         }
         let mut tokens = BTreeMap::new();
         for (name, member_of) in users {
