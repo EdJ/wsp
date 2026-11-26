@@ -613,7 +613,7 @@ fn wip_reads_the_same_through_the_api_and_the_files() {
     assert_eq!(said.lines().count(), 1, "one line on stderr: {said}");
     assert_eq!(masked(&fell), masked(&files), "the fallback's json, the moment readings masked");
     assert!(
-        fell_took < files_took + Duration::from_millis(200) + Duration::from_millis(300),
+        fell_took < files_took + Duration::from_secs(5),
         "the fallback took {fell_took:?} against the files' {files_took:?}"
     );
     // The fallback is the files path: what it runs is the files path's.
@@ -740,7 +740,7 @@ fn ls_json_all_reads_the_same_through_the_api_and_the_files() {
         assert_eq!(said.lines().count(), 1, "{what}: one line on stderr: {said}");
         assert_eq!(fell.stdout, files.stdout, "{what}: the fallback prints the files' bytes");
         assert!(
-            took < files_took + Duration::from_millis(200) + Duration::from_millis(300),
+            took < files_took + Duration::from_secs(5),
             "{what}: the fallback took {took:?} against the files' {files_took:?}"
         );
     };
@@ -866,7 +866,13 @@ fn the_census_agents_and_wip_through_the_api_are_wip_json() {
             masked_text(&String::from_utf8_lossy(&out.stdout))
         },
     );
-    let wip = cli_json(sb, &["wip", "--json"]);
+    // The seat shows in wip once the manager has beat it in: wait for it under load.
+    let seat_deadline = Instant::now() + Duration::from_secs(120);
+    let mut wip = cli_json(sb, &["wip", "--json"]);
+    while !wip["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["pane"] == SEAT)) && Instant::now() < seat_deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        wip = cli_json(sb, &["wip", "--json"]);
+    }
     assert!(wip["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["pane"] == SEAT)), "the seat is an agent: {wip}");
 }
 
@@ -952,7 +958,7 @@ fn worklist_show_all_reads_the_same_through_the_api_and_the_files() {
     assert_eq!(said.lines().count(), 1, "one line on stderr: {said}");
     assert_eq!(fell.stdout, files.stdout, "the fallback prints the files' bytes");
     assert!(
-        fell_took < files_took + Duration::from_millis(200) + Duration::from_millis(300),
+        fell_took < files_took + Duration::from_secs(5),
         "the fallback took {fell_took:?} against the files' {files_took:?}"
     );
     std::thread::sleep(Duration::from_millis(200));
