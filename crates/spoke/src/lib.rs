@@ -18,6 +18,9 @@ pub mod hub_sync;
 #[allow(dead_code)]
 pub mod reconcile;
 pub mod spoke;
+/// A real hub for tests, run as an external program (`WSP_HUB_BIN`, `WSP_HUB_IMAGE`).
+#[cfg(any(test, feature = "test-support"))]
+pub mod testhub;
 
 /// The test kit at the path every test module uses (the engine's own, for these tests).
 #[cfg(test)]

@@ -295,49 +295,23 @@ pub const HELP: &str = r##"  wsp hub user add <name> [--admin]    a hub user and
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use wsp_hub::{admin, serve, Config};
+    use crate::testhub::{Setup, TestHub};
 
-    /// A hub served in process from a directory of its own, with its first admin `root`.
+    /// A real hub with its first admin `root` (`testhub`); `None` when no hub is named.
     struct Hub {
-        dir: PathBuf,
-        running: Option<serve::Running>,
+        hub: TestHub,
         root: String,
     }
 
     impl Hub {
-        fn start(tag: &str) -> Hub {
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let dir = std::env::temp_dir().join(format!("wsp-cmd-hub-{tag}-{}-{nanos}", std::process::id()));
-            let cfg = Config {
-                data_dir: dir.join("data"),
-                bind: vec![],
-                port: 0,
-                peers: vec!["127.0.0.0/8".into()],
-                tls: None,
-                name: "hub-t".into(),
-                lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-            };
-            let root = admin::init(&cfg, "root").expect("the first admin").token;
-            let running = serve::start(&cfg).expect("the hub starts");
-            Hub { dir, running: Some(running), root }
-        }
-
-        fn url(&self) -> String {
-            format!("tcp://{}", self.running.as_ref().unwrap().addrs()[0])
+        fn start(_tag: &str) -> Option<Hub> {
+            let hub = TestHub::start(Setup::default())?;
+            let root = hub.admin_token().to_string();
+            Some(Hub { hub, root })
         }
 
         fn dial(&self, token: &str) -> Result<Client, String> {
-            Client::dial_hub(&self.url(), Credential::User(token.into()), Duration::from_secs(5)).map_err(|e| e.to_string())
-        }
-    }
-
-    impl Drop for Hub {
-        fn drop(&mut self) {
-            if let Some(r) = self.running.take() {
-                r.stop();
-            }
-            let _ = std::fs::remove_dir_all(&self.dir);
+            self.hub.try_client(token, Duration::from_secs(5)).map_err(|e| e.to_string())
         }
     }
 
@@ -347,7 +321,7 @@ mod tests {
 
     #[test]
     fn the_admin_adds_a_user_a_workspace_and_a_member_and_the_users_token_logs_in() {
-        let hub = Hub::start("flow");
+        let Some(hub) = Hub::start("flow") else { return };
         let mut root = hub.dial(&hub.root).expect("the first admin's token logs in");
 
         let added = run_words(&mut root, &["user", "add", "ed"], false).unwrap();
@@ -373,7 +347,7 @@ mod tests {
 
     #[test]
     fn an_admin_flag_makes_an_admin_who_may_add_users() {
-        let hub = Hub::start("admin-flag");
+        let Some(hub) = Hub::start("admin-flag") else { return };
         let mut root = hub.dial(&hub.root).unwrap();
         let ann = token_of(&run_words(&mut root, &["user", "add", "ann"], true).unwrap());
         let mut as_ann = hub.dial(&ann).unwrap();
@@ -382,7 +356,7 @@ mod tests {
 
     #[test]
     fn a_reissued_token_replaces_the_old_one_and_a_revoked_user_logs_in_no_more() {
-        let hub = Hub::start("reissue");
+        let Some(hub) = Hub::start("reissue") else { return };
         let mut root = hub.dial(&hub.root).unwrap();
         let old = token_of(&run_words(&mut root, &["user", "add", "ed"], false).unwrap());
         assert!(hub.dial(&old).is_ok());

@@ -33,6 +33,8 @@ wsp-view = { path = "crates/view" }
 wsp-machines = { path = "crates/machines" }
 
 [dev-dependencies]
+# The hub tests run a real hub as an external program (`wsp_spoke::testhub`: WSP_HUB_BIN or WSP_HUB_IMAGE).
+wsp-spoke = { path = "crates/spoke", features = ["test-support"] }
 wsp-manager = { path = "crates/manager" }
 wsp-testkit = { path = "crates/testkit" }
 wsp-base = { path = "crates/base", features = ["test-support"] }

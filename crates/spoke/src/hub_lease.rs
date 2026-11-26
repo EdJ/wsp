@@ -856,59 +856,30 @@ pub mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
-    use crate::hub_client::{Client, Credential, Item};
-    use wsp_hub::{Config, Hub};
-    use wsp_store_contract::{
-        At, Command as Cmd, Entity, EventKind, IdempotencyKey, ProjectId, Row, RowState, SharedName, TokenId, UserName,
-    };
+    use crate::hub_client::{Client, Item};
+    use crate::testhub::{Setup, TestHub};
+    use wsp_store_contract::{At, Entity, EventKind, ProjectId, Row, RowState};
 
-    const DAY: Duration = Duration::from_secs(86_400);
     const WAIT: Duration = Duration::from_secs(10);
 
-    fn person(n: &str) -> Principal {
-        Principal::Person(n.into())
+    /// The lease TTL of a hub whose leases a test lets run out, in real time.
+    pub const SHORT_LEASE: u64 = 4;
+
+    /// A hub (no TLS, loopback) with `ann`, `bo` members of `shared:team`;
+    /// `None` when no hub is named (the test is skipped, `testhub`).
+    fn serve(setup: Setup) -> Option<(TestHub, BTreeMap<String, String>)> {
+        serve_users(setup, &["ann", "bo"])
     }
 
-    /// A served hub (no TLS, loopback) with `ann`, `bo` members of `shared:team`.
-    fn serve(dir: &Path) -> (wsp_hub::serve::Running, BTreeMap<String, String>) {
-        serve_users(dir, &["ann", "bo"])
+    /// A hub with `users` members of `shared:team`, and their tokens.
+    pub fn serve_users(setup: Setup, users: &[&str]) -> Option<(TestHub, BTreeMap<String, String>)> {
+        let hub = TestHub::start(setup)?;
+        let tokens = hub.seed_members(&["team"], users);
+        Some((hub, tokens))
     }
 
-    /// A served hub with `users` members of `shared:team`, and their tokens.
-    pub fn serve_users(dir: &Path, users: &[&str]) -> (wsp_hub::serve::Running, BTreeMap<String, String>) {
-        let data = dir.join("hub-data");
-        let mut tokens = BTreeMap::new();
-        {
-            let hub = Hub::open(&data).unwrap();
-            let apply = |cmd: Cmd, by: &Principal| {
-                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-            };
-            let root = person("root");
-            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-            apply(Cmd::HubWorkspaceAdd { name: SharedName("team".into()) }, &root);
-            for user in users.iter().copied() {
-                apply(Cmd::HubUserAdd { name: UserName(user.into()), admin: false }, &root);
-                apply(Cmd::HubMemberSet { workspace: SharedName("team".into()), user: UserName(user.into()), member: true }, &root);
-                let (secret, hash) = crate::hub_client::token::mint();
-                apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.into()), hash }, &root);
-                tokens.insert(user.to_string(), secret);
-            }
-        }
-        let cfg = Config {
-            data_dir: data,
-            bind: vec![],
-            port: 0,
-            peers: vec!["127.0.0.0/8".into()],
-            tls: None,
-            name: "wsp-hub".into(),
-            lease_days: 7,
-        };
-        (wsp_hub::serve::start(&cfg).expect("the hub starts"), tokens)
-    }
-
-    pub fn dial(running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> Client {
-        let url = format!("tcp://{}", running.addrs()[0]);
-        Client::dial_hub(&url, Credential::User(tokens[who].clone()), WAIT).expect("the hub answers")
+    pub fn dial(hub: &TestHub, tokens: &BTreeMap<String, String>, who: &str) -> Client {
+        hub.client(&tokens[who])
     }
 
     fn shared_row(store: &Store, id: &str) {
@@ -930,7 +901,7 @@ pub mod tests {
         let dir = std::env::temp_dir().join(format!("wsp-466-two-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = serve(&dir);
+        let Some((running, tokens)) = serve(Setup::default().lease_secs(SHORT_LEASE)) else { return };
         let (mut ann, mut bo) = (dial(&running, &tokens, "ann"), dial(&running, &tokens, "bo"));
         let mut feed = dial(&running, &tokens, "bo").subscribe(None);
         assert!(matches!(feed.next_within(WAIT), Some(Item::State { .. })));
@@ -952,22 +923,21 @@ pub mod tests {
         let why = take(&mut bo, "shared:team", "wsp-1").unwrap_err();
         assert!(why.contains("wsp-1") && why.contains("ann"), "{why}");
 
-        // Not due yet: nothing is sent. An hour on, a dead seat is not renewed...
+        // Not due yet: nothing is sent. Past half the TTL, a dead seat is not renewed...
         let now = util::epoch_secs();
-        assert_eq!(renew_due(&store, &mut ann, now, &mut |_| true), Renewed::default(), "an hour has not passed");
-        let later = now + 2 * 3600;
+        assert_eq!(renew_due(&store, &mut ann, now, &mut |_| true), Renewed::default(), "half the TTL has not passed");
+        let later = now + SHORT_LEASE as i64;
         assert_eq!(renew_due(&store, &mut ann, later, &mut |_| false), Renewed::default(), "a dead seat is not renewed");
-        // ...a live one is, and the claim's expiry moves to the hub's.
+        // ...a live one is, and the claim's expiry moves to the hub's (two seconds on, in real time).
         let before = wsp_store::store::record_expires(&store.claims()["wsp-1"]).unwrap();
-        running.hub().clock().advance(Duration::from_secs(2 * 3600));
+        std::thread::sleep(Duration::from_secs(2));
         assert_eq!(renew_due(&store, &mut ann, later, &mut |seat| seat == "cpd-a").renewed, 1);
         let after = wsp_store::store::record_expires(&store.claims()["wsp-1"]).unwrap();
-        assert!(after >= before + 2 * 3600 - 2, "{after} after {before}");
+        assert!(after >= before + 1, "{after} after {before}");
         assert_eq!(store.claims()["wsp-1"][TOKEN], held.token.0, "the token is the same one");
 
-        // A's seat is killed and not renewed; the hub's clock passes the TTL.
-        running.hub().clock().advance(8 * DAY);
-        assert_eq!(running.hub().expire_leases().unwrap().len(), 1);
+        // A's seat is killed and not renewed; the TTL passes and the hub sweeps it.
+        running.pass_ttl();
         let heard = loop {
             match feed.next_within(WAIT) {
                 Some(Item::Event(e)) if e.kind == EventKind::LeaseExpired => break e,
@@ -992,7 +962,7 @@ pub mod tests {
         let theirs = take(&mut bo, "shared:team", "wsp-1").unwrap();
         assert!(theirs.token > held.token, "{theirs:?} after {held:?}");
 
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1008,7 +978,7 @@ pub mod tests {
         let dir = std::env::temp_dir().join(format!("wsp-468-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = serve(&dir);
+        let Some((running, tokens)) = serve(Setup::default().lease_secs(SHORT_LEASE)) else { return };
         let (mut ann, mut bo) = (dial(&running, &tokens, "ann"), dial(&running, &tokens, "bo"));
 
         let store = Store::open();
@@ -1045,8 +1015,7 @@ pub mod tests {
         }
 
         // The lease runs out and B takes the row, and pushes what B has.
-        running.hub().clock().advance(8 * DAY);
-        assert_eq!(running.hub().expire_leases().unwrap().len(), 1);
+        running.pass_ttl();
         let theirs = take(&mut bo, "shared:team", "wsp-1").unwrap();
         push_verdict(&mut bo, "shared:team", "wsp-1", EventKind::RowReviewed, &json!({ "commit": "bbbbbbb" }), theirs.token).unwrap();
         let left = head(&mut bo).unwrap();
@@ -1061,7 +1030,7 @@ pub mod tests {
         let again = push_verdict(&mut ann, "shared:team", "wsp-1", EventKind::RowLanded, &json!({ "commit": "ccccccc" }), held.token);
         assert!(matches!(again, Err(PushError::Fenced(_))), "{again:?}");
 
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1077,7 +1046,7 @@ pub mod tests {
         let dir = std::env::temp_dir().join(format!("wsp-486-verdict-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = serve(&dir);
+        let Some((running, tokens)) = serve(Setup::default()) else { return };
         let mut ann = dial(&running, &tokens, "ann");
 
         let store = Store::open();
@@ -1135,7 +1104,7 @@ pub mod tests {
         take_verdict(&ds, "wsp-1", &json!({ "commit": "abc1234", "verdict": "blocks" }));
         assert!(!verdict_held(&ds, "wsp-1"), "a later blocks overrides the hold");
 
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1321,7 +1290,7 @@ pub mod tests {
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = serve(&dir);
+        let Some((running, tokens)) = serve(Setup::default()) else { return };
         let remote = env.path("remote.git");
         bare_remote(&remote);
 
@@ -1382,7 +1351,7 @@ pub mod tests {
             assert_eq!(head.landed.as_deref(), Some(t.sha.as_str()), "{who}: {other}");
         }
 
-        running.stop();
+        drop(running);
     }
 
     /// Done-when 2 (wsp-466): a row allocated to user A is refused to B's spoke
@@ -1396,7 +1365,7 @@ pub mod tests {
         let dir = std::env::temp_dir().join(format!("wsp-466-for-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = serve(&dir);
+        let Some((running, tokens)) = serve(Setup::default()) else { return };
         let (mut ann, mut bo) = (dial(&running, &tokens, "ann"), dial(&running, &tokens, "bo"));
 
         // The row as publish carries it: its `for:` in the record's fields.
@@ -1423,19 +1392,14 @@ pub mod tests {
         assert!(why.contains("forbidden") && why.contains("wsp-2"), "{why}");
         assert!(take(&mut ann, "shared:team", "wsp-2").is_ok(), "the user it is for takes it");
 
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A spoke's home logged in to the served hub as `who`.
-    pub fn login(dir: &Path, running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+    pub fn login(dir: &Path, hub: &TestHub, tokens: &BTreeMap<String, String>, who: &str) -> std::path::PathBuf {
         let home = dir.join(format!("home-{who}"));
-        let file = home.join(".config/wsp/hubs.json");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let url = format!("tcp://{}", running.addrs()[0]);
-        std::fs::write(&file, json!({ "url": url, "token": tokens[who], "user": who, "at": "2026-11-23T00:00:00Z" }).to_string()).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        hub.login(&home, who, &tokens[who]);
         home
     }
 
@@ -1450,7 +1414,7 @@ pub mod tests {
         let dir = std::env::temp_dir().join(format!("wsp-466-pub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = serve(&dir);
+        let Some((running, tokens)) = serve(Setup::default()) else { return };
         let home = login(&dir, &running, &tokens, "ann");
         let ws: wsp_engine::model::WorkspaceId = "shared:team".parse().unwrap();
 
@@ -1488,7 +1452,7 @@ pub mod tests {
         assert_eq!(store.panes_for_task(&new), vec!["cpd-a".to_string()], "the seat's binding moved with it");
         assert!(take(&mut bo, "shared:team", &new).unwrap_err().contains("ann"), "ann holds the new id");
 
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

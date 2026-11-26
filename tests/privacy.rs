@@ -1,12 +1,13 @@
 //! The privacy gate (wsp-180): B cannot see A's private rows by any read,
 //! subscribe or presence path, against the real binaries.
 //!
-//! A wsp-hub over its own listener, with three users: `ed` and `jesper`, members
-//! of `shared:core`, and `cara`, logged in but a member of nothing. Each is a
-//! `--fake` sandbox with a `wsp daemon`, and dials the hub over TLS through a
-//! **tap**: a front that ends the spoke's TLS session itself (the test's own CA
-//! and a certificate for `localhost`), writes down every frame the spoke sends in
-//! the clear, and carries it on to the hub over loopback. What a frame holds
+//! A real hub run as an external program over TLS (`wsp_spoke::testhub`:
+//! `WSP_HUB_BIN` or `WSP_HUB_IMAGE`), with three users: `ed` and `jesper`,
+//! members of `shared:core`, and `cara`, logged in but a member of nothing. Each
+//! is a `--fake` sandbox with a `wsp daemon`, and dials the hub over TLS through
+//! a **tap** of its own (`testhub::Tap`): a front that ends the spoke's TLS
+//! session itself (the hub's test CA and certificate for `localhost`), writes
+//! down every frame the spoke sends in the clear, and carries it on to the hub. What a frame holds
 //! includes what is base64 inside it (an object travels as a `Blob`), so the tap
 //! reads those too.
 //!
@@ -24,23 +25,18 @@
 //! private title in an object the hub keeps, and the same readers find them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use wsp_api::Blob;
-use wsp_client::{Client, Credential};
-use wsp_hub::{Config, Hub};
 use wsp_objects::{Object, WorkspaceId};
-use wsp_server::tcp::Tcp as Line;
-use wsp_server::testing::TestPki;
-use wsp_store_contract::{
-    At, Command as Cmd, Entity, IdempotencyKey, Principal, ProjectId, Row, RowId, RowState, SharedName, Subject, TokenId, UserName,
-};
+use wsp_spoke::hub_client::Client;
+use wsp_spoke::testhub::protocol::{Blob, Call};
+use wsp_spoke::testhub::{Setup, Tap, TestHub};
+use wsp_store_contract::{At, Entity, Principal, ProjectId, Row, RowId, RowState, Subject};
 
 const WSP: &str = env!("CARGO_BIN_EXE_wsp");
 const MACHINE: &str = r#"{"cores": 8, "load": [1.5, 1.25, 1.0], "mem_free": 60, "swap": [512, 4096], "thermal": 100}"#;
@@ -57,17 +53,13 @@ const TWO: &str = "Core row two";
 
 // ───────────────────────────────── the tap ─────────────────────────────────
 
-/// Every frame a spoke sent, with the user whose spoke it was.
-#[derive(Clone, Default)]
-struct Tap(Arc<Mutex<Vec<(String, String)>>>);
+/// Every frame a spoke sent, with the user whose spoke it was: one tap per user.
+#[derive(Default)]
+struct Taps(BTreeMap<String, Tap>);
 
-impl Tap {
-    fn push(&self, who: &str, line: String) {
-        self.0.lock().unwrap().push((who.to_string(), line));
-    }
-
+impl Taps {
     fn frames(&self) -> Vec<(String, String)> {
-        self.0.lock().unwrap().clone()
+        self.0.iter().flat_map(|(who, tap)| tap.sent().into_iter().map(move |l| (who.clone(), l))).collect()
     }
 
     /// The frames (all users', or `who`'s) in which a needle is found: the user,
@@ -157,129 +149,39 @@ fn unbase64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A TLS listener on loopback for one user's spoke: ends the session, records
-/// each line the spoke sends, and carries every line both ways to the hub.
-fn front(who: &str, hub: SocketAddr, pki: &TestPki, tap: &Tap) -> SocketAddr {
-    let config = wsp_server::tls::server_config(&pki.cert, &pki.key).expect("the front's certificate");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (who, tap) = (who.to_string(), tap.clone());
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(stream) = conn else { continue };
-            let Ok(spoke) = Line::accept_tls(stream, config.clone()) else { continue };
-            let Ok(up) = Line::dial(hub, Duration::from_secs(5)) else { continue };
-            let (mut spoke_w, mut hub_w) = (spoke.try_clone().unwrap(), up.try_clone().unwrap());
-            let (spoke_end, hub_end) = (spoke.try_clone().unwrap(), up.try_clone().unwrap());
-            let (mut spoke_r, mut hub_r) = (spoke, up);
-            let (w, t) = (who.clone(), tap.clone());
-            let ends = (spoke_end.try_clone().unwrap(), hub_end.try_clone().unwrap());
-            std::thread::spawn(move || {
-                loop {
-                    match spoke_r.recv_line(Duration::from_secs(1)) {
-                        Ok(Some(line)) => {
-                            let text = String::from_utf8_lossy(&line).into_owned();
-                            t.push(&w, text.clone());
-                            if hub_w.send_line(&format!("{text}\n")).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
-                    }
-                }
-                ends.0.shutdown();
-                ends.1.shutdown();
-            });
-            std::thread::spawn(move || {
-                loop {
-                    match hub_r.recv_line(Duration::from_secs(1)) {
-                        Ok(Some(line)) => {
-                            let text = String::from_utf8_lossy(&line).into_owned();
-                            if spoke_w.send_line(&format!("{text}\n")).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
-                    }
-                }
-                spoke_end.shutdown();
-                hub_end.shutdown();
-            });
-        }
-    });
-    addr
-}
-
 // ─────────────────────────────── the hub rig ───────────────────────────────
 
-/// A hub with `shared:core`, its users and a front each, behind the tap.
+/// A real hub with `shared:core`, its users and a tap each.
 struct HubRig {
     dir: PathBuf,
-    pki: TestPki,
-    running: Option<wsp_hub::serve::Running>,
+    hub: TestHub,
+    ca: PathBuf,
     tokens: BTreeMap<String, String>,
     urls: BTreeMap<String, String>,
-    tap: Tap,
+    tap: Taps,
 }
 
 impl HubRig {
-    /// `users` all exist; those in `members` are in `shared:core`.
-    fn up(tag: &str, users: &[&str], members: &[&str]) -> HubRig {
+    /// `users` all exist; those in `members` are in `shared:core`. `None` when
+    /// no hub is named: the test is skipped.
+    fn up(tag: &str, users: &[&str], members: &[&str]) -> Option<HubRig> {
+        let hub = TestHub::start(Setup::default().tls())?;
         let dir = PathBuf::from("/tmp").join(format!("pv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let data = dir.join("hub");
-        let mut tokens = BTreeMap::new();
-        {
-            let hub = Hub::open(&data).unwrap();
-            let apply = |cmd: Cmd, by: &Principal| {
-                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-            };
-            let root = Principal::Person("root".into());
-            let core = SharedName("core".into());
-            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-            apply(Cmd::HubWorkspaceAdd { name: core.clone() }, &root);
-            for who in users {
-                let (secret, hash) = wsp_machines::token::mint();
-                apply(Cmd::HubUserAdd { name: UserName(who.to_string()), admin: false }, &root);
-                if members.contains(who) {
-                    apply(Cmd::HubMemberSet { workspace: core.clone(), user: UserName(who.to_string()), member: true }, &root);
-                }
-                apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{who}")), user: UserName(who.to_string()), hash }, &root);
-                tokens.insert(who.to_string(), secret);
-            }
-        }
-        let cfg = Config {
-            data_dir: data,
-            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            port: 0,
-            peers: vec!["127.0.0.0/8".into()],
-            tls: None,
-            name: "wsp-hub".into(),
-            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-        };
-        let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
-        let pki = TestPki::new(&dir.join("pki"), "hub");
-        let tap = Tap::default();
-        let urls = users
-            .iter()
-            .map(|who| {
-                let at = front(who, running.addrs()[0], &pki, &tap);
-                (who.to_string(), format!("tls://localhost:{}", at.port()))
-            })
-            .collect();
-        HubRig { dir, pki, running: Some(running), tokens, urls, tap }
+        let core: &[&str] = &["core"];
+        let none: &[&str] = &[];
+        let all: Vec<(&str, &[&str])> = users.iter().map(|u| (*u, if members.contains(u) { core } else { none })).collect();
+        let tokens = hub.seed(&["core"], &all);
+        let tap = Taps(users.iter().map(|who| (who.to_string(), Tap::start(&hub))).collect());
+        let urls = tap.0.iter().map(|(who, t)| (who.clone(), t.url())).collect();
+        let ca = hub.ca().expect("a TLS hub").to_path_buf();
+        Some(HubRig { dir, hub, ca, tokens, urls, tap })
     }
 
-    fn data(&self) -> PathBuf {
-        self.dir.join("hub")
-    }
-
-    /// `who` straight on the wire, through their front (so the tap sees it).
+    /// `who` straight on the wire, through their tap (so the tap sees it).
     fn client(&self, who: &str) -> Client {
-        Client::dial_hub_ca(&self.urls[who], Credential::User(self.tokens[who].clone()), Some(&self.pki.ca), Duration::from_secs(10))
+        Client::dial_hub_ca(&self.urls[who], wsp_spoke::hub_client::Credential::User(self.tokens[who].clone()), Some(&self.ca), Duration::from_secs(10))
             .expect("dials the hub through the tap")
     }
 
@@ -288,9 +190,7 @@ impl HubRig {
     /// subject is one of `subjects`.
     fn kept(&self, needles: &[String], subjects: &[Subject]) -> Vec<String> {
         let mut found = Vec::new();
-        let mut files = Vec::new();
-        walk(&self.data(), &mut files);
-        for (path, bytes) in &files {
+        for (path, bytes) in &self.hub.data_files() {
             let text = String::from_utf8_lossy(bytes);
             for n in needles {
                 // An object's file is named by its hash, split `ab/cdef…` after two digits.
@@ -310,17 +210,15 @@ impl HubRig {
         found
     }
 
+    /// The subjects the hub has heads for in `shared:core`, as a member (ed) reads them.
     fn heads(&self) -> Vec<Subject> {
-        let hub = self.running.as_ref().unwrap().hub();
-        hub.heads(&WorkspaceId(SHARED.into())).unwrap().heads.iter().map(|(s, _)| s.clone()).collect()
+        let refs = self.hub.client(&self.tokens["ed"]).sync_heads(&WorkspaceId(SHARED.into())).unwrap();
+        refs.heads.iter().map(|(s, _)| s.clone()).collect()
     }
 }
 
 impl Drop for HubRig {
     fn drop(&mut self) {
-        if let Some(r) = self.running.take() {
-            r.stop();
-        }
         let dir = self.dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
@@ -390,7 +288,7 @@ impl Spoke {
         std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
         let login = serde_json::json!({
             "url": rig.urls[who], "token": rig.tokens[who], "user": who, "at": "2026-11-23T00:00:00Z",
-            "ca": rig.pki.ca.display().to_string(),
+            "ca": rig.ca.display().to_string(),
         });
         std::fs::write(&hubs, login.to_string()).unwrap();
         std::fs::set_permissions(&hubs, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -563,7 +461,7 @@ fn ed_makes(ed: &Spoke) -> Made {
 
 #[test]
 fn what_ed_keeps_private_reaches_no_frame_no_object_and_no_other_user() {
-    let rig = HubRig::up("gate", &["ed", "jesper", "cara"], &["ed", "jesper"]);
+    let Some(rig) = HubRig::up("gate", &["ed", "jesper", "cara"], &["ed", "jesper"]) else { return };
     let mut ed = Spoke::up(&rig, "ed");
     let mut jesper = Spoke::up(&rig, "jesper");
     let mut cara = Spoke::up(&rig, "cara");
@@ -703,7 +601,7 @@ fn what_ed_keeps_private_reaches_no_frame_no_object_and_no_other_user() {
 /// frame, and a private title inside an object, are found by the same readers.
 #[test]
 fn the_tap_and_the_store_scan_find_a_private_id_planted_in_a_frame_and_an_object() {
-    let rig = HubRig::up("bite", &["ed", "cara"], &["ed"]);
+    let Some(rig) = HubRig::up("bite", &["ed", "cara"], &["ed"]) else { return };
     let mut ed = rig.client("ed");
     let needles = vec!["hush-001".to_string(), P_TITLE.to_string()];
     assert!(rig.tap.leaks(&needles, None).is_empty(), "a clean wire to begin with");
@@ -711,7 +609,7 @@ fn the_tap_and_the_store_scan_find_a_private_id_planted_in_a_frame_and_an_object
 
     // A private id in the clear, in a frame's arguments: the hub refuses the
     // verb, which is beside the point; the frame went by.
-    let _ = ed.request("show", serde_json::json!({ "id": "hush-001" }));
+    let _ = ed.request(Call::Unknown { verb: "show".into(), args: serde_json::json!({ "id": "hush-001" }) });
     let seen = rig.tap.leaks(&needles, Some("ed"));
     assert!(seen.iter().any(|l| l.contains("`hush-001`")), "the tap finds an id planted in a frame: {seen:?}");
     assert!(rig.tap.leaks(&needles, Some("cara")).is_empty(), "the tap is per user: cara sent nothing");

@@ -339,10 +339,16 @@ mod tests {
     /// A served hub with `ed` and `jesper` in `shared:team`; this store a spoke
     /// logged in as `me`; three shared rows in `todo` and the `run` list over
     /// them, shared and running.
-    fn two_spokes(env: &wsp_engine::util::Isolated, store: &Store, me: &str) -> (wsp_hub::serve::Running, std::collections::BTreeMap<String, String>, Home) {
+    /// `None` when no hub is named (the test is skipped, `testhub`).
+    fn two_spokes(
+        env: &wsp_engine::util::Isolated,
+        store: &Store,
+        me: &str,
+        setup: crate::testhub::Setup,
+    ) -> Option<(crate::testhub::TestHub, std::collections::BTreeMap<String, String>, Home)> {
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = hub_lease::tests::serve_users(&dir, &["ed", "jesper"]);
+        let (running, tokens) = hub_lease::tests::serve_users(setup, &["ed", "jesper"])?;
         let home = Home::at(&hub_lease::tests::login(&dir, &running, &tokens, me));
         for id in ["wsp-1", "wsp-2", "wsp-3"] {
             let mut t = Task::new(id, id);
@@ -354,7 +360,7 @@ mod tests {
         w.set_groups(&[Group { members: vec!["wsp-1".into(), "wsp-2".into(), "wsp-3".into()], agent: "claude".into(), ..Group::default() }]);
         w.workspace = "shared:team".parse().unwrap();
         store.save_worklist(&w).unwrap();
-        (running, tokens, home)
+        Some((running, tokens, home))
     }
 
     /// The spoke's half of Done-when 1 (wsp-467): Ed's spoke takes the drive
@@ -371,7 +377,11 @@ mod tests {
         // The spoke's own lease code asks core who is logged in
         // (`address::logged_in_user`), which asks the installed add-on.
         let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(Spoke::new()));
-        let (running, tokens, _home) = two_spokes(&env, &store, "ed");
+        // Short leases, so the drive lease runs out in real time below.
+        let Some((running, tokens, _home)) = two_spokes(&env, &store, "ed", crate::testhub::Setup::default().lease_secs(8)) else { return };
+        let feed_client = hub_lease::tests::dial(&running, &tokens, "ed");
+        let mut feed = feed_client.subscribe(None);
+        assert!(matches!(feed.next_within(std::time::Duration::from_secs(10)), Some(crate::hub_client::Item::State { .. })), "subscribed before the leases are taken");
         let mut jesper = hub_lease::tests::dial(&running, &tokens, "jesper");
         hub_lease::take(&mut jesper, "shared:team", "wsp-2").unwrap();
         let w = store.worklist("run").unwrap();
@@ -414,15 +424,20 @@ mod tests {
         // The drive lease expires on the hub: Ed's spoke lets it go, and the
         // next gate (any spoke of Ed's) takes it again with a higher token.
         let token = hub_lease::Book::read(&store).drives["run"].token;
-        running.hub().clock().advance(std::time::Duration::from_secs(8 * 86_400));
-        let expired = running.hub().expire_leases().unwrap();
-        let drive = expired.iter().find(|e| e.row.0 == "drive:run").expect("drive:run expired");
-        let payload = serde_json::json!({ "row": drive.row.0, "token": drive.token.0 });
+        running.pass_ttl();
+        let payload = loop {
+            match feed.next_within(std::time::Duration::from_secs(10)) {
+                Some(crate::hub_client::Item::Event(e)) if e.kind == wsp_store_contract::EventKind::LeaseExpired && e.payload["row"] == "drive:run" => break e.payload,
+                Some(_) => continue,
+                None => panic!("no lease.expired for drive:run on the stream"),
+            }
+        };
+        assert_eq!(payload["token"], token.0, "the drive lease Ed's spoke held expired");
         assert!(hub_lease::follow_expired(&store, &payload));
         assert!(!hub_lease::Book::read(&store).drives.contains_key("run"));
         assert_eq!(spoke.drive(&store, &w), Drives::Here);
         assert!(hub_lease::Book::read(&store).drives["run"].token > token, "taken again");
-        running.stop();
+        drop(running);
     }
 
     /// The spoke's half of wsp-486: Jesper's spoke, on a list allocated to Ed,
@@ -435,7 +450,7 @@ mod tests {
         // The spoke's own lease code asks core who is logged in
         // (`address::logged_in_user`), which asks the installed add-on.
         let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(Spoke::new()));
-        let (running, _tokens, _home) = two_spokes(&env, &store, "jesper");
+        let Some((running, _tokens, _home)) = two_spokes(&env, &store, "jesper", crate::testhub::Setup::default()) else { return };
         let mut w = store.worklist("run").unwrap();
         w.for_user = Some("ed".into());
         store.save_worklist(&w).unwrap();
@@ -450,7 +465,7 @@ mod tests {
         assert_eq!(spoke.running_elsewhere(&store, "wsp-2"), None, "the member is this spoke's to verify");
         assert!(hub_lease::Book::read(&store).drives.is_empty());
         assert_eq!(std::fs::read_to_string(store.worklist_path("run")).unwrap(), before, "the list untouched");
-        running.stop();
+        drop(running);
     }
 
     /// The spoke's half of Done-when 2 (wsp-467): with the drive lease held by
@@ -463,7 +478,7 @@ mod tests {
         // The spoke's own lease code asks core who is logged in
         // (`address::logged_in_user`), which asks the installed add-on.
         let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(Spoke::new()));
-        let (running, tokens, _home) = two_spokes(&env, &store, "jesper");
+        let Some((mut running, tokens, _home)) = two_spokes(&env, &store, "jesper", crate::testhub::Setup::default()) else { return };
         let mut ed = hub_lease::tests::dial(&running, &tokens, "ed");
         hub_lease::take(&mut ed, "shared:team", &hub_lease::drive_row("run")).unwrap();
         let w = store.worklist("run").unwrap();

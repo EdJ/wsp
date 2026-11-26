@@ -590,54 +590,21 @@ mod tests {
         assert!(!said.contains("tok-sekrit"));
     }
 
-    /// A hub over TLS on an ephemeral loopback port, with `users` and their tokens, all under `dir`.
+    /// A real hub over TLS (`testhub`), with `users` and their tokens; `None` when no hub is named.
     struct TlsHub {
-        running: Option<wsp_hub::serve::Running>,
-        pki: wsp_server::testing::TestPki,
+        _hub: crate::testhub::TestHub,
+        ca: PathBuf,
         url: String,
         tokens: std::collections::BTreeMap<String, String>,
     }
 
     impl TlsHub {
-        fn start(dir: &Path, users: &[&str]) -> TlsHub {
-            use wsp_store_contract::{Command as Cmd, IdempotencyKey, TokenId, UserName};
-            let data = dir.join("hub-data");
-            let mut tokens = std::collections::BTreeMap::new();
-            {
-                let hub = wsp_hub::Hub::open(&data).unwrap();
-                let apply = |cmd: Cmd, by: &Principal| {
-                    hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-                };
-                let root = Principal::Person("root".into());
-                apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-                for user in users {
-                    let (secret, hash) = hub_client::token::mint();
-                    apply(Cmd::HubUserAdd { name: UserName(user.to_string()), admin: false }, &root);
-                    apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.to_string()), hash }, &root);
-                    tokens.insert(user.to_string(), secret);
-                }
-            }
-            let pki = wsp_server::testing::TestPki::new(&dir.join("pki"), "hub");
-            let cfg = wsp_hub::Config {
-                data_dir: data,
-                bind: vec![],
-                port: 0,
-                peers: vec!["127.0.0.0/8".into()],
-                tls: Some(wsp_hub::TlsFiles { cert: pki.cert.clone(), key: pki.key.clone() }),
-                name: "wsp-hub".into(),
-                lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-            };
-            let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
-            let port = running.addrs()[0].port();
-            TlsHub { running: Some(running), pki, url: format!("tls://localhost:{port}"), tokens }
-        }
-    }
-
-    impl Drop for TlsHub {
-        fn drop(&mut self) {
-            if let Some(r) = self.running.take() {
-                r.stop();
-            }
+        fn start(users: &[&str]) -> Option<TlsHub> {
+            let hub = crate::testhub::TestHub::start(crate::testhub::Setup::default().tls())?;
+            let all: Vec<(&str, &[&str])> = users.iter().map(|u| (*u, &[][..])).collect();
+            let tokens = hub.seed(&[], &all);
+            let (ca, url) = (hub.ca().expect("a TLS hub").to_path_buf(), hub.url());
+            Some(TlsHub { _hub: hub, ca, url, tokens })
         }
     }
 
@@ -648,12 +615,12 @@ mod tests {
     fn login_against_a_tls_hub_writes_the_file_a_wrong_token_writes_nothing_and_logout_removes_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = home_dir("tls");
-        let hub = TlsHub::start(&dir, &["ann", "bo"]);
+        let Some(hub) = TlsHub::start(&["ann", "bo"]) else { return };
         let home = dir.join("home");
         let path = home.join(HUBS_FILE);
 
         // A wrong token: refused by the hub, nothing written, the token said nowhere.
-        let why = log_in(&home, &hub.url, "not-a-token-the-hub-issued", Some(&hub.pki.ca)).unwrap_err();
+        let why = log_in(&home, &hub.url, "not-a-token-the-hub-issued", Some(&hub.ca)).unwrap_err();
         assert!(why.contains("refused") || why.contains("Unauthorised"), "{why}");
         assert!(!why.contains("not-a-token-the-hub-issued"), "{why}");
         assert!(!path.exists() && !home.exists(), "a refused login wrote something");
@@ -664,25 +631,25 @@ mod tests {
         assert!(!home.exists());
 
         // The right token: the file, at 0600, with the hub's name for the user.
-        let done = log_in(&home, &hub.url, &hub.tokens["ann"], Some(&hub.pki.ca)).unwrap();
+        let done = log_in(&home, &hub.url, &hub.tokens["ann"], Some(&hub.ca)).unwrap();
         assert_eq!((done.url.as_str(), done.user.as_str(), done.replaced.is_none()), (hub.url.as_str(), "ann", true));
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["url"], hub.url.as_str());
         assert_eq!(doc["user"], "ann");
         assert_eq!(doc["token"], hub.tokens["ann"].as_str());
-        assert_eq!(doc["ca"], hub.pki.ca.display().to_string());
+        assert_eq!(doc["ca"], hub.ca.display().to_string());
         assert!(doc["at"].as_str().is_some_and(|a| a.ends_with('Z')), "{doc}");
 
         // The client's own reading of the file is what it dials with.
         assert_eq!(Credential::for_hub_in(None, &home), Ok(Credential::User(hub.tokens["ann"].clone())));
         assert_eq!(hub_client::hub_url_in(None, &home).unwrap(), hub.url);
-        assert_eq!(hub_client::hub_ca_in(None, &home).unwrap(), Some(hub.pki.ca.clone()));
+        assert_eq!(hub_client::hub_ca_in(None, &home).unwrap(), Some(hub.ca.clone()));
 
         // A second login replaces the first, and says what it replaced; a wrong one leaves the first.
-        assert!(log_in(&home, &hub.url, "nope", Some(&hub.pki.ca)).is_err());
+        assert!(log_in(&home, &hub.url, "nope", Some(&hub.ca)).is_err());
         assert_eq!(hub_login_in(&home).unwrap().unwrap().user, "ann");
-        let done = log_in(&home, &hub.url, &hub.tokens["bo"], Some(&hub.pki.ca)).unwrap();
+        let done = log_in(&home, &hub.url, &hub.tokens["bo"], Some(&hub.ca)).unwrap();
         assert_eq!(done.user, "bo");
         assert_eq!(done.replaced.map(|r| r.user), Some("ann".to_string()));
         assert_eq!(hub_login_in(&home).unwrap().unwrap().user, "bo");

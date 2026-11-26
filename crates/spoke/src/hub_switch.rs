@@ -554,20 +554,21 @@ mod tests {
     struct Rig {
         _addon: wsp_engine::addon::Scoped,
         _hub_home: HubHome,
-        running: wsp_hub::serve::Running,
+        running: crate::testhub::TestHub,
         tokens: BTreeMap<String, String>,
         store: Store,
         home: std::path::PathBuf,
         _env: wsp_engine::util::Isolated,
     }
 
-    fn rig(tag: &str) -> Rig {
+    /// `None` when no hub is named (the test is skipped, `testhub`).
+    fn rig(tag: &str) -> Option<Rig> {
+        let (running, tokens) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"])?;
         let env = wsp_engine::util::isolated(&format!("hub-switch-{tag}"));
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
-        let (running, tokens) = hub_lease::tests::serve_users(&dir, &["ann", "bo"]);
         let home = hub_lease::tests::login(&dir, &running, &tokens, "ann");
         let hub_home = HubHome::at(&home);
         let addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
@@ -578,7 +579,7 @@ mod tests {
         let held = hub_lease::take(&mut ann, "shared:team", "s-1").unwrap();
         claim(&store, "s-1", "cpd-s1", Some(&held));
         claim(&store, "p-1", "cpd-p1", None);
-        Rig { _addon: addon, _hub_home: hub_home, running, tokens, store, home, _env: env }
+        Some(Rig { _addon: addon, _hub_home: hub_home, running, tokens, store, home, _env: env })
     }
 
     /// Done-when: disable parks the shared row in flight and nothing else, with
@@ -587,7 +588,7 @@ mod tests {
     /// reads as standalone to core.
     #[test]
     fn hub_switch_disable_parks_only_shared_rows_in_flight_flushes_and_gives_the_leases_back() {
-        let r = rig("disable");
+        let Some(r) = rig("disable") else { return };
         let done = disable(&r.store, &r.home);
         assert_eq!(done.parked, vec!["s-1".to_string()], "{done:?}");
         assert_eq!(done.unreachable, None, "{done:?}");
@@ -618,7 +619,6 @@ mod tests {
         assert!(lines.contains("disabled") && lines.contains("s-1 (was doing)"), "{lines}");
         // The login is kept.
         assert!(r.home.join(crate::hub_client::HUBS_FILE).exists());
-        r.running.stop();
     }
 
     /// Done-when: a disable the hub does not answer still switches off and
@@ -626,8 +626,8 @@ mod tests {
     /// hub), and `wsp hub status` says what was not sent.
     #[test]
     fn hub_switch_disable_with_the_hub_unreachable_parks_keeps_the_journal_and_says_what_was_not_sent() {
-        let r = rig("unreachable");
-        let addr = r.running.addrs()[0];
+        let Some(mut r) = rig("unreachable") else { return };
+        let addr = r.running.addr();
         r.running.stop();
         // Nothing answers on the hub's port now.
         let _ = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100));
@@ -652,7 +652,7 @@ mod tests {
     /// it stays parked and the user is told who holds it.
     #[test]
     fn hub_switch_enable_resumes_a_row_whose_lease_it_takes_and_leaves_one_another_user_holds_parked() {
-        let r = rig("enable");
+        let Some(r) = rig("enable") else { return };
         // A second shared row in flight here.
         let mut ann = hub_lease::tests::dial(&r.running, &r.tokens, "ann");
         let held = hub_lease::take(&mut ann, "shared:team", "s-2").unwrap();
@@ -678,14 +678,13 @@ mod tests {
         assert!(matches!(on.replay, Some(Ok(()))), "{on:?}");
         assert_eq!(Switch::read(&r.store).parked.keys().cloned().collect::<Vec<_>>(), vec!["s-2".to_string()], "only the one still parked is remembered");
         assert!(wsp_engine::addon::get().active(&r.store));
-        r.running.stop();
     }
 
     /// Done-when: `wsp logout` disables first (parked, leases given back), then
     /// removes the login.
     #[test]
     fn hub_switch_logout_disables_first_then_removes_the_login() {
-        let r = rig("logout");
+        let Some(r) = rig("logout") else { return };
         let args = Args::synth("logout", &[], &[]);
         assert_eq!(crate::cmd_login::logout(&r.store, &args), 0);
         assert!(!r.home.join(crate::hub_client::HUBS_FILE).exists(), "the login is gone");
@@ -695,7 +694,6 @@ mod tests {
         assert!(hub_lease::token_of(&r.store.claims()["s-1"]).is_none());
         let mut bo = hub_lease::tests::dial(&r.running, &r.tokens, "bo");
         assert!(hub_lease::take(&mut bo, "shared:team", "s-1").is_ok(), "the lease went back before the login went");
-        r.running.stop();
     }
 
 
@@ -711,7 +709,7 @@ mod tests {
     /// when it is free, and leaves the row parked naming the holder when not.
     #[test]
     fn hub_switch_a_lease_wsp_start_took_with_no_claim_is_parked_given_back_and_taken_again() {
-        let r = rig("start");
+        let Some(r) = rig("start") else { return };
         assert_eq!(start(&r.store, "s-2"), 0);
         assert_eq!(status(&r.store, "s-2"), Status::Doing);
         assert!(!r.store.claims().contains_key("s-2"), "`wsp start` makes no claim");
@@ -740,7 +738,6 @@ mod tests {
         assert_eq!(status(&r.store, "s-2"), Status::Doing);
         assert!(hub_lease::Book::read(&r.store).rows["s-2"].token > token, "a lease again, under a new token");
         assert!(hub_lease::take(&mut bo, "shared:team", "s-2").unwrap_err().contains("ann"));
-        r.running.stop();
     }
 
     /// Finding 1: whatever ends the work lets a `wsp start` lease go, as a
@@ -748,7 +745,7 @@ mod tests {
     /// landing closed by another write, at the sync worker's next sweep.
     #[test]
     fn hub_switch_the_end_of_a_started_rows_work_gives_its_lease_back() {
-        let r = rig("start-end");
+        let Some(r) = rig("start-end") else { return };
         let mut bo = hub_lease::tests::dial(&r.running, &r.tokens, "bo");
         assert_eq!(start(&r.store, "s-2"), 0);
         assert_eq!(wsp_engine::cmd_task::park(&r.store, &Args::synth("park", &["s-2", "later"], &[])), 0);
@@ -770,7 +767,6 @@ mod tests {
         assert!(hub_lease::take(&mut bo, "shared:team", "s-2").is_ok(), "landed: given back");
         // A claimed row's lease is its claim's, never swept.
         assert!(hub_lease::finished_unheld(&r.store).is_empty());
-        r.running.stop();
     }
 
     /// Finding 2: after `wsp logout` the rows the disconnect parked are still
@@ -779,14 +775,13 @@ mod tests {
     /// line, and exit 1.
     #[test]
     fn hub_switch_after_logout_status_says_not_logged_in_and_what_waits_for_the_next_login() {
-        let r = rig("logout-status");
+        let Some(r) = rig("logout-status") else { return };
         assert_eq!(crate::cmd_login::logout(&r.store, &Args::synth("logout", &[], &[])), 0);
         assert_eq!(Switch::read(&r.store).parked.keys().cloned().collect::<Vec<_>>(), vec!["s-1".to_string()], "remembered for the next login");
         let lines = logged_out_lines(&r.store).join("\n");
         assert!(lines.contains("s-1") && lines.contains("wsp login") && lines.contains("wsp hub enable"), "{lines}");
         assert!(!lines.contains("disabled since") && !lines.starts_with("off"), "{lines}");
         assert_eq!(crate::cmd_login::hub(&r.store, &Args::synth("hub", &["status"], &[])), 1);
-        r.running.stop();
     }
 
     /// Finding 3: a revoked token is a refused login, not an outage: the
@@ -794,16 +789,8 @@ mod tests {
     /// `cycle.log`, status says it, `whoami` says it, and the backoff applies.
     #[test]
     fn hub_switch_a_revoked_token_is_a_refused_login_in_the_log_the_status_and_whoami() {
-        let r = rig("revoked");
-        let root = wsp_store_contract::Principal::Person("root".into());
-        r.running
-            .hub()
-            .apply(
-                wsp_store_contract::Command::HubTokenRevoke { id: wsp_store_contract::TokenId("t-ann".into()) },
-                wsp_store_contract::IdempotencyKey("revoke-ann".into()),
-                root,
-            )
-            .expect("revoked");
+        let Some(r) = rig("revoked") else { return };
+        r.running.apply(wsp_hub_protocol::IdentityCommand::HubTokenRevoke { id: wsp_store_contract::TokenId("t-ann".into()) });
         let mut worker = hub_sync::Worker::new(r.home.clone());
         let why = worker.turn(&r.store).unwrap_err();
         assert!(hub_sync::is_refused_login(&why), "{why}");
@@ -818,17 +805,16 @@ mod tests {
         let _ = worker.turn(&r.store);
         let again = std::fs::read_to_string(r.store.state.join("cycle.log")).unwrap_or_default();
         assert_eq!(again.matches(hub_sync::REFUSED_LOGIN).count(), 1, "{again}");
-        let url = format!("tcp://{}", r.running.addrs()[0]);
-        let said = crate::spoke::whoami_at(&url, crate::hub_client::Credential::User(r.tokens["ann"].clone()), None);
+        let url = r.running.url();
+        let said = crate::spoke::whoami_at(&url, crate::hub_client::Credential::User(r.tokens["ann"].clone()), r.running.ca());
         assert!(matches!(&said, wsp_engine::addon::WhoAmI::Refused(w) if hub_sync::is_refused_login(w)), "{said:?}");
-        r.running.stop();
     }
 
     /// Finding 3: a workspace the hub will not sync for this user (not a
     /// member) is in `sync.json` and status, though the link is up.
     #[test]
     fn hub_switch_a_workspace_the_hub_will_not_sync_shows_in_sync_json_and_status() {
-        let r = rig("forbidden");
+        let Some(r) = rig("forbidden") else { return };
         let mut t = wsp_engine::model::Task::new("x-1", "x-1");
         t.workspace = "shared:other".parse().unwrap();
         r.store.save_task(&t).unwrap();
@@ -838,6 +824,5 @@ mod tests {
         assert_eq!(st["link"], "up", "{st}");
         assert!(st["refused"]["shared:other"].as_str().is_some(), "{st}");
         assert!(link_lines(&r.store).iter().any(|l| l.contains("not synced: shared:other")), "{:?}", link_lines(&r.store));
-        r.running.stop();
     }
 }

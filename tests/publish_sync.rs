@@ -1,20 +1,20 @@
 //! A published list reaches the other member (wsp-185): two spokes, ed and
-//! jesper, each a `--fake` sandbox daemon with a login to one in-process
-//! wsp-hub, both members of `shared:mp`. Ed adds three private rows and a list
+//! jesper, each a `--fake` sandbox daemon with a login to one real hub run as
+//! an external program (`wsp_spoke::testhub`: `WSP_HUB_BIN` or `WSP_HUB_IMAGE`),
+//! both members of `shared:mp`. Ed adds three private rows and a list
 //! holding them, publishes the list, and within a few turns jesper's store
 //! holds the list and the three rows under their hub ids, while ed's old ids
 //! still show the rows through ids.json.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use wsp_hub::{Config, Hub};
-use wsp_store_contract::{Command as Cmd, IdempotencyKey, Principal, SharedName, TokenId, UserName};
+use wsp_spoke::testhub::{Setup, TestHub};
 
 const WSP: &str = env!("CARGO_BIN_EXE_wsp");
 const MACHINE: &str = r#"{"cores": 8, "load": [1.5, 1.25, 1.0], "mem_free": 60, "swap": [512, 4096], "thermal": 100}"#;
@@ -45,7 +45,7 @@ struct Spoke {
 }
 
 impl Spoke {
-    fn up(root: &Path, who: &str, url: &str, token: &str) -> Spoke {
+    fn up(root: &Path, who: &str, hub: &TestHub, token: &str) -> Spoke {
         let dir = root.join(who);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -63,7 +63,10 @@ impl Spoke {
         // The login, as `wsp login` writes it, under the sandbox's hub home (wsp-490).
         let hubs = std::path::PathBuf::from(&env["WSP_HUB_HOME"]).join(".config/wsp/hubs.json");
         std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
-        let login = serde_json::json!({ "url": url, "token": token, "user": who, "at": "2026-11-23T00:00:00Z" });
+        let mut login = serde_json::json!({ "url": hub.url(), "token": token, "user": who, "at": "2026-11-23T00:00:00Z" });
+        if let Some(ca) = hub.ca() {
+            login["ca"] = serde_json::json!(ca.display().to_string());
+        }
         std::fs::write(&hubs, login.to_string()).unwrap();
         std::fs::set_permissions(&hubs, std::fs::Permissions::from_mode(0o600)).unwrap();
         let s = Spoke { dir, name, outer, env, home, daemon: None };
@@ -144,44 +147,14 @@ fn wait(what: &str, within: Duration, mut done: impl FnMut() -> bool, why: impl 
 
 #[test]
 fn a_published_list_and_its_three_rows_reach_the_other_member_under_hub_ids() {
+    let Some(hub) = TestHub::start(Setup::default()) else { return };
+    let tokens = hub.seed_members(&["mp"], &["ed", "jesper"]);
     let root = PathBuf::from("/tmp").join(format!("ps-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
-    let data = root.join("hub");
-    let (ed_token, jesper_token) = {
-        let hub = Hub::open(&data).unwrap();
-        let apply = |cmd: Cmd, by: &Principal| {
-            hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-        };
-        let root_user = Principal::Person("root".into());
-        let mp = SharedName("mp".into());
-        apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-        apply(Cmd::HubWorkspaceAdd { name: mp.clone() }, &root_user);
-        let mut tokens = Vec::new();
-        for who in ["ed", "jesper"] {
-            let (secret, hash) = wsp_machines::token::mint();
-            apply(Cmd::HubUserAdd { name: UserName(who.into()), admin: false }, &root_user);
-            apply(Cmd::HubMemberSet { workspace: mp.clone(), user: UserName(who.into()), member: true }, &root_user);
-            apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{who}")), user: UserName(who.into()), hash }, &root_user);
-            tokens.push(secret);
-        }
-        (tokens.remove(0), tokens.remove(0))
-    };
-    let cfg = Config {
-        data_dir: data,
-        bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-        port: 0,
-        peers: vec!["127.0.0.0/8".into()],
-        tls: None,
-        name: "wsp-hub".into(),
-        lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-    };
-    let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
-    let url = format!("tcp://{}", running.addrs()[0]);
-
-    let mut ed = Spoke::up(&root, "ed", &url, &ed_token);
-    let mut jesper = Spoke::up(&root, "jesper", &url, &jesper_token);
+    let mut ed = Spoke::up(&root, "ed", &hub, &tokens["ed"]);
+    let mut jesper = Spoke::up(&root, "jesper", &hub, &tokens["jesper"]);
     ed.start_daemon();
     jesper.start_daemon();
 
@@ -224,6 +197,6 @@ fn a_published_list_and_its_three_rows_reach_the_other_member_under_hub_ids() {
         assert!(text.contains(id.as_str()), "the list names {id}: {text}");
     }
     drop((ed, jesper));
-    running.stop();
+    drop(hub);
     let _ = std::fs::remove_dir_all(&root);
 }

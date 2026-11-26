@@ -970,14 +970,13 @@ dependencies = [
 name = "wsp-spoke"
 version = "0.1.0"
 dependencies = [
+ "rcgen",
  "rustls",
  "rustls-native-certs",
  "serde_json",
  "sha2",
- "wsp-api",
  "wsp-base",
  "wsp-engine",
- "wsp-hub",
  "wsp-hub-protocol",
  "wsp-objects",
  "wsp-server",

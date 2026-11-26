@@ -1502,46 +1502,25 @@ fn hub_head_in(received: &[Blob], subject: &Subject) -> Option<ObjectId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-    use wsp_store_contract::{Command as Cmd, IdempotencyKey, SharedName, TokenId};
+    use crate::testhub::{Setup, TestHub};
 
     /// wsp-484: a worker that lost `minted` (the daemon restarted with the
     /// journal not yet pushed) takes the journaled record for the unchanged
     /// row as the row's id; it makes no twin of it.
     #[test]
     fn a_restarted_worker_reuses_the_journaled_record_of_an_unchanged_row() {
+        // The hub: ann a member of `mp`, with a token. It is stopped until the daemon "restarts".
+        let Some(mut hub) = TestHub::start(Setup::default()) else { return };
+        let token = hub.seed_members(&["mp"], &["ann"])["ann"].clone();
+        hub.stop();
         let env = wsp_engine::util::isolated("hub-sync-restart");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let dir = std::env::temp_dir().join(format!("wsp-484-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
-        let data = dir.join("hub");
         std::fs::create_dir_all(&home).unwrap();
-
-        // The hub: ann a member of `mp`, with a token.
-        let token = {
-            let hub = wsp_hub::Hub::open(&data).unwrap();
-            let apply = |cmd: Cmd, by: &Principal| {
-                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-            };
-            let root = Principal::Person("root".into());
-            let mp = SharedName("mp".into());
-            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-            apply(Cmd::HubWorkspaceAdd { name: mp.clone() }, &root);
-            let (secret, hash) = hub_client::token::mint();
-            apply(Cmd::HubUserAdd { name: UserName("ann".into()), admin: false }, &root);
-            apply(Cmd::HubMemberSet { workspace: mp, user: UserName("ann".into()), member: true }, &root);
-            apply(Cmd::HubTokenIssue { id: TokenId("t-ann".into()), user: UserName("ann".into()), hash }, &root);
-            secret
-        };
-        let login = |addr: std::net::SocketAddr| {
-            let hubs = home.join(HUBS_FILE);
-            std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
-            let v = serde_json::json!({ "url": format!("tcp://{addr}"), "token": token, "user": "ann", "at": "2026-11-23T00:00:00Z" });
-            std::fs::write(&hubs, v.to_string()).unwrap();
-            std::fs::set_permissions(&hubs, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-        };
+        let login_gone = |addr: std::net::SocketAddr| log_in_at(&home, &format!("tcp://{addr}"), None, &token, "ann");
 
         // A shared row, and the hub away: a port nobody listens on.
         let mut t = wsp_engine::model::Task::new("a shared row", "wsp-484-r1");
@@ -1550,7 +1529,7 @@ mod tests {
         store.save_task(&t).unwrap();
         let subject = Subject::Row(RowId(t.id.clone()));
         let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        login(gone);
+        login_gone(gone);
 
         let mut first = Worker::new(home.clone());
         assert!(first.turn(&store).is_err(), "the hub is away");
@@ -1561,83 +1540,54 @@ mod tests {
         drop(first);
 
         // The daemon restarts; the hub is back; the file has not changed.
-        let cfg = wsp_hub::Config {
-            data_dir: data.clone(),
-            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            port: 0,
-            peers: vec!["127.0.0.0/8".into()],
-            tls: None,
-            name: "wsp-hub".into(),
-            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-        };
-        let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
-        login(running.addrs()[0]);
+        hub.restart();
+        hub.login(&home, "ann", &token);
         let mut second = Worker::new(home.clone());
         assert!(second.minted.is_empty(), "a fresh worker remembers nothing");
         second.turn(&store).expect("the hub answers");
 
-        // The hub's line for the row: one new record, the journaled one.
-        let hub = running.hub();
-        let head = hub.heads(&WorkspaceId("shared:mp".into())).unwrap().get(&subject).copied();
+        // The hub's line for the row: one new record, the journaled one. The
+        // head is read as a member reads it; the records from the hub's object files.
+        let head = hub.client(&token).sync_heads(&WorkspaceId("shared:mp".into())).unwrap().get(&subject).copied();
         assert_eq!(head, Some(id), "the hub's head is the journaled record");
-        let mut records = 0;
-        let mut stack = vec![hub.objects().root().to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
-                if e.path().is_dir() {
-                    stack.push(e.path());
-                } else if let Some(o) = std::fs::read(e.path()).ok().and_then(|b| wsp_objects::decode(&b).ok()) {
-                    records += usize::from(o.subject() == &subject);
-                }
-            }
-        }
+        let records = hub
+            .data_files()
+            .iter()
+            .filter(|(p, _)| p.starts_with("objects"))
+            .filter_map(|(_, b)| wsp_objects::decode(b).ok())
+            .filter(|o| o.subject() == &subject)
+            .count();
         assert_eq!(records, 1, "the row's line has one record, not two");
         assert!(held(&journal) <= 1 && journal.by_subject().get(&subject).is_none_or(|(_, es)| es.iter().all(|e| e.id == id)), "no twin in the journal");
-        running.stop();
+        drop(hub);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- messages through the hub (wsp-470) ----
 
-    /// A served hub whose users `ed` and `jesper` are members of `mp`; their tokens.
-    fn message_hub(dir: &std::path::Path) -> (wsp_hub::serve::Running, BTreeMap<String, String>) {
-        let data = dir.join("hub");
-        let mut tokens = BTreeMap::new();
-        {
-            let hub = wsp_hub::Hub::open(&data).unwrap();
-            let apply = |cmd: Cmd, by: &Principal| {
-                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-            };
-            let root = Principal::Person("root".into());
-            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-            apply(Cmd::HubWorkspaceAdd { name: SharedName("mp".into()) }, &root);
-            for user in ["ed", "jesper"] {
-                let (secret, hash) = hub_client::token::mint();
-                apply(Cmd::HubUserAdd { name: UserName(user.into()), admin: false }, &root);
-                apply(Cmd::HubMemberSet { workspace: SharedName("mp".into()), user: UserName(user.into()), member: true }, &root);
-                apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.into()), hash }, &root);
-                tokens.insert(user.to_string(), secret);
-            }
-        }
-        let cfg = wsp_hub::Config {
-            data_dir: data,
-            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            port: 0,
-            peers: vec!["127.0.0.0/8".into()],
-            tls: None,
-            name: "wsp-hub".into(),
-            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-        };
-        (wsp_hub::serve::start(&cfg).expect("the hub starts"), tokens)
+    /// A hub whose users `ed` and `jesper` are members of `mp`; their tokens.
+    /// `None` when no hub is named (the test is skipped, `testhub`).
+    fn message_hub() -> Option<(TestHub, BTreeMap<String, String>)> {
+        let hub = TestHub::start(Setup::default())?;
+        let tokens = hub.seed_members(&["mp"], &["ed", "jesper"]);
+        Some((hub, tokens))
     }
 
-    /// `home` logged in to the hub at `addr` as `user`, as `wsp login` writes it.
-    fn log_in(home: &std::path::Path, addr: std::net::SocketAddr, token: &str, user: &str) {
+    /// `home` logged in to the hub at `url` as `user`, as `wsp login` writes it.
+    fn log_in_at(home: &std::path::Path, url: &str, ca: Option<&std::path::Path>, token: &str, user: &str) {
         let hubs = home.join(HUBS_FILE);
         std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
-        let v = serde_json::json!({ "url": format!("tcp://{addr}"), "token": token, "user": user, "at": "2026-11-23T00:00:00Z" });
+        let mut v = serde_json::json!({ "url": url, "token": token, "user": user, "at": "2026-11-23T00:00:00Z" });
+        if let Some(ca) = ca {
+            v["ca"] = serde_json::json!(ca.display().to_string());
+        }
         std::fs::write(&hubs, v.to_string()).unwrap();
         std::fs::set_permissions(&hubs, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    }
+
+    /// `home` logged in to a plain address nothing (or a test's own listener) answers on.
+    fn log_in(home: &std::path::Path, addr: std::net::SocketAddr, token: &str, user: &str) {
+        log_in_at(home, &format!("tcp://{addr}"), None, token, user);
     }
 
     /// A store at `dir` with row `row` in `shared:mp`, claimed, and seat `pane` bound to it.
@@ -1670,13 +1620,12 @@ mod tests {
         let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
         let dir = env.home().parent().unwrap().join("two-spokes");
         let _ = std::fs::remove_dir_all(&dir);
-        let (running, tokens) = message_hub(&dir);
-        let addr = running.addrs()[0];
+        let Some((running, tokens)) = message_hub() else { return };
 
         // Jesper's spoke: the seat cpd-j1 on j-1, whose hub lease is his.
         let jesper = spoke_with_seat(&dir.join("jesper"), "j-1", "cpd-j1");
         let jesper_home = dir.join("jesper/home");
-        log_in(&jesper_home, addr, &tokens["jesper"], "jesper");
+        running.login(&jesper_home, "jesper", &tokens["jesper"]);
         dial(&jesper_home).unwrap().lease_take(&WorkspaceId("shared:mp".into()), &RowId("j-1".into())).unwrap();
         let jesper_db = crate::testkit::orders_db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
         crate::testkit::orders_seat(&jesper_db, "cpd-j1", wsp_store_contract::SeatState::Idle);
@@ -1684,7 +1633,7 @@ mod tests {
         // Ed's spoke: the seat cpd-e1 on e-9; the hub said j-1 is another user's.
         let ed = spoke_with_seat(&dir.join("ed"), "e-9", "cpd-e1");
         let ed_home = dir.join("ed/home");
-        log_in(&ed_home, addr, &tokens["ed"], "ed");
+        running.login(&ed_home, "ed", &tokens["ed"]);
         crate::hub_lease::Book::edit(&ed, |b| b.elsewhere.insert("j-1".into(), "jesper".into()));
         let ed_db = crate::testkit::orders_db(&dir.join("ed/orders"), wsp_server::Mode::Owned);
         crate::testkit::orders_seat(&ed_db, "cpd-e1", wsp_store_contract::SeatState::Idle);
@@ -1724,7 +1673,7 @@ mod tests {
         assert_eq!(replies.len(), 1, "{replies:?}");
         assert_eq!(replies[0].0, Principal::Seat(wsp_store_contract::SeatId("cpd-j1@jesper".into())));
         assert!(replies[0].1.starts_with("seat:j-1@jesper says: landed at abc123"), "{}", replies[0].1);
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1737,8 +1686,7 @@ mod tests {
         let env = wsp_engine::util::isolated("hub-msg-offline");
         let dir = env.home().parent().unwrap().join("offline");
         let _ = std::fs::remove_dir_all(&dir);
-        let (running, tokens) = message_hub(&dir);
-        let addr = running.addrs()[0];
+        let Some((running, tokens)) = message_hub() else { return };
         let jesper = spoke_with_seat(&dir.join("jesper"), "j-1", "cpd-j1");
         let jesper_home = dir.join("jesper/home");
         // Jesper's spoke is away: his login points at a port nobody listens on.
@@ -1754,7 +1702,7 @@ mod tests {
 
         // Meanwhile Ed tells Jesper's primary through the hub, from a shell.
         let ed_home = dir.join("ed/home");
-        log_in(&ed_home, addr, &tokens["ed"], "ed");
+        running.login(&ed_home, "ed", &tokens["ed"]);
         let ed = Store::at(dir.join("ed/wsp"), dir.join("ed/state"));
         ed.ensure_dirs().unwrap();
         let book = wsp_engine::address::Book { login: Some("ed".into()), ..wsp_engine::address::Book::default() };
@@ -1763,7 +1711,7 @@ mod tests {
 
         // Jesper's primary is the seat cpd-j1 here; Jesper reconnects.
         wsp_engine::cmd_message::tests_govern(&jesper, "primary", "cpd-j1");
-        log_in(&jesper_home, addr, &tokens["jesper"], "jesper");
+        running.login(&jesper_home, "jesper", &tokens["jesper"]);
         let mut worker = Worker::new(jesper_home.clone());
         // The first take tells it, and its ack is lost: the hub hands it out again.
         let mail = dial(&jesper_home).unwrap().msg_take().unwrap();
@@ -1777,7 +1725,7 @@ mod tests {
         assert!(Worker::new(jesper_home.clone()).take_messages(&jesper, &hand).unwrap() == 0);
         assert!(dial(&jesper_home).unwrap().msg_take().unwrap().is_empty(), "acknowledged on the hub");
         assert_eq!(orders_of(&db, "cpd-j1").len(), 1);
-        running.stop();
+        drop(running);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

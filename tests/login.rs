@@ -1,6 +1,7 @@
 //! `wsp login`, `wsp logout` and `wsp hub status` as processes (wsp-462), against
-//! a real hub over TLS: HOME and WSP_STATE in a temp dir, the hub in this process
-//! with a generated CA, the token on stdin. What is checked is what a person or a
+//! a real hub over TLS: HOME and WSP_STATE in a temp dir, the hub an external
+//! program (`wsp_spoke::testhub`: `WSP_HUB_BIN` or `WSP_HUB_IMAGE`) with a
+//! generated CA, the token on stdin. What is checked is what a person or a
 //! log reader could see: the file's mode, what the commands print, the command
 //! lines of the login and anything it started, and every file the call left in
 //! the state directory. The token is in none of them but `hubs.json`.
@@ -11,58 +12,33 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use wsp_hub::{Config, Hub, TlsFiles};
-use wsp_server::testing::TestPki;
-use wsp_store_contract::{Command as Cmd, IdempotencyKey, Principal, TokenId, UserName};
+use wsp_spoke::testhub::{Setup, TestHub};
 
 const WSP: &str = env!("CARGO_BIN_EXE_wsp");
 
-/// A directory of its own, a hub in it over TLS, and the home and state a `wsp` runs in.
+/// A directory of its own, a real hub over TLS (`testhub`), and the home and state a `wsp` runs in.
 struct Rig {
     dir: PathBuf,
-    running: Option<wsp_hub::serve::Running>,
-    pki: TestPki,
+    _hub: TestHub,
+    ca: PathBuf,
     url: String,
     tokens: BTreeMap<String, String>,
 }
 
 impl Rig {
-    fn new(name: &str, users: &[&str]) -> Rig {
+    /// `None` when no hub is named: the test is skipped (`wsp_spoke::testhub`).
+    fn new(name: &str, users: &[&str]) -> Option<Rig> {
+        let hub = TestHub::start(Setup::default().tls())?;
         // Short on purpose: a sandbox's fake listens on a unix socket under here, and macOS
         // refuses a path past 104 bytes, which `$TMPDIR` (/var/folders/..) alone nearly fills.
         let dir = PathBuf::from("/tmp").join(format!("wsp-li-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("home")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();
-        let data = dir.join("hub-data");
-        let mut tokens = BTreeMap::new();
-        {
-            let hub = Hub::open(&data).unwrap();
-            let apply = |cmd: Cmd, by: &Principal| {
-                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-            };
-            let root = Principal::Person("root".into());
-            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-            for user in users {
-                let (secret, hash) = wsp_machines::token::mint();
-                apply(Cmd::HubUserAdd { name: UserName(user.to_string()), admin: false }, &root);
-                apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.to_string()), hash }, &root);
-                tokens.insert(user.to_string(), secret);
-            }
-        }
-        let pki = TestPki::new(&dir.join("pki"), "hub");
-        let cfg = Config {
-            data_dir: data,
-            bind: vec![],
-            port: 0,
-            peers: vec!["127.0.0.0/8".into()],
-            tls: Some(TlsFiles { cert: pki.cert.clone(), key: pki.key.clone() }),
-            name: "wsp-hub".into(),
-            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-        };
-        let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
-        let url = format!("tls://localhost:{}", running.addrs()[0].port());
-        Rig { dir, running: Some(running), pki, url, tokens }
+        let all: Vec<(&str, &[&str])> = users.iter().map(|u| (*u, &[][..])).collect();
+        let tokens = hub.seed(&[], &all);
+        let (ca, url) = (hub.ca().unwrap().to_path_buf(), hub.url());
+        Some(Rig { dir, _hub: hub, ca, url, tokens })
     }
 
     fn home(&self) -> PathBuf {
@@ -105,7 +81,7 @@ impl Rig {
 
     fn login(&self, user: &str) -> Output {
         let token = format!("{}\n", self.tokens[user]);
-        let ca = self.pki.ca.display().to_string();
+        let ca = self.ca.display().to_string();
         let (out, _) = self.run(&["login", &self.url, "--ca", &ca], &token);
         out
     }
@@ -135,9 +111,6 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        if let Some(r) = self.running.take() {
-            r.stop();
-        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -181,10 +154,10 @@ fn said(o: &Output) -> String {
 
 #[test]
 fn login_writes_hubs_json_at_0600_with_the_url_and_user_a_wrong_token_writes_nothing_and_logout_removes_it() {
-    let rig = Rig::new("flow", &["ann", "bo"]);
+    let Some(rig) = Rig::new("flow", &["ann", "bo"]) else { return };
 
     // A wrong token: refused, nothing written, nothing said of it.
-    let ca = rig.pki.ca.display().to_string();
+    let ca = rig.ca.display().to_string();
     let (out, _) = rig.run(&["login", &rig.url, "--ca", &ca], "not-a-token-the-hub-issued\n");
     assert_eq!(out.status.code(), Some(1), "{}", said(&out));
     assert!(!said(&out).contains("not-a-token-the-hub-issued"), "{}", said(&out));
@@ -234,9 +207,9 @@ fn login_writes_hubs_json_at_0600_with_the_url_and_user_a_wrong_token_writes_not
 
 #[test]
 fn login_token_is_in_no_command_line_no_output_no_log_and_no_status() {
-    let rig = Rig::new("secret", &["ann"]);
+    let Some(rig) = Rig::new("secret", &["ann"]) else { return };
     let token = rig.tokens["ann"].clone();
-    let ca = rig.pki.ca.display().to_string();
+    let ca = rig.ca.display().to_string();
 
     // The token goes in on stdin: no command line of the login, or of what it started, has it.
     let (out, lines) = rig.run(&["login", &rig.url, "--ca", &ca], &format!("{token}\n"));
@@ -271,7 +244,7 @@ fn login_token_is_in_no_command_line_no_output_no_log_and_no_status() {
 
 #[test]
 fn login_over_a_file_wider_than_0600_is_refused_naming_it_and_leaves_it() {
-    let rig = Rig::new("wide", &["ann"]);
+    let Some(rig) = Rig::new("wide", &["ann"]) else { return };
     std::fs::create_dir_all(rig.hubs().parent().unwrap()).unwrap();
     std::fs::write(rig.hubs(), r#"{"url":"tls://old.invalid:1","token":"old"}"#).unwrap();
     std::fs::set_permissions(rig.hubs(), std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -315,8 +288,8 @@ fn in_sandbox(rig: &Rig, exports: &[(String, String)], args: &[&str], stdin: &st
 /// stands for the developer's own, never holds a `hubs.json`.
 #[test]
 fn two_sandboxes_hold_two_logins_and_the_developers_is_untouched() {
-    let rig = Rig::new("sandboxes", &["alice", "bob"]);
-    let ca = rig.pki.ca.display().to_string();
+    let Some(rig) = Rig::new("sandboxes", &["alice", "bob"]) else { return };
+    let ca = rig.ca.display().to_string();
     let a = sandbox_exports(&rig, "alice-sb");
     let b = sandbox_exports(&rig, "bob-sb");
     for exports in [&a, &b] {

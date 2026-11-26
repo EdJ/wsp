@@ -1,8 +1,9 @@
 //! Spoke mode's sync worker as processes (wsp-464): a `wsp daemon` in a `--fake`
-//! sandbox whose home holds a login, and a wsp-hub served in this process over
-//! loopback TCP. Between them a proxy that records every byte both ways, so a
-//! frame is read as the wire carried it, and that lets the hub be stopped and
-//! started again behind one address.
+//! sandbox whose home holds a login, and a real hub run as an external program
+//! (`wsp_spoke::testhub`: `WSP_HUB_BIN` or `WSP_HUB_IMAGE`). Between them a tap
+//! that records every line both ways in the clear, so a frame is read as the
+//! wire carried it, and that lets the hub be stopped and started again behind
+//! one address.
 //!
 //! 1. A row added to a shared workspace reaches the hub as one object within
 //!    two of the worker's turns; a private row never does: no object in the
@@ -11,85 +12,22 @@
 //!    syncs when the hub is back.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use wsp_hub::{Config, Hub};
-use wsp_store_contract::{Command as Cmd, IdempotencyKey, Principal, RowId, SharedName, Subject, TokenId, UserName};
+use wsp_objects::{ObjectId, WorkspaceId};
+use wsp_spoke::testhub::{Setup, Tap, TestHub};
+use wsp_store_contract::{RowId, Subject};
 
 const WSP: &str = env!("CARGO_BIN_EXE_wsp");
 const MACHINE: &str = r#"{"cores": 8, "load": [1.5, 1.25, 1.0], "mem_free": 60, "swap": [512, 4096], "thermal": 100}"#;
 /// The worker's turn here: half a second, not ten.
 const TURN_MS: &str = "500";
 const WORKSPACE: &str = "shared:mp";
-
-// ─────────────────────────────── the proxy ───────────────────────────────
-
-/// A loopback address that forwards each connection to the hub, while there is
-/// one, and records what passed. With no hub it takes a connection and closes
-/// it, as a stopped hub's port would refuse it.
-struct Proxy {
-    addr: SocketAddr,
-    upstream: Arc<Mutex<Option<SocketAddr>>>,
-    wire: Arc<Mutex<Vec<u8>>>,
-}
-
-impl Proxy {
-    fn start() -> Proxy {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let upstream: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-        let wire = Arc::new(Mutex::new(Vec::new()));
-        let (up, w) = (upstream.clone(), wire.clone());
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(client) = conn else { continue };
-                let to = *up.lock().unwrap();
-                let Some(hub) = to.and_then(|a| TcpStream::connect(a).ok()) else {
-                    let _ = client.shutdown(Shutdown::Both);
-                    continue;
-                };
-                for (from, into) in [(client.try_clone().unwrap(), hub.try_clone().unwrap()), (hub, client)] {
-                    let w = w.clone();
-                    std::thread::spawn(move || pipe(from, into, &w));
-                }
-            }
-        });
-        Proxy { addr, upstream, wire }
-    }
-
-    fn point_at(&self, hub: Option<SocketAddr>) {
-        *self.upstream.lock().unwrap() = hub;
-    }
-
-    fn wire(&self) -> String {
-        String::from_utf8_lossy(&self.wire.lock().unwrap()).into_owned()
-    }
-}
-
-/// Copy `from` into `into` until either ends, recording each read; then close both.
-fn pipe(mut from: TcpStream, mut into: TcpStream, wire: &Mutex<Vec<u8>>) {
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        match from.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                wire.lock().unwrap().extend_from_slice(&buf[..n]);
-                if into.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    let _ = from.shutdown(Shutdown::Both);
-    let _ = into.shutdown(Shutdown::Both);
-}
 
 // ──────────────────────────────── the rig ────────────────────────────────
 
@@ -108,14 +46,14 @@ fn bare(env: &BTreeMap<String, String>, home: &Path) -> Command {
     c
 }
 
-/// A hub (its data directory, served while `running`), the proxy in front of
-/// it, and a fake sandbox whose home is logged in to it as `ann`, a member of
-/// `mp`.
+/// A real hub (`wsp_spoke::testhub`), the tap in front of it (which records
+/// every line both ways, and stays one address across a stop and a start),
+/// and a fake sandbox whose home is logged in to it as `ann`, a member of `mp`.
 struct Rig {
     dir: PathBuf,
-    data: PathBuf,
-    running: Option<wsp_hub::serve::Running>,
-    proxy: Proxy,
+    hub: TestHub,
+    token: String,
+    proxy: Tap,
     name: String,
     outer: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
@@ -124,31 +62,17 @@ struct Rig {
 }
 
 impl Rig {
-    fn up(tag: &str) -> Rig {
+    /// `None` when no hub is named: the test is skipped.
+    fn up(tag: &str) -> Option<Rig> {
+        // The hub: root, the workspace, and ann in it with a token.
+        let hub = TestHub::start(Setup::default())?;
+        let token = hub.seed_members(&["mp"], &["ann"])["ann"].clone();
+        let proxy = Tap::start(&hub);
         // Short: the fake backend's unix socket lives under it.
         let dir = PathBuf::from("/tmp").join(format!("hs{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
-
-        // The hub: root, the workspace, and ann in it with a token.
-        let data = dir.join("hub");
-        let token = {
-            let hub = Hub::open(&data).unwrap();
-            let apply = |cmd: Cmd, by: &Principal| {
-                hub.apply(cmd.clone(), IdempotencyKey(format!("{cmd:?}")), by.clone()).expect("the identity machine takes it");
-            };
-            let root = Principal::Person("root".into());
-            let mp = SharedName("mp".into());
-            apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
-            apply(Cmd::HubWorkspaceAdd { name: mp.clone() }, &root);
-            let (secret, hash) = wsp_machines::token::mint();
-            apply(Cmd::HubUserAdd { name: UserName("ann".into()), admin: false }, &root);
-            apply(Cmd::HubMemberSet { workspace: mp, user: UserName("ann".into()), member: true }, &root);
-            apply(Cmd::HubTokenIssue { id: TokenId("t-ann".into()), user: UserName("ann".into()), hash }, &root);
-            secret
-        };
-        let proxy = Proxy::start();
 
         let outer: BTreeMap<String, String> = [
             ("WSP_HOME".to_string(), dir.join("store").display().to_string()),
@@ -164,63 +88,37 @@ impl Rig {
         // The login, as `wsp login` writes it, under the sandbox's hub home (wsp-490).
         let hubs = std::path::PathBuf::from(&env["WSP_HUB_HOME"]).join(".config/wsp/hubs.json");
         std::fs::create_dir_all(hubs.parent().unwrap()).unwrap();
-        let login = serde_json::json!({ "url": format!("tcp://{}", proxy.addr), "token": token, "user": "ann", "at": "2026-11-23T00:00:00Z" });
+        let mut login = serde_json::json!({ "url": proxy.url(), "token": token, "user": "ann", "at": "2026-11-23T00:00:00Z" });
+        if let Some(ca) = proxy.ca() {
+            login["ca"] = serde_json::json!(ca.display().to_string());
+        }
         std::fs::write(&hubs, login.to_string()).unwrap();
         std::fs::set_permissions(&hubs, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let mut rig = Rig { dir, data, running: None, proxy, name, outer, env, home, daemon: None };
+        let rig = Rig { dir, hub, token, proxy, name, outer, env, home, daemon: None };
         rig.ok(&["init"]);
         rig.ok(&["project", "add", "alpha", "--name", "Alpha"]);
-        rig.start_hub();
-        rig
+        Some(rig)
     }
 
     fn start_hub(&mut self) {
-        let cfg = Config {
-            data_dir: self.data.clone(),
-            bind: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            port: 0,
-            peers: vec!["127.0.0.0/8".into()],
-            tls: None,
-            name: "wsp-hub".into(),
-            lease_days: wsp_hub::DEFAULT_LEASE_DAYS,
-        };
-        let running = wsp_hub::serve::start(&cfg).expect("the hub starts");
-        self.proxy.point_at(Some(running.addrs()[0]));
-        self.running = Some(running);
+        self.hub.restart();
+        self.proxy.point_at(Some(&self.hub));
     }
 
     fn stop_hub(&mut self) {
         self.proxy.point_at(None);
-        if let Some(r) = self.running.take() {
-            r.stop();
-        }
+        self.hub.stop();
     }
 
-    fn hub(&self) -> &Hub {
-        self.running.as_ref().expect("the hub is up").hub()
-    }
-
-    /// The hub's head for `row` in the workspace, if it has one.
-    fn hub_head(&self, row: &str) -> Option<wsp_api::ObjectId> {
-        let refs = self.hub().heads(&wsp_api::WorkspaceId(WORKSPACE.into())).unwrap();
+    /// The hub's head for `row` in the workspace, if it has one, as ann reads it.
+    fn hub_head(&self, row: &str) -> Option<ObjectId> {
+        let refs = self.hub.client(&self.token).sync_heads(&WorkspaceId(WORKSPACE.into())).unwrap();
         refs.get(&Subject::Row(RowId(row.into()))).copied()
     }
 
     /// Every object file in the hub's store, as text.
     fn hub_objects(&self) -> Vec<String> {
-        fn walk(dir: &Path, out: &mut Vec<String>) {
-            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if let Ok(b) = std::fs::read(&p) {
-                    out.push(String::from_utf8_lossy(&b).into_owned());
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(self.hub().objects().root(), &mut out);
-        out
+        self.hub.data_files().into_iter().filter(|(p, _)| p.starts_with("objects")).map(|(_, b)| String::from_utf8_lossy(&b).into_owned()).collect()
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -336,7 +234,6 @@ impl Drop for Rig {
             let _ = d.kill();
             let _ = d.wait();
         }
-        self.stop_hub();
         let _ = bare(&self.outer, &self.home).args(["sandbox", "rm", &self.name]).output();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -346,7 +243,7 @@ impl Drop for Rig {
 
 #[test]
 fn a_shared_row_reaches_the_hub_as_one_object_within_two_turns_and_a_private_one_never_does() {
-    let mut rig = Rig::up("a");
+    let Some(mut rig) = Rig::up("a") else { return };
     rig.daemon_turning();
     assert!(rig.threads().iter().any(|t| t == "hub-sync"), "no hub-sync thread: {:?}", rig.threads());
 
@@ -364,7 +261,7 @@ fn a_shared_row_reaches_the_hub_as_one_object_within_two_turns_and_a_private_one
     assert_eq!(objects.len(), 1, "the hub holds one object: {objects:?}");
     assert!(objects[0].contains(&shared) && objects[0].contains("Told to the team"), "the object is the shared row: {}", objects[0]);
     let head = rig.hub_head(&shared).unwrap();
-    assert_eq!(rig.hub().get(&[head]).unwrap().len(), 1, "the head is the object held");
+    assert_eq!(rig.hub.client(&rig.token).sync_get(vec![head]).unwrap().len(), 1, "the head is the object held");
 
     // The private row: in no object and in no frame.
     for o in &objects {
@@ -379,7 +276,7 @@ fn a_shared_row_reaches_the_hub_as_one_object_within_two_turns_and_a_private_one
 
 #[test]
 fn with_the_hub_stopped_the_worker_says_so_once_keeps_running_and_syncs_when_it_is_back() {
-    let mut rig = Rig::up("b");
+    let Some(mut rig) = Rig::up("b") else { return };
     rig.daemon_turning();
     let first = rig.add("Before the outage", Some(WORKSPACE));
     rig.wait("the first row on the hub", Duration::from_secs(30), |r| r.hub_head(&first).is_some());
