@@ -829,7 +829,6 @@ dependencies = [
  "serde",
  "serde_json",
  "wsp-api",
- "wsp-objects",
  "wsp-store-contract",
 ]
 

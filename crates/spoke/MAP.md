@@ -22,6 +22,12 @@ row; `docs/multiplayer.md`). Depends on `wsp-engine` and the crates below it (`w
   login file and `WSP_HUB_*` (`hubs.json`), certificate expiry, the GitHub login, and token mint/hash
 - `cmd_login`, `cmd_hub`, `cmd_publish`, `cmd_allocate` — the verbs of the shared side (`wsp login`, with a token or
   `--github`, `logout`, `hub`, `publish`, `allocate`)
+- `testhub` (behind `test-support`, and in this crate's tests) — a real hub for tests, run as an external program:
+  `WSP_HUB_BIN` (the `wsp-hub` binary of the hub's repository) or `WSP_HUB_IMAGE` (its container image, over TLS with
+  a throwaway CA, removed on drop). Seeded over the wire through `hub_client`; URL, CA, tokens, restart and stop, the
+  log and data files, raw frames (`Wire`), a `Tap` that records every line; `protocol` re-exports the wire for the
+  root's raw-frame tests. With neither variable, `TestHub::start` is `None` and the test returns, after one notice per
+  test binary; `WSP_HUB_REQUIRED=1` makes that a failure
 
 ## Does not hold
 
@@ -30,9 +36,16 @@ never name it.
 
 ## Tests
 
-`cargo test -p wsp-spoke` (75). Its tests log in to a real hub (`wsp-hub`, the old in-tree hub, a dev-dependency, with
-`wsp-api` beside it to hand it objects in its own types) over TLS. The GitHub login is tested against a scripted
-connection only: the in-tree hub serves no login. They use the
+`cargo test -p wsp-spoke` (81). The tests that need a hub run the hub's own program (`testhub`):
+
+```text
+WSP_HUB_BIN=<path to wsp-hub> cargo test -p wsp-spoke        # the binary, a child process on loopback
+WSP_HUB_IMAGE=wsp-hub:test cargo test -p wsp-spoke           # the container image, over TLS
+```
+
+Without either they are skipped, said once per test binary. Leases run out in real time (`Setup::lease_secs`); what a
+test reads of the hub it reads over the wire, or from its data files. The GitHub login is tested against a scripted
+connection only. They use the
 engine's fixtures behind its `test-support` feature (`verification::record`, `cmd_message::tests_govern`);
 the orders fixtures (`testkit::orders_db`, `orders_seat`) are its own, because the engine's normal dependencies never reach the sqlite crate. The three drive-lease scenarios are split at the add-on interface: through `cycle::step`, with a
 scripted `SharedWork`, in the engine's `cycle` tests; against a real hub, asking the real `Spoke`, in `spoke.rs`. None

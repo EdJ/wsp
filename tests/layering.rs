@@ -637,6 +637,65 @@ fn the_engine_does_not_reach_the_spoke() {
     assert!(deps_named(&spoke).contains("wsp-engine"), "wsp-spoke is the add-on of wsp-engine");
 }
 
+/// The hub is a program of its own repository: no crate of this workspace is
+/// `wsp-hub`, none depends on it, and nothing names a `crates/hub`. Its wire,
+/// `wsp-hub-protocol`, is the spoke's alone: `wsp-spoke` is the one crate that
+/// depends on it (the root's tests reach it through the spoke's `testhub`).
+#[test]
+fn the_hub_is_not_in_this_workspace_and_its_wire_is_the_spokes_alone() {
+    for m in manifests() {
+        let text = fs::read_to_string(&m).unwrap();
+        assert!(!text.lines().any(|l| l.trim() == "name = \"wsp-hub\""), "{} is the hub", m.display());
+        assert!(!declares(&text, "wsp-hub"), "{} depends on wsp-hub", m.display());
+        assert!(!text.contains("crates/hub\"") && !text.contains("\"../hub\""), "{} names crates/hub", m.display());
+        let is_spoke = m.ends_with("crates/spoke/Cargo.toml");
+        let is_protocol = m.ends_with("crates/hub-protocol/Cargo.toml");
+        if !is_spoke && !is_protocol {
+            assert!(!declares(&text, "wsp-hub-protocol"), "{} depends on wsp-hub-protocol: only wsp-spoke may", m.display());
+        }
+    }
+    assert!(!root().join("crates/hub").exists(), "crates/hub is back");
+    assert!(declares(&fs::read_to_string(root().join("crates/spoke/Cargo.toml")).unwrap(), "wsp-hub-protocol"));
+}
+
+/// What only the old in-tree hub needed stays out of the state core's crates: their manifests
+/// name no TLS crate, and their sources none of the hub's items (a check by name, so a
+/// reintroduction under the same name fails here).
+#[test]
+fn the_state_cores_server_api_client_and_machines_hold_no_hub_item() {
+    let words = |dir: &str| -> String {
+        let mut out = String::new();
+        let mut stack = vec![root().join(dir).join("src")];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push_str(&strip(&fs::read_to_string(&p).unwrap()));
+                }
+            }
+        }
+        out
+    };
+    let banned: &[(&str, &[&str])] = &[
+        ("crates/server", &["SyncVerbs", "trait Gate", "Welcomed", "accept_tls", "Ranges", "revoke", "fn readable"]),
+        ("crates/api", &["SyncCall", "HubMessage", "MsgSend", "RefMove", "IdsAlloc", "LeaseTake", "fence_subject", "SYNC_VERBS", "Fenced"]),
+        ("crates/client", &["dial_hub", "Credential", "HUB_HOME_ENV", "hubs.json", "hub_cert_expiry", "SyncReport", "MemHub", "rustls", "Resync { state", "Gone { subject", "fn refused(&self)"]),
+        ("crates/machines", &["Identity", "pub mod token", "/dev/urandom"]),
+    ];
+    for (dir, items) in banned {
+        let code = words(dir);
+        for item in *items {
+            assert!(!code.contains(item), "{dir} holds `{item}`, which only the old in-tree hub needed");
+        }
+        let manifest = fs::read_to_string(root().join(dir).join("Cargo.toml")).unwrap();
+        for dep in ["rustls", "rustls-native-certs", "rcgen", "sha2", "wsp-objects"] {
+            assert!(!declares(&manifest, dep), "{dir} depends on {dep} again");
+        }
+    }
+}
+
 /// `wsp-manager`, the agent manager, depends on `wsp-host-api`, `wsp-base` and
 /// `wsp-host`, and on nothing of the store or the wire (2.3 R1, d1 Q3; wsp-021).
 #[test]
@@ -758,15 +817,15 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
     );
 }
 
-/// No manifest of the workspace but the root's and the hub's names `wsp-store-sqlite`: nothing
-/// but the two binaries links the backend (wsp-460: the hub keeps its refs and leases in it).
+/// No manifest of the workspace but the root's names `wsp-store-sqlite`: nothing but the binary
+/// links the backend (the hub, which keeps its own store, is a program of its own repository).
 /// One exception, for tests alone: `wsp-engine` (wsp-440) names it as a dev-dependency, because
 /// the engine's orders, fold and mirror tests open a real `state.db` as the daemon does; its
 /// normal dependencies never reach it (`the_engine_links_neither_the_sqlite_crate_nor_a_binary`).
 /// The same exception holds for `wsp-spoke`, whose sync tests serve the orders a hub's peers write.
 #[test]
 fn no_manifest_but_the_roots_names_the_sqlite_crate() {
-    let binaries = [root().join("Cargo.toml"), root().join("crates/hub/Cargo.toml")];
+    let binaries = [root().join("Cargo.toml")];
     let tests_only = [root().join("crates/engine/Cargo.toml"), root().join("crates/spoke/Cargo.toml")];
     for m in manifests() {
         if binaries.contains(&m) {
@@ -784,7 +843,7 @@ fn no_manifest_but_the_roots_names_the_sqlite_crate() {
         let own = text.lines().any(|l| l.trim() == "name = \"wsp-store-sqlite\"");
         assert!(
             own || !text.contains("wsp-store-sqlite"),
-            "{} names wsp-store-sqlite; only the root manifest and the hub's may (docs/state-core.md section 6)",
+            "{} names wsp-store-sqlite; only the root manifest may (docs/state-core.md section 6)",
             m.display()
         );
     }
@@ -828,14 +887,13 @@ fn deps_named(manifest: &str) -> BTreeSet<String> {
 }
 
 /// `wsp-api`, the API's wire types, is a contract crate (R2, R5): it depends on
-/// `wsp-store-contract` and, since the sync verbs (wsp-459), `wsp-objects` (pure: the ids, refs
-/// and workspaces they carry), and on nothing else of the workspace, directly or through them,
+/// `wsp-store-contract` and on nothing else of the workspace, directly or through it,
 /// its own tests included (`docs/state-core.md` section 6; wsp-071). Its only other dependencies
 /// are `serde` and `serde_json`, so no IO crate, and its source names no IO of the standard
 /// library: a carrier is `wsp-server`'s or `wsp-client`'s.
 #[test]
 fn the_api_links_the_contract_alone_and_does_no_io() {
-    const MAY: &[&str] = &["wsp-store-contract", "wsp-objects"];
+    const MAY: &[&str] = &["wsp-store-contract"];
     let dir = root().join("crates/api");
     let bad = beyond(&reached_from(&dir, "wsp-api"), MAY);
     assert!(
@@ -845,8 +903,8 @@ fn the_api_links_the_contract_alone_and_does_no_io() {
 
     let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
     let extra: Vec<&String> =
-        named.iter().filter(|d| !["serde", "serde_json", "wsp-store-contract", "wsp-objects", "wsp-api"].contains(&d.as_str())).collect();
-    assert!(extra.is_empty(), "wsp-api depends on serde, serde_json, the contract and the objects alone, not {extra:?}");
+        named.iter().filter(|d| !["serde", "serde_json", "wsp-store-contract", "wsp-api"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-api depends on serde, serde_json and the contract alone, not {extra:?}");
 
     const IO: &[&str] = &[
         "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "File::", "TcpStream",
@@ -956,8 +1014,7 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
         "wsp-server's normal dependencies are the api, the machines and the contract"
     );
 
-    // `wsp-objects` comes with the api's sync verbs (wsp-459), never as a dependency of its own.
-    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-machines", "wsp-store-conformance", "wsp-objects"];
+    const MAY: &[&str] = &["wsp-api", "wsp-store-contract", "wsp-machines", "wsp-store-conformance"];
     let bad = beyond(&reached_from(&dir, "wsp-server"), MAY);
     assert!(
         bad.is_empty(),
@@ -993,7 +1050,7 @@ fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone(
 
     // `wsp-machines` comes with the server its tests start (wsp-121), never as a dependency of its own.
     const MAY: &[&str] =
-        &["wsp-api", "wsp-store-contract", "wsp-objects", "wsp-server", "wsp-machines", "wsp-store-conformance"];
+        &["wsp-api", "wsp-store-contract", "wsp-server", "wsp-machines", "wsp-store-conformance"];
     let bad = beyond(&reached_from(&dir, "wsp-client"), MAY);
     assert!(
         bad.is_empty(),

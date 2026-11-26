@@ -2,9 +2,8 @@
 
 The state core's API on the wire (`docs/state-core.md` section 4; section 6's `wsp-api` row; state-core step 1,
 wsp-071). A contract crate under `docs/components.md` R2: types, one trait and constants, no IO. Depends on
-`wsp-store-contract` (whose rows, seats, events, commands, refusals and `Feed` it carries), `wsp-objects` (pure; the
-ids, refs and workspaces the sync verbs carry, wsp-459), `serde` and `serde_json`, and on nothing else of the
-workspace; `tests/layering.rs` holds it to that and to no IO of the standard library.
+`wsp-store-contract` (whose rows, seats, events, commands, refusals and `Feed` it carries), `serde` and
+`serde_json`, and on nothing else of the workspace; `tests/layering.rs` holds it to that and to no IO of the standard library.
 Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the client by the CLI and web-chrome.
 
 ## Holds
@@ -12,19 +11,11 @@ Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the 
 - `src/lib.rs` — `Frame` (one line, tagged `type`: `hello`, `welcome`, `refused`, `request`, `reply`, `feed`);
   `Hello` (4.1's credential: `token`, `by`, `client`, `protocol`), `Welcome` (`server`, `protocol`, `head`),
   `Refused` (`code`, `text`); `Request` (4.1's envelope `v`, `id`, `key?`, `by`, then `verb` and `args`) and its
-  `Call` (a read `Verb`, a contract `Command`, a `SyncCall`, or `Unknown`); `Verb` (4.2's read verbs, 4.3's `subscribe`, wsp-695's `wip`,
+  `Call` (a read `Verb`, a contract `Command`, or `Unknown`); `Verb` (4.2's read verbs, 4.3's `subscribe`, wsp-695's `wip`,
   the view verbs `throttle`, `spend` and `show { id }`, wsp-307, and `whoami`, wsp-165: the principal the connection is held as and the instance) and
   `NoArgs`; `Reply` (`id`, `ok` | `err`, `events`), `Outcome`, `Answer` (one per verb), `Failure` and `Code`;
   `ReqId`, `ApiToken`, `Listen`; `PROTOCOL`, `TOKEN_FILE`, `TOKEN_MODE`, `LISTEN_FILE`, `MAX_EVENTS`,
   `READ_VERBS`, `COMMAND_VERBS`; the contract's types re-exported where a frame carries them
-- `src/sync.rs` (wsp-459) — `SyncCall`, the hub's sync verbs: `sync.heads { workspace }`, `sync.have { ids }`,
-  `sync.put { objects }`, `sync.get { ids }`, `refs.move { workspace, subject, from, to }` (`RefMove`); `Blob` (an
-  id and its bytes, base64 on the wire); `Move` (`moved { head }` or `stale { head }`); `SYNC_VERBS`; the `base64`
-  codec (RFC 4648, padded; no crate for it); `ObjectId`, `Refs` and `WorkspaceId` re-exported from `wsp-objects`.
-  Their answers are `Answer::Heads`, `Missing`, `Stored { stored }`, `Objects` and `Move`. The message verbs
-  (wsp-470): `msg.send` (`MsgSend { to, from, seat?, text, re? }`) answered `Queued { id, user }`, `msg.take`
-  answered `Messages` (`HubMessage`s), `msg.ack { ids }` answered `Acked { acked }`; `msg_subject` names the
-  `order.queued` announcement
 - `src/principal.rs` — `Principal`'s text form (`person:ed`, `seat:cpd-3698`, `manager:<host>`,
   `executor:<machine>`, `wsp:<instance>`): `text`, `parse` (a `Malformed` error, never a panic), `KINDS`, and the
   `#[serde(with = "principal")]` helpers the envelope's `by` uses
@@ -32,7 +23,7 @@ Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the 
   rule, copied word for word from `wsp-host-api` (compact JSON plus one `\n`, a 16 MB line cap, `Malformed` keeps the
   connection); `pair`/`Memory`, the in-memory implementation, behind `test-support`
 - `tests/round_trip.rs` — tables of every frame type, request verb (each command included), answer, error code and
-  `Feed` frame, round-tripped with their wire names (the sync verbs and their answers too, and their spelling pinned), each table's coverage held by an exhaustive match; the verb
+  `Feed` frame, round-tripped with their wire names, each table's coverage held by an exhaustive match; the verb
   tables held to the variants; `Principal`'s text form for every kind and malformed ones; the pinned spelling;
   peers of other versions; the memory pair's framing
 
@@ -74,10 +65,9 @@ or `Principal` fails to compile here (`tests/round_trip.rs`) until `COMMAND_VERB
   `Show`, each the JSON document `wsp throttle --json`, `wsp spend --json` and `wsp show <id> --json` print, as a
   `Value`, so a client printing it pretty has the CLI's bytes; web-chrome reads them in place of spawning the CLI.
   Additive: an older server answers them `unsupported`, so `PROTOCOL` stays 1.
-- **The sync verbs (wsp-459)** are a third kind of call, `Call::Sync`, decoded after a command and before
-  `Unknown`. None carries a key: a put is idempotent by its hash, a move by its `from`. A move from a head that is
-  not the hub's is answered `ok: {"move": {"stale": {"head": …}}}`, not `err`: the head is data the writer
-  reconciles from (wsp-176), and `Failure` has no field to carry it without touching every literal of it. A local
-  server answers the sync verbs `unsupported`; the hub (wsp-460) runs them. Additive, so `PROTOCOL` stays 1.
+- **The hub's wire is not here.** The sync, id, lease and message verbs, their answers and `fenced` were part of
+  this crate while the old in-tree hub ran on `wsp-server`; they are `wsp-hub-protocol`'s (the spoke's), byte for
+  byte as they were (its `tests/golden`). A hub verb sent to a local server decodes as `Call::Unknown` and is
+  answered `unsupported`.
 - **`Principal`'s text form** splits at the first `:`, so a name may hold one; rendering is total, and parsing
   accepts every rendering. `executor:` is the contract's fifth kind, beside the four the row names.

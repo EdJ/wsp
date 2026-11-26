@@ -2,8 +2,8 @@
 
 The state core's machines (`docs/state-core.md` section 3), each a pure `Domain` (`decide`, `evolve`) over the
 contract's types: section 6's crate. Depends on `wsp-store-contract` and `serde_json` (an event's payload), nothing
-else (plus `sha2` for `token::hash`), and its domains do no IO and reads no clock; only `token::mint` reads
-`/dev/urandom`, and `tests/layering.rs` lets `src/token.rs` name `std::fs`, `std::io` and `File::` and nothing else. Step 2 brings the orders machine (wsp-118); seats,
+else, and does no IO and reads no clock (`tests/layering.rs`). The hub's identity machine and its tokens left with
+the old in-tree hub: they are the hub's, in its own repository. Step 2 brings the orders machine (wsp-118); seats,
 rows and lists come with steps 3 and 4. Nothing outside this crate names it yet: wsp-server composes `Orders` with
 its `Mirror` at group 3 (wsp-121).
 
@@ -14,14 +14,6 @@ its `Mirror` at group 3 (wsp-121).
   routes them), `decide` with the table in its module docs, and `evolve`, which folds the `order.*` events and
   `lease.taken`/`lease.released` (`order.deliver`'s guard reads the lease). `ATTEMPTS` (3), the counted refusals
   before `failed`. Order ids are `<seat>-o<n>`, minted from the state
-- `src/identity.rs` — `Identity` (wsp-159), the hub's users and token records: `owns` (the `hub.user.*` /
-  `hub.token.*` verbs, `hub.workspace.add`, `hub.member.set`), `decide` with the table in its module docs (admin user may; the hub's `wsp:<instance>`
-  only `hub.user.add { admin: true }` while no active admin exists; else `forbidden`), `evolve` into
-  `State.users` / `State.credentials`. Revoking a user revokes their active tokens in the same decision. Shared
-  workspaces and their members (wsp-478) fold into `State.workspaces` / `State.members`
-- `src/token.rs` — `mint()` (32 random bytes as hex, and its hash; reads `/dev/urandom`, so it is no part of a
-  domain), `hash` (hex SHA-256), `same` (constant-time compare)
-- `tests/identity.rs` — who may, the rules and the fold through `Log`; the token helpers
 - `tests/orders.rs` — one test per transition of 3.1; every illegal transition in one table, each refused with
   its exact `Refusal` and nothing written (the stand-in for conformance case 9, below); each answer applied twice
   deciding nothing the second time. `Log` there is a backend's `apply` in memory: decide, stamp, fold
@@ -30,7 +22,7 @@ its `Mirror` at group 3 (wsp-121).
 
 - **Pure.** `decide` reads only the `State`, the command and the principal; `evolve` only the state and the
   event. A refusal drafts nothing. No `std::fs`, `std::net`, `std::process`, `std::time` or the like
-  (`tests/layering.rs`), bar `token::mint`'s read of `/dev/urandom`, which is no part of a `Domain`.
+  (`tests/layering.rs`).
 - **The contract's refusals only** (R5: a new code is a contract row). 3.1's "no seat" is `not_found { seat }` or
   `illegal { seat, "gone", verb }`; "busy" and "not ready" are `illegal { seat, <its state>, "order.deliver" }`;
   every other illegal transition is `illegal { order, <its state>, verb }`. `order.deliver`'s fence is checked
