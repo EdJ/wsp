@@ -123,10 +123,24 @@ fn home() -> Option<std::path::PathBuf> {
     hub_client::hub_home()
 }
 
-/// The lease a claim on `row` needs, taken before anything is written: `None`
-/// for a private row or a spoke with no login, `Err` for a refusal (the claim
-/// is then not made) or a hub that does not answer.
+/// The lease a claim on `row` (or a `wsp start`) needs, taken before anything
+/// is written: `None` for a private row or a spoke with no login, `Err` for a
+/// refusal (the claim is then not made) or a hub that does not answer. A lease
+/// taken is kept in the book ([`Book::rows`]) with its token, whether or not a
+/// claim will hold it: `wsp start` makes none, and a lease no record here
+/// knows could never be given back.
 pub fn before_claim(store: &Store, row: &str) -> Result<Option<Held>, String> {
+    let held = take_for(store, row)?;
+    if let Some(h) = &held {
+        let now = util::epoch_secs();
+        Book::edit(store, |b| {
+            b.rows.insert(row.to_string(), Drive { token: h.token, expires: h.expires, ttl: (h.expires - now).max(0) });
+        });
+    }
+    Ok(held)
+}
+
+fn take_for(store: &Store, row: &str) -> Result<Option<Held>, String> {
     let Some(t) = store.task(row) else { return Ok(None) };
     if t.workspace.is_private() {
         return Ok(None);
@@ -164,9 +178,10 @@ pub fn seat_of(rec: &Value) -> Option<&str> {
 /// The claim on `row` lets go: its lease goes back to the hub, best effort (a
 /// lease the hub cannot be told of runs out on its own). Called as the claim
 /// ends, so a row released by `despawn`, `done` or a hand-off is free to the
-/// next user and not held for a week.
-pub fn let_go(row: &str, claim: &Value) {
+/// next user and not held for a week. The book forgets it.
+pub fn let_go(store: &Store, row: &str, claim: &Value) {
     let Some(token) = token_of(claim) else { return };
+    forget_row(store, row, token);
     let Some(home) = home().filter(|h| logged_in(h)) else { return };
     let Ok(mut client) = crate::cmd_publish::dial(&home) else { return };
     let _ = client.lease_release(&RowId(row.to_string()), token);
@@ -490,12 +505,14 @@ fn drop_claim(store: &Store, row: &str, token: Token, why: &str) -> bool {
 }
 
 /// A `lease.expired` the hub announced, `payload` its `{workspace,row,holder,token}`:
-/// where the claim here holds that token it is released. Whether it was.
+/// where the claim here holds that token it is released. Whether it was. The
+/// book forgets the row lease either way.
 pub fn follow_expired(store: &Store, payload: &Value) -> bool {
     let (Some(row), Some(token)) = (payload["row"].as_str(), payload["token"].as_u64()) else { return false };
     if let Some(list) = row.strip_prefix(DRIVE) {
         return drop_drive(store, list, Token(token), &format!("it expired on the hub (token {token})"));
     }
+    forget_row(store, row, Token(token));
     drop_claim(store, row, Token(token), &format!("lease expired on the hub: {row}, token {token}"))
 }
 
@@ -531,6 +548,12 @@ pub struct Book {
     /// Row → the commit a verifier held, as the spoke holding the row pushed it
     /// (wsp-486): what the driver's barrier reads for a member held elsewhere.
     pub verdicts: std::collections::BTreeMap<String, String>,
+    /// Row → every row lease this spoke took ([`before_claim`]), held by a
+    /// claim or not (`wsp start` makes none): what disable gives back and
+    /// status lists. A claim's lease is renewed with the claim; one no claim
+    /// holds is not renewed (nothing here keeps a seat on it) and runs its
+    /// TTL, unless the work ends first ([`release_finished`]).
+    pub rows: std::collections::BTreeMap<String, Drive>,
 }
 
 impl Book {
@@ -548,24 +571,26 @@ impl Book {
                 .filter_map(|(r, u)| Some((r.clone(), u.as_str()?.to_string())))
                 .collect()
         };
-        let drives = v["drives"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter_map(|(l, d)| {
-                Some((l.clone(), Drive { token: Token(d["token"].as_u64()?), expires: d["expires"].as_i64()?, ttl: d["ttl"].as_i64().unwrap_or(0) }))
-            })
-            .collect();
-        Book { drives, elsewhere: strings("elsewhere"), driven_by: strings("driven_by"), verdicts: strings("verdicts") }
+        let leases = |k: &str| {
+            v[k].as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(l, d)| {
+                    Some((l.clone(), Drive { token: Token(d["token"].as_u64()?), expires: d["expires"].as_i64()?, ttl: d["ttl"].as_i64().unwrap_or(0) }))
+                })
+                .collect()
+        };
+        Book { drives: leases("drives"), elsewhere: strings("elsewhere"), driven_by: strings("driven_by"), verdicts: strings("verdicts"), rows: leases("rows") }
     }
 
     fn write(&self, store: &Store) {
-        let drives: serde_json::Map<String, Value> = self
-            .drives
-            .iter()
-            .map(|(l, d)| (l.clone(), json!({ "token": d.token.0, "expires": d.expires, "ttl": d.ttl })))
-            .collect();
-        let v = json!({ "drives": drives, "elsewhere": self.elsewhere, "driven_by": self.driven_by, "verdicts": self.verdicts });
+        let leases = |m: &std::collections::BTreeMap<String, Drive>| -> serde_json::Map<String, Value> {
+            m.iter().map(|(l, d)| (l.clone(), json!({ "token": d.token.0, "expires": d.expires, "ttl": d.ttl }))).collect()
+        };
+        let mut v = json!({ "drives": leases(&self.drives), "elsewhere": self.elsewhere, "driven_by": self.driven_by, "verdicts": self.verdicts });
+        if !self.rows.is_empty() {
+            v["rows"] = Value::Object(leases(&self.rows));
+        }
         let path = Book::path(store);
         let Some(dir) = path.parent() else { return };
         let _ = std::fs::create_dir_all(dir);
@@ -763,6 +788,67 @@ fn drop_drive(store: &Store, list: &str, token: Token, why: &str) -> bool {
         wsp_store::store::log_line(store, &format!("{list}: the drive lease is gone: {why}; another spoke of its user may take it"));
     }
     dropped
+}
+
+// ---- row leases no claim holds -----------------------------------------------
+
+/// The book forgets `row`'s lease, where it is the one with `token`.
+pub fn forget_row(store: &Store, row: &str, token: Token) {
+    Book::edit(store, |b| {
+        if b.rows.get(row).is_some_and(|d| d.token == token) {
+            b.rows.remove(row);
+        }
+    });
+}
+
+/// Whether `row`'s work here is over as far as its lease goes: done, parked,
+/// put back (`todo`, `inbox`) or gone.
+fn finished(store: &Store, row: &str) -> bool {
+    store.find_task(row).is_none_or(|t| {
+        matches!(t.status(), wsp_engine::model::Status::Done | wsp_engine::model::Status::Parked | wsp_engine::model::Status::Todo | wsp_engine::model::Status::Inbox)
+    })
+}
+
+/// The row leases in the book that no claim holds and whose work is over
+/// (`done`, `park`, a landing, a row put back): what [`release_finished`] gives
+/// back. A claim's lease goes back when its claim ends ([`let_go`]), as before.
+pub fn finished_unheld(store: &Store) -> Vec<(String, Token)> {
+    let claims = store.claims();
+    Book::read(store)
+        .rows
+        .into_iter()
+        .filter(|(row, d)| claims.get(row).and_then(token_of) != Some(d.token))
+        .filter(|(row, _)| finished(store, row))
+        .map(|(row, d)| (row, d.token))
+        .collect()
+}
+
+/// Gives back each lease [`finished_unheld`] names (a lease the hub says is
+/// gone counts as given back) and forgets it; how many. Run by the sync
+/// worker each turn, and by the spoke as a verb moves a row's status.
+pub fn release_finished(store: &Store, client: &mut Client) -> usize {
+    let mut n = 0;
+    for (row, token) in finished_unheld(store) {
+        match client.lease_release(&RowId(row.clone()), token) {
+            Ok(()) | Err(HubError::Refused(_)) => {
+                forget_row(store, &row, token);
+                n += 1;
+            }
+            Err(_) => {}
+        }
+    }
+    n
+}
+
+/// [`release_finished`] for `row` alone, dialling the login's hub: a verb
+/// moved its status. Nothing is dialled when there is nothing to give back.
+pub fn release_if_finished(store: &Store, row: &str) {
+    let Some((_, token)) = finished_unheld(store).into_iter().find(|(r, _)| r == row) else { return };
+    let Some(home) = home().filter(|h| logged_in(h)) else { return };
+    let Ok(mut client) = crate::cmd_publish::dial(&home) else { return };
+    if matches!(client.lease_release(&RowId(row.to_string()), token), Ok(()) | Err(HubError::Refused(_))) {
+        forget_row(store, row, token);
+    }
 }
 
 #[cfg(test)]

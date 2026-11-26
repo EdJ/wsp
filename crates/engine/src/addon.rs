@@ -129,6 +129,20 @@ pub struct Lent {
     pub spool: Spool,
 }
 
+/// What the shared side says of who this process is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhoAmI {
+    /// No login (or no add-on): the caller is the literal `person`.
+    NotLoggedIn,
+    /// The principal the login names, and the server that said so.
+    Known(Principal, String),
+    /// A login is there and the hub refused it (revoked, or a token it never
+    /// issued), in words.
+    Refused(String),
+    /// A login is there and the hub did not answer, in words.
+    Unanswered(String),
+}
+
 /// What a shared-work add-on provides to core. Every default is the standalone
 /// answer; see the module's doc.
 pub trait SharedWork: Send + Sync {
@@ -145,10 +159,10 @@ pub trait SharedWork: Send + Sync {
     }
 
     /// Who the shared side says this process is (the principal its credential
-    /// names) and the name of the server that said it: `None` standalone, with
-    /// no login, or when nothing answers. Never reads a seat's own token.
-    fn whoami(&self) -> Option<(Principal, String)> {
-        None
+    /// names) and the name of the server that said it, or why it cannot say.
+    /// Never reads a seat's own token.
+    fn whoami(&self) -> WhoAmI {
+        WhoAmI::NotLoggedIn
     }
 
     /// Whether a new record may be filed into a shared workspace, asked by
@@ -171,6 +185,10 @@ pub trait SharedWork: Send + Sync {
     fn leased(&self, _claim: &Value) -> bool {
         false
     }
+
+    /// A verb wrote `row` with a new status (`cmd_task::write_task`): a lease
+    /// the add-on holds for it with no claim goes back if the work is over.
+    fn row_moved(&self, _store: &Store, _row: &str) {}
 
     /// A claim on `row` is ending: its lease goes back, best effort.
     fn let_go(&self, _store: &Store, _row: &str, _claim: &Value) {}
@@ -349,6 +367,6 @@ mod tests {
         assert!(s.send(&store, Outgoing { to: "primary:ed".into(), from: "wsp".into(), seat: None, text: "hi".into(), re: None }).is_err());
         assert!(s.may_file_shared(&store).is_err());
         assert_eq!(s.user(), None);
-        assert_eq!(s.whoami(), None);
+        assert_eq!(s.whoami(), WhoAmI::NotLoggedIn);
     }
 }

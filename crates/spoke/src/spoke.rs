@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use wsp_engine::addon::{Drives, Elsewhere, Held, Lent, Member, SharedWork};
+use wsp_engine::addon::{Drives, Elsewhere, Held, Lent, Member, SharedWork, WhoAmI};
 use wsp_engine::model::Worklist;
 use wsp_engine::store::{log_line, Store};
 use crate::{hub_cache, hub_journal, hub_lease, hub_switch, hub_sync};
@@ -76,6 +76,25 @@ fn is_shared_row(store: &Store, row: &str) -> bool {
     store.task(row).is_some_and(|t| !t.workspace.is_private())
 }
 
+/// `whoami` at the hub `url` with `credential`: the principal it names, a
+/// refused login, or no answer, each in words.
+pub fn whoami_at(url: &str, credential: crate::hub_client::Credential, ca: Option<&std::path::Path>) -> WhoAmI {
+    let mut client = match crate::hub_client::Client::dial_hub_ca(url, credential, ca, WHOAMI_WAIT) {
+        Ok(c) => c,
+        Err(e) => {
+            let why = hub_sync::said_of(&e);
+            return match hub_sync::is_refused_login(&why) {
+                true => WhoAmI::Refused(why),
+                false => WhoAmI::Unanswered(why),
+            };
+        }
+    };
+    match client.whoami() {
+        Ok((by, server)) => WhoAmI::Known(by, server),
+        Err(e) => WhoAmI::Unanswered(e.to_string()),
+    }
+}
+
 impl SharedWork for Spoke {
     /// Logged in with a login file (as the sync worker starts and a tell
     /// through the hub is sent only with one), and switched on.
@@ -89,16 +108,18 @@ impl SharedWork for Spoke {
         Some(login.user).filter(|u| !u.trim().is_empty())
     }
 
-    fn whoami(&self) -> Option<(wsp_store_contract::Principal, String)> {
+    fn whoami(&self) -> WhoAmI {
         // A test never dials: a developer's own login must not change what it reads.
         if cfg!(test) {
-            return None;
+            return WhoAmI::NotLoggedIn;
         }
-        let credential = crate::hub_client::Credential::for_hub().ok()?;
-        let url = crate::hub_client::hub_url().ok()?;
-        let ca = crate::hub_client::hub_ca().ok()?;
-        let mut client = crate::hub_client::Client::dial_hub_ca(&url, credential, ca.as_deref(), WHOAMI_WAIT).ok()?;
-        client.whoami().ok()
+        let Ok(credential) = crate::hub_client::Credential::for_hub() else { return WhoAmI::NotLoggedIn };
+        let Ok(url) = crate::hub_client::hub_url() else { return WhoAmI::NotLoggedIn };
+        let ca = match crate::hub_client::hub_ca() {
+            Ok(ca) => ca,
+            Err(e) => return WhoAmI::Unanswered(e.to_string()),
+        };
+        whoami_at(&url, credential, ca.as_deref())
     }
 
     fn may_file_shared(&self, store: &Store) -> Result<(), String> {
@@ -130,7 +151,17 @@ impl SharedWork for Spoke {
         if hub_switch::off(store) {
             return;
         }
-        hub_lease::let_go(row, claim);
+        hub_lease::let_go(store, row, claim);
+    }
+
+    /// A verb moved `row`'s status: a lease no claim holds (`wsp start`'s) goes
+    /// back once the work is over (`done`, `park`, put back). Switched off,
+    /// nothing is dialled: disable gave back what it could.
+    fn row_moved(&self, store: &Store, row: &str) {
+        if hub_switch::off(store) {
+            return;
+        }
+        hub_lease::release_if_finished(store, row);
     }
 
     fn allocated_elsewhere(&self, store: &Store, row: &str) -> Option<String> {

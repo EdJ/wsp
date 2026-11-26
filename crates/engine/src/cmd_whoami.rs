@@ -21,7 +21,12 @@ use crate::store::Store;
 /// engineer token the hub knows: resolved once, through `whoami`.
 pub fn engineer() -> Option<String> {
     static ENGINEER: OnceLock<Option<String>> = OnceLock::new();
-    ENGINEER.get_or_init(|| resolve().and_then(|(by, _)| engineer_of(&by))).clone()
+    ENGINEER
+        .get_or_init(|| match resolve() {
+            crate::addon::WhoAmI::Known(by, _) => engineer_of(&by),
+            _ => None,
+        })
+        .clone()
 }
 
 /// The name a principal gives a person: an engineer's, and nobody else's.
@@ -52,9 +57,8 @@ pub fn sign(line: String) -> String {
     }
 }
 
-/// Who the shared-work add-on says this process is, and its name: none when
-/// there is no add-on, no login or no answer.
-fn resolve() -> Option<(Principal, String)> {
+/// Who the shared-work add-on says this process is, or why it cannot say.
+fn resolve() -> crate::addon::WhoAmI {
     crate::addon::get().whoami()
 }
 
@@ -70,22 +74,38 @@ pub fn describe(by: &Principal, server: &str) -> String {
     format!("{} ({server}: {kind})", wsp_api::principal::text(by))
 }
 
-/// `wsp whoami`: the principal the hub holds this process as, or `person` when it is not logged in.
-pub fn whoami(_store: &Store, args: &Args) -> i32 {
-    let said = resolve();
-    if args.json() {
-        let v = match &said {
-            Some((by, server)) => serde_json::json!({ "by": wsp_api::principal::text(by), "server": server }),
-            None => serde_json::json!({ "by": "person", "server": null }),
+/// What `wsp whoami` prints, and its exit code: 0 for a principal the hub
+/// named or no login at all; 1 for a login the hub refused or did not
+/// answer, which says so rather than reading as no login.
+pub fn whoami_said(said: &crate::addon::WhoAmI, json: bool) -> (String, i32) {
+    use crate::addon::WhoAmI;
+    if json {
+        let v = match said {
+            WhoAmI::Known(by, server) => serde_json::json!({ "by": wsp_api::principal::text(by), "server": server }),
+            WhoAmI::NotLoggedIn => serde_json::json!({ "by": "person", "server": null }),
+            WhoAmI::Refused(why) => serde_json::json!({ "by": "person", "server": null, "refused": why }),
+            WhoAmI::Unanswered(why) => serde_json::json!({ "by": "person", "server": null, "unanswered": why }),
         };
-        println!("{v}");
-        return 0;
+        let code = if matches!(said, WhoAmI::Known(..) | WhoAmI::NotLoggedIn) { 0 } else { 1 };
+        return (v.to_string(), code);
     }
     match said {
-        Some((by, server)) => println!("{}", describe(&by, &server)),
-        None => println!("person (not logged in to a hub)"),
+        WhoAmI::Known(by, server) => (describe(by, server), 0),
+        WhoAmI::NotLoggedIn => ("person (not logged in to a hub)".into(), 0),
+        WhoAmI::Refused(why) => (format!("person: {why}"), 1),
+        WhoAmI::Unanswered(why) => (format!("person: logged in, but the hub did not answer: {why}"), 1),
     }
-    0
+}
+
+/// `wsp whoami`: the principal the hub holds this process as, `person` when it
+/// is not logged in, and why not when a login is there and was not answered.
+pub fn whoami(_store: &Store, args: &Args) -> i32 {
+    let (text, code) = whoami_said(&resolve(), args.json());
+    match code {
+        0 => println!("{text}"),
+        _ => eprintln!("wsp: whoami: {text}"),
+    }
+    code
 }
 
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
@@ -115,6 +135,22 @@ mod tests {
         assert_eq!(person_named(Some("jesper")), "person:jesper");
         assert_eq!(engineer(), None, "a test never dials");
         assert_eq!(person(), "person");
+    }
+
+    /// A login the hub refused, or did not answer, is not "not logged in":
+    /// it says so and exits 1.
+    #[test]
+    fn whoami_says_a_refused_or_unanswered_login_and_exits_one() {
+        use crate::addon::WhoAmI;
+        assert_eq!(whoami_said(&WhoAmI::NotLoggedIn, false), ("person (not logged in to a hub)".to_string(), 0));
+        let (text, code) = whoami_said(&WhoAmI::Refused("the hub refused this login: revoked — `wsp login` again".into()), false);
+        assert_eq!(code, 1);
+        assert!(text.contains("refused this login") && text.contains("wsp login") && !text.contains("not logged in"), "{text}");
+        let (text, code) = whoami_said(&WhoAmI::Unanswered("nothing answered".into()), true);
+        assert_eq!(code, 1);
+        assert!(text.contains("\"unanswered\""), "{text}");
+        let (text, code) = whoami_said(&WhoAmI::Known(Principal::Person("ann".into()), "hub".into()), false);
+        assert_eq!((text.as_str(), code), ("person:ann (hub: engineer)", 0));
     }
 
     #[test]

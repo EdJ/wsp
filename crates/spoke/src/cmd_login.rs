@@ -289,7 +289,7 @@ fn url_of(args: &Args) -> Result<String, String> {
     }
 }
 
-pub fn login(_store: &Store, args: &Args) -> i32 {
+pub fn login(store: &Store, args: &Args) -> i32 {
     // 2 for a command line that is not one, 1 for what the login met.
     let go = || -> Result<LoggedIn, (i32, String)> {
         let url = url_of(args).map_err(|w| (2, w))?;
@@ -319,6 +319,10 @@ pub fn login(_store: &Store, args: &Args) -> i32 {
                     println!("replacing the login to {}{who}: one hub per wsp", old.url);
                 }
                 println!("logged in to {} as {}", done.url, done.user);
+                // A logout disables first, and the switch stays off over it.
+                if crate::hub_switch::off(store) {
+                    println!("the hub connection is off here (it was disabled, or a logout disabled it): `wsp hub enable` turns it on and resumes what the disconnect parked");
+                }
             }
             0
         }
@@ -424,12 +428,15 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
                 println!("{doc}");
             } else {
                 println!("{}", status_text(&login));
-                // On or off, what the disconnect parked and what is unsent:
-                // said for a login, and for no login once a switch was written.
-                if login.is_some() || crate::hub_switch::off(store) {
-                    for line in crate::hub_switch::status_lines(store) {
-                        println!("{line}");
-                    }
+                // Logged in: on or off, what the disconnect parked, what is
+                // unsent, the leases held and what the hub refused. Not logged
+                // in: only what a logout left parked, and the way back.
+                let lines = match login.is_some() {
+                    true => crate::hub_switch::status_lines(store),
+                    false => crate::hub_switch::logged_out_lines(store),
+                };
+                for line in lines {
+                    println!("{line}");
                 }
             }
             if login.is_some() { 0 } else { 1 }

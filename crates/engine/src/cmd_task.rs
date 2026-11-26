@@ -1316,6 +1316,9 @@ pub fn write_task(store: &Store, t: &Task, verb: &str, caller: &crate::cmd_messa
         json!({ "id": t.id, "project": t.project, "status": t.status().as_str(), "title": t.title, "by": caller.by }),
     );
     store.git_commit(&format!("wsp: {verb} {} — {}", t.id, t.title));
+    // A shared row's lease that no claim holds (`wsp start`'s) goes back once
+    // its work is over: the add-on decides.
+    crate::addon::get().row_moved(store, &t.id);
     // `wsp-134`: a review or a block may be the step a run was waiting on.
     if matches!(verb, "review" | "blocked") {
         crate::cycle::poke_task(store, &t.id, verb);

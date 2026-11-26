@@ -212,7 +212,28 @@ pub fn dial(home: &std::path::Path) -> Result<Client, String> {
     let url = hub_client::hub_url_in(env(hub_client::HUB_URL_ENV), home).map_err(|e| e.to_string())?;
     let cred = Credential::for_hub_in(env(hub_client::HUB_TOKEN_ENV), home).map_err(|e| e.to_string())?;
     let ca = hub_client::hub_ca_in(env(hub_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
-    Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| e.to_string())
+    Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| said_of(&e))
+}
+
+/// How a refused login begins, in every word the spoke says of it: the hub
+/// answered, and said no to this token (revoked, or one it never issued).
+/// Not an outage, and no amount of waiting mends it: `wsp login` does.
+pub const REFUSED_LOGIN: &str = "the hub refused this login";
+
+/// A dial's failure in words: a hello refused `unauthorised` is a refused
+/// login ([`REFUSED_LOGIN`]), anything else as the dial said it.
+pub fn said_of(e: &hub_client::Silent) -> String {
+    match e {
+        hub_client::Silent::Refused(r) if r.code == wsp_hub_protocol::Code::Unauthorised => {
+            format!("{REFUSED_LOGIN}: {} — `wsp login` again", r.text)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Whether `why` is a refused login ([`said_of`]).
+pub fn is_refused_login(why: &str) -> bool {
+    why.starts_with(REFUSED_LOGIN)
 }
 
 /// [`wsp_engine::cmd_message::off_machine`]'s message sent to the hub the login in
@@ -302,6 +323,10 @@ pub enum Link {
     Up,
     /// It did not answer; why, as the dial or the request said.
     Down(String),
+    /// The hub answered and refused this login ([`REFUSED_LOGIN`]): a revoked
+    /// or unknown token. Tried again on the same backoff, in case it was
+    /// issued again, and said once.
+    Refused(String),
     /// Not dialled on purpose: the connection is switched off
     /// ([`crate::hub_switch`]) or the login is gone. What is kept here is as it
     /// was last synced.
@@ -314,6 +339,7 @@ impl Link {
             Link::Unknown => "unknown",
             Link::Up => "up",
             Link::Down(_) => "down",
+            Link::Refused(_) => "refused",
             Link::Off => "off",
         }
     }
@@ -523,6 +549,9 @@ pub struct Worker {
     minted: BTreeMap<Subject, (Option<ObjectId>, ObjectId)>,
     /// Lines already in the log, so a refusal that repeats each turn is said once.
     said: BTreeSet<String>,
+    /// Workspaces the hub would not sync on the last turn, and why: kept in
+    /// `sync.json` beside the link, so a refusal that is not an outage shows.
+    refused: BTreeMap<String, String>,
     pub turns: u64,
     /// The hub's stream for this spoke's workspaces (wsp-465): a wake-up for
     /// the turn, and the position `stream.json` keeps.
@@ -548,6 +577,7 @@ impl Worker {
             retry_at: None,
             minted: BTreeMap::new(),
             said: BTreeSet::new(),
+            refused: BTreeMap::new(),
             turns: 0,
             feed: None,
             forced: BTreeSet::new(),
@@ -620,7 +650,9 @@ impl Worker {
         match &out {
             Ok(_) => {
                 match &self.link {
-                    Link::Down(_) => wsp_engine::store::log_line(store, &format!("hub-sync: the hub at {} answers again", self.url())),
+                    Link::Down(_) | Link::Refused(_) => {
+                        wsp_engine::store::log_line(store, &format!("hub-sync: the hub at {} answers again", self.url()))
+                    }
                     Link::Unknown if self.client.is_some() => {
                         wsp_engine::store::log_line(store, &format!("hub-sync: syncing with the hub at {}", self.url()))
                     }
@@ -639,8 +671,14 @@ impl Worker {
             }
             Err(why) => {
                 self.client = None;
-                if !matches!(self.link, Link::Down(_)) {
-                    wsp_engine::store::log_line(
+                self.feed = None;
+                let refused = is_refused_login(why);
+                // Said when the kind of failure changes: an outage once, a
+                // refused login once (a revoke is often seen first as the
+                // hub closing the connection, then as the hello refused).
+                match (refused, &self.link) {
+                    (false, Link::Down(_)) | (true, Link::Refused(_)) => {}
+                    (false, _) => wsp_engine::store::log_line(
                         store,
                         &format!(
                             "hub-sync: the hub at {} is unreachable ({why}); trying again from {}s to {}s apart",
@@ -648,9 +686,13 @@ impl Worker {
                             BACKOFF_MIN.as_secs(),
                             BACKOFF_MAX.as_secs()
                         ),
-                    );
+                    ),
+                    (true, _) => wsp_engine::store::log_line(
+                        store,
+                        &format!("hub-sync: {why} (the hub at {}); asking again from {}s to {}s apart", self.url(), BACKOFF_MIN.as_secs(), BACKOFF_MAX.as_secs()),
+                    ),
                 }
-                self.link = Link::Down(why.clone());
+                self.link = if refused { Link::Refused(why.clone()) } else { Link::Down(why.clone()) };
                 // Work goes on: what moved is journaled for the reconnect.
                 self.journal_offline(store);
                 self.retry_at = Some(Instant::now() + self.backoff);
@@ -671,6 +713,13 @@ impl Worker {
         // And the drive leases of the shared lists this spoke drives (wsp-467).
         crate::hub_lease::renew_drives(store, client, now);
         crate::hub_lease::push_all(store, client);
+        // A lease no claim holds (`wsp start`'s) goes back once its work is
+        // over, by whatever write ended it (a landing, `done`, `park`). Not
+        // in the flush `wsp hub disable` runs: its own step gives every lease
+        // back and says which.
+        if !crate::hub_switch::off(store) {
+            crate::hub_lease::release_finished(store, client);
+        }
     }
 
     fn url(&self) -> String {
@@ -693,7 +742,7 @@ impl Worker {
         let now = wsp_engine::util::epoch_secs();
         let last_ok = if matches!(self.link, Link::Up) { Some(serde_json::json!(now)) } else { before.get("last_ok").cloned() };
         let last_failure = match &self.link {
-            Link::Down(w) => Some(serde_json::json!({ "at": now, "why": w })),
+            Link::Down(w) | Link::Refused(w) => Some(serde_json::json!({ "at": now, "why": w })),
             _ => before.get("last_failure").cloned(),
         };
         let v = serde_json::json!({
@@ -701,7 +750,11 @@ impl Worker {
             "last_failure": last_failure,
             "turns": self.turns,
             "link": self.link.word(),
-            "why": match &self.link { Link::Down(w) => Some(w.clone()), _ => None },
+            "why": match &self.link { Link::Down(w) | Link::Refused(w) => Some(w.clone()), _ => None },
+            // Workspaces the hub would not sync this turn, and why (a
+            // `forbidden` for one the user is not a member of): the link is
+            // up, and these are not.
+            "refused": self.refused,
             "last": last.map(|t| serde_json::json!({ "sent": t.sent, "moved": t.moved, "adopted": t.adopted, "reconciled": t.reconciled, "heads": t.heads, "sided": t.sided })),
             "journal": Journal::of(store).len(),
             // Which process wrote it: `wsp hub disable` waits only on a live one.
@@ -849,6 +902,7 @@ impl Worker {
     /// Every shared workspace once. `Err` is the hub not answering; a
     /// workspace it refuses is said in the log once and the rest go on.
     fn sync_all(&mut self, store: &Store) -> Result<Turned, String> {
+        self.refused.clear();
         self.open_feed(store)?;
         let mut workspaces: BTreeMap<String, Vec<wsp_engine::model::Task>> =
             wsp_engine::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
@@ -897,6 +951,7 @@ impl Worker {
             Ok(r) => r,
             Err(e) if unreachable(&e) => return Err(e.to_string()),
             Err(e) => {
+                self.refused.insert(ws.to_string(), e.to_string());
                 self.say_once(store, format!("hub-sync: {ws} did not sync: {e}"));
                 return Ok(());
             }
@@ -904,6 +959,7 @@ impl Worker {
         let classified = match hub_cache::classify(store, client, ws, &hub, &me, by, &forced) {
             Ok(c) => c,
             Err(why) => {
+                self.refused.insert(ws.to_string(), format!("its heads were not read: {why}"));
                 self.say_once(store, format!("hub-sync: the heads of {ws} were not read: {why}"));
                 return Ok(());
             }
@@ -922,6 +978,7 @@ impl Worker {
             Ok(r) => r,
             Err(SyncError::Request(e)) if unreachable(&e) => return Err(e.to_string()),
             Err(e) => {
+                self.refused.insert(ws.to_string(), e.to_string());
                 self.say_once(store, format!("hub-sync: {ws} did not sync: {e}"));
                 return Ok(());
             }
