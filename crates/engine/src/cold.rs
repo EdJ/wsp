@@ -303,7 +303,7 @@ pub fn away_wants(owed: bool, list_running: bool, away: bool, last: Option<i64>,
 /// The daemon's tick: build cold for a project whose tip has none while the
 /// person is away (`throttle` auto mode, idle past `away_minutes`).
 pub fn when_away(store: &Store, launch: &dyn Fn(&Store, &[&str])) {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return;
     }
     if store.worklists().iter().any(|w| w.status() == WorklistStatus::Running) {

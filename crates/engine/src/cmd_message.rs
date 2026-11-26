@@ -2871,7 +2871,8 @@ pub fn tests_govern(store: &Store, scope: &str, pane: &str) {
     store.set_governor(scope, serde_json::json!({ "workspace": "w9", "pane": pane, "since": "2026-11-23" }));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
 

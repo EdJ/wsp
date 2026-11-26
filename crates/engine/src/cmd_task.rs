@@ -1420,7 +1420,7 @@ fn refuse_done(args: &Args, id: &str, why: &str, open: usize, buttons: Vec<crate
     if args.json() {
         println!("{v}");
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     tests::REFUSED.with(|r| *r.borrow_mut() = Some(v));
     1
 }
@@ -1744,8 +1744,8 @@ fn ran_with(store: &Store, t: &Task) -> Option<Vec<String>> {
 /// Run `wsp <argv>` as the sender would have, in their environment, so the
 /// spawn records them as its spawner. Its own output is the receipt.
 fn respawn(argv: &[String], json: bool) -> (String, i32) {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::RESEATED.with(|r| r.borrow_mut().push(argv.to_vec()));
         return (String::new(), 0);
     }
@@ -4352,7 +4352,8 @@ fn claim_expires_line(claim: &serde_json::Value, now: i64) -> Option<String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
 
@@ -4473,6 +4474,7 @@ pub mod tests {
 
     /// A member `wsp-101` of a running group with an `agent:` line, in a real
     /// repository, with a tree of its own holding one commit ahead of master.
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
     pub fn a_member_with_a_commit(tag: &str) -> (crate::util::Isolated, Store, std::path::PathBuf) {
         let env = crate::util::isolated(tag);
         let store = Store::at(env.home(), env.state());

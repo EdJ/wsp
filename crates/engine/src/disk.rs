@@ -554,7 +554,7 @@ pub fn loud(store: &Store) -> Option<String> {
 ///
 /// Not under test: the machine running the tests may itself be short of room.
 pub fn hold(store: &Store, path: &Path) -> Option<String> {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return None;
     }
     let (volume, free) = free_of(path)?;
@@ -578,7 +578,7 @@ static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Not under test, for `check_tree::tidy`'s reason; the tests drive [`Disk`]
 /// and [`read`].
 pub fn tidy(store: &Store) {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return;
     }
     for disk in read(store, LOW, false) {

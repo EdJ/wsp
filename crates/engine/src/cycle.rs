@@ -513,8 +513,10 @@ static SEATS: std::sync::OnceLock<&'static (dyn Seats + Sync)> = std::sync::Once
 
 pub fn install_seats(seats: &'static (dyn Seats + Sync)) {
     // A test's install is its own thread's: the tests share one process.
-    #[cfg(test)]
-    install_tests::install(seats);
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
+        install_tests::install(seats);
+    }
     let _ = SEATS.set(seats);
 }
 
@@ -523,9 +525,10 @@ pub fn install_seats(seats: &'static (dyn Seats + Sync)) {
 pub fn seats() -> &'static dyn Seats {
     // The engine's own tests have no `main`, and nothing real to install: they
     // read the double unless the test installed another.
-    #[cfg(test)]
-    return install_tests::installed();
-    #[cfg(not(test))]
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
+        return install_tests::installed();
+    }
     required(SEATS.get().copied())
 }
 
@@ -672,8 +675,9 @@ fn launch(store: &Store, argv: &[&str]) {
 /// that cause; this is so the next one is said.
 fn start_detached(store: &Store, argv: &[&str]) -> Result<(), String> {
     // A test's `current_exe` is the test harness, and handing it `worklist
-    // advance` would run the suite again from inside itself.
-    if cfg!(test) || std::env::var_os(OFF).is_some() {
+    // advance` would run the suite again from inside itself. A dependent's
+    // tests too, so `under_test` and not `cfg!(test)` (wsp-544).
+    if crate::base::under_test() || std::env::var_os(OFF).is_some() {
         return Ok(());
     }
     let exe = util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
@@ -4394,19 +4398,15 @@ fn is_list_wide(why: &str) -> bool {
 /// `None`. Checked before any seat is opened: a start that fails this fails for
 /// every row, five times over, with a seat's minute each (wsp-017).
 fn list_wide_blocker(store: &Store, rows: &[String]) -> Option<String> {
-    #[cfg(test)]
-    {
-        let _ = (store, rows);
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
         return tests::PACK_MISSING.with(|p| p.borrow().clone());
     }
-    #[cfg(not(test))]
-    {
-        let needs = rows.iter().any(|id| store.find_task(id).is_some_and(|t| t.status() == Status::Todo && crate::packet_gen::eligible(&t).is_ok()));
-        if !needs {
-            return None;
-        }
-        crate::packet_gen::pack_bin().err()
+    let needs = rows.iter().any(|id| store.find_task(id).is_some_and(|t| t.status() == Status::Todo && crate::packet_gen::eligible(&t).is_ok()));
+    if !needs {
+        return None;
     }
+    crate::packet_gen::pack_bin().err()
 }
 
 /// Park the list for a cause shared by every row, after one try. The row is
@@ -4618,7 +4618,7 @@ fn forgive_spent_starts(store: &Store, list: &str) -> usize {
 /// The starts that gave up under a throttle or memory hold are tried again once
 /// the hold lets go, without a hand `advance` (`wsp-600`). Says which, once.
 fn retry_after_hold(store: &Store, list: &str) {
-    let spent = crate::starts::forgive_after_hold(store, &start_labels(store, list), !cfg!(test) && crate::throttle::holding_back(store).is_some());
+    let spent = crate::starts::forgive_after_hold(store, &start_labels(store, list), !crate::base::under_test() && crate::throttle::holding_back(store).is_some());
     if !spent.is_empty() {
         log_line(store, &format!("{list}: the hold has let go — {} tried again, its start having given up under it", spent.join(", ")));
     }
@@ -5262,7 +5262,7 @@ pub fn stand_down_own_seat(store: &Store, list: &str) {
 /// [`rotate_on_behalf`](crate::cmd_spawn::rotate_on_behalf) finds the one it
 /// replaces; under test, the recorded one.
 pub fn occupied(store: &Store, seat: &crate::governors::Seat) -> Option<String> {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return (!seat.pane.is_empty()).then(|| seat.pane.clone());
     }
     Seats::occupant(seats(), store, seat)
@@ -5270,8 +5270,8 @@ pub fn occupied(store: &Store, seat: &crate::governors::Seat) -> Option<String> 
 
 /// [`crate::cmd_spawn::end_seat_when_idle`], recorded instead under test.
 pub fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::ENDED.with(|s| s.borrow_mut().push(seat.to_string()));
         return Ok(());
     }
@@ -5565,10 +5565,10 @@ fn despawn_argv(target: &[&str], keep: bool) -> Vec<String> {
 /// [`despawn_seat`], leaving the tree when `keep`: a member handed to its
 /// verifier, which reads in it (`wsp-430`).
 pub fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String> {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::ON_END.with(|h| h.borrow().as_ref().map(|f| f(seat)));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         return tests::ENDED.with(|s| {
             s.borrow_mut().push(seat.to_string());
             if keep {
@@ -5594,7 +5594,7 @@ pub fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String> {
 /// may stand in the primary seat, whose despawn gives a why (`wsp-344`'s
 /// `wsp done` on a verified row whose seat sits idle). Its gate is despawn's.
 pub fn despawn_seat_because(seat: &str, why: &str) -> Result<(), String> {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return despawn_seat_keeping(seat, true);
     }
     let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
@@ -5624,14 +5624,14 @@ pub fn despawned(store: &Store, id: &str) -> Result<(), String> {
 /// [`despawned`], with `--keep-tree` when `keep`.
 pub fn despawned_keeping(store: &Store, id: &str, keep: bool) -> Result<(), String> {
     say_uncommitted(store, id);
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(why) = tests::DESPAWN_FAILS.with(|f| f.borrow().clone()) {
             return Err(why);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         tests::ENDED.with(|s| s.borrow_mut().push(id.to_string()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if keep {
             tests::KEPT.with(|s| s.borrow_mut().push(id.to_string()));
         }
@@ -6004,8 +6004,8 @@ fn heard(w: &Worklist, event: &str, passed: Option<usize>) -> Option<String> {
 /// than said under `cfg(test)`, as [`tell`] is; [`hand_it_up`] is the half that
 /// decides, and is driven on its own.
 pub fn tell_above(store: &Store, w: &Worklist, text: &str) {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::HEARD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
@@ -6086,7 +6086,7 @@ fn rotate(store: &Store, seats: &dyn Seats, w: &Worklist) {
 
 pub use crate::store::log_line;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod install_tests {
     use super::{Report, Seats};
     use crate::store::Store;
@@ -6144,7 +6144,8 @@ pub mod install_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     /// `wsp-538`: the reason a member gave for a full suite is in its verifier's
     /// order, so an unneeded run can be challenged.
@@ -7715,6 +7716,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// A project over a repository with member `m-1` in its own tree, one commit
     /// ahead of a trunk that has since gained `trunk_file` (`wsp-341`).
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
     pub fn ready_tree(tag: &str, member_file: &str, trunk_file: &str) -> (util::Isolated, Store, std::path::PathBuf, crate::model::Worklist) {
         let (env, store) = scratch(tag);
         let repo = env.path("repo");
@@ -7819,6 +7821,7 @@ fn only_a_working_screen_is_ever_overruled() {
         ran: std::path::PathBuf,
     }
 
+    #[cfg(test)] // calls `ready_tree`
     pub fn run_ready(tag: &str, checks: &str, member_file: &str, trunk_file: &str) -> Run {
         // The land a hold performs reruns checks through the engine's answers, which `main` installs.
         crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
@@ -12005,6 +12008,7 @@ fn only_a_working_screen_is_ever_overruled() {
         }
     }
 
+    #[cfg(test)] // the hub is a dev-dependency, and only engine's own tests serve one
     /// A served hub with `ed` and `jesper` in `shared:team`; this store a spoke
     /// logged in as `me`; three shared rows in `todo` and the `run` list over
     /// them, shared.

@@ -1467,7 +1467,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>, caption: Option<&str>) -> Result<Pass, String> {
     record_checked(store, member, state, text, me, caption, Vec::new(), None)
 }
@@ -1723,7 +1723,8 @@ fn apply(store: &Store, plan: &Plan) -> Result<usize, String> {
     Ok(moved)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
 
@@ -2253,6 +2254,7 @@ pub mod tests {
         ready: String,
     }
 
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
     pub fn ground(tag: &str, checks: &str, member: &[(&str, &str)], trunk: &[(&str, &str)]) -> Ground {
         // The land a hold performs reruns checks through the engine's answers, which `main` installs.
         crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {

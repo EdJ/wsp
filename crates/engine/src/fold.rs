@@ -1318,14 +1318,15 @@ pub mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod mirror_tests {
     use super::*;
     use wsp_host_api::{Epoch, Key, RowId, SeatId, SeatStarted, SeatStopped};
     use wsp_store_contract::{EventKind, Events};
 
     pub fn open(state: &Path) -> SharedStore {
-        Arc::new(wsp_store_sqlite::SqliteStore::open(state.join("state.db"), Arc::new(wsp_server::Mirror)).unwrap())
+        crate::orders::tests::open_db(&state.join("state.db"), Arc::new(wsp_server::Mirror))
     }
 
     pub fn frame(id: u64, msg: Message) -> Frame {

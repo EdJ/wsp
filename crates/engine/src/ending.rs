@@ -184,7 +184,7 @@ pub const FINISHED_GRACE_SECS: i64 = 5 * 60;
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
 /// `KILL`, so this is the margin after that, not the whole grace.
-const GONE_WITHIN_MS: u64 = if cfg!(test) { 0 } else { 5_000 };
+const GONE_WITHIN_MS: u64 = 5_000;
 
 /// A verification that holds and still stands — the trigger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,9 +427,10 @@ pub fn tick(store: &Store, seats: &dyn Seats) {
 /// Whether the tick scans finished trees: always, but in a test only where it
 /// asked to on its thread.
 fn scans_finished() -> bool {
-    #[cfg(test)]
-    return tests::SCANS.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
+        return tests::SCANS.with(std::cell::Cell::get);
+    }
     true
 }
 
@@ -886,7 +887,7 @@ pub fn handed_to_legs(store: &Store, row: &str, seat: &str, binding: &serde_json
 /// `Ok` once none of `pids` is running, waiting [`GONE_WITHIN_MS`] at most.
 /// The member's check, and the verifier's in [`crate::cycle::end_passes`].
 pub fn confirm_gone(seats: &dyn Seats, pids: &[u32]) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(GONE_WITHIN_MS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(if crate::base::under_test() { 0 } else { GONE_WITHIN_MS });
     loop {
         let running = seats.running(pids);
         if running.is_empty() {
@@ -1360,7 +1361,8 @@ fn said_exit(store: &Store, seat: &str, row: &str, kind: &str, line: &str) -> St
     line.to_string()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
 

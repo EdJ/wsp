@@ -1015,8 +1015,8 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
         return;
     }
     stamp(store, &format!("{scope}: the seat reads {word} and {trigger} — seating a successor"));
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         crate::cycle::tests::RESEATED.with(|s| s.borrow_mut().push(scope.clone()));
     }
     // A successor that never started is a failed reseat, said with its reason
@@ -1585,7 +1585,7 @@ const GONE_KEEP: i64 = 30 * 60;
 /// The host's side of a seat's death, as far as the host keeps it: the load
 /// and the free memory now, which is the nearest reading to the moment.
 fn host_words() -> String {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return "host readings not taken".to_string();
     }
     let load = crate::throttle::load_avgs()
@@ -2546,7 +2546,8 @@ fn undated(line: &str) -> &str {
 /// well as written, so a test can read what was said from either.
 
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
     use crate::cycle::tests::{ENDED, MEMBER_TOLD, RESEATED, SPAWNED, TOLD};
@@ -2890,6 +2891,7 @@ impl Seats for Absent {
 
     /// A member at `review` in a project whose `m-1` branch is level with the
     /// trunk — its work has landed and its row says nothing about how.
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
     pub fn landed_member(env: &util::Isolated, store: &Store, ahead: bool) -> String {
         let repo = repo(env, store);
         crate::testkit::repo(&repo);
@@ -4668,6 +4670,7 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         assert!(refused.contains("resolve deps") && refused.contains("`wsp land m-1`") && refused.contains("`wsp reopen m-1"), "the verbs: {refused}");
     }
 
+    #[cfg(test)] // calls `landed_member`
     /// A member told to land, its notice an hour old and its seat `cpd-1`.
     pub fn told_an_hour_ago(tag: &str) -> (util::Isolated, Store) {
         let (env, store) = scratch(tag);

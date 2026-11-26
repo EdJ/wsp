@@ -573,7 +573,7 @@ impl Asks {
         Some(Wait { why: Why::Question(id.clone()), on: On::Person, own: None })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn waiter(pane: &str, task: &str, id: &str) -> Asks {
         let mut a = Asks::one(pane, task, id, On::Person);
         a.awaited_pane.insert(pane.to_string(), id.to_string());
@@ -581,7 +581,7 @@ impl Asks {
         a
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn held_one(pane: &str, task: &str, id: &str) -> Asks {
         let mut a = Asks::one(pane, task, id, On::Person);
         a.held_by_pane.insert(pane.to_string(), id.to_string());
@@ -589,7 +589,7 @@ impl Asks {
         a
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn one(pane: &str, task: &str, id: &str, on: On) -> Asks {
         let mut a = Asks::default();
         a.by_pane.insert(pane.to_string(), (id.to_string(), on.clone()));
@@ -797,7 +797,7 @@ impl Shells {
     pub fn read<'a>(seats: impl IntoIterator<Item = &'a str>, self_wait: &dyn Fn(&str) -> bool) -> Shells {
         // A test's seat ids are not this machine's, and a fake backend's are
         // not anybody's: a test hands the index in with [`Shells::one`].
-        if cfg!(test) {
+        if crate::base::under_test() {
             return Shells::default();
         }
         let backends = crate::place::local_backends();
@@ -920,12 +920,12 @@ impl Shells {
         Shells { by_seat }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn own(seat: &str, own: Own) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), own)]) }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn one(seat: &str, n: usize) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), Own { n, ..Own::default() })]) }
     }

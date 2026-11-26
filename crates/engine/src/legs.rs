@@ -1439,7 +1439,8 @@ fn cmd_show(store: &Store, args: &Args) -> i32 {
     0
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
 

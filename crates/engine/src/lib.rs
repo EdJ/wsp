@@ -10,10 +10,11 @@ pub use wsp_wire::{fake, far, host, host_tcp, launchd, manager, place, place_com
 pub mod base;
 
 /// The test kit at the path every test module uses: the store-backed fixtures beside `Store` in `wsp-store`,
-/// the git repository fixture in `wsp-testkit`.
-#[cfg(test)]
+/// the git repository fixture in `wsp-testkit`. Only the first reach a dependent: layering keeps `wsp-testkit` a dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod testkit {
     pub use wsp_store::testkit::{isolated_store, store};
+    #[cfg(test)]
     pub use wsp_testkit::{git, repo, repo_at};
 }
 
