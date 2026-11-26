@@ -281,6 +281,10 @@ pub enum Link {
     Up,
     /// It did not answer; why, as the dial or the request said.
     Down(String),
+    /// Not dialled on purpose: the connection is switched off
+    /// ([`crate::hub_switch`]) or the login is gone. What is kept here is as it
+    /// was last synced.
+    Off,
 }
 
 impl Link {
@@ -289,6 +293,7 @@ impl Link {
             Link::Unknown => "unknown",
             Link::Up => "up",
             Link::Down(_) => "down",
+            Link::Off => "off",
         }
     }
 }
@@ -532,11 +537,27 @@ impl Worker {
     }
 
     /// Turns until the process ends: one every `turn`, one at once when a task
-    /// file changes, and while the hub is down one per backoff.
+    /// file changes, and while the hub is down one per backoff. While the
+    /// connection is switched off (`wsp hub disable`) or the login is gone
+    /// (`wsp logout`) it takes no turn and holds no connection: it says so in
+    /// `sync.json` once, and the first look after `wsp hub enable` (or a new
+    /// login) is a turn at once, which replays the journal.
     fn run(mut self, store: &Store, turn: Duration) {
         let mut seen = fingerprint(store);
         let mut due = Instant::now();
         loop {
+            if !self.live(store) {
+                if self.link != Link::Off {
+                    self.stand_down(store);
+                    crate::store::log_line(store, "hub-sync: the hub connection is off here; the worker takes no turn until `wsp hub enable`");
+                }
+                std::thread::sleep(POLL);
+                due = Instant::now();
+                continue;
+            }
+            if self.link == Link::Off {
+                self.link = Link::Unknown;
+            }
             let now = Instant::now();
             let ready = match self.retry_at {
                 Some(at) => now >= at,
@@ -552,6 +573,23 @@ impl Worker {
                 due = Instant::now();
             }
         }
+    }
+
+    /// Whether the worker may dial: logged in, and the connection switched on.
+    fn live(&self, store: &Store) -> bool {
+        self.home.join(HUBS_FILE).exists() && !crate::hub_switch::off(store)
+    }
+
+    /// The connection and the stream let go, and `sync.json` says the link is
+    /// off: what `wsp hub disable` waits to read before it flushes the journal
+    /// itself, so two turns never run at once.
+    pub fn stand_down(&mut self, store: &Store) {
+        self.client = None;
+        self.feed = None;
+        self.retry_at = None;
+        self.backoff = BACKOFF_MIN;
+        self.link = Link::Off;
+        self.write_status(store, None);
     }
 
     /// One turn: sync every shared workspace, then move the link's state.
@@ -645,6 +683,8 @@ impl Worker {
             "why": match &self.link { Link::Down(w) => Some(w.clone()), _ => None },
             "last": last.map(|t| serde_json::json!({ "sent": t.sent, "moved": t.moved, "adopted": t.adopted, "reconciled": t.reconciled, "heads": t.heads, "sided": t.sided })),
             "journal": Journal::of(store).len(),
+            // Which process wrote it: `wsp hub disable` waits only on a live one.
+            "pid": std::process::id(),
         });
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(format!(".sync.json.{}.tmp", std::process::id()));

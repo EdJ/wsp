@@ -80,6 +80,7 @@ pub mod hold_close;
 pub mod hub_cache;
 pub mod hub_journal;
 pub mod hub_lease;
+pub mod hub_switch;
 pub mod hub_sync;
 pub mod inner;
 pub mod kind_attention;

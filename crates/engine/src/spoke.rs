@@ -3,25 +3,46 @@
 //!
 //! Core never names a module of the spoke; it asks [`crate::addon::get`], which
 //! `main` filled with a [`Spoke`]. Each answer is the standalone one for a
-//! private row or list and for a spoke with no login.
+//! private row or list, for a spoke with no login, and, for new shared work,
+//! while the hub connection is switched off ([`crate::hub_switch`]): then no
+//! lease is taken, no shared list is advanced from here, nothing new is filed
+//! shared and nothing is dialled, while what is kept here (the cache, the
+//! journal, who holds what) stays readable.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde_json::Value;
 
 use crate::addon::{Drives, Elsewhere, Held, Lent, Member, SharedWork};
 use crate::model::Worklist;
 use crate::store::{log_line, Store};
-use crate::{hub_cache, hub_journal, hub_lease, hub_sync};
+use crate::{hub_cache, hub_journal, hub_lease, hub_switch, hub_sync};
 
-/// The spoke.
+/// The spoke. Holds only the lines it has said once, so a switched-off list is
+/// not said every tick.
 #[derive(Default)]
-pub struct Spoke;
+pub struct Spoke {
+    said: Mutex<BTreeSet<String>>,
+}
 
 impl Spoke {
     pub fn new() -> Spoke {
-        Spoke
+        Spoke::default()
+    }
+
+    fn say_once(&self, store: &Store, line: String) {
+        let fresh = self.said.lock().map(|mut s| s.insert(line.clone())).unwrap_or(true);
+        if fresh {
+            log_line(store, &line);
+        }
+    }
+
+    fn forget_said(&self, prefix: &str) {
+        if let Ok(mut s) = self.said.lock() {
+            s.retain(|l| !l.starts_with(prefix));
+        }
     }
 }
 
@@ -37,11 +58,26 @@ pub fn logged_in() -> bool {
     home().is_some_and(|h| wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), &h).is_ok())
 }
 
+/// Logged in and switched off: the one state in which the spoke refuses new
+/// shared work it would otherwise take.
+fn switched_off(store: &Store) -> bool {
+    hub_switch::off(store) && logged_in()
+}
+
+/// What a refusal says while the connection is off.
+pub fn off_said(what: &str) -> String {
+    format!("{what}: the hub connection is disabled here, so no shared work is taken (`wsp hub enable` turns it back on)")
+}
+
+fn is_shared_row(store: &Store, row: &str) -> bool {
+    store.task(row).is_some_and(|t| !t.workspace.is_private())
+}
+
 impl SharedWork for Spoke {
-    /// Logged in with a login file, as the sync worker starts and a tell
-    /// through the hub is sent only with one.
-    fn active(&self, _store: &Store) -> bool {
-        home().is_some_and(|h| h.join(wsp_client::HUBS_FILE).exists())
+    /// Logged in with a login file (as the sync worker starts and a tell
+    /// through the hub is sent only with one), and switched on.
+    fn active(&self, store: &Store) -> bool {
+        home().is_some_and(|h| h.join(wsp_client::HUBS_FILE).exists()) && !hub_switch::off(store)
     }
 
     fn user(&self) -> Option<String> {
@@ -50,11 +86,18 @@ impl SharedWork for Spoke {
         Some(login.user).filter(|u| !u.trim().is_empty())
     }
 
-    fn may_file_shared(&self, _store: &Store) -> Result<(), String> {
-        wsp_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())
+    fn may_file_shared(&self, store: &Store) -> Result<(), String> {
+        wsp_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())?;
+        match hub_switch::off(store) {
+            true => Err("the hub connection is disabled here (`wsp hub enable` turns it back on)".into()),
+            false => Ok(()),
+        }
     }
 
     fn before_claim(&self, store: &Store, row: &str) -> Result<Option<Held>, String> {
+        if is_shared_row(store, row) && switched_off(store) {
+            return Err(off_said(&format!("{row} is shared")));
+        }
         hub_lease::before_claim(store, row)
     }
 
@@ -66,7 +109,12 @@ impl SharedWork for Spoke {
         hub_lease::token_of(claim).is_some()
     }
 
-    fn let_go(&self, _store: &Store, row: &str, claim: &Value) {
+    fn let_go(&self, store: &Store, row: &str, claim: &Value) {
+        // Switched off, nothing is dialled: `wsp hub disable` gave back what it
+        // could, and a lease it could not runs out on the hub.
+        if hub_switch::off(store) {
+            return;
+        }
         hub_lease::let_go(row, claim);
     }
 
@@ -75,11 +123,19 @@ impl SharedWork for Spoke {
     }
 
     /// [`hub_lease::drive`], with who drives the list said in `cycle.log` once
-    /// each time it changes (wsp-467).
+    /// each time it changes (wsp-467). Switched off, a shared list is not
+    /// advanced from here, said once.
     fn drive(&self, store: &Store, w: &Worklist) -> Drives {
         if w.workspace.is_private() {
             return Drives::Here;
         }
+        let off = format!("{}: not advanced — ", w.id);
+        if switched_off(store) {
+            let why = "the hub connection is disabled here (`wsp hub enable`)".to_string();
+            self.say_once(store, format!("{off}{why}"));
+            return Drives::NotYet(why);
+        }
+        self.forget_said(&off);
         let drives = hub_lease::drive(store, w);
         let (user, line) = match &drives {
             Drives::Here => match self.user() {
@@ -104,10 +160,16 @@ impl SharedWork for Spoke {
     }
 
     fn lease_member(&self, store: &Store, row: &str) -> Member {
+        if is_shared_row(store, row) && switched_off(store) {
+            return Member::NotYet(off_said(&format!("{row} is shared")));
+        }
         hub_lease::lease_member(store, row)
     }
 
     fn unused(&self, store: &Store, row: &str, held: &Held) {
+        if hub_switch::off(store) {
+            return;
+        }
         hub_lease::unused(store, row, held);
     }
 
@@ -127,11 +189,20 @@ impl SharedWork for Spoke {
         if !hub_cache::is_head(store, row) {
             return None;
         }
+        if switched_off(store) {
+            return Some(Err(off_said(&format!("{row} is kept here as the hub's head only"))));
+        }
         Some(hub_sync::fetch(store, row))
     }
 
     fn show_lines(&self, store: &Store, row: &str) -> Vec<String> {
-        hub_cache::show_line(store, row).into_iter().chain(hub_journal::show_line(store, row)).collect()
+        let head = hub_cache::show_line(store, row);
+        let stale = head.is_some() && switched_off(store);
+        let mut out: Vec<String> = head.into_iter().chain(hub_journal::show_line(store, row)).collect();
+        if stale {
+            out.push("not live: the hub connection is disabled here, so this head is as it was last synced".into());
+        }
+        out
     }
 
     fn elsewhere(&self, store: &Store) -> Elsewhere {
@@ -141,7 +212,10 @@ impl SharedWork for Spoke {
         Elsewhere { rows, lists: drive.driven_by }
     }
 
-    fn send(&self, _store: &Store, msg: wsp_api::MsgSend) -> Result<(String, String), String> {
+    fn send(&self, store: &Store, msg: wsp_api::MsgSend) -> Result<(String, String), String> {
+        if hub_switch::off(store) {
+            return Err(off_said("a message for another user's wsp is not sent"));
+        }
         let home = home().ok_or("no HOME, so no hub login")?;
         hub_sync::dial(&home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()))
     }
@@ -156,10 +230,13 @@ impl SharedWork for Spoke {
         notes: &mut Vec<String>,
     ) {
         hub_sync::health(store, home().as_deref(), now, alive, problems, warnings, notes);
+        if switched_off(store) {
+            warnings.push(hub_switch::health_line(store));
+        }
     }
 
     /// The hooks the lease follower and the message hand need from above, and
-    /// the sync worker.
+    /// the sync worker (which idles while the connection is switched off).
     fn start(&self, store: &Store, lent: Lent) -> Option<std::thread::JoinHandle<()>> {
         hub_lease::install(lent.release, lent.alive);
         hub_sync::install_spool(lent.spool);

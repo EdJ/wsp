@@ -17,13 +17,16 @@
 //! A wrong token, an unreachable hub or a certificate that is refused writes
 //! nothing.
 //!
-//! `logout` removes the file and says so; a sync worker (wsp-464) reads the file
-//! at each turn and stops when it is gone. `hub status` prints the URL and user,
-//! never the token. The token is in no word that reaches a log, a message or a
+//! `logout` disables the connection first ([`crate::hub_switch::disable`]: the
+//! shared rows in flight parked, the journal flushed, the leases given back),
+//! then removes the file and says so; a sync worker (wsp-464) looks for the
+//! file before each turn and takes none while it is gone. `hub status` prints
+//! the URL and user, never the token, and the switch's state. The token is in no word that reaches a log, a message or a
 //! child's command line: [`scrub`] takes it out of anything a dial said, and the
 //! only child this module starts is `stty`, with fixed arguments.
 //!
-//! None of the three needs a store.
+//! `login` needs no store; `logout` and `hub status` read this spoke's switch
+//! in it.
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -274,7 +277,7 @@ pub fn log_out(home: &Path) -> Result<Option<Option<HubLogin>>, String> {
     Ok(Some(was))
 }
 
-pub fn logout(_store: &Store, args: &Args) -> i32 {
+pub fn logout(store: &Store, args: &Args) -> i32 {
     if !args.rest.is_empty() {
         eprintln!("usage: wsp logout");
         return 2;
@@ -286,6 +289,12 @@ pub fn logout(_store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // A clean disconnect first, while the login is there to dial with: shared
+    // rows in flight parked, the journal flushed, the leases given back.
+    if hub_login_in(&home).ok().flatten().is_some() {
+        let done = crate::hub_switch::disable(store, &home);
+        println!("{}", crate::cmd_hub::disabled_text(&done, false));
+    }
     match log_out(&home) {
         Ok(None) => {
             println!("not logged in to any hub; nothing to remove");
@@ -297,7 +306,7 @@ pub fn logout(_store: &Store, args: &Args) -> i32 {
                 Some(l) => println!("logged out of {}", l.url),
                 None => println!("logged out: removed {}", home.join(HUBS_FILE).display()),
             }
-            println!("a running sync worker stops at its next turn");
+            println!("a running sync worker stops at its next look");
             0
         }
         Err(why) => {
@@ -327,10 +336,12 @@ pub fn status_text(login: &Option<HubLogin>) -> String {
 pub fn hub(store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(String::as_str) {
         Some("status") if args.rest.len() == 1 => {}
+        // This spoke's own switch.
+        Some(word @ ("enable" | "disable")) if args.rest.len() == 1 => return crate::cmd_hub::switch(store, args, word),
         // The admin verbs (wsp-163): user, token, workspace, member.
         Some("user" | "token" | "workspace" | "member") => return crate::cmd_hub::run(store, args),
         _ => {
-            eprintln!("usage: wsp hub status [--json] | user … | token … | workspace … | member … (wsp help)");
+            eprintln!("usage: wsp hub status [--json] | enable | disable | user … | token … | workspace … | member … (wsp help)");
             return 2;
         }
     }
@@ -343,12 +354,19 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
         Ok(login) => {
             if args.json() {
                 let doc = match &login {
-                    None => json!({ "logged_in": false }),
-                    Some(l) => json!({ "logged_in": true, "url": l.url, "user": l.user, "at": l.at, "ca": l.ca }),
+                    None => json!({ "logged_in": false, "connection": crate::hub_switch::status_json(store) }),
+                    Some(l) => json!({ "logged_in": true, "url": l.url, "user": l.user, "at": l.at, "ca": l.ca, "connection": crate::hub_switch::status_json(store) }),
                 };
                 println!("{doc}");
             } else {
                 println!("{}", status_text(&login));
+                // On or off, what the disconnect parked and what is unsent:
+                // said for a login, and for no login once a switch was written.
+                if login.is_some() || crate::hub_switch::off(store) {
+                    for line in crate::hub_switch::status_lines(store) {
+                        println!("{line}");
+                    }
+                }
             }
             if login.is_some() { 0 } else { 1 }
         }
@@ -375,7 +393,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
         help: &[crate::verbs::Help {
             section: crate::verbs::Section::Machines,
             order: 110,
-            text: r##"  wsp logout                        forget the hub's token; a sync worker stops"##,
+            text: r##"  wsp logout                        disable the hub connection (wsp hub disable),
+                                    then forget the hub's token"##,
         }],
     },
     crate::verbs::Verb {
@@ -385,7 +404,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Machines,
                 order: 120,
-                text: r##"  wsp hub status [--json]           the hub you are logged in to, and as whom"##,
+                text: r##"  wsp hub status [--json]           the hub you are logged in to, and as whom; on or
+                                    off, what the disconnect parked, what is unsent"##,
             },
             crate::verbs::Help { section: crate::verbs::Section::Machines, order: 121, text: crate::cmd_hub::HELP },
         ],

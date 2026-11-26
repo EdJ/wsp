@@ -7,7 +7,12 @@
 //! wsp hub token <name>                  issue a new token, revoking the old ones
 //! wsp hub workspace add <name>          a shared workspace
 //! wsp hub member add|rm <ws> <user>     a user in a shared workspace, or out of it
+//! wsp hub disable                       stop taking part in shared work, the login kept
+//! wsp hub enable                        take part again, taking back what the disable parked
 //! ```
+//!
+//! `disable` and `enable` are this spoke's own switch ([`crate::hub_switch`]),
+//! not the hub's admin verbs: any logged-in user runs them, on their own wsp.
 //!
 //! Each is one or two identity commands sent to the hub over the API as the
 //! user the login names ([`wsp_client::Client::dial_hub_ca`]); the hub's
@@ -204,6 +209,77 @@ pub fn run(_store: &Store, args: &Args) -> i32 {
     }
 }
 
+/// `wsp hub disable` / `wsp hub enable`: the switch, under the login there is.
+pub fn switch(store: &Store, args: &Args, word: &str) -> i32 {
+    let Some(home) = wsp_client::hub_home().filter(|h| wsp_client::hub_login_in(h).ok().flatten().is_some()) else {
+        eprintln!("wsp: hub {word}: not logged in to a hub, so there is nothing to switch (`wsp login <hub-url>`)");
+        return 1;
+    };
+    match word {
+        "disable" => {
+            let done = crate::hub_switch::disable(store, &home);
+            println!("{}", disabled_text(&done, args.json()));
+            0
+        }
+        _ => {
+            let done = crate::hub_switch::enable(store, &home);
+            println!("{}", enabled_text(&done, args.json()));
+            if done.still_parked.is_empty() { 0 } else { 1 }
+        }
+    }
+}
+
+/// What `wsp hub disable` (and `wsp logout`, which disables first) prints.
+pub fn disabled_text(d: &crate::hub_switch::Disabled, json: bool) -> String {
+    if json {
+        return json!({
+            "enabled": false, "was_off": d.was_off, "parked": d.parked, "unreachable": d.unreachable,
+            "unsent": d.unsent, "released": d.released, "not_released": d.not_released,
+        })
+        .to_string();
+    }
+    let mut out = vec![if d.was_off { "the hub connection was off already; what was left is done again".to_string() } else { "hub connection disabled: no shared work is taken here".to_string() }];
+    if !d.parked.is_empty() {
+        out.push(format!("parked (agents keep their seats and finish what they are doing): {}", d.parked.join(" ")));
+    }
+    match &d.unreachable {
+        None => out.push(format!("journal flushed; {} lease(s) given back", d.released.len())),
+        Some(why) => out.push(format!("the hub did not answer ({why}): the journal is kept and the leases run out on the hub")),
+    }
+    if d.unsent > 0 {
+        out.push(format!("unsent: {} journal entries", d.unsent));
+    }
+    if !d.not_released.is_empty() {
+        out.push(format!("not given back: {}", d.not_released.join(" ")));
+    }
+    out.push("the login is kept; `wsp hub enable` takes part again".into());
+    out.join("\n")
+}
+
+fn enabled_text(e: &crate::hub_switch::Enabled, json: bool) -> String {
+    if json {
+        let still: Vec<_> = e.still_parked.iter().map(|(r, why)| json!({ "row": r, "why": why })).collect();
+        let replay = e.replay.as_ref().map(|r| match r {
+            Ok(()) => json!({ "ok": true }),
+            Err(why) => json!({ "ok": false, "why": why }),
+        });
+        return json!({ "enabled": true, "was_on": e.was_on, "resumed": e.resumed, "still_parked": still, "replay": replay }).to_string();
+    }
+    let mut out = vec![if e.was_on { "the hub connection was on already".to_string() } else { "hub connection enabled: shared work is taken and synced again".to_string() }];
+    if !e.resumed.is_empty() {
+        out.push(format!("resumed, their leases taken again: {}", e.resumed.join(" ")));
+    }
+    for (row, why) in &e.still_parked {
+        out.push(format!("still parked: {row}: {why}"));
+    }
+    match &e.replay {
+        Some(Err(why)) => out.push(format!("the journal was not replayed: {why}; the sync worker tries again")),
+        Some(Ok(())) => out.push("journal replayed".into()),
+        None => out.push("the daemon's sync worker replays the journal".into()),
+    }
+    out.join("\n")
+}
+
 /// The help of the admin verbs, carried by `wsp hub`'s entry in `cmd_login`
 /// (the one verb `hub`, whose `status` is the login's).
 pub const HELP: &str = r##"  wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
@@ -211,7 +287,12 @@ pub const HELP: &str = r##"  wsp hub user add <name> [--admin]    a hub user and
   wsp hub user revoke <name>           revoke a user and every token of its
   wsp hub token <name>                 a new token for a user, the old ones revoked
   wsp hub workspace add <name>         a shared workspace
-  wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it"##;
+  wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
+  wsp hub disable                      stop taking shared work here, cleanly: shared
+                                       rows in flight parked, the journal flushed,
+                                       leases given back; the login is kept
+  wsp hub enable                       take part again: parked rows resumed where
+                                       their lease can be taken"##;
 
 #[cfg(test)]
 mod tests {
