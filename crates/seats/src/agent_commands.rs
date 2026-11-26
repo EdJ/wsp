@@ -2058,22 +2058,8 @@ impl Kind for Pi {
     }
 }
 
-/// How long a completed turn has to have been over before a screen still
-/// reading `Working` is overruled, in seconds.
-///
-/// **The threshold is not arbitrary.** A turn that has just ended leaves the
-/// screen reading `Working` for as long as the TUI takes to repaint, which is
-/// normally under a second; a session that finished longer ago than that and is
-/// *still* reading `Working` is a seat whose screen has stopped telling us
-/// anything. Without a threshold the reader contradicts the screen on every turn
-/// boundary, and one that overrides its most direct witness on every tick is a
-/// reader nobody would believe.
-///
-/// **It lives here and the comparison lives in [`crate::cycle::overrule`],
-/// which is what makes both testable**: a test can cross the threshold in
-/// microseconds against a supplied clock and no opencode, a database or a
-/// frozen TUI, which is the same bargain [`crate::repair::Pass::due`] makes.
-pub const SETTLED_AFTER: i64 = 60;
+/// Moved to the run, beside the overrule that reads it (wsp-437).
+pub use crate::cycle::SETTLED_AFTER;
 
 /// Claude Code.
 pub struct Claude;

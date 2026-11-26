@@ -166,7 +166,7 @@ impl HubRig {
     /// no hub is named: the test is skipped.
     fn up(tag: &str, users: &[&str], members: &[&str]) -> Option<HubRig> {
         let hub = TestHub::start(Setup::default().tls())?;
-        let dir = PathBuf::from("/tmp").join(format!("pv-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let core: &[&str] = &["core"];

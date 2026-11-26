@@ -293,7 +293,7 @@ pub fn pointer(path: &Path) -> String {
 /// declaring `check:box`, a project `pj` rooted there, and a row `pj-001` in
 /// review at a commit that changes `web/src/pane/Pane.tsx` (one line out, one
 /// in) and `pj-002` at one that changes `b.rs`. Returns the first row's commit.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn react_fixture(store: &Store) -> String {
     use crate::model::{Project, Status};
     let repo = store.root.join("react-repo");

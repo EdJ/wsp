@@ -2683,7 +2683,7 @@ mod jobs_tests {
 
     impl Place {
         fn new(tag: &str) -> Place {
-            let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            let base = std::env::temp_dir();
             let top = base.join(format!("wvj-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&top);
             let root = top.join("trees");

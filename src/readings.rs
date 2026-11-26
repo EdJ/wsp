@@ -285,6 +285,7 @@ mod tests {
         use wsp_api::{Answer, Frame, Outcome, Reply, ReqId, MAX_LINE};
         use wsp_store_contract::{AskState, Reading, Reads, ListFilter, RowFilter};
 
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         // `Store::open` refuses the live store in a test, on purpose; this reads it and writes nothing.
         let store = Store::at(wsp_base::util::home().join("wsp"), Store::default_state());
         let db = wsp_store_sqlite::SqliteStore::open_read_only(store.state.join("state.db")).expect("state.db opens read-only");

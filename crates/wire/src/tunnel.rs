@@ -1077,7 +1077,7 @@ mod tests {
     /// A store under a short scratch directory, with a far seat's record for each
     /// `(seat, machine)`: both sockets recorded, as `start` does.
     fn store_with_seats(name: &str, seats: &[(&str, &str)]) -> (Store, PathBuf) {
-        let root = PathBuf::from("/tmp").join(format!("wt-{name}-{}-{}", std::process::id(), util::epoch_nanos() % 100_000));
+        let root = std::env::temp_dir().join(format!("wt-{name}-{}-{}", std::process::id(), util::epoch_nanos() % 100_000));
         let _ = std::fs::remove_dir_all(&root);
         let store = Store::at(root.clone(), root.join("state"));
         let fwd = root.join("state/sock");

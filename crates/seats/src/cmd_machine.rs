@@ -206,7 +206,7 @@ impl Fleet {
 pub fn seat_working(store: &Store) -> Vec<String> {
     match store.seat_cap() {
         None => Vec::new(),
-        Some(_) => crate::room::working_now(store, &crate::cycle::Fleet).iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
+        Some(_) => crate::room::working_now(store, crate::cycle::seats()).iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
     }
 }
 
@@ -1323,6 +1323,7 @@ mod tests {
     /// else a record carries is about reaching it.
     #[test]
     fn the_seat_takes_an_agent_cap_and_nothing_else() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let store = scratch("seat-agents");
         let set_to = |kv: &str| set(&store, &Args::synth("machine", &["set", "seat", kv], &[]));
 

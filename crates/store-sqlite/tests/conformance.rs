@@ -17,7 +17,7 @@ impl Harness for SqliteHarness {
     type Handle = SqliteStore;
 
     fn create(&self, domain: Arc<dyn Domain + Send + Sync>) -> SqliteStore {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let dir = std::env::temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("store-{}-{}.db", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
         SqliteStore::open(path, domain).unwrap()

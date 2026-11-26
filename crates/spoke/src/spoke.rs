@@ -109,8 +109,9 @@ impl SharedWork for Spoke {
     }
 
     fn whoami(&self) -> WhoAmI {
-        // A test never dials: a developer's own login must not change what it reads.
-        if cfg!(test) {
+        // A test never dials: a developer's own login must not change what it
+        // reads. A test of any crate (wsp-544's `under_test`), not this one's alone.
+        if wsp_engine::base::under_test() {
             return WhoAmI::NotLoggedIn;
         }
         let Ok(credential) = crate::hub_client::Credential::for_hub() else { return WhoAmI::NotLoggedIn };

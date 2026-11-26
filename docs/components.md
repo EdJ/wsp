@@ -107,8 +107,8 @@ except `base` and `testkit`, whose names are also modules of `wsp-base` and `wsp
 | `store` | `model`, `checks`, `caption`, `store`, `resolve`, `message`, `lapse`, `lease`, `sharing`, `testkit`, `governors`, `agent_kind`, `verbs`, `decisions`, `log`, `tags`, `lands` |
 | `wire` | `place`, `place_compound`, `place_super`, `host`, `host_tcp`, `host_inproc`, `tunnel`, `far`, `launchd`, `systemd`, `manager`, `fake` |
 | `trees` | `cmd_checkout`, `cmd_verify`, `treecopy`, `check_tree`, `job_place`, `throttle`, `warm`, `overlap`, `guard`, `greens`, `at_stop`, `gc` |
-| `engine` | `addon`, `address`, `affected`, `after`, `artefact`, `attempt`, `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `by_merge`, `check`, `classify`, `closing`, `cmd_initiative`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_submit`, `cmd_task`, `cmd_whoami`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`, `follow_up`, `history`, `hold`, `hold_close`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `liveness`, `local_trust`, `mirror`, `orders`, `outputs`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`, `pieces`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `scope`, `scratch`, `size_check`, `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`, `verifier_packet`, `waiting`, `waits`, `worklist` |
-| `seats` | `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`, `cmd_install`, `cmd_machine`, `cmd_project`, `cmd_resume`, `cmd_role`, `cmd_sandbox`, `cmd_spawn`, `cmd_stamp`, `cmd_watch`, `kind_attention`, `kind_data`, `memory`, `room`, `wake` |
+| `engine` | `addon`, `address`, `affected`, `after`, `artefact`, `attempt`, `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `by_merge`, `check`, `claims`, `classify`, `closing`, `cmd_initiative`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_submit`, `cmd_task`, `cmd_whoami`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`, `follow_up`, `history`, `hold`, `hold_close`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `liveness`, `local_trust`, `mirror`, `orders`, `outputs`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`, `pieces`, `prose`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `room`, `scope`, `scratch`, `sent`, `size_check`, `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`, `verifier_packet`, `waiting`, `waits`, `watch_levels`, `worklist` |
+| `seats` | `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`, `cmd_install`, `cmd_machine`, `cmd_project`, `cmd_resume`, `cmd_role`, `cmd_sandbox`, `cmd_spawn`, `cmd_stamp`, `cmd_watch`, `kind_attention`, `kind_data`, `memory`, `wake` |
 | `spoke` | `cmd_allocate`, `cmd_hub`, `cmd_login`, `cmd_publish`, `hub_cache`, `hub_client`, `hub_journal`, `hub_ids`, `hub_lease`, `hub_switch`, `hub_sync`, `reconcile`, `spoke`, `testhub` |
 | `timeline` | `timeline`, `cmd_cost`, `cmd_burn`, `spend`, `cmd_calls`, `cmd_report`, `wallbuckets`, `cmd_attempts`, `cmd_verifications`, `retro`, `retro_run`, `retro_series`, `stale` |
 | `surface` | `panel`, `detail`, `draw`, `kanban`, `live`, `story`, `arrange` |
@@ -158,14 +158,16 @@ not a structure problem (row `c0-fixtures` below).
 | `wsp-server` | `crates/server` | state-core step 1 (wsp-073) | the state core's server (docs/state-core.md section 6), step 1's part: `Server::start` on loopback and the tailnet (D19), refusing any peer outside `127.0.0.0/8`, `::1`, `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, `api.token` made at first start (0600), `api.json` written with what it bound, refusing to start while anything answers its port; per connection `hello` first, the read verbs of 4.2 as one store call each, the view verbs `throttle`, `spend` and `show` answered by the `Views` the daemon hands in (wsp-307), every command `unsupported` but the orders machine's (wsp-121: `order.send` and `order.cancel` from a person or a seat, `order.deliver` and the executor's answers from `wsp:<instance>` or a manager and `unauthorised` from anyone else, each with a key, applied through the store and answered `applied` with its events), a malformed line answered `malformed` with the connection kept; `subscribe {}` / `{from}` (snapshot or replay, then the head through `wait_for`, a beat every `BEAT_SECS`, a client silent for `MISSED_BEATS` dropped); `tcp::Tcp`, the carrier (public for wsp-client's tests); `mirror::Mirror`, the domain step 1's store runs (`mirror.put` for what changed, `machine.beat` for a machine whose beat and liveness facts alone moved (wsp-304), `mirror.gone` for what is present, nothing for what is unchanged); `domain::Composed`, the mirror and `wsp-machines`' orders machine as one domain under a `Mode` (wsp-121): `Mirrored` (the mirror puts orders, the machine's verbs `illegal`, state `mirrored`), `Owned` (the machine decides them, a `mirror` naming an order `illegal`, state `owned`), its fold the same under either. Over any `dyn Store`; tested over `MemStore` (`tests/server.rs`). Since wsp-075 the daemon starts it (`WSP_API=off` does not). It serves no hub: the gate, the sync-verb hook, TLS, peer ranges, token revocation and scoped subscriptions that the old in-tree hub ran on left with it. **External dependency: `serde_json`.** **Links `wsp-api`, `wsp-store-contract` and `wsp-machines` alone** (`wsp-store-conformance` as a dev-dependency), never the sqlite crate: `tests/layering.rs` walks its path dependencies | `crates/server/MAP.md` |
 | `wsp-client` | `crates/client` | state-core step 1 (wsp-074) | the state core's client (docs/state-core.md section 6), step 1's part, the one way a process outside the daemon talks to the API (the CLI, wsp-076, and web-chrome, wsp-078, by path): `Client::dial(state_dir, by, wait)` reads `api.json` and `api.token`, dials the addresses in turn within `wait`, says `hello`, and is `Silent` (no file, no token, nothing answering, no welcome, a refused token) with a reason that names which, never a panic or a hang; `Client::request(verb, args)` is one reply matched by id with one timeout, and the next request after a lost connection dials again; `Client::subscribe(from)` is a `Feed` that hands out `Item::State`, then each event once (an id already handed out is dropped, 4.3), counts missed beats, and on a closed connection or `MISSED_BEATS` quiet beats dials again and subscribes from its last id, announced as one `Item::Resumed { from }`; `too_old` leads to `subscribe {}` and a fresh `State`. Its TCP carrier is a dial-side twin of the server's, so a caller does not link the server. A hub is no server of its: the spoke has its own client of the hub (`wsp-spoke`'s `hub_client`). **Links `wsp-api` and `wsp-store-contract` alone**, beside `serde_json`, so web-chrome, which links the client by path, links no more of wsp than the protocol; `wsp-server` and `wsp-store-conformance` are dev-dependencies (a loopback server over `MemStore`, `tests/client.rs`): `tests/layering.rs` walks its path dependencies | `crates/client/MAP.md` |
 | `wsp-hub-protocol` | `crates/hub-protocol` | spoke and hub (step 2) | the hub's wire surface, the contract a spoke and the hub share, copied from the hub's own repository (where the hub lives, a program of its own) with its tests: `Frame` with `hello`/`welcome`/`refused` and the GitHub login frames (`login`, `login_prompt`, `login_done`), the request envelope and `Reply`, the read verbs a hub answers (`state`, `events`, `subscribe`, `whoami`), the six `hub.*` identity commands (`IdentityCommand`), the sync, ref, id, lease and message verbs (`SyncCall`), `Answer`s and `Code`s, the `Connection` trait and the framing constants, `Principal`'s text form. Types, encode/decode and constants only: no logic, no IO. `tests/wire.rs` holds every frame to the bytes `wsp-api` wrote while it still had the hub's frames, frozen in `tests/golden` (the login frames, which this repository's `wsp-api` never had, to the hub repository's bytes). Only `wsp-spoke` depends on it (`tests/layering.rs`). **Links `wsp-store-contract` and `wsp-objects` alone**, beside `serde` and `serde_json`; `wsp-api` is a dev-dependency, for the wire test | its `lib.rs` |
-| `wsp-engine` | `crates/engine` | phase 2 (wsp-440) | the `engine` and `seats` rows of the map below, cut whole (§5, phase 2): 97 modules, the run (`worklist`, `cycle`, `repair`, `verification`, `legs`, the barrier), the row and list verbs, orders, the fold and the mirror, and the seat commands (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `room`, `cmd_watch`, …), with `disk` and `memory`. The root re-exports each at its old path (`main.rs`); every `pub(crate)` in them is `pub`. The build stamp is the root's (`build.rs`), so `main` hands it in (`base::stamp::BUILD_STAMP`, as `store::BUILD_STAMP`); timeline's report writers likewise (`outputs::install`), with stand-ins in the crate's own tests. Doc blocks are not doctests (`doctest = false`). **Normal dependencies: `serde_json` and the members below it** (`wsp-base`, `wsp-store`, `wsp-wire`, `wsp-trees`, `wsp-host-api`, `wsp-store-contract`, `wsp-objects`, `wsp-server`, `wsp-api`, `wsp-client`, `wsp-view`); `wsp-store-sqlite` (optional, behind `test-support`, for the orders fixtures), `wsp-manager`, `wsp-host` and `wsp-testkit` are dev-dependencies, the sqlite crate for tests alone. **Never `wsp-spoke`, not even in tests**: the shared-work add-on is reached only through `addon::SharedWork`, and its twelve modules (`spoke`, `hub_*`, `reconcile`, `cmd_login`, `cmd_hub`, `cmd_publish`, `cmd_allocate`) live in `wsp-spoke`. Nothing the add-on interface carries is a hub wire type: a message off the machine is `addon::Outgoing`, one delivered here `addon::Incoming`. `tests/layering.rs` walks its path dependencies | `crates/engine/MAP.md` |
-| `wsp-spoke` | `crates/spoke` | spoke and hub (step 1b) | the shared-work add-on: the spoke that logs in to a hub and syncs shared work (`spoke::Spoke`, which implements `wsp_engine::addon::SharedWork`; the leases and the drive in `hub_lease`, the sync worker in `hub_sync`, its journal and cache in `hub_journal` and `hub_cache`, the merge in `reconcile`, the on/off switch `hub_switch`, its own client of the hub in `hub_client`) and the verbs of the shared side (`wsp login`, with a token or `--github`, `logout`, `hub`, `publish`, `allocate`). `hub_client` speaks `wsp-hub-protocol` and nothing else: the dial (TLS with a pinned CA, or TCP), hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, `hubs.json` and `WSP_HUB_*`, certificate expiry, the GitHub login and the token mint/hash. `testhub` (behind `test-support`) runs the hub's own program for tests, `WSP_HUB_BIN=<path to wsp-hub>` or `WSP_HUB_IMAGE=<image>`; without either, the tests that need a hub are skipped with one notice per test binary (`WSP_HUB_REQUIRED=1` fails them). The root installs it (`addon::install`) and registers its verbs; the engine never names it, and a wsp without it answers every shared-work question standalone (R3). **Links `wsp-engine` and the members below it** (`wsp-base`, `wsp-store`, `wsp-store-contract`, `wsp-objects`) and `wsp-hub-protocol`, beside `rustls`, `rustls-native-certs`, `sha2` and (behind `test-support`) `rcgen`; never `wsp-api`, `wsp-client`, `wsp-server` or `wsp-machines` as a normal dependency (`wsp-server` and `wsp-store-sqlite` are dev-dependencies for the orders fixtures): `tests/layering.rs` checks that `wsp-engine` reaches no `wsp-spoke` | `crates/spoke/MAP.md` |
+| `wsp-engine` | `crates/engine` | phase 2 (wsp-440) | the `engine` row of the map below (§5, phase 2; the `seats` row left for `wsp-seats` at wsp-441): 80 modules, the run (`worklist`, `cycle`, `repair`, `verification`, `legs`, the barrier), the row and list verbs, orders, the fold and the mirror, `room` (cycle and waits use `room::Gate`), with `disk`. The root re-exports each at its old path (`main.rs`); every `pub(crate)` in them is `pub`. The build stamp is the root's (`build.rs`), so `main` hands it in (`base::stamp::BUILD_STAMP`, as `store::BUILD_STAMP`); timeline's report writers likewise (`outputs::install`), with stand-ins in the crate's own tests; and the seats, which it reaches only through the installed `dyn Seats` (`cycle::install_seats(&cmd_spawn::Fleet)`, wsp-542). Doc blocks are not doctests (`doctest = false`). **Normal dependencies: `serde_json` and the members below it** (`wsp-base`, `wsp-store`, `wsp-wire`, `wsp-trees`, `wsp-host-api`, `wsp-store-contract`, `wsp-objects`, `wsp-server`, `wsp-api`, `wsp-client`, `wsp-view`); `wsp-store-sqlite`, `wsp-manager`, `wsp-host` and `wsp-testkit` are dev-dependencies, the sqlite crate for tests alone; **never `wsp-seats` or `wsp-spoke`, in any table**: the shared-work add-on is reached only through `addon::SharedWork` (the root installs `wsp-spoke`'s `Spoke` with `addon::install`), as the seats are only through `cycle::seats()`; nothing the add-on interface carries is a hub wire type (`addon::Outgoing`, `addon::Incoming`). `tests/layering.rs` walks its path dependencies. `test-support` (wsp-544) gives a dependent's tests its fixtures and recorders | `crates/engine/MAP.md` |
+| `wsp-seats` | `crates/seats` | phase 3 (wsp-441) | the `seats` row of the map below: 18 modules, the seat commands (`cmd_spawn` with `Fleet`, the `Seats` impl the root installs into the engine, `cmd_agent`, `agent_commands`, `wake`, `cmd_govern`, `cmd_watch`, `cmd_machine`, `cmd_sandbox`, `cmd_install`, `cmd_brief`, `cmd_resume`, `cmd_role`, …), with `memory`. Moved by `git mv` from `wsp-engine`; its `lib.rs` re-exports every engine module at its old path (`crate::cycle`, …) and the root re-exports the 18 at theirs, so no caller changed. 12 engine items went from `pub(crate)` to `pub` for it (`watch_levels`, `sent`, `stage`). Doc blocks are not doctests. **Normal dependencies: `serde_json`, `wsp-engine` and the members it names directly** (`wsp-base`, `wsp-store`, `wsp-wire`, `wsp-host-api`, `wsp-store-contract`, `wsp-server`, `wsp-api`, `wsp-client`, `wsp-view`); `wsp-engine` with `test-support`, `wsp-testkit`, `wsp-manager`, `wsp-host` and `wsp-store-sqlite` are dev-dependencies, the sqlite crate for tests alone (d1 on wsp-441: its tests install the `state.db` open, `install_db`): `tests/layering.rs` walks its path dependencies and its source | `crates/seats/MAP.md` |
+| `wsp-spoke` | `crates/spoke` | spoke and hub (step 1b) | the shared-work add-on: the spoke that logs in to a hub and syncs shared work (`spoke::Spoke`, which implements `wsp_engine::addon::SharedWork`; the leases and the drive in `hub_lease`, the sync worker in `hub_sync`, its journal and cache in `hub_journal` and `hub_cache`, the merge in `reconcile`, the on/off switch `hub_switch`, its own client of the hub in `hub_client`) and the verbs of the shared side (`wsp login`, with a token or `--github`, `logout`, `hub`, `publish`, `allocate`). `hub_client` speaks `wsp-hub-protocol` and nothing else: the dial (TLS with a pinned CA, or TCP), hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, `hubs.json` and `WSP_HUB_*`, certificate expiry, the GitHub login and the token mint/hash. `testhub` (behind `test-support`) runs the hub's own program for tests, `WSP_HUB_BIN=<path to wsp-hub>` or `WSP_HUB_IMAGE=<image>`; without either, the tests that need a hub are skipped with one notice per test binary (`WSP_HUB_REQUIRED=1` fails them). The root installs it (`addon::install`) and registers its verbs; the engine never names it, and a wsp without it answers every shared-work question standalone (R3). **Links `wsp-engine` and the members below it** (`wsp-base`, `wsp-store`, `wsp-store-contract`, `wsp-objects`) and `wsp-hub-protocol`, beside `rustls`, `rustls-native-certs`, `sha2` and (behind `test-support`) `rcgen`; never `wsp-api`, `wsp-client`, `wsp-server` or `wsp-machines` as a normal dependency (`wsp-server` and `wsp-store-sqlite` are dev-dependencies for the orders fixtures): `tests/layering.rs` checks that neither `wsp-engine` nor `wsp-seats` reaches `wsp-spoke` | `crates/spoke/MAP.md` |
 | `wsp-machines` | `crates/machines` | state-core step 2 (wsp-118) | the state core's machines (docs/state-core.md sections 3 and 6), each a pure `Domain` over the contract; step 2's part is `orders::Orders`, 3.1's machine: `Orders::owns` (the seven `order.*` verbs, for the server's routing), `decide` (`order.send` → `queued`; `order.deliver` → `typed` by the holder of `deliver:<seat>` at its current token, to a seat `idle` or `working` (`started` for a `first` order) with no other order `typed`; the executor's `delivered`, `acked`, `refused` (`attempts + 1`, `failed` at `ATTEMPTS` = 3; `counts: false` no attempt) and `done`; `cancel` from any state but `done`), every refusal one of the contract's codes and drafting nothing, a repeat answer an empty decision; and `evolve` (the `order.*` events and `lease.*`). One test per transition and a table of every illegal one in `tests/orders.rs`, which stands in for conformance case 9 (fixed to `TestDomain`). `wsp-server`'s `domain::Composed` composes it beside the mirror (wsp-121). **Links `wsp-store-contract` alone**, beside `serde_json`, and its source names no IO and reads no clock: `tests/layering.rs` walks its path dependencies and its source | `crates/machines/MAP.md` |
 
 `disk` and `memory` moved with the phase 2 crate (wsp-440); since wsp-432 the layering table maps them where they
-live, `disk` to `engine` and `memory` to `seats`, and neither reaches above its row but `disk -> cmd_sandbox` (inside
-the phase 2 crate). Dependencies are `serde_json` only (and `rusqlite`, in `wsp-store-sqlite` alone: D2); the members are path dependencies in the workspace.
-At the phase 2 cut (wsp-440) it is 4142 before and 4144 after: the move keeps every test, splits one in two (cycle's wsp-030 boundaries, its timeline half to `timeline.rs`) and adds the layering test of the new crate's links. The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
+live, `disk` to `engine` (`wsp-engine`) and `memory` to `seats` (`wsp-seats` since wsp-441), and neither reaches above
+its row (wsp-437 and wsp-438 removed the last `engine -> seats` lines, `disk -> cmd_sandbox` among them). Dependencies are `serde_json` only (and `rusqlite`, in `wsp-store-sqlite` alone: D2); the members are path dependencies in the workspace.
+At the seats cut (wsp-441) it is 4163 before and 4163 after: the move adds no test and drops none (the layering
+test of the new crate's links extends the engine's). At the phase 2 cut (wsp-440) it is 4142 before and 4144 after: the move keeps every test, splits one in two (cycle's wsp-030 boundaries, its timeline half to `timeline.rs`) and adds the layering test of the new crate's links. The test count is `cargo test --workspace -- --list` = 2756 at `c1` (2754 `#[test]`, the same before and after, plus
 the two layering tests); the 2534 above is the figure of 5 Nov.
 
 ### The contract of each, and who writes what
@@ -367,6 +369,282 @@ dependency**, with one amendment: **D2 (docs/state-core.md section 6) admits `ru
 `wsp-store-sqlite` only, pinned exactly and `bundled`; `tests/layering.rs` fails when any other manifest names it. A
 workspace's members are not dependencies in the sense of that rule, and the commit should say so.
 A single binary linked from the members costs nothing at start-up (`robustness-077`).
+
+### Phase 3 sets, measured
+
+Counted at trunk `1a16d54` (wsp-533) with `tests/layering.rs`'s own parser and line rule (`crate::` paths and `use
+crate::{…}` in non-test code, up to the first `#[cfg(test)] mod`). A line is one (from module, to module) pair, as
+`docs/components-upward.txt` writes it; symbols are distinct per target module (`*` is a use of the module itself).
+
+**core -> spoke is not at 5 lines or fewer: it is 13 lines, so by decision 5 the spoke cut (wsp-534) does not go ahead
+as the code stands; spoke -> core, the edge that cut would keep, is 14 lines (33 symbols).**
+
+Re-counted for wsp-534 at trunk `abf65ef`, the same way: core -> spoke is **14 lines, 31 symbols** (spoke -> core 14
+lines, 33 symbols), over decision 5's 5, so `wsp-spoke` was not cut and no code changed. The one new line,
+`cycle -> hub_journal`, and 5 of the 7 new symbols come from `cycle`'s `test-support` module, which the parser reads as
+product code (`#[cfg(test)]` at `1a16d54`, so not counted then); without that module it is 13 lines, 26 symbols, still
+over 5.
+
+**Since then the spoke is cut, by removing core -> spoke rather than by counting it down** (the spoke-and-hub work,
+merged onto this cut): core asks a shared-work add-on through the engine's `addon::SharedWork`, which the root
+fills with `wsp-spoke`'s `Spoke`, so core -> spoke and seats -> spoke are 0 lines; spoke -> core and spoke -> the
+installed seats (`cycle::seats()`) are the edges kept. `wsp-spoke` holds the eight below less `cmd_whoami` (it stays in
+core and asks the add-on), plus `cmd_allocate`, `reconcile`, `hub_switch`, `hub_ids` and its own hub client;
+`tests/layering.rs` holds that neither `wsp-engine` nor `wsp-seats` reaches it. The tables below are the count as it
+was at `1a16d54`.
+
+- **spoke** (8): `cmd_hub`, `cmd_login`, `cmd_publish`, `cmd_whoami`, `hub_cache`, `hub_journal`, `hub_lease`,
+  `hub_sync`.
+- **seats** (19, the map's `seats` row): `agent_commands`, `cmd_agent`, `cmd_attend`, `cmd_brief`, `cmd_govern`,
+  `cmd_install`, `cmd_machine`, `cmd_project`, `cmd_resume`, `cmd_role`, `cmd_sandbox`, `cmd_spawn`, `cmd_stamp`,
+  `cmd_watch`, `kind_attention`, `kind_data`, `memory`, `room`, `wake`.
+- **core** (75): the map's `engine` row less the spoke modules: `address`, `affected`, `after`, `artefact`, `attempt`,
+  `attention`, `auto_close`, `barrier`, `barrier_replay`, `barrier_run`, `build_output`, `by_merge`, `check`,
+  `classify`, `closing`, `cmd_allocate`, `cmd_initiative`, `cmd_mandate`, `cmd_message`, `cmd_migrate`, `cmd_submit`,
+  `cmd_task`, `cmd_worklist`, `cold`, `cycle`, `deliver`, `did`, `disk`, `door`, `duplicate`, `ending`, `exit`, `fold`,
+  `follow_up`, `history`, `hold`, `hold_close`, `inner`, `leg_seat`, `leg_tree`, `legs`, `list_sweep`, `liveness`,
+  `local_trust`, `mirror`, `orders`, `outputs`, `owed`, `packet`, `packet_gen`, `pickup`, `piece_close`, `piece_seat`,
+  `pieces`, `reconcile`, `record_workspace`, `refusals`, `repair`, `retro_yours`, `scope`, `scratch`, `size_check`,
+  `split`, `stage`, `stand_down`, `starts`, `stepping`, `stuck`, `tell_log`, `untaken`, `verification`,
+  `verifier_packet`, `waiting`, `waits`, `worklist`.
+
+**One module moved from the list this was ordered with.** The order named seven spoke modules; `cmd_publish` is
+counted with them as an eighth, because it is plainly a hub client (it takes each new id from the hub with
+`ids.alloc`, and its `dial` is the hub client `hub_lease` connects with). With the seven alone, core -> spoke is 13
+lines and spoke -> core 15; the answer to decision 5 is the same. All seven listed are hub clients. `door` (the import
+of the hub's objects into the files) and `reconcile` (the merge after a `stale`) serve the sync but do not dial the
+hub, and stay in core.
+
+| direction | lines | distinct symbols | lines with the seven listed |
+|---|---|---|---|
+| core -> seats | 26 | 57 | 26 |
+| seats -> core | 113 | 227 | 113 |
+| core -> spoke | 13 | 24 | 13 |
+| spoke -> core | 14 | 33 | 15 |
+| seats -> spoke | 2 | 4 | 2 |
+| spoke -> seats | 0 | 0 | 0 |
+
+**core -> seats**: 26 lines, 57 symbols.
+
+```
+attention -> cmd_watch: *, Edge, Emit, Kind, Ledger, Poll, Scope, Signal, Source, resume
+cmd_message -> agent_commands: of
+cmd_message -> cmd_agent: Sent, delivered, locate_seat, prose, twice, typed_message
+cmd_message -> cmd_govern: answering_seat, room_of, whereabouts
+cmd_message -> wake: held_because, say
+cmd_task -> cmd_agent: *, claim_line, current_project, hand_off, live_holders, say_looking, worked_line
+cmd_task -> cmd_resume: thread_for_task
+cmd_task -> cmd_spawn: kind_or_default
+cmd_worklist -> cmd_agent: claim_where, named_project
+cmd_worklist -> cmd_govern: slots
+cycle -> agent_commands: SETTLED_AFTER
+cycle -> cmd_agent: did_of_seat, notice
+cycle -> cmd_govern: last_seat, mark_stood_down, occupant, reseat_why, vacate
+cycle -> room: Gate
+cycle -> wake: messages_held, say, settle_held
+leg_seat -> cmd_agent: ran_in_seat, spawned_at
+repair -> agent_commands: opencode_finished_at
+repair -> cmd_agent: stuck_of_seat
+repair -> cmd_govern: *
+repair -> cmd_spawn: seat_kind
+repair -> wake: owed_to, scopes_owed
+stage -> cmd_agent: sentence
+stage -> cmd_govern: needs_a_person
+stand_down -> cmd_govern: *
+stand_down -> wake: owed_to
+waits -> room: Counted, Gate, working_now
+```
+
+**wsp-437 took the run's 15 of these out** (the `cycle`, `repair`, `stage`, `stand_down` and `waits` lines), with no
+change in behaviour, so 11 are left, all wsp-438's. Pure helpers moved down: the governor record's reads and writes
+(`last_seat`, `seat_held`, `host_of`, `reseat_why`, `vacate`, `mark_stood_down`, `count_unseated`, `claim_seat`,
+`forget_unseated`, `reseat_failed`, `seat_kind`) into `governors` (store), next to the ones wsp-403 put there;
+`kind_or_default` and `DEFAULT_KIND` into `agent_kind`; `SETTLED_AFTER` into `cycle`, beside `overrule`;
+`stuck_of_seat` into `stuck`; `sentence` into `stage`; `did_of_seat` is `fold::did_since` called directly;
+`needs_a_person` is `wsp_view::stage`'s called directly. `room` is now in the `engine` row: the cap is what the run
+admits by (its `Gate` reads seats through the `Seats` port already), and its one use of the seats, `governs_seat`,
+went with it. The rest are acts on the `Seats` port that `Fleet` implements in `cmd_spawn`: `say`, `messages_held`,
+`settle_held`, `owed_to`, `scopes_owed` (the seat's spool), `notice`, `answering_scope`, `occupant` and
+`opencode_finished_at`. Each seats module re-exports what left it, so its other callers are unchanged.
+
+**wsp-438 took the other 11 out**, with no change in behaviour, so `docs/components-upward.txt` has no line left and
+the layering test reads 0 upward edges. Moved down, each re-exported from where it was: the watch's level model
+(`Kind`, `Class`, `Signal`, `EVERYONE`, `Edge`, `Ledger`, `Emit`, `Routing`, `resume`, `Source`, `Scope`) out of
+`cmd_watch` into a new `watch_levels` (engine), so `attention` reads it from its own row; `machine_source`, which
+builds the census-reading `Poll`, went up into `cmd_watch`, and the daemon hands it to `attention::tick` as the
+`&mut dyn Source` it already took. `claim_line`, `worked_line`, `claim_where`, `spawned_at`, `Pane` and
+`live_holders` into a new `claims` (engine); `prose`, `from_source`, `typed_message`, `piped_message` into a new
+`prose` (engine); `Sent`, `twice`, `delivered` and `locate_seat` into a new `sent` (engine); `say_looking` into
+`stage`; `held_because` into `waiting`; `named_project` into `resolve` (store); `room_of`, `whereabouts`, `Slot`
+and `slots` into `governors` (store); `kind_or_default` is `agent_kind`'s, called directly. `wake::Report` is now
+`cycle::Report` and is what `Seats::say` answers with, in place of wsp-437's two-field `Said`. New acts on the
+`Seats` port, which `Fleet` implements in `cmd_spawn`: `answering_seat`, `current_project` (the standing-in chain
+reads the caller's seat), `hand_off` (it reads what served the attempt off the session), `thread_kind`,
+`ran_in_seat`, and `tell_as` (the kind's own typing at a seat).
+
+**seats -> core**: 113 lines, 227 symbols.
+
+```
+agent_commands -> did: Did
+cmd_agent -> address: Address, Book, claim_holder, parse, resolve
+cmd_agent -> attempt: attempts_of
+cmd_agent -> attention: health, orphans
+cmd_agent -> barrier: ran_on, seat_label, seats
+cmd_agent -> classify: Holder, Item, Kind, Seat, of
+cmd_agent -> cmd_mandate: from_map
+cmd_agent -> cmd_message: asked_of_the_person, sender, tell_via_hub, whoami
+cmd_agent -> cmd_migrate: is_dated
+cmd_agent -> cmd_task: *
+cmd_agent -> cycle: BLOCKED_ESCALATES_AFTER, OWNED, OWNED_GROUP, OWNED_LIST, blocked_since, poke_task, silent
+cmd_agent -> did: Did
+cmd_agent -> disk: health, loud, loud_of
+cmd_agent -> ending: handed_to_legs
+cmd_agent -> fold: did_since, stall, state_since
+cmd_agent -> follow_up: json_of, line, unheld
+cmd_agent -> leg_tree: row_of
+cmd_agent -> legs: Standing, State, seat_label, seated, tally
+cmd_agent -> liveness: a_backend_answered, dead, health, running
+cmd_agent -> local_trust: dialog_fix
+cmd_agent -> mirror: LOCAL, api_health, binding_of, claim_of, finished_item, finished_rows, holders_of, list_of, message_of, seated_of, spawned_of, state_of, task_of, wip_reads_in_full
+cmd_agent -> orders: Error, Mode, TELL_WAIT, all, all_in, answer, health, mode, order, orders_of, principal, said, send, typed_since, typed_since_in
+cmd_agent -> packet: clause
+cmd_agent -> pickup: started_lately, wip_lines
+cmd_agent -> pieces: Standing, State, addressed, seat_label, seated, tally
+cmd_agent -> refusals: TEST_DOOR, refusing
+cmd_agent -> repair: run_said, stuck_seats
+cmd_agent -> stuck: Kind, Stall, classify, waits_on_itself_line
+cmd_agent -> tell_log: show
+cmd_agent -> verification: SECTION, ran_on_by_seat, seat_label, seated, seats, verified
+cmd_agent -> waiting: Asks, Facts, Kind, SeatWait, Shells, Wait, Why, on_screen, reading, seat_wait
+cmd_agent -> worklist: Running, Settlement, homes, passed_by_running
+cmd_attend -> check: *
+cmd_attend -> packet: build, of
+cmd_attend -> worklist: verified_by_a_run
+cmd_brief -> artefact: BRIEF_LINE
+cmd_brief -> barrier: seat_label, seat_of
+cmd_brief -> cmd_mandate: *
+cmd_brief -> cmd_message: census
+cmd_brief -> cmd_task: paint_prio
+cmd_brief -> leg_seat: brief_lines, has_packet
+cmd_brief -> liveness: a_backend_answered, dead, running
+cmd_brief -> piece_seat: brief_lines
+cmd_brief -> split: NOT_A_SUBTASK, route
+cmd_brief -> verification: seats
+cmd_brief -> worklist: Placing, Position, Running, running_position
+cmd_govern -> address: logged_in_user
+cmd_govern -> cycle: Fleet, STARTED_BY
+cmd_govern -> repair: Occupancy, reading
+cmd_govern -> verification: verified_in
+cmd_govern -> worklist: Running, home_of_scope
+cmd_install -> artefact: hash_of
+cmd_machine -> cycle: Fleet
+cmd_machine -> mirror: LOCAL, state_of
+cmd_project -> cmd_initiative: all, tree_lines
+cmd_project -> cmd_task: Prose, edit_prose, paint_prio
+cmd_project -> record_workspace: of_new
+cmd_project -> worklist: home_of_scope
+cmd_role -> barrier: seats
+cmd_role -> check: key_text
+cmd_role -> cmd_task: done
+cmd_role -> cycle: Fleet
+cmd_role -> verification: latest, seats, verified
+cmd_role -> worklist: Running
+cmd_sandbox -> disk: strays_of
+cmd_sandbox -> local_trust: clear
+cmd_spawn -> address: claim_holder
+cmd_spawn -> attention: seat_gone
+cmd_spawn -> barrier: mark_ended, name_seat, seat_label, seat_of, subject
+cmd_spawn -> closing: Kind, baton_path, clear_verdict, verdict_path
+cmd_spawn -> cmd_allocate: allocated_elsewhere, elsewhere_said
+cmd_spawn -> cmd_message: type_at
+cmd_spawn -> cycle: Fleet, OWNED_LIST, RESEAT_ASKED, RUN_STEP, Seats, check_order, overrule, sent_back_order, verifier_order_line
+cmd_spawn -> disk: hold
+cmd_spawn -> duplicate: moved_note
+cmd_spawn -> ending: stop_in_tree
+cmd_spawn -> exit: Kind
+cmd_spawn -> leg_seat: *
+cmd_spawn -> leg_tree: Prepared, discard, prepare, record
+cmd_spawn -> legs: lasts, legs
+cmd_spawn -> local_trust: trust
+cmd_spawn -> orders: Error, Mode, answer, mode, send
+cmd_spawn -> packet: at_leg_spawn, at_spawn, give_leg, leg_order, order_in
+cmd_spawn -> piece_seat: Prepared, Standing, attach, open, order_line, prepare, record_tree, tier_of, unopen
+cmd_spawn -> pieces: record
+cmd_spawn -> repair: Occupancy, reading
+cmd_spawn -> scratch: path
+cmd_spawn -> stuck: waits_on_itself_line
+cmd_spawn -> verification: name_seat, seat_label, seats
+cmd_spawn -> waiting: Shells, TurnEnd, read_last_turn
+cmd_spawn -> worklist: Running, running_position
+cmd_watch -> address: logged_in_user
+cmd_watch -> attention: forget_level
+cmd_watch -> disk: LOW, read
+cmd_watch -> liveness: a_backend_answered, loud, running
+cmd_watch -> verification: stalled_at_cap
+cmd_watch -> waiting: Asks, Why
+cmd_watch -> worklist: *, Running
+room -> barrier: NOT_UP_AFTER, moot, seat_label, seats
+room -> cycle: STARTED_BY, Seats
+room -> ending: exited_seats
+room -> inner: run_inside
+room -> legs: State, label, legs
+room -> pieces: State, record
+room -> repair: undelivered_reason
+room -> verification: Ending, State, passes, seat_label, seats
+room -> worklist: open_list_of
+wake -> address: Address, Book, logged_in_user, parse
+wake -> cmd_message: hub_tell
+wake -> cycle: Fleet, Seats
+wake -> fold: turn_began_since
+wake -> refusals: *, Door, accepted, door, refuse
+wake -> repair: Occupancy, reading, will_seat
+```
+
+**core -> spoke**: 13 lines, 24 symbols.
+
+```
+address -> hub_cache: Cache
+address -> hub_lease: Book
+cmd_message -> cmd_whoami: engineer, person, person_named
+cmd_message -> hub_sync: Hand, dial
+cmd_task -> cmd_whoami: sign
+cmd_task -> hub_cache: is_head, show_line
+cmd_task -> hub_journal: refusal, show_line
+cmd_task -> hub_lease: before_claim
+cmd_task -> hub_sync: fetch
+cmd_worklist -> hub_lease: driven_by, running_elsewhere
+cycle -> hub_lease: Book, Drives, Member, drive, lease_member, running_elsewhere, token_of, unused, verdict_held
+door -> cmd_publish: highest_local
+verification -> hub_journal: refusal
+```
+
+**spoke -> core**: 14 lines, 33 symbols.
+
+```
+hub_cache -> cmd_message: Caller
+hub_cache -> cmd_task: *
+hub_cache -> door: *, Heads, task_of_record, user_of
+hub_cache -> repair: landed_line
+hub_lease -> address: logged_in_user
+hub_lease -> cmd_allocate: allocated_elsewhere, allocated_to, elsewhere_said
+hub_lease -> repair: commit_of, landed_line, ready
+hub_lease -> verification: blocked, tell_governor, verified
+hub_sync -> cmd_message: receive
+hub_sync -> door: *, Applied, Door, Heads, Refusal, list_digest, user_of
+hub_sync -> mirror: by_shared_workspace, list_texts_of, lists, shared_row
+hub_sync -> orders: Mode, mode, send_keyed
+hub_sync -> reconcile: *, Lease, Merging, NoLease, Objects
+hub_sync -> verification: tell_governor
+```
+
+**seats -> spoke**: 2 lines, 4 symbols.
+
+```
+cmd_agent -> hub_lease: before_claim, let_go, stamp
+cmd_agent -> hub_sync: health
+```
+
+**spoke -> seats**: 0 lines, 0 symbols.
 
 ## 6. The maps, and how the brief points at them
 

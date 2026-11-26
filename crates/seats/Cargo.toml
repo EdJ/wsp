@@ -1,0 +1,36 @@
+[package]
+name = "wsp-seats"
+version = "0.1.0"
+edition = "2021"
+description = "wsp's seats: the seat commands (spawn, agent, wake, govern, watch, machine, sandbox, install, …), on wsp-engine"
+
+[lib]
+path = "src/lib.rs"
+# Its doc blocks are prose and never ran as doctests while these modules were the bin's (wsp-440).
+doctest = false
+
+[dependencies]
+serde_json = "1"
+# The engine below it (wsp-441): every module it does not hold, re-exported at its old path in lib.rs.
+wsp-engine = { path = "../engine" }
+wsp-base = { path = "../base" }
+wsp-store = { path = "../store" }
+wsp-wire = { path = "../wire" }
+wsp-host-api = { path = "../host-api" }
+wsp-store-contract = { path = "../store-contract" }
+wsp-server = { path = "../server" }
+wsp-api = { path = "../api" }
+wsp-client = { path = "../client" }
+wsp-view = { path = "../view" }
+
+[dev-dependencies]
+# Engine's fixtures and recorders, and its `base::under_test` (wsp-544).
+wsp-engine = { path = "../engine", features = ["test-support"] }
+wsp-base = { path = "../base", features = ["test-support"] }
+wsp-store = { path = "../store", features = ["test-support"] }
+wsp-wire = { path = "../wire", features = ["test-support"] }
+wsp-testkit = { path = "../testkit" }
+wsp-manager = { path = "../manager" }
+wsp-host = { path = "../host" }
+# The seats tests that open a real state.db install its open (orders::tests::install_db; tests only, wsp-441 d1).
+wsp-store-sqlite = { path = "../store-sqlite" }

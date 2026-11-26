@@ -2,7 +2,8 @@
 
 use serde_json::{json, Value};
 
-use crate::cmd_agent::{claim_line, current_project, worked_line};
+use crate::claims::{claim_line, worked_line};
+use crate::cycle::Seats;
 use crate::message::{self, Ask, Message, Shape};
 use crate::model::{Priority, Status, Task};
 use crate::resolve::Index;
@@ -138,7 +139,7 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         // follow-up is not part of its origin and may belong elsewhere.
         o.project.clone()
     } else {
-        match current_project(store, args, &index) {
+        match Seats::current_project(crate::cycle::seats(), store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -346,7 +347,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     let scope = if args.has("all") && !args.has("project") {
         None
     } else {
-        match current_project(store, args, &index) {
+        match Seats::current_project(crate::cycle::seats(), store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -456,7 +457,7 @@ pub fn find(store: &Store, args: &Args) -> i32 {
     let scope = if args.has("all") && !args.has("project") {
         None
     } else {
-        match current_project(store, args, &index) {
+        match Seats::current_project(crate::cycle::seats(), store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -1376,7 +1377,7 @@ pub fn done(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, seats: &dyn
 
 /// What a seat standing on a row is doing, as `wsp done` judges it (`wsp-344`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Standing {
+pub enum Standing {
     /// At its prompt, or holding no agent: nothing a close takes from it.
     Idle,
     /// A turn in progress.
@@ -1385,7 +1386,7 @@ enum Standing {
     Unsettled,
 }
 
-fn standing_as(seats: &dyn crate::cycle::Seats, seat: &str) -> Standing {
+pub fn standing_as(seats: &dyn crate::cycle::Seats, seat: &str) -> Standing {
     use crate::place::State;
     use std::collections::BTreeMap;
     match seats.state(seat) {
@@ -1443,7 +1444,7 @@ fn refuse_done(args: &Args, id: &str, why: &str, open: usize, buttons: Vec<crate
     if args.json() {
         println!("{v}");
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     tests::REFUSED.with(|r| *r.borrow_mut() = Some(v));
     1
 }
@@ -1460,7 +1461,7 @@ fn refusal_json(id: &str, why: &str, buttons: &[crate::classify::Button]) -> ser
 
 /// The seats still standing on `id`, named: a row's bindings, leaving out a
 /// leg's (the run ends those on a tick) and a seat `live` cannot find.
-fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<String> {
+pub fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<String> {
     let bindings = store.bindings();
     store
         .panes_for_task(id)
@@ -1487,7 +1488,7 @@ fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<Stri
 /// the claim and closes the row in the one call. A seat in a turn still
 /// refuses it, and the refusal says a turn is in progress; so does one that
 /// is starting, on a person's prompt, or that nothing can read.
-fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> i32 {
+pub fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> i32 {
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
         // Another user leased it while this spoke was offline (wsp-469).
         if let Some(why) = crate::addon::get().refusal(store, &t.id, "done") {
@@ -1563,7 +1564,7 @@ fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &d
         for pane in store.panes_for_task(&t.id) {
             store.clear_binding(&pane);
         }
-        crate::cmd_agent::hand_off(store, &t.id, None, "done");
+        Seats::hand_off(crate::cycle::seats(), store, &t.id, None, "done");
     }
     let id = args.rest.first().and_then(|needle| store.find_task(needle)).map(|t| t.id);
     let code = mutate(store, args, "done", |t| {
@@ -1750,9 +1751,9 @@ fn reseat(store: &Store, args: &Args, run: Option<String>) {
 fn ran_with(store: &Store, t: &Task) -> Option<Vec<String>> {
     let log = t.section("Log").unwrap_or_default();
     let claim = log.lines().filter(|l| l.contains("claimed by pane ")).last()?;
-    let kind = crate::cmd_resume::thread_for_task(store, &t.id).map(|th| th.kind).unwrap_or_default();
+    let kind = Seats::thread_kind(crate::cycle::seats(), store, &t.id).unwrap_or_default();
     let mut argv = vec!["spawn".to_string(), t.id.clone(), "--agent".to_string()];
-    argv.extend(["--kind".to_string(), crate::cmd_spawn::kind_or_default(&kind)]);
+    argv.extend(["--kind".to_string(), crate::agent_kind::kind_or_default(&kind)]);
     let tier = claim.split(" · spawned at ").nth(1).and_then(|r| r.split(" · ").next()).map(str::trim);
     if let Some((model, effort)) = tier.and_then(|s| s.rsplit_once('/')) {
         for (flag, v) in [("--model", model), ("--effort", effort)] {
@@ -1767,8 +1768,8 @@ fn ran_with(store: &Store, t: &Task) -> Option<Vec<String>> {
 /// Run `wsp <argv>` as the sender would have, in their environment, so the
 /// spawn records them as its spawner. Its own output is the receipt.
 fn respawn(argv: &[String], json: bool) -> (String, i32) {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::RESEATED.with(|r| r.borrow_mut().push(argv.to_vec()));
         return (String::new(), 0);
     }
@@ -3113,7 +3114,7 @@ pub fn pick(b: &Backlog, scope_ids: Option<&[String]>) -> Pick {
     // agents set going at once would otherwise all be handed the same task and
     // all three bounce.
     let taken = |t: &Task| {
-        !crate::cmd_agent::live_holders(&b.bindings, &[], &t.id, b.me.as_deref()).is_empty()
+        !crate::claims::live_holders(&b.bindings, &[], &t.id, b.me.as_deref()).is_empty()
     };
 
     let mut candidates: Vec<Task> = b
@@ -3161,7 +3162,7 @@ pub fn nothing_because(p: &Pick) -> String {
 
 pub fn next(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
-    let scope = match current_project(store, args, &index) {
+    let scope = match Seats::current_project(crate::cycle::seats(), store, args, &index) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -3175,7 +3176,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
         // than a moment. This pane stays like this until somebody hands it
         // something, so of the two labels `say_looking` writes, this is the one
         // that is still on screen when a person comes looking.
-        crate::cmd_agent::say_looking(store, scope.as_deref(), false);
+        crate::stage::say_looking(store, scope.as_deref(), false);
 
         if args.json() {
             println!("null");
@@ -3191,7 +3192,7 @@ pub fn next(store: &Store, args: &Args) -> i32 {
 
     // Named, but not yet taken up: the claim is the agent's next move and the
     // reading of the task comes in between. The claim renames over this.
-    crate::cmd_agent::say_looking(store, scope.as_deref(), true);
+    crate::stage::say_looking(store, scope.as_deref(), true);
 
     if args.json() {
         println!("{}", t.json());
@@ -4375,7 +4376,8 @@ fn claim_expires_line(claim: &serde_json::Value, now: i64) -> Option<String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
 
@@ -4389,7 +4391,7 @@ pub mod tests {
     }
 
     /// compound-581's shape: claimed at a tier, landed, reviewed, released.
-    fn released(store: &Store, id: &str, claim: &str) {
+    pub fn released(store: &Store, id: &str, claim: &str) {
         let mut t = Task::new(id, id);
         t.set_status(Status::Review);
         t.log(claim);
@@ -4409,7 +4411,7 @@ pub mod tests {
         assert_eq!(claim_expires_line(&serde_json::json!({ "workspace": "w" }), now), None);
     }
 
-    fn scratch(tag: &str) -> Store {
+    pub fn scratch(tag: &str) -> Store {
         crate::testkit::store(tag)
     }
 
@@ -4478,7 +4480,7 @@ pub mod tests {
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing", "and it did not move");
     }
 
-    fn git_at(dir: &std::path::Path, args: &[&str]) -> String {
+    pub fn git_at(dir: &std::path::Path, args: &[&str]) -> String {
         let out = wsp_base::calls::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -4496,7 +4498,8 @@ pub mod tests {
 
     /// A member `wsp-101` of a running group with an `agent:` line, in a real
     /// repository, with a tree of its own holding one commit ahead of master.
-    fn a_member_with_a_commit(tag: &str) -> (crate::util::Isolated, Store, std::path::PathBuf) {
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
+    pub fn a_member_with_a_commit(tag: &str) -> (crate::util::Isolated, Store, std::path::PathBuf) {
         let env = crate::util::isolated(tag);
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -4897,7 +4900,7 @@ pub mod tests {
 
     /// Two done tasks, one on either side of the cutoff — enough to say both
     /// halves of what a dry run is for.
-    fn swept_store(tag: &str) -> Store {
+    pub fn swept_store(tag: &str) -> Store {
         let store = scratch(tag);
         let mut old = Task::new("Overscrolling has dead travel", "render-018");
         old.updated = "2025-11-02T09:00:00Z".into();
@@ -5004,7 +5007,7 @@ pub mod tests {
         assert!(asking(&up[0]).contains("wsp ack "), "a notification is acknowledged, not answered");
     }
 
-    fn task_with(store: &Store, id: &str, level: &str) -> Task {
+    pub fn task_with(store: &Store, id: &str, level: &str) -> Task {
         let mut t = Task::new("Retune the early reflections", id);
         t.project = Some("verb".into());
         t.priority_raw = level.into();
@@ -5363,7 +5366,7 @@ pub mod tests {
 
     // ---- what `next` picks, offline ---------------------------------------
 
-    fn open_task(id: &str, title: &str, status: &str, prio: &str) -> Task {
+    pub fn open_task(id: &str, title: &str, status: &str, prio: &str) -> Task {
         let mut t = Task::new(title, id);
         t.project = Some("wsp".into());
         t.status_raw = status.to_string();
@@ -5372,7 +5375,7 @@ pub mod tests {
     }
 
     /// Four open tasks, one of them in another agent's hand.
-    fn backlog() -> Backlog {
+    pub fn backlog() -> Backlog {
         let mut bindings = std::collections::BTreeMap::new();
         bindings.insert("w2:p1".to_string(), json!({ "task_id": "t-002" }));
         Backlog {
@@ -5441,7 +5444,7 @@ pub mod tests {
         assert_eq!(p.held, 0);
     }
 
-    fn parse(line: &[&str]) -> Args {
+    pub fn parse(line: &[&str]) -> Args {
         Args::parse(line.iter().map(|s| (*s).to_string()).collect())
     }
 
@@ -5493,35 +5496,6 @@ pub mod tests {
         assert_eq!(store.task("p-002").unwrap().status(), Status::Done);
     }
 
-    /// `wsp-582`: `done` on a row whose seat is up refuses, names the seat and the
-    /// verb, and leaves the claim and binding exactly as they were; a seat that
-    /// is gone, or a leg's, does not stop it.
-    #[test]
-    fn done_refuses_a_row_whose_seat_is_up_and_names_it() {
-        let _env = util::isolated("done-live-seat");
-        let store = Store::open();
-        store.ensure_dirs().unwrap();
-        let mut t = Task::new("a row", "p-001");
-        t.set_status(Status::Doing);
-        store.save_task(&t).unwrap();
-        store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
-        store.set_binding("cpd-8@mb", json!({ "task_id": "p-001", "pane_id": "cpd-8@mb", "workspace_id": "cpd-8@mb" }));
-        store.set_binding("cpd-7", json!({ "task_id": "p-001", "leg": "a", "pane_id": "cpd-7", "workspace_id": "cpd-7" }));
-        store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
-
-        let alive = |s: &str| s != "cpd-gone";
-        assert_eq!(standing_on(&store, "p-001", &alive), vec!["cpd-8@mb".to_string(), "cpd-9".to_string()], "a far seat is named too, a leg's is not");
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &alive, &Reads(vec![("cpd-9", State::Idle), ("cpd-8@mb", State::Idle)])), 1, "not verified: an idle seat still refuses");
-        assert_eq!(store.task("p-001").unwrap().status(), Status::Doing, "a refused close closes nothing");
-        assert!(store.claims().contains_key("p-001"), "and releases nothing");
-        assert!(store.bindings().contains_key("cpd-9") && store.bindings().contains_key("cpd-8@mb"));
-
-        // The seats gone: the close goes through as it always did.
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
-        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
-        assert!(!store.claims().contains_key("p-001"));
-    }
-
     use crate::place::State;
     use std::collections::BTreeMap;
 
@@ -5530,16 +5504,16 @@ pub mod tests {
         pub(super) static REFUSED: std::cell::RefCell<Option<serde_json::Value>> = const { std::cell::RefCell::new(None) };
     }
 
-    fn refused() -> serde_json::Value {
+    pub fn refused() -> serde_json::Value {
         REFUSED.with(|r| r.borrow_mut().take()).expect("done refused")
     }
 
-    fn labels(v: &serde_json::Value, key: &str) -> Vec<String> {
+    pub fn labels(v: &serde_json::Value, key: &str) -> Vec<String> {
         v[key].as_array().unwrap().iter().map(|b| b["label"].as_str().unwrap().to_string()).collect()
     }
 
     /// Mark `seat` as on the far machine `machine`, as `place_compound` records it.
-    fn far(store: &Store, seat: &str, machine: &str) {
+    pub fn far(store: &Store, seat: &str, machine: &str) {
         let dir = store.state.join(crate::place_compound::SEATS).join(seat);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("seat.json"), json!({ "machine": machine }).to_string()).unwrap();
@@ -5583,7 +5557,8 @@ pub mod tests {
             "sentence": "none", "confirm": true }]));
 
         // Its Release, and the close goes through.
-        assert_eq!(crate::cmd_agent::release(&store, &parse(&["release", "p-001"])), 0);
+        store.clear_binding("cpd-9");
+        store.clear_claim("p-001");
         assert_eq!(holder_with(&store, "p-001", &|_| true, &Reads(vec![("cpd-9", State::Idle)])), crate::classify::Holder::Nobody);
         assert_eq!(done_with(&store, &json_done("p-001"), &|_| true, &Reads(vec![])), 0);
         assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
@@ -5696,7 +5671,7 @@ pub mod tests {
     }
 
     /// What each seat reads, for `wsp done`'s judgement (`wsp-344`).
-    struct Reads(Vec<(&'static str, State)>);
+    pub struct Reads(pub Vec<(&'static str, State)>);
 
     impl crate::cycle::Seats for Reads {
         fn state(&self, seat: &str) -> Option<State> {
@@ -5705,7 +5680,7 @@ pub mod tests {
     }
 
     /// A row at `review` whose verifier holds, claimed and bound on `cpd-9`.
-    fn verified_row(store: &Store) {
+    pub fn verified_row(store: &Store) {
         let mut t = Task::new("a row", "p-001");
         t.set_status(Status::Review);
         let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
@@ -5718,43 +5693,6 @@ pub mod tests {
         store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
         store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
         crate::cycle::tests::ENDED.with(|e| e.borrow_mut().clear());
-    }
-
-    /// `wsp-344`: `wsp done` on a verified row whose seat sits idle at its
-    /// prompt ends the seat (tree kept for the close's own sweep), releases the
-    /// claim and closes the row — one call, no `wsp release` first.
-    #[test]
-    fn done_closes_a_verified_row_whose_seat_is_idle_in_one_call() {
-        let _env = util::isolated("done-verified-idle");
-        let store = Store::open();
-        store.ensure_dirs().unwrap();
-        verified_row(&store);
-        crate::cycle::tests::KEPT.with(|k| k.borrow_mut().clear());
-
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Reads(vec![("cpd-9", State::Idle)])), 0);
-        let t = store.task("p-001").unwrap();
-        assert_eq!(t.status(), Status::Done);
-        assert!(!store.claims().contains_key("p-001"), "the claim is released");
-        assert!(!store.bindings().contains_key("cpd-9"));
-        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the idle seat is ended");
-        assert_eq!(crate::cycle::tests::KEPT.with(|k| k.borrow().clone()), vec!["cpd-9".to_string()], "its tree left to done's sweep");
-        let log = t.section("Log").unwrap_or_default();
-        assert!(log.contains("`wsp done` ended it and released the claim") && log.contains("→ done"), "{log}");
-    }
-
-    /// `wsp-344`: a verified row whose seat is gone — no backend has it — closes
-    /// in one call too, and ends nothing.
-    #[test]
-    fn done_closes_a_verified_row_whose_seat_is_gone_in_one_call() {
-        let _env = util::isolated("done-verified-gone");
-        let store = Store::open();
-        store.ensure_dirs().unwrap();
-        verified_row(&store);
-
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
-        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
-        assert!(!store.claims().contains_key("p-001"));
-        assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "nothing left to end");
     }
 
     /// `wsp-509`: a real despawn runs in its own process, and its release
@@ -5787,7 +5725,7 @@ pub mod tests {
     }
 
     /// A seat no backend has: `state` reads `None`, `absent` reads true.
-    struct Absent;
+    pub struct Absent;
 
     impl crate::cycle::Seats for Absent {
         fn state(&self, _: &str) -> Option<State> {
@@ -5796,27 +5734,6 @@ pub mod tests {
         fn absent(&self, _: &str) -> bool {
             true
         }
-    }
-
-    /// `wsp-509`: a verified row whose seat `locate` still finds but the Seats
-    /// port positively does not have reads as idle (`standing_as`), so the close
-    /// goes through in one call and ends the seat as an idle one.
-    #[test]
-    fn done_closes_a_verified_row_whose_seat_is_live_by_locate_but_absent_by_the_port() {
-        let _env = util::isolated("done-verified-absent");
-        let store = Store::open();
-        store.ensure_dirs().unwrap();
-        verified_row(&store);
-
-        assert_eq!(standing_as(&Absent, "cpd-9"), Standing::Idle);
-        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Absent), 0);
-        let t = store.task("p-001").unwrap();
-        assert_eq!(t.status(), Status::Done);
-        assert!(!store.claims().contains_key("p-001"), "the claim is released");
-        assert!(!store.bindings().contains_key("cpd-9"));
-        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the seat locate found is ended");
-        let log = t.section("Log").unwrap_or_default();
-        assert!(log.contains("`wsp done` ended it and released the claim"), "{log}");
     }
 
     /// `wsp-344`: a turn in progress still refuses the close, verified or not,
@@ -5881,13 +5798,13 @@ pub mod tests {
         assert_eq!(unheld.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec![found.id.as_str()]);
     }
 
-    fn scratch_file(name: &str, text: &str) -> String {
+    pub fn scratch_file(name: &str, text: &str) -> String {
         let p = std::env::temp_dir().join(format!("wsp-{name}-{}.md", std::process::id()));
         std::fs::write(&p, text).unwrap();
         p.to_string_lossy().to_string()
     }
 
-    fn log_of(store: &Store, id: &str) -> String {
+    pub fn log_of(store: &Store, id: &str) -> String {
         store.find_task(id).expect("the task").section("Log").unwrap_or_default()
     }
 
@@ -6275,25 +6192,6 @@ pub mod tests {
         assert!(reseated().is_empty(), "no agent ever claimed it, so none is guessed at");
     }
 
-    /// `wsp-304`. compound-581 was landed, verified and released, then sent
-    /// back for a regression: it sat at `doing` with nobody on it. A reopen
-    /// of a row whose agent has gone seats one, with the kind and tier it ran.
-    #[test]
-    fn a_reopen_after_the_agent_was_released_seats_one_as_it_ran() {
-        let store = scratch("reopenreseat");
-        released(&store, "m-1", "claimed by pane cpd-1306 · spawned at sonnet/high");
-        store.log_event("session-learned", serde_json::json!({ "id": "m-1", "kind": "opencode", "pane": "cpd-1306", "session": "s-1" }));
-
-        let args = Args::synth("reopen", &["m-1", "regression: the tab draws empty"], &[]);
-        assert_eq!(reopen(&store, &args), 0);
-        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
-        assert_eq!(
-            reseated(),
-            [["spawn", "m-1", "--agent", "--kind", "opencode", "--model", "sonnet", "--effort", "high"]],
-            "one spawn, at what it ran with"
-        );
-    }
-
     /// wsp-303's done-when rested on `wsp mv`. Its review says so in one line,
     /// however many items or verbs; the overview before a done-when, and a
     /// done-when that needs no refused verb, say nothing (`wsp-312`).
@@ -6361,7 +6259,7 @@ pub mod tests {
         released(&store, "m-1", "claimed by pane w2:p1 · spawned at opencode/x-free/default");
 
         assert_eq!(reopen(&store, &Args::synth("reopen", &["m-1", "again"], &[])), 0);
-        let kind = crate::cmd_spawn::kind_or_default("");
+        let kind = crate::agent_kind::kind_or_default("");
         assert_eq!(reseated(), [vec!["spawn", "m-1", "--agent", "--kind", kind.as_str(), "--model", "opencode/x-free"]]);
     }
 

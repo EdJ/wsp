@@ -115,7 +115,7 @@ fn bare(env: &BTreeMap<String, String>) -> Command {
 impl Sandbox {
     fn up(tag: &str) -> Sandbox {
         // Short: the fake backend's unix socket lives under it, and macOS caps that path at 104 bytes.
-        let dir = PathBuf::from("/tmp").join(format!("wa-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wa-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let outer: BTreeMap<String, String> = [
@@ -147,9 +147,11 @@ impl Sandbox {
         String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
     }
 
-    fn start_daemon(&mut self, port: u16) {
+    /// Port 0: the daemon writes the port it bound to `api.json`. One picked here and let go can be
+    /// taken before the daemon binds it, and then it runs without the API.
+    fn start_daemon(&mut self) {
         let mut c = self.cmd(&["daemon"]);
-        c.env("WSP_API_PORT", port.to_string()).stdout(Stdio::null()).stderr(Stdio::null());
+        c.env("WSP_API_PORT", "0").stdout(Stdio::null()).stderr(Stdio::null());
         self.daemon = Some(c.spawn().unwrap());
     }
 
@@ -519,7 +521,7 @@ fn seeded(tag: &str) -> Seeded {
     install_record(&sb.state, &local, Duration::from_secs(5)).unwrap();
 
     // The daemon, folding the manager and serving the mirror.
-    sb.start_daemon(free_port());
+    sb.start_daemon();
     let client = sb.client(Duration::from_secs(20));
 
     // One seat the manager runs, on the doing row.

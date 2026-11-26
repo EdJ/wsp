@@ -909,6 +909,7 @@ mod tests {
             first: None,
             reused: None,
             build: None,
+            via: None,
         }
     }
 

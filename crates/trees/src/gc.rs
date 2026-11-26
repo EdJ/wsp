@@ -210,7 +210,7 @@ mod tests {
     use super::*;
 
     fn repo(name: &str) -> PathBuf {
-        let base = std::env::var("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let base = std::env::temp_dir();
         let d = base.join(format!("gc-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();

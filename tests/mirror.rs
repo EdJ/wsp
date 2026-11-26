@@ -45,7 +45,7 @@ fn free_port() -> u16 {
 impl Sandbox {
     fn up(tag: &str) -> Sandbox {
         // Short: the fake backend's unix socket lives under it, and macOS caps that path at 104 bytes.
-        let dir = PathBuf::from("/tmp").join(format!("wm-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wm-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let outer: BTreeMap<String, String> = [

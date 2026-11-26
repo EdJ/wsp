@@ -26,14 +26,14 @@ use crate::inproc::{alive, signal_group};
 use crate::port::Seat;
 use std::cell::RefCell;
 
-/// This process's run directory, short because a unix socket path may be
-/// 104 bytes and `$TMPDIR` on a Mac is not.
+/// This process's run directory. A unix socket path may be 104 bytes: the
+/// test runner (`.cargo/test-run`) keeps `$TMPDIR` short enough for it.
 pub fn run_dir() -> PathBuf {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(|| {
         // The run directories of test processes that have ended: a
         // supervisor killed rather than closed leaves its sockets behind.
-        let Ok(dirs) = fs::read_dir("/tmp") else { return };
+        let Ok(dirs) = fs::read_dir(std::env::temp_dir()) else { return };
         for d in dirs.flatten() {
             let name = d.file_name().to_string_lossy().into_owned();
             let Some(pid) = name.strip_prefix("wsp-cpd-run-").and_then(|p| p.parse::<u32>().ok()) else { continue };
@@ -42,7 +42,7 @@ pub fn run_dir() -> PathBuf {
             }
         }
     });
-    let dir = PathBuf::from("/tmp").join(format!("wsp-cpd-run-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("wsp-cpd-run-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     dir
 }

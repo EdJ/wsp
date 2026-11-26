@@ -27,7 +27,7 @@ const HOST: &str = "test-host";
 
 /// An exec dir and a tree root with a `work` directory in it.
 fn place(tag: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::temp_dir();
     let top = base.join(format!("wmj-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&top);
     let (dir, root) = (top.join("m"), top.join("trees"));

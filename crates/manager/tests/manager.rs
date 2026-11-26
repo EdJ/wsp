@@ -19,7 +19,7 @@ use wsp_manager::{Config, Manager, StartError, JOURNAL_FILE, LOG_DIR, TOKEN_FILE
 const WAIT: Duration = Duration::from_secs(5);
 
 fn exec_dir(name: &str) -> PathBuf {
-    let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::temp_dir();
     let d = base.join(format!("wsp-manager-test-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     d

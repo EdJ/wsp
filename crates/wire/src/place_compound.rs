@@ -2618,8 +2618,8 @@ mod tests {
     }
 
     fn far_script(name: &str, link_down: bool, forward_fails: bool) -> (FarScript, PathBuf) {
-        // Short: a forwarded socket path may be 103 bytes, and `$TMPDIR` is not.
-        let root = PathBuf::from("/tmp").join(format!("wf-{name}-{}-{}", std::process::id(), util::epoch_nanos() % 100_000));
+        // A forwarded socket path may be 103 bytes: `.cargo/test-run` keeps `$TMPDIR` short.
+        let root = std::env::temp_dir().join(format!("wf-{name}-{}-{}", std::process::id(), util::epoch_nanos() % 100_000));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("fwd")).unwrap();
         let f = FarScript {

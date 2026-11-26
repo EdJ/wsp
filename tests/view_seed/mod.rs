@@ -57,7 +57,7 @@ impl Sandbox {
     /// `tag` keeps the tests that run at once apart.
     pub fn up(tag: &str) -> Sandbox {
         // Short: the fake backend's unix socket lives under it, and macOS caps that path at 104 bytes.
-        let dir = PathBuf::from("/tmp").join(format!("wv{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wv{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let outer: BTreeMap<String, String> = [

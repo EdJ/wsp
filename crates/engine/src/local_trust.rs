@@ -216,10 +216,10 @@ mod tests {
         let (new, known) = (mk("new-1"), root.join("repo/.worktrees/known-1"));
         std::fs::create_dir_all(known.join(".git")).unwrap();
         // Not a tree wsp made: nothing is written.
-        assert_eq!(trust(crate::cmd_sandbox::dir_of(&store), &root.join("elsewhere").display().to_string()).unwrap(), None);
+        assert_eq!(trust(Some(sb.clone()), &root.join("elsewhere").display().to_string()).unwrap(), None);
         assert_eq!(json_of(&file)["projects"].as_object().unwrap().len(), 2);
 
-        let said = trust(crate::cmd_sandbox::dir_of(&store), &new).unwrap().expect("a new tree is trusted");
+        let said = trust(Some(sb.clone()), &new).unwrap().expect("a new tree is trusted");
         assert!(said.contains(&new), "{said}");
         let doc = json_of(&file);
         for k in ["hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved", "hasClaudeMdExternalIncludesWarningShown"] {
@@ -230,10 +230,10 @@ mod tests {
         assert_eq!(backups.len(), 1, "one backup before the first write");
         assert!(!std::fs::read_to_string(backups[0].path()).unwrap().contains("new-1"), "the backup is of the file as it was");
         // A second seat in the same tree writes the same and backs up nothing more.
-        trust(crate::cmd_sandbox::dir_of(&store), &new).unwrap().unwrap();
+        trust(Some(sb.clone()), &new).unwrap().unwrap();
         assert_eq!(std::fs::read_dir(state_root.join("trust-backups")).unwrap().count(), 1);
         // An entry that was there before this sandbox is its owner's.
-        assert_eq!(trust(crate::cmd_sandbox::dir_of(&store), &known.display().to_string()).unwrap(), None);
+        assert_eq!(trust(Some(sb.clone()), &known.display().to_string()).unwrap(), None);
         assert!(json_of(&file)["projects"][known.display().to_string()].get("hasTrustDialogAccepted").is_none());
 
         let (lines, kept) = clear(&sb, true);
@@ -247,8 +247,7 @@ mod tests {
         assert_eq!(doc["projects"][known.display().to_string()]["allowedTools"][0], "x");
         assert!(!sb.join(LEDGER).exists());
         // Outside a sandbox nothing is written at all.
-        let live = Store::at(root.join("live/wsp"), root.join("live/state"));
-        assert_eq!(trust(crate::cmd_sandbox::dir_of(&live), &new).unwrap(), None);
+        assert_eq!(trust(None, &new).unwrap(), None);
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&root);
     }

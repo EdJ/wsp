@@ -11,61 +11,29 @@ use crate::message::{self, About, Ask, Hand, Kind, Message, Party, Shape, Waitin
 use crate::model::{Status, Task};
 use crate::place::{Delivery, Place, Refusal, State};
 pub use crate::place::my_pane;
+pub use crate::room::governs_seat;
+pub use crate::stage::sentence;
+pub use crate::stuck::stuck_of_seat;
+pub use crate::claims::{claim_line, claim_where, live_holders, spawned_at, worked_line, Pane};
+pub use crate::prose::{from_source, piped_message, prose, typed_message};
+pub use crate::sent::{delivered, locate_seat, twice, Sent};
+use crate::sent::message_id;
+#[cfg(test)]
+use crate::sent::SAME_BREATH;
+#[cfg(test)]
+use crate::stage::looking_label;
+pub use crate::resolve::named_project;
+pub use crate::stage::say_looking;
 use crate::resolve::{self, Index};
 use crate::store::Store;
 use crate::util::{self, Paint};
 use crate::base::args::Args;
-
-/// One pane row, as the views in this file read one. Nothing fills it live
-/// (`wsp-120`).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Pane {
-    pub pane_id: String,
-    pub label: String,
-    pub workspace_id: String,
-    pub agent: String,
-    pub agent_status: String,
-    pub cwd: String,
-    pub title: String,
-    pub focused: bool,
-}
 
 /// One workspace row, as [`Pane`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Workspace {
     pub id: String,
     pub label: String,
-}
-
-/// Every pane holding `task` that is not `me`, and that a live agent is
-/// driving.
-///
-/// The one definition of "somebody else has this". `claim` refuses on it and
-/// `next` declines to name it, and the two have to be the same rule: when they
-/// disagreed, `next` named work `claim` would refuse, so an agent told to find
-/// its own work was sent straight into a wall with nothing to try instead.
-///
-/// A *dead* pane's binding is not a holder — that is exactly the stale state a
-/// re-claim exists to clear. Nor is a shell's: a person at a terminal can be
-/// asked to move, and refusing on their behalf helps nobody.
-pub fn live_holders<'a>(
-    bindings: &std::collections::BTreeMap<String, serde_json::Value>,
-    panes_now: &'a [Pane],
-    task: &str,
-    me: Option<&str>,
-) -> Vec<&'a Pane> {
-    panes_now
-        .iter()
-        .filter(|p| !p.agent.is_empty())
-        .filter(|p| Some(p.pane_id.as_str()) != me)
-        .filter(|p| {
-            bindings
-                .get(&p.pane_id)
-                .and_then(|b| b.get("task_id"))
-                .and_then(|x| x.as_str())
-                == Some(task)
-        })
-        .collect()
 }
 
 /// Everything the standing-in chain reads, gathered into one value.
@@ -232,20 +200,6 @@ pub fn current_project(
     }
 }
 
-/// What `-p` names, or why it cannot: `None` when it was not given. Split from
-/// [`current_project`] so the refusal is a string a test can read — the verbs
-/// that print it are all `eprintln!` and an exit code.
-pub fn named_project(args: &Args, index: &Index) -> Option<Result<Option<String>, String>> {
-    let p = args.get("project")?;
-    if p == "none" || p == "inbox" {
-        return Some(Ok(None));
-    }
-    Some(match index.find(&p) {
-        Some(found) => Ok(Some(found.id.clone())),
-        None => Err(crate::util::no_such("project", &p)),
-    })
-}
-
 fn pane_id(args: &Args) -> Option<String> {
     args.get("pane").or_else(my_pane)
 }
@@ -397,25 +351,6 @@ pub fn full_name(
             _ => None,
         })
         .filter(|full| full != name)
-}
-
-/// The sentence a seat's agent last said about itself, while it is still
-/// about the work the seat holds.
-///
-/// Not [`full_name`], which answers *what is the whole of this label* and is
-/// invalidated by a rename. This answers *what did the agent say it is doing*,
-/// for a surface drawing no label of ours — a compound pane header, `wsp wip`
-/// — and what makes it stale is the seat's work changing under it: a sentence
-/// said on one task is not a statement about the next one, or about none. The
-/// task is compared rather than trusted to have been cleared, for the reason
-/// `full_name` compares the label: every claim, release and handoff would
-/// otherwise have to remember this record, and the one that forgot would put
-/// a sentence about old work over new work.
-pub fn sentence(said: &BTreeMap<String, Value>, pane: &str, held: Option<&str>) -> Option<String> {
-    let entry = said.get(pane)?;
-    let task = entry.get("task").and_then(|t| t.as_str());
-    let said = entry.get("said").and_then(|s| s.as_str()).filter(|s| !s.is_empty())?;
-    (task == held).then(|| said.to_string())
 }
 
 /// `wsp flag <id> "why"` — an agent raises a hand about one task.
@@ -1859,281 +1794,6 @@ fn addressee_id(store: &Store, needle: &str, what: &str) -> String {
     store.find_task(needle).map(|t| t.id).unwrap_or_else(|| needle.to_string())
 }
 
-/// One sentence on its way to one pane: everything both `tell` verbs need to
-/// recognise it, report it and record it.
-///
-/// It exists because there are two of them. `wsp tell <task>` and `wsp govern
-/// <scope> --tell` end at the same [`crate::agent_commands::Kind::tell`] and
-/// used to disagree about everything after it: one wrote an event and the other
-/// wrote none, one read [`Refusal::NotTaken`] as a rescue and the other as a
-/// failure, and only one of them was ever right. A governor's seat is the
-/// address that has no task behind it, so the verb a governor is *obliged* to
-/// use was the one with less of the machinery.
-pub struct Sent {
-    /// The addressee as an id: a task, or the scope a seat governs. What the
-    /// JSON and the event carry.
-    pub target: String,
-    /// The same addressee as a person would say it — `worklist-002`, or `the
-    /// wsp seat` — which is what makes a refusal read as a sentence.
-    pub what: String,
-    pub pane: String,
-    /// What to type after `wsp peek` when the sentence needs rescuing.
-    pub peek: String,
-    pub chars: usize,
-    /// The sentence itself, for the event `wsp tell --log --full` reads.
-    pub text: String,
-    /// This exact sentence to this exact pane, as a short handle.
-    ///
-    /// **Derived from the message and not minted**, which is the whole of its
-    /// value: a resend of the same paragraph to the same seat carries the same
-    /// id, so a retry is recognisable as a repeat by anything that has seen the
-    /// first — [`Sent::already_sent`] below, and a person reading two lines of
-    /// output. An id from a counter would be unique per attempt and would
-    /// answer a question nobody asked.
-    pub id: String,
-    /// Who spoke, as an address, and which message this answers (`wsp-521`).
-    /// Empty and `None` for the paths that do not say, which write the event as
-    /// they always did.
-    pub from: String,
-    pub re: Option<String>,
-    pub reply: bool,
-    /// Set when this is one seat of a `list:` fan-out (`wsp-523`): the fan-out's
-    /// key and how many seats it went to, which the event carries.
-    pub fan: Option<(String, usize)>,
-    pub json: bool,
-}
-
-/// How long a sentence is still the same sentence.
-///
-/// Two minutes, and both bounds are the recorded harm rather than taste.
-/// worklist-010's retries came seconds after a delivery falsely reported as a
-/// failure — that is the whole population this is for, and it is measured in
-/// seconds. Anything much longer starts refusing the deliberate repeat: a
-/// governor typing `continue` at an agent twice in an evening means it twice,
-/// and a channel that silently swallowed the second would stall a night to
-/// prevent a duplicate paragraph.
-const SAME_BREATH: i64 = 120;
-
-impl Sent {
-    pub fn new(target: &str, what: &str, pane: &str, peek: &str, text: &str, args: &Args) -> Sent {
-        Sent {
-            target: target.into(),
-            what: what.into(),
-            pane: pane.into(),
-            peek: peek.into(),
-            chars: text.len(),
-            text: text.to_string(),
-            id: message_id(pane, text),
-            from: String::new(),
-            re: None,
-            reply: false,
-            fan: None,
-            json: args.json(),
-        }
-    }
-
-    pub fn in_fan(mut self, fan: Option<(&str, usize)>) -> Sent {
-        self.fan = fan.map(|(k, n)| (k.to_string(), n));
-        self
-    }
-
-    /// Who said it, what it answers, and whether it carried a reply footer.
-    pub fn by(mut self, from: &str, re: Option<&str>, reply: bool) -> Sent {
-        self.from = from.into();
-        self.re = re.map(str::to_string);
-        self.reply = reply;
-        self
-    }
-
-    /// This same sentence, to this same pane, within the last [`SAME_BREATH`].
-    ///
-    /// The idempotence half of worklist-010, and it is the half that addresses
-    /// the *harm* rather than the report. A verb that says "was not told" about
-    /// a message it delivered turns one paragraph into three, and the fix for
-    /// the report — a backend `tell` that no longer lies — cannot undo a
-    /// retry that has already been typed. This can: the second send of the same
-    /// text is recognised and refused, whatever made somebody type it.
-    ///
-    /// Off the event log, which is where the first send wrote itself. That is
-    /// the only durable record either verb has ever left, and it is why
-    /// [`delivered`] writes one from both paths rather than from one.
-    pub fn already_sent(&self, store: &Store) -> Option<i64> {
-        let now = util::epoch_secs();
-        store
-            .events_of("agent-told")
-            .iter()
-            .rev()
-            .filter(|d| d.get("id").and_then(Value::as_str) == Some(&self.id))
-            .filter_map(|d| d.get("at").and_then(Value::as_i64))
-            .map(|at| now - at)
-            .find(|ago| *ago <= SAME_BREATH)
-    }
-}
-
-/// A sentence's short handle: the pane and the text, and nothing that changes
-/// between two attempts to send it.
-///
-/// FNV-1a, written out rather than reached for, because `DefaultHasher` is
-/// SipHash with keys that Rust does not promise across versions — an id that
-/// changed under a compiler upgrade would silently stop recognising repeats,
-/// which is the one thing this is for. Sixteen hex characters of a 64-bit
-/// digest is not a claim about adversaries; two sentences would have to collide
-/// *and* arrive at the same pane within two minutes to be confused.
-fn message_id(pane: &str, text: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in pane.as_bytes().iter().chain(b"\0").chain(text.as_bytes()) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    format!("m-{h:016x}")
-}
-
-/// Refuse a sentence that has just been sent to this pane, and say so.
-///
-/// `--again` is the escape and it is deliberately a word rather than a
-/// timeout: the case where somebody means it twice exists, and the case where
-/// they are retrying a failure that never happened is the one worth an extra
-/// keystroke.
-pub fn twice(sent: &Sent, ago: i64, p: &Paint) -> i32 {
-    if sent.json {
-        println!(
-            "{}",
-            json!({ "target": sent.target, "pane": sent.pane, "id": sent.id, "told": false, "already": ago })
-        );
-    } else {
-        println!(
-            "{} {}  {}",
-            p.dim("·"),
-            p.bold(&sent.id),
-            p.dim(&format!(
-                "the same sentence reached {} {} ago — `--again` sends it anyway",
-                sent.what,
-                util::duration_human(ago)
-            )),
-        );
-    }
-    0
-}
-
-/// What became of a sentence, said honestly, recorded once, from both verbs.
-///
-/// **The rule this enforces is worklist-010's and it is a constraint rather
-/// than a preference: never report failure for a send that happened.** The old
-/// path printed `the wsp seat was not told` on a backend wait timing out, and the
-/// seat it was addressed to had already read the message — so the governor
-/// retried, and one paragraph was delivered three times. `delivered, no turn
-/// seen` is a true sentence about the same event, and it is what
-/// [`Delivery::Unconfirmed`] prints.
-///
-/// The event is the other half. `wsp tell` has always written `agent-told` and
-/// `govern --tell` wrote nothing at all, so the channel a governor is obliged
-/// to use was the one channel with no forensic trace — and worklist-010 was
-/// investigated for a day out of terminal scrollback because of it. Both write
-/// it now, with the message's id in it, which is what makes a repeat
-/// recognisable at all.
-pub fn delivered(store: &Store, outcome: crate::place::Result<Delivery>, sent: &Sent) -> i32 {
-    let p = Paint::new();
-    let Sent { target, what, pane, peek, chars, text, id, from, re, reply, fan, json } = sent;
-    match outcome {
-        Ok(how) => {
-            // Recorded as an event and not on the task's log, deliberately. The
-            // log is injected into every future spawn on that task, so a line
-            // per sentence would be paid for by every session afterwards; this
-            // is forensics — who said what to whom, when — and belongs where
-            // the claims and the releases already are.
-            store.log_event(
-                "agent-told",
-                json!({
-                    "target": target, "pane": pane, "chars": chars, "id": id,
-                    "from": from, "re": re, "reply": reply, "text": text,
-                    "fan": fan.as_ref().map(|f| f.0.as_str()), "fan_of": fan.as_ref().map(|f| f.1),
-                    "at": util::epoch_secs(),
-                    "turn": matches!(how, Delivery::Started | Delivery::Acked),
-                }),
-            );
-            // The seat's supervisor acknowledged it (wsp-477): the same line the
-            // wake path writes for a governor scope, so a direct tell to a
-            // compound seat leaves its acknowledgement in cycle.log too.
-            if matches!(how, Delivery::Acked) {
-                crate::store::log_line(store, &format!("told {target}: delivered, acknowledged by the seat"));
-            }
-            if *json {
-                println!(
-                    "{}",
-                    json!({ "target": target, "pane": pane, "id": id, "told": true, "from": from, "re": re,
-                            "turn": matches!(how, Delivery::Started | Delivery::Acked) })
-                );
-            } else {
-                // The tail is on the unconfirmed one only, and it is not a
-                // hedge: a sentence queued behind a turn has not been read yet,
-                // which is a different thing to know at a barrier than a turn
-                // that started on it.
-                let tail = match how {
-                    Delivery::Started => String::new(),
-                    Delivery::Acked => format!(" · {}", p.dim("delivered")),
-                    Delivery::Unconfirmed => format!(" · {}", p.dim("delivered, no turn seen")),
-                };
-                println!("{}{}", p.dim(&format!("→ {what} · {pane}")), tail);
-            }
-            0
-        }
-        // `NotTaken` is delivered-and-unmoved, which for this verb is the
-        // interesting answer rather than an error. Where the text now sits is
-        // said as the unknown it is: the keystrokes were written at the pane,
-        // and whether the TUI is still holding them in the composer or dropped
-        // them is inside the application, which wsp cannot read. The first
-        // wording asserted "sitting in the composer" flat out; the spawn
-        // failures of 2026-08-25 showed composers empty after deliveries that
-        // had been reported the same way, so the assertion was a guess that
-        // had already been wrong. The rescue differs by half, and peek tells
-        // the halves apart — which is why it is named before the keystroke:
-        // resending blind would duplicate a composer still holding the text.
-        Err(Refusal::NotTaken) => {
-            eprintln!("wsp: {what} took the text and started nothing — it may be sitting in the composer or may have been dropped");
-            eprintln!("     `wsp peek {peek}` shows which; if it is sitting there, a return in the pane sends it");
-            1
-        }
-        // Read off the screen, so said flat: it is there (`wsp-252`). The
-        // return is the repair; a second `wsp tell` also works, and leaves
-        // the sentence in the prompt twice.
-        Err(Refusal::Unsubmitted(_)) => {
-            eprintln!("wsp: {what} has the text typed in its prompt and not submitted — wsp pressed submit again and it stayed");
-            eprintln!("     a return in {pane} sends it; `wsp peek {peek}` shows it waiting");
-            1
-        }
-        Err(e) => {
-            // The supervisor's own answer after its retries: the wake path's
-            // line for it, so a failed direct tell is not only on stderr.
-            if let Refusal::Failed(why) = &e {
-                crate::store::log_line(store, &format!("told {target}: delivery failed — {why}"));
-            }
-            eprintln!("wsp: {what} was not told: {e}");
-            1
-        }
-    }
-}
-
-/// The pane holding an agent that a needle names: a pane id, or a task.
-///
-/// A workspace is not accepted, and that is a refusal rather than an omission.
-/// A workspace can hold several panes with agents in them, and picking one for
-/// the caller is how a sentence meant for one agent reaches its neighbour —
-/// `govern --tell` may do it because a governorship *is* the workspace's, and a
-/// task is held by a pane.
-/// Which of `backends` answers for `seat`, and the row it answered with —
-/// `wsp tell`'s own join, pulled out so it can be proven without a real
-/// `Place::tell` to receive anything (`compound-077`). The same "ask every
-/// backend, take whichever one's census names this seat" `Wip::live` already
-/// does, one seat at a time instead of the whole list.
-pub fn locate_seat<'a>(
-    backends: &'a [Box<dyn Place>; 1],
-    seat: &str,
-) -> Option<(&'a Box<dyn Place>, crate::place::Seated)> {
-    backends.iter().find_map(|b| {
-        b.census().ok().and_then(|c| c.seats().find(|s| s.seat.as_str() == seat).cloned()).map(|row| (b, row))
-    })
-}
-
 /// Whether compound minted `needle` and still holds it — the seat id read by
 /// who made it rather than by how one is spelled (`wsp-156`).
 ///
@@ -2178,107 +1838,6 @@ fn target(store: &Store, needle: &str, seated: &dyn Fn(&str) -> bool) -> Option<
 /// in a brief are what make it readable by the thing that has to act on it.
 fn message(args: &Args) -> Result<String, i32> {
     prose(args, 1)
-}
-
-/// The same sentence, for the verbs that are not `tell`.
-///
-/// `wsp ask` and `wsp answer` take prose after an id exactly as this does, and
-/// they must take it *identically*: the `-` form, the empty check and the
-/// backtick refusal are one behaviour, and a second copy of them is a second
-/// set of edge cases. `render-080` is why the refusal exists at all — three
-/// phrases were executed by the shell instead of delivered, and the message
-/// arrived fluent with the load-bearing nouns missing.
-pub fn prose(args: &Args, skip: usize) -> Result<String, i32> {
-    from_source(args, &args.text(skip))
-}
-
-/// The paragraph, out of the three places a paragraph comes from: typed on the
-/// line, a stream, or a file named by `--from`.
-///
-/// **The file form is `worklist-036` beyond the row it was found on.** `flag`
-/// lost the message because it had no `--from` and the parser bound the path to
-/// an option nothing read — and `flag` was not alone in the first half of that:
-/// `tell`, `ask`, `answer` and `govern --tell` all took `-` and none of them
-/// took a file, while the house rule printed in every brief is *give a wsp verb
-/// its prose through a file*, because a shell evaluates backticks inside double
-/// quotes. Four verbs told agents to use a spelling four verbs did not have.
-/// The dropped-word guard in `main` now says so out loud instead of losing it
-/// (see [`crate::base::args::Args::dropped`]); this is the other half, which is that the
-/// spelling should simply work, and it works the same way on all of them
-/// because they are one act and share this function.
-///
-/// Two sources is refused rather than resolved: `--from` beside a typed
-/// sentence is a caller who does not know which one is being sent, and picking
-/// either is the same silent loss in a smaller hat.
-pub fn from_source(args: &Args, typed: &str) -> Result<String, i32> {
-    let Some(path) = args.get("from") else {
-        return match typed.trim() == "-" {
-            true => piped_message(),
-            false => typed_message(typed),
-        };
-    };
-    if !typed.trim().is_empty() && typed.trim() != "-" {
-        eprintln!("wsp: a sentence and --from are two messages — send one");
-        return Err(2);
-    }
-    // A lone `--from`, or `--from -`, is the stream: a dash is not a value, it
-    // is the conventional name for stdin, and `prose_source` reads it the same
-    // way for `note` and its neighbours.
-    if matches!(path.as_str(), "true" | "-") {
-        return piped_message();
-    }
-    match crate::util::read_source(&path) {
-        Ok(text) if text.trim().is_empty() => {
-            eprintln!("wsp: {path} is empty — nothing sent");
-            Err(2)
-        }
-        Ok(text) => Ok(text.trim().to_string()),
-        Err(e) => {
-            eprintln!("wsp: cannot read {path}: {e}");
-            Err(1)
-        }
-    }
-}
-
-/// A message given on the command line, checked for the one thing that says it
-/// is not one. See [`crate::util::terminal_output`] — the payload here is prose
-/// about the CLI going through a shell, which is the exact shape that comes
-/// back carrying a command's output instead of the command's name.
-pub fn typed_message(raw: &str) -> Result<String, i32> {
-    let text = raw.trim();
-    if text.is_empty() {
-        eprintln!("wsp: nothing to say");
-        return Err(2);
-    }
-    if let Some(why) = util::terminal_output(text) {
-        eprintln!("wsp: {why}");
-        eprintln!("     a backtick inside double quotes runs a command. `-` reads the message from a stream, where a shell never sees it");
-        return Err(2);
-    }
-    Ok(text.to_string())
-}
-
-/// The message on stdin. Shared with `govern --tell -`, because the two verbs
-/// are one act — a sentence typed into an agent's composer — and a stream form
-/// that behaved differently on one of them is a stream form nobody trusts.
-pub fn piped_message() -> Result<String, i32> {
-    if util::stdin_is_tty() {
-        // The same failure `wsp note` names: a command that stops and silently
-        // swallows keys is worse than one that refuses.
-        eprintln!("wsp: nothing is piped in — `-` reads the message from a stream");
-        return Err(2);
-    }
-    match crate::util::read_source("-") {
-        Ok(raw) if raw.trim().is_empty() => {
-            eprintln!("wsp: nothing on stdin — nothing sent");
-            Err(2)
-        }
-        Ok(raw) => Ok(raw.trim().to_string()),
-        Err(e) => {
-            eprintln!("wsp: cannot read stdin: {e}");
-            Err(1)
-        }
-    }
 }
 
 /// `wsp say "<what you are doing>"` — an agent says where it has got to.
@@ -2404,144 +1963,6 @@ pub fn say(store: &Store, args: &Args) -> i32 {
     0
 }
 
-/// What a pane wears while its agent is looking for a task.
-///
-/// State first, project second, because the ellipsis falls on the right: a
-/// sidebar draws 26 columns, and `looking for work in stra…` still says
-/// the thing a person scanning a column of panes is scanning for. The project
-/// is the half they can usually read off the workspace row anyway.
-fn looking_label(project: Option<&str>, found: bool) -> String {
-    match (found, project) {
-        (true, Some(p)) => format!("looking for work in {p}"),
-        (true, None) => "looking for work".into(),
-        (false, Some(p)) => format!("nothing actionable in {p}"),
-        (false, None) => "nothing actionable".into(),
-    }
-}
-
-/// Say, on the pane, that this agent has nothing in hand and is looking.
-///
-/// The gap this fills is the one between being sent to find work and having
-/// found it. `claim` names the pane after the task, so everything from the
-/// claim onwards is visible from outside — but the minute or two before it, in
-/// which an agent reads a backlog, writes an overview and decides, showed
-/// whatever the pane was called last. From outside that is indistinguishable
-/// from an agent that read its instruction and did nothing.
-///
-/// Two conditions, and both are about the caller rather than the answer:
-///
-/// *An agent.* A person running `wsp next` in a shell is asking a question,
-/// not reporting a state, and their pane is not ours to rename.
-///
-/// *Holding nothing.* A bound pane running `next` is peeking at what comes
-/// after the thing it is in the middle of — and `next` deliberately keeps that
-/// pane's own `doing` task in the running, so the answer is often the task it
-/// already has. Renaming there would replace a true name with a false one. It
-/// is also why this needs no separate hook for the panel's `f`: `find_work`
-/// refuses on an agent that still holds a task, so an agent sent looking is
-/// unbound by the time it asks.
-///
-/// Nothing here is worth failing a command over, so every failure is silent —
-/// the same bargain `claim`'s rename makes.
-///
-/// Said the way [`say`] says things, since wsp-115: into the record first, so
-/// a seat no host draws still says it is looking. *An agent* is asked of the
-/// backend that seated it — a supervisor sets its seat variable only on a
-/// process it spawned as one, so a seat that arrived by that name is driven by
-/// construction.
-pub fn say_looking(store: &Store, project: Option<&str>, found: bool) {
-    let Some(pane) = my_pane() else { return };
-    if crate::place::seat_from_env().is_none() {
-        return;
-    }
-    let holds = store
-        .bindings()
-        .get(&pane)
-        .and_then(|b| b.get("task_id"))
-        .and_then(|t| t.as_str())
-        .is_some_and(|id| store.task(id).is_some());
-    if holds {
-        return;
-    }
-    let label = looking_label(project, found);
-    store.set_sentence(&pane, &label, None);
-}
-
-/// `Trance Video · 3h12m` — a claim as one line.
-///
-/// Both this and `worked_line` join what they have and skip what they do not,
-/// because every part is optional: a claim made outside a seat has no label, and
-/// one made before the clock was recorded has no duration. Formatting them with
-/// fixed separators left `" · 3s · to prio1-001"` hanging off nothing.
-pub fn claim_line(c: &serde_json::Value) -> String {
-    let get = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or("");
-    let mut parts: Vec<String> = Vec::new();
-    match (get("workspace_label"), get("workspace_id")) {
-        ("", "") => {}
-        ("", id) => parts.push(id.to_string()),
-        (label, "") => parts.push(label.to_string()),
-        (label, id) => parts.push(format!("{label} ({id})")),
-    }
-    let held = util::since(get("claimed_at"));
-    if held > 0 {
-        parts.push(util::duration_human(held));
-    }
-    parts.join(" · ")
-}
-
-/// `Trance Video · 3h12m · to render-004` — the claim that ended.
-pub fn worked_line(w: &serde_json::Value) -> String {
-    let get = |k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("");
-    let mut parts: Vec<String> = Vec::new();
-    match (get("workspace_label"), get("workspace_id")) {
-        ("", id) if !id.is_empty() => parts.push(id.to_string()),
-        (label, _) if !label.is_empty() => parts.push(label.to_string()),
-        _ => {}
-    }
-    let spent = w.get("seconds").and_then(|x| x.as_i64()).unwrap_or(0);
-    if spent > 0 {
-        parts.push(util::duration_human(spent));
-    }
-    match get("handed_to") {
-        "" => parts.push(get("reason").to_string()),
-        next => parts.push(format!("to {next}")),
-    }
-    parts.join(" · ")
-}
-
-/// The tier a claim was made at, as a clause on the line that records the
-/// claim — and nothing at all when none was stated.
-///
-/// **A clause and not a line of its own**, which is the whole reason it is
-/// shaped like this. `wsp brief` hands an arriving agent the last four log
-/// lines and nothing more; a record that spent one of those four on the tier
-/// would push whatever direction was written on the task out of the brief, on
-/// every spawn, for ever. The claim line was already the one that says an
-/// attempt started, so this is the same sentence finishing itself.
-///
-/// **`default` is a word here and an absence in the flag**, and the asymmetry
-/// is deliberate. `--effort high` with no `--model` is a real thing to type,
-/// so the pair has to be printable with one half missing; `default/high` says
-/// *whatever the settings file says, at high effort*, which is precisely what
-/// was asked for and reads back unambiguously. What it does **not** do is
-/// name the model — because at the moment of the claim wsp does not know it,
-/// and the record that does is [`crate::agent_kind::Ran`], read off the
-/// transcript when the claim ends.
-///
-/// Empty for a spawn that stated neither, so the ordinary claim line is
-/// byte-for-byte what it was — the same compatibility rule `--model` itself
-/// keeps, and the reason nothing in the store needs migrating.
-pub fn spawned_at(model: Option<&str>, effort: Option<&str>) -> String {
-    match (model, effort) {
-        (None, None) => String::new(),
-        (m, e) => format!(
-            " · spawned at {}/{}",
-            m.unwrap_or("default"),
-            e.unwrap_or("default")
-        ),
-    }
-}
-
 /// What served the attempt that is ending, as a clause on the line that ends
 /// it — and nothing at all when it cannot be read.
 ///
@@ -2618,16 +2039,6 @@ pub fn ran_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::agen
 /// transcript is read (wsp-028).
 pub fn did_of_seat(store: &Store, seat: &str, since: &str) -> Option<crate::did::Did> {
     crate::fold::did_since(store, seat, util::epoch_of(since))
-}
-
-/// The stalled shell commands in the end of a seat's transcript (`wsp-397`),
-/// open ones counted to `now`: the manager's `seat.stuck` as folded
-/// ([`crate::fold::stall`]), its start kept at the `recorded` one when the
-/// command is the same (wsp-028). No transcript is read.
-pub fn stuck_of_seat(store: &Store, seat: &str, now: i64, recorded: Option<(&str, i64)>) -> Vec<crate::stuck::Stall> {
-    let Some(r) = crate::fold::stall(store, seat, now, recorded) else { return Vec::new() };
-    let kind = crate::stuck::classify(&r.command).unwrap_or(crate::stuck::Kind::TimedOut);
-    vec![crate::stuck::Stall { kind, command: r.command, at: r.at, secs: r.secs, open: r.open }]
 }
 
 /// The kind, session and cwd a seat's binding records, when it has a session.
@@ -3621,23 +3032,6 @@ fn release_task(store: &Store, args: &Args, needle: &str) -> i32 {
         println!("nothing holds {}", t.id);
     }
     0
-}
-
-/// Where a claim says the work is, for one line of output.
-///
-/// The id rather than the label, which is the opposite of what a list wants.
-/// A workspace holding a task is *named after* it — `002 · the probe task
-/// claimed onto anot…` — so the label restates the id already in the sentence
-/// and arrives elided, with the ellipsis landing mid-clause. The id is the part
-/// the reader cannot reconstruct: it says which screen to go and look at.
-pub fn claim_where(claim: &serde_json::Value) -> String {
-    let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    let (label, id) = (get("workspace_label"), get("workspace_id"));
-    match (id.is_empty(), label.is_empty()) {
-        (false, _) => id.to_string(),
-        (true, false) => label.to_string(),
-        (true, true) => "somewhere it did not record".to_string(),
-    }
 }
 
 /// End the durable claim on a task, and commit the trace of it.
@@ -4996,13 +4390,6 @@ pub fn holding(
                 == Some(seat)
         })
         .map(|(id, _)| id.clone())
-}
-
-/// Whether `seat` is a project's governor seat, through the same query `wip`
-/// draws its `▣` from.
-pub fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
-    let workspace = seat.split(':').next().unwrap_or(seat);
-    crate::place::governs(governors, &crate::place::seat_query(workspace, Some(seat))).is_some()
 }
 
 /// One agent, as `wip` wants it.
@@ -7871,6 +7258,7 @@ mod tests {
     /// site that stopped calling `util::no_such` fails here, not in review.
     #[test]
     fn a_title_a_flag_ate_is_reported_as_a_flag_and_files_nothing() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let (_env, store) = scratch("dash-title");
         let mut demo = crate::model::Project::new("demo");
         demo.name = "demo".into();
@@ -7947,6 +7335,7 @@ mod tests {
     /// announcing the same hand to the same seat a minute later.
     #[test]
     fn a_hand_raised_under_a_seat_is_owed_by_that_seat_rather_than_only_drawn() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let (_env, store) = scratch("flag-to-seat");
         a_task(&store, "wsp-001");
         // The governor record written directly rather than through `take`:
@@ -7982,6 +7371,7 @@ mod tests {
     /// hand and the panel showed the person what the governor had been told.
     #[test]
     fn a_run_notice_says_it_is_wsps_and_for_the_seat_and_is_not_the_persons() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let (_env, store) = scratch("run-notice");
         a_task(&store, "wsp-001");
         store.set_governor(
@@ -9431,6 +8821,7 @@ mod tests {
     /// `first-orders.json` filled them, its `stuck` from `stuck-commands.json`).
     #[test]
     fn under_the_orders_machine_wip_draws_the_files_paths_words_and_json_from_the_orders() {
+        crate::install_db();
         let env = util::isolated("wip-orders-json");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -9466,6 +8857,8 @@ mod tests {
         assert!(DeliveryColumns::read(&reads, None, now_ms()).unsent.is_empty(), "typed this tick is not unsent yet");
 
         let mut stored = wip_world();
+        // The same rows, not a second build's: its stamps can be a second later.
+        stored.tasks = files.tasks.clone();
         stored.agents[0].state = State::Idle;
         stored.unsent = cols.unsent;
         stored.dropped = cols.dropped;
@@ -9491,6 +8884,7 @@ mod tests {
     /// `Wip::from_api` give the same columns.
     #[test]
     fn under_the_orders_machine_wip_reads_none_of_the_delivery_files() {
+        crate::install_db();
         let env = util::isolated("wip-orders-files");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -11653,5 +11047,272 @@ mod tests {
             assert!(text.contains(line), "{line} in:\n{text}");
         }
         assert!(!text.contains("↳ working"), "a turn in flight already says working:\n{text}");
+    }
+}
+
+/// Moved from `fold`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_fold {
+    use crate::fold::*;
+    use crate::fold::mirror_tests::*;
+    use std::collections::BTreeMap;
+    use serde_json::json;
+    use wsp_host_api::Message;
+    use wsp_store_contract::{self as c, Entity, IdempotencyKey, MachineName, Principal, SeatState};
+    use crate::store::Store;
+    use crate::util;
+    use wsp_host_api::{Epoch, Key, RowId, SeatId, SeatStarted, SeatStopped};
+
+    /// wsp-094: after a machine restart the manager journalled every seat
+    /// stopped and the fold put each gone; nothing ever forgot them. The tick's
+    /// sweep forgets a gone seat with nothing to say — in the state core and in
+    /// `spawned.json` — keeps one that said something,
+    /// forgets a seat mirrored before the census word was carried, and a
+    /// second sweep finds nothing.
+    #[test]
+    fn the_sweep_forgets_seats_a_restart_left_gone_with_nothing_to_say() {
+        crate::install_db();
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let env = util::isolated("fold-sweep-mute");
+        let store = Store::open();
+        let db = open(&env.state());
+        let mut id = 0;
+        for seat in ["cpd-r1", "cpd-r2"] {
+            let s = SeatId(seat.into());
+            id += 1;
+            let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 19479, sockets: vec![] };
+            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStarted(started))));
+            id += 1;
+            let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
+            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStopped(stopped))));
+        }
+        store.set_sentence("cpd-r2", "stopped at the barrier", None);
+        // As a build before the census word mirrored it: gone, and nothing else.
+        let old = c::Seat {
+            id: c::SeatId("cpd-r3".into()),
+            machine: MachineName("h".into()),
+            kind: "claude".into(),
+            model: None,
+            state: SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(1),
+            fields: BTreeMap::from([("epoch".to_string(), "1".to_string())]),
+        };
+        db.apply(put_cmd(vec![Entity::Seat(old)]), IdempotencyKey("old".into()), Principal::Wsp("test".into())).unwrap();
+        assert!(store.spawned().contains_key("cpd-r1"), "the fold recorded the start");
+        assert!(state_since(&store, ["cpd-r1"]).contains_key("cpd-r1"), "and dated the gone");
+
+        let mut forgot = sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s));
+        forgot.sort();
+        assert_eq!(forgot, ["cpd-r1", "cpd-r3"]);
+        let seats = db.snapshot().unwrap().0.seats;
+        assert!(!seats.contains_key(&c::SeatId("cpd-r1".into())) && !seats.contains_key(&c::SeatId("cpd-r3".into())), "{seats:?}");
+        assert!(seats.contains_key(&c::SeatId("cpd-r2".into())), "it said something");
+        assert!(!store.spawned().contains_key("cpd-r1"));
+        assert!(store.spawned().contains_key("cpd-r2"));
+        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "nothing left to forget");
+
+        // A day after it was first seen gone, the one that said something goes too.
+        let day_ago = util::epoch_secs() - crate::cmd_agent::GONE_FOR - 60;
+        say(&store, "cpd-r2", |m| {
+            m.insert("at".into(), json!(util::iso_at(day_ago)));
+        });
+        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-r2"]);
+    }
+
+    /// A despawn of a gone seat that said something ends its record, and the
+    /// next sweep forgets it at once.
+    #[test]
+    fn the_sweep_forgets_a_despawned_seat_at_once() {
+        crate::install_db();
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let env = util::isolated("fold-sweep-despawned");
+        let store = Store::open();
+        let db = open(&env.state());
+        let s = SeatId("cpd-d1".into());
+        let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 1, sockets: vec![] };
+        fold_into(&store, Some(&db), "h", &frame(1, Message::SeatStarted(started)));
+        let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
+        fold_into(&store, Some(&db), "h", &frame(2, Message::SeatStopped(stopped)));
+        store.set_sentence("cpd-d1", "stopped at the barrier", None);
+        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "it said something");
+        store.end_spawned("cpd-d1", util::epoch_secs());
+        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-d1"]);
+    }
+}
+
+/// Moved from `ending`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_ending {
+    use crate::ending::tests::*;
+
+    /// `wsp-433`: `wsp doctor` found 26 task files with release lines and 43
+    /// worklist files with attempts marked `ended` on disk and in no commit.
+    /// The release (`release_pane`'s claim and log line) and both endings (the
+    /// row's, and the check's on its worklist) leave the store clean.
+    #[test]
+    fn a_release_and_an_attempts_end_leave_the_store_committed() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = verified("committed");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "wsp@test"],
+            &["config", "user.name", "wsp test"],
+            &["config", "commit.gpgsign", "false"],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "store"],
+        ] {
+            let ok = wsp_base::calls::Command::new("git").arg("-C").arg(&store.root).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
+            assert!(ok.success(), "git {args:?}");
+        }
+        let loose = || {
+            let out = wsp_base::calls::Command::new("git")
+                .arg("-C")
+                .arg(&store.root)
+                .args(["status", "--porcelain"])
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(loose(), "", "the baseline is clean");
+
+        // The member's ending, then the release line a seat's ending writes.
+        pass(&store, &Fake::at_rest());
+        assert!(log_of(&store, "m-1").contains("ended: verification holds"), "{}", log_of(&store, "m-1"));
+        assert_eq!(loose(), "", "the row's ending is committed");
+        let (removed, task) = crate::cmd_agent::release_pane(&store, "cpd-1");
+        assert!(removed && task.as_deref() == Some("m-1"));
+        assert!(log_of(&store, "m-1").contains("released"), "{}", log_of(&store, "m-1"));
+        assert_eq!(loose(), "", "the release line is committed");
+
+        // And a check marked ended on its worklist.
+        let mut w = store.worklist("run").unwrap();
+        let mut g = w.groups();
+        g[0].checks.push(crate::barrier::Check {
+            at: "2026-10-06T09:00:00Z".into(),
+            state: crate::barrier::State::Running,
+            read: None,
+            pane: Some("cpd-9".into()),
+            on: Some("claude sonnet/high".into()),
+            ending: crate::barrier::Ending::Standing,
+            was: None,
+            tries: 1,
+            gave_up: false,
+            suite: None,
+            run: None,
+            by: None,
+        });
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        store.git_commit("test: a check");
+        assert_eq!(loose(), "");
+        assert!(crate::barrier::mark_ended(&store, "cpd-9", true));
+        assert!(loose().is_empty(), "the attempt's end is committed: {}", loose());
+    }
+}
+
+/// Moved from `cmd_task`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_cmd_task {
+    use crate::cmd_task::*;
+    use crate::cmd_task::tests::*;
+    use crate::place::State;
+    use serde_json::json;
+    use crate::model::{Status, Task};
+    use crate::store::Store;
+    use crate::util::{self};
+
+    /// `wsp-344`: a verified row whose seat is gone — no backend has it — closes
+    /// in one call too, and ends nothing.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_gone_in_one_call() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-verified-gone");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"));
+        assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "nothing left to end");
+    }
+
+    /// `wsp-344`: `wsp done` on a verified row whose seat sits idle at its
+    /// prompt ends the seat (tree kept for the close's own sweep), releases the
+    /// claim and closes the row — one call, no `wsp release` first.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_idle_in_one_call() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-verified-idle");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+        crate::cycle::tests::KEPT.with(|k| k.borrow_mut().clear());
+
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Reads(vec![("cpd-9", State::Idle)])), 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"), "the claim is released");
+        assert!(!store.bindings().contains_key("cpd-9"));
+        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the idle seat is ended");
+        assert_eq!(crate::cycle::tests::KEPT.with(|k| k.borrow().clone()), vec!["cpd-9".to_string()], "its tree left to done's sweep");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("`wsp done` ended it and released the claim") && log.contains("→ done"), "{log}");
+    }
+
+    /// `wsp-509`: a verified row whose seat `locate` still finds but the Seats
+    /// port positively does not have reads as idle (`standing_as`), so the close
+    /// goes through in one call and ends the seat as an idle one.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_live_by_locate_but_absent_by_the_port() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-verified-absent");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        assert_eq!(standing_as(&Absent, "cpd-9"), Standing::Idle);
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Absent), 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"), "the claim is released");
+        assert!(!store.bindings().contains_key("cpd-9"));
+        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the seat locate found is ended");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("`wsp done` ended it and released the claim"), "{log}");
+    }
+
+    /// `wsp-582`: `done` on a row whose seat is up refuses, names the seat and the
+    /// verb, and leaves the claim and binding exactly as they were; a seat that
+    /// is gone, or a leg's, does not stop it.
+    #[test]
+    fn done_refuses_a_row_whose_seat_is_up_and_names_it() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-live-seat");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "p-001");
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
+        store.set_binding("cpd-8@mb", json!({ "task_id": "p-001", "pane_id": "cpd-8@mb", "workspace_id": "cpd-8@mb" }));
+        store.set_binding("cpd-7", json!({ "task_id": "p-001", "leg": "a", "pane_id": "cpd-7", "workspace_id": "cpd-7" }));
+        store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
+
+        let alive = |s: &str| s != "cpd-gone";
+        assert_eq!(standing_on(&store, "p-001", &alive), vec!["cpd-8@mb".to_string(), "cpd-9".to_string()], "a far seat is named too, a leg's is not");
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &alive, &Reads(vec![("cpd-9", State::Idle), ("cpd-8@mb", State::Idle)])), 1, "not verified: an idle seat still refuses");
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Doing, "a refused close closes nothing");
+        assert!(store.claims().contains_key("p-001"), "and releases nothing");
+        assert!(store.bindings().contains_key("cpd-9") && store.bindings().contains_key("cpd-8@mb"));
+
+        // The seats gone: the close goes through as it always did.
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"));
     }
 }

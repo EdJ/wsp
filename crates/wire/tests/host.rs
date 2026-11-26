@@ -113,7 +113,7 @@ esac
 /// A short directory for one test (the fake's paths stay inside a socket's 104
 /// bytes) and the fake beside it.
 fn place(tag: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::temp_dir();
     let dir = base.join(format!("wh-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();

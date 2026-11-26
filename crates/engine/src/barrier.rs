@@ -212,7 +212,7 @@ pub enum Mechanical {
 /// waiting on an agent that will never answer. An open entry with no seat after
 /// [`RETRY_BACKOFF`] is a start that never arrived, and is taken again — on the
 /// backoff, [`TRIES`] times in all, and then not at all: [`give_up`] says so.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn open(store: &Store, w: &Worklist, at: usize, read: Option<String>, on: Option<String>, gone: &dyn Fn(&str) -> bool) -> Option<Opened> {
     open_within(store, w, at, read, on, Mechanical::No, gone, &|| true)
 }

@@ -210,3 +210,39 @@ pub fn efforts_of(kind: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+
+/// backend's default when nobody says which agent. Every other kind it knows is
+/// spelt the way its own CLI spells it and passed straight through — an
+/// unknown one is refused by backend with the whole catalogue in the message,
+/// which is a better list than one kept here and left to go stale.
+pub const DEFAULT_KIND: &str = "claude";
+
+/// The kind a record names, or [`DEFAULT_KIND`] for one that names none.
+///
+/// **`core-031`'s second decision, and it is a decision rather than a
+/// convenience.** A record with no kind can be read two ways — as `claude`,
+/// which is compatible and wrong for exactly the agents `core-020` is adding,
+/// or as *unknown*, which is honest and costs more than it sounds.
+///
+/// Unknown resolves to [`crate::agent_commands::Plain`], and `Plain` has no
+/// resume flag: `wsp resume` on every record written before this existed would
+/// stop working, and the ones written before this existed are all `claude`
+/// because `--kind` was read and thrown away. So honesty about the absence buys
+/// nothing true and loses the whole back catalogue.
+///
+/// What makes the default safe rather than merely convenient is that an absence
+/// no longer lasts: [`crate::cmd_agent::learn_sessions`] and
+/// [`crate::cmd_govern::learn_seats`] take the kind off backend's own reading on
+/// every `sync` tick, so a live record is corrected within a tick of anything
+/// looking at it and only a record whose agent is already gone can still be
+/// reading its default. For those, the default is what they were.
+///
+/// One function because there are three call sites and `cmd_resume`'s census
+/// path already had this line written out; the store path now reads the same
+/// fact the same way.
+pub fn kind_or_default(recorded: &str) -> String {
+    match recorded.trim() {
+        "" => DEFAULT_KIND.to_string(),
+        k => k.to_string(),
+    }
+}

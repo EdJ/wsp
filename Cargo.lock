@@ -811,6 +811,7 @@ dependencies = [
  "wsp-host-api",
  "wsp-manager",
  "wsp-objects",
+ "wsp-seats",
  "wsp-server",
  "wsp-spoke",
  "wsp-store",
@@ -926,6 +927,27 @@ dependencies = [
  "serde_json",
  "sha2",
  "wsp-store-contract",
+]
+
+[[package]]
+name = "wsp-seats"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-api",
+ "wsp-base",
+ "wsp-client",
+ "wsp-engine",
+ "wsp-host",
+ "wsp-host-api",
+ "wsp-manager",
+ "wsp-server",
+ "wsp-store",
+ "wsp-store-contract",
+ "wsp-store-sqlite",
+ "wsp-testkit",
+ "wsp-view",
+ "wsp-wire",
 ]
 
 [[package]]

@@ -9,7 +9,6 @@
 //! cut in SQL), and readings, kept beside the state with no event.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -195,7 +194,7 @@ fn seeded<S: Store>(s: &S) {
 }
 
 fn sqlite(tag: &str) -> SqliteStore {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dir = std::env::temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("wip-{tag}-{}.db", std::process::id()));
     for ext in ["", "-wal", "-shm"] {

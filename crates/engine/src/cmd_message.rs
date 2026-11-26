@@ -164,7 +164,7 @@ fn ask_of(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let text = match crate::cmd_agent::prose(args, 1) {
+    let text = match crate::prose::prose(args, 1) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -250,7 +250,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // With choices the sentence may be left out: the questions are it.
     let text = match (&choices, args.text(1).trim().is_empty() && args.get("from").is_none()) {
         (Some(c), true) => c.sentence(),
-        _ => match crate::cmd_agent::prose(args, 1) {
+        _ => match crate::prose::prose(args, 1) {
             Ok(t) => t,
             Err(code) => return code,
         },
@@ -285,7 +285,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // About the list's group when it can say which: `--group N`, or the group
     // the asking seat is checking.
     let (about, subject_id, seat, to) = match &subject {
-        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cmd_govern::answering_seat(store, t), addressed(store, t)),
+        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cycle::Seats::answering_seat(crate::cycle::seats(), store, t), addressed(store, t)),
         Err(w) => {
             let group = args.get("group").and_then(|g| g.parse::<usize>().ok()).or_else(|| {
                 pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p)).filter(|(l, _)| *l == w.id).map(|(_, at)| at)
@@ -321,7 +321,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
                 Some(s) => format!(
                     "asked of the {} governor, above {scope} · {}",
                     s.scope,
-                    crate::cmd_govern::room_of(&store.governors(), &s.scope)
+                    crate::governors::room_of(&store.governors(), &s.scope)
                 ),
                 None => to,
             };
@@ -420,7 +420,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // it — unless that seat is the one asking, which would wake it on its own
     // words.
     let report = seat.as_ref().filter(|s| !(q.for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
-        crate::wake::say(store, &s.scope, &for_a_governor(&q), Some(&q.id))
+        crate::cycle::Seats::say(crate::cycle::seats(), store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
 
     if wait.on {
@@ -915,7 +915,7 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
     let (text, choice) = match chosen {
         // A set is answered per question, below; its words are its own.
         _ if a_set => (String::new(), None),
-        false => match crate::cmd_agent::prose(args, 1) {
+        false => match crate::prose::prose(args, 1) {
             Ok(t) => (t, None),
             Err(code) => return code,
         },
@@ -927,7 +927,7 @@ pub fn answer(store: &Store, args: &Args) -> i32 {
             let typed = args.text(1);
             let typed = match typed.trim().is_empty() {
                 true => String::new(),
-                false => match crate::cmd_agent::typed_message(&typed) {
+                false => match crate::prose::typed_message(&typed) {
                     Ok(t) => t,
                     Err(code) => return code,
                 },
@@ -1199,7 +1199,7 @@ fn cancel_as(store: &Store, args: &Args, caller: &Answerer) -> i32 {
     let why = args.text(1);
     let why = match why.trim().is_empty() {
         true => CANCELLED.to_string(),
-        false => match crate::cmd_agent::typed_message(&why) {
+        false => match crate::prose::typed_message(&why) {
             Ok(t) => format!("{CANCELLED}: {}", t.trim()),
             Err(code) => return code,
         },
@@ -1659,7 +1659,7 @@ fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
         id = closed.question.id,
         answer = closed.question.via.last().map(|h| h.note.as_str()).unwrap_or_default(),
     );
-    let r = crate::wake::say(store, &seat.scope, &text, Some(&closed.question.id));
+    let r = crate::cycle::Seats::say(crate::cycle::seats(), store, &seat.scope, &text, Some(&closed.question.id));
     if !args.json() {
         println!("  {}", r.said(&format!("the {} seat", r.scope), &Paint::new()));
     }
@@ -1926,7 +1926,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // an answer addressed to a compound-hosted agent was filed as "no backend
     // socket" and never delivered, on a machine where the agent was running.
     let backends = crate::place::local_backends();
-    let Some((place, found)) = crate::cmd_agent::locate_seat(&backends, &pane) else {
+    let Some((place, found)) = crate::sent::locate_seat(&backends, &pane) else {
         receipt(false, false, &format!("nothing answers for {pane} any more — the answer is written"));
         return 0;
     };
@@ -1958,24 +1958,23 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     if !found.state.will_take_a_prompt() {
         let why = match crate::waiting::on_screen(found.state) {
             Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
-            None => crate::wake::held_because(found.state).unwrap_or("not taking a prompt").to_string(),
+            None => crate::waiting::held_because(found.state).unwrap_or("not taking a prompt").to_string(),
         };
         return hold(store, closed, &pane, &why, &receipt);
     }
 
     let text = wire(closed);
-    let how = crate::agent_commands::of(&found.agent.kind);
-    let sent = crate::cmd_agent::Sent::new(&pane, &asker(closed), &pane, &pane, &text, args);
+    let sent = crate::sent::Sent::new(&pane, &asker(closed), &pane, &pane, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
-            return crate::cmd_agent::twice(&sent, ago, &p);
+            return crate::sent::twice(&sent, ago, &p);
         }
     }
-    let out = how.tell(place.as_ref(), &crate::place::Seat::new(&pane), &text);
+    let out = crate::cycle::Seats::tell_as(crate::cycle::seats(), &found.agent.kind, place.as_ref(), &crate::place::Seat::new(&pane), &text);
     // The census row said idle and the backend said busy: the turn started in
     // between. The same hold, for the same reason, rather than a refusal.
     if let Err(crate::place::Refusal::NotReady(state)) = out {
-        let why = crate::wake::held_because(state).unwrap_or("not taking a prompt");
+        let why = crate::waiting::held_because(state).unwrap_or("not taking a prompt");
         return hold(store, closed, &pane, why, &receipt);
     }
     // `delivered` owns the honest-reporting rule and the `agent-told` event, so
@@ -1983,7 +1982,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
     // on `NotTaken` is right for `wsp tell`, where the sentence is the only
     // thing that happened; here the record is already written, so a rescue is
     // worth printing and is not a failure of the verb.
-    match crate::cmd_agent::delivered(store, out, &sent) {
+    match crate::sent::delivered(store, out, &sent) {
         0 => 0,
         _ => {
             eprintln!("     the answer is on the record whatever the composer does");
@@ -2019,10 +2018,10 @@ fn deliver_as_order(
 ) -> Option<i32> {
     let p = Paint::new();
     let text = wire(closed);
-    let sent = crate::cmd_agent::Sent::new(pane, &asker(closed), pane, pane, &text, args);
+    let sent = crate::sent::Sent::new(pane, &asker(closed), pane, pane, &text, args);
     if let Some(ago) = sent.already_sent(store) {
         if !args.has("again") {
-            return Some(crate::cmd_agent::twice(&sent, ago, &p));
+            return Some(crate::sent::twice(&sent, ago, &p));
         }
     }
     let seat = wsp_store_contract::SeatId(pane.to_string());
@@ -2038,7 +2037,7 @@ fn deliver_as_order(
     if !state.will_take_a_prompt() {
         let why = match crate::waiting::on_screen(state) {
             Some(wait) => format!("{} — `wsp peek {pane}` shows what it is asking", wait.sentence()),
-            None => crate::wake::held_because(state).unwrap_or("not taking a prompt").to_string(),
+            None => crate::waiting::held_because(state).unwrap_or("not taking a prompt").to_string(),
         };
         receipt(false, true, &format!("{pane}: {why} — sent as order {}, typed there by the daemon when it is next idle", id.0));
         return Some(0);
@@ -2054,7 +2053,7 @@ fn deliver_as_order(
     if let Some(o) = now.as_ref() {
         settle_one(store, &closed.reply.id, pane, o);
     }
-    Some(match crate::cmd_agent::delivered(store, outcome, &sent) {
+    Some(match crate::sent::delivered(store, outcome, &sent) {
         0 => 0,
         _ => {
             eprintln!("     the answer is on the record whatever the composer does");
@@ -2179,12 +2178,11 @@ pub fn deliver_held(store: &Store, seats: &dyn crate::cycle::Seats) -> Vec<Strin
 /// pane or nothing in it is an agent, which a later tick asks again.
 pub fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::place::Delivery>> {
     let backends = crate::place::local_backends();
-    let (place, found) = crate::cmd_agent::locate_seat(&backends, pane)?;
+    let (place, found) = crate::sent::locate_seat(&backends, pane)?;
     if found.agent.kind.trim().is_empty() {
         return None;
     }
-    let how = crate::agent_commands::of(&found.agent.kind);
-    Some(how.tell(place.as_ref(), &crate::place::Seat::new(pane), text))
+    Some(crate::cycle::Seats::tell_as(crate::cycle::seats(), &found.agent.kind, place.as_ref(), &crate::place::Seat::new(pane), text))
 }
 
 /// How long a held answer is asked about again after a delivery that did not
@@ -2297,7 +2295,7 @@ fn deliver_held_through(store: &Store, seats: &dyn crate::cycle::Seats, type_at:
 }
 
 /// How the asker sees it, and the first line is the byline.
-fn wire(closed: &message::Closed) -> String {
+pub fn wire(closed: &message::Closed) -> String {
     let mut out = format!(
         "[{}, answering your question {}]\n\n{}",
         whose(closed),
@@ -2333,7 +2331,7 @@ fn asker(closed: &message::Closed) -> String {
 fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s: &crate::governors::Seat) -> String {
     match crate::governors::user_of_primary(&s.scope) {
         Some(user) => format!("asked of {user}'s primary"),
-        None => format!("asked of the {} governor · {}", s.scope, crate::cmd_govern::whereabouts(governors, s)),
+        None => format!("asked of the {} governor · {}", s.scope, crate::governors::whereabouts(governors, s)),
     }
 }
 
@@ -2348,7 +2346,7 @@ fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s
 /// is a property of its shape.
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
     let governors = store.governors();
-    match crate::cmd_govern::answering_seat(store, task) {
+    match crate::cycle::Seats::answering_seat(crate::cycle::seats(), store, task) {
         Some(s) => asked_of(&governors, &s),
         None => "asked of every panel — no governor above it".into(),
     }
@@ -2675,7 +2673,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 /// Tell a governor's seat a question was filed for it (`wsp submit`'s asks), kept
 /// here because this module already reaches the seat layer and `cmd_submit` may not.
 pub fn say_to_governor(store: &Store, scope: &str, q: &Message) {
-    let _ = crate::wake::say(store, scope, &for_a_governor(q), Some(&q.id));
+    let _ = crate::cycle::Seats::say(crate::cycle::seats(), store, scope, &for_a_governor(q), Some(&q.id));
 }
 
 // ---------------------------------------------------------------- tells through the hub (wsp-470)
@@ -2870,8 +2868,9 @@ pub fn tests_govern(store: &Store, scope: &str, pane: &str) {
     store.set_governor(scope, serde_json::json!({ "workspace": "w9", "pane": pane, "since": "2026-11-23" }));
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
+pub mod tests {
     use super::*;
 
     /// `wsp-485`: the receipt for an ask reaching `primary:ed` names ed's primary
@@ -2893,20 +2892,20 @@ mod tests {
     use crate::model::Task;
 
     /// An item as `yours --json` prints it, through the builder and wsp-view's projection.
-    fn item_json(store: &Store, q: &Message) -> serde_json::Value {
+    pub fn item_json(store: &Store, q: &Message) -> serde_json::Value {
         wsp_view::flag::item_json(&item_of(store, q))
     }
 
     /// A closed question as `yours --json`'s `closed` prints it.
-    fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
+    pub fn closed_json(store: &Store, q: &Message, closed: serde_json::Value) -> serde_json::Value {
         wsp_view::flag::closed_json(&wsp_view::flag::Closed { item: item_of(store, q), closed })
     }
 
-    fn scratch(tag: &str) -> Store {
+    pub fn scratch(tag: &str) -> Store {
         crate::testkit::store(&format!("ans-{tag}"))
     }
 
-    fn task(store: &Store, id: &str) -> Task {
+    pub fn task(store: &Store, id: &str) -> Task {
         let mut t = Task::new("the work", id);
         t.project = Some("worklist".into());
         t.body = String::from("## Overview\nthe brief\n\n## Log\n- 2026-08-19 claimed\n");
@@ -2914,7 +2913,7 @@ mod tests {
         t
     }
 
-    fn a_question(store: &Store, about: &str) -> Message {
+    pub fn a_question(store: &Store, about: &str) -> Message {
         let q = Message::question(
             Party::seat("worklist"),
             Kind::Note,
@@ -3001,38 +3000,6 @@ mod tests {
         assert_eq!(ask(&store, &args), 1, "an id that names nothing says so");
     }
 
-    /// `wsp-230`. A barrier check holds no task, so it asks about the list it
-    /// is checking: the question reaches that list's governor, naming the
-    /// barrier, and the answer is written on the list's log — the one durable
-    /// home a seat with no row has — before it is taken back to the asker.
-    #[test]
-    fn a_check_asks_about_its_list_and_the_governor_is_asked_and_the_answer_lands_on_the_list() {
-        let _env = util::isolated("ask-list");
-        let store = scratch("ask-list");
-        let mut w = crate::model::Worklist::new("run", "r");
-        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
-        store.save_worklist(&w).unwrap();
-        store.set_governor("run", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
-
-        // The check's own seat, which is who is waiting: said here rather than
-        // inherited from whatever seat runs the suite.
-        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
-        let args = crate::base::args::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
-        let code = ask(&store, &args);
-        std::env::remove_var(crate::base::seat::SEAT_ENV);
-        assert_eq!(code, 0, "a worklist is somewhere for the answer to live");
-        let q = message::open_questions(&store).pop().expect("the question");
-        assert_eq!(q.about, About::Group { scope: "run".into(), group: 1 });
-        let spooled = std::fs::read_to_string(store.state.join("watches.json")).unwrap_or_default();
-        assert!(spooled.contains("barrier 1 of run") && spooled.contains(&q.id), "held for the run's seat: {spooled}");
-
-        let closed = message::answer(&store, &q.id, &Party::seat("run"), "yes, all of it").unwrap();
-        assert_eq!(closed.landed, Landed::List("run".into()));
-        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
-        assert!(log.contains("answered by") && log.contains("yes, all of it"), "{log}");
-        assert!(wire(&closed).contains("the run list's log"), "{}", wire(&closed));
-    }
-
     /// A question needs a subject **because the subject is what gives the
     /// answer somewhere to live**, and the refusal is at the point of asking
     /// rather than at the point of answering. Discovered late, this is an agent
@@ -3080,7 +3047,7 @@ mod tests {
     }
 
     /// A pane whose state a test sets, and which says whether it is gone.
-    struct Pane {
+    pub struct Pane {
         state: std::cell::Cell<Option<crate::place::State>>,
         gone: bool,
     }
@@ -3096,7 +3063,7 @@ mod tests {
 
     /// cpd-380's question, answered by the wsp-process seat while cpd-380 was
     /// mid-turn — the verb's half: the reply held on its record.
-    fn answered_mid_turn(store: &Store) -> message::Closed {
+    pub fn answered_mid_turn(store: &Store) -> message::Closed {
         task(store, "wsp-149");
         let q = Message::question(
             Party::pane("cpd-380", ""),
@@ -3345,7 +3312,7 @@ mod tests {
     }
 
 
-    fn for_the_person_about(store: &Store, from: Party, about: About) -> Message {
+    pub fn for_the_person_about(store: &Store, from: Party, about: About) -> Message {
         let q = Message::question(from, Kind::Note, "accept +190 ms startup, or file rows?", Waiting::new("w3R:p1", ""))
             .about(about)
             .for_the_person();
@@ -3544,52 +3511,6 @@ mod tests {
         assert!(store.task("m-1").unwrap().body.contains("accepted; gpui costs that"), "the member asked, and hears it");
     }
 
-    /// `wsp-275`'s done-when, at the verb: a plain ask on a member of a running
-    /// list goes to the list's governor and is not the person's; `--person`, and
-    /// a plain ask on a row no seat answers for, are — in `wsp yours` and in
-    /// `wsp flag --person` alike, because the flight view's badge is one count.
-    /// And `for` names the route on all three, where compound-490's plain ask
-    /// to ux-next read `for: null` and the two verbs disagreed about it.
-    #[test]
-    fn every_ask_names_whose_answer_it_waits_on_and_yours_and_flag_person_agree() {
-        let _env = util::isolated("ask-route");
-        let store = scratch("ask-route");
-        task(&store, "m-1");
-        task(&store, "lone-1");
-        let mut w = crate::model::Worklist::new("ux-next", "r");
-        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
-        w.set_status(crate::model::WorklistStatus::Running);
-        store.save_worklist(&w).unwrap();
-        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
-
-        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
-        let asked = |id: &str, text: &str, flags: &[(&str, &str)]| -> String {
-            let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
-            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &[id, text], flags)), 0);
-            message::all(&store).into_iter().map(|m| m.id).find(|m| !before.contains(m)).expect("a new question")
-        };
-        let governed = asked("m-1", "could you paste the panic?", &[]);
-        let persons = asked("m-1", "keep the bump?", &[("person", "")]);
-        let lone = asked("lone-1", "which crate?", &[]);
-        std::env::remove_var(crate::base::seat::SEAT_ENV);
-
-        let route = |id: &str| store.message(id).unwrap().to_json()["for"].clone();
-        assert_eq!(route(&governed), serde_json::json!({ "seat": "ux-next" }), "the list's governor answers it");
-        assert_eq!(route(&persons), "person");
-        assert_eq!(route(&lone), "person", "no seat answers for lone-1, so the person does");
-        assert!(store.message(&governed).unwrap().handed_to("ux-next"), "and the seat was handed it");
-
-        let ids = |v: Vec<Message>| -> Vec<String> {
-            let mut v: Vec<String> = v.into_iter().map(|m| m.id).collect();
-            v.sort();
-            v
-        };
-        let mut want = vec![persons.clone(), lone.clone()];
-        want.sort();
-        assert_eq!(ids(yours_in(&store, None)), want, "yours: the person's two and not the governor's");
-        assert_eq!(ids(message::raised_to_the_person(&store)), want, "flag --person: the same ids");
-    }
-
     /// The primary interface's question is the person's (`wsp-279`), even about
     /// a row a seated governor answers for: it is where the person sits, and
     /// the governor is not who it asks.
@@ -3605,6 +3526,8 @@ mod tests {
         store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
         store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
 
+        // A seat answers for the row, so only the asker being the primary keeps it from that seat.
+        crate::cycle::install_tests::ANSWERS.with(|a| *a.borrow_mut() = Some("ux-next".into()));
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
         assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
@@ -3709,7 +3632,7 @@ mod tests {
 
     // ---- choices (wsp-299) -------------------------------------------------
 
-    fn two_questions() -> serde_json::Value {
+    pub fn two_questions() -> serde_json::Value {
         serde_json::json!({
             "kind": "ask",
             "questions": [
@@ -3721,7 +3644,7 @@ mod tests {
         })
     }
 
-    fn a_permission() -> serde_json::Value {
+    pub fn a_permission() -> serde_json::Value {
         serde_json::json!({
             "kind": "permission", "tool": "Bash", "command": "scripts/seed.sh save", "via": "hook",
             "input": { "command": "scripts/seed.sh save", "description": "save the seed" },
@@ -3731,7 +3654,7 @@ mod tests {
 
     /// A question for the person carrying `choices`, raised the way the verb
     /// raises it and read back from the store.
-    fn asked_with(store: &Store, about: &str, choices: &serde_json::Value) -> Message {
+    pub fn asked_with(store: &Store, about: &str, choices: &serde_json::Value) -> Message {
         let mut q = Message::question(
             Party::pane("w9:p1", "w9"),
             Kind::Note,
@@ -3745,73 +3668,13 @@ mod tests {
         store.message(&q.id).unwrap()
     }
 
-    fn answer_args(mid: &str, flags: &[(&str, &str)], typed: &[&str]) -> crate::base::args::Args {
+    pub fn answer_args(mid: &str, flags: &[(&str, &str)], typed: &[&str]) -> crate::base::args::Args {
         let mut rest = vec![mid];
         rest.extend_from_slice(typed);
         let mut f = flags.to_vec();
         // The tests run under an agent, and this is the person typing in it.
         f.push(("as-person", ""));
         crate::base::args::Args::synth("answer", &rest, &f)
-    }
-
-    #[test]
-    fn ask_with_choices_raises_a_question_that_carries_them() {
-        let env = util::isolated("ask-choices");
-        let store = scratch("ask-choices");
-        task(&store, "lone-1");
-        // An asker has to be somewhere, and this agent's own seat is not it.
-        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
-        let file = env.path("choices.json");
-        std::fs::write(&file, two_questions().to_string()).unwrap();
-        let f = file.to_string_lossy().to_string();
-
-        let bad = env.path("bad.json");
-        std::fs::write(&bad, r#"{"kind":"poll"}"#).unwrap();
-        let bad = bad.to_string_lossy().to_string();
-        let n = |store: &Store| message::all(store).len();
-        // (what, flags, the sentence typed, the exit)
-        for (what, flags, typed, code) in [
-            ("a file that is not there", vec![("person", ""), ("choices", "/nonexistent/c.json")], "", 2),
-            ("a file that is not JSON", vec![("person", ""), ("choices", "/dev/null")], "", 2),
-            ("a kind it does not know", vec![("person", ""), ("choices", bad.as_str())], "", 2),
-        ] {
-            let before = n(&store);
-            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", typed], &flags)), code, "{what}");
-            assert_eq!(n(&store), before, "{what}: nothing was raised");
-        }
-
-        // Without a sentence the questions are it, and the choices ride along.
-        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("choices", f.as_str())])), 0);
-        let q = message::all(&store).pop().expect("raised");
-        assert_eq!(q.text, "Which figure is the headline? Which views show the split?");
-        assert!(q.for_person);
-        let j = q.to_json();
-        assert_eq!(j["choices"]["kind"], "ask");
-        assert_eq!(j["choices"]["via"], "ask", "raised from the CLI");
-        assert_eq!(j["choices"]["questions"][1]["multi"], true);
-        assert_eq!(item_json(&store, &q)["choices"], j["choices"], "yours --json prints them");
-        assert_eq!(q.caption().text.chars().count() < 60, true, "the caption rule is unchanged: {:?}", q.caption());
-
-        // Choices are the person's: a question a seat answers takes none.
-        let mut w = crate::model::Worklist::new("ux-next", "r");
-        w.set_groups(&[crate::model::Group { members: vec!["lone-1".into()], ..Default::default() }]);
-        w.set_status(crate::model::WorklistStatus::Running);
-        store.save_worklist(&w).unwrap();
-        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
-        let before = n(&store);
-        let code = ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick"], &[("choices", f.as_str())]));
-        assert_eq!((code, n(&store)), (2, before), "a seat's question takes no choices");
-
-        // A sentence of its own stands, and a question without choices says null.
-        assert_eq!(
-            ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick one"], &[("person", ""), ("choices", f.as_str())])),
-            0
-        );
-        assert_eq!(message::all(&store).pop().unwrap().text, "pick one");
-        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
-        let plain = message::all(&store).pop().unwrap();
-        assert!(plain.choices.is_none() && plain.to_json()["choices"].is_null());
-        std::env::remove_var(crate::base::seat::SEAT_ENV);
     }
 
     #[test]
@@ -3866,7 +3729,7 @@ mod tests {
         assert!(given(&plain, &[("choice", "x")]).unwrap_err().contains("no choices"));
     }
 
-    fn a_question_for(store: &Store, about: &str) -> Message {
+    pub fn a_question_for(store: &Store, about: &str) -> Message {
         let q = Message::question(Party::pane("w9:p1", "w9"), Kind::Note, "plain?", Waiting::new("w9:p1", about))
             .about(About::Task(about.into()))
             .for_the_person();
@@ -4025,7 +3888,7 @@ mod tests {
     /// Time that moves only when the wait sleeps, and runs what is due **when
     /// it is looked at** — so an event at the deadline lands after the wait's
     /// last read and before its release, which is the race the release closes.
-    struct Fake<'a> {
+    pub struct Fake<'a> {
         now: std::cell::Cell<u64>,
         due: std::cell::RefCell<Vec<(u64, Box<dyn FnOnce() + 'a>)>>,
     }
@@ -4059,20 +3922,20 @@ mod tests {
     }
 
     /// A pid that has exited, for a waiter that was killed.
-    fn a_dead_pid() -> u32 {
+    pub fn a_dead_pid() -> u32 {
         let mut c = wsp_base::calls::Command::new("true").spawn().unwrap();
         let pid = c.id();
         c.wait().unwrap();
         pid
     }
 
-    fn one_question() -> serde_json::Value {
+    pub fn one_question() -> serde_json::Value {
         serde_json::json!({ "kind": "ask", "questions": [
             { "question": "Land now?", "header": "Land", "options": [{ "label": "Land now" }, { "label": "Wait" }] }] })
     }
 
     /// A question for the person with a waiter on it, raised as the verb does.
-    fn waited_on(store: &Store, about: &str, choices: Option<&serde_json::Value>) -> Message {
+    pub fn waited_on(store: &Store, about: &str, choices: Option<&serde_json::Value>) -> Message {
         let mut q = Message::question(Party::pane("cpd-893", ""), Kind::Note, "Land now?", Waiting::new("cpd-893", about))
             .about(About::Task(about.into()))
             .for_the_person();
@@ -4083,11 +3946,11 @@ mod tests {
     }
 
     /// The newest question in the store; the reply an answer mints is newer still.
-    fn last_question(store: &Store) -> Message {
+    pub fn last_question(store: &Store) -> Message {
         message::all(store).into_iter().filter(|m| !m.is_reply()).last().expect("a question")
     }
 
-    fn the_person_answers(store: &Store, mid: &str, how: &[(&str, &str)]) {
+    pub fn the_person_answers(store: &Store, mid: &str, how: &[(&str, &str)]) {
         assert_eq!(answer(store, &answer_args(mid, how, &[])), 0);
     }
 
@@ -4317,7 +4180,7 @@ mod tests {
     // ---- stale asks close, and the person can cancel (wsp-308) ---------------
 
     /// Raised the way each kind is, about `lone-1`, for `cancel` to be driven on.
-    fn every_kind(store: &Store) -> Vec<(&'static str, Message)> {
+    pub fn every_kind(store: &Store) -> Vec<(&'static str, Message)> {
         let kinds: Vec<(&'static str, Message)> = vec![
             ("person", waited_on(store, "lone-1", None)),
             ("choices", waited_on(store, "lone-1", Some(&one_question()))),
@@ -4339,7 +4202,7 @@ mod tests {
         kinds
     }
 
-    fn ask_cancel(mid: &str, why: &[&str], as_person: bool) -> crate::base::args::Args {
+    pub fn ask_cancel(mid: &str, why: &[&str], as_person: bool) -> crate::base::args::Args {
         let mut flags = vec![("cancel", "")];
         if as_person {
             flags.push(("as-person", ""));
@@ -4538,7 +4401,7 @@ mod tests {
 
     // ---- sets (wsp-682) ----------------------------------------------------
 
-    fn a_set() -> serde_json::Value {
+    pub fn a_set() -> serde_json::Value {
         let q = |h: &str, rec: Option<&str>| {
             let mut v = serde_json::json!({ "header": h, "question": format!("About {h}?"),
                 "options": [{ "label": "A", "description": "first" }, { "label": "B" }, { "label": "C" }] });
@@ -4551,7 +4414,7 @@ mod tests {
         serde_json::json!({ "title": "Plan decisions", "intro": "settles it", "questions": [q("One", Some("A")), q("Two", None), q("Three", Some("B"))] })
     }
 
-    fn file_set(env: &util::Isolated, name: &str, v: &serde_json::Value) -> String {
+    pub fn file_set(env: &util::Isolated, name: &str, v: &serde_json::Value) -> String {
         let f = env.path(name);
         std::fs::write(&f, v.to_string()).unwrap();
         f.to_string_lossy().to_string()

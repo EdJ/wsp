@@ -123,7 +123,7 @@ impl Rig {
     /// A manager on loopback with the fake supervisor, the machine record
     /// naming it, an initialised store, and `wsp daemon` on it under `orders`.
     fn up(tag: &str, orders: Option<&str>) -> Rig {
-        let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let base = std::env::temp_dir();
         let dir = base.join(format!("wt-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let state = dir.join("state");

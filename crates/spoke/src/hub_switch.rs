@@ -190,7 +190,19 @@ fn seat_ops() -> SeatOps {
     if let Some(ops) = TEST_OPS.with(|c| c.get()) {
         return ops;
     }
-    SeatOps { live: wsp_engine::cmd_spawn::seat_is_live, end: wsp_engine::cmd_spawn::end_seat_when_idle }
+    SeatOps { live: seat_is_live, end: end_when_idle }
+}
+
+/// Whether a seat is there: the installed seats (`cycle::seats()`, the root's
+/// `cmd_spawn::Fleet`) can say what it is doing.
+fn seat_is_live(seat: &str) -> bool {
+    wsp_engine::cycle::seats().state(seat).is_some()
+}
+
+/// The seats' own ending once a seat is not mid-turn (`Fleet::end_when_idle`:
+/// a detached `wsp despawn --pane <seat> --keep-tree` that waits out the turn).
+fn end_when_idle(store: &Store, seat: &str) -> Result<(), String> {
+    wsp_engine::cycle::seats().end_when_idle(store, seat)
 }
 
 /// A claim on `row` ended (`Spoke::let_go`). Where it is a row whose agent the
@@ -1005,21 +1017,44 @@ mod tests {
         ENDS.with(|e| e.borrow().clone())
     }
 
-    /// What the scheduled despawn does once the turn is over, through the
-    /// engine's own release: the seat's binding and its row's claim end, and
-    /// the claim's end reaches the add-on (`let_go`).
+    /// What the scheduled despawn does to the add-on once the turn is over.
+    /// Its release is the seats' (`release_pane` -> `hand_off`, above the
+    /// engine, which this crate does not link): the seat's binding goes, the
+    /// claim's end reaches the add-on (`addon::get().let_go`, as `hand_off`
+    /// calls it, before the claim is cleared), and the claim goes.
     fn turn_over(store: &Store, seat: &str) {
-        let (released, row) = wsp_engine::cmd_agent::release_pane(store, seat);
-        assert!(released && row.is_some(), "{seat} was bound and released");
+        let row = store.bindings().get(seat).and_then(|b| b["task_id"].as_str().map(str::to_string)).expect("the seat is bound");
+        let claim = store.claims().get(&row).cloned().expect("the row is claimed");
+        store.clear_binding(seat);
+        wsp_engine::addon::get().let_go(store, &row, &claim);
+        store.clear_claim(&row);
     }
 
-    /// The disable does not wait out a turn: the default ending is the
-    /// engine's `end_seat_when_idle` (a detached despawn with the tree kept).
+    /// The disable does not wait out a turn: the default ending is the seats'
+    /// own `end_when_idle` (the root's `Fleet`: a detached despawn with the
+    /// tree kept), and a seat is live when the seats can say what it is doing,
+    /// both asked through the engine's `cycle::seats()`, never the seats crate.
     #[test]
-    fn hub_switch_the_ending_is_the_engines_despawn_when_idle() {
+    fn hub_switch_the_ending_is_the_seats_despawn_when_idle() {
+        thread_local! {
+            static ASKED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        struct Rec;
+        impl wsp_engine::cycle::Seats for Rec {
+            fn state(&self, seat: &str) -> Option<wsp_engine::place::State> {
+                (seat == "cpd-live").then_some(wsp_engine::place::State::Idle)
+            }
+            fn end_when_idle(&self, _: &Store, seat: &str) -> Result<(), String> {
+                ASKED.with(|a| a.borrow_mut().push(seat.to_string()));
+                Ok(())
+            }
+        }
+        wsp_engine::cycle::install_seats(Box::leak(Box::new(Rec)));
+        let (_env, store) = crate::testkit::isolated_store("hub-switch-ops");
         let ops = seat_ops();
-        assert!(std::ptr::fn_addr_eq(ops.end, wsp_engine::cmd_spawn::end_seat_when_idle as fn(&Store, &str) -> Result<(), String>));
-        assert!(std::ptr::fn_addr_eq(ops.live, wsp_engine::cmd_spawn::seat_is_live as fn(&str) -> bool));
+        assert!((ops.live)("cpd-live") && !(ops.live)("cpd-gone"));
+        (ops.end)(&store, "cpd-live").unwrap();
+        assert_eq!(ASKED.with(|a| a.borrow().clone()), vec!["cpd-live".to_string()]);
     }
 
     /// Owner's decision: disable parks a shared row whose seat is live and

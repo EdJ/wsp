@@ -9,7 +9,7 @@ name = "wsp"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/wire", "crates/trees", "crates/engine", "crates/base", "crates/store", "crates/store-contract", "crates/objects", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager", "crates/api", "crates/server", "crates/client", "crates/view", "crates/machines", "crates/hub-protocol", "crates/spoke"]
+members = ["crates/wire", "crates/trees", "crates/engine", "crates/seats", "crates/base", "crates/store", "crates/store-contract", "crates/objects", "crates/store-conformance", "crates/store-sqlite", "crates/testkit", "crates/host-api", "crates/host", "crates/manager", "crates/api", "crates/server", "crates/client", "crates/view", "crates/machines", "crates/hub-protocol", "crates/spoke"]
 
 [dependencies]
 serde_json = "1"
@@ -17,8 +17,9 @@ wsp-base = { path = "crates/base" }
 wsp-store = { path = "crates/store" }
 wsp-wire = { path = "crates/wire" }
 wsp-trees = { path = "crates/trees" }
-# The engine and the seats (wsp-440), re-exported module by module at their old paths in main.rs.
+# The engine (wsp-440) and the seats on it (wsp-441), re-exported module by module at their old paths in main.rs.
 wsp-engine = { path = "crates/engine" }
+wsp-seats = { path = "crates/seats" }
 # The shared-work add-on (the hub spoke): installed in main, its verbs registered in registry.
 wsp-spoke = { path = "crates/spoke" }
 wsp-host-api = { path = "crates/host-api" }

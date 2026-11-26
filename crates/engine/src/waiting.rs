@@ -573,7 +573,7 @@ impl Asks {
         Some(Wait { why: Why::Question(id.clone()), on: On::Person, own: None })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn waiter(pane: &str, task: &str, id: &str) -> Asks {
         let mut a = Asks::one(pane, task, id, On::Person);
         a.awaited_pane.insert(pane.to_string(), id.to_string());
@@ -581,7 +581,7 @@ impl Asks {
         a
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn held_one(pane: &str, task: &str, id: &str) -> Asks {
         let mut a = Asks::one(pane, task, id, On::Person);
         a.held_by_pane.insert(pane.to_string(), id.to_string());
@@ -589,7 +589,7 @@ impl Asks {
         a
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn one(pane: &str, task: &str, id: &str, on: On) -> Asks {
         let mut a = Asks::default();
         a.by_pane.insert(pane.to_string(), (id.to_string(), on.clone()));
@@ -797,7 +797,7 @@ impl Shells {
     pub fn read<'a>(seats: impl IntoIterator<Item = &'a str>, self_wait: &dyn Fn(&str) -> bool) -> Shells {
         // A test's seat ids are not this machine's, and a fake backend's are
         // not anybody's: a test hands the index in with [`Shells::one`].
-        if cfg!(test) {
+        if crate::base::under_test() {
             return Shells::default();
         }
         let backends = crate::place::local_backends();
@@ -920,12 +920,12 @@ impl Shells {
         Shells { by_seat }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn own(seat: &str, own: Own) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), own)]) }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn one(seat: &str, n: usize) -> Shells {
         Shells { by_seat: BTreeMap::from([(seat.to_string(), Own { n, ..Own::default() })]) }
     }
@@ -1356,6 +1356,36 @@ pub fn seat_wait(f: &Facts) -> Option<SeatWait> {
         },
         None => SeatWait { kind: Kind::Idle, target: None, since: f.in_state_since, quiet_secs: None, line: idle },
     })
+}
+
+/// Why a pane would not take a wake, in the words `--status` and `doctor`
+/// print.
+///
+/// **One sentence per state rather than one for all of them**, because they
+/// want four different repairs and a reader who cannot tell them apart goes
+/// looking in the wrong place: mid-turn clears itself and is not a fault at
+/// all, `Blocked` needs a person at a keyboard, `Starting` clears itself in
+/// seconds, and `Unknown` means the seat could not be read — which is a fault
+/// about the *reporter* and not about the seat.
+///
+/// No wildcard, for [`crate::cmd_watch::Line::disposition`]'s reason: a state
+/// added later has to come past here and say what a wake does about it, rather
+/// than inheriting a sentence that was written before it existed.
+pub fn held_because(state: crate::place::State) -> Option<&'static str> {
+    use crate::place::State;
+    match state {
+        // The one state a wake may be typed into, and it is
+        // [`crate::place::State::will_take_a_prompt`]'s whole definition. This
+        // function is the only thing [`Tell::deliver`] asks, so a test that
+        // enumerates it is reading the gate rather than a copy of it.
+        State::Idle => None,
+        State::Working => Some("the seat is mid-turn"),
+        State::Blocked => Some("the seat is stopped on a prompt only a person can answer"),
+        State::Starting => Some("the agent is still coming up"),
+        State::Empty | State::Gone => Some("the seat is empty"),
+        State::Unreachable => Some("the seat is unreachable — held until the link returns"),
+        State::Unknown => Some("wsp cannot say what the seat is doing"),
+    }
 }
 
 #[cfg(test)]

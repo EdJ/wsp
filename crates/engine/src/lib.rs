@@ -1,4 +1,4 @@
-//! `wsp-engine`: the engine and the seats, the phase 2 cut (`docs/components.md` §5, wsp-440); see `MAP.md`.
+//! `wsp-engine`: the engine, the phase 2 cut (`docs/components.md` §5, wsp-440; the seats are `wsp-seats`, wsp-441); see `MAP.md`.
 //! Depends on `wsp-base`, `wsp-store`, `wsp-wire` and `wsp-trees`. The root re-exports each module at its old
 //! path (`crate::cycle`, `crate::cmd_spawn`, …), so no caller changed.
 
@@ -10,10 +10,11 @@ pub use wsp_wire::{fake, far, host, host_tcp, launchd, manager, place, place_com
 pub mod base;
 
 /// The test kit at the path every test module uses: the store-backed fixtures beside `Store` in `wsp-store`,
-/// the git repository fixture in `wsp-testkit`.
-#[cfg(test)]
+/// the git repository fixture in `wsp-testkit`. Only the first reach a dependent: layering keeps `wsp-testkit` a dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
 pub mod testkit {
     pub use wsp_store::testkit::{isolated_store, store};
+    #[cfg(test)]
     pub use wsp_testkit::{git, repo, repo_at};
 }
 
@@ -21,7 +22,6 @@ pub mod addon;
 pub mod address;
 pub mod affected;
 pub mod after;
-pub mod agent_commands;
 pub mod artefact;
 pub mod attempt;
 pub mod attention;
@@ -32,27 +32,15 @@ pub mod barrier_run;
 pub mod build_output;
 pub mod by_merge;
 pub mod check;
+pub mod claims;
 pub mod classify;
 pub mod closing;
-pub mod cmd_agent;
-pub mod cmd_attend;
-pub mod cmd_brief;
-pub mod cmd_govern;
 pub mod cmd_initiative;
-pub mod cmd_install;
-pub mod cmd_machine;
 pub mod cmd_mandate;
 pub mod cmd_message;
 pub mod cmd_migrate;
-pub mod cmd_project;
-pub mod cmd_resume;
-pub mod cmd_role;
-pub mod cmd_sandbox;
-pub mod cmd_spawn;
-pub mod cmd_stamp;
 pub mod cmd_submit;
 pub mod cmd_task;
-pub mod cmd_watch;
 pub mod cmd_whoami;
 pub mod cmd_worklist;
 pub mod cold;
@@ -72,15 +60,12 @@ pub mod history;
 pub mod hold;
 pub mod hold_close;
 pub mod inner;
-pub mod kind_attention;
-pub mod kind_data;
 pub mod leg_seat;
 pub mod leg_tree;
 pub mod legs;
 pub mod list_sweep;
 pub mod liveness;
 pub mod local_trust;
-pub mod memory;
 pub mod mirror;
 pub mod orders;
 pub mod outputs;
@@ -91,6 +76,7 @@ pub mod pickup;
 pub mod piece_close;
 pub mod piece_seat;
 pub mod pieces;
+pub mod prose;
 #[allow(dead_code)]
 pub mod record_workspace;
 pub mod refusals;
@@ -99,6 +85,7 @@ pub mod retro_yours;
 pub mod room;
 pub mod scope;
 pub mod scratch;
+pub mod sent;
 pub mod size_check;
 pub mod split;
 pub mod stage;
@@ -112,5 +99,5 @@ pub mod verification;
 pub mod verifier_packet;
 pub mod waiting;
 pub mod waits;
-pub mod wake;
+pub mod watch_levels;
 pub mod worklist;

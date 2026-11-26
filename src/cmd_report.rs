@@ -1115,6 +1115,7 @@ mod tests {
         // The writers, as `main` installs them: the engine's test build installed
         // these for the whole crate while it was this one (wsp-440).
         crate::outputs::install(REPORTS);
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let env = util::isolated(&format!("report-{slug}"));
         // The engine's launches (`cycle::launch`) stand down in its own test
         // build; this crate's tests run it as the binary does, and a launch

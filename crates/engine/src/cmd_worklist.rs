@@ -389,7 +389,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
     // Where it stands (`wsp-263`): `-p`, or nothing stated and the seat that
     // made it remembered, since at `new` there are no members to ask.
     let index = crate::resolve::Index::new(store.projects());
-    let (project, made_in) = match crate::cmd_agent::named_project(args, &index) {
+    let (project, made_in) = match crate::resolve::named_project(args, &index) {
         Some(Ok(p)) => (p, None),
         Some(Err(said)) => {
             eprintln!("{said}");
@@ -2450,7 +2450,7 @@ pub fn member(store: &Store, args: &Args) -> i32 {
 /// not been read yet.
 fn member_started(store: &Store, id: &str) -> Option<String> {
     let t = store.find_task(id)?;
-    let claim = store.claims().get(id).map(crate::cmd_agent::claim_where);
+    let claim = store.claims().get(id).map(crate::claims::claim_where);
     match (t.status(), claim) {
         (crate::model::Status::Todo, None) => None,
         (s, None) => Some(s.as_str().to_string()),
@@ -4491,7 +4491,7 @@ fn front(store: &Store, g: Option<&Group>, members: &[Standing], holds: &BTreeMa
             // after the claim when the work was sitting unlanded (`wsp-142`).
             let why = match s.settlement.settled() {
                 true => s.note(),
-                false => crate::cmd_agent::claim_where(c),
+                false => crate::claims::claim_where(c),
             };
             waiting.push((s.clone(), why));
         } else if let Some(on) = holds.get(&s.id) {
@@ -5666,7 +5666,7 @@ enum SeatOn {
 /// somewhere — this must agree with it or the line would promise a seat that
 /// no hand arrives at.
 fn seat_on(store: &Store, w: &Worklist) -> SeatOn {
-    let slot = crate::cmd_govern::slots(&store.governors()).into_iter().find(|s| s.scope == w.id);
+    let slot = crate::governors::slots(&store.governors()).into_iter().find(|s| s.scope == w.id);
     match slot {
         Some(s) if s.filled() => SeatOn::Held,
         Some(s) if s.elsewhere() => SeatOn::Elsewhere(s.host),
@@ -6110,7 +6110,7 @@ pub fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i32 {
     // release` is refused for a seat, so the honest ending is the whole one, and
     // it is the seat that is told what happened. Not the barrier check: this is
     // usually its turn, and it ends at `review` on a tick (`wsp-209`).
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Held);
+    crate::cycle::end_what_the_run_opened(store, crate::cycle::seats(), &w.id, pos.at, crate::cycle::Closing::Held);
 
     if args.json() {
         println!(
@@ -7116,7 +7116,7 @@ pub fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cycle::Clo
     // be typed on a list with work still open — that is its documented meaning —
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, how);
+    crate::cycle::end_what_the_run_opened(store, crate::cycle::seats(), &w.id, pos.at, how);
     // And the trees of its members that are closed, where their work is on the
     // trunk (`wsp-305`): no barrier will sweep them now. After the run's seats
     // are ended, so a claim that just went does not keep one.
@@ -7561,7 +7561,7 @@ pub fn status(store: &Store, args: &Args) -> i32 {
         // Whatever the run opened goes first, as `done` does, so no agent is
         // left on a row that is about to be somebody else's again.
         if matches!(was, worklist::ListStatus::Executing) {
-            crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Done);
+            crate::cycle::end_what_the_run_opened(store, crate::cycle::seats(), &w.id, pos.at, crate::cycle::Closing::Done);
         }
         let note = match &why {
             Some(why) => format!("put back to todo: {} was cancelled — {why}", w.id),
@@ -7687,7 +7687,7 @@ pub fn edit(store: &Store, args: &Args) -> i32 {
 /// window to respect. The next escalation reads the new one.
 fn rehome(store: &Store, args: &Args, w: Worklist) -> i32 {
     let index = crate::resolve::Index::new(store.projects());
-    let project = match crate::cmd_agent::named_project(args, &index) {
+    let project = match crate::resolve::named_project(args, &index) {
         Some(Ok(p)) => p,
         Some(Err(said)) => {
             eprintln!("{said}");
@@ -10528,6 +10528,8 @@ mod tests {
         assert_eq!(worklist::home_of_scope(&store, "batch").as_deref(), Some("wsp"), "the walk has a home to climb");
         assert!(crate::worklist::seat_above_in(&store, "batch").is_none(), "and nobody seated on it");
 
+        // The walk reaches the asker's own list first.
+        crate::cycle::install_tests::ANSWERS.with(|a| *a.borrow_mut() = Some("batch".into()));
         std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
         let asked = crate::cmd_message::ask(&store, &Args::synth("ask", &["wl-001", "ship it with the panic unexplained?"], &[]));
         std::env::remove_var(crate::base::seat::SEAT_ENV);
@@ -10542,7 +10544,8 @@ mod tests {
         let ids = |v: Vec<message::Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
         assert_eq!(ids(message::raised_to_the_person(&store)), vec![q.id.clone()], "flag --person lists it");
         assert_eq!(ids(crate::cmd_message::yours_in(&store, None)), vec![q.id.clone()], "and so does yours");
-        assert!(crate::wake::scopes_owed(&store).is_empty(), "no spool woken, the asker's least of all");
+        let woken = crate::cycle::install_tests::SAID_TO.with(|s| s.borrow().clone());
+        assert!(woken.is_empty(), "no spool woken, the asker's least of all: {woken:?}");
         assert!(!q.handed_to("batch"));
 
         assert_eq!(ids(message::holding_group(&store, "batch", 1)), vec![q.id.clone()]);
