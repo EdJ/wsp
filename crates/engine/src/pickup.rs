@@ -470,6 +470,34 @@ mod tests {
     }
 
     #[test]
+    fn a_list_of_the_next_increment_is_not_picked_while_the_one_before_stands_at_its_align() {
+        let (_env, store) = setup("align");
+        let mut prod = crate::model::Project::new("compound");
+        prod.kind = "product".into();
+        store.save_project(&prod).unwrap();
+        let init = |rest: &[&str], flags: &[(&str, &str)]| crate::cmd_initiative::initiative(&store, &Args::synth("initiative", rest, flags));
+        assert_eq!(init(&["add", "Plan"], &[("product", "compound")]), 0);
+        planned(&store, "n1", "g-1", "2026-11-05T09:00:00Z");
+        planned(&store, "n2", "g-2", "2026-11-05T09:30:00Z");
+        assert_eq!(init(&["increment", "add", "init-1", "One"], &[("list", "n1")]), 0);
+        assert_eq!(init(&["increment", "add", "init-1", "Two"], &[("list", "n2")]), 0);
+        // n1 has finished: n2 is after nothing that is open, but n stands at its align.
+        let mut n1 = store.worklist("n1").unwrap();
+        n1.status_raw = "done".into();
+        store.save_worklist(&n1).unwrap();
+
+        assert_eq!(tick_on(&store, room(8)), None, "n+1 is held at the align");
+        assert_eq!(word(&store, "n2"), "planned");
+        let listed = worklist::listing(&store, store.worklists());
+        let wait = crate::waits::read_on(&store, &listed, room(8)).into_iter().find(|r| r.id == "n2").unwrap().wait;
+        assert_eq!(wait, Some(Wait::Align("align I1 of init-1".into())));
+        assert_eq!(crate::waits::line(&wait), "waiting on align I1 of init-1");
+
+        assert_eq!(init(&["align", "pass", "init-1", "I1", "good"], &[]), 0);
+        assert_eq!(tick_on(&store, room(8)).as_deref(), Some("n2"), "the pass starts it");
+    }
+
+    #[test]
     fn alone_holds_the_right_list_back_while_another_on_its_project_executes() {
         let (_env, store) = setup("alone");
         let mut p = crate::model::Project::new("proj");

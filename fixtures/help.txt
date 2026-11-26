@@ -13,6 +13,9 @@ PROJECTS
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
                                     | approve <id> "verdict"  | changes <id> "what to change"
+                                    | align show <id> [I<n>] [--json]  the stop list, lists, commits, state
+                                    | align pass <id> I<n> "verdict"|- [--fix-next "note"]  start n+1
+                                    | align back <id> I<n> "note"|-  a change request; n+1 stays held
                                     | run <id> [--json]  the build's feed: group running, rows, spend
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md

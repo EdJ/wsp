@@ -15,7 +15,8 @@
 //!    5-minute averages both over 1.5 times the core count, which holds builds
 //!    back today.
 //! 3. **after** — the list it is `after` is not yet complete (`complete` or
-//!    `closed`).
+//!    `closed`); then **align** — the increment before its own has finished
+//!    but its align has not been passed (`wsp initiative align pass`).
 //! 4. **alone** — a list on the same project is executing. On by default for
 //!    wsp's own source, and `--alone` / `--no-alone` on the list say otherwise.
 //!    An executing list that waits on a person (a manual group, or a question
@@ -87,6 +88,9 @@ pub enum Wait {
     Throttle(crate::throttle::Pause),
     /// The list it is `after` is not complete yet.
     After(String),
+    /// An increment before this list's has not passed its align (`wsp-793`):
+    /// `align I1 of init-3`.
+    Align(String),
     /// A list on the same project is executing, and this one runs alone.
     Alone(String),
     /// Its next group has no `agent:` line.
@@ -103,6 +107,7 @@ impl Wait {
             Wait::Room { short } => format!("room: {short} slots short"),
             Wait::Throttle(hold) => hold.text(),
             Wait::After(other) => format!("after {other}"),
+            Wait::Align(at) => format!("waiting on {at}"),
             Wait::Alone(other) => format!("alone: {other} executing"),
             Wait::Manual => "manual group".into(),
             Wait::Empty => "no groups".into(),
@@ -120,6 +125,9 @@ pub struct Entry {
     pub planned: Option<String>,
     /// Every list this one waits on; it starts when all are complete.
     pub after: Vec<String>,
+    /// The align this list waits on, if its increment is behind one not yet
+    /// passed: `align I1 of init-3`.
+    pub align: Option<String>,
     pub alone: bool,
     /// What `alone` is judged against: the project, or [`OWN_SOURCE`] for
     /// anything under it. `None` for a list with no home, which conflicts with
@@ -191,6 +199,9 @@ fn first_wait(e: &Entry, world: &World, free: Option<usize>) -> Option<Wait> {
     if !open.is_empty() {
         return Some(Wait::After(open.join(", ")));
     }
+    if let Some(at) = &e.align {
+        return Some(Wait::Align(at.clone()));
+    }
     if e.alone {
         if let Some((other, _)) = world
             .executing
@@ -249,6 +260,7 @@ fn entry_of(store: &Store, l: &Listed, seat_cap: Option<usize>) -> Entry {
         prio: Prio::of(w),
         planned: w.planned.clone(),
         after: w.after.clone(),
+        align: crate::cmd_initiative::align_hold(store, &w.id),
         alone: w.alone.unwrap_or(scope.as_deref() == Some(OWN_SOURCE)),
         scope,
         need,
@@ -394,6 +406,7 @@ impl Wait {
             Wait::Room { .. } => "room".into(),
             Wait::Throttle(_) => "throttle".into(),
             Wait::After(other) => format!("after {other}"),
+            Wait::Align(at) => format!("waiting on {at}"),
             Wait::Alone(other) => format!("alone with {other}"),
             Wait::Manual => "manual group".into(),
             Wait::Empty => "no groups".into(),
@@ -420,6 +433,7 @@ mod tests {
             prio: Prio::Normal,
             planned: Some("2026-11-05T10:00:00Z".into()),
             after: Vec::new(),
+            align: None,
             alone: false,
             scope: Some("proj".into()),
             need: 3,

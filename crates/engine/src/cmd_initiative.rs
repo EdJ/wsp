@@ -113,6 +113,9 @@ pub struct Rec {
     pub effect: Option<u32>,
     /// `agent` or `person`.
     pub by: String,
+    /// Criteria only: the checks recorded against it (`--check`), what the
+    /// align reads as `covered`.
+    pub checks: Vec<String>,
 }
 
 pub const CRITERIA_STATUS: [&str; 2] = ["draft", "confirmed"];
@@ -133,11 +136,49 @@ pub struct Increment {
     pub caption: String,
     pub criteria: Vec<String>,
     pub lists: Vec<String>,
+    /// What the person said at the align (`wsp-793`): passed, or sent back.
+    pub aligned: Option<Align>,
 }
 
 impl Increment {
     fn json(&self) -> serde_json::Value {
-        json!({ "id": self.id, "caption": self.caption, "criteria": self.criteria, "lists": self.lists })
+        let mut v = json!({ "id": self.id, "caption": self.caption, "criteria": self.criteria, "lists": self.lists });
+        if let Some(a) = &self.aligned {
+            v["aligned"] = a.json();
+        }
+        v
+    }
+}
+
+/// The person's word at an increment's align, kept on its `## Increments`
+/// line: who, when, the criteria as they stood, the commits the increment's
+/// lists put on the trunk, and the verdict (or, sent back, the note).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Align {
+    /// `passed` or `back`.
+    pub state: String,
+    pub by: String,
+    pub at: String,
+    /// A short hash of the criteria text and their checks when it was said.
+    pub criteria: String,
+    pub commits: Vec<String>,
+    pub text: String,
+}
+
+impl Align {
+    fn json(&self) -> serde_json::Value {
+        json!({ "state": self.state, "by": self.by, "at": self.at, "criteria_version": self.criteria, "commits": self.commits, "text": self.text })
+    }
+    fn from_json(v: &serde_json::Value) -> Option<Align> {
+        let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+        v.is_object().then(|| Align {
+            state: s("state"),
+            by: s("by"),
+            at: s("at"),
+            criteria: s("criteria_version"),
+            commits: v["commits"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+            text: s("text"),
+        })
     }
 }
 
@@ -149,7 +190,11 @@ pub const GATE_ALIGN: &str = "align";
 
 impl Rec {
     fn json(&self) -> serde_json::Value {
-        json!({ "id": self.id, "text": self.text, "source": self.source, "status": self.status, "effect": self.effect, "by": self.by })
+        let mut v = json!({ "id": self.id, "text": self.text, "source": self.source, "status": self.status, "effect": self.effect, "by": self.by });
+        if !self.checks.is_empty() {
+            v["checks"] = json!(self.checks);
+        }
+        v
     }
 }
 
@@ -165,6 +210,7 @@ impl Initiative {
                 status: v["status"].as_str().unwrap_or("").into(),
                 effect: v["effect"].as_u64().map(|n| n as u32),
                 by: v["by"].as_str().unwrap_or("").into(),
+                checks: v["checks"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
             })
             .collect()
     }
@@ -184,6 +230,7 @@ impl Initiative {
                 caption: v["caption"].as_str().unwrap_or("").into(),
                 criteria: strs(&v["criteria"]),
                 lists: strs(&v["lists"]),
+                aligned: Align::from_json(&v["aligned"]),
             })
             .collect()
     }
@@ -299,9 +346,10 @@ pub fn initiative(store: &Store, args: &Args) -> i32 {
         "plan" => plan(store, args),
         "approve" => approve(store, args),
         "changes" => changes(store, args),
+        "align" => align(store, args),
         "run" => crate::initiative_run::run(store, args),
         other => {
-            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan|approve|changes|run)");
+            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan|approve|changes|align|run)");
             2
         }
     }
@@ -329,7 +377,7 @@ fn finish(store: &Store, i: &Initiative, what: &str, args: &Args) -> i32 {
     store.log_event("initiative-changed", json!({ "id": i.id, "what": what }));
     store.git_commit(&format!("wsp: initiative {} {what}", i.id));
     if args.json() {
-        println!("{}", serde_json::to_string_pretty(&i.json()).unwrap_or_default());
+        println!("{}", serde_json::to_string_pretty(&json_with_aligns(store, i)).unwrap_or_default());
     } else {
         println!("{} {what}", i.id);
     }
@@ -404,7 +452,7 @@ fn show(store: &Store, args: &Args) -> i32 {
         Err(c) => return c,
     };
     if args.json() {
-        println!("{}", serde_json::to_string_pretty(&i.json()).unwrap_or_default());
+        println!("{}", serde_json::to_string_pretty(&json_with_aligns(store, &i)).unwrap_or_default());
         return 0;
     }
     let p = Paint::new();
@@ -577,7 +625,7 @@ fn link(store: &Store, args: &Args) -> i32 {
 fn records(store: &Store, args: &Args, criteria: bool) -> i32 {
     let (noun, letter, sec) = if criteria { ("criterion", 'C', CRIT_SEC) } else { ("assume", 'A', ASSUME_SEC) };
     let usage = if criteria {
-        "wsp initiative criterion add <init> \"text\" [--source S] [--status draft|confirmed] | edit <init> C1 [\"text\"] [--source S] [--status …] | rm <init> C1"
+        "wsp initiative criterion add <init> \"text\" [--source S] [--status draft|confirmed] [--check \"…\"]… | edit <init> C1 [\"text\"] [--source S] [--status …] [--check \"…\"]… | rm <init> C1"
     } else {
         "wsp initiative assume add <init> \"text\" [--source S] [--effect N] | edit <init> A1 [\"text\"] [--source S] [--status assumed|accepted|changed] [--effect N] | accept <init> A1 | rm <init> A1"
     };
@@ -646,6 +694,7 @@ fn records(store: &Store, args: &Args, criteria: bool) -> i32 {
                 status: status.unwrap_or_else(|| statuses[0].to_string()),
                 effect,
                 by,
+                checks: args.all("check").into_iter().filter(|c| c != "true" && !c.trim().is_empty()).collect(),
             });
             what = format!("{noun} {id} added");
         }
@@ -688,6 +737,11 @@ fn records(store: &Store, args: &Args, criteria: bool) -> i32 {
                     }
                     if val("by").is_some() {
                         r.by = by;
+                    }
+                    for c in args.all("check").into_iter().filter(|c| c != "true" && !c.trim().is_empty()) {
+                        if !r.checks.contains(&c) {
+                            r.checks.push(c);
+                        }
                     }
                     what = format!("{noun} {rid} edited");
                 }
@@ -749,7 +803,7 @@ fn increment(store: &Store, args: &Args) -> i32 {
             }
             let n = incs.iter().filter_map(|r| r.id.get(1..)?.parse::<u32>().ok()).max().unwrap_or(0);
             let id = format!("I{}", n + 1);
-            incs.push(Increment { id: id.clone(), caption, criteria: criteria.unwrap_or_default(), lists: lists.clone().unwrap_or_default() });
+            incs.push(Increment { id: id.clone(), caption, criteria: criteria.unwrap_or_default(), lists: lists.clone().unwrap_or_default(), ..Increment::default() });
             touched = Some(incs.len() - 1);
             what = format!("increment {id} added");
         }
@@ -931,7 +985,7 @@ pub fn plan_graph(store: &Store, i: &Initiative) -> serde_json::Value {
                     "id": g.id, "ordinal": gi + 1,
                     "caption": crate::caption::of_group(g, &task_caption).text,
                     "kind": g.kind, "agent": g.agent,
-                    "gate": GATE_BARRIER, "increment_end": end,
+                    "gate": if end { GATE_ALIGN } else { GATE_BARRIER }, "increment_end": end,
                     "rows": rows,
                 })
             })
@@ -952,7 +1006,7 @@ pub fn plan_graph(store: &Store, i: &Initiative) -> serde_json::Value {
                 None => json!({ "id": c, "text": null, "status": "missing" }),
             })
             .collect();
-        out_incs.push(json!({ "id": inc.id, "ordinal": k + 1, "caption": inc.caption, "criteria": criteria, "lists": lists }));
+        out_incs.push(json!({ "id": inc.id, "ordinal": k + 1, "caption": inc.caption, "criteria": criteria, "lists": lists, "align": align_json(store, i, inc) }));
     }
     let planned: Vec<&String> = incs.iter().flat_map(|r| &r.lists).collect();
     let unplanned: Vec<_> = i.worklists.iter().filter(|w| !planned.contains(w)).map(|w| list_json(w, false)).collect();
@@ -1128,6 +1182,18 @@ fn mark_change_answered(i: &mut Initiative, n: usize, row: &str) {
     crate::model::set_section_in_order(&mut i.body, "Questions", &text, &ALL_SECTIONS);
 }
 
+/// Store a change request in `## Questions`; its number.
+fn add_change(i: &mut Initiative, text: &str) -> usize {
+    let n = change_requests(i).into_iter().map(|(n, _, _)| n).max().unwrap_or(0) + 1;
+    let mut q = i.section("Questions").unwrap_or_default().trim().to_string();
+    if !q.is_empty() {
+        q.push('\n');
+    }
+    q.push_str(&format!("{CHANGE_MARK}{n}: {text}"));
+    crate::model::set_section_in_order(&mut i.body, "Questions", &q, &ALL_SECTIONS);
+    n
+}
+
 /// `wsp initiative changes <id> "what to change"`: Ask for changes. Stores the
 /// request as a question, leaves the state `planned`, starts nothing.
 fn changes(store: &Store, args: &Args) -> i32 {
@@ -1146,13 +1212,7 @@ fn changes(store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {} is {} — changes are asked of a plan, and only a planned initiative has one waiting", i.id, i.state);
         return 1;
     }
-    let n = change_requests(&i).into_iter().map(|(n, _, _)| n).max().unwrap_or(0) + 1;
-    let mut q = i.section("Questions").unwrap_or_default().trim().to_string();
-    if !q.is_empty() {
-        q.push('\n');
-    }
-    q.push_str(&format!("{CHANGE_MARK}{n}: {text}"));
-    crate::model::set_section_in_order(&mut i.body, "Questions", &q, &ALL_SECTIONS);
+    let n = add_change(&mut i, &text);
     if let Err(e) = save(store, &i) {
         eprintln!("wsp: write failed: {e}");
         return 1;
@@ -1424,6 +1484,392 @@ pub fn decide(store: &Store, needle: &str, text: &str, supersedes: &[String], js
     Some(0)
 }
 
+// ---- the align (wsp-793) ------------------------------------------------
+//
+// When every list of increment n has finished, n stands at its align: its
+// stop list is n's criteria, and the lists of n+1 wait for the person's word.
+// The word is kept on n's `## Increments` line ([`Align`]); whether n is
+// running, standing or has been answered is read, never stored.
+
+/// Where an increment stands at its align.
+pub struct AlignState {
+    /// `running`, `standing`, `passed` or `sent back`.
+    pub word: &'static str,
+    /// When it came to stand there, where that is known.
+    pub since: Option<String>,
+    pub done: usize,
+    pub total: usize,
+}
+
+fn list_complete(store: &Store, id: &str) -> bool {
+    use crate::worklist::ListStatus;
+    store
+        .worklist(id)
+        .and_then(|w| crate::worklist::listing(store, vec![w]).into_iter().next())
+        .is_some_and(|l| matches!(l.phase(store).status, ListStatus::Complete | ListStatus::Closed))
+}
+
+/// The newest dated line in a list's log: when its last thing happened.
+fn last_stamp(store: &Store, id: &str) -> Option<String> {
+    let w = store.worklist(id)?;
+    w.section("Log")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- ").and_then(|r| r.split_once(' ')).map(|(s, _)| s.to_string()))
+        .filter(|s| util::is_stamp(s))
+        .max_by_key(|s| util::epoch_of(s))
+}
+
+pub fn align_state(store: &Store, inc: &Increment) -> AlignState {
+    let total = inc.lists.len();
+    let done = inc.lists.iter().filter(|l| list_complete(store, l)).count();
+    let (word, since) = match &inc.aligned {
+        Some(a) if a.state == "passed" => ("passed", Some(a.at.clone())),
+        _ if done < total => ("running", None),
+        Some(a) => ("sent back", Some(a.at.clone())),
+        None => ("standing", inc.lists.iter().filter_map(|l| last_stamp(store, l)).max_by_key(|s| util::epoch_of(s))),
+    };
+    AlignState { word, since, done, total }
+}
+
+/// The reason a list may not start though everything it is `after` is done:
+/// the align of the increment before its own has not been passed. `None` for
+/// a list in no increment, in the first, or behind a passed align.
+pub fn align_hold(store: &Store, list: &str) -> Option<String> {
+    for i in all(store) {
+        let incs = i.increments();
+        let Some(k) = incs.iter().position(|r| r.lists.iter().any(|l| l == list)) else { continue };
+        let prev = incs[..k].iter().rev().find(|r| !r.lists.is_empty())?;
+        if prev.aligned.as_ref().is_some_and(|a| a.state == "passed") {
+            return None;
+        }
+        return Some(format!("align {} of {}", prev.id, i.id));
+    }
+    None
+}
+
+/// A short stamp of the criteria an increment delivers, text and checks: it
+/// changes when either does, so a record says which criteria it was said on.
+fn criteria_version(i: &Initiative, inc: &Increment) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for r in i.criteria().iter().filter(|r| inc.criteria.contains(&r.id)) {
+        for b in r.json().to_string().bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{:08x}", h & 0xffff_ffff)
+}
+
+/// The commits the increment's lists put on the trunk, in list order.
+fn align_commits(store: &Store, inc: &Increment) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in &inc.lists {
+        let Some(w) = store.worklist(l) else { continue };
+        for g in w.groups() {
+            for c in g.landed.iter().filter_map(|e| e.commit.clone()) {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One increment's align as JSON: its state, its stop list (each criterion
+/// with its checks and `covered`), its lists and commits, and the record.
+pub fn align_json(store: &Store, i: &Initiative, inc: &Increment) -> serde_json::Value {
+    let st = align_state(store, inc);
+    let crit = i.criteria();
+    let criteria: Vec<_> = inc
+        .criteria
+        .iter()
+        .map(|c| match crit.iter().find(|r| &r.id == c) {
+            Some(r) => json!({ "id": r.id, "text": r.text, "status": r.status, "checks": r.checks, "covered": !r.checks.is_empty() }),
+            None => json!({ "id": c, "text": null, "status": "missing", "checks": [], "covered": false }),
+        })
+        .collect();
+    let lists: Vec<_> = inc
+        .lists
+        .iter()
+        .map(|l| json!({ "id": l, "status": store.worklist(l).map(|w| w.status().as_str().to_string()), "complete": list_complete(store, l) }))
+        .collect();
+    json!({
+        "increment": inc.id, "caption": inc.caption,
+        "state": st.word, "since": st.since,
+        "lists": lists, "lists_complete": st.done,
+        "commits": align_commits(store, inc),
+        "criteria": criteria,
+        "criteria_version": criteria_version(i, inc),
+        "record": inc.aligned.as_ref().map(|a| a.json()),
+    })
+}
+
+/// The initiative as JSON with each increment's align state beside it.
+fn json_with_aligns(store: &Store, i: &Initiative) -> serde_json::Value {
+    let mut v = i.json();
+    for (k, inc) in i.increments().iter().enumerate() {
+        v["increments"][k]["align"] = align_json(store, i, inc);
+    }
+    v
+}
+
+fn align_text(a: &serde_json::Value) -> String {
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let mut o = format!("{} · {}", s(&a["increment"]), s(&a["caption"]));
+    o.push_str(&format!("\n  state {}", s(&a["state"])));
+    if let Some(since) = a["since"].as_str() {
+        o.push_str(&format!(" since {since}"));
+    }
+    o.push_str(&format!(" · {} of {} lists complete", a["lists_complete"], a["lists"].as_array().map_or(0, |l| l.len())));
+    o.push_str("\n  stop list (criteria version ");
+    o.push_str(&s(&a["criteria_version"]));
+    o.push(')');
+    for c in a["criteria"].as_array().into_iter().flatten() {
+        let mark = if c["covered"] == json!(true) { "covered" } else { "not covered" };
+        o.push_str(&format!("\n  - {}  {}  [{mark}]", s(&c["id"]), s(&c["text"])));
+        for k in c["checks"].as_array().into_iter().flatten() {
+            o.push_str(&format!("\n      check: {}", s(k)));
+        }
+    }
+    for l in a["lists"].as_array().into_iter().flatten() {
+        o.push_str(&format!("\n  list {}  {}", s(&l["id"]), if l["complete"] == json!(true) { "complete" } else { "not complete" }));
+    }
+    let commits: Vec<String> = a["commits"].as_array().into_iter().flatten().map(s).collect();
+    if !commits.is_empty() {
+        o.push_str(&format!("\n  commits {}", commits.iter().map(|c| c.chars().take(10).collect::<String>()).collect::<Vec<_>>().join(" ")));
+    }
+    if let Some(r) = a["record"].as_object() {
+        let g = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        o.push_str(&format!("\n  {} by {} at {} (criteria {}): {}", if g("state") == "passed" { "passed" } else { "sent back" }, g("by"), g("at"), g("criteria_version"), g("text")));
+    }
+    o.push('\n');
+    o
+}
+
+/// The word typed after the increment, or stdin where it is `-`.
+fn word_from(args: &Args, at: usize) -> Result<String, i32> {
+    let t = args.text(at);
+    let t = if t.trim() == "-" {
+        match util::read_source("-") {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("wsp: cannot read stdin: {e}");
+                return Err(1);
+            }
+        }
+    } else {
+        t
+    };
+    Ok(t.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// `wsp initiative align show <id> [I<n>] [--json] | pass <id> I<n> "verdict"|- [--fix-next "note"] | back <id> I<n> "note"|-`
+fn align(store: &Store, args: &Args) -> i32 {
+    const USAGE: &str = "wsp initiative align show <id> [I<n>] [--json] | pass <id> I<n> \"verdict\"|- [--fix-next \"note\"] | back <id> I<n> \"note\"|-";
+    let (Some(verb), Some(needle)) = (args.rest.get(1).map(|s| s.as_str()), args.rest.get(2)) else {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    };
+    let Some(mut i) = find(store, needle) else {
+        eprintln!("wsp: no initiative `{needle}`");
+        return 1;
+    };
+    if !matches!(verb, "show" | "pass" | "back") {
+        eprintln!("wsp initiative align: unknown `{verb}` — {USAGE}");
+        return 2;
+    }
+    let mut incs = i.increments();
+    let ids = || if incs.is_empty() { "none".to_string() } else { incs.iter().map(|r| r.id.clone()).collect::<Vec<_>>().join(" ") };
+    let want = args.rest.get(3).map(|s| s.to_uppercase());
+    let pos = match (&want, verb) {
+        (Some(w), _) => match incs.iter().position(|r| &r.id == w) {
+            Some(p) => p,
+            None => {
+                eprintln!("wsp: no increment `{w}` on {} — it has {}", i.id, ids());
+                return 1;
+            }
+        },
+        (None, "show") => {
+            // The one standing now: the first not passed, else the last.
+            match incs.iter().position(|r| !r.aligned.as_ref().is_some_and(|a| a.state == "passed")).or(incs.len().checked_sub(1)) {
+                Some(p) => p,
+                None => {
+                    eprintln!("wsp: {} has no increments", i.id);
+                    return 1;
+                }
+            }
+        }
+        (None, _) => {
+            eprintln!("usage: {USAGE}");
+            return 2;
+        }
+    };
+    if verb == "show" {
+        let a = align_json(store, &i, &incs[pos]);
+        if args.json() {
+            println!("{}", serde_json::to_string_pretty(&a).unwrap_or_default());
+        } else {
+            print!("{}  {}", i.id, align_text(&a));
+        }
+        return 0;
+    }
+
+    let text = match word_from(args, 4) {
+        Ok(t) => t,
+        Err(c) => return c,
+    };
+    if text.is_empty() {
+        eprintln!("usage: {USAGE}");
+        return 2;
+    }
+    if let Some(why) = util::terminal_output(&text) {
+        eprintln!("wsp: {why}");
+        return 2;
+    }
+    let st = align_state(store, &incs[pos]);
+    let id = incs[pos].id.clone();
+    if st.word == "passed" {
+        eprintln!("wsp: {id} of {} has passed its align already", i.id);
+        return 1;
+    }
+    if verb == "pass" && st.word == "running" {
+        eprintln!("wsp: {id} of {} is still running ({} of {} lists complete) — an align is passed when every list of it has finished", i.id, st.done, st.total);
+        return 1;
+    }
+    if verb == "back" && st.word == "running" {
+        eprintln!("wsp: {id} of {} is still running ({} of {} lists complete) — it stands at its align when every list has finished", i.id, st.done, st.total);
+        return 1;
+    }
+    let fix = match args.get("fix-next") {
+        Some(f) if verb == "pass" => Some(f).filter(|f| f != "true"),
+        Some(_) => {
+            eprintln!("wsp: --fix-next goes with `pass`");
+            return 2;
+        }
+        None => None,
+    };
+    if args.get("fix-next").is_some_and(|f| f == "true") {
+        eprintln!("wsp: --fix-next takes the note: --fix-next \"…\"");
+        return 2;
+    }
+
+    let record = Align {
+        state: if verb == "pass" { "passed".into() } else { "back".into() },
+        by: crate::cmd_whoami::person(),
+        at: util::now_iso(),
+        criteria: criteria_version(&i, &incs[pos]),
+        commits: align_commits(store, &incs[pos]),
+        text: text.clone(),
+    };
+    incs[pos].aligned = Some(record);
+    let mut filed: Option<String> = None;
+    if verb == "pass" {
+        if let Some(note) = &fix {
+            match file_fix_next(store, &mut i, &mut incs, pos, note) {
+                Ok(row) => filed = Some(row),
+                Err(why) => {
+                    eprintln!("{why}");
+                    return 1;
+                }
+            }
+        }
+        crate::model::append_decision(&mut i.body, &format!("aligned {id}: {text}"), &[]);
+    } else {
+        // The change request is the one `wsp initiative changes` stores; a
+        // build is past the state that verb takes, so it is stored here.
+        let n = add_change(&mut i, &format!("{id} sent back at its align: {text}"));
+        crate::model::append_decision(&mut i.body, &format!("sent {id} back at its align (change #{n}): {text}"), &[]);
+    }
+    i.put_increments(&incs);
+    if let Err(e) = save(store, &i) {
+        eprintln!("wsp: write failed: {e}");
+        return 1;
+    }
+    store.log_event("initiative-align", json!({ "id": i.id, "increment": id, "what": verb, "fix_row": filed }));
+    store.git_commit(&format!("wsp: {} {id} align {} — {}", i.id, if verb == "pass" { "passed" } else { "sent back" }, util::truncate(&text, 60)));
+    let next = incs[pos + 1..].iter().find(|r| !r.lists.is_empty());
+    if args.json() {
+        let a = align_json(store, &i, &incs[pos]);
+        println!("{}", json!({ "initiative": i.id, "increment": id, "state": a["state"], "align": a, "fix_row": filed, "next": next.map(|n| json!({ "id": n.id, "lists": n.lists })) }));
+    } else if verb == "pass" {
+        println!("◆ {}  {id} passed its align{}", i.id, match next {
+            Some(n) => format!(" — {} starts: {}", n.id, n.lists.join(", ")),
+            None => String::new(),
+        });
+        if let Some(row) = &filed {
+            println!("  fix filed as {row}");
+        }
+    } else {
+        println!("◇ {}  {id} sent back — change asked; {} stays held until {id} passes", i.id, next.map(|n| n.id.as_str()).unwrap_or("what follows"));
+    }
+    0
+}
+
+/// File `note` as a row in the first group of the first list of the increment
+/// after `incs[k]`; with none after it, as a one-row list in a new last
+/// increment. The row's id comes back.
+fn file_fix_next(store: &Store, i: &mut Initiative, incs: &mut Vec<Increment>, k: usize, note: &str) -> Result<String, String> {
+    let before = incs.clone();
+    let from = incs[k].id.clone();
+    let next = incs[k + 1..].iter().position(|r| !r.lists.is_empty()).map(|p| k + 1 + p);
+    let home = next.and_then(|n| incs[n].lists.first()).and_then(|l| store.worklist(l)).and_then(|w| w.project).or_else(|| i.projects.first().cloned());
+    let project = home.or_else(|| incs[k].lists.iter().filter_map(|l| store.worklist(l)).find_map(|w| w.project));
+    let id = store.alloc_task_id(project.as_deref()).map_err(|e| format!("wsp: cannot allocate id: {e}"))?;
+    let mut t = crate::model::Task::new(&format!("Fix from {from} align: {}", util::truncate(note, 60)), &id);
+    t.project = project.clone();
+    if project.is_none() {
+        t.status_raw = "inbox".into();
+    }
+    crate::model::set_section_in(&mut t.body, "Overview", &format!("Filed at the {from} align of {}:\n\n{note}", i.id));
+    match next {
+        Some(n) => {
+            let list = incs[n].lists[0].clone();
+            let Some(mut w) = store.worklist(&list) else { return Err(format!("wsp: no worklist `{list}`")) };
+            let mut groups = w.groups();
+            let Some(first) = groups.first_mut() else { return Err(format!("wsp: `{list}` has no group to file the fix in")) };
+            first.members.push(id.clone());
+            store.save_task(&t).map_err(|e| format!("wsp: write failed: {e}"))?;
+            store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title }));
+            w.log(&format!("{id} → group 1 · fix filed at the {from} align of {}", i.id));
+            w.set_groups(&groups);
+            store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+            store.log_event("worklist-edited", json!({ "id": w.id, "what": "add" }));
+        }
+        None => {
+            let mut slug = util::slugify(&format!("{}-fix-{}", i.id, from));
+            let mut n = 1;
+            while store.scope_taken(&slug, None).is_some() {
+                n += 1;
+                slug = util::slugify(&format!("{}-fix-{}-{n}", i.id, from));
+            }
+            let agent = incs[k].lists.iter().rev().filter_map(|l| store.worklist(l)).find_map(|w| w.groups().last().map(|g| (g.agent.clone(), g.kind.clone())));
+            let mut w = crate::model::Worklist::new(&slug, &format!("Fixes from the {from} align of {}", i.id));
+            w.project = project.clone();
+            let (agent, kind) = agent.unwrap_or_default();
+            w.set_groups(&[crate::model::Group { members: vec![id.clone()], agent, kind, ..Default::default() }]);
+            w.log(&format!("{id} → group 1 (new) · fix filed at the {from} align of {}", i.id));
+            if i.state == "building" {
+                w.set_planned();
+            }
+            store.save_task(&t).map_err(|e| format!("wsp: write failed: {e}"))?;
+            store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title }));
+            store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
+            store.log_event("worklist-added", json!({ "id": w.id }));
+            let nid = incs.iter().filter_map(|r| r.id.get(1..)?.parse::<u32>().ok()).max().unwrap_or(0) + 1;
+            incs.push(Increment { id: format!("I{nid}"), caption: format!("Fixes from {from}"), lists: vec![slug.clone()], ..Increment::default() });
+            if !i.worklists.contains(&slug) {
+                i.worklists.push(slug);
+            }
+            sync_after(store, &before, incs)?;
+        }
+    }
+    if !i.tasks.contains(&id) {
+        i.tasks.push(id.clone());
+    }
+    Ok(id)
+}
+
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
     names: &["initiative"],
     run: initiative,
@@ -1438,6 +1884,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
                                     | approve <id> "verdict"  | changes <id> "what to change"
+                                    | align show <id> [I<n>] [--json]  the stop list, lists, commits, state
+                                    | align pass <id> I<n> "verdict"|- [--fix-next "note"]  start n+1
+                                    | align back <id> I<n> "note"|-  a change request; n+1 stays held
                                     | run <id> [--json]  the build's feed: group running, rows, spend
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md
@@ -1619,6 +2068,126 @@ mod tests {
 
     /// `wsp-731`: increments over 2 lists, 5 groups, 2 increments — the verbs'
     /// refusals, the `after` they keep, and the plan graph's JSON shape.
+    /// Two increments of one list each, `n1` and `n2`, and an initiative
+    /// `init-1` with a criterion that has a check; `n1`'s list `done` as asked.
+    fn two_increments(tag: &str, n1_done: bool) -> Store {
+        use crate::model::{Group, Task, Worklist};
+        let store = crate::testkit::store(tag);
+        let mut prod = Project::new("compound");
+        prod.kind = "product".into();
+        store.save_project(&prod).unwrap();
+        assert_eq!(run(&store, &["add", "Plan"], &[("product", "compound")]), 0);
+        assert_eq!(run(&store, &["criterion", "add", "init-1", "it works"], &[("check", "cargo test works")]), 0);
+        assert_eq!(run(&store, &["criterion", "add", "init-1", "it is fast"], &[]), 0);
+        for (l, m) in [("n1", "q-1"), ("n2", "q-2")] {
+            store.save_task(&Task::new(m, m)).unwrap();
+            let mut w = Worklist::new(l, l);
+            w.set_groups(&[Group { members: vec![m.into()], agent: "claude sonnet".into(), ..Group::default() }]);
+            store.save_worklist(&w).unwrap();
+        }
+        assert_eq!(run(&store, &["increment", "add", "init-1", "First"], &[("criteria", "C1,C2"), ("list", "n1")]), 0);
+        assert_eq!(run(&store, &["increment", "add", "init-1", "Second"], &[("list", "n2")]), 0);
+        if n1_done {
+            let mut w = store.worklist("n1").unwrap();
+            w.status_raw = "done".into();
+            store.save_worklist(&w).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn align_show_reads_the_stop_list_the_lists_and_the_state_and_pass_is_refused_while_running() {
+        let store = two_increments("align-show", false);
+        let i = find(&store, "init-1").unwrap();
+        let a = align_json(&store, &i, &i.increments()[0]);
+        assert_eq!(a["state"], json!("running"), "{a}");
+        assert_eq!(a["criteria"][0]["covered"], json!(true), "{a}");
+        assert_eq!(a["criteria"][0]["checks"], json!(["cargo test works"]));
+        assert_eq!(a["criteria"][1]["covered"], json!(false), "{a}");
+        assert_eq!(a["lists"][0]["complete"], json!(false));
+        assert_eq!(align_hold(&store, "n2").as_deref(), Some("align I1 of init-1"));
+        // Refused while n's lists are running, and says so.
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I1", "fine"], &[]), 1);
+        assert_eq!(run(&store, &["align", "back", "init-1", "I1", "no"], &[]), 1);
+        assert!(find(&store, "init-1").unwrap().increments()[0].aligned.is_none());
+        // show: text and --json, with and without the increment named.
+        assert_eq!(run(&store, &["align", "show", "init-1"], &[]), 0);
+        assert_eq!(run(&store, &["align", "show", "init-1", "I2"], &[("json", "true")]), 0);
+        assert_eq!(run(&store, &["align", "show", "init-1", "I9"], &[]), 1);
+        assert_eq!(run(&store, &["align", "show"], &[]), 2);
+        assert_eq!(run(&store, &["align", "bogus", "init-1"], &[]), 2);
+        // initiative show --json and plan show --json carry each increment's state.
+        let v = json_with_aligns(&store, &i);
+        assert_eq!(v["increments"][0]["align"]["state"], json!("running"));
+        assert_eq!(plan_graph(&store, &i)["increments"][1]["align"]["state"], json!("running"));
+        assert_eq!(plan_graph(&store, &i)["increments"][0]["lists"][0]["groups"][0]["gate"], json!(GATE_ALIGN), "the last group of an increment ends at its align");
+    }
+
+    #[test]
+    fn a_standing_align_holds_the_next_increment_and_pass_records_who_when_and_what_and_releases_it() {
+        let store = two_increments("align-pass", true);
+        let i = find(&store, "init-1").unwrap();
+        let st = align_state(&store, &i.increments()[0]);
+        assert_eq!(st.word, "standing");
+        assert_eq!(align_hold(&store, "n2").as_deref(), Some("align I1 of init-1"), "n+1 is held while n stands");
+        assert_eq!(align_hold(&store, "n1"), None, "the first increment waits on no align");
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I1"], &[]), 2, "a verdict is asked for");
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I1", "looks", "right"], &[]), 0);
+        let i = find(&store, "init-1").unwrap();
+        let rec = i.increments()[0].aligned.clone().unwrap();
+        assert_eq!((rec.state.as_str(), rec.text.as_str()), ("passed", "looks right"));
+        assert!(rec.by.starts_with("person") && !rec.at.is_empty() && rec.criteria.len() == 8, "{rec:?}");
+        assert_eq!(align_hold(&store, "n2"), None, "pass releases n+1");
+        assert_eq!(align_state(&store, &i.increments()[0]).word, "passed");
+        assert!(crate::model::decisions_of(&i.body).iter().any(|d| d.text.contains("aligned I1: looks right")));
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I1", "again"], &[]), 1, "passed once");
+        // The wait the queue tells.
+        assert_eq!(crate::waits::Wait::Align("align I1 of init-1".into()).text(), "waiting on align I1 of init-1");
+    }
+
+    #[test]
+    fn back_stores_a_change_request_and_keeps_the_next_increment_held_until_it_passes() {
+        let store = two_increments("align-back", true);
+        assert_eq!(run(&store, &["align", "back", "init-1", "I1", "C2", "is", "not", "met"], &[]), 0);
+        let i = find(&store, "init-1").unwrap();
+        assert_eq!(align_state(&store, &i.increments()[0]).word, "sent back");
+        let ch = change_requests(&i);
+        assert_eq!(ch.len(), 1);
+        assert!(ch[0].2.contains("C2 is not met") && ch[0].2.contains("I1"), "{ch:?}");
+        assert_eq!(align_hold(&store, "n2").as_deref(), Some("align I1 of init-1"), "n+1 stays held");
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I1", "--", "fixed"], &[]), 0, "a sent-back align can be passed once the lists have finished");
+        assert_eq!(align_hold(&store, "n2"), None);
+    }
+
+    #[test]
+    fn fix_next_files_a_row_in_the_next_increments_first_group_or_a_new_last_increment() {
+        let store = two_increments("align-fix", true);
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I1", "ok"], &[("fix-next", "tighten the C2 check")]), 0);
+        let w = store.worklist("n2").unwrap();
+        let first = &w.groups()[0];
+        assert_eq!(first.members.len(), 2, "{:?}", first.members);
+        let row = first.members.last().unwrap();
+        let t = store.task(row).unwrap();
+        assert!(t.title.contains("tighten the C2 check"), "{}", t.title);
+        assert!(find(&store, "init-1").unwrap().tasks.contains(row));
+        // The last increment: a new one with a one-row list.
+        let mut n2 = store.worklist("n2").unwrap();
+        n2.status_raw = "done".into();
+        store.save_worklist(&n2).unwrap();
+        assert_eq!(run(&store, &["align", "pass", "init-1", "I2", "ok"], &[("fix-next", "one more thing")]), 0);
+        let i = find(&store, "init-1").unwrap();
+        let incs = i.increments();
+        assert_eq!(incs.len(), 3, "{incs:?}");
+        assert_eq!(incs[2].lists.len(), 1);
+        let nl = store.worklist(&incs[2].lists[0]).unwrap();
+        assert_eq!(nl.groups().len(), 1);
+        assert_eq!(nl.groups()[0].members.len(), 1);
+        assert_eq!(nl.groups()[0].agent, "claude sonnet");
+        assert_eq!(nl.after, ["n2"], "the new increment waits on the one before it");
+        assert_eq!(align_hold(&store, &incs[2].lists[0]), None, "I2 passed, so the list filed behind it is not held by it");
+        assert_eq!(run(&store, &["align", "back", "init-1", "I1", "x"], &[("fix-next", "no")]), 1, "--fix-next goes with pass");
+    }
+
     #[test]
     fn increments_order_their_lists_and_plan_show_is_one_graph() {
         use crate::model::{Group, Task, Worklist};
