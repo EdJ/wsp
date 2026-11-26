@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
-use wsp_client::{hub_login_in, Client, Credential, HubLogin, Silent, HUBS_FILE, HUB_CA_ENV};
+use crate::hub_client::{self, hub_login_in, Client, Credential, HubLogin, Silent, HUBS_FILE, HUB_CA_ENV};
 use wsp_store_contract::Principal;
 
 use wsp_engine::base::args::Args;
@@ -57,7 +57,7 @@ pub struct LoggedIn {
 
 /// The home directory the login file is under: `$HOME`, which is a path or nothing.
 fn home() -> Result<PathBuf, String> {
-    match wsp_client::hub_home().filter(|h| !h.as_os_str().is_empty()) {
+    match hub_client::hub_home().filter(|h| !h.as_os_str().is_empty()) {
         Some(h) => Ok(h),
         None => Err("HOME is not set, so there is no ~/.config/wsp/hubs.json to write".into()),
     }
@@ -537,7 +537,7 @@ mod tests {
                 let root = Principal::Person("root".into());
                 apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
                 for user in users {
-                    let (secret, hash) = wsp_machines::token::mint();
+                    let (secret, hash) = hub_client::token::mint();
                     apply(Cmd::HubUserAdd { name: UserName(user.to_string()), admin: false }, &root);
                     apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.to_string()), hash }, &root);
                     tokens.insert(user.to_string(), secret);
@@ -601,9 +601,9 @@ mod tests {
         assert!(doc["at"].as_str().is_some_and(|a| a.ends_with('Z')), "{doc}");
 
         // The client's own reading of the file is what it dials with.
-        assert_eq!(wsp_client::Credential::for_hub_in(None, &home), Ok(wsp_client::Credential::User(hub.tokens["ann"].clone())));
-        assert_eq!(wsp_client::hub_url_in(None, &home).unwrap(), hub.url);
-        assert_eq!(wsp_client::hub_ca_in(None, &home).unwrap(), Some(hub.pki.ca.clone()));
+        assert_eq!(Credential::for_hub_in(None, &home), Ok(Credential::User(hub.tokens["ann"].clone())));
+        assert_eq!(hub_client::hub_url_in(None, &home).unwrap(), hub.url);
+        assert_eq!(hub_client::hub_ca_in(None, &home).unwrap(), Some(hub.pki.ca.clone()));
 
         // A second login replaces the first, and says what it replaced; a wrong one leaves the first.
         assert!(log_in(&home, &hub.url, "nope", Some(&hub.pki.ca)).is_err());
@@ -617,7 +617,7 @@ mod tests {
         // Logout removes it and the client is no longer logged in.
         assert!(log_out(&home).unwrap().is_some());
         assert!(!path.exists());
-        assert!(matches!(wsp_client::Credential::for_hub_in(None, &home), Err(Silent::NotLoggedIn(_))));
+        assert!(matches!(Credential::for_hub_in(None, &home), Err(Silent::NotLoggedIn(_))));
     }
 
     #[test]

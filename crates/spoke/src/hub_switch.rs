@@ -249,11 +249,11 @@ fn held_leases(store: &Store) -> Vec<String> {
 /// Releases every row lease a claim here holds (the claim keeps its binding and
 /// loses its token) and every drive lease. A lease the hub says is gone already
 /// counts as given back.
-fn release_all(store: &Store, client: &mut wsp_client::Client, out: &mut Disabled) {
+fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut Disabled) {
     for (row, claim) in store.claims() {
         let Some(token) = hub_lease::token_of(&claim) else { continue };
         match client.lease_release(&RowId(row.clone()), token) {
-            Ok(()) | Err(wsp_client::Error::Refused(_)) => {
+            Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
                 strip_token(store, &row, token);
                 hub_journal::Leased::forget(store, &row);
                 out.released.push(row);
@@ -264,7 +264,7 @@ fn release_all(store: &Store, client: &mut wsp_client::Client, out: &mut Disable
     for (list, d) in hub_lease::Book::read(store).drives {
         let row = hub_lease::drive_row(&list);
         match client.lease_release(&RowId(row.clone()), d.token) {
-            Ok(()) | Err(wsp_client::Error::Refused(_)) => {
+            Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
                 hub_lease::Book::edit(store, |b| {
                     if b.drives.get(&list).is_some_and(|x| x.token == d.token) {
                         b.drives.remove(&list);
@@ -433,8 +433,8 @@ mod tests {
 
     impl HubHome {
         fn at(home: &Path) -> HubHome {
-            let was = std::env::var_os(wsp_client::HUB_HOME_ENV);
-            std::env::set_var(wsp_client::HUB_HOME_ENV, home);
+            let was = std::env::var_os(crate::hub_client::HUB_HOME_ENV);
+            std::env::set_var(crate::hub_client::HUB_HOME_ENV, home);
             HubHome(was)
         }
     }
@@ -442,8 +442,8 @@ mod tests {
     impl Drop for HubHome {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(h) => std::env::set_var(wsp_client::HUB_HOME_ENV, h),
-                None => std::env::remove_var(wsp_client::HUB_HOME_ENV),
+                Some(h) => std::env::set_var(crate::hub_client::HUB_HOME_ENV, h),
+                None => std::env::remove_var(crate::hub_client::HUB_HOME_ENV),
             }
         }
     }
@@ -543,7 +543,7 @@ mod tests {
         let lines = status_lines(&r.store).join("\n");
         assert!(lines.contains("disabled") && lines.contains("s-1 (was doing)"), "{lines}");
         // The login is kept.
-        assert!(r.home.join(wsp_client::HUBS_FILE).exists());
+        assert!(r.home.join(crate::hub_client::HUBS_FILE).exists());
         r.running.stop();
     }
 
@@ -614,7 +614,7 @@ mod tests {
         let r = rig("logout");
         let args = Args::synth("logout", &[], &[]);
         assert_eq!(crate::cmd_login::logout(&r.store, &args), 0);
-        assert!(!r.home.join(wsp_client::HUBS_FILE).exists(), "the login is gone");
+        assert!(!r.home.join(crate::hub_client::HUBS_FILE).exists(), "the login is gone");
         assert!(off(&r.store));
         assert_eq!(status(&r.store, "s-1"), Status::Parked);
         assert_eq!(status(&r.store, "p-1"), Status::Doing);

@@ -59,10 +59,10 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
-use wsp_api::{Blob, Code, Move, RefMove};
-use wsp_client::{Client, Error as HubError};
-use wsp_objects::WorkspaceId as HubWorkspace;
-use wsp_store_contract::{At, EventKind, Principal, Refusal, RowId, Token};
+use crate::hub_client::{self, Client, Error as HubError};
+use wsp_hub_protocol::{Blob, Code, Move, RefMove, FENCE_TOKEN};
+use wsp_objects::{Object, ObjectId, WorkspaceId as HubWorkspace};
+use wsp_store_contract::{At, EventKind, LeaseName, Principal, Refusal, RowId, Subject, Token};
 
 use wsp_engine::store::Store;
 use wsp_engine::util;
@@ -116,11 +116,11 @@ pub fn take(client: &mut Client, workspace: &str, row: &str) -> Result<Held, Str
 /// Whether this machine is logged in to a hub (the login file or the env).
 fn logged_in(home: &Path) -> bool {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home).is_ok()
+    hub_client::hub_url_in(env(hub_client::HUB_URL_ENV), home).is_ok()
 }
 
 fn home() -> Option<std::path::PathBuf> {
-    wsp_client::hub_home()
+    hub_client::hub_home()
 }
 
 /// The lease a claim on `row` needs, taken before anything is written: `None`
@@ -260,11 +260,11 @@ pub fn push_verdict(
     token: Token,
 ) -> Result<(), PushError> {
     let (wid, id) = (HubWorkspace(workspace.to_string()), RowId(row.to_string()));
-    let subject = wsp_api::fence_subject(&id);
+    let subject = fence_subject(&id);
     for _ in 0..3 {
         let from = client.sync_heads(&wid).map_err(failed)?.get(&subject).copied();
         let at = At((util::epoch_secs().max(0) as u64) * 1000);
-        let object = wsp_api::fenced_event(wid.clone(), &id, kind, payload.clone(), token, from, client.by().clone(), at);
+        let object = fenced_event(wid.clone(), &id, kind, payload.clone(), token, from, client.by().clone(), at);
         let (to, bytes) = wsp_objects::encode(&object);
         client.sync_put(vec![Blob { id: to, bytes }]).map_err(failed)?;
         match client.refs_move(RefMove { workspace: wid.clone(), subject: subject.clone(), from, to }).map_err(failed)? {
@@ -273,6 +273,36 @@ pub fn push_verdict(
         }
     }
     Err(PushError::Failed(format!("{row}: the hub's head kept moving")))
+}
+
+/// The subject a row's verdicts and landings are chained on: the row's lease.
+/// (The hub holds a verdict or a landing to the row's current lease token.)
+pub fn fence_subject(row: &RowId) -> Subject {
+    Subject::Lease(LeaseName(format!("row:{}", row.0)))
+}
+
+/// A verdict (`row.reviewed`) or a landing (`row.landed`) of `row` as an
+/// object under the lease `token`: `payload`'s fields (the verdict, the commit
+/// on the remote) with the token added. `parent` is the head of
+/// [`fence_subject`] the writer saw.
+#[allow(clippy::too_many_arguments)]
+pub fn fenced_event(
+    workspace: HubWorkspace,
+    row: &RowId,
+    kind: EventKind,
+    payload: Value,
+    token: Token,
+    parent: Option<ObjectId>,
+    by: Principal,
+    at: At,
+) -> Object {
+    let mut payload = match payload {
+        Value::Object(o) => Value::Object(o),
+        Value::Null => json!({}),
+        other => json!({ "value": other }),
+    };
+    payload[FENCE_TOKEN] = json!(token.0);
+    Object::Event { workspace, subject: fence_subject(row), kind, payload, parent, by, at }
 }
 
 /// What a pass of [`push_all`] did.
@@ -740,8 +770,7 @@ pub mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
-    use wsp_api::ApiToken;
-    use wsp_client::{Client, Item};
+    use crate::hub_client::{Client, Credential, Item};
     use wsp_hub::{Config, Hub};
     use wsp_store_contract::{
         At, Command as Cmd, Entity, EventKind, IdempotencyKey, ProjectId, Row, RowState, SharedName, TokenId, UserName,
@@ -774,7 +803,7 @@ pub mod tests {
             for user in users.iter().copied() {
                 apply(Cmd::HubUserAdd { name: UserName(user.into()), admin: false }, &root);
                 apply(Cmd::HubMemberSet { workspace: SharedName("team".into()), user: UserName(user.into()), member: true }, &root);
-                let (secret, hash) = wsp_machines::token::mint();
+                let (secret, hash) = crate::hub_client::token::mint();
                 apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.into()), hash }, &root);
                 tokens.insert(user.to_string(), secret);
             }
@@ -792,7 +821,8 @@ pub mod tests {
     }
 
     pub fn dial(running: &wsp_hub::serve::Running, tokens: &BTreeMap<String, String>, who: &str) -> Client {
-        Client::dial_at(vec![running.addrs()[0].to_string()], ApiToken(tokens[who].clone()), person(who), WAIT).expect("the hub answers")
+        let url = format!("tcp://{}", running.addrs()[0]);
+        Client::dial_hub(&url, Credential::User(tokens[who].clone()), WAIT).expect("the hub answers")
     }
 
     fn shared_row(store: &Store, id: &str) {
@@ -907,7 +937,7 @@ pub mod tests {
             t.log(&line);
             store.save_task(&t).unwrap();
         };
-        let subject = wsp_api::fence_subject(&RowId("wsp-1".into()));
+        let subject = super::fence_subject(&RowId("wsp-1".into()));
         let head = |c: &mut Client| c.sync_heads(&HubWorkspace("shared:team".into())).unwrap().get(&subject).copied();
         let body_of = |c: &mut Client, id| {
             let blob = c.sync_get(vec![id]).unwrap().remove(0);
@@ -980,7 +1010,7 @@ pub mod tests {
         let first = push_all(&store, &mut ann).sent;
         assert!(first >= 1, "the hold went to the hub");
         assert_eq!(push_all(&store, &mut ann).sent, 0, "once");
-        let subject = wsp_api::fence_subject(&RowId("wsp-1".into()));
+        let subject = super::fence_subject(&RowId("wsp-1".into()));
         let head = ann.sync_heads(&HubWorkspace("shared:team".into())).unwrap().get(&subject).copied().expect("a head");
         let mut at = Some(head);
         let mut verdicts = Vec::new();
@@ -1243,7 +1273,7 @@ pub mod tests {
         let mut c = dial(&running, &tokens, "ann");
         let heads = c.sync_heads(&HubWorkspace("shared:team".into())).unwrap();
         for (row, l) in [("wsp-1", &a), ("wsp-2", &b)] {
-            let id = *heads.get(&wsp_api::fence_subject(&RowId(row.into()))).unwrap_or_else(|| panic!("{row}: no landing on the hub"));
+            let id = *heads.get(&super::fence_subject(&RowId(row.into()))).unwrap_or_else(|| panic!("{row}: no landing on the hub"));
             let blob = c.sync_get(vec![id]).unwrap().remove(0);
             match wsp_objects::decode(&blob.bytes).unwrap() {
                 wsp_objects::Object::Event { kind, payload, .. } => {
@@ -1274,7 +1304,7 @@ pub mod tests {
     #[test]
     fn hub_lease_a_row_allocated_to_another_user_is_forbidden() {
         use wsp_objects::{encode, Object};
-        use wsp_api::{Blob, RefMove};
+        use wsp_hub_protocol::{Blob, RefMove};
         use wsp_store_contract::{Principal as P, Subject};
         let _env = wsp_engine::util::isolated("hub-lease-for");
         let dir = std::env::temp_dir().join(format!("wsp-466-for-{}", std::process::id()));

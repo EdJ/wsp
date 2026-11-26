@@ -10,6 +10,7 @@ pub mod cmd_publish;
 // After a `stale` (wsp-176): the merge, and the push and stale glue; called by the sync worker (wsp-464, wsp-469).
 #[allow(dead_code)]
 pub mod hub_cache;
+pub mod hub_client;
 pub mod hub_journal;
 pub mod hub_lease;
 pub mod hub_switch;

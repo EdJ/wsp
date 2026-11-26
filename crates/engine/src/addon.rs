@@ -18,9 +18,10 @@
 //! `outputs::install`), the add-on is installed once by `main`, before any
 //! verb runs ([`install`]); [`get`] hands back the installed one, or the
 //! standalone default. The types that cross ([`Held`], [`Drives`], [`Member`],
-//! [`Elsewhere`], [`Lent`], [`Hand`]) are plain data with no logic, so the
-//! add-on can live in a crate of its own that depends on this one and not the
-//! other way round.
+//! [`Elsewhere`], [`Outgoing`], [`Incoming`], [`Lent`], [`Hand`]) are plain data
+//! with no logic, and none is a type of the hub's wire, so the add-on can live
+//! in a crate of its own that depends on this one and not the other way round,
+//! and speak to its hub in whatever types it likes.
 //!
 //! A test that needs an add-on saying something in particular installs one on
 //! its own thread for as long as a guard lives ([`scoped`]): tests run in
@@ -77,6 +78,34 @@ pub struct Elsewhere {
     pub rows: BTreeSet<String>,
     /// List -> the user it was last read as driven by.
     pub lists: BTreeMap<String, String>,
+}
+
+/// A message leaving this machine for another user's: the address it is for
+/// (`to`), who sends it (`from`, an address or `wsp`), the sending seat's pane
+/// when a seat sends it, the words, and the id of the message it replies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    pub to: String,
+    pub from: String,
+    pub seat: Option<String>,
+    pub text: String,
+    pub re: Option<String>,
+}
+
+/// A message another user's machine sent here, as the add-on hands it to
+/// `cmd_message::receive`: its id (the add-on's, which a reply names), the
+/// address it is for, the user it was routed to (this machine's), the sending
+/// user, the sender's address and seat, the words, and what it replies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incoming {
+    pub id: String,
+    pub to: String,
+    pub user: String,
+    pub from_user: String,
+    pub from: String,
+    pub seat: Option<String>,
+    pub text: String,
+    pub re: Option<String>,
 }
 
 /// How a message from another machine is handed to a seat here: to `seat`, the
@@ -206,7 +235,7 @@ pub trait SharedWork: Send + Sync {
 
     /// Send a message to another machine: the id it was given and the user it
     /// was routed to, or why not.
-    fn send(&self, _store: &Store, _msg: wsp_api::MsgSend) -> Result<(String, String), String> {
+    fn send(&self, _store: &Store, _msg: Outgoing) -> Result<(String, String), String> {
         Err("this wsp has no hub to carry a message off this machine".into())
     }
 
@@ -317,7 +346,7 @@ mod tests {
         assert_eq!(s.before_claim(&store, "t-1"), Ok(None));
         assert!(!s.leased(&serde_json::json!({ "hub_token": 3 })));
         assert!(matches!(s.lease_member(&store, "t-1"), Member::Free));
-        assert!(s.send(&store, wsp_api::MsgSend { to: "primary:ed".into(), from: "wsp".into(), seat: None, text: "hi".into(), re: None }).is_err());
+        assert!(s.send(&store, Outgoing { to: "primary:ed".into(), from: "wsp".into(), seat: None, text: "hi".into(), re: None }).is_err());
         assert!(s.may_file_shared(&store).is_err());
         assert_eq!(s.user(), None);
         assert_eq!(s.whoami(), None);

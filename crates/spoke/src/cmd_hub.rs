@@ -15,21 +15,19 @@
 //! not the hub's admin verbs: any logged-in user runs them, on their own wsp.
 //!
 //! Each is one or two identity commands sent to the hub over the API as the
-//! user the login names ([`wsp_client::Client::dial_hub_ca`]); the hub's
+//! user the login names ([`crate::hub_client::Client::dial_hub_ca`]); the hub's
 //! identity machine decides them, so a user who is no admin is `forbidden`.
-//! The token is minted here ([`wsp_machines::token::mint`] through the
-//! machines crate's own `token`) and only its hash is sent: it is printed once
+//! The token is minted here ([`crate::hub_client::token::mint`]) and only
+//! its hash is sent: it is printed once
 //! to stdout and is in no log, no command, no event and no file. `wsp hub`
 //! needs no local store.
 
 use std::time::Duration;
 
 use serde_json::json;
-use wsp_api::{Answer, Code, Outcome};
-use wsp_client::{Client, Credential, Error};
-use wsp_store_contract::{
-    Command, IdentityState, Refusal, SharedName, State, TokenId, UserName,
-};
+use crate::hub_client::{self, token, Client, Credential, Error};
+use wsp_hub_protocol::{Answer, Call, Code, IdentityCommand as Command, NoArgs, Outcome, Verb};
+use wsp_store_contract::{IdentityState, Refusal, SharedName, State, TokenId, UserName};
 
 use wsp_engine::base::args::Args;
 use wsp_engine::store::Store;
@@ -45,9 +43,9 @@ pub struct Done {
 }
 
 fn dial() -> Result<Client, String> {
-    let url = wsp_client::hub_url().map_err(|e| e.to_string())?;
+    let url = hub_client::hub_url().map_err(|e| e.to_string())?;
     let credential = Credential::for_hub().map_err(|e| e.to_string())?;
-    let ca = wsp_client::hub_ca().map_err(|e| e.to_string())?;
+    let ca = hub_client::hub_ca().map_err(|e| e.to_string())?;
     Client::dial_hub_ca(&url, credential, ca.as_deref(), WAIT).map_err(|e| e.to_string())
 }
 
@@ -56,7 +54,7 @@ fn dial() -> Result<Client, String> {
 fn say(e: Error) -> String {
     match e {
         Error::Refused(Refusal::Forbidden { by }) => {
-            format!("forbidden: {} is not an admin of this hub", wsp_api::principal::text(&by))
+            format!("forbidden: {} is not an admin of this hub", wsp_hub_protocol::principal::text(&by))
         }
         Error::Refused(r) => format!("the hub refused it: {r:?}"),
         Error::Failed(f) if f.code == Code::Forbidden => format!("forbidden: {}", f.text),
@@ -70,7 +68,7 @@ fn send(client: &mut Client, cmd: Command) -> Result<(), String> {
 
 /// The hub's whole state: `wip` leaves out the users and token records.
 fn state(client: &mut Client) -> Result<State, String> {
-    match client.request("state", json!({})).map_err(say)?.outcome {
+    match client.request(Call::Verb(Verb::State(NoArgs {}))).map_err(say)?.outcome {
         Outcome::Ok(Answer::State { state, .. }) => Ok(state),
         Outcome::Ok(other) => Err(format!("the hub answered state with {other:?}")),
         Outcome::Err(f) => Err(format!("the hub refused state: {}", f.text)),
@@ -84,7 +82,7 @@ fn fresh_id(user: &str) -> TokenId {
 
 /// Issues `user` a token: minted here, its hash sent, the token returned.
 fn issue(client: &mut Client, user: &str) -> Result<String, String> {
-    let (secret, hash) = wsp_machines::token::mint();
+    let (secret, hash) = token::mint();
     send(client, Command::HubTokenIssue { id: fresh_id(user), user: UserName(user.to_string()), hash })?;
     Ok(secret)
 }
@@ -199,7 +197,7 @@ pub fn run(_store: &Store, args: &Args) -> i32 {
     };
     match run_words(&mut client, &words, args.has("admin")) {
         Ok(done) => {
-            println!("{}", render(&done, args.has("json"), wsp_client::hub_url().ok().as_deref()));
+            println!("{}", render(&done, args.has("json"), hub_client::hub_url().ok().as_deref()));
             0
         }
         Err(why) => {
@@ -211,7 +209,7 @@ pub fn run(_store: &Store, args: &Args) -> i32 {
 
 /// `wsp hub disable` / `wsp hub enable`: the switch, under the login there is.
 pub fn switch(store: &Store, args: &Args, word: &str) -> i32 {
-    let Some(home) = wsp_client::hub_home().filter(|h| wsp_client::hub_login_in(h).ok().flatten().is_some()) else {
+    let Some(home) = hub_client::hub_home().filter(|h| hub_client::hub_login_in(h).ok().flatten().is_some()) else {
         eprintln!("wsp: hub {word}: not logged in to a hub, so there is nothing to switch (`wsp login <hub-url>`)");
         return 1;
     };
@@ -363,7 +361,7 @@ mod tests {
         let ls = run_words(&mut root, &["user", "ls"], false).unwrap().lines.join("\n");
         assert!(ls.contains("root") && ls.contains("admin"), "{ls}");
         assert!(ls.lines().any(|l| l.starts_with("ed") && l.contains("user") && l.contains("1 token")), "{ls}");
-        assert!(!ls.contains(&ed) && !ls.contains(&wsp_machines::token::hash(&ed)), "no token or hash is listed: {ls}");
+        assert!(!ls.contains(&ed) && !ls.contains(&token::hash(&ed)), "no token or hash is listed: {ls}");
 
         // The new user's token logs in; it is no admin, so adding a user is forbidden.
         let mut as_ed = hub.dial(&ed).expect("the new user's token logs in");

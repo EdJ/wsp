@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
-use wsp_client::Client;
+use crate::hub_client::Client;
 use wsp_objects::{Object, ObjectId, Refs};
 use wsp_store_contract::{Entity, Principal, Row, RowId, Subject};
 

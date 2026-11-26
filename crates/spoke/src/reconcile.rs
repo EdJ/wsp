@@ -588,7 +588,7 @@ mod tests {
         let id2 = wsp_objects::encode(&theirs).0;
         let objects: BTreeMap<ObjectId, Object> = [(id1, first), (id2, theirs)].into();
 
-        let stale = wsp_client::Stale { subject: Subject::Row(RowId("wsp-950".into())), from: Some(id1), head: Some(id2) };
+        let stale = crate::hub_client::Stale { subject: Subject::Row(RowId("wsp-950".into())), from: Some(id1), head: Some(id2) };
         let got = crate::hub_sync::after_stale(&store, &stale, &objects, &NoLease, &ann).unwrap();
         assert!(matches!(&got, Applied::Reconciled(s) if s.contains("status")), "{got:?}");
 

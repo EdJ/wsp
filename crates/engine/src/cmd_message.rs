@@ -2727,7 +2727,7 @@ fn note_received(store: &Store, id: &str, record: serde_json::Value) -> std::io:
 
 /// Who a message from another user's spoke is from, as the receiving seat reads
 /// it: the sender's address named with its user (`seat:wsp-9@ed`).
-pub fn hub_speaker(m: &wsp_api::HubMessage) -> String {
+pub fn hub_speaker(m: &crate::addon::Incoming) -> String {
     format!("{}@{}", m.from.trim(), m.from_user)
 }
 
@@ -2735,7 +2735,7 @@ pub fn hub_speaker(m: &wsp_api::HubMessage) -> String {
 /// that names a post, else the sender's user's primary (a shell, a bare pane).
 /// The hub routes the reply by its `--re` either way; this is what the sender's
 /// spoke resolves it to.
-pub fn reply_address(m: &wsp_api::HubMessage) -> String {
+pub fn reply_address(m: &crate::addon::Incoming) -> String {
     match crate::address::parse(&m.from) {
         Some(crate::address::Address::Primary) | Some(crate::address::Address::List(_)) | None => {
             crate::governors::primary_of(&m.from_user)
@@ -2746,14 +2746,14 @@ pub fn reply_address(m: &wsp_api::HubMessage) -> String {
 
 /// `m` as the seat reads it: who says it, the words, and the reply footer
 /// naming the address and the hub's id.
-pub fn hub_dressed(m: &wsp_api::HubMessage) -> String {
+pub fn hub_dressed(m: &crate::addon::Incoming) -> String {
     let who = hub_speaker(m);
     format!("{who} says: {} [from {who} · reply: wsp tell {} --re {} -]", m.text.trim_end(), reply_address(m), m.id)
 }
 
 /// The principal a delivered message is from: the sending seat named with its
 /// user, or the user for a message sent from a shell.
-pub fn hub_sender(m: &wsp_api::HubMessage) -> wsp_store_contract::Principal {
+pub fn hub_sender(m: &crate::addon::Incoming) -> wsp_store_contract::Principal {
     match m.seat.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(pane) => wsp_store_contract::Principal::Seat(wsp_store_contract::SeatId(format!("{pane}@{}", m.from_user))),
         None => wsp_store_contract::Principal::Person(m.from_user.clone()),
@@ -2764,7 +2764,7 @@ pub fn hub_sender(m: &wsp_api::HubMessage) -> wsp_store_contract::Principal {
 /// through `hand`. `Ok(true)` when told now, `Ok(false)` when it was told
 /// before (so it is only acknowledged), `Err` when no one seat here answers to
 /// its address now (the hub keeps it queued).
-pub fn receive(store: &Store, m: &wsp_api::HubMessage, hand: &crate::addon::Hand) -> Result<bool, String> {
+pub fn receive(store: &Store, m: &crate::addon::Incoming, hand: &crate::addon::Hand) -> Result<bool, String> {
     if received(store, &m.id).is_some() {
         return Ok(false);
     }
@@ -2822,9 +2822,9 @@ pub fn off_machine(
     re: Option<&str>,
     from: &str,
     seat: Option<String>,
-) -> Option<wsp_api::MsgSend> {
+) -> Option<crate::addon::Outgoing> {
     let to = hub_bound(book, needle, re, &|id| received(store, id).is_some())?;
-    Some(wsp_api::MsgSend { to, from: from.to_string(), seat, text: text.to_string(), re: re.map(str::to_string) })
+    Some(crate::addon::Outgoing { to, from: from.to_string(), seat, text: text.to_string(), re: re.map(str::to_string) })
 }
 
 /// `wsp tell <address>` through the shared-work add-on, when the address is

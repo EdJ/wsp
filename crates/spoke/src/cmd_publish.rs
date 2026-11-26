@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use wsp_client::{Client, Credential, Error as HubError};
+use crate::hub_client::{self, Client, Credential, Error as HubError};
 use wsp_objects::WorkspaceId as HubWorkspace;
 
 use wsp_engine::base::args::Args;
@@ -174,9 +174,9 @@ fn say(e: HubError) -> String {
 pub fn dial(home: &Path) -> Result<Client, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let not_in = |why: String| format!("not logged in to a hub ({why}): `wsp login <hub-url>` first");
-    let url = wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home).map_err(|e| not_in(e.to_string()))?;
-    let cred = Credential::for_hub_in(env(wsp_client::HUB_TOKEN_ENV), home).map_err(|e| not_in(e.to_string()))?;
-    let ca = wsp_client::hub_ca_in(env(wsp_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
+    let url = hub_client::hub_url_in(env(hub_client::HUB_URL_ENV), home).map_err(|e| not_in(e.to_string()))?;
+    let cred = Credential::for_hub_in(env(hub_client::HUB_TOKEN_ENV), home).map_err(|e| not_in(e.to_string()))?;
+    let ca = hub_client::hub_ca_in(env(hub_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
     Client::dial_hub_ca(&url, cred, ca.as_deref(), WAIT).map_err(|e| format!("the hub did not answer: {e}"))
 }
 
@@ -258,7 +258,7 @@ pub fn run(store: &Store, args: &Args) -> i32 {
             return 2;
         }
     };
-    let Some(home) = wsp_client::hub_home() else {
+    let Some(home) = hub_client::hub_home() else {
         eprintln!("wsp: publish: HOME is not set, so there is no login to read");
         return 1;
     };

@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
-use wsp_api::Blob;
+use wsp_hub_protocol::Blob;
 use wsp_objects::{Object, ObjectId, WorkspaceId};
 use wsp_store_contract::{At, EventKind, OrderId, Principal, Subject};
 
@@ -169,7 +169,7 @@ impl Journal {
         let mut sent = 0;
         for e in entries {
             let Some(bytes) = self.bytes(e) else { continue };
-            if size + bytes.len() > wsp_client::PUT_BYTES && !chunk.is_empty() {
+            if size + bytes.len() > crate::hub_client::PUT_BYTES && !chunk.is_empty() {
                 sent += chunk.len();
                 put(std::mem::take(&mut chunk))?;
                 size = 0;
@@ -454,6 +454,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The objects as the old in-tree hub's own `put` takes them (`wsp-api`'s
+    /// blob, the same on the wire as the protocol's).
+    fn old_hubs(blobs: &[Blob]) -> Vec<wsp_api::Blob> {
+        blobs.iter().map(|b| wsp_api::Blob { id: b.id, bytes: b.bytes.clone() }).collect()
+    }
+
     #[test]
     fn a_crash_mid_push_replays_the_journal_with_no_duplicate_object_on_the_hub() {
         let dir = std::env::temp_dir().join(format!("wsp-journal-crash-{}", std::process::id()));
@@ -470,7 +476,7 @@ mod tests {
         // The push gets two objects to the hub, then the process dies: nothing
         // left the journal.
         let first: Vec<Blob> = entries[..2].iter().map(|e| Blob { id: e.id, bytes: j.bytes(e).unwrap() }).collect();
-        assert_eq!(hub.put(&first).unwrap(), 2);
+        assert_eq!(hub.put(&old_hubs(&first)).unwrap(), 2);
         assert_eq!(j.len(), 5, "a cut push leaves the journal whole");
 
         // The replay puts all five, in order; the hub writes only the three it lacked.
@@ -479,7 +485,7 @@ mod tests {
         let sent = j
             .replay(&j.entries(), &mut |blobs: Vec<Blob>| {
                 order.extend(blobs.iter().map(|b| b.id));
-                let n = hub.put(&blobs)?;
+                let n = hub.put(&old_hubs(&blobs))?;
                 written += n;
                 Ok::<u32, wsp_store_contract::Error>(n)
             })
@@ -491,7 +497,7 @@ mod tests {
         let held = entries.iter().filter(|e| hub.objects().has(&e.id)).count();
         assert_eq!(held, 5);
         // A second replay (a crash after the put, before the journal let go) adds nothing.
-        let again = j.replay(&j.entries(), &mut |blobs: Vec<Blob>| hub.put(&blobs)).unwrap();
+        let again = j.replay(&j.entries(), &mut |blobs: Vec<Blob>| hub.put(&old_hubs(&blobs))).unwrap();
         assert_eq!(again, 5);
         assert_eq!(std::fs::read_dir(hub.objects().root()).unwrap().count(), files, "no object is kept twice");
         let _ = std::fs::remove_dir_all(&dir);

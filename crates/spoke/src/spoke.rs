@@ -48,7 +48,7 @@ impl Spoke {
 
 /// The home the login is under (`$WSP_HUB_HOME`, else `$HOME`).
 fn home() -> Option<PathBuf> {
-    wsp_client::hub_home()
+    crate::hub_client::hub_home()
 }
 
 /// How long a `whoami` dial waits for the hub: a verb writing one line does not wait on it for long.
@@ -58,7 +58,7 @@ const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// environment's URL.
 pub fn logged_in() -> bool {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    home().is_some_and(|h| wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), &h).is_ok())
+    home().is_some_and(|h| crate::hub_client::hub_url_in(env(crate::hub_client::HUB_URL_ENV), &h).is_ok())
 }
 
 /// Logged in and switched off: the one state in which the spoke refuses new
@@ -80,12 +80,12 @@ impl SharedWork for Spoke {
     /// Logged in with a login file (as the sync worker starts and a tell
     /// through the hub is sent only with one), and switched on.
     fn active(&self, store: &Store) -> bool {
-        home().is_some_and(|h| h.join(wsp_client::HUBS_FILE).exists()) && !hub_switch::off(store)
+        home().is_some_and(|h| h.join(crate::hub_client::HUBS_FILE).exists()) && !hub_switch::off(store)
     }
 
     fn user(&self) -> Option<String> {
         let home = home()?;
-        let login = wsp_client::hub_login_in(&home).ok().flatten()?;
+        let login = crate::hub_client::hub_login_in(&home).ok().flatten()?;
         Some(login.user).filter(|u| !u.trim().is_empty())
     }
 
@@ -94,15 +94,15 @@ impl SharedWork for Spoke {
         if cfg!(test) {
             return None;
         }
-        let credential = wsp_client::Credential::for_hub().ok()?;
-        let url = wsp_client::hub_url().ok()?;
-        let ca = wsp_client::hub_ca().ok()?;
-        let mut client = wsp_client::Client::dial_hub_ca(&url, credential, ca.as_deref(), WHOAMI_WAIT).ok()?;
+        let credential = crate::hub_client::Credential::for_hub().ok()?;
+        let url = crate::hub_client::hub_url().ok()?;
+        let ca = crate::hub_client::hub_ca().ok()?;
+        let mut client = crate::hub_client::Client::dial_hub_ca(&url, credential, ca.as_deref(), WHOAMI_WAIT).ok()?;
         client.whoami().ok()
     }
 
     fn may_file_shared(&self, store: &Store) -> Result<(), String> {
-        wsp_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())?;
+        crate::hub_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())?;
         match hub_switch::off(store) {
             true => Err("the hub connection is disabled here (`wsp hub enable` turns it back on)".into()),
             false => Ok(()),
@@ -227,12 +227,12 @@ impl SharedWork for Spoke {
         Elsewhere { rows, lists: drive.driven_by }
     }
 
-    fn send(&self, store: &Store, msg: wsp_api::MsgSend) -> Result<(String, String), String> {
+    fn send(&self, store: &Store, msg: wsp_engine::addon::Outgoing) -> Result<(String, String), String> {
         if hub_switch::off(store) {
             return Err(off_said("a message for another user's wsp is not sent"));
         }
         let home = home().ok_or("no HOME, so no hub login")?;
-        hub_sync::dial(&home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()))
+        hub_sync::dial(&home).and_then(|mut c| c.msg_send(hub_sync::msg_send(msg)).map_err(|e| e.to_string()))
     }
 
     fn health(

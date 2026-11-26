@@ -20,7 +20,7 @@
 //! ([`wsp_engine::mirror::by_shared_workspace`]), makes a record of each one whose
 //! file moved since its synced head ([`push_record`], the mirror's projection),
 //! encodes it, keeps it in `$WSP_STATE/hub/objects/`, and syncs the workspace
-//! through [`wsp_client::Client::sync`] from the synced heads ([`Heads`]). A
+//! through [`crate::hub_client::Client::sync`] from the synced heads ([`Heads`]). A
 //! private task is in no workspace it syncs, and is never projected.
 //!
 //! What comes back: a moved head is the synced one; the hub's objects are kept
@@ -62,8 +62,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use wsp_api::{Answer, Blob, Move, Outcome, RefMove};
-use wsp_client::{Client, Credential, Feed, Item, ObjectSource, SyncError, SyncReport, HUBS_FILE};
+use crate::hub_client::{self, Client, Credential, Feed, Item, ObjectSource, SyncError, SyncReport, HUBS_FILE};
+use wsp_hub_protocol::{Answer, Blob, Call, HubMessage, Move, MsgSend, NoArgs, Outcome, RefMove, Verb};
 use wsp_objects::{Object, ObjectId, Refs, WorkspaceId};
 use wsp_store_contract::{At, Entity, EventId, EventKind, ListId, Principal, RowId, Subject, Token, UserName};
 
@@ -136,7 +136,7 @@ pub fn publisher(store: &Store, list: &str) -> Option<String> {
 fn member_workspaces(client: &Client) -> Vec<WorkspaceId> {
     let mut feed = client.subscribe(None);
     match feed.next_within(DIAL_WAIT) {
-        Some(wsp_client::Item::State { state, .. }) => {
+        Some(hub_client::Item::State { state, .. }) => {
             state.workspaces.keys().map(|n| WorkspaceId(format!("shared:{}", n.0))).collect()
         }
         _ => Vec::new(),
@@ -147,7 +147,7 @@ fn member_workspaces(client: &Client) -> Vec<WorkspaceId> {
 /// `objects` (what the sync fetched), merged into the file by the door.
 pub fn after_stale(
     store: &Store,
-    stale: &wsp_client::Stale,
+    stale: &hub_client::Stale,
     objects: &dyn Objects,
     lease: &dyn Lease,
     by: &Principal,
@@ -180,7 +180,7 @@ const DIAL_WAIT: Duration = Duration::from_secs(3);
 /// Start the worker when `home` holds a login; `None` (no thread, no file)
 /// without one.
 pub fn start(store: &Store) -> Option<std::thread::JoinHandle<()>> {
-    let home = wsp_client::hub_home()?;
+    let home = hub_client::hub_home()?;
     if !home.join(HUBS_FILE).exists() {
         return None;
     }
@@ -197,7 +197,7 @@ pub fn start(store: &Store) -> Option<std::thread::JoinHandle<()>> {
 
 /// Take the row `id`, kept as a head only, whole from the hub (`wsp show --fetch`).
 pub fn fetch(store: &Store, id: &str) -> Result<(), String> {
-    let home = wsp_client::hub_home().ok_or("no HOME")?;
+    let home = hub_client::hub_home().ok_or("no HOME")?;
     if !home.join(HUBS_FILE).exists() {
         return Err("not logged in to a hub: `wsp login <url>`".into());
     }
@@ -209,9 +209,9 @@ pub fn fetch(store: &Store, id: &str) -> Result<(), String> {
 /// hub does (wsp-470).
 pub fn dial(home: &std::path::Path) -> Result<Client, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let url = wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home).map_err(|e| e.to_string())?;
-    let cred = Credential::for_hub_in(env(wsp_client::HUB_TOKEN_ENV), home).map_err(|e| e.to_string())?;
-    let ca = wsp_client::hub_ca_in(env(wsp_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
+    let url = hub_client::hub_url_in(env(hub_client::HUB_URL_ENV), home).map_err(|e| e.to_string())?;
+    let cred = Credential::for_hub_in(env(hub_client::HUB_TOKEN_ENV), home).map_err(|e| e.to_string())?;
+    let ca = hub_client::hub_ca_in(env(hub_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
     Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| e.to_string())
 }
 
@@ -232,8 +232,29 @@ pub fn hub_tell(
 ) -> Option<Result<(String, String, String), String>> {
     let msg = wsp_engine::cmd_message::off_machine(store, book, needle, text, re, from, seat)?;
     let to = msg.to.clone();
-    let sent = dial(home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()));
+    let sent = dial(home).and_then(|mut c| c.msg_send(msg_send(msg)).map_err(|e| e.to_string()));
     Some(sent.map(|(id, user)| (id, user, to)))
+}
+
+/// Core's message for another user's wsp as the hub's `msg.send` carries it.
+pub fn msg_send(m: wsp_engine::addon::Outgoing) -> MsgSend {
+    MsgSend { to: m.to, from: m.from, seat: m.seat, text: m.text, re: m.re }
+}
+
+/// A message the hub delivered as core's `cmd_message::receive` takes it: the
+/// hub's id for it is the one a reply names. (When the hub queued it, `at`, is
+/// not core's to know.)
+pub fn incoming(m: &HubMessage) -> wsp_engine::addon::Incoming {
+    wsp_engine::addon::Incoming {
+        id: m.id.clone(),
+        to: m.to.clone(),
+        user: m.user.clone(),
+        from_user: m.from_user.clone(),
+        from: m.from.clone(),
+        seat: m.seat.clone(),
+        text: m.text.clone(),
+        re: m.re.clone(),
+    }
 }
 
 /// How a message the hub delivered is handed to a seat here: to `seat`, the
@@ -385,9 +406,9 @@ pub fn health(
 ) {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let home = home.unwrap_or_else(|| std::path::Path::new(""));
-    let url = match wsp_client::hub_url_in(env(wsp_client::HUB_URL_ENV), home) {
+    let url = match hub_client::hub_url_in(env(hub_client::HUB_URL_ENV), home) {
         Ok(u) => u,
-        Err(wsp_client::Silent::BadHubsFile(why)) => {
+        Err(hub_client::Silent::BadHubsFile(why)) => {
             problems.push(format!("the hub login cannot be read: {why}"));
             return;
         }
@@ -396,14 +417,14 @@ pub fn health(
             return;
         }
     };
-    let user = env(wsp_client::HUB_USER_ENV)
-        .or_else(|| wsp_client::hub_login_in(home).ok().flatten().map(|l| l.user).filter(|u| !u.is_empty()))
+    let user = env(hub_client::HUB_USER_ENV)
+        .or_else(|| hub_client::hub_login_in(home).ok().flatten().map(|l| l.user).filter(|u| !u.is_empty()))
         .unwrap_or_else(|| "(unnamed)".into());
     notes.push(format!("hub {url} as {user}"));
 
     // The certificate the hub presents now.
-    let ca = wsp_client::hub_ca_in(env(wsp_client::HUB_CA_ENV), home).ok().flatten();
-    match wsp_client::hub_cert_expiry(&url, ca.as_deref(), Duration::from_secs(2)) {
+    let ca = hub_client::hub_ca_in(env(hub_client::HUB_CA_ENV), home).ok().flatten();
+    match hub_client::hub_cert_expiry(&url, ca.as_deref(), Duration::from_secs(2)) {
         Ok(None) => notes.push("hub certificate: none (the hub is dialled in the clear)".into()),
         Ok(Some(at)) => {
             let days = (at - now).div_euclid(86_400);
@@ -469,8 +490,8 @@ pub fn health(
 }
 
 /// A request that failed because the hub is not there, as against one it refused.
-fn unreachable(e: &wsp_client::Error) -> bool {
-    matches!(e, wsp_client::Error::Timeout | wsp_client::Error::Lost(_) | wsp_client::Error::Silent(_))
+fn unreachable(e: &hub_client::Error) -> bool {
+    matches!(e, hub_client::Error::Timeout | hub_client::Error::Lost(_) | hub_client::Error::Silent(_))
 }
 
 /// One turn's tally.
@@ -653,7 +674,7 @@ impl Worker {
     }
 
     fn url(&self) -> String {
-        wsp_client::hub_url_in(None, &self.home).unwrap_or_else(|_| "(no url)".into())
+        hub_client::hub_url_in(None, &self.home).unwrap_or_else(|_| "(no url)".into())
     }
 
     fn say_once(&mut self, store: &Store, line: String) {
@@ -712,7 +733,7 @@ impl Worker {
         let mut done = Vec::new();
         let mut told = 0;
         for m in &mail {
-            match wsp_engine::cmd_message::receive(store, m, hand) {
+            match wsp_engine::cmd_message::receive(store, &incoming(m), hand) {
                 Ok(fresh) => {
                     told += usize::from(fresh);
                     done.push(m.id.clone());
@@ -733,7 +754,7 @@ impl Worker {
         let client = self.client()?;
         let head = client.head().0;
         let me = user_of(client.by());
-        let reply = client.request("state", serde_json::json!({})).map_err(|e| e.to_string())?;
+        let reply = client.request(Call::Verb(Verb::State(NoArgs {}))).map_err(|e| e.to_string())?;
         let Outcome::Ok(Answer::State { state, at }) = reply.outcome else { return Ok((Vec::new(), head)) };
         let user = UserName(me);
         let names = state
@@ -1068,7 +1089,7 @@ impl Worker {
                     continue;
                 }
                 Err(e) if unreachable(&e) => return Err(e.to_string()),
-                Err(wsp_client::Error::Refused(_)) => {}
+                Err(hub_client::Error::Refused(_)) => {}
                 Err(e) => {
                     self.say_once(store, format!("hub-sync: the lease of {} was not read: {e}; it waits", row.0));
                     self.held_back.insert(subject.clone());
@@ -1093,10 +1114,10 @@ impl Worker {
                         &format!("hub-sync: {}'s lease ran out while the hub was away; taken again (token {}) and pushed", row.0, taken.0),
                     );
                 }
-                Err(wsp_client::Error::Refused(wsp_store_contract::Refusal::Held { holder, .. })) => {
+                Err(hub_client::Error::Refused(wsp_store_contract::Refusal::Held { holder, .. })) => {
                     aside.push((row.clone(), user_of(&holder), token));
                 }
-                Err(wsp_client::Error::Refused(wsp_store_contract::Refusal::Forbidden { .. })) => {
+                Err(hub_client::Error::Refused(wsp_store_contract::Refusal::Forbidden { .. })) => {
                     let holder = hub_cache::Cache::read(store).get(&row.0).and_then(|h| h.allocation.clone());
                     aside.push((row.clone(), holder.unwrap_or_else(|| "another user".into()), token));
                 }
@@ -1374,10 +1395,10 @@ impl Worker {
         }
         // A move refused `stale`, and a head both sides wrote: the hub's head
         // through reconcile, which writes the merge; the next turn pushes it.
-        let mut stale: Vec<wsp_client::Stale> = report.stale.clone();
+        let mut stale: Vec<hub_client::Stale> = report.stale.clone();
         for s in &report.diverged {
             if let Some(head) = hub_head_in(&report.received, s) {
-                stale.push(wsp_client::Stale { subject: s.clone(), from: before.head(s).copied(), head: Some(head) });
+                stale.push(hub_client::Stale { subject: s.clone(), from: before.head(s).copied(), head: Some(head) });
             }
         }
         for st in &stale {
@@ -1403,13 +1424,13 @@ fn set_parent(obj: &mut Object, to: ObjectId) {
 /// The principal the login names, for a record made before the hub ever said
 /// who this connection is.
 fn login_principal(home: &std::path::Path) -> Option<Principal> {
-    let login = wsp_client::hub_login_in(home).ok().flatten()?;
+    let login = hub_client::hub_login_in(home).ok().flatten()?;
     (!login.user.is_empty()).then(|| Principal::Person(login.user.as_str().into()))
 }
 
 /// The hub's head for `subject` among what a sync fetched: its object that no
 /// other fetched object of the subject names as parent.
-fn hub_head_in(received: &[wsp_api::Blob], subject: &Subject) -> Option<ObjectId> {
+fn hub_head_in(received: &[Blob], subject: &Subject) -> Option<ObjectId> {
     let of: Vec<(ObjectId, Option<ObjectId>)> = received
         .iter()
         .filter_map(|b| wsp_objects::decode(&b.bytes).ok().map(|o| (b.id, o)))
@@ -1451,7 +1472,7 @@ mod tests {
             let mp = SharedName("mp".into());
             apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
             apply(Cmd::HubWorkspaceAdd { name: mp.clone() }, &root);
-            let (secret, hash) = wsp_machines::token::mint();
+            let (secret, hash) = hub_client::token::mint();
             apply(Cmd::HubUserAdd { name: UserName("ann".into()), admin: false }, &root);
             apply(Cmd::HubMemberSet { workspace: mp, user: UserName("ann".into()), member: true }, &root);
             apply(Cmd::HubTokenIssue { id: TokenId("t-ann".into()), user: UserName("ann".into()), hash }, &root);
@@ -1500,7 +1521,7 @@ mod tests {
 
         // The hub's line for the row: one new record, the journaled one.
         let hub = running.hub();
-        let head = hub.heads(&wsp_api::WorkspaceId("shared:mp".into())).unwrap().get(&subject).copied();
+        let head = hub.heads(&WorkspaceId("shared:mp".into())).unwrap().get(&subject).copied();
         assert_eq!(head, Some(id), "the hub's head is the journaled record");
         let mut records = 0;
         let mut stack = vec![hub.objects().root().to_path_buf()];
@@ -1534,7 +1555,7 @@ mod tests {
             apply(Cmd::HubUserAdd { name: UserName("root".into()), admin: true }, &Principal::Wsp("wsp-hub".into()));
             apply(Cmd::HubWorkspaceAdd { name: SharedName("mp".into()) }, &root);
             for user in ["ed", "jesper"] {
-                let (secret, hash) = wsp_machines::token::mint();
+                let (secret, hash) = hub_client::token::mint();
                 apply(Cmd::HubUserAdd { name: UserName(user.into()), admin: false }, &root);
                 apply(Cmd::HubMemberSet { workspace: SharedName("mp".into()), user: UserName(user.into()), member: true }, &root);
                 apply(Cmd::HubTokenIssue { id: TokenId(format!("t-{user}")), user: UserName(user.into()), hash }, &root);
@@ -1690,7 +1711,7 @@ mod tests {
         // The first take tells it, and its ack is lost: the hub hands it out again.
         let mail = dial(&jesper_home).unwrap().msg_take().unwrap();
         assert_eq!(mail.len(), 1);
-        assert!(wsp_engine::cmd_message::receive(&jesper, &mail[0], &hand).unwrap(), "told on reconnect");
+        assert!(wsp_engine::cmd_message::receive(&jesper, &incoming(&mail[0]), &hand).unwrap(), "told on reconnect");
         assert_eq!(worker.take_messages(&jesper, &hand).unwrap(), 0, "taken again after the lost ack, not told again");
         let told = orders_of(&db, "cpd-j1");
         assert_eq!(told.len(), 1, "exactly once: {told:?}");
