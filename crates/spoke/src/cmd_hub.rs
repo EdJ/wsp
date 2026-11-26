@@ -233,12 +233,20 @@ pub fn disabled_text(d: &crate::hub_switch::Disabled, json: bool) -> String {
         return json!({
             "enabled": false, "was_off": d.was_off, "parked": d.parked, "unreachable": d.unreachable,
             "unsent": d.unsent, "released": d.released, "not_released": d.not_released,
+            "ending": d.ending.iter().map(|(r, s)| json!({ "row": r, "seat": s })).collect::<Vec<_>>(),
+            "not_ended": d.not_ended.iter().map(|(r, s, why)| json!({ "row": r, "seat": s, "why": why })).collect::<Vec<_>>(),
         })
         .to_string();
     }
     let mut out = vec![if d.was_off { "the hub connection was off already; what was left is done again".to_string() } else { "hub connection disabled: no shared work is taken here".to_string() }];
     if !d.parked.is_empty() {
-        out.push(format!("parked (agents keep their seats and finish what they are doing): {}", d.parked.join(" ")));
+        out.push(format!("parked: {}", d.parked.join(" ")));
+    }
+    for (row, seat) in &d.ending {
+        out.push(format!("{row}: its agent on {seat} ends when its turn is over (its tree is kept); the lease goes back then"));
+    }
+    for (row, seat, why) in &d.not_ended {
+        out.push(format!("{row}: its agent on {seat} could not be set to end ({why}); end it with `wsp despawn --pane {seat} --keep-tree`"));
     }
     match &d.unreachable {
         None => out.push(format!("journal flushed; {} lease(s) given back", d.released.len())),
@@ -265,7 +273,10 @@ fn enabled_text(e: &crate::hub_switch::Enabled, json: bool) -> String {
     }
     let mut out = vec![if e.was_on { "the hub connection was on already".to_string() } else { "hub connection enabled: shared work is taken and synced again".to_string() }];
     if !e.resumed.is_empty() {
-        out.push(format!("resumed, their leases taken again: {}", e.resumed.join(" ")));
+        out.push(format!(
+            "resumed, their leases taken again: {} — no agent is started for them: each is ready to be started again (`wsp spawn <row>`), and a member of a list this wsp drives is reseated by the run once it has been without a seat for a while",
+            e.resumed.join(" ")
+        ));
     }
     for (row, why) in &e.still_parked {
         out.push(format!("still parked: {row}: {why}"));

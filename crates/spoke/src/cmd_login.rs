@@ -362,6 +362,15 @@ pub fn logout(store: &Store, args: &Args) -> i32 {
     if hub_login_in(&home).ok().flatten().is_some() {
         let done = crate::hub_switch::disable(store, &home);
         println!("{}", crate::cmd_hub::disabled_text(&done, false));
+        // An agent still finishing its turn ends after the login is gone, and
+        // with no login nothing can give its row's lease back: it runs out.
+        if !done.ending.is_empty() {
+            let rows: Vec<&str> = done.ending.iter().map(|(r, _)| r.as_str()).collect();
+            println!(
+                "{}: the agent ends after this logout, so its lease cannot be given back and runs out on the hub; `wsp hub disable`, and `wsp logout` once its agent has ended, gives it back",
+                rows.join(" ")
+            );
+        }
     }
     match log_out(&home) {
         Ok(None) => {

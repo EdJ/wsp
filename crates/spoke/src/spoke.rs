@@ -146,6 +146,12 @@ impl SharedWork for Spoke {
     }
 
     fn let_go(&self, store: &Store, row: &str, claim: &Value) {
+        // An agent the disable asked to end at the end of its turn is gone:
+        // its row's lease goes back now (whether or not the connection is
+        // still off), and the row is said to be parked with its agent ended.
+        if hub_switch::agent_gone(store, row, claim) {
+            return;
+        }
         // Switched off, nothing is dialled: `wsp hub disable` gave back what it
         // could, and a lease it could not runs out on the hub.
         if hub_switch::off(store) {

@@ -77,6 +77,11 @@ pub struct Switch {
     pub not_released: Vec<String>,
     /// Why the hub did not answer the disable, if it did not.
     pub unreachable: Option<String>,
+    /// Row -> the live seat on it whose agent the disable asked to end at the
+    /// end of its turn: its lease is held until that agent is gone.
+    pub ending: BTreeMap<String, String>,
+    /// Rows parked whose agent has since ended, its lease given back.
+    pub ended: Vec<String>,
 }
 
 impl Switch {
@@ -98,6 +103,13 @@ impl Switch {
                 .collect(),
             not_released: v["not_released"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect(),
             unreachable: v["unreachable"].as_str().map(str::to_string),
+            ending: v["ending"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(r, s)| Some((r.clone(), s.as_str()?.to_string())))
+                .collect(),
+            ended: v["ended"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect(),
         }
     }
 
@@ -111,6 +123,8 @@ impl Switch {
             "parked": self.parked,
             "not_released": self.not_released,
             "unreachable": self.unreachable,
+            "ending": self.ending,
+            "ended": self.ended,
         });
         let tmp = dir.join(format!(".switch.json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, v.to_string())?;
@@ -118,7 +132,7 @@ impl Switch {
     }
 
     /// Read, change and write back under the store's lock.
-    fn edit<T>(store: &Store, f: impl FnOnce(&mut Switch) -> T) -> std::io::Result<T> {
+    pub fn edit<T>(store: &Store, f: impl FnOnce(&mut Switch) -> T) -> std::io::Result<T> {
         store.locked(|| {
             let mut s = Switch::read(store);
             let out = f(&mut s);
@@ -147,6 +161,77 @@ pub struct Disabled {
     pub released: Vec<String>,
     /// Leases not given back.
     pub not_released: Vec<String>,
+    /// `(row, seat)`: an agent asked to end when its turn is over, its row's
+    /// lease held until it is gone.
+    pub ending: Vec<(String, String)>,
+    /// `(row, seat, why)`: an agent whose ending could not be arranged; its
+    /// row is parked and its lease held.
+    pub not_ended: Vec<(String, String, String)>,
+}
+
+/// How the disable reads and ends seats: the engine's own `seat_is_live` and
+/// `end_seat_when_idle` (a detached `wsp despawn --pane <seat> --keep-tree`
+/// that waits until the seat is not mid-turn). A test puts its own on its
+/// thread, since the real ending runs this process's binary.
+#[derive(Clone, Copy)]
+pub struct SeatOps {
+    pub live: fn(&str) -> bool,
+    pub end: fn(&Store, &str) -> Result<(), String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_OPS: std::cell::Cell<Option<SeatOps>> = const { std::cell::Cell::new(None) };
+}
+
+fn seat_ops() -> SeatOps {
+    #[cfg(test)]
+    if let Some(ops) = TEST_OPS.with(|c| c.get()) {
+        return ops;
+    }
+    SeatOps { live: wsp_engine::cmd_spawn::seat_is_live, end: wsp_engine::cmd_spawn::end_seat_when_idle }
+}
+
+/// A claim on `row` ended (`Spoke::let_go`). Where it is a row whose agent the
+/// disable asked to end, the agent is gone now: its lease goes back (dialled
+/// even though the connection is off, as the last of the disable's own step),
+/// and the row is said to be parked with its agent ended. `true` when the row
+/// was one of those.
+pub fn agent_gone(store: &Store, row: &str, claim: &Value) -> bool {
+    if !Switch::read(store).ending.contains_key(row) {
+        return false;
+    }
+    let mut tokens: Vec<Token> = hub_lease::token_of(claim).into_iter().collect();
+    if let Some(d) = hub_lease::Book::read(store).rows.get(row) {
+        if !tokens.contains(&d.token) {
+            tokens.push(d.token);
+        }
+    }
+    let given_back = match hub_client_home().and_then(|h| hub_sync::dial(&h).ok()) {
+        Some(mut client) => tokens.iter().all(|t| {
+            matches!(client.lease_release(&RowId(row.to_string()), *t), Ok(()) | Err(crate::hub_client::Error::Refused(_)))
+        }),
+        None => tokens.is_empty(),
+    };
+    for t in &tokens {
+        if given_back {
+            hub_lease::forget_row(store, row, *t);
+        }
+    }
+    let _ = Switch::edit(store, |s| {
+        s.ending.remove(row);
+        if !s.ended.iter().any(|r| r == row) {
+            s.ended.push(row.to_string());
+        }
+        if !given_back && !s.not_released.iter().any(|r| r == row) {
+            s.not_released.push(row.to_string());
+        }
+    });
+    true
+}
+
+fn hub_client_home() -> Option<std::path::PathBuf> {
+    crate::hub_client::hub_home()
 }
 
 /// The shared rows a claim here holds that are not finished or parked: the
@@ -201,15 +286,33 @@ pub fn disable(store: &Store, home: &Path) -> Disabled {
     out.was_off = was.unwrap_or(false);
     worker_stood_down(store);
 
-    // 2. Park what is in flight on shared rows, with `wsp park`'s own write.
+    // 2. Park what is in flight on shared rows, with `wsp park`'s own write,
+    // and end the agent of each live seat on one when its turn is over, with
+    // the despawn the engine already has for that (`end_seat_when_idle`: a
+    // detached `wsp despawn --pane <seat> --keep-tree` that waits until the
+    // seat is not mid-turn). Its lease is held until that agent is gone.
+    let ops = seat_ops();
     for (row, status) in in_flight(store) {
         let args = Args::synth("park", &[row.as_str(), REASON], &[]);
-        if wsp_engine::cmd_task::park(store, &args) == 0 {
-            let _ = Switch::edit(store, |s| {
-                s.parked.insert(row.clone(), status.as_str().to_string());
-            });
-            out.parked.push(row);
+        if wsp_engine::cmd_task::park(store, &args) != 0 {
+            continue;
         }
+        let _ = Switch::edit(store, |s| {
+            s.parked.insert(row.clone(), status.as_str().to_string());
+        });
+        for seat in wsp_engine::attention::seats_of_row(store, &row).into_iter().filter(|s| (ops.live)(s)) {
+            match (ops.end)(store, &seat) {
+                Ok(()) => {
+                    let _ = Switch::edit(store, |s| {
+                        s.ending.insert(row.clone(), seat.clone());
+                        s.ended.retain(|r| r != &row);
+                    });
+                    out.ending.push((row.clone(), seat));
+                }
+                Err(why) => out.not_ended.push((row.clone(), seat, why)),
+            }
+        }
+        out.parked.push(row);
     }
 
     // 3. Flush the journal while the hub answers.
@@ -218,7 +321,8 @@ pub fn disable(store: &Store, home: &Path) -> Disabled {
         out.unreachable = Some(why);
     }
 
-    // 4. Give the leases back.
+    // 4. Give the leases back: all but those of rows whose agent is still
+    // finishing its turn, which go back as that agent's claim ends.
     if out.unreachable.is_none() {
         match hub_sync::dial(home) {
             Ok(mut client) => release_all(store, &mut client, &mut out),
@@ -254,7 +358,11 @@ pub fn held_leases(store: &Store) -> Vec<String> {
 /// loses its token) and every drive lease. A lease the hub says is gone already
 /// counts as given back.
 fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut Disabled) {
+    let ending = Switch::read(store).ending;
     for (row, claim) in store.claims() {
+        if ending.contains_key(&row) {
+            continue;
+        }
         let Some(token) = hub_lease::token_of(&claim) else { continue };
         match client.lease_release(&RowId(row.clone()), token) {
             Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
@@ -268,6 +376,9 @@ fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut 
     // The row leases no claim holds (`wsp start` made none), and any the book
     // has under another token than its claim's.
     for (row, d) in hub_lease::Book::read(store).rows {
+        if ending.contains_key(&row) {
+            continue;
+        }
         // Already given back with its claim: the hub says it is not held
         // under this token any more, and that counts as given back.
         match client.lease_release(&RowId(row.clone()), d.token) {
@@ -322,7 +433,8 @@ pub struct Enabled {
     pub was_on: bool,
     /// Rows whose lease was taken again and which are back at their status.
     pub resumed: Vec<String>,
-    /// Rows still parked, and why (who holds the lease, or the hub's silence).
+    /// Rows still parked, and why (who holds the lease, the hub's silence, or
+    /// an agent still finishing its turn).
     pub still_parked: Vec<(String, String)>,
     /// The journal replayed by this process (no daemon worker was running):
     /// why not, if it did not answer.
@@ -350,7 +462,17 @@ pub fn enable(store: &Store, home: &Path) -> Enabled {
         };
         // Moved on by hand since: no longer the disconnect's to take back.
         if t.status() != Status::Parked {
-            let _ = Switch::edit(store, |s| s.parked.remove(&row));
+            let _ = Switch::edit(store, |s| {
+                s.parked.remove(&row);
+                s.ended.retain(|r| r != &row);
+            });
+            continue;
+        }
+        // Its agent is still finishing the turn the disable let it finish: it
+        // is ended when that turn is over and its lease goes back then, so the
+        // row is not taken back under it. Enable again once it is gone.
+        if let Some(seat) = Switch::read(store).ending.get(&row) {
+            out.still_parked.push((row, format!("its agent on {seat} is still finishing its turn; it ends when the turn is over — `wsp hub enable` again then")));
             continue;
         }
         match hub_lease::before_claim(store, &row) {
@@ -370,7 +492,10 @@ pub fn enable(store: &Store, home: &Path) -> Enabled {
                 let caller = wsp_engine::cmd_message::Caller::here(store);
                 match wsp_engine::cmd_task::write_task(store, &t, "resume", &caller) {
                     Ok(()) => {
-                        let _ = Switch::edit(store, |s| s.parked.remove(&row));
+                        let _ = Switch::edit(store, |s| {
+                            s.parked.remove(&row);
+                            s.ended.retain(|r| r != &row);
+                        });
                         out.resumed.push(row);
                     }
                     Err(e) => out.still_parked.push((row, format!("the row was not written: {e}"))),
@@ -407,7 +532,12 @@ pub fn status_lines(store: &Store) -> Vec<String> {
         (true, None) => "off   disabled: no shared work is taken (`wsp hub enable`)".to_string(),
     }];
     for (row, was) in &s.parked {
-        out.push(format!("parked by the disconnect: {row} (was {was})"));
+        let agent = match (s.ending.get(row), s.ended.contains(row)) {
+            (Some(seat), _) => format!(", its agent on {seat} finishing its turn: it ends when the turn is over, and the lease goes back then"),
+            (None, true) => ", its agent ended".to_string(),
+            (None, false) => String::new(),
+        };
+        out.push(format!("parked by the disconnect: {row} (was {was}){agent}"));
     }
     let unsent = hub_journal::Journal::of(store).len();
     if unsent > 0 {
@@ -475,6 +605,8 @@ pub fn status_json(store: &Store) -> Value {
         "enabled": !s.off,
         "since": s.at,
         "parked": s.parked,
+        "ending": s.ending,
+        "ended": s.ended,
         "unsent": hub_journal::Journal::of(store).len(),
         "not_released": s.not_released,
         "unreachable": s.unreachable,
@@ -824,5 +956,169 @@ mod tests {
         assert_eq!(st["link"], "up", "{st}");
         assert!(st["refused"]["shared:other"].as_str().is_some(), "{st}");
         assert!(link_lines(&r.store).iter().any(|l| l.contains("not synced: shared:other")), "{:?}", link_lines(&r.store));
+    }
+
+
+    // ---- agents on shared rows end when their turn is over ------------------------
+
+    thread_local! {
+        static ENDS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Seats `cpd-s1` (on the shared `s-1`) and `cpd-p1` (on the private
+    /// `p-1`) read as live, and an ending is recorded where the real one
+    /// starts a detached `wsp despawn --pane <seat> --keep-tree` that waits
+    /// out the turn. Put back when the guard drops.
+    struct Ops;
+
+    impl Ops {
+        fn on() -> Ops {
+            ENDS.with(|e| e.borrow_mut().clear());
+            TEST_OPS.with(|c| {
+                c.set(Some(SeatOps {
+                    live: |seat| seat == "cpd-s1" || seat == "cpd-p1",
+                    end: |_, seat| {
+                        ENDS.with(|e| e.borrow_mut().push(seat.to_string()));
+                        Ok(())
+                    },
+                }))
+            });
+            Ops
+        }
+    }
+
+    impl Drop for Ops {
+        fn drop(&mut self) {
+            TEST_OPS.with(|c| c.set(None));
+        }
+    }
+
+    fn ends() -> Vec<String> {
+        ENDS.with(|e| e.borrow().clone())
+    }
+
+    /// What the scheduled despawn does once the turn is over, through the
+    /// engine's own release: the seat's binding and its row's claim end, and
+    /// the claim's end reaches the add-on (`let_go`).
+    fn turn_over(store: &Store, seat: &str) {
+        let (released, row) = wsp_engine::cmd_agent::release_pane(store, seat);
+        assert!(released && row.is_some(), "{seat} was bound and released");
+    }
+
+    /// The disable does not wait out a turn: the default ending is the
+    /// engine's `end_seat_when_idle` (a detached despawn with the tree kept).
+    #[test]
+    fn hub_switch_the_ending_is_the_engines_despawn_when_idle() {
+        let ops = seat_ops();
+        assert!(std::ptr::fn_addr_eq(ops.end, wsp_engine::cmd_spawn::end_seat_when_idle as fn(&Store, &str) -> Result<(), String>));
+        assert!(std::ptr::fn_addr_eq(ops.live, wsp_engine::cmd_spawn::seat_is_live as fn(&str) -> bool));
+    }
+
+    /// Owner's decision: disable parks a shared row whose seat is live and
+    /// sets its agent to end when its turn is over; the row's lease is held
+    /// until that agent is gone, so nobody leases a row an agent still writes
+    /// to, and goes back then. Status says which agent is still finishing, and
+    /// afterwards that the row's agent ended. A private row's seat is not
+    /// touched.
+    #[test]
+    fn hub_switch_disable_ends_the_agent_on_a_shared_row_when_its_turn_is_over_and_then_gives_the_lease_back() {
+        let Some(mut r) = rig("agent-ends") else { return };
+        let _ops = Ops::on();
+        let done = disable(&r.store, &r.home);
+        assert_eq!(done.parked, vec!["s-1".to_string()], "{done:?}");
+        assert_eq!(done.ending, vec![("s-1".to_string(), "cpd-s1".to_string())]);
+        assert_eq!(ends(), vec!["cpd-s1".to_string()], "the private row's seat is not ended");
+        assert!(!done.released.contains(&"s-1".to_string()), "not given back while its agent may still write: {done:?}");
+        assert_eq!(status(&r.store, "s-1"), Status::Parked);
+        assert_eq!(status(&r.store, "p-1"), Status::Doing);
+        assert!(disabled_lines(&done).iter().any(|l| l.contains("cpd-s1") && l.contains("ends when its turn is over")));
+        let mut bo = hub_lease::tests::dial(&r.running, &r.tokens, "bo");
+        assert!(hub_lease::take(&mut bo, "shared:team", "s-1").unwrap_err().contains("ann"), "still ann's while the agent finishes");
+        let lines = status_lines(&r.store).join("\n");
+        assert!(lines.contains("s-1 (was doing), its agent on cpd-s1 finishing its turn"), "{lines}");
+
+        // The turn is over and the despawn runs: the claim ends, the lease goes back.
+        turn_over(&r.store, "cpd-s1");
+        assert!(!r.store.claims().contains_key("s-1"));
+        assert!(hub_lease::take(&mut bo, "shared:team", "s-1").is_ok(), "free to another user once the agent is gone");
+        let sw = Switch::read(&r.store);
+        assert!(sw.ending.is_empty() && sw.ended == vec!["s-1".to_string()], "{sw:?}");
+        assert_eq!(status(&r.store, "s-1"), Status::Parked, "the despawn keeps the row parked");
+        let lines = status_lines(&r.store).join("\n");
+        assert!(lines.contains("s-1 (was doing), its agent ended"), "{lines}");
+        assert!(r.store.claims().contains_key("p-1"), "the private row's claim stands");
+        r.running.stop();
+    }
+
+    /// Enable leaves a row whose agent is still finishing parked and says so;
+    /// once the agent is gone it takes the lease again (held by another user:
+    /// stays parked, naming them) and puts the row back, starting no agent.
+    #[test]
+    fn hub_switch_enable_waits_for_a_finishing_agent_then_resumes_the_row_without_an_agent() {
+        let Some(mut r) = rig("agent-enable") else { return };
+        let _ops = Ops::on();
+        disable(&r.store, &r.home);
+        let on = enable(&r.store, &r.home);
+        assert!(on.still_parked.iter().any(|(row, why)| row == "s-1" && why.contains("still finishing its turn")), "{on:?}");
+        assert_eq!(status(&r.store, "s-1"), Status::Parked);
+
+        turn_over(&r.store, "cpd-s1");
+        let mut bo = hub_lease::tests::dial(&r.running, &r.tokens, "bo");
+        let bos = hub_lease::take(&mut bo, "shared:team", "s-1").expect("given back as the agent ended");
+        let on = enable(&r.store, &r.home);
+        assert!(on.still_parked.iter().any(|(row, why)| row == "s-1" && why.contains("bo")), "{on:?}");
+        bo.lease_release(&RowId("s-1".into()), bos.token).unwrap();
+        let on = enable(&r.store, &r.home);
+        assert_eq!(on.resumed, vec!["s-1".to_string()], "{on:?}");
+        assert_eq!(status(&r.store, "s-1"), Status::Doing);
+        assert!(!r.store.claims().contains_key("s-1"), "no agent was started");
+        assert!(hub_lease::Book::read(&r.store).rows.contains_key("s-1"), "the lease is held again, in the book");
+        assert!(Switch::read(&r.store).ended.is_empty());
+        r.running.stop();
+    }
+
+    /// A hub that does not answer: the agent is still set to end at the end
+    /// of its turn and the row parked; when it is gone its lease cannot be
+    /// given back and runs out, and status says so. Needs no hub: the login
+    /// names a port nothing listens on.
+    #[test]
+    fn hub_switch_with_the_hub_unreachable_the_agent_still_ends_at_its_turns_end() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = wsp_engine::util::isolated("hub-switch-agent-offline");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let home = env.path("login-home");
+        let file = home.join(".config/wsp/hubs.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, json!({ "url": format!("tcp://127.0.0.1:{port}"), "token": "t", "user": "ann", "at": "2026-11-23T00:00:00Z" }).to_string()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _hub_home = HubHome::at(&home);
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let _ops = Ops::on();
+        row(&store, "s-1", true, Status::Doing);
+        row(&store, "p-1", false, Status::Doing);
+        claim(&store, "s-1", "cpd-s1", Some(&Held { token: Token(5), expires: wsp_engine::util::epoch_secs() + 86_400 }));
+        claim(&store, "p-1", "cpd-p1", None);
+
+        let done = disable(&store, &home);
+        assert!(done.unreachable.is_some(), "{done:?}");
+        assert_eq!(done.parked, vec!["s-1".to_string()]);
+        assert_eq!(done.ending, vec![("s-1".to_string(), "cpd-s1".to_string())]);
+        assert_eq!(ends(), vec!["cpd-s1".to_string()]);
+        assert_eq!(status(&store, "s-1"), Status::Parked);
+        assert_eq!(status(&store, "p-1"), Status::Doing);
+
+        turn_over(&store, "cpd-s1");
+        let sw = Switch::read(&store);
+        assert_eq!(sw.ended, vec!["s-1".to_string()], "{sw:?}");
+        assert!(sw.not_released.contains(&"s-1".to_string()), "not given back: it runs out on the hub: {sw:?}");
+        let lines = status_lines(&store).join("\n");
+        assert!(lines.contains("its agent ended") && lines.contains("not given back: s-1"), "{lines}");
+    }
+
+    /// What `wsp hub disable` prints, line by line.
+    fn disabled_lines(d: &Disabled) -> Vec<String> {
+        crate::cmd_hub::disabled_text(d, false).lines().map(str::to_string).collect()
     }
 }
