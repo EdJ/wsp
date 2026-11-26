@@ -816,52 +816,56 @@ fn increment(store: &Store, args: &Args) -> i32 {
     finish(store, &i, &what, args)
 }
 
-/// The plan's lists as one chain of `after`, in plan order: an increment's
-/// first list waits on the previous increment's last, and each next list on
-/// the one before it in its own increment. `after` names one list (wsp-734
-/// would let it name several), so increment n+1 can wait on increment n only
-/// through its last list, and that holds only if the lists before it are
-/// chained to it — so the chain inside an increment is wsp's to keep, not a
-/// planner's, and an edit of one increment never undoes it. A list the plan
-/// let go of is let go by its `after` too, where that named a list of the
-/// plan. A chain that would come back round is refused before anything is
-/// written.
+/// The plan's lists ordered by increment through `after`: every list of an
+/// increment waits on *all* the lists of the nearest earlier increment that
+/// has any (`wsp-734`), so two lists of one increment run side by side and the
+/// next increment starts only when both are done. Lists inside one increment
+/// wait on nothing the plan says. `after` is wsp's to keep for a planned list:
+/// an edit of one increment never undoes it. A list the plan let go of is let
+/// go by its `after` too, where that named a list of the plan. A chain that
+/// would come back round is refused before anything is written.
 fn sync_after(store: &Store, before: &[Increment], after: &[Increment]) -> Result<(), String> {
-    let mut want: Vec<(String, Option<String>)> = Vec::new();
-    let mut prev: Option<String> = None;
-    for l in after.iter().flat_map(|inc| &inc.lists) {
-        want.push((l.clone(), prev.clone()));
-        prev = Some(l.clone());
+    let mut want: Vec<(String, Vec<String>)> = Vec::new();
+    let mut prev: Vec<String> = Vec::new();
+    for inc in after {
+        for l in &inc.lists {
+            if !want.iter().any(|(w, _)| w == l) {
+                want.push((l.clone(), prev.clone()));
+            }
+        }
+        if !inc.lists.is_empty() {
+            prev = inc.lists.clone();
+        }
     }
     let planned: Vec<&String> = before.iter().chain(after).flat_map(|r| &r.lists).collect();
     for l in before.iter().flat_map(|r| &r.lists) {
         if !want.iter().any(|(w, _)| w == l) {
             if let Some(w) = store.worklist(l) {
-                if w.after.as_ref().is_some_and(|a| planned.contains(&a)) {
-                    want.push((l.clone(), None));
+                if w.after.iter().any(|a| planned.contains(&a)) {
+                    want.push((l.clone(), w.after.iter().filter(|a| !planned.contains(a)).cloned().collect()));
                 }
             }
         }
     }
-    // The chain each list would stand in, read with the new edges in place.
-    let edge = |id: &str| -> Option<String> {
+    // The graph each list would stand in, read with the new edges in place.
+    let edge = |id: &str| -> Vec<String> {
         match want.iter().find(|(w, _)| w == id) {
             Some((_, a)) => a.clone(),
-            None => store.worklist(id).and_then(|w| w.after),
+            None => store.worklist(id).map(|w| w.after).unwrap_or_default(),
         }
     };
     for (l, a) in &want {
-        let mut at = a.clone();
-        let mut hops = 0;
-        while let Some(x) = at {
+        let mut seen: Vec<String> = Vec::new();
+        let mut todo: Vec<String> = a.clone();
+        while let Some(x) = todo.pop() {
             if &x == l {
-                return Err(format!("wsp: `{l}` after `{}` would wait for itself", a.as_deref().unwrap_or("")));
+                return Err(format!("wsp: `{l}` after `{}` would wait for itself", a.join(", ")));
             }
-            hops += 1;
-            if hops > 64 {
-                break;
+            if seen.contains(&x) || seen.len() > 256 {
+                continue;
             }
-            at = edge(&x);
+            todo.extend(edge(&x));
+            seen.push(x);
         }
     }
     store.locked(|| -> Result<(), String> {
@@ -871,9 +875,9 @@ fn sync_after(store: &Store, before: &[Increment], after: &[Increment]) -> Resul
                 continue;
             }
             w.after = a.clone();
-            w.log(&match a {
-                Some(o) => format!("after {o} (initiative plan)"),
-                None => "no longer after any list (initiative plan)".to_string(),
+            w.log(&match a.is_empty() {
+                false => format!("after {} (initiative plan)", a.join(", ")),
+                true => "no longer after any list (initiative plan)".to_string(),
             });
             store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
             store.log_event("worklist-edited", json!({ "id": w.id, "what": "after", "after": w.after }));
@@ -1302,7 +1306,8 @@ pub fn plan_text(g: &serde_json::Value) -> String {
             o.push_str(&format!("  {}  (no such worklist)\n", s(&l["id"])));
             return;
         }
-        let after = l["after"].as_str().map(|a| format!(" · after {a}")).unwrap_or_default();
+        let on: Vec<&str> = l["after"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+        let after = if on.is_empty() { String::new() } else { format!(" · after {}", on.join(", ")) };
         o.push_str(&format!("  {}  {} [{}]{after}\n", s(&l["id"]), s(&l["caption"]), s(&l["status"])));
         for gr in l["groups"].as_array().into_iter().flatten() {
             let kind = if s(&gr["kind"]).is_empty() { String::new() } else { format!(" · {}", s(&gr["kind"])) };
@@ -1676,9 +1681,9 @@ mod tests {
         let i = find(&store, "init-1").unwrap();
         assert_eq!(i.increments().iter().map(|r| (r.id.as_str(), r.lists.clone())).collect::<Vec<_>>(), vec![("I1", vec!["pa".to_string()]), ("I2", vec!["pb".to_string()])]);
         assert!(i.worklists.contains(&"pa".to_string()) && i.worklists.contains(&"pb".to_string()), "an increment's lists are linked");
-        assert_eq!(store.worklist("pb").unwrap().after.as_deref(), Some("pa"), "increment 2 waits on increment 1");
-        assert_eq!(store.worklist("pa").unwrap().after, None);
-        assert_eq!(store.worklist("pc").unwrap().after, None, "a list let go of the plan is let go by its after");
+        assert_eq!(store.worklist("pb").unwrap().after, ["pa"], "increment 2 waits on increment 1");
+        assert!(store.worklist("pa").unwrap().after.is_empty());
+        assert!(store.worklist("pc").unwrap().after.is_empty(), "a list let go of the plan is let go by its after");
 
         let v = plan_graph(&store, &i);
         assert_eq!(v["totals"], json!({ "increments": 2, "lists": 3, "groups": 5, "rows": 7 }), "pc is counted, unplanned: {v}");
@@ -1708,7 +1713,7 @@ mod tests {
         assert_eq!(r[1]["after"], json!(["p-1"]));
         assert_eq!(r[0]["tier"], json!({ "kind": "claude", "model": "opus", "effort": "high" }));
         let gb = &v["increments"][1]["lists"][0]["groups"];
-        assert_eq!(v["increments"][1]["lists"][0]["after"], json!("pa"));
+        assert_eq!(v["increments"][1]["lists"][0]["after"], json!(["pa"]));
         assert_eq!(gb.as_array().unwrap().len(), 3);
         assert_eq!(gb[2]["rows"][1]["status"], json!("missing"), "a member no task answers to is drawn as missing");
         assert_eq!(gb[0]["rows"][0]["tier"], json!({ "kind": "claude", "model": null, "effort": null }));
@@ -1720,21 +1725,24 @@ mod tests {
         }
         assert!(i.json()["increments"][1]["lists"] == json!(["pb"]));
 
-        // Two lists in one increment, then another increment: the chain inside
-        // the first is kept, and the next waits on its last (cpd-6489's repro).
+        // Two lists in one increment run side by side, and the next increment's
+        // lists each wait on both (`wsp-734`).
         assert_eq!(run(&store, &["add", "Chain"], &[("product", "compound")]), 0);
-        for id in ["qa", "qb", "qc"] {
+        for id in ["qa", "qb", "qc", "qd"] {
             store.save_worklist(&Worklist::new(id, id)).unwrap();
         }
         let after = |id: &str| store.worklist(id).unwrap().after;
         assert_eq!(run(&store, &["increment", "add", "init-2", "one"], &[("list", "qa"), ("list", "qb")]), 0);
-        assert_eq!((after("qa"), after("qb").as_deref()), (None, Some("qa")), "an increment's lists are chained");
-        assert_eq!(wl(&["after", "qb", "qa"], &[]), 0);
-        assert_eq!(run(&store, &["increment", "add", "init-2", "two"], &[("list", "qc")]), 0);
-        assert_eq!(after("qb").as_deref(), Some("qa"), "the next increment's add keeps the chain inside the first");
-        assert_eq!(after("qc").as_deref(), Some("qb"), "and waits on the first increment's last list");
-        assert_eq!(run(&store, &["increment", "edit", "init-2", "I1"], &[("list", "qb,qa")]), 0);
-        assert_eq!((after("qb"), after("qa").as_deref(), after("qc").as_deref()), (None, Some("qb"), Some("qa")), "reordered, the chain follows");
+        assert!(after("qa").is_empty() && after("qb").is_empty(), "an increment's lists wait on nothing in it");
+        assert_eq!(run(&store, &["increment", "add", "init-2", "two"], &[("list", "qc,qd")]), 0);
+        assert_eq!((after("qc"), after("qd")), (vec!["qa".to_string(), "qb".to_string()], vec!["qa".to_string(), "qb".to_string()]), "the next increment waits on all of the first");
+        let v = plan_graph(&store, &find(&store, "init-2").unwrap());
+        assert_eq!(v["increments"][1]["lists"][1]["after"], json!(["qa", "qb"]), "--json shows every edge");
+        assert!(plan_text(&v).contains("qc") && plan_text(&v).contains("· after qa, qb"), "plan show shows every edge:\n{}", plan_text(&v));
+        assert_eq!(run(&store, &["increment", "edit", "init-2", "I1"], &[("list", "qb")]), 0);
+        assert_eq!((after("qc"), after("qa")), (vec!["qb".to_string()], Vec::<String>::new()), "an edit of the first increment moves the second's edges; the list let go keeps none");
+        assert_eq!(run(&store, &["increment", "edit", "init-2", "I1"], &[("list", "qa,qb")]), 0);
+        assert_eq!(after("qd"), ["qa", "qb"]);
     }
 
     /// `wsp-732`: approve for build and ask for changes, table-driven.
@@ -1801,7 +1809,7 @@ mod tests {
             let w = store.worklist(l).unwrap();
             assert!(w.is_planned() && w.status() != crate::model::WorklistStatus::Running, "{l} planned, not executing");
         }
-        assert_eq!(store.worklist("pb").unwrap().after.as_deref(), Some("pa"), "later lists wait on earlier ones");
+        assert_eq!(store.worklist("pb").unwrap().after, ["pa"], "later lists wait on earlier ones");
         assert_eq!(run(&store, &["approve", "init-1", "again"], &[]), 1, "approved once");
     }
 }

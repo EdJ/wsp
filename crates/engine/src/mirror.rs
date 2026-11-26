@@ -573,7 +573,7 @@ fn lists_with(
             put(&mut f, "status", status.as_str());
             put(&mut f, "project", w.project.as_deref().unwrap_or(""));
             put(&mut f, "prio", w.prio.as_deref().unwrap_or(""));
-            put(&mut f, "after", w.after.as_deref().unwrap_or(""));
+            put(&mut f, "after", &w.after.join(", "));
             put(&mut f, "alone", &w.alone.map(|a| a.to_string()).unwrap_or_default());
             put(&mut f, "created", &w.created);
             put(&mut f, "planned", w.planned.as_deref().unwrap_or(""));

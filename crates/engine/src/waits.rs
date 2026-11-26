@@ -118,7 +118,8 @@ pub struct Entry {
     /// When it was planned, ISO; a list planned by hand-editing the file has
     /// none and queues behind every one that has.
     pub planned: Option<String>,
-    pub after: Option<String>,
+    /// Every list this one waits on; it starts when all are complete.
+    pub after: Vec<String>,
     pub alone: bool,
     /// What `alone` is judged against: the project, or [`OWN_SOURCE`] for
     /// anything under it. `None` for a list with no home, which conflicts with
@@ -186,8 +187,9 @@ fn first_wait(e: &Entry, world: &World, free: Option<usize>) -> Option<Wait> {
     if let Some(hold) = world.throttled {
         return Some(Wait::Throttle(hold));
     }
-    if let Some(other) = e.after.as_ref().filter(|o| !world.complete.contains(*o)) {
-        return Some(Wait::After(other.clone()));
+    let open: Vec<&str> = e.after.iter().filter(|o| !world.complete.contains(*o)).map(String::as_str).collect();
+    if !open.is_empty() {
+        return Some(Wait::After(open.join(", ")));
     }
     if e.alone {
         if let Some((other, _)) = world
@@ -417,7 +419,7 @@ mod tests {
             id: id.into(),
             prio: Prio::Normal,
             planned: Some("2026-11-05T10:00:00Z".into()),
-            after: None,
+            after: Vec::new(),
             alone: false,
             scope: Some("proj".into()),
             need: 3,
@@ -482,10 +484,22 @@ mod tests {
     #[test]
     fn a_list_waits_for_the_one_it_is_after_until_that_is_complete() {
         let mut e = entry("b");
-        e.after = Some("a".into());
+        e.after = vec!["a".into()];
         let mut w = world();
         assert_eq!(only(e.clone(), &w).unwrap().text(), "after a");
         w.complete.insert("a".into());
+        assert_eq!(only(e, &w), None);
+    }
+
+    #[test]
+    fn a_list_after_several_waits_until_every_one_is_complete() {
+        let mut e = entry("c");
+        e.after = vec!["a".into(), "b".into()];
+        let mut w = world();
+        assert_eq!(only(e.clone(), &w).unwrap().text(), "after a, b");
+        w.complete.insert("a".into());
+        assert_eq!(only(e.clone(), &w), Some(Wait::After("b".into())), "one done is not enough");
+        w.complete.insert("b".into());
         assert_eq!(only(e, &w), None);
     }
 
@@ -545,7 +559,7 @@ mod tests {
     #[test]
     fn the_first_reason_is_told_in_the_order_room_throttle_after_alone_manual() {
         let mut e = entry("b");
-        e.after = Some("a".into());
+        e.after = vec!["a".into()];
         e.alone = true;
         e.manual = true;
         let mut w = world();
@@ -582,7 +596,7 @@ mod tests {
     fn an_earlier_list_blocked_on_after_does_not_hold_back_a_later_one() {
         let mut first = entry("first");
         first.planned = Some("2026-11-05T09:00:00Z".into());
-        first.after = Some("never".into());
+        first.after = vec!["never".into()];
         let mut second = entry("second");
         second.planned = Some("2026-11-05T10:00:00Z".into());
         let got = queue(vec![second, first], &world());
