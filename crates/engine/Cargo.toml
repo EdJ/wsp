@@ -25,11 +25,9 @@ wsp-view = { path = "../view" }
 
 [dev-dependencies]
 wsp-base = { path = "../base", features = ["test-support"] }
-wsp-client = { path = "../client", features = ["test-support"] }
 wsp-store = { path = "../store", features = ["test-support"] }
 wsp-wire = { path = "../wire", features = ["test-support"] }
 wsp-trees = { path = "../trees", features = ["test-support"] }
-wsp-server = { path = "../server", features = ["test-support"] }
 wsp-testkit = { path = "../testkit" }
 wsp-manager = { path = "../manager" }
 # repair's reseat test posts its played hook's turn to the manager, as a real hook does.

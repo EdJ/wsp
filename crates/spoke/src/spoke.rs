@@ -258,6 +258,10 @@ impl SharedWork for Spoke {
         Elsewhere { rows, lists: drive.driven_by }
     }
 
+    fn isolate(&self, dir: &std::path::Path) -> Vec<(String, String)> {
+        vec![(crate::hub_client::HUB_HOME_ENV.to_string(), dir.join("hub").display().to_string())]
+    }
+
     fn send(&self, store: &Store, msg: wsp_engine::addon::Outgoing) -> Result<(String, String), String> {
         if hub_switch::off(store) {
             return Err(off_said("a message for another user's wsp is not sent"));

@@ -18,10 +18,6 @@
 //! anything answers its port, and names what does. Once bound it writes
 //! `$state_dir/api.json` ([`wsp_api::Listen`]), loopback first.
 //!
-//! **TLS** (wsp-461). The hub sets [`Config::tls`] and every connection it
-//! accepts is inside a TLS session (`tls`, `tcp::Tcp::accept_tls`); the
-//! daemon sets none. The peer rule is the same either way.
-//!
 //! **Per connection** (`conn`): `hello` first, or the connection is closed;
 //! then requests answered by id. **Subscribe** (`subscribe`): a snapshot or a
 //! replay, then the head followed through `wait_for`, with a beat. The
@@ -30,10 +26,10 @@
 //! It goes through `Store` only, and links `wsp-api`, `wsp-store-contract` and
 //! `wsp-machines` alone of the workspace (never the sqlite crate: section 6).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,28 +38,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use wsp_api::{
-    ApiToken, Call, Code, Command, Connection, Failure, Frame, Hello, Listen, Outcome, Principal, SyncCall, LISTEN_FILE,
-    PROTOCOL,
-    TOKEN_FILE, TOKEN_MODE,
-};
-use wsp_store_contract::{At, SharedName, State, Store};
+use wsp_api::{ApiToken, Code, Connection, Failure, Frame, Hello, Listen, Principal, LISTEN_FILE, PROTOCOL, TOKEN_FILE, TOKEN_MODE};
+use wsp_store_contract::{At, Store};
 
 mod conn;
 pub mod domain;
 pub mod mirror;
-pub mod ranges;
-mod revoke;
 mod subscribe;
 pub mod tcp;
-pub mod tls;
 mod wip;
-#[cfg(feature = "test-support")]
-pub mod testing;
 
 pub use domain::{Composed, Mode, OWNED};
 pub use mirror::Mirror;
-pub use ranges::Ranges;
 
 /// The store a server serves: any backend, shared with its threads.
 pub type SharedStore = Arc<dyn Store + Send + Sync>;
@@ -100,65 +86,6 @@ impl std::fmt::Debug for dyn Views {
     }
 }
 
-/// What answers the sync verbs (wsp-459: `sync.heads`, `sync.have`, `sync.put`,
-/// `sync.get`, `refs.move`), which the hub (wsp-460) serves and a state core
-/// does not. Like [`Views`], it is handed in, since what holds the objects is
-/// no `dyn Store`: the server passes the call and the connection's principal in
-/// and the outcome back whole, on the asking connection's thread, after the
-/// hello and the request's `by` were checked.
-pub trait SyncVerbs: Send + Sync {
-    fn answer(&self, by: &Principal, call: SyncCall) -> Outcome;
-}
-
-impl std::fmt::Debug for dyn SyncVerbs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SyncVerbs(..)")
-    }
-}
-
-/// What a [`Gate`] says a hello is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Welcomed {
-    pub by: Principal,
-    /// The id of the credential the hello's token is, when it is one: the
-    /// server drops the connection when a `hub.token.revoked` event names it.
-    pub credential: Option<String>,
-}
-
-/// Who a connection is, where the hello's token decides it rather than its
-/// `by` (the hub, wsp-161). Without one a server keeps the state core's rule:
-/// the hello's token must be the instance's, and its `by` is trusted. Like
-/// [`SyncVerbs`] it is handed in, and the server holds nothing of what it
-/// decides from.
-pub trait Gate: Send + Sync {
-    /// The principal `hello`'s token names, which replaces the hello's `by` for
-    /// the connection's life (and is what `welcome` names), and the credential
-    /// it is (wsp-162: what a revocation of it drops); `Err` is refused
-    /// `unauthorised` with its text. `token` is the instance's own
-    /// (`api.token`), for a gate that gives it a meaning.
-    fn hello(&self, hello: &Hello, token: &ApiToken) -> Result<Welcomed, String>;
-    /// Whether the connection's principal `by` may make `call`, asked after
-    /// the request's `by` was found to be `by`; `Err` is the reply's `err`.
-    fn admits(&self, by: &Principal, call: &Call) -> Result<(), Failure>;
-    /// The commands applied through the store beside the orders machine's
-    /// (with a key, under the connection's principal), whose domain decides
-    /// who may send them.
-    fn owns(&self, cmd: &Command) -> bool;
-    /// The shared workspaces `by` may read in `state` (wsp-174): a subscription
-    /// holds only what is in them. `None`, the default, reads everything: the
-    /// state core's own rule. The server knows its domain's workspaces and
-    /// never the client's selectors, so this is authorisation, not a view.
-    fn readable(&self, _by: &Principal, _state: &State) -> Option<BTreeSet<SharedName>> {
-        None
-    }
-}
-
-impl std::fmt::Debug for dyn Gate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Gate(..)")
-    }
-}
-
 /// What a server is started with.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -175,17 +102,6 @@ pub struct Config {
     pub beat: Duration,
     /// What answers the view verbs; none answers each `unsupported`.
     pub views: Option<Arc<dyn Views>>,
-    /// What answers the sync verbs; none answers each `unsupported`.
-    pub sync: Option<Arc<dyn SyncVerbs>>,
-    /// Who a hello is; none trusts the hello's `by` behind the instance's token.
-    pub gate: Option<Arc<dyn Gate>>,
-    /// The ranges a peer must be in, and an address to bind (loopback aside,
-    /// which is always bound): none keeps [`allowed`]'s loopback and tailnet.
-    pub peers: Option<Ranges>,
-    /// TLS for every accepted connection (the hub's, wsp-461: [`tls::server_config`]);
-    /// none keeps plain TCP, which is the daemon's. It does not change who is
-    /// admitted: [`Config::admits`] reads `peers` or [`allowed`] either way.
-    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Config {
@@ -199,19 +115,6 @@ impl Config {
             instance: "wsp".into(),
             beat: Duration::from_secs(wsp_api::BEAT_SECS),
             views: None,
-            sync: None,
-            gate: None,
-            peers: None,
-            tls: None,
-        }
-    }
-
-    /// Whether a peer at `ip` may connect, or the server bind it: [`Config::peers`]
-    /// when it names ranges, else [`allowed`].
-    pub fn admits(&self, ip: &IpAddr) -> bool {
-        match &self.peers {
-            Some(ranges) => ranges.contains(ip),
-            None => allowed(ip),
         }
     }
 }
@@ -230,7 +133,7 @@ pub enum StartError {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartError::Address(ip) => write!(f, "{ip} is outside the ranges this server admits (loopback and the tailnet unless configured)"),
+            StartError::Address(ip) => write!(f, "{ip} is outside loopback and the tailnet, the ranges this server admits"),
             StartError::Answered { addr, who } => write!(f, "{who} answers at {addr}"),
             StartError::Io(why) => f.write_str(why),
         }
@@ -315,9 +218,8 @@ pub(crate) struct Shared {
     pub(crate) token: ApiToken,
     pub(crate) log: Log,
     pub(crate) stopping: AtomicBool,
-    /// The welcomed connections, by number, with a handle that closes each, and
-    /// the credentials revoked (`revoke`).
-    pub(crate) clients: Mutex<revoke::Clients>,
+    /// The welcomed connections, by number, each with a handle that closes it.
+    pub(crate) clients: Mutex<BTreeMap<u64, TcpStream>>,
     next_client: AtomicU64,
     /// The last `wip` answer, by the head it was cut at (wsp-373).
     pub(crate) wip: wip::Cache,
@@ -341,7 +243,7 @@ impl Server {
     /// answers the port, bind loopback and `cfg.addrs`, write `api.json`, and
     /// accept.
     pub fn start(store: SharedStore, cfg: Config) -> Result<Server, StartError> {
-        if let Some(bad) = cfg.addrs.iter().find(|ip| !cfg.admits(ip)) {
+        if let Some(bad) = cfg.addrs.iter().find(|ip| !allowed(ip)) {
             return Err(StartError::Address(*bad));
         }
         // Loopback is always bound, except where the IPv4 wildcard is asked for: it covers loopback, and
@@ -417,10 +319,6 @@ impl Server {
                 std::thread::spawn(move || accept(s, l))
             })
             .collect();
-        if shared.cfg.gate.is_some() {
-            let s = shared.clone();
-            threads.push(std::thread::spawn(move || revoke::follow(s)));
-        }
         {
             let s = shared.clone();
             threads.push(std::thread::spawn(move || wip::follow(s)));
@@ -440,7 +338,7 @@ impl Server {
 
     /// How many clients have been welcomed and are still connected.
     pub fn clients(&self) -> usize {
-        self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()).open.len()
+        self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// The log's path.
@@ -456,8 +354,8 @@ impl Server {
             let _ = t.join();
         }
         let clients = std::mem::take(&mut *self.shared.clients.lock().unwrap_or_else(|e| e.into_inner()));
-        for e in clients.open.values() {
-            let _ = e.stream.shutdown(std::net::Shutdown::Both);
+        for stream in clients.values() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
         self.shared.log.line("stopped");
     }
@@ -503,8 +401,8 @@ fn accept(shared: Arc<Shared>, listener: TcpListener) {
     while !shared.stopping() {
         match listener.accept() {
             Ok((stream, peer)) => {
-                if !shared.cfg.admits(&peer.ip()) {
-                    shared.log.line(&format!("{peer}: refused, outside the ranges this server admits"));
+                if !allowed(&peer.ip()) {
+                    shared.log.line(&format!("{peer}: refused, outside loopback and the tailnet"));
                     drop(stream);
                     continue;
                 }

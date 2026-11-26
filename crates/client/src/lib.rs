@@ -6,9 +6,6 @@
 //!   nothing answering is [`Silent`], never a panic or a hang.
 //! - [`Client::dial_at`] does the same against addresses and a token the
 //!   caller holds (another machine's API, its token fetched over ssh).
-//! - [`Client::dial_hub`] dials a hub with a [`Credential`] (the user's token,
-//!   from `$WSP_HUB_TOKEN` or `~/.config/wsp/hubs.json`); the instance token
-//!   goes to a [`Target::Local`] server only.
 //! - [`Client::request`] sends one verb and returns the reply with its id.
 //! - [`Client::wip`] reads the `wip` verb's cut of the state, typed.
 //! - [`Client::apply`] sends a command under one idempotency key, again under
@@ -23,13 +20,11 @@
 //!   `wsp-view` projection takes, typed.
 //! - [`Client::subscribe`] returns a [`Feed`]: the snapshot and events in
 //!   order, each event id once, reconnecting by itself from its last id.
-//! - [`Client::sync`] syncs one workspace with a hub by hash (wsp-459): the
-//!   objects each side lacks, then one `refs.move` per subject from the head
-//!   it saw; a stale move is reported, never retried. [`testing`] (behind
-//!   `test-support`) holds an in-memory hub that answers the sync verbs.
 //!
-//! It links `wsp-api`, `wsp-store-contract` and `wsp-objects` alone (the
-//! server only in tests), so web-chrome links no more of wsp than the protocol.
+//! A hub is no server of this client's: the shared-work add-on (`wsp-spoke`)
+//! has its own client of the hub. It links `wsp-api` and `wsp-store-contract`
+//! alone (the server only in tests), so web-chrome links no more of wsp than
+//! the protocol.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -41,23 +36,13 @@ use wsp_api::{
 };
 use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Refusal, Row, RowFilter, State};
 
-mod credential;
 mod dial;
 mod orders;
 mod subscribe;
-mod sync;
-mod tls;
-#[cfg(any(test, feature = "test-support"))]
-pub mod testing;
 
-pub use credential::{
-    hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, Credential, HubLogin, Target, HUBS_FILE, HUB_CA_ENV, HUB_HOME_ENV, HUB_TOKEN_ENV, HUB_URL_ENV,
-    HUB_USER_ENV,
-};
-pub use dial::{hub_cert_expiry, Silent};
+pub use dial::Silent;
 pub use orders::APPLY_ATTEMPTS;
 pub use subscribe::{Feed, Item};
-pub use sync::{ObjectSource, Stale, SyncError, SyncReport, IDS_PER_REQUEST, PUT_BYTES};
 
 /// How long [`Client::request`] waits for a reply unless [`Client::set_timeout`]
 /// says otherwise (or the dial's `wait` is longer).
@@ -146,9 +131,6 @@ pub(crate) struct Dial {
 pub(crate) enum Where {
     StateDir(PathBuf),
     Addrs { addrs: Vec<String>, token: ApiToken },
-    /// A hub, by the address its URL names, and the user's token (never the instance's);
-    /// `tls` when the URL is `tls://`.
-    Hub { addr: String, token: ApiToken, tls: Option<tls::Tls> },
 }
 
 /// A welcomed connection to the server, for requests.
@@ -178,41 +160,10 @@ impl Client {
         Client::dial_target(Dial { at: Where::Addrs { addrs, token }, by, wait })
     }
 
-    /// Dial the hub at `url` and say `hello` with the user's token from
-    /// `credential`, within `wait` in all. `tls://host:port` is TLS, the
-    /// hub's certificate checked against the platform's roots and for `host`
-    /// (wsp-461); `tcp://host:port` and a bare `host:port` are plain TCP, for
-    /// loopback and a private network. A refused certificate is [`Silent::Tls`],
-    /// naming its fault. The hub ignores the hello's `by` (wsp-161), so the
-    /// client sends the user's name (`$WSP_HUB_USER`, else `$USER`) as a hint
-    /// only, and makes every request as the principal the `welcome` names. The
-    /// instance token is never sent to a hub: [`Credential::Instance`]
-    /// is [`Silent::NotLoggedIn`], and `api.token` is never read. A lost
-    /// connection dials the same hub again.
-    pub fn dial_hub(url: &str, credential: Credential, wait: Duration) -> Result<Client, Silent> {
-        Client::dial_hub_ca(url, credential, None, wait)
-    }
-
-    /// [`Client::dial_hub`] trusting the CA in `ca` (a PEM file) and nothing
-    /// else, for a hub whose certificate a private CA signed (a test, a
-    /// self-hosted hub): `--ca <file>`, [`hub_ca`]. It applies to `tls://` only.
-    pub fn dial_hub_ca(url: &str, credential: Credential, ca: Option<&Path>, wait: Duration) -> Result<Client, Silent> {
-        let token = match credential {
-            Credential::User(token) => ApiToken(token),
-            Credential::Instance => {
-                return Err(Silent::NotLoggedIn("the instance token is never sent to a hub".into()))
-            }
-        };
-        let (addr, secure) = credential::hub_addr(url)?;
-        let tls = if secure { Some(tls::Tls::new(&addr, ca)?) } else { None };
-        Client::dial_target(Dial { at: Where::Hub { addr, token, tls }, by: credential::hint(), wait })
-    }
-
     fn dial_target(mut target: Dial) -> Result<Client, Silent> {
         let wait = target.wait;
         let open = dial::open(&target)?;
-        // Every request's `by` must be who the connection is: a hub names that from the token
-        // (wsp-161), whatever `by` the hello sent, and a server that trusts the hello names the hello's.
+        // Every request's `by` must be who the connection is: the server names it in its welcome.
         if let Some(by) = open.welcome.by.clone() {
             target.by = by;
         }
@@ -231,9 +182,8 @@ impl Client {
         &self.server
     }
 
-    /// Who this connection is: the principal the server's `welcome` named
-    /// (a hub names it from the token, wsp-161), else the one the dial said.
-    /// `wsp login` stores its name as the login's `user` (wsp-462).
+    /// Who this connection is: the principal the server's `welcome` named,
+    /// else the one the dial said.
     pub fn by(&self) -> &Principal {
         &self.target.by
     }
@@ -262,8 +212,7 @@ impl Client {
     }
 
     /// The `whoami` verb (wsp-165): who the server holds this connection as,
-    /// and the instance it is on. On a hub the principal is what the token
-    /// names.
+    /// and the instance it is on.
     pub fn whoami(&mut self) -> Result<(Principal, String), Error> {
         let reply = self.send_call(Call::Verb(Verb::Whoami(NoArgs {})), None)?;
         match reply.outcome {

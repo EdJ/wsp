@@ -253,7 +253,9 @@ fn a_row_spoke_a_adds_is_a_head_in_spoke_bs_ls_within_two_turns_and_whole_once_i
     let id = rig.a.add("Written on A");
     rig.a.wait("A's row on the hub", Duration::from_secs(30), |_| rig.hub_head(&id).is_some());
     let from = rig.b.turns();
-    rig.b.wait("the row in B's ls", Duration::from_secs(30), |s| s.ls().contains(&id));
+    // In `ls`, and readable by `show`: under load a line `ls` prints can name the row
+    // a moment before the turn that brings it has written it.
+    rig.b.wait("the row in B's ls", Duration::from_secs(30), |s| s.ls().contains(&id) && s.run(&["show", &id]).0);
     let took = rig.b.turns() - from;
     assert!(took <= 2, "the row took {took} of B's turns to reach its ls");
 

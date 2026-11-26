@@ -15,17 +15,6 @@ wsp-api = { path = "../api" }
 wsp-machines = { path = "../machines" }
 wsp-store-contract = { path = "../store-contract" }
 
-# TLS (wsp-461): the hub'"'"'s listener. The ring provider, named explicitly where a config is built, so
-# no process-wide default is installed.
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-# A generated CA and a certificate for `localhost`, for the tests of whatever serves or dials TLS
-# (`testing`, behind `test-support`).
-rcgen = { version = "0.14", optional = true }
-
-[features]
-test-support = ["dep:rcgen"]
-
 [dev-dependencies]
-wsp-server = { path = ".", features = ["test-support"] }
 # MemStore, for the tests' server, and nothing of a backend (section 6).
 wsp-store-conformance = { path = "../store-conformance" }

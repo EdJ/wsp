@@ -10,11 +10,7 @@
 //! to re-read. A `too_old` answer leads to `subscribe {}` and a fresh
 //! [`Item::State`]. Ids at or before the last handed out are dropped.
 //!
-//! On a scoped subscription (wsp-174) ids have gaps: the server sends only
-//! the events of the workspaces the subscriber may read, and nothing here
-//! assumes the ids are contiguous, only that they grow. A [`Item::Gone`]
-//! drops a record that left the subscriber's sight; an [`Item::Resync`] is a
-//! fresh snapshot after a change of scope, folded as the first one.
+//! Nothing here assumes the ids are contiguous, only that they grow.
 //!
 //! A snapshot too large for one line comes as `Feed::Part`s closed by a
 //! `Feed::State` (wsp-702); the feed puts them back together and hands out
@@ -22,11 +18,6 @@
 //! before it delivered anything (no item, no beat) is dialled again after a
 //! backoff that doubles each time, as a failed dial is, so that a snapshot the
 //! client cannot read does not cost the server one every 25 ms.
-//!
-//! A `refused { unauthorised }` after a welcome is final (wsp-162): the hub
-//! sends it to a subscriber whose token was revoked, then closes. The feed
-//! hands out what it held, dials no more, and [`Feed::refused`] says why; its
-//! iterator ends. A redial whose hello is refused `unauthorised` ends it too.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -35,9 +26,7 @@ use wsp_api::{
     Answer, Call, Code, ConnError, Connection, Event, EventId, Feed as Frames, Frame, Outcome, ReqId, Request, State,
     Subscribe, Verb, BEAT_SECS, MISSED_BEATS, PROTOCOL,
 };
-use wsp_store_contract::Subject;
-
-use crate::dial::{self, Silent, Tcp};
+use crate::dial::{self, Tcp};
 use crate::Dial;
 
 /// What a [`Feed`] hands out.
@@ -46,13 +35,6 @@ pub enum Item {
     /// The snapshot, and the id it is consistent at: the first item of
     /// `subscribe(None)`, and the one after a `too_old`.
     State { state: State, at: EventId },
-    /// A fresh snapshot of a live subscription (wsp-174): the subscriber's
-    /// scope changed, so what it may read is sent again at the head. Fold it
-    /// as the first [`Item::State`]: what was held is replaced.
-    Resync { state: State, at: EventId },
-    /// A record left the subscriber's sight (wsp-174): drop `subject`. `at` is
-    /// the id of the event that moved it.
-    Gone { subject: Subject, at: EventId },
     /// One event, in commit order; no id is handed out twice.
     Event(Event),
     /// The feed lost its connection and has a new one, subscribed from `from`
@@ -87,8 +69,6 @@ pub struct Feed {
     /// The pieces of a split snapshot so far, and the id they are at.
     parts: Option<(State, EventId)>,
     silent: Option<String>,
-    /// Why the feed is over for good: the server refused its token.
-    refused: Option<String>,
     backoff: Duration,
     retry_at: Instant,
 }
@@ -117,7 +97,6 @@ impl Feed {
             delivered: false,
             parts: None,
             silent: None,
-            refused: None,
             backoff: BACKOFF_FIRST,
             retry_at: Instant::now(),
         }
@@ -159,12 +138,6 @@ impl Feed {
         self.silent.as_deref()
     }
 
-    /// Why the feed ended for good, once the server refused its token
-    /// `unauthorised` after welcoming it: it does not dial again.
-    pub fn refused(&self) -> Option<&str> {
-        self.refused.as_deref()
-    }
-
     /// The next item, waiting up to `wait` for it; `None` when none came (the
     /// feed keeps trying to connect in the meantime and again on the next call).
     pub fn next_within(&mut self, wait: Duration) -> Option<Item> {
@@ -172,9 +145,6 @@ impl Feed {
         loop {
             if let Some(item) = self.pending.pop_front() {
                 return Some(item);
-            }
-            if self.refused.is_some() {
-                return None;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if self.conn.is_none() {
@@ -207,7 +177,6 @@ impl Feed {
             let got = self.conn.as_mut().expect("connected").recv(step);
             match got {
                 Ok(Some(Frame::Feed(frame))) => self.take(frame),
-                Ok(Some(Frame::Refused(r))) if r.code == Code::Unauthorised => self.end(r.text),
                 Ok(Some(_)) => {}
                 Ok(None) => self.quiet_wake(),
                 Err(e) => self.lose(format!("the connection failed: {e}")),
@@ -254,29 +223,8 @@ impl Feed {
                 self.delivered = true;
                 self.pending.push_back(Item::State { state, at });
             }
-            Frames::Resync { state, at } => {
-                let state = match self.parts.take() {
-                    Some((mut held, held_at)) if held_at == at => {
-                        held.absorb(state);
-                        held
-                    }
-                    _ => state,
-                };
-                // A snapshot is not an event: it is handed out whatever the
-                // last id was, which scoped feeds leave with gaps.
-                self.last = Some(at);
-                self.delivered = true;
-                self.pending.push_back(Item::Resync { state, at });
-            }
-            Frames::Gone { subject, at } => {
-                self.delivered = true;
-                if self.last.is_some_and(|last| at <= last) {
-                    self.dropped += 1;
-                } else {
-                    self.last = Some(at);
-                    self.pending.push_back(Item::Gone { subject, at });
-                }
-            }
+            // The frames of a scoped subscription, which no state core sends.
+            Frames::Resync { .. } | Frames::Gone { .. } => {}
             Frames::Event(e) => {
                 self.delivered = true;
                 if self.last.is_some_and(|last| e.id <= last) {
@@ -318,16 +266,6 @@ impl Feed {
         }
     }
 
-    /// The server refused the token after welcoming it: no more dials.
-    fn end(&mut self, why: String) {
-        if let Some(c) = self.conn.take() {
-            c.shutdown();
-        }
-        self.parts = None;
-        self.silent = Some(format!("refused unauthorised: {why}"));
-        self.refused = Some(why);
-    }
-
     fn failed(&mut self, why: String) {
         self.silent = Some(why);
         self.retry_at = Instant::now() + self.backoff;
@@ -339,9 +277,6 @@ impl Feed {
     fn connect(&mut self) {
         let mut open = match dial::open(&self.target) {
             Ok(o) => o,
-            Err(Silent::Refused(r)) if r.code == Code::Unauthorised && self.connected_before => {
-                return self.end(r.text);
-            }
             Err(s) => return self.failed(s.to_string()),
         };
         let resumed = self.connected_before.then_some(self.last).flatten();
@@ -358,10 +293,6 @@ impl Feed {
                 }
                 Err(Refusal::TooOld) => return self.reject(open.conn, "subscribe {} was refused too_old".into()),
                 Err(Refusal::Other(why)) => return self.reject(open.conn, why),
-                Err(Refusal::Revoked(why)) => {
-                    open.conn.shutdown();
-                    return self.end(why);
-                }
             }
         }
         let reconnect = self.connected_before;
@@ -404,7 +335,6 @@ impl Feed {
                         Outcome::Err(f) => Err(Refusal::Other(format!("subscribe was refused {:?}: {}", f.code, f.text))),
                     }
                 }
-                Ok(Some(Frame::Refused(r))) if r.code == Code::Unauthorised => return Err(Refusal::Revoked(r.text)),
                 // Frames of an earlier subscription cannot be on a new connection.
                 Ok(Some(_)) => {}
                 Ok(None) => return Err(Refusal::Other("no reply to subscribe in time".into())),
@@ -417,24 +347,17 @@ impl Feed {
 
 enum Refusal {
     TooOld,
-    /// `refused { unauthorised }` after the welcome.
-    Revoked(String),
     Other(String),
 }
 
 impl Iterator for Feed {
     type Item = Item;
 
-    /// Blocks until the next item: it never ends while the server may come
-    /// back, but once it refused the token (`unauthorised`, after a welcome)
-    /// it ends.
+    /// Blocks until the next item: it never ends while the server may come back.
     fn next(&mut self) -> Option<Item> {
         loop {
             if let Some(item) = self.next_within(Duration::from_secs(1)) {
                 return Some(item);
-            }
-            if self.refused.is_some() {
-                return None;
             }
         }
     }

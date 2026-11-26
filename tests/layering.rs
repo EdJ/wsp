@@ -902,10 +902,6 @@ fn the_view_links_the_contract_alone_and_does_no_io() {
 /// `serde_json` (an event's payload) and `sha2` (wsp-159: `token::hash` is the hex SHA-256 of a
 /// token), and its source names no IO of the standard library and reads no clock: `decide` and
 /// `evolve` see only the state, the command and the event they are handed.
-///
-/// One exception, on purpose (wsp-159): `src/token.rs` makes a token, so `mint` reads
-/// `/dev/urandom`. That file may name `std::fs`, `std::io` and `File::` and nothing else of the
-/// list; tokens are made and hashed there while `decide` and `evolve` stay pure.
 #[test]
 fn the_machines_link_the_contract_alone_and_do_no_io() {
     const MAY: &[&str] = &["wsp-store-contract"];
@@ -915,8 +911,8 @@ fn the_machines_link_the_contract_alone_and_do_no_io() {
 
     let named = deps_named(&fs::read_to_string(dir.join("Cargo.toml")).unwrap());
     let extra: Vec<&String> =
-        named.iter().filter(|d| !["serde_json", "sha2", "wsp-store-contract", "wsp-machines"].contains(&d.as_str())).collect();
-    assert!(extra.is_empty(), "wsp-machines depends on serde_json, sha2 and the contract alone, not {extra:?}");
+        named.iter().filter(|d| !["serde_json", "wsp-store-contract", "wsp-machines"].contains(&d.as_str())).collect();
+    assert!(extra.is_empty(), "wsp-machines depends on serde_json and the contract alone, not {extra:?}");
 
     const IO: &[&str] = &[
         "std::fs", "std::net", "std::process", "std::io", "std::os", "std::env", "std::thread", "std::time",
@@ -934,10 +930,7 @@ fn the_machines_link_the_contract_alone_and_do_no_io() {
             }
             files += 1;
             let code = strip(&fs::read_to_string(&p).unwrap());
-            // `token::mint` reads the system's randomness (wsp-159); nothing else there does IO.
-            let randomness: &[&str] =
-                if p.file_name().is_some_and(|n| n == "token.rs") { &["std::fs", "std::io", "File::"] } else { &[] };
-            for io in IO.iter().filter(|io| code.contains(*io) && !randomness.contains(io)) {
+            for io in IO.iter().filter(|io| code.contains(*io)) {
                 found.push(format!("{}: {io}", p.strip_prefix(root()).unwrap().display()));
             }
         }
@@ -951,9 +944,8 @@ fn the_machines_link_the_contract_alone_and_do_no_io() {
 /// step 2 (wsp-121), `wsp-machines` (the pure machines it composes beside the mirror), and with
 /// its tests it reaches only those and `wsp-store-conformance` (for `MemStore`) of the workspace,
 /// so nothing that does OS or store-file work: never `wsp-store-sqlite` ("not the sqlite crate,
-/// except in main"), `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`. Its external
-/// dependencies are `serde_json` and, since wsp-461's TLS on the hub's listener, `rustls` (and
-/// `rcgen`, optional, behind `test-support`, for the tests' generated CA).
+/// except in main"), `wsp-store`, `wsp-wire`, `wsp-host` or `wsp-manager`. Its one external
+/// dependency is `serde_json`: it serves no hub, and so no TLS.
 #[test]
 fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_file_work() {
     let dir = root().join("crates/server");
@@ -977,41 +969,26 @@ fn the_server_links_the_api_and_the_contract_and_nothing_that_does_os_or_store_f
         .iter()
         .filter(|d| {
             // `wsp-server` itself: the dev-dependency that turns its own `test-support` on in its tests.
-            ![
-                "serde_json",
-                "rustls",
-                "rcgen",
-                "wsp-server",
-                "wsp-api",
-                "wsp-store-contract",
-                "wsp-machines",
-                "wsp-store-conformance",
-            ]
-            .contains(&d.as_str())
+            !["serde_json", "wsp-api", "wsp-store-contract", "wsp-machines", "wsp-store-conformance"].contains(&d.as_str())
         })
         .collect();
-    assert!(
-        extra.is_empty(),
-        "wsp-server depends on serde_json, rustls, the api, the machines and the contract alone, not {extra:?}"
-    );
+    assert!(extra.is_empty(), "wsp-server depends on serde_json, the api, the machines and the contract alone, not {extra:?}");
 }
 
 /// `wsp-client`, the state core's client, speaks the protocol and nothing else: its normal
-/// dependencies are `wsp-api`, `wsp-store-contract` and, since the sync verbs (wsp-459),
-/// `wsp-objects` (pure: the ids it holds objects to and the refs it diffs), so that web-chrome,
-/// which links it by path, links no more of wsp than that (`docs/state-core.md` section 6; wsp-074). Its tests may also
-/// reach `wsp-server` and `wsp-store-conformance` (a loopback server over `MemStore`), never the
-/// store, the wire, the host, the manager or the sqlite crate. Its external dependencies are
-/// `serde_json` and, since a hub URL can be `tls://` (wsp-461), `rustls` and `rustls-native-certs`
-/// (the platform's roots).
+/// dependencies are `wsp-api` and `wsp-store-contract`, so that web-chrome, which links it by
+/// path, links no more of wsp than that (`docs/state-core.md` section 6; wsp-074). Its tests may
+/// also reach `wsp-server` and `wsp-store-conformance` (a loopback server over `MemStore`), never
+/// the store, the wire, the host, the manager or the sqlite crate. Its one external dependency is
+/// `serde_json`: a hub is no server of its (the spoke has its own client of the hub).
 #[test]
 fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone() {
     let dir = root().join("crates/client");
     let normal: Vec<String> = path_deps(&dir.join("Cargo.toml"), false).into_keys().collect();
     assert_eq!(
         normal,
-        ["wsp-api", "wsp-objects", "wsp-store-contract"],
-        "wsp-client's normal dependencies are the api, the objects and the contract"
+        ["wsp-api", "wsp-store-contract"],
+        "wsp-client's normal dependencies are the api and the contract"
     );
 
     // `wsp-machines` comes with the server its tests start (wsp-121), never as a dependency of its own.
@@ -1027,24 +1004,10 @@ fn the_client_links_the_api_and_the_contract_only_and_the_server_in_tests_alone(
     let extra: Vec<&String> = named
         .iter()
         .filter(|d| {
-            ![
-                "serde_json",
-                "rustls",
-                "rustls-native-certs",
-                "wsp-api",
-                "wsp-store-contract",
-                "wsp-objects",
-                "wsp-client",
-                "wsp-server",
-                "wsp-store-conformance",
-            ]
-            .contains(&d.as_str())
+            !["serde_json", "wsp-api", "wsp-store-contract", "wsp-server", "wsp-store-conformance"].contains(&d.as_str())
         })
         .collect();
-    assert!(
-        extra.is_empty(),
-        "wsp-client depends on serde_json, rustls, the api, the objects and the contract alone, not {extra:?}"
-    );
+    assert!(extra.is_empty(), "wsp-client depends on serde_json, the api and the contract alone, not {extra:?}");
 
     // The server is a dev-dependency: a normal dependency would link it into web-chrome.
     let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();

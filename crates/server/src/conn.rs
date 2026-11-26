@@ -32,11 +32,7 @@
 //!   stays up: as a reply to its `id` when it has one, else as `refused`.
 //! - A request whose `by` is not the connection's is `forbidden`; one whose
 //!   `v` is not [`PROTOCOL`], `protocol`. The connection is the hello's `by`,
-//!   behind the instance's token; with a [`crate::Gate`] (the hub, wsp-161)
-//!   it is the principal the gate says the hello's token names, whatever `by`
-//!   the hello sent, and each request is then put to the gate's `admits`, and
-//!   a command the gate `owns` is applied like the orders machine's, its
-//!   domain deciding who may. Either way `welcome` names it.
+//!   behind the instance's token, and `welcome` names it.
 //! - A reply whose line would be longer than [`MAX_LINE`] is not sent: the
 //!   client would drop the connection on it (wsp-377). The request is
 //!   answered `too_large` instead, naming the length. `state` of a full store
@@ -61,7 +57,6 @@ use wsp_api::{
 use wsp_machines::Orders;
 use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal, Row, RowFilter};
 
-use crate::revoke::{Entry, DROPPED};
 use crate::tcp::Tcp;
 use crate::{subscribe, Shared};
 
@@ -122,11 +117,7 @@ fn refuse(conn: &mut Tcp, code: Code, text: &str) {
 
 /// Serve one accepted connection until it ends.
 pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
-    let made = match &shared.cfg.tls {
-        Some(config) => Tcp::accept_tls(stream, config.clone()),
-        None => Tcp::new(stream),
-    };
-    let Ok(mut conn) = made else { return };
+    let Ok(mut conn) = Tcp::new(stream) else { return };
     let peer = conn.peer().map_or("?".into(), |p| p.to_string());
     let patience = shared.cfg.beat * MISSED_BEATS;
 
@@ -148,28 +139,13 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
             }
             return conn.shutdown();
         }
-        Err(e) => {
-            // A client that refuses the certificate ends the handshake here; a TLS server says so.
-            if conn.is_tls() && !matches!(e, ConnError::Closed) {
-                shared.log.line(&format!("{peer}: closed before a hello: {e}"));
-            }
-            return conn.shutdown();
-        }
+        Err(_) => return conn.shutdown(),
     };
-    let (by, credential) = match &shared.cfg.gate {
-        Some(gate) => match gate.hello(&hello, &shared.token) {
-            Ok(w) => (w.by, w.credential),
-            Err(why) => {
-                shared.log.line(&format!("{peer}: refused, {why} ({})", hello.client));
-                return refuse(&mut conn, Code::Unauthorised, &why);
-            }
-        },
-        None if same(&hello.token.0, &shared.token.0) => (hello.by.clone(), None),
-        None => {
-            shared.log.line(&format!("{peer}: refused, a wrong token ({})", hello.client));
-            return refuse(&mut conn, Code::Unauthorised, "the token is not this instance's");
-        }
-    };
+    if !same(&hello.token.0, &shared.token.0) {
+        shared.log.line(&format!("{peer}: refused, a wrong token ({})", hello.client));
+        return refuse(&mut conn, Code::Unauthorised, "the token is not this instance's");
+    }
+    let by = hello.by.clone();
     if hello.protocol != PROTOCOL {
         return refuse(
             &mut conn,
@@ -190,25 +166,12 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
         return conn.shutdown();
     };
     let writer: Writer = Arc::new(Mutex::new(writer));
-    let (subscribed, revoked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    let entry = Entry {
-        stream: handle,
-        writer: writer.clone(),
-        credential,
-        by: by.clone(),
-        subscribed: subscribed.clone(),
-        revoked: revoked.clone(),
-    };
-    // A token revoked between its hello and here is found by the registry.
-    if shared.clients.lock().unwrap_or_else(|e| e.into_inner()).add(n, entry).is_err() {
-        shared.log.line(&format!("{peer} ({}): {DROPPED}", hello.client));
-        return refuse(&mut conn, Code::Unauthorised, "the token is revoked");
-    }
-    let mut c = Client { shared: &shared, by, writer, closed: Arc::new(AtomicBool::new(false)), subscribed, revoked, feed: None };
+    shared.clients.lock().unwrap_or_else(|e| e.into_inner()).insert(n, handle);
+    let mut c = Client { shared: &shared, by, writer, closed: Arc::new(AtomicBool::new(false)), feed: None };
     let why = if shared.stopping() { "closed, the server stops".to_string() } else { c.follow(&mut conn) };
     c.closed.store(true, Ordering::SeqCst);
     conn.shutdown();
-    shared.clients.lock().unwrap_or_else(|e| e.into_inner()).open.remove(&n);
+    shared.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&n);
     if let Some(feed) = c.feed.take() {
         let _ = feed.join();
     }
@@ -220,15 +183,11 @@ pub(crate) fn serve(shared: Arc<Shared>, stream: TcpStream, n: u64) {
 /// A welcomed connection.
 struct Client<'a> {
     shared: &'a Arc<Shared>,
-    /// Who the connection is: the hello's `by`, or what the gate resolved.
+    /// Who the connection is: the hello's `by`.
     by: Principal,
     writer: crate::conn::Writer,
     /// Set by either half when the connection is done.
     closed: Arc<AtomicBool>,
-    /// Set when `subscribe` is answered, so a revocation tells the feed.
-    subscribed: Arc<AtomicBool>,
-    /// Set by the revocation thread when it cut this connection.
-    revoked: Arc<AtomicBool>,
     /// The subscription's thread, once `subscribe` was answered.
     feed: Option<JoinHandle<()>>,
 }
@@ -243,9 +202,6 @@ impl Client<'_> {
         loop {
             if self.shared.stopping() {
                 return "closed, the server stops".into();
-            }
-            if self.revoked.load(Ordering::SeqCst) {
-                return DROPPED.into();
             }
             if self.closed.load(Ordering::SeqCst) {
                 return "closed, its feed could not be written".into();
@@ -265,7 +221,6 @@ impl Client<'_> {
                     heard = Instant::now();
                 }
                 Ok(None) => {}
-                Err(_) if self.revoked.load(Ordering::SeqCst) => return DROPPED.into(),
                 Err(ConnError::Closed) => return String::new(),
                 Err(e) => return format!("closed: {e}"),
             }
@@ -309,11 +264,6 @@ impl Client<'_> {
             let f = Failure { code: Code::Forbidden, text, refusal: Some(Refusal::Forbidden { by: req.by }) };
             return send(&self.writer, &reply(id, Err(f)));
         }
-        if let Some(gate) = &self.shared.cfg.gate {
-            if let Err(f) = gate.admits(&self.by, &req.call) {
-                return send(&self.writer, &reply(id, Err(f)));
-            }
-        }
         let outcome = match req.call {
             Call::Verb(Verb::Subscribe(sub)) => return self.subscribe(id, sub),
             // Who this connection is: the principal it was welcomed as, which `read` does not hold (wsp-165).
@@ -325,14 +275,8 @@ impl Client<'_> {
             },
             Call::Verb(verb) => read(self.shared, verb),
             Call::Command(cmd) => return self.command(id, req.key, cmd),
-            // The sync verbs are the hub's (wsp-460): answered by what it handed in, else not this server's.
-            Call::Sync(call) => match &self.shared.cfg.sync {
-                Some(sync) => match sync.answer(&self.by, call) {
-                    Outcome::Ok(a) => Ok(a),
-                    Outcome::Err(f) => Err(f),
-                },
-                None => Err(failure(Code::Unsupported, format!("{} is a hub's verb, not this server's", call.verb()))),
-            },
+            // The sync verbs are a hub's, which this server is not.
+            Call::Sync(call) => Err(failure(Code::Unsupported, format!("{} is a hub's verb, not this server's", call.verb()))),
             Call::Unknown { verb, .. } => {
                 if READ_VERBS.contains(&verb.as_str())
                     || COMMAND_VERBS.contains(&verb.as_str())
@@ -351,13 +295,12 @@ impl Client<'_> {
     /// with a key, applied; every other `unsupported`.
     fn command(&mut self, id: ReqId, key: Option<IdempotencyKey>, cmd: Command) -> bool {
         let verb = verb_of(&cmd);
-        let gated = self.shared.cfg.gate.as_ref().is_some_and(|g| g.owns(&cmd));
-        if !gated && !Orders::owns(&cmd) {
+        if !Orders::owns(&cmd) {
             let text = format!("{verb} is a command this server does not run over the API");
             return send(&self.writer, &reply(id, Err(failure(Code::Unsupported, text))));
         }
         let by = &self.by;
-        if !gated && !may_command(&self.shared.cfg.instance, by, &cmd) {
+        if !may_command(&self.shared.cfg.instance, by, &cmd) {
             let text = if matches!(cmd, Command::OrderSend { .. } | Command::OrderCancel { .. }) {
                 format!("{verb} is sent by a person or a seat, not {}", wsp_api::principal::text(by))
             } else {
@@ -385,11 +328,10 @@ impl Client<'_> {
             let f = failure(Code::Invalid, "this connection is subscribed already; it holds one subscription".into());
             return send(&self.writer, &reply(id, Err(f)));
         }
-        let opened = match subscribe::open(self.shared, &sub, &self.by) {
+        let opened = match subscribe::open(self.shared, &sub) {
             Ok(o) => o,
             Err(f) => return send(&self.writer, &reply(id, Err(f))),
         };
-        self.subscribed.store(true, Ordering::SeqCst);
         if !send(&self.writer, &reply(id, Ok(Answer::Subscribed))) {
             return false;
         }

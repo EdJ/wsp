@@ -270,6 +270,14 @@ pub trait SharedWork: Send + Sync {
     ) {
     }
 
+    /// The environment a sandbox in `dir` sets so that the add-on's own state
+    /// (its login, for one) is kept apart from the developer's and from every
+    /// other sandbox's: names and values, each value under `dir`. None
+    /// standalone.
+    fn isolate(&self, _dir: &std::path::Path) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// The daemon's background work for the add-on, started once with what the
     /// daemon lends it. `None` when there is nothing to run.
     fn start(&self, _store: &Store, _lent: Lent) -> Option<std::thread::JoinHandle<()>> {
