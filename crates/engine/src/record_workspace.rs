@@ -2,26 +2,33 @@
 //! `wsp project add` file into the caller's workspace.
 //!
 //! Private unless `--workspace shared:<name>` or `$WSP_WORKSPACE` says
-//! otherwise (the flag first). A shared workspace needs a login
-//! (`~/.config/wsp/hubs.json` or `$WSP_HUB_TOKEN`); membership is read from the
-//! cache's member list once wsp-465 lands, and until then a login is what is
-//! asked. A child (sub-task, leg, piece) takes its parent's workspace, whatever
-//! the flag says. Moving a record that exists is `wsp publish` (wsp-185), never
-//! a flag on an edit: no edit verb reads `--workspace`.
+//! otherwise (the flag first). A shared workspace needs the shared-work add-on
+//! to say yes ([`crate::addon::SharedWork::may_file_shared`]: the spoke asks
+//! for a login, `~/.config/wsp/hubs.json` or `$WSP_HUB_TOKEN`); with none, a
+//! shared workspace is refused and everything is private. A child (sub-task,
+//! leg, piece) takes its parent's workspace, whatever the flag says. Moving a
+//! record that exists is `wsp publish` (wsp-185), never a flag on an edit: no
+//! edit verb reads `--workspace`.
+//!
+//! This is core, not the add-on's: the workspace is a field of every record,
+//! and it is core that stamps it on a new one and keeps a child where its
+//! parent is, so a private record stays private whether or not an add-on is
+//! there. The add-on is asked one thing, whether shared may be filed at all.
 
 use crate::model::WorkspaceId;
+use crate::store::Store;
 
 /// The environment variable that names the default workspace.
 pub const ENV: &str = "WSP_WORKSPACE";
 
 /// The workspace a new record is filed in. `parent` is the workspace of the
 /// record's parent, when it has one: it decides, and the flag is not read.
-pub fn of_new(flag: Option<&str>, parent: Option<&WorkspaceId>) -> Result<WorkspaceId, String> {
+pub fn of_new(store: &Store, flag: Option<&str>, parent: Option<&WorkspaceId>) -> Result<WorkspaceId, String> {
     if let Some(p) = parent {
         return Ok(p.clone());
     }
     let env = std::env::var(ENV).ok();
-    resolve(flag, env.as_deref(), || wsp_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string()))
+    resolve(flag, env.as_deref(), || crate::addon::get().may_file_shared(store))
 }
 
 /// [`of_new`] without a parent, with the flag, the environment's value and the
@@ -88,8 +95,20 @@ mod tests {
 
     #[test]
     fn a_child_takes_its_parents_workspace_whatever_the_flag_says() {
+        let (_env, store) = crate::testkit::isolated_store("record-workspace-child");
         let shared: WorkspaceId = "shared:core".parse().unwrap();
-        assert_eq!(of_new(Some("private"), Some(&shared)), Ok(shared.clone()));
-        assert_eq!(of_new(Some("shared:core"), Some(&WorkspaceId::Private)), Ok(WorkspaceId::Private));
+        assert_eq!(of_new(&store, Some("private"), Some(&shared)), Ok(shared.clone()));
+        assert_eq!(of_new(&store, Some("shared:core"), Some(&WorkspaceId::Private)), Ok(WorkspaceId::Private));
+    }
+
+    /// With no add-on on the thread a shared workspace is refused, naming the
+    /// login, and nothing said is private still.
+    #[test]
+    fn with_no_addon_shared_is_refused_and_private_is_private() {
+        let (_env, store) = crate::testkit::isolated_store("record-workspace-standalone");
+        let _standalone = crate::addon::scoped(std::sync::Arc::new(crate::addon::Standalone));
+        let why = of_new(&store, Some("shared:core"), None).unwrap_err();
+        assert!(why.contains("wsp login") && why.contains("shared:core"), "{why}");
+        assert_eq!(of_new(&store, Some("private"), None), Ok(WorkspaceId::Private));
     }
 }

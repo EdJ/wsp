@@ -123,20 +123,9 @@ pub fn plan(store: &Store, target: &str) -> Result<Plan, String> {
     Ok(Plan { list, rows: rows.iter().map(|t| (t.id.clone(), code_of(store, t))).collect(), pieces })
 }
 
-/// The highest number under `code` this store has used: a row live or archived,
-/// the project's counter, and an id `ids.json` knows.
-pub fn highest_local(store: &Store, code: &str) -> u64 {
-    let prefix = format!("{code}-");
-    let num = |id: &str| id.strip_prefix(&prefix).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).and_then(|n| n.parse::<u64>().ok());
-    let mut top = store.projects().iter().filter(|p| p.code() == code).map(|p| p.seq as u64).max().unwrap_or(0);
-    for t in store.tasks().iter().chain(store.archived_tasks().iter()) {
-        top = top.max(num(&t.id).unwrap_or(0));
-    }
-    for (k, v) in store.renamed_ids() {
-        top = top.max(num(&k).unwrap_or(0)).max(num(&v).unwrap_or(0));
-    }
-    top
-}
+/// The highest number under `code` this store has used: the import door's
+/// reading, which renumbers a private row out of a shared id's way too.
+pub use crate::door::highest_local;
 
 fn taken_here(store: &Store, id: &str, ids: &BTreeMap<String, String>) -> bool {
     store.task_path(id).exists() || ids.contains_key(id) || store.archived_tasks().iter().any(|t| t.id == id)

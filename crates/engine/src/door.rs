@@ -13,7 +13,7 @@
 //! synced, a parent that is not the head, or a local write since the head not
 //! yet pushed) is the two sides having moved apart, and goes to [`Reconcile`]
 //! (wsp-176), which writes what it decides; the door writes nothing of its own
-//! for it. [`crate::reconcile::Merging`] is the one that merges.
+//! for it. The spoke's merging reconcile is the one that merges.
 //!
 //! **Not pushed back.** The spoke keeps, per subject, the head it last synced
 //! and the digest of the file that head left ([`Heads`], in the state
@@ -165,7 +165,7 @@ impl<'a> Door<'a> {
         }
         let Some((code, _)) = id.rsplit_once('-') else { return Ok(()) };
         let ids = self.store.renamed_ids();
-        let mut n = crate::cmd_publish::highest_local(self.store, code) + 1;
+        let mut n = highest_local(self.store, code) + 1;
         let fresh = loop {
             let cand = format!("{code}-{n:03}");
             if !self.store.task_path(&cand).exists() && !ids.contains_key(&cand) && !self.store.archived_tasks().iter().any(|t| t.id == cand) {
@@ -347,6 +347,21 @@ pub fn pending(store: &Store) -> Vec<Subject> {
             (!t.workspace.is_private() && moved).then_some(subject)
         })
         .collect()
+}
+
+/// The highest number under `code` this store has used: a row live or archived,
+/// the project's counter, and an id `ids.json` knows.
+pub fn highest_local(store: &Store, code: &str) -> u64 {
+    let prefix = format!("{code}-");
+    let num = |id: &str| id.strip_prefix(&prefix).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).and_then(|n| n.parse::<u64>().ok());
+    let mut top = store.projects().iter().filter(|p| p.code() == code).map(|p| p.seq as u64).max().unwrap_or(0);
+    for t in store.tasks().iter().chain(store.archived_tasks().iter()) {
+        top = top.max(num(&t.id).unwrap_or(0));
+    }
+    for (k, v) in store.renamed_ids() {
+        top = top.max(num(&k).unwrap_or(0)).max(num(&v).unwrap_or(0));
+    }
+    top
 }
 
 #[cfg(test)]

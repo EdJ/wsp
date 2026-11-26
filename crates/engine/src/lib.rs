@@ -17,6 +17,7 @@ pub mod testkit {
     pub use wsp_testkit::{git, repo, repo_at};
 }
 
+pub mod addon;
 pub mod address;
 pub mod affected;
 pub mod after;
@@ -111,6 +112,7 @@ pub mod scope;
 pub mod scratch;
 pub mod size_check;
 pub mod split;
+pub mod spoke;
 pub mod stage;
 pub mod stand_down;
 pub mod starts;

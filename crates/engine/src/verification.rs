@@ -974,7 +974,7 @@ pub fn verified_as(store: &Store, args: &Args, me: Option<String>) -> i32 {
     };
     // Another user leased the row while this spoke was offline: its verdict is
     // refused, and nothing is written (wsp-469, wsp-483).
-    if let Some(why) = crate::hub_journal::refusal(store, &member.id, "verified") {
+    if let Some(why) = crate::addon::get().refusal(store, &member.id, "verified") {
         eprintln!("{why}");
         return 1;
     }
@@ -2262,7 +2262,7 @@ mod tests {
             after_land: crate::check::after_land,
             rerun: crate::check::rerun,
             held: |_| None,
-            refused: |store, row| crate::hub_journal::refusal(store, row, "land"),
+            refused: |store, row| crate::addon::get().refusal(store, row, "land"),
         });
         let env = util::isolated(&format!("hold-{tag}"));
         let store = Store::at(env.home(), env.state());
@@ -2352,32 +2352,29 @@ mod tests {
         crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).collect())
     }
 
-    /// The journal's side chain for `m-1`, written by this spoke while it was
-    /// offline and now behind another user's lease (wsp-469): the state
-    /// `hub_journal::refusal` reads.
-    fn side_chain_it(g: &Ground) {
-        let mut sides = crate::hub_journal::Sides::default();
-        sides.rows.insert(
-            "m-1".into(),
-            crate::hub_journal::Side {
-                workspace: "ws-1".into(),
-                row: "m-1".into(),
-                tip: "sha256:0123456789abcdef0123456789abcdef".into(),
-                holder: "bo".into(),
-                old: "ann".into(),
-                mine: true,
-                token: Some(1),
-                at: "2026-11-23T10:00:00Z".into(),
-            },
-        );
-        sides.write(&g.store).unwrap();
+    /// A shared-work add-on that refuses every verb on `m-1`, as the spoke does
+    /// for a row its journal side-chained while it was offline and another
+    /// user's spoke now holds (wsp-469; the spoke's reading of `side.json` is
+    /// tested beside it, in `spoke`).
+    struct SideChained;
+
+    impl crate::addon::SharedWork for SideChained {
+        fn refusal(&self, _: &Store, row: &str, verb: &str) -> Option<String> {
+            (row == "m-1").then(|| {
+                format!("wsp: {row} was leased by bo while this spoke was offline, so `wsp {verb}` is refused here: the work done offline is on the hub as a side chain")
+            })
+        }
+    }
+
+    fn side_chain_it() -> crate::addon::Scoped {
+        crate::addon::scoped(std::sync::Arc::new(SideChained))
     }
 
     #[test]
     fn a_row_the_journal_side_chained_refuses_the_hold_and_the_land_and_moves_nothing() {
         let g = ground("side-chained", "", &[("m.txt", "mine\n")], &[]);
-        side_chain_it(&g);
-        let why = crate::hub_journal::refusal(&g.store, "m-1", "verified").expect("the row is refused");
+        let side_chained = side_chain_it();
+        let why = crate::addon::get().refusal(&g.store, "m-1", "verified").expect("the row is refused");
         let before = g.trunk();
         let log = g.member().body.clone();
 
@@ -2397,19 +2394,19 @@ mod tests {
             after_land: crate::check::after_land,
             rerun: crate::check::rerun,
             held: |_| None,
-            refused: |store, row| crate::hub_journal::refusal(store, row, "land"),
+            refused: |store, row| crate::addon::get().refusal(store, row, "land"),
         });
         assert_eq!(land(&[]), 1, "`wsp land` is refused");
         assert_eq!(land(&[("for-run", "true")]), 1, "and the run's land of the member");
         match crate::cmd_checkout::land_verdict(&g.store, "m-1") {
-            crate::cmd_checkout::Verdict::Blocked(said) => assert_eq!(said, crate::hub_journal::refusal(&g.store, "m-1", "land").unwrap()),
+            crate::cmd_checkout::Verdict::Blocked(said) => assert_eq!(said, crate::addon::get().refusal(&g.store, "m-1", "land").unwrap()),
             _ => panic!("the hold's own land is refused with the journal's reason"),
         }
         assert_eq!(g.trunk(), before, "nothing reached the trunk");
         assert!(why.contains("`wsp verified` is refused here") && why.contains("bo"), "{why}");
 
         // The same row with the side chain gone lands: the refusal was the whole of it.
-        std::fs::remove_file(g.store.state.join("hub").join("side.json")).unwrap();
+        drop(side_chained);
         assert_eq!(land(&[]), 0);
         assert_ne!(g.trunk(), before);
     }

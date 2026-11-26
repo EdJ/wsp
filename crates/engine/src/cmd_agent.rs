@@ -2688,7 +2688,7 @@ pub fn hand_off(store: &Store, task_id: &str, to: Option<&str>, reason: &str) {
     let get = |k: &str| claim.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let from = get("claimed_at");
     let secs = util::since(&from);
-    crate::hub_lease::let_go(task_id, &claim);
+    crate::addon::get().let_go(store, task_id, &claim);
 
     // What the attempt was actually served at, asked for while the record that
     // answers it is still standing: `thread_for_task` reads the binding first
@@ -2996,7 +2996,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
     // A row in a shared workspace is the hub's to lease (wsp-466): taken before
     // anything is written, so a row another user's spoke holds, or one allocated
     // to someone else, is refused with nothing changed here.
-    let leased = match crate::hub_lease::before_claim(store, &t.id) {
+    let leased = match crate::addon::get().before_claim(store, &t.id) {
         Ok(l) => l,
         Err(why) => {
             if args.json() {
@@ -3102,7 +3102,7 @@ pub fn claim(store: &Store, args: &Args) -> i32 {
         }
         wsp_store::store::stamp_claim_expiry(&mut claim);
         if let Some(held) = &leased {
-            crate::hub_lease::stamp(&mut claim, held);
+            crate::addon::get().stamp(&mut claim, held);
         }
         store.set_claim(&t.id, claim);
 
@@ -7184,12 +7184,12 @@ pub fn doctor(store: &Store, args: &Args) -> i32 {
         &mut problems,
         &mut notes,
     );
-    // And the hub: one line for a standalone wsp, the login's state for a spoke.
+    // And the shared-work add-on: one line for a standalone wsp, the login's
+    // state for a spoke.
     {
         // A seat is alive when the fleet census the seat checks above read lists it.
-        crate::hub_sync::health(
+        crate::addon::get().health(
             store,
-            wsp_client::hub_home().as_deref(),
             util::epoch_secs(),
             &mut |seat| seats.iter().any(|s| s.seat.as_str() == seat),
             &mut problems,

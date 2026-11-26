@@ -2710,8 +2710,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // A shared row allocated to another user runs on their wsp: refused before
     // anything opens, and before the hub is asked (wsp-416).
     if let Some(t) = work.task.as_deref() {
-        if let Some(user) = crate::cmd_allocate::allocated_elsewhere(store, t) {
-            eprintln!("wsp: {}", crate::cmd_allocate::elsewhere_said(t, &user));
+        if let Some(user) = crate::addon::get().allocated_elsewhere(store, t) {
+            eprintln!("wsp: {t} is allocated to {user}; it runs on their wsp");
             return 1;
         }
     }

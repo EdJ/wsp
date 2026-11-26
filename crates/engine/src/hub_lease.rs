@@ -84,11 +84,8 @@ pub fn install(release: Release, alive: Alive) {
 }
 
 /// A lease the hub granted: its token and when it runs out, in epoch seconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Held {
-    pub token: Token,
-    pub expires: i64,
-}
+/// The type crosses to core, so it is the add-on interface's.
+pub use crate::addon::Held;
 
 fn who(p: &Principal) -> String {
     match p {
@@ -562,17 +559,10 @@ impl Book {
     }
 }
 
-/// What the gate before advancing a shared list answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Drives {
-    /// Advance it: this spoke holds the drive lease, or the list is private,
-    /// or there is no hub (the standalone case).
-    Here,
-    /// Another user's spoke drives it, or is the one that may.
-    Elsewhere(String),
-    /// Not advanced this turn: the hub did not answer, in words.
-    NotYet(String),
-}
+/// What the gate before advancing a shared list answers: `Here` (this spoke
+/// holds the drive lease, the list is private, or there is no hub),
+/// `Elsewhere(user)` or `NotYet(why)`. The add-on interface's type.
+pub use crate::addon::Drives;
 
 /// The user a shared list's drive lease belongs to: its allocated user, else
 /// its publisher (the first record of it this spoke holds), else `None` (a
@@ -618,20 +608,12 @@ pub fn drive(store: &Store, w: &crate::model::Worklist) -> Drives {
     }
 }
 
-/// What the run does about one member of a list it drives, before it starts it.
-#[derive(Debug)]
-pub enum Member {
-    /// No lease to take: a private row, or no hub.
-    Free,
-    /// The hub leased it to this spoke's user; the spawn's claim takes it again
-    /// (the same holder keeps its token).
-    Leased(Held),
-    /// Another user's spoke holds it: it runs there, and the barrier waits for
-    /// its landing as for any member.
-    Elsewhere(String),
-    /// The hub did not answer, in words: not started this turn.
-    NotYet(String),
-}
+/// What the run does about one member of a list it drives, before it starts
+/// it: `Free` (a private row, or no hub), `Leased` (the spawn's claim takes it
+/// again; the same holder keeps its token), `Elsewhere(user)` (it runs there,
+/// and the barrier waits for its landing) or `NotYet(why)`. The add-on
+/// interface's type.
+pub use crate::addon::Member;
 
 /// The driver leases `row` before spawning it (wsp-467). A refusal `held`
 /// records the holder, so the run neither starts, reseats nor verifies the
@@ -1424,6 +1406,8 @@ pub mod tests {
     #[test]
     fn hub_lease_start_on_a_row_allocated_to_another_user_is_refused_before_the_hub() {
         let env = crate::util::isolated("hub-lease-416");
+        // Core asks the shared-work add-on: the spoke, on this thread.
+        let _addon = crate::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
         let (listener, home) = counted_login(&env, "jesper");
         let was = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);

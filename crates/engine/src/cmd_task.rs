@@ -158,7 +158,7 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     // Private unless said otherwise; a sub-task is where its parent is (wsp-172).
     // Before an id exists, so a refusal leaves nothing reserved.
     let beside = parent.as_ref().or(found_by.as_ref()).map(|p| &p.workspace);
-    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), beside) {
+    let workspace = match crate::record_workspace::of_new(store, args.get("workspace").as_deref(), beside) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("wsp: {why}");
@@ -896,14 +896,19 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    // A row the synced cache keeps as a head only (wsp-465), brought whole.
-    if args.has("fetch") && crate::hub_cache::is_head(store, &t.id) {
-        if let Err(why) = crate::hub_sync::fetch(store, &t.id) {
-            eprintln!("wsp: {why}");
-            return 1;
-        }
-        if let Some(whole) = store.task(&t.id) {
-            t = whole;
+    // A row the shared-work add-on keeps as a stub only (wsp-465), brought whole.
+    if args.has("fetch") {
+        match crate::addon::get().fetch(store, &t.id) {
+            Some(Err(why)) => {
+                eprintln!("wsp: {why}");
+                return 1;
+            }
+            Some(Ok(())) => {
+                if let Some(whole) = store.task(&t.id) {
+                    t = whole;
+                }
+            }
+            None => {}
         }
     }
 
@@ -927,12 +932,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     println!("{} {}", p.dim(&util::pad("created", 9)), t.created);
     println!("{} {}", p.dim(&util::pad("updated", 9)), t.updated);
-    // A head says so, above everything it does not have.
-    if let Some(line) = crate::hub_cache::show_line(store, &t.id) {
-        println!("{} {}", p.dim(&util::pad("hub", 9)), line);
-    }
-    // A side chain (wsp-469): this row's offline work went to the hub beside it.
-    if let Some(line) = crate::hub_journal::show_line(store, &t.id) {
+    // What the shared-work add-on says of the row: a stub says so, above
+    // everything it does not have, and a side chain (wsp-469) says where this
+    // row's offline work went.
+    for line in crate::addon::get().show_lines(store, &t.id) {
         println!("{} {}", p.dim(&util::pad("hub", 9)), line);
     }
     // Above the prose rather than after it. Everything below this point reads
@@ -1336,7 +1339,7 @@ pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
     // (wsp-466): refused, naming the holder, with nothing changed.
     if status == Status::Doing {
         if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
-            if let Err(why) = crate::hub_lease::before_claim(store, &t.id) {
+            if let Err(why) = crate::addon::get().before_claim(store, &t.id) {
                 eprintln!("wsp: {verb}: {why}");
                 return 1;
             }
@@ -1466,7 +1469,7 @@ fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<Stri
 fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> i32 {
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
         // Another user leased it while this spoke was offline (wsp-469).
-        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "done") {
+        if let Some(why) = crate::addon::get().refusal(store, &t.id, "done") {
             return refuse_done(args, &t.id, &why, 0, Vec::new());
         }
         let seats = standing_on(store, &t.id, live);
@@ -2005,7 +2008,7 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             eprintln!("{why}");
             return 1;
         }
-        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "review") {
+        if let Some(why) = crate::addon::get().refusal(store, &t.id, "review") {
             eprintln!("{why}");
             return 1;
         }
@@ -2123,7 +2126,7 @@ pub fn accept(store: &Store, args: &Args, account: &str, said: Option<&str>) -> 
 fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
     // A row copied to an executor is reviewed only at the tree `verify` ran on.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
-        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "submit") {
+        if let Some(why) = crate::addon::get().refusal(store, &t.id, "submit") {
             eprintln!("{why}");
             return 1;
         }

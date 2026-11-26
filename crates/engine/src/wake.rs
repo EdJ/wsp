@@ -669,14 +669,13 @@ impl Primaries<'_> {
 /// `text` to `to` (`primary:<user>`) as a routed message of the hub's
 /// (`wsp-470`): the hub queues it for an offline spoke and tells it once.
 fn through_the_hub(store: &Store, to: &str, text: &str) -> Result<String, String> {
-    let home = wsp_client::hub_home().ok_or("no HOME")?;
-    if !home.join(wsp_client::HUBS_FILE).exists() {
+    let shared = crate::addon::get();
+    if !shared.active(store) {
         return Err("not logged in to a hub: `wsp login <url>`".into());
     }
     let book = crate::address::Book::read(store);
-    match crate::cmd_message::hub_tell(store, &home, &book, to, text, None, "wsp", None) {
-        Some(Ok((id, ..))) => Ok(id),
-        Some(Err(why)) => Err(why),
+    match crate::cmd_message::off_machine(store, &book, to, text, None, "wsp", None) {
+        Some(msg) => shared.send(store, msg).map(|(id, _)| id),
         None => Err(format!("`{to}` is not another user's primary")),
     }
 }

@@ -7,10 +7,11 @@ The engine and the seats, the phase 2 cut (`docs/components.md` §5, wsp-440). D
 
 ## Holds
 
-The `engine` and `seats` rows of the layering map, 97 modules: the run (`worklist`, `cycle`, `repair`, `verification`,
+The `engine` and `seats` rows of the layering map, 99 modules: the run (`worklist`, `cycle`, `repair`, `verification`,
 `legs`, `leg_seat`, `stage`, `barrier*`, `check`, `closing`, `ending`, `hold*`), the row and list verbs (`cmd_task`,
-`cmd_worklist`, `cmd_message`, `cmd_submit`, …), orders, `fold`, `mirror`, `deliver`, the hub's spoke side
-(`hub_*`, `cmd_hub`, `cmd_login`), and the seat commands (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `room`,
+`cmd_worklist`, `cmd_message`, `cmd_submit`, …), orders, `fold`, `mirror`, `deliver`, the shared-work add-on
+interface (`addon`), the hub's spoke side behind it (`spoke`, `hub_*`, `cmd_hub`, `cmd_login`, `cmd_publish`,
+`cmd_allocate`, `reconcile`: no other module names these), and the seat commands (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `room`,
 `cmd_govern`, `cmd_watch`, `cmd_machine`, `cmd_sandbox`, `cmd_install`, …), with `disk` and `memory`. The rows stay
 two in the map so a later split starts from them; the 28 `engine -> seats` lines are a ratchet inside the crate.
 
@@ -26,6 +27,10 @@ they stay in `wsp` and use this crate, never the other way (`docs/components-upw
 - `outputs::install(cmd_report::REPORTS)`: timeline's report writers. This crate's tests install stand-ins that put
   `effort.*` and `work.html` where the real ones do; the real writers are tested in `cmd_report`.
 - `mirror::LIST_OUTPUTS`, `LIST_SHOW`, `SEAT_WORKING`, `ROW_HOLDER`, `cmd_checkout::install_engine`: as before the cut.
+- `addon::install(Arc::new(spoke::Spoke::new()))`: the shared-work add-on, which core asks through `addon::get` and
+  never by its modules. Unset, every answer is the standalone one. The daemon starts its background work with one
+  `addon::get().start(store, Lent { .. })`. This crate's tests run standalone unless a test puts an add-on on its
+  own thread with `addon::scoped` (the spoke's tests put the spoke there).
 
 ## Notes
 

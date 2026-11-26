@@ -411,7 +411,7 @@ pub fn new(store: &Store, args: &Args) -> i32 {
         None => None,
     };
 
-    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), None) {
+    let workspace = match crate::record_workspace::of_new(store, args.get("workspace").as_deref(), None) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("wsp: {why}");
@@ -3651,7 +3651,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
         println!("{}  for {u}", p.dim(&util::pad("for", 8)));
     }
     // A shared list moves on one spoke, its driver's (wsp-467).
-    if let Some(u) = crate::hub_lease::driven_by(store, &w) {
+    if let Some(u) = crate::addon::get().driven_by(store, &w) {
         println!("{}  driven by {u}", p.dim(&util::pad("driven", 8)));
     }
     // Where it is up to, and — on a list nobody has started — the fact that
@@ -3736,7 +3736,7 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             if pos.at == Some(ordinal) {
                 for s in pos.holding() {
                     let mut note = edge_note(edges.get(&s.id), waits.get(&s.id));
-                    if let Some(user) = crate::hub_lease::running_elsewhere(store, &s.id) {
+                    if let Some(user) = crate::addon::get().running_elsewhere(store, &s.id) {
                         note.push_str(&format!(" · running on {user}'s wsp"));
                     }
                     println!("{}{}  {}", " ".repeat(members_at), s.id, p.dim(&format!("{}{note}", s.settlement.word())));

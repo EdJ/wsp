@@ -215,10 +215,32 @@ pub fn dial(home: &std::path::Path) -> Result<Client, String> {
     Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| e.to_string())
 }
 
+/// [`crate::cmd_message::off_machine`]'s message sent to the hub the login in
+/// `home` names: `None` for a tell delivered here (nothing is dialled), else
+/// the hub's id for it, the user it was routed to and the address, or why it
+/// did not take it.
+#[allow(clippy::too_many_arguments)]
+pub fn hub_tell(
+    store: &Store,
+    home: &std::path::Path,
+    book: &crate::address::Book,
+    needle: &str,
+    text: &str,
+    re: Option<&str>,
+    from: &str,
+    seat: Option<String>,
+) -> Option<Result<(String, String, String), String>> {
+    let msg = crate::cmd_message::off_machine(store, book, needle, text, re, from, seat)?;
+    let to = msg.to.clone();
+    let sent = dial(home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()));
+    Some(sent.map(|(id, user)| (id, user, to)))
+}
+
 /// How a message the hub delivered is handed to a seat here: to `seat`, the
 /// dressed `text`, from `from`, under the idempotency `key`; the order's id, or
-/// why not.
-pub type Hand<'a> = dyn Fn(&wsp_store_contract::SeatId, &str, &Principal, &str) -> Result<String, String> + 'a;
+/// why not. Core's `cmd_message::receive` takes it, so it is the add-on
+/// interface's type.
+pub use crate::addon::Hand;
 
 /// What keeps a tell for a seat's next idle under `WSP_ORDERS=files`: the
 /// seats layer's held-tell spool, which this layer cannot reach, so the daemon
@@ -1526,6 +1548,8 @@ mod tests {
     #[test]
     fn a_tell_to_a_row_another_users_spoke_holds_is_told_there_and_its_reply_comes_back() {
         let env = crate::util::isolated("hub-msg-two-spokes");
+        // Core asks the shared-work add-on: the spoke, on this thread.
+        let _addon = crate::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
         let dir = env.home().parent().unwrap().join("two-spokes");
         let _ = std::fs::remove_dir_all(&dir);
         let (running, tokens) = message_hub(&dir);
@@ -1549,7 +1573,7 @@ mod tests {
 
         // Ed's seat tells seat:j-1.
         let book = crate::address::Book::read(&ed);
-        let sent = crate::cmd_message::hub_tell(&ed, &ed_home, &book, "seat:j-1", "is j-1 landed?", None, "seat:e-9", Some("cpd-e1".into()));
+        let sent = hub_tell(&ed, &ed_home, &book, "seat:j-1", "is j-1 landed?", None, "seat:e-9", Some("cpd-e1".into()));
         let (id, user, to) = sent.expect("j-1 is another user's: through the hub").expect("the hub takes it");
         assert_eq!((user.as_str(), to.as_str()), ("jesper", "seat:j-1"));
 
@@ -1570,7 +1594,7 @@ mod tests {
         // The seat there replies as its footer says: seat:e-9 is nothing on Jesper's spoke; the --re routes it.
         let book = crate::address::Book::read(&jesper);
         assert!(crate::address::resolve(&crate::address::parse("seat:e-9").unwrap(), &book).is_err(), "no e-9 here");
-        let back = crate::cmd_message::hub_tell(&jesper, &jesper_home, &book, "seat:e-9", "landed at abc123", Some(&id), "seat:j-1", Some("cpd-j1".into()));
+        let back = hub_tell(&jesper, &jesper_home, &book, "seat:e-9", "landed at abc123", Some(&id), "seat:j-1", Some("cpd-j1".into()));
         let (_, user, _) = back.expect("a reply to a hub message: through the hub").expect("the hub takes it");
         assert_eq!(user, "ed");
 
@@ -1616,7 +1640,7 @@ mod tests {
         let ed = Store::at(dir.join("ed/wsp"), dir.join("ed/state"));
         ed.ensure_dirs().unwrap();
         let book = crate::address::Book { login: Some("ed".into()), ..crate::address::Book::default() };
-        let sent = crate::cmd_message::hub_tell(&ed, &ed_home, &book, "primary:jesper", "call me", None, "person:ed", None);
+        let sent = hub_tell(&ed, &ed_home, &book, "primary:jesper", "call me", None, "person:ed", None);
         let (id, ..) = sent.expect("another user's primary").expect("queued while Jesper is away");
 
         // Jesper's primary is the seat cpd-j1 here; Jesper reconnects.
@@ -1672,16 +1696,16 @@ mod tests {
         book.login = Some("ed".into());
         book.remote_rows.insert("j-1".into());
         for local in ["seat:e-9", "primary", "primary:ed", "seat:nope", "governor:nobody", "cpd-e1"] {
-            let sent = crate::cmd_message::hub_tell(&store, &home, &book, local, "hello", None, "seat:e-9", None);
+            let sent = hub_tell(&store, &home, &book, local, "hello", None, "seat:e-9", None);
             assert!(sent.is_none(), "{local} is this spoke's");
         }
         // A `--re` naming no message the hub delivered here is no reason to dial it.
-        assert!(crate::cmd_message::hub_tell(&store, &home, &book, "seat:e-9", "hi", Some("m-0123"), "seat:e-9", None).is_none());
+        assert!(hub_tell(&store, &home, &book, "seat:e-9", "hi", Some("m-0123"), "seat:e-9", None).is_none());
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(wire.lock().unwrap().0, 0, "no connection, no frame");
 
         // The control: another user's row dials the hub's address.
-        let sent = crate::cmd_message::hub_tell(&store, &home, &book, "seat:j-1", "hello", None, "seat:e-9", None);
+        let sent = hub_tell(&store, &home, &book, "seat:j-1", "hello", None, "seat:e-9", None);
         assert!(sent.is_some_and(|r| r.is_err()), "through the hub, which this listener is not");
         let w = wire.lock().unwrap();
         assert_eq!(w.0, 1, "one connection");
