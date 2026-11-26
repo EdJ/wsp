@@ -52,7 +52,7 @@ use std::time::Instant;
 use serde_json::Value;
 use wsp_api::{
     Answer, Call, Code, ConnError, Connection, Failure, Frame, Hello, Outcome, Refused, Reply, ReqId, Request, Verb,
-    Welcome, COMMAND_VERBS, MAX_EVENTS, MAX_EVENTS_BYTES, MAX_LINE, MISSED_BEATS, PROTOCOL, READ_VERBS, SYNC_VERBS,
+    Welcome, COMMAND_VERBS, MAX_EVENTS, MAX_EVENTS_BYTES, MAX_LINE, MISSED_BEATS, PROTOCOL, READ_VERBS,
 };
 use wsp_machines::Orders;
 use wsp_store_contract::{Command, Error, IdempotencyKey, Principal, Refusal, Row, RowFilter};
@@ -275,13 +275,8 @@ impl Client<'_> {
             },
             Call::Verb(verb) => read(self.shared, verb),
             Call::Command(cmd) => return self.command(id, req.key, cmd),
-            // The sync verbs are a hub's, which this server is not.
-            Call::Sync(call) => Err(failure(Code::Unsupported, format!("{} is a hub's verb, not this server's", call.verb()))),
             Call::Unknown { verb, .. } => {
-                if READ_VERBS.contains(&verb.as_str())
-                    || COMMAND_VERBS.contains(&verb.as_str())
-                    || SYNC_VERBS.contains(&verb.as_str())
-                {
+                if READ_VERBS.contains(&verb.as_str()) || COMMAND_VERBS.contains(&verb.as_str()) {
                     Err(failure(Code::Malformed, format!("{verb}'s args do not fit it")))
                 } else {
                     Err(failure(Code::Unsupported, format!("{verb} is no verb this server knows")))

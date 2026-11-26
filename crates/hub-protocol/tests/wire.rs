@@ -1,7 +1,7 @@
 //! The hub's wire, held to today's byte for byte: every frame this crate
-//! writes is written through `wsp-api` too (built field by field by `api_*`
-//! below, never through JSON), and the two lines are the same bytes; each
-//! side decodes the other's line to the value it started from.
+//! writes is the line the state core's `wsp-api` wrote for it while the hub's
+//! frames were part of it, frozen in `tests/golden` (see [`golden`]), and
+//! decodes to the value it started from.
 //!
 //! The tables are table-driven as `wsp-api`'s `tests/round_trip.rs` is: each
 //! table's coverage is held by an exhaustive match (the `*_ordinal`s), so a
@@ -30,185 +30,29 @@ use wsp_store_contract::{
     User, UserName,
 };
 
-// ---------------------------------------------------------------- the map to today's types
-
-fn api_token(t: &ApiToken) -> api::ApiToken {
-    api::ApiToken(t.0.clone())
-}
-
-fn api_frame(f: &Frame) -> Option<api::Frame> {
-    Some(match f {
-        Frame::Hello(h) => api::Frame::Hello(api::Hello {
-            token: api_token(&h.token),
-            by: h.by.clone(),
-            client: h.client.clone(),
-            protocol: h.protocol,
-        }),
-        Frame::Welcome(w) => api::Frame::Welcome(api::Welcome {
-            server: w.server.clone(),
-            protocol: w.protocol,
-            head: w.head,
-            by: w.by.clone(),
-        }),
-        Frame::Refused(r) => api::Frame::Refused(api::Refused { code: api_code(r.code), text: r.text.clone() }),
-        Frame::Request(r) => api::Frame::Request(api::Request {
-            v: r.v,
-            id: api::ReqId(r.id.0),
-            key: r.key.clone(),
-            by: r.by.clone(),
-            call: api_call(&r.call),
-        }),
-        Frame::Reply(r) => api::Frame::Reply(api::Reply {
-            id: api::ReqId(r.id.0),
-            outcome: match &r.outcome {
-                Outcome::Ok(a) => api::Outcome::Ok(api_answer(a)),
-                Outcome::Err(e) => api::Outcome::Err(api_failure(e)),
-            },
-            events: r.events.clone(),
-        }),
-        Frame::Feed(feed) => api::Frame::Feed(feed.clone()),
-        // This repo's `wsp-api` has no login frames (the hub repo's copy does):
-        // they are held to pinned bytes instead, in `login_line`.
-        Frame::Login(_) | Frame::LoginPrompt(_) | Frame::LoginDone(_) => return None,
-    })
-}
-
-fn api_call(c: &Call) -> api::Call {
-    match c {
-        Call::Verb(v) => api::Call::Verb(match v {
-            Verb::State(NoArgs {}) => api::Verb::State(api::NoArgs {}),
-            Verb::Events { from, limit } => api::Verb::Events { from: *from, limit: *limit },
-            Verb::Subscribe(s) => api::Verb::Subscribe(s.clone()),
-            Verb::Whoami(NoArgs {}) => api::Verb::Whoami(api::NoArgs {}),
-        }),
-        Call::Command(c) => api::Call::Command(api_command(c)),
-        Call::Sync(s) => api::Call::Sync(api_sync(s)),
-        Call::Unknown { verb, args } => api::Call::Unknown { verb: verb.clone(), args: args.clone() },
-    }
-}
-
-fn api_command(c: &IdentityCommand) -> wsp_store_contract::Command {
-    use wsp_store_contract::Command as C;
-    match c.clone() {
-        IdentityCommand::HubUserAdd { name, admin } => C::HubUserAdd { name, admin },
-        IdentityCommand::HubUserRevoke { name } => C::HubUserRevoke { name },
-        IdentityCommand::HubTokenIssue { id, user, hash } => C::HubTokenIssue { id, user, hash },
-        IdentityCommand::HubTokenRevoke { id } => C::HubTokenRevoke { id },
-        IdentityCommand::HubWorkspaceAdd { name } => C::HubWorkspaceAdd { name },
-        IdentityCommand::HubMemberSet { workspace, user, member } => C::HubMemberSet { workspace, user, member },
-    }
-}
-
-fn api_blob(b: &Blob) -> api::Blob {
-    api::Blob { id: b.id, bytes: b.bytes.clone() }
-}
-
-fn api_sync(s: &SyncCall) -> api::SyncCall {
-    match s.clone() {
-        SyncCall::Heads { workspace } => api::SyncCall::Heads { workspace },
-        SyncCall::Have { ids } => api::SyncCall::Have { ids },
-        SyncCall::Put { objects } => api::SyncCall::Put { objects: objects.iter().map(api_blob).collect() },
-        SyncCall::Get { ids } => api::SyncCall::Get { ids },
-        SyncCall::Move(RefMove { workspace, subject, from, to }) => {
-            api::SyncCall::Move(api::RefMove { workspace, subject, from, to })
-        }
-        SyncCall::Alloc(IdsAlloc { workspace, project, n, past }) => {
-            api::SyncCall::Alloc(api::IdsAlloc { workspace, project, n, past })
-        }
-        SyncCall::LeaseTake(LeaseTake { workspace, row }) => api::SyncCall::LeaseTake(api::LeaseTake { workspace, row }),
-        SyncCall::LeaseRenew(LeaseHold { row, token }) => api::SyncCall::LeaseRenew(api::LeaseHold { row, token }),
-        SyncCall::LeaseRelease(LeaseHold { row, token }) => api::SyncCall::LeaseRelease(api::LeaseHold { row, token }),
-        SyncCall::MsgSend(MsgSend { to, from, seat, text, re }) => {
-            api::SyncCall::MsgSend(api::MsgSend { to, from, seat, text, re })
-        }
-        SyncCall::MsgTake(NoArgs {}) => api::SyncCall::MsgTake(api::NoArgs {}),
-        SyncCall::MsgAck { ids } => api::SyncCall::MsgAck { ids },
-    }
-}
-
-fn api_message(m: &HubMessage) -> api::HubMessage {
-    let HubMessage { id, to, user, from_user, from, seat, text, re, at } = m.clone();
-    api::HubMessage { id, to, user, from_user, from, seat, text, re, at }
-}
-
-fn api_answer(a: &Answer) -> api::Answer {
-    match a.clone() {
-        Answer::State { state, at } => api::Answer::State { state, at },
-        Answer::Events { events, head, through } => api::Answer::Events { events, head, through },
-        Answer::Subscribed => api::Answer::Subscribed,
-        Answer::Applied => api::Answer::Applied,
-        Answer::Whoami { by, server } => api::Answer::Whoami { by, server },
-        Answer::Heads(refs) => api::Answer::Heads(refs),
-        Answer::Missing(ids) => api::Answer::Missing(ids),
-        Answer::Stored { stored } => api::Answer::Stored { stored },
-        Answer::Objects(blobs) => api::Answer::Objects(blobs.iter().map(api_blob).collect()),
-        Answer::Move(Move::Moved { head }) => api::Answer::Move(api::Move::Moved { head }),
-        Answer::Move(Move::Stale { head }) => api::Answer::Move(api::Move::Stale { head }),
-        Answer::Ids(ids) => api::Answer::Ids(ids),
-        Answer::Lease { token, expires } => api::Answer::Lease { token, expires },
-        Answer::Released => api::Answer::Released,
-        Answer::Queued { id, user } => api::Answer::Queued { id, user },
-        Answer::Messages(ms) => api::Answer::Messages(ms.iter().map(api_message).collect()),
-        Answer::Acked { acked } => api::Answer::Acked { acked },
-    }
-}
-
-fn api_failure(f: &Failure) -> api::Failure {
-    api::Failure { code: api_code(f.code), text: f.text.clone(), refusal: f.refusal.clone() }
-}
-
-fn api_code(c: Code) -> api::Code {
-    match c {
-        Code::Stale => api::Code::Stale,
-        Code::TooOld => api::Code::TooOld,
-        Code::Conflict => api::Code::Conflict,
-        Code::Held => api::Code::Held,
-        Code::NotFound => api::Code::NotFound,
-        Code::Illegal => api::Code::Illegal,
-        Code::Forbidden => api::Code::Forbidden,
-        Code::Invalid => api::Code::Invalid,
-        Code::Malformed => api::Code::Malformed,
-        Code::Unauthorised => api::Code::Unauthorised,
-        Code::Protocol => api::Code::Protocol,
-        Code::Unsupported => api::Code::Unsupported,
-        Code::Backend => api::Code::Backend,
-        Code::Fenced => api::Code::Fenced,
-        Code::TooLarge => api::Code::TooLarge,
-        Code::Unknown => api::Code::Unknown,
-    }
-}
-
 // ---------------------------------------------------------------- the harness
 
-/// One frame both ways: this crate's line and today's are the same bytes, one
-/// line; today's decodes this crate's to the value it maps to, and this crate
-/// decodes today's to the frame it started from and writes it again the same.
-/// Returns the line's JSON.
+/// One frame on the wire: this crate's line is the bytes the state core's
+/// `wsp-api` wrote for the same frame when the hub's frames were still part of
+/// it ([`golden`]), one line, and this crate decodes it to the frame it
+/// started from and writes it again the same. Returns the line's JSON.
 fn wire(f: &Frame) -> Value {
     let ours = serde_json::to_string(f).unwrap();
     golden(&ours);
-    let Some(theirs_value) = api_frame(f) else {
-        assert_eq!(ours, login_line(f), "the login frame's pinned bytes");
-        let read_here: Frame = serde_json::from_str(&ours).unwrap();
-        assert_eq!(&read_here, f, "this crate reads the pinned line: {ours}");
-        return serde_json::from_str(&ours).unwrap();
-    };
-    let theirs = serde_json::to_string(&theirs_value).unwrap();
-    assert_eq!(ours, theirs, "the same bytes as today's wsp-api");
     assert!(!ours.contains('\n'), "a frame is one line: {ours}");
-    let read_by_today: api::Frame = serde_json::from_str(&ours).unwrap();
-    assert_eq!(read_by_today, theirs_value, "today's wsp-api reads this crate's line: {ours}");
-    let read_here: Frame = serde_json::from_str(&theirs).unwrap();
-    assert_eq!(&read_here, f, "this crate reads today's line: {theirs}");
+    let read_here: Frame = serde_json::from_str(&ours).unwrap();
+    assert_eq!(&read_here, f, "this crate reads its own line: {ours}");
     assert_eq!(serde_json::to_string(&read_here).unwrap(), ours, "written again the same");
     serde_json::from_str(&ours).unwrap()
 }
 
-/// Today's bytes, frozen: each test's frames, in the order it writes them,
-/// are the lines of `tests/golden/<test>.jsonl`, so the proof survives the
-/// day `wsp-api` no longer has the hub's frames to compare with. The files
-/// were written from today's `wsp-api` (each line is held to its bytes above)
-/// with `WSP_WIRE_BLESS=1`.
+/// The bytes frozen: each test's frames, in the order it writes them, are the
+/// lines of `tests/golden/<test>.jsonl`. The files were written with
+/// `WSP_WIRE_BLESS=1` while `wsp-api` still had the hub's frames, and every
+/// line was then held, byte for byte, to what `wsp-api` wrote for the frame
+/// (the login frames, which this repository's `wsp-api` never had, to the
+/// hub repository's bytes): the proof outlived the frames' removal from
+/// `wsp-api`.
 fn golden(line: &str) {
     use std::cell::RefCell;
     use std::io::Write;
@@ -238,24 +82,8 @@ fn golden(line: &str) {
     });
 }
 
-/// The bytes of the login frames in `frames()`, pinned as literals: this
-/// repo's `wsp-api` has no `login`, `login_prompt` or `login_done` (the hub
-/// repo's copy of it, which the hub serves, does). They are the bytes that
-/// copy writes for these frames: its structs' fields in order, as its
-/// `tests/round_trip.rs` and this test's hub-repo twin encode them.
-fn login_line(f: &Frame) -> &'static str {
-    match f {
-        Frame::Login(l) if l.client == "wsp 0.1.0" => r#"{"type":"login","method":"github","client":"wsp 0.1.0","protocol":1}"#,
-        Frame::LoginPrompt(l) if l.code == "ABCD-1234" => {
-            r#"{"type":"login_prompt","url":"https://github.com/login/device","code":"ABCD-1234","expires_secs":900}"#
-        }
-        Frame::LoginDone(l) if l.user == "ann" => r#"{"type":"login_done","user":"ann","token":"t"}"#,
-        other => panic!("no pinned bytes for {other:?}"),
-    }
-}
-
-/// Checks a table: every frame is the same on both wires, its wire name is
-/// the ordinal's, and every ordinal below `count` has a frame.
+/// Checks a table: every frame is today's bytes, its wire name is the
+/// ordinal's, and every ordinal below `count` has a frame.
 fn table(frames: &[Frame], count: usize, ordinal: fn(&Frame) -> (usize, &'static str), name: fn(&Value) -> String) {
     let mut seen = BTreeSet::new();
     for f in frames {
@@ -575,7 +403,7 @@ fn the_verb_tables_are_the_variants_and_todays() {
                 syncs.push(c.verb());
             }
             Call::Unknown { verb, .. } => {
-                for table in [p::READ_VERBS, p::COMMAND_VERBS, p::SYNC_VERBS, api::READ_VERBS, api::COMMAND_VERBS, api::SYNC_VERBS] {
+                for table in [p::READ_VERBS, p::COMMAND_VERBS, p::SYNC_VERBS, api::READ_VERBS, api::COMMAND_VERBS] {
                     assert!(!table.contains(&verb.as_str()), "{verb}");
                 }
             }
@@ -590,7 +418,12 @@ fn the_verb_tables_are_the_variants_and_todays() {
     assert_eq!((p::READ_VERBS.len(), p::COMMAND_VERBS.len(), p::SYNC_VERBS.len()), (VERBS, COMMANDS, SYNCS));
     assert!(p::READ_VERBS.iter().all(|v| api::READ_VERBS.contains(v)));
     assert!(p::COMMAND_VERBS.iter().all(|v| api::COMMAND_VERBS.contains(v)));
-    assert_eq!(p::SYNC_VERBS, api::SYNC_VERBS);
+    // The state core's API has no sync verb: they are the hub's alone, spelled as the hub serves them.
+    assert!(p::SYNC_VERBS.iter().all(|v| !api::READ_VERBS.contains(v) && !api::COMMAND_VERBS.contains(v)));
+    assert_eq!(
+        p::SYNC_VERBS,
+        ["sync.heads", "sync.have", "sync.put", "sync.get", "refs.move", "ids.alloc", "lease.take", "lease.renew", "lease.release", "msg.send", "msg.take", "msg.ack"]
+    );
 }
 
 // ---------------------------------------------------------------- replies
@@ -893,8 +726,14 @@ fn a_verb_without_arguments_decodes_either_way() {
         for (verb, want) in [("state", Call::Verb(Verb::State(NoArgs {}))), ("whoami", Call::Verb(Verb::Whoami(NoArgs {}))), ("msg.take", Call::Sync(SyncCall::MsgTake(NoArgs {})))] {
             let line = format!(r#"{{"type":"request","v":1,"id":3,"by":"person:ann","verb":"{verb}"{args}}}"#);
             assert_eq!(call_of(&decode(&line)), &want, "{line}");
-            let today: api::Frame = serde_json::from_str(&line).unwrap();
-            assert_eq!(serde_json::to_string(&today).unwrap(), serde_json::to_string(&decode(&line)).unwrap(), "{line}");
+            // Written `{}`, as `wsp-api` writes a verb with none (`state`, `whoami`; `msg.take` was
+            // one of its verbs too, until the hub's verbs left it).
+            let written = serde_json::to_string(&decode(&line)).unwrap();
+            assert_eq!(written, format!(r#"{{"type":"request","v":1,"id":3,"by":"person:ann","verb":"{verb}","args":{{}}}}"#), "{line}");
+            if verb != "msg.take" {
+                let today: api::Frame = serde_json::from_str(&line).unwrap();
+                assert_eq!(serde_json::to_string(&today).unwrap(), written, "{line}");
+            }
         }
     }
     let line = r#"{"type":"request","v":1,"id":3,"by":"person:ann","verb":"subscribe","args":{}}"#;
@@ -989,15 +828,17 @@ fn the_constants_are_todays() {
     assert_eq!(p::MAX_LINE, api::MAX_LINE);
     assert_eq!(p::MAX_EVENTS, api::MAX_EVENTS);
     assert_eq!(p::MAX_EVENTS_BYTES, api::MAX_EVENTS_BYTES);
-    assert_eq!(p::MAX_IDS, api::MAX_IDS);
+    // The hub's own constants, held to the values `wsp-api` had for them.
+    assert_eq!(p::MAX_IDS, 1000);
     // This repo's `wsp-api` has no `MAX_PAST` (the hub repo's copy added it with
     // the check that refuses a higher `past`): held to the hub repo's value.
     assert_eq!(p::MAX_PAST, 1_000_000_000);
-    assert_eq!(p::FENCE_TOKEN, api::FENCE_TOKEN);
+    assert_eq!(p::FENCE_TOKEN, "token");
     // This repo's `wsp-api` has no login: `LOGIN_GITHUB` is held to its spelling.
     assert_eq!(p::LOGIN_GITHUB, "github");
     assert_eq!((p::BEAT_SECS, p::MISSED_BEATS), (api::BEAT_SECS, api::MISSED_BEATS));
     let every: Vec<u8> = (0..=255).collect();
-    assert_eq!(p::sync::base64::encode(&every), api::sync::base64::encode(&every));
+    // RFC 4648's standard alphabet, padded: what `wsp-api`'s encoder wrote (and Python's `base64.b64encode`).
+    assert_eq!(p::sync::base64::encode(&every), "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==");
 }
 
