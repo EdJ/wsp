@@ -1,4 +1,4 @@
-//! `wsp-engine`: the engine and the seats, the phase 2 cut (`docs/components.md` §5, wsp-440); see `MAP.md`.
+//! `wsp-engine`: the engine, the phase 2 cut (`docs/components.md` §5, wsp-440; the seats are `wsp-seats`, wsp-441); see `MAP.md`.
 //! Depends on `wsp-base`, `wsp-store`, `wsp-wire` and `wsp-trees`. The root re-exports each module at its old
 //! path (`crate::cycle`, `crate::cmd_spawn`, …), so no caller changed.
 
@@ -21,7 +21,6 @@ pub mod testkit {
 pub mod address;
 pub mod affected;
 pub mod after;
-pub mod agent_commands;
 pub mod artefact;
 pub mod attempt;
 pub mod attention;
@@ -35,29 +34,16 @@ pub mod check;
 pub mod claims;
 pub mod classify;
 pub mod closing;
-pub mod cmd_agent;
 pub mod cmd_allocate;
-pub mod cmd_attend;
-pub mod cmd_brief;
-pub mod cmd_govern;
 pub mod cmd_hub;
 pub mod cmd_initiative;
-pub mod cmd_install;
 pub mod cmd_login;
-pub mod cmd_machine;
 pub mod cmd_mandate;
 pub mod cmd_message;
 pub mod cmd_migrate;
-pub mod cmd_project;
 pub mod cmd_publish;
-pub mod cmd_resume;
-pub mod cmd_role;
-pub mod cmd_sandbox;
-pub mod cmd_spawn;
-pub mod cmd_stamp;
 pub mod cmd_submit;
 pub mod cmd_task;
-pub mod cmd_watch;
 pub mod cmd_whoami;
 pub mod cmd_worklist;
 pub mod cold;
@@ -83,15 +69,12 @@ pub mod hub_journal;
 pub mod hub_lease;
 pub mod hub_sync;
 pub mod inner;
-pub mod kind_attention;
-pub mod kind_data;
 pub mod leg_seat;
 pub mod leg_tree;
 pub mod legs;
 pub mod list_sweep;
 pub mod liveness;
 pub mod local_trust;
-pub mod memory;
 pub mod mirror;
 pub mod orders;
 pub mod outputs;
@@ -127,5 +110,4 @@ pub mod verifier_packet;
 pub mod waiting;
 pub mod waits;
 pub mod watch_levels;
-pub mod wake;
 pub mod worklist;

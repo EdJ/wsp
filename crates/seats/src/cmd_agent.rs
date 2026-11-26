@@ -8821,6 +8821,7 @@ mod tests {
     /// `first-orders.json` filled them, its `stuck` from `stuck-commands.json`).
     #[test]
     fn under_the_orders_machine_wip_draws_the_files_paths_words_and_json_from_the_orders() {
+        crate::install_db();
         let env = util::isolated("wip-orders-json");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -8883,6 +8884,7 @@ mod tests {
     /// `Wip::from_api` give the same columns.
     #[test]
     fn under_the_orders_machine_wip_reads_none_of_the_delivery_files() {
+        crate::install_db();
         let env = util::isolated("wip-orders-files");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -11069,6 +11071,7 @@ mod from_fold {
     /// second sweep finds nothing.
     #[test]
     fn the_sweep_forgets_seats_a_restart_left_gone_with_nothing_to_say() {
+        crate::install_db();
         crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let env = util::isolated("fold-sweep-mute");
         let store = Store::open();
@@ -11123,6 +11126,7 @@ mod from_fold {
     /// next sweep forgets it at once.
     #[test]
     fn the_sweep_forgets_a_despawned_seat_at_once() {
+        crate::install_db();
         crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let env = util::isolated("fold-sweep-despawned");
         let store = Store::open();

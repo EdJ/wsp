@@ -124,7 +124,7 @@ impl Kind {
         ]
     }
 
-    pub(crate) fn parse(word: &str) -> Option<Kind> {
+    pub fn parse(word: &str) -> Option<Kind> {
         Kind::every()
             .into_iter()
             .chain(std::iter::once(Kind::Blind))
@@ -139,7 +139,7 @@ impl Kind {
     /// agent — and so does a hand lowered by another seat. A task leaving
     /// `review` is nearly always the reader having just closed it, and a line
     /// saying so is the surface telling you what you did.
-    pub(crate) fn clears(&self) -> bool {
+    pub fn clears(&self) -> bool {
         matches!(
             self,
             Kind::NeedsAPerson
@@ -173,7 +173,7 @@ impl Kind {
     /// So: silence is not evidence. A level of a kind that could not be read this tick is
     /// **held**, not cleared, and it goes down on the first tick that can
     /// actually see it.
-    pub(crate) fn needs_census(&self) -> bool {
+    pub fn needs_census(&self) -> bool {
         match self {
             Kind::NeedsAPerson | Kind::AgentGone | Kind::SeatStalled => true,
             // The store answers these whether or not anything else does, which
@@ -207,7 +207,7 @@ impl Kind {
     /// will resolve it. `note` is *act when convenient*, and this state does not
     /// improve while nobody is convenient — it is what `robustness-083` cost
     /// three agents in one day, unread, with every other signal healthy.
-    pub(crate) fn loudness(&self) -> crate::message::Kind {
+    pub fn loudness(&self) -> crate::message::Kind {
         match self {
             Kind::SeatStalled => crate::message::Kind::Direction,
             _ => crate::message::Kind::Note,
@@ -292,7 +292,7 @@ impl Class {
     }
 
     /// Back from the word, for a spool written by another build.
-    pub(crate) fn parse(word: &str) -> Option<Class> {
+    pub fn parse(word: &str) -> Option<Class> {
         Class::every().into_iter().find(|c| c.word() == word)
     }
 
@@ -318,7 +318,7 @@ impl Class {
     /// [`Kind::word`]'s vocabulary, sitting in the field a consumer reads that
     /// vocabulary out of. `class` is where it belongs, and a consumer keying on
     /// `signal == "watch-over"` was keying on prose with extra steps.
-    pub(crate) fn envelope(&self, at: i64, to: &str, text: &str) -> Value {
+    pub fn envelope(&self, at: i64, to: &str, text: &str) -> Value {
         json!({ "class": self.word(), "at": util::iso_at(at), "to": to, "text": text })
     }
 }
@@ -458,7 +458,7 @@ impl Signal {
     }
 
     /// Said as loud as whoever wrote the record asked for.
-    pub(crate) fn as_loud_as(mut self, k: crate::message::Kind) -> Signal {
+    pub fn as_loud_as(mut self, k: crate::message::Kind) -> Signal {
         self.loud = Some(k);
         self
     }
@@ -476,7 +476,7 @@ impl Signal {
     }
 
     /// Whether this is worth the red column rather than the yellow one.
-    pub(crate) fn shouts(&self) -> bool {
+    pub fn shouts(&self) -> bool {
         self.loudness() < crate::message::Kind::Note
     }
 
@@ -649,7 +649,7 @@ impl Edge {
     }
 
     /// Back from the word, for a spool written by another build.
-    pub(crate) fn parse(word: &str) -> Option<Edge> {
+    pub fn parse(word: &str) -> Option<Edge> {
         [Edge::Up, Edge::Down, Edge::Left].into_iter().find(|e| e.word() == word)
     }
 }

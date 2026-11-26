@@ -2253,6 +2253,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     /// in `refused-deliveries.json` on the way.
     #[test]
     fn under_the_orders_machine_a_spool_is_one_order_per_emit_set_and_clears_when_acknowledged() {
+        crate::install_db();
         use wsp_store_contract::SeatId;
         let env = util::isolated("wake-orders");
         let store = Store::at(env.home(), env.state());
@@ -2285,6 +2286,7 @@ fn a_scope_whose_governor_vacated_keeps_what_is_said_to_it() {
     /// the reconciler reads the failed order itself.
     #[test]
     fn under_the_orders_machine_a_failed_order_is_held_and_raised_and_counted_nowhere() {
+        crate::install_db();
         use wsp_store_contract::SeatId;
         let env = util::isolated("wake-orders-failed");
         let store = Store::at(env.home(), env.state());

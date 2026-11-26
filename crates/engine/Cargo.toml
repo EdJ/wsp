@@ -2,7 +2,7 @@
 name = "wsp-engine"
 version = "0.1.0"
 edition = "2021"
-description = "wsp's engine and seats: the run (worklist, cycle, repair, verification, legs, the barrier), the row and list verbs, and the seat commands"
+description = "wsp's engine: the run (worklist, cycle, repair, verification, legs, the barrier), the row and list verbs, orders, the fold and the mirror"
 
 [lib]
 path = "src/lib.rs"

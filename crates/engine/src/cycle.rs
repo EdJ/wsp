@@ -5793,6 +5793,7 @@ pub fn tell(store: &Store, w: &Worklist, text: &str) {
         tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
+    told_in_a_dependents_test(text);
     log_line(store, &format!("tell {}: {}", w.id, util::truncate(text, 120)));
     tell_now(store, w, text);
 }
@@ -5807,7 +5808,17 @@ pub fn tell_logged(store: &Store, w: &Worklist, text: &str) {
         tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
+    told_in_a_dependents_test(text);
     tell_now(store, w, text);
+}
+
+/// [`tell`] in a dependent's test (`wsp-seats`'), which takes the real path: recorded in `tests::TOLD` as well,
+/// so a seats test's "nobody was told" can fail (wsp-441). Nothing outside a test harness built with `test-support`.
+fn told_in_a_dependents_test(_text: &str) {
+    #[cfg(all(not(test), feature = "test-support"))]
+    if crate::base::under_test() {
+        tests::TOLD.with(|s| s.borrow_mut().push(_text.to_string()));
+    }
 }
 
 /// [`tell`]'s delivery, which [`hand_on_what_done_lists_held`] takes too:

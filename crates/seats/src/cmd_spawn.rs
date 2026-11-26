@@ -8274,6 +8274,7 @@ mod tests {
     /// acknowledged. Nothing is owed in a file.
     #[test]
     fn under_store_an_acked_first_order_is_one_acknowledged_order_under_the_id_the_seat_was_asked() {
+        crate::install_db();
         use wsp_store_contract::{OrderState, SeatId, SeatState};
         let env = util::isolated("spawn-first-stored");
         let store = Store::open();
@@ -8317,6 +8318,7 @@ mod tests {
     /// as `order not received` (wsp-126).
     #[test]
     fn under_store_a_refused_first_order_is_delivered_at_idle_and_one_refused_to_the_cap_is_failed() {
+        crate::install_db();
         use crate::place::Refusal as Said;
         use wsp_store_contract::{OrderState, SeatId, SeatState};
         let env = util::isolated("spawn-first-refused");

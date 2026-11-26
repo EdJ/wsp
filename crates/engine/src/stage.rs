@@ -688,7 +688,7 @@ pub fn sentence(said: &BTreeMap<String, serde_json::Value>, pane: &str, held: Op
 /// sidebar draws 26 columns, and `looking for work in stra…` still says
 /// the thing a person scanning a column of panes is scanning for. The project
 /// is the half they can usually read off the workspace row anyway.
-pub(crate) fn looking_label(project: Option<&str>, found: bool) -> String {
+pub fn looking_label(project: Option<&str>, found: bool) -> String {
     match (found, project) {
         (true, Some(p)) => format!("looking for work in {p}"),
         (true, None) => "looking for work".into(),

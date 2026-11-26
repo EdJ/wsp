@@ -1,23 +1,22 @@
 # wsp-engine
 
-The engine and the seats, the phase 2 cut (`docs/components.md` §5, wsp-440). Depends on `wsp-base`, `wsp-store`,
-`wsp-wire`, `wsp-trees` and the state core's crates (`wsp-store-contract`, `wsp-api`, `wsp-client`, `wsp-server`,
-`wsp-view`, `wsp-machines`, `wsp-objects`, `wsp-host-api`). The root re-exports each module at its old path
-(`crate::cycle`, `crate::cmd_spawn`, …), so no caller changed.
+The engine, the phase 2 cut (`docs/components.md` §5, wsp-440; the seats left for `wsp-seats` at wsp-441). Depends
+on `wsp-base`, `wsp-store`, `wsp-wire`, `wsp-trees` and the state core's crates (`wsp-store-contract`, `wsp-api`,
+`wsp-client`, `wsp-server`, `wsp-view`, `wsp-machines`, `wsp-objects`, `wsp-host-api`). The root re-exports each module
+at its old path (`crate::cycle`, `crate::cmd_task`, …), so no caller changed.
 
 ## Holds
 
-The `engine` and `seats` rows of the layering map, 97 modules: the run (`worklist`, `cycle`, `repair`, `verification`,
-`legs`, `leg_seat`, `stage`, `barrier*`, `check`, `closing`, `ending`, `hold*`), the row and list verbs (`cmd_task`,
-`cmd_worklist`, `cmd_message`, `cmd_submit`, …), orders, `fold`, `mirror`, `deliver`, the hub's spoke side
-(`hub_*`, `cmd_hub`, `cmd_login`), and the seat commands (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `room`,
-`cmd_govern`, `cmd_watch`, `cmd_machine`, `cmd_sandbox`, `cmd_install`, …), with `disk` and `memory`. The rows stay
-two in the map so a later split starts from them; the 28 `engine -> seats` lines are a ratchet inside the crate.
+The `engine` row of the layering map, 88 modules: the run (`worklist`, `cycle`, `repair`, `verification`, `legs`,
+`leg_seat`, `stage`, `barrier*`, `check`, `closing`, `ending`, `hold*`), the row and list verbs (`cmd_task`,
+`cmd_worklist`, `cmd_message`, `cmd_submit`, …), orders, `fold`, `mirror`, `deliver`, the hub's spoke side (`hub_*`,
+`cmd_hub`, `cmd_login`), `room` (cycle and waits use `room::Gate`), `watch_levels`, `sent`, `claims`, `prose`, `disk`.
 
 ## Does not hold
 
-`timeline`, `surface` and `top` (`cmd_report`, `cmd_cost`, `cmd_attempts`, `panel`, `daemon`, `main`, `registry`, …):
-they stay in `wsp` and use this crate, never the other way (`docs/components-upward.txt` has no line out of it).
+The seats (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `cmd_govern`, `cmd_watch`, `memory`, …): `wsp-seats`,
+built on this crate, which never names it (`tests/layering.rs`). `timeline`, `surface` and `top` (`cmd_report`,
+`panel`, `daemon`, `main`, …) stay in `wsp`. Neither reaches back (`docs/components-upward.txt` has no line out of it).
 
 ## Hooks the binary fills
 
@@ -33,12 +32,14 @@ they stay in `wsp` and use this crate, never the other way (`docs/components-upw
 
 ## Notes
 
-- Every `pub(crate)` became `pub` in the move.
+- Every `pub(crate)` became `pub` in the move (wsp-440). Of those written since, the 12 `wsp-seats` names
+  (`watch_levels`, `sent`, `stage`) became `pub` at wsp-441; the rest are used inside this crate alone.
 - `test-support` (wsp-544) gives a dependent's tests the fixtures and recorders they name; `tests/dependent.rs` lists
   them. Guards on `base::under_test()` (`start_detached`'s among them) hold here and, with the feature, in a test
   process run from `target/*/deps`, so in the root's unit tests too; not in the `wsp` binary its integration tests run.
 - A guard still on `cfg!(test)` (`cycle::start`, `start_check`, `trunk_tip`, `tell`, `tell_logged`, ...) holds only in
-  this crate's tests: a dependent's test that reaches one takes the real path.
+  this crate's tests: a dependent's test that reaches one takes the real path. `tell` and `tell_logged` record into
+  `cycle::tests::TOLD` there as well (wsp-441), so a seats test's "nobody was told" can fail.
 - A dependent installs the `state.db` open (`orders::tests::install_db`) and takes `testkit::repo_at` from its own
   `wsp-testkit`: layering keeps both out of this crate's normal dependencies.
 - Paths: `include_str!` reaches the repository root as `../../../`; tests that read files do it from

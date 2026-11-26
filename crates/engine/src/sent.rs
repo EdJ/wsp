@@ -68,7 +68,7 @@ pub struct Sent {
 /// governor typing `continue` at an agent twice in an evening means it twice,
 /// and a channel that silently swallowed the second would stall a night to
 /// prevent a duplicate paragraph.
-pub(crate) const SAME_BREATH: i64 = 120;
+pub const SAME_BREATH: i64 = 120;
 
 impl Sent {
     pub fn new(target: &str, what: &str, pane: &str, peek: &str, text: &str, args: &Args) -> Sent {
@@ -135,7 +135,7 @@ impl Sent {
 /// which is the one thing this is for. Sixteen hex characters of a 64-bit
 /// digest is not a claim about adversaries; two sentences would have to collide
 /// *and* arrive at the same pane within two minutes to be confused.
-pub(crate) fn message_id(pane: &str, text: &str) -> String {
+pub fn message_id(pane: &str, text: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in pane.as_bytes().iter().chain(b"\0").chain(text.as_bytes()) {
         h ^= *b as u64;
