@@ -13,6 +13,7 @@ PROJECTS
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
                                     | approve <id> "verdict"  | changes <id> "what to change"
+                                    | run <id> [--json]  the build's feed: group running, rows, spend
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md
                                     | brief <id>  a record below a product: artefacts and
@@ -729,8 +730,9 @@ WORKLISTS
                                     exception-to-the-small-row wording needs
                                     legs, pieces or sub-tasks, or `--whole --why
                                     "…"` on the add. No word: the mode and hits
-  wsp worklist after <slug> <other|none>
-                                    start <slug> only once <other> is complete
+  wsp worklist after <slug> <other>[,<other>…]|none
+                                    start <slug> only once every <other> is
+                                    complete (several: commas or more words)
   wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone] [--no-retro]
                                     where a planned list queues (high first, then
                                     the earlier planned) and whether it waits for
