@@ -11792,6 +11792,7 @@ mod from_repair {
     use crate::repair::*;
     use crate::repair::tests::*;
     use crate::util;
+    use crate::model::Status;
 
     /// **A seat on a backend pane, read by the real fleet** (`wsp-148`, live on
     /// 2026-10-06). backend is out of the picture, and while the fleet still asked
@@ -11814,5 +11815,57 @@ mod from_repair {
         );
         assert_eq!(reading(&store, crate::cycle::seats(), "run"), Occupancy::Vacant("gone"));
         let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-344`: a claim whose seat the manager reports absent is released on
+    /// the next tick, with the reason on the row; a seat that is there, a far
+    /// seat (a machine that is gone is `--lost`'s), a claim younger than a
+    /// minute and a seat nobody can read keep theirs.
+    #[test]
+    fn a_gone_seats_claim_is_released_on_the_next_tick_with_a_line_on_the_row() {
+        /// Absence is scripted; the release is the real fleet's.
+        struct GoneThenReal(Absent);
+        impl crate::cycle::Seats for GoneThenReal {
+            fn state(&self, seat: &str) -> Option<crate::place::State> {
+                self.0.state(seat)
+            }
+            fn absent(&self, seat: &str) -> bool {
+                self.0.absent(seat)
+            }
+            fn release_gone(&self, store: &crate::store::Store, row: &str, seat: &str, why: &str) -> bool {
+                crate::cycle::Seats::release_gone(&super::Fleet, store, row, seat, why)
+            }
+        }
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = in_flight("gone-seat-claim");
+        for (id, seat) in [("m-far", "cpd-8@mb"), ("m-young", "cpd-3"), ("m-here", "cpd-4")] {
+            member(&store, id, Status::Doing);
+            claim(&store, id, seat);
+        }
+        let rec = store.state.join(crate::place_compound::SEATS).join("cpd-8@mb");
+        std::fs::create_dir_all(&rec).unwrap();
+        std::fs::write(rec.join("seat.json"), r#"{"machine":"mb"}"#).unwrap();
+        store.set_claim("m-young", serde_json::json!({ "workspace": "cpd-3", "claimed_at": util::now_iso() }));
+        // A claim no binding stands for is still a claim.
+        member(&store, "m-bare", Status::Doing);
+        store.set_claim("m-bare", serde_json::json!({ "agent_id": "a-bare" }));
+        store.set_agent("a-bare", serde_json::json!({ "seat": "cpd-2" }));
+
+        let gone = Absent(["cpd-1", "cpd-2", "cpd-8@mb", "cpd-3"].map(String::from).to_vec());
+        tick(&store, &GoneThenReal(gone), &mut Pass::new());
+
+        let claims = store.claims();
+        assert!(!claims.contains_key("m-1"), "the gone seat's claim is released");
+        assert!(!store.bindings().contains_key("cpd-1"), "and its binding");
+        let log = store.task("m-1").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("released") && log.contains("its seat cpd-1 is gone"), "{log}");
+        assert_eq!(store.task("m-1").unwrap().status(), Status::Doing, "the row's status is not this pass's");
+        assert!(!claims.contains_key("m-bare"), "the claim with no binding is released too");
+        let bare = store.task("m-bare").unwrap().section("Log").unwrap_or_default();
+        assert!(bare.contains("its seat cpd-2 is gone"), "{bare}");
+        assert!(claims.contains_key("m-far"), "a far seat keeps --lost's path");
+        assert!(claims.contains_key("m-young"), "a claim made a moment ago is not judged on the seat table yet");
+        assert!(claims.contains_key("m-here"), "a seat no backend calls absent keeps its claim");
+        assert!(stamped().iter().any(|l| l.contains("claim(s) whose seat is gone, released:") && l.contains("m-1 (cpd-1)")));
     }
 }

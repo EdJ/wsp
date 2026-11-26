@@ -2784,7 +2784,9 @@ impl Seats for Absent {
         self.0.iter().any(|s| s == seat)
     }
     /// What the engine can see of a release: binding, claim and the log line.
-    /// The act itself is the seats' and is tested there.
+    /// The act itself is the seats': `cmd_spawn::from_repair`'s
+    /// `a_gone_seats_claim_is_released_on_the_next_tick_with_a_line_on_the_row`
+    /// runs the real one under the same tick.
     fn release_gone(&self, store: &Store, row: &str, seat: &str, why: &str) -> bool {
         store.clear_binding(seat);
         store.clear_claim(row);
@@ -2854,36 +2856,6 @@ impl Seats for Absent {
         list(&store, &["m-1"], "claude");
         claim(&store, "m-1", "cpd-1");
         (env, store)
-    }
-
-    /// `wsp-344`: a claim whose seat the manager reports absent is released on
-    /// the next tick, with the reason on the row; a seat that is there, a far
-    /// seat (a machine that is gone is `--lost`'s), a claim younger than a
-    /// minute and a seat nobody can read keep theirs.
-    #[test]
-    fn a_gone_seats_claim_is_released_on_the_next_tick_with_a_line_on_the_row() {
-        let (_env, store) = in_flight("gone-seat-claim");
-        for (id, seat) in [("m-far", "cpd-8@mb"), ("m-young", "cpd-3"), ("m-here", "cpd-4")] {
-            member(&store, id, Status::Doing);
-            claim(&store, id, seat);
-        }
-        let rec = store.state.join(crate::place_compound::SEATS).join("cpd-8@mb");
-        std::fs::create_dir_all(&rec).unwrap();
-        std::fs::write(rec.join("seat.json"), r#"{"machine":"mb"}"#).unwrap();
-        store.set_claim("m-young", serde_json::json!({ "workspace": "cpd-3", "claimed_at": util::now_iso() }));
-
-        tick(&store, &Absent(vec!["cpd-1".into(), "cpd-8@mb".into(), "cpd-3".into()]), &mut Pass::new());
-
-        let claims = store.claims();
-        assert!(!claims.contains_key("m-1"), "the gone seat's claim is released");
-        assert!(!store.bindings().contains_key("cpd-1"), "and its binding");
-        let log = store.task("m-1").unwrap().section("Log").unwrap_or_default();
-        assert!(log.contains("released") && log.contains("its seat cpd-1 is gone"), "{log}");
-        assert_eq!(store.task("m-1").unwrap().status(), Status::Doing, "the row's status is not this pass's");
-        assert!(claims.contains_key("m-far"), "a far seat keeps --lost's path");
-        assert!(claims.contains_key("m-young"), "a claim made a moment ago is not judged on the seat table yet");
-        assert!(claims.contains_key("m-here"), "a seat no backend calls absent keeps its claim");
-        assert!(stamped().iter().any(|l| l.contains("claim(s) whose seat is gone, released: m-1 (cpd-1)")));
     }
 
     pub fn claim(store: &Store, id: &str, seat: &str) {
