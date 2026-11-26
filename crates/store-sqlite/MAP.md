@@ -15,7 +15,7 @@ each, no exceptions file). Nothing in wsp opens it until group 6.
 - `src/reads.rs` — `Reads`, `Events` (`events_after`, `head`) and `Texts`; `wip_snapshot` is cut in SQL over the state row
 - `src/events.rs` — `wait_for`: the process-wide wake registry and the `data_version` poll
 - `tests/conformance.rs` — the `Harness` and the ten cases, plus the read-only and surface tests
-- `tests/wip.rs` — `wip_snapshot`'s shape (bodies on open rows, unfinished lists and finished lists a seat still sits on only, raised asks only), and that it agrees with `MemStore`'s
+- `tests/wip.rs` — `wip_snapshot`'s shape (bodies on open rows only, unfinished lists and finished lists a seat still sits on only, the other finished lists left out, raised asks only), and that it agrees with `MemStore`'s
 
 ## Schema
 

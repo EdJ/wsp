@@ -32,7 +32,9 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   is one store call. `lists`, `asks`, `machines`, and `orders` with no seat have no `Reads` verb, so they read the
   one `snapshot`. A command verb is `unsupported`, an unknown verb is `unsupported`, and a known verb with bad
   `args` is `malformed`. `throttle`, `spend` and `show` are answered by `Config::views` whole (its `Err` as the
-  reply's `err`), `unsupported` without one. A request whose `by` is not the connection's is `forbidden`, and one whose `v` is not 1 is
+  reply's `err`), `unsupported` without one. `wip` is answered from `src/wip.rs`'s cut cached by head; a cut past
+  the line is kept as `SNAPSHOT_PART` pieces, `wip {}` answers the first with `parts`, `wip { at, part }` the rest,
+  and the connection pins the cut it began on until its last part (wsp-783). A request whose `by` is not the connection's is `forbidden`, and one whose `v` is not 1 is
   `protocol`. A line that does not decode is answered `malformed` and the connection stays up. If an `id` can be
   read from the line, the answer is a reply to that id; otherwise it is `refused`. A client silent for
   `MISSED_BEATS` beats is dropped.
