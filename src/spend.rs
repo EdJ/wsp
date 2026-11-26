@@ -254,7 +254,7 @@ mod tests {
         for k in ["id", "cost", "output", "sessions"] {
             assert!(r["projects"][0].get(k).is_some(), "projects[].{k}");
         }
-        for k in ["slug", "project", "cost", "output", "sessions"] {
+        for k in ["slug", "project", "cost", "today", "output", "sessions"] {
             assert!(r["lists"][0].get(k).is_some(), "lists[].{k}");
         }
     }
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!((t["30d"]["cost"].as_f64(), t["30d"]["sessions"].as_u64()), (Some(6.75), Some(5)), "October 10th is outside: {t}");
         assert_eq!(r["projects"][0], json!({ "id": "compounding", "cost": 6.5, "output": 650, "sessions": 4 }), "the verifier's seat counts to its row");
         assert_eq!(r["projects"][1]["id"], "unplaced");
-        assert_eq!(r["lists"][0], json!({ "slug": "pass-9", "project": "compounding", "cost": 6.5, "output": 650, "sessions": 4 }));
+        assert_eq!(r["lists"][0], json!({ "slug": "pass-9", "project": "compounding", "cost": 6.5, "today": 0.0, "output": 650, "sessions": 4 }));
         assert_eq!(r["rows"], json!({ "landed_30d": 1, "cost_per_landed_row": 6.75 }));
     }
 
