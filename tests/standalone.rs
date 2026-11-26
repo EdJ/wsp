@@ -347,7 +347,7 @@ struct Sandbox {
 impl Sandbox {
     fn up() -> Sandbox {
         // Short: the fake backend's unix socket lives under it, and macOS caps that path at 104 bytes.
-        let dir = PathBuf::from("/tmp").join(format!("sa-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sa-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -604,7 +604,7 @@ fn a_planted_socket_in_this_process_is_read_off_the_machine() {
 
 #[test]
 fn a_planted_file_is_outside_the_allow_list() {
-    let dir = PathBuf::from("/tmp").join(format!("sa-plant-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sa-plant-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let name = "alone";
     let allowed: Vec<String> = ALLOWED.iter().map(|p| p.replace("<n>", &format!("wsp-{name}"))).collect();

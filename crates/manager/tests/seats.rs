@@ -106,7 +106,7 @@ esac
 /// wait. So the fake's first start is waited on here, on its answer and on no
 /// clock, and [`start`] gives the manager's handshake the test's own [`WAIT`].
 fn place(tag: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::temp_dir();
     let dir = base.join(format!("wm-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let sup = base.join(format!("wm-{tag}-{}.sup", std::process::id()));

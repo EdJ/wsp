@@ -280,7 +280,7 @@ struct Rig {
 
 impl Rig {
     fn up(tag: &str) -> Rig {
-        let dir = PathBuf::from("/tmp").join(format!("hc{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hc{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let data = dir.join("hub");

@@ -126,7 +126,7 @@ struct Rig {
 impl Rig {
     fn up(tag: &str) -> Rig {
         // Short: the fake backend's unix socket lives under it.
-        let dir = PathBuf::from("/tmp").join(format!("hs{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hs{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();

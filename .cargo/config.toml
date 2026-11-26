@@ -12,6 +12,11 @@ rustc-wrapper = ".cargo/rustc-wrap"
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-adhoc_codesign"]
 
+# wsp-548: every test process runs with a TMPDIR of its own that is removed after it, so a test's
+# scratch goes under `std::env::temp_dir()` and nowhere else.
+[target.'cfg(unix)']
+runner = ".cargo/test-run"
+
 # State-core step 0 (docs/state-core.md section 9): C compiled by a build script (libsqlite3-sys's
 # sqlite3.c) goes through `.cargo/cc-wrap`, sccache's `cc` when installed, bare `cc` when not.
 # No `force`: a CC in the environment still wins. `relative` makes the path absolute from this file.
