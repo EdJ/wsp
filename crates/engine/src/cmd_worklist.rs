@@ -6106,7 +6106,7 @@ pub fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i32 {
     // release` is refused for a seat, so the honest ending is the whole one, and
     // it is the seat that is told what happened. Not the barrier check: this is
     // usually its turn, and it ends at `review` on a tick (`wsp-209`).
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Held);
+    crate::cycle::end_what_the_run_opened(store, crate::cycle::seats(), &w.id, pos.at, crate::cycle::Closing::Held);
 
     if args.json() {
         println!(
@@ -7112,7 +7112,7 @@ pub fn close(store: &Store, args: &Args, mut w: Worklist, how: crate::cycle::Clo
     // be typed on a list with work still open — that is its documented meaning —
     // and ending a member's agent on a list somebody meant to come back to is
     // not something to do without saying.
-    crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, how);
+    crate::cycle::end_what_the_run_opened(store, crate::cycle::seats(), &w.id, pos.at, how);
     // And the trees of its members that are closed, where their work is on the
     // trunk (`wsp-305`): no barrier will sweep them now. After the run's seats
     // are ended, so a claim that just went does not keep one.
@@ -7557,7 +7557,7 @@ pub fn status(store: &Store, args: &Args) -> i32 {
         // Whatever the run opened goes first, as `done` does, so no agent is
         // left on a row that is about to be somebody else's again.
         if matches!(was, worklist::ListStatus::Executing) {
-            crate::cycle::end_what_the_run_opened(store, &crate::cycle::Fleet, &w.id, pos.at, crate::cycle::Closing::Done);
+            crate::cycle::end_what_the_run_opened(store, crate::cycle::seats(), &w.id, pos.at, crate::cycle::Closing::Done);
         }
         let note = match &why {
             Some(why) => format!("put back to todo: {} was cancelled — {why}", w.id),

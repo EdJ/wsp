@@ -241,7 +241,7 @@ fn ended_line_at(store: &Store, leg: &Leg, pane: &str, extra: &str, at: &str) ->
     let started = leg.started.clone().unwrap_or_default();
     let secs = if started.is_empty() { 0 } else { (util::epoch_of(at) - util::epoch_of(&started)).max(0) };
     let after = if secs > 0 { format!(" after {}", util::duration_human(secs)) } else { String::new() };
-    let ran = if started.is_empty() { String::new() } else { crate::cycle::Seats::ran_in_seat(&crate::cycle::Fleet, store, pane, &started) };
+    let ran = if started.is_empty() { String::new() } else { crate::cycle::Seats::ran_in_seat(crate::cycle::seats(), store, pane, &started) };
     format!("leg {} ended{after}{extra}{ran}", leg.name)
 }
 

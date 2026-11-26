@@ -752,7 +752,7 @@ fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option
     }
     let arranged = match cfg!(test) {
         true => Ok(()),
-        false => crate::cycle::Seats::end_exit_when_idle(&crate::cycle::Fleet, store, &seat),
+        false => crate::cycle::Seats::end_exit_when_idle(crate::cycle::seats(), store, &seat),
     };
     Some(match arranged {
         Ok(()) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now, ended at its Stop"),
@@ -781,9 +781,9 @@ fn refused(store: &Store, seat: Option<&str>) {
 /// the seat's turn to end, then end it by [`crate::ending::end_exit`]. Through
 /// the [`crate::cycle::Seats`] port, so this module reaches no seat verb.
 fn end_at_stop(store: &Store, seat: &str) -> i32 {
-    let fleet = crate::cycle::Fleet;
-    crate::cycle::Seats::wait_idle(&fleet, seat);
-    match crate::ending::end_exit(store, &fleet, seat) {
+    let fleet = crate::cycle::seats();
+    crate::cycle::Seats::wait_idle(fleet, seat);
+    match crate::ending::end_exit(store, fleet, seat) {
         Some(line) => println!("{line}"),
         None => println!("wsp: {seat} is still in a turn or unreadable — the next tick ends it"),
     }

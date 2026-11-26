@@ -507,33 +507,26 @@ impl Report {
     }
 }
 
-/// The real reading, over the backends on this machine — with opencode's own
-/// database overruling a screen that has stopped repainting. `wsp-160`.
-///
-/// **A backend that is not running here is not asked** (`wsp-148`, live on
-/// 2026-10-06). backend is out of the picture (Ed, 2026-10-06), and while the
-/// fleet still asked it, its `Unreachable` with no server was read as "cannot
-/// say" — so every dead governor seat was `Unreadable` for as long as backend
-/// stayed down, which is always now, and the reconciler refilled none of them:
-/// compound, jolt-app and wsp. backend owns its panes, so no server here means no
-/// backend pane here to be in, and a seat recorded on one is a seat compound has
-/// no record of: nobody is in it, and a reseat fills it on compound. Only a
-/// bare id — one qualified `@machine` is that machine's backend's to answer.
-///
-/// [`crate::backend::available_now`] rather than the cached answer, because the
-/// daemon lives for days: a cache latched `false` would go on skipping backend
-/// after it came back, and skipping is the direction that seats a successor
-/// beside a live pane. One connect, once a minute, per seat asked about.
-///
-/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
-/// and the argument is the cost: that function is called from `survey`, from
-/// `wsp wip`, and from a panel four times a second, and the overrule shells to
-/// `opencode db`. A reader that fires it on every call would run a process per
-/// opencode seat per panel frame. The reconciler runs it once a minute, on the
-/// seats it is already asking about, and can say in `cycle.log` that it did —
-/// which is what `wsp-160` asks for ("log the repair beside it") and what a
-/// function returning a [`State`] has nowhere to put.
-pub struct Fleet;
+/// The real [`Seats`] is seats' (`cmd_spawn::Fleet`), above the engine, so it is
+/// installed (wsp-542): by `main` first thing, and by a test in its setup.
+static SEATS: std::sync::OnceLock<&'static (dyn Seats + Sync)> = std::sync::OnceLock::new();
+
+pub fn install_seats(seats: &'static (dyn Seats + Sync)) {
+    let _ = SEATS.set(seats);
+}
+
+/// The installed [`Seats`]. Panics before [`install_seats`]: an answer made up
+/// here would read as "nobody can say" and the run would act on it.
+pub fn seats() -> &'static dyn Seats {
+    // The engine's own tests have no `main` to install it for them.
+    #[cfg(test)]
+    install_tests::install();
+    required(SEATS.get().copied())
+}
+
+fn required(seats: Option<&'static (dyn Seats + Sync)>) -> &'static dyn Seats {
+    seats.expect("no Seats installed: call cycle::install_seats(&cmd_spawn::Fleet) before this")
+}
 
 
 /// How long a completed turn has to have been over before a screen still
@@ -554,7 +547,7 @@ pub struct Fleet;
 /// [`crate::repair::Pass::due`] makes.
 pub const SETTLED_AFTER: i64 = 60;
 
-/// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
+/// The half of [`crate::cmd_spawn::Fleet::overrule_frozen_opencode`] that decides, split out so a
 /// test can drive it without an opencode, a database and a frozen TUI.
 ///
 /// **`finished` is the session's last completed turn in seconds, and `None` is
@@ -800,7 +793,7 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
         // is owed start here, through the gate (`start_inside` leaves a list's
         // member to the list).
         if store.find_task(&id).is_some_and(|t| crate::inner::run_inside(&t)) {
-            let _ = start_inside(store, &id, &Fleet);
+            let _ = start_inside(store, &id, seats());
         }
     }
     if let (Some(list), Some(event)) = (named.as_deref(), args.get("event")) {
@@ -837,13 +830,13 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
                     // step is still taken: a hand-run group may be followed
                     // by one wsp runs.
                     if !ran_by_wsp(&w, passed) {
-                        let _ = step(store, &w, &Fleet);
+                        let _ = step(store, &w, seats());
                         return 0;
                     }
                     if let Some(n) = passed {
-                        after_pass(store, &Fleet, &w, n);
+                        after_pass(store, seats(), &w, n);
                     }
-                    let _ = step(store, &w, &Fleet);
+                    let _ = step(store, &w, seats());
                     tell(store, &w, &passed_sentence(store, &w, passed));
                     return 0;
                 }
@@ -864,7 +857,7 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
         }
     }
     for w in stepped(store, named.as_deref(), args.get("task").as_deref()) {
-        let _ = step(store, &w, &Fleet);
+        let _ = step(store, &w, seats());
     }
     0
 }
@@ -4922,7 +4915,7 @@ pub fn end_checks_when_idle(store: &Store, list: &str, at: usize) -> Vec<String>
 fn end_check(store: &Store, list: &str, id: &str) {
     let pane = store.panes_for_task(id).into_iter().next();
     if let Some(pane) = pane.as_deref().filter(|_| !cfg!(test)) {
-        Seats::wait_idle(&Fleet, pane);
+        Seats::wait_idle(seats(), pane);
     }
     if !store.claims().contains_key(id) {
         log_line(store, &format!("{list}: {id} settled its barrier and has already gone — nothing to end"));
@@ -4936,7 +4929,7 @@ fn end_check(store: &Store, list: &str, id: &str) {
 /// with no row, which holds no claim — its standing entry is the test.
 fn end_check_seat(store: &Store, list: &str, seat: &str) {
     if !cfg!(test) {
-        Seats::wait_idle(&Fleet, seat);
+        Seats::wait_idle(seats(), seat);
     }
     if crate::barrier::seat_of(store, seat).is_none() {
         log_line(store, &format!("{list}: the check in {seat} settled its barrier and has already gone — nothing to end"));
@@ -5266,7 +5259,7 @@ pub fn occupied(store: &Store, seat: &crate::governors::Seat) -> Option<String> 
     if cfg!(test) {
         return (!seat.pane.is_empty()).then(|| seat.pane.clone());
     }
-    Seats::occupant(&Fleet, store, seat)
+    Seats::occupant(seats(), store, seat)
 }
 
 /// [`crate::cmd_spawn::end_seat_when_idle`], recorded instead under test.
@@ -5276,7 +5269,7 @@ pub fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
         tests::ENDED.with(|s| s.borrow_mut().push(seat.to_string()));
         return Ok(());
     }
-    Seats::end_when_idle(&Fleet, store, seat)
+    Seats::end_when_idle(seats(), store, seat)
 }
 
 /// Every agent this run opened that has nothing left to do, and holds a claim.
@@ -5831,7 +5824,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     // wsp's own notice, for the seat that answers for the member — not a
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
-    Seats::notice(&Fleet, store, &first, &text)
+    Seats::notice(seats(), store, &first, &text)
 }
 
 /// wsp's notice on a row on no list, for the seat that answers for it (its
@@ -5839,7 +5832,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
 /// the engine modules that tell a row's stall reach it through the run and not
 /// up into the seats (`wsp-690`). Returns whether it was raised.
 pub fn notice_on_row(store: &Store, member: &str, text: &str) -> bool {
-    Seats::notice(&Fleet, store, member, text)
+    Seats::notice(seats(), store, member, text)
 }
 
 /// The member [`tell_now`] puts a run's notice on: the first of the group the
@@ -5916,7 +5909,7 @@ pub fn nobody_coming(store: &Store, list: &str) -> Option<String> {
 pub fn hand_on_what_done_lists_held(store: &Store) {
     for key in store.watches().keys() {
         let Some(scope) = key.strip_prefix("wake:") else { continue };
-        let held = Seats::messages_held(&Fleet, store, scope);
+        let held = Seats::messages_held(seats(), store, scope);
         if held.is_empty() {
             continue;
         }
@@ -5946,7 +5939,7 @@ pub fn hand_on_what_done_lists_held(store: &Store) {
                 handed.push(*seq);
             }
         }
-        Seats::settle_held(&Fleet, store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
+        Seats::settle_held(seats(), store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
         // Said when something moved, not every tick something could not: a
         // done list with no member to put a notice on would otherwise write
         // this line a minute for ever. What stays is still on `--status`.
@@ -6031,7 +6024,7 @@ pub fn hand_it_up(store: &Store, w: &Worklist, text: &str) -> Option<String> {
     if crate::cmd_message::caller(store) == above.scope {
         return None;
     }
-    Seats::say(&Fleet, store, &above.scope, text, None);
+    Seats::say(seats(), store, &above.scope, text, None);
     Some(above.scope)
 }
 
@@ -6062,7 +6055,7 @@ pub fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -> bool 
     // nowhere, and the caller's hand on a member reaches the seat above.
     let own = || (w.runs_itself() && nobody_coming(store, &w.id).is_none()).then(|| w.id.clone());
     let Some(scope) = governing_scope(store, w).or_else(own) else { return false };
-    let report = Seats::say(&Fleet, store, &scope, text, None);
+    let report = Seats::say(seats(), store, &scope, text, None);
     // Said as well as returned, because `cycle.log` is how a governor reads what
     // the run has been doing, and *the seat is mid-turn* is the answer to "why
     // has nobody started my next group" that used to be missing from it. The
@@ -6086,6 +6079,19 @@ fn rotate(store: &Store, seats: &dyn Seats, w: &Worklist) {
 }
 
 pub use crate::store::log_line;
+
+#[cfg(test)]
+mod install_tests {
+    pub fn install() {
+        super::install_seats(&crate::cmd_spawn::Fleet);
+    }
+
+    #[test]
+    #[should_panic(expected = "no Seats installed: call cycle::install_seats")]
+    fn a_seats_call_before_the_install_panics_naming_it() {
+        super::required(None);
+    }
+}
 
 #[cfg(test)]
 pub mod tests {

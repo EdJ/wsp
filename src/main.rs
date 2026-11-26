@@ -453,6 +453,8 @@ fn needs_store(args: &Args) -> bool {
 }
 
 fn main() {
+    // Before the daemon or any verb: the engine reaches seats only through this (wsp-542).
+    cycle::install_seats(&cmd_spawn::Fleet);
     die_on_broken_pipe();
     let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
     let _ = wsp_engine::base::stamp::BUILD_STAMP.set(base::stamp::build_stamp);
@@ -460,7 +462,7 @@ fn main() {
     outputs::install(cmd_report::REPORTS);
     let _ = mirror::LIST_SHOW.set(cmd_worklist::show_facts);
     let _ = mirror::SEAT_WORKING.set(cmd_machine::seat_working);
-    let _ = mirror::ROW_HOLDER.set(|store, id| cmd_task::holder_with(store, id, &cmd_spawn::seat_is_live, &cycle::Fleet));
+    let _ = mirror::ROW_HOLDER.set(|store, id| cmd_task::holder_with(store, id, &cmd_spawn::seat_is_live, cycle::seats()));
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,

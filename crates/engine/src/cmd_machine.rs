@@ -206,7 +206,7 @@ impl Fleet {
 pub fn seat_working(store: &Store) -> Vec<String> {
     match store.seat_cap() {
         None => Vec::new(),
-        Some(_) => crate::room::working_now(store, &crate::cycle::Fleet).iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
+        Some(_) => crate::room::working_now(store, crate::cycle::seats()).iter().map(|c| if c.weight < crate::room::WHOLE { format!("{} (light)", c.said()) } else { c.said() }).collect(),
     }
 }
 

@@ -2374,7 +2374,7 @@ mod tests {
         root.kill().unwrap();
         root.wait().unwrap();
         let after = crate::place_super::tree_of(root.id());
-        let running = crate::cycle::Fleet.running(&tree);
+        let running = crate::cycle::seats().running(&tree);
         // By pid, never by pattern — this test's own sleep and nothing else.
         crate::host::Host::signal(&crate::host::LOCAL, &[child], "TERM");
         assert!(after.contains(&child), "still in the group with its parent gone: {after:?}");

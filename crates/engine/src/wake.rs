@@ -271,7 +271,7 @@ fn wake_by(store: &Store, emits: &[Emit], at: i64, primaries: &Primaries) {
         mine.entry(e.to.clone()).or_default().push(e);
     }
     for (scope, theirs) in mine {
-        deliver_to(store, &crate::cycle::Fleet, &scope, &theirs, at);
+        deliver_to(store, crate::cycle::seats(), &scope, &theirs, at);
     }
     // And the tells held for seats that could not be reached, now that the pass
     // has looked at the fleet once more.
@@ -539,7 +539,7 @@ impl Report {
 /// [`Tell::deliver`] — the same question the reconciler asks, which is the sixth
 /// instance of this row's own lesson about two readers of one record.
 pub fn say(store: &Store, scope: &str, text: &str, record: Option<&str>) -> Report {
-    say_through(store, &crate::cycle::Fleet, scope, text, record)
+    say_through(store, crate::cycle::seats(), scope, text, record)
 }
 
 /// [`say`], with the port that reads the seat named — so a test can say what the
@@ -1763,7 +1763,7 @@ mod tests {
         assert_eq!(spool_of(&store, "primary").depth(), 0, "jesper's own primary is not told ed's ask");
 
         // The same words said by `wsp ask` itself, twice: still the one.
-        let first = say_by(&store, &crate::cycle::Fleet, "primary:ed", "which way?", Some(&q.id), &primaries);
+        let first = say_by(&store, crate::cycle::seats(), "primary:ed", "which way?", Some(&q.id), &primaries);
         assert_eq!(sent.borrow().len(), 1, "already sent: {}", first.why);
         assert!(first.said("ed's primary", &util::Paint::plain()).contains("ed's primary"), "{}", first.said("x", &util::Paint::plain()));
 
@@ -1779,7 +1779,7 @@ mod tests {
         // A hub that does not take it is tried again on the next pass.
         let refuse = |_: &Store, _: &str, _: &str| -> Result<String, String> { Err("no hub".into()) };
         let down_hub = Primaries { me: Some("jesper".into()), route: &refuse };
-        let r = say_by(&store, &crate::cycle::Fleet, "primary:ed", "again", None, &down_hub);
+        let r = say_by(&store, crate::cycle::seats(), "primary:ed", "again", None, &down_hub);
         assert_eq!(r.settled, 0);
         assert!(r.why.contains("no hub"), "{}", r.why);
     }
@@ -1799,7 +1799,7 @@ mod tests {
         assert_eq!(spool_of(&store, "primary").depth(), 1, "held for the primary slot, as a governor's is");
         assert_eq!(spool_of(&store, "primary:ed").depth(), 0);
 
-        say_by(&store, &crate::cycle::Fleet, "primary:ed", "which way?", Some(&q.id), &primaries);
+        say_by(&store, crate::cycle::seats(), "primary:ed", "which way?", Some(&q.id), &primaries);
         assert_eq!(spool_of(&store, "primary").depth(), 2, "a said sentence goes to the same spool");
         assert!(store.message(&q.id).unwrap().handed_to("primary:ed"), "and the record says the primary was handed it");
     }

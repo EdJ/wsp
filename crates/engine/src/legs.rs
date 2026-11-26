@@ -1306,8 +1306,7 @@ fn cmd_skip(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     };
     let why = args.text(3);
     let live = |seat: &str| {
-        use crate::cycle::Seats;
-        let fleet = crate::cycle::Fleet;
+        let fleet = crate::cycle::seats();
         !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty))
     };
     let mut seat = None;
@@ -1381,8 +1380,7 @@ fn cmd_reset(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         return refuse(format!("{name} is {}, and only a running leg can be reset", leg.state.as_str()));
     }
     if let Some(seat) = &leg.pane {
-        use crate::cycle::Seats;
-        let fleet = crate::cycle::Fleet;
+        let fleet = crate::cycle::seats();
         let there = !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty));
         if there && !args.has("force") {
             return refuse(format!(

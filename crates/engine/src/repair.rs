@@ -471,7 +471,7 @@ fn step_running(store: &Store, seats: &dyn Seats) {
 /// seat a running list governs is examined as that list's own and the backlog
 /// contributes nothing new for it.
 fn seat_scopes(store: &Store) -> Vec<(String, String)> {
-    seat_scopes_owing(store, Seats::scopes_owed(&crate::cycle::Fleet, store))
+    seat_scopes_owing(store, Seats::scopes_owed(crate::cycle::seats(), store))
 }
 
 /// [`seat_scopes`], with the backlog half asked only of the scopes in `owed`.
@@ -566,7 +566,7 @@ fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, 
 /// lines none of which is owed, read `unseated · 8 held · counting` on
 /// 2026-10-06 while this walk never counted it.
 pub fn will_seat(store: &Store, scope: &str) -> bool {
-    let owed = Seats::owed_to(&crate::cycle::Fleet, store, scope);
+    let owed = Seats::owed_to(crate::cycle::seats(), store, scope);
     let owed = if owed > 0 { vec![(scope.to_string(), owed)] } else { Vec::new() };
     seat_scopes_owing(store, owed).iter().any(|(s, _)| s == scope)
 }
@@ -600,7 +600,7 @@ pub fn stamp(store: &Store, line: &str) {
 
 /// Every seat whose screen this pass overruled, said once each.
 ///
-/// **Said here rather than inside the reading that overrules it.** [`Fleet`] is
+/// **Said here rather than inside the reading that overrules it.** [`crate::cmd_spawn::Fleet`] is
 /// what turns a frozen opencode screen into `Idle`, and it is deliberately a
 /// cheap function on a port that a panel calls four times a second — it has no
 /// store, no file and no place to put a sentence. This has all three, and a
@@ -3086,7 +3086,7 @@ impl Seats for Absent {
     /// `Seats::state` answers `None` on a machine with no backend answering, and
     /// this is the repair that starts agents: reading an absence as a death would
     /// seat a successor for every running list at the moment the terminal server
-    /// is restarting, which is the same failure [`Fleet`]'s docs warn about and
+    /// is restarting, which is the same failure [`crate::cmd_spawn::Fleet`]'s docs warn about and
     /// it is the one place the warning applies.
     #[test]
     fn a_seat_nobody_can_be_asked_about_is_never_reseated() {
@@ -3625,7 +3625,7 @@ esac
                 "vacated": "2026-08-29T11:51:45Z",
             }),
         );
-        assert_eq!(reading(&store, &crate::cycle::Fleet, "run"), Occupancy::Vacant("gone"));
+        assert_eq!(reading(&store, crate::cycle::seats(), "run"), Occupancy::Vacant("gone"));
         let _ = std::fs::remove_dir_all(&store.root);
     }
 

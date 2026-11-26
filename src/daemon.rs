@@ -678,7 +678,7 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
         // daemon stderr line nobody has attached to would be a second place to
         // look for the same answer.
         if repair_pass.due(now) {
-            repairs(store, &crate::cycle::Fleet, &mut repair_pass);
+            repairs(store, crate::cycle::seats(), &mut repair_pass);
         }
 
         // Every seated agent's resident memory, on its own interval, so a
@@ -1045,6 +1045,7 @@ mod tests {
     fn a_claim_whose_lease_ran_out_is_released_and_its_row_goes_back_to_todo() {
         use wsp_store::model::{Group, Machine, Task, Worklist, WorklistStatus};
 
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _env = crate::util::isolated("claim-expire");
         std::env::remove_var("WSP_CLAIM_TTL");
         let store = Store::open();
@@ -1382,6 +1383,7 @@ mod tests {
         /// daemon's fold thread on it; its first beat (its own probes, in this
         /// process) folded before anything is counted.
         fn manager(store: &Store, exec: &std::path::Path) -> (Manager, std::thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+            crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
             let mut cfg = Config::new(exec, HOST);
             cfg.port = 0;
             cfg.beat = Duration::from_secs(3600);
@@ -1657,6 +1659,7 @@ mod idle_tick {
     /// parsed again, and no other.
     #[test]
     fn a_tick_with_no_changed_file_parses_nothing() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _env = crate::util::isolated("idle-tick-763");
         let store = Store::open();
         store.ensure_dirs().unwrap();
@@ -1669,7 +1672,7 @@ mod idle_tick {
             let p = wsp_store::model::task_parses;
             let mut by = Vec::new();
             let a = p();
-            repairs(store, &crate::cycle::Fleet, &mut crate::repair::Pass::new());
+            repairs(store, crate::cycle::seats(), &mut crate::repair::Pass::new());
             by.push(("repairs".to_string(), p() - a));
             let a = p();
             let mut pass = attention::Pass::new();

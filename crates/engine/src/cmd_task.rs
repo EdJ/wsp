@@ -139,7 +139,7 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         // follow-up is not part of its origin and may belong elsewhere.
         o.project.clone()
     } else {
-        match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
+        match Seats::current_project(crate::cycle::seats(), store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -334,7 +334,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     let scope = if args.has("all") && !args.has("project") {
         None
     } else {
-        match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
+        match Seats::current_project(crate::cycle::seats(), store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -444,7 +444,7 @@ pub fn find(store: &Store, args: &Args) -> i32 {
     let scope = if args.has("all") && !args.has("project") {
         None
     } else {
-        match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
+        match Seats::current_project(crate::cycle::seats(), store, args, &index) {
             Ok(p) => p,
             Err(code) => return code,
         }
@@ -1540,7 +1540,7 @@ fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &d
         for pane in store.panes_for_task(&t.id) {
             store.clear_binding(&pane);
         }
-        Seats::hand_off(&crate::cycle::Fleet, store, &t.id, None, "done");
+        Seats::hand_off(crate::cycle::seats(), store, &t.id, None, "done");
     }
     let id = args.rest.first().and_then(|needle| store.find_task(needle)).map(|t| t.id);
     let code = mutate(store, args, "done", |t| {
@@ -1727,7 +1727,7 @@ fn reseat(store: &Store, args: &Args, run: Option<String>) {
 fn ran_with(store: &Store, t: &Task) -> Option<Vec<String>> {
     let log = t.section("Log").unwrap_or_default();
     let claim = log.lines().filter(|l| l.contains("claimed by pane ")).last()?;
-    let kind = Seats::thread_kind(&crate::cycle::Fleet, store, &t.id).unwrap_or_default();
+    let kind = Seats::thread_kind(crate::cycle::seats(), store, &t.id).unwrap_or_default();
     let mut argv = vec!["spawn".to_string(), t.id.clone(), "--agent".to_string()];
     argv.extend(["--kind".to_string(), crate::agent_kind::kind_or_default(&kind)]);
     let tier = claim.split(" · spawned at ").nth(1).and_then(|r| r.split(" · ").next()).map(str::trim);
@@ -3138,7 +3138,7 @@ pub fn nothing_because(p: &Pick) -> String {
 
 pub fn next(store: &Store, args: &Args) -> i32 {
     let index = Index::new(store.projects());
-    let scope = match Seats::current_project(&crate::cycle::Fleet, store, args, &index) {
+    let scope = match Seats::current_project(crate::cycle::seats(), store, args, &index) {
         Ok(p) => p,
         Err(code) => return code,
     };

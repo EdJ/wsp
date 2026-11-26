@@ -2440,7 +2440,7 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         }
     };
     if args.has("primary") {
-        return seat_primary(place.as_ref(), &crate::cycle::Fleet, store, args);
+        return seat_primary(place.as_ref(), crate::cycle::seats(), store, args);
     }
     place_work(place.as_ref(), store, args)
 }
@@ -2875,7 +2875,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         && !verifying
         && checking.is_none();
     if by_hand && args.has("agent") && !args.has("govern") && args.get("on").is_none() {
-        if let Some((cap, now)) = crate::room::full(store, &crate::cycle::Fleet) {
+        if let Some((cap, now)) = crate::room::full(store, crate::cycle::seats()) {
             eprintln!(
                 "wsp: the seat is at its cap of {cap} ({}) — starting this anyway: a hand spawn is not the run",
                 crate::room::names(&now)
@@ -5880,7 +5880,35 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 ];
 
 // The real `Seats` — the port's implementation lives with the seats it reads and acts on (`wsp-406`).
-impl crate::cycle::Seats for crate::cycle::Fleet {
+/// The real reading, over the backends on this machine — with opencode's own
+/// database overruling a screen that has stopped repainting. `wsp-160`.
+///
+/// **A backend that is not running here is not asked** (`wsp-148`, live on
+/// 2026-10-06). backend is out of the picture (Ed, 2026-10-06), and while the
+/// fleet still asked it, its `Unreachable` with no server was read as "cannot
+/// say" — so every dead governor seat was `Unreadable` for as long as backend
+/// stayed down, which is always now, and the reconciler refilled none of them:
+/// compound, jolt-app and wsp. backend owns its panes, so no server here means no
+/// backend pane here to be in, and a seat recorded on one is a seat compound has
+/// no record of: nobody is in it, and a reseat fills it on compound. Only a
+/// bare id — one qualified `@machine` is that machine's backend's to answer.
+///
+/// [`crate::backend::available_now`] rather than the cached answer, because the
+/// daemon lives for days: a cache latched `false` would go on skipping backend
+/// after it came back, and skipping is the direction that seats a successor
+/// beside a live pane. One connect, once a minute, per seat asked about.
+///
+/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
+/// and the argument is the cost: that function is called from `survey`, from
+/// `wsp wip`, and from a panel four times a second, and the overrule shells to
+/// `opencode db`. A reader that fires it on every call would run a process per
+/// opencode seat per panel frame. The reconciler runs it once a minute, on the
+/// seats it is already asking about, and can say in `cycle.log` that it did —
+/// which is what `wsp-160` asks for ("log the repair beside it") and what a
+/// function returning a [`State`] has nowhere to put.
+pub struct Fleet;
+
+impl crate::cycle::Seats for Fleet {
     /// **The store is not a parameter**, and that is the one thing here worth
     /// stating: this overrule logs, and logging means naming the store whose
     /// `cycle.log` the line goes in. [`Seats::state`] carries only the seat, so
@@ -5889,7 +5917,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     fn state(&self, seat: &str) -> Option<State> {
         let seat_id = Seat::new(seat);
         let compound = crate::place_compound::Compound::new();
-        let raw = crate::cycle::Fleet::here(seat).find_map(|b| b.state(&seat_id).ok())?;
+        let raw = Fleet::here(seat).find_map(|b| b.state(&seat_id).ok())?;
         Some(self.overrule_frozen_opencode(&compound, seat, raw))
     }
 
@@ -5909,7 +5937,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         // `wsp-344`: no backend asked is nobody saying anything, not every
         // backend saying "not mine" — and a claim is released on this answer.
         let mut asked = false;
-        let none_has_it = crate::cycle::Fleet::here(seat).all(|b| {
+        let none_has_it = Fleet::here(seat).all(|b| {
             asked = true;
             matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_)))
         });
@@ -5918,7 +5946,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn pids(&self, seat: &str) -> Option<Vec<u32>> {
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find_map(|b| b.pids(&seat_id))
+        Fleet::here(seat).find_map(|b| b.pids(&seat_id))
     }
 
     fn release_gone(&self, store: &Store, row: &str, seat: &str, why: &str) -> bool {
@@ -5928,7 +5956,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn typed(&self, seat: &str) -> Option<bool> {
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find_map(|b| b.typed(&seat_id))
+        Fleet::here(seat).find_map(|b| b.typed(&seat_id))
     }
 
     fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
@@ -5947,7 +5975,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn turn_end(&self, seat: &str) -> Option<crate::waiting::TurnEnd> {
         let seat_id = Seat::new(seat);
-        let stop = crate::cycle::Fleet::here(seat).find_map(|b| b.stopped(&seat_id))?;
+        let stop = Fleet::here(seat).find_map(|b| b.stopped(&seat_id))?;
         let (words, denied) = stop
             .transcript
             .as_deref()
@@ -5966,7 +5994,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
             return false;
         }
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
+        Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
     }
 
     /// Not under `WSP_ORDERS=store`, for [`Self::press`]'s reason: nothing
@@ -6078,7 +6106,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     }
 }
 
-impl crate::cycle::Fleet {
+impl Fleet {
     /// The backends that could hold this seat: every local one, less backend when
     /// no backend is running here to hold it. See [`Fleet`].
     pub fn here(_seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {

@@ -1083,7 +1083,7 @@ pub fn govern(store: &Store, args: &Args) -> i32 {
         // reading of the backend on a path that already opens panes, and the
         // alternative is a second opinion to keep in step with the first.
         if matches!(
-            crate::repair::reading(store, &crate::cycle::Fleet, &scope),
+            crate::repair::reading(store, crate::cycle::seats(), &scope),
             crate::repair::Occupancy::Occupied
         ) {
             eprintln!("wsp: the {scope} seat has somebody in it - nothing to reseat");

@@ -102,7 +102,7 @@ fn flag_open(store: &Store, scope: &str) -> bool {
         .iter()
         .filter(|m| !m.is_reply())
         .filter_map(|m| m.about.task().and_then(|id| store.find_task(id)))
-        .any(|t| Seats::answering_scope(&crate::cycle::Fleet, store, &t).is_some_and(|s| s == scope))
+        .any(|t| Seats::answering_scope(crate::cycle::seats(), store, &t).is_some_and(|s| s == scope))
 }
 
 fn stand_down_idle_projects(store: &Store, seats: &dyn Seats, now: i64, idle_secs: i64) {
@@ -120,7 +120,7 @@ fn stand_down_idle_projects(store: &Store, seats: &dyn Seats, now: i64, idle_sec
         let busy = !at_a_prompt
             || rotating(store, scope)
             || list_under(store, &index, scope)
-            || Seats::owed_to(&crate::cycle::Fleet, store, scope) > 0
+            || Seats::owed_to(crate::cycle::seats(), store, scope) > 0
             || flag_open(store, scope);
         let since = util::epoch_of(rec.get(IDLE_SINCE).and_then(serde_json::Value::as_str).unwrap_or_default());
         if busy {

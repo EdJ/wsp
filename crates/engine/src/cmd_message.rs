@@ -285,7 +285,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // About the list's group when it can say which: `--group N`, or the group
     // the asking seat is checking.
     let (about, subject_id, seat, to) = match &subject {
-        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cycle::Seats::answering_seat(&crate::cycle::Fleet, store, t), addressed(store, t)),
+        Ok(t) => (About::Task(t.id.clone()), t.id.clone(), crate::cycle::Seats::answering_seat(crate::cycle::seats(), store, t), addressed(store, t)),
         Err(w) => {
             let group = args.get("group").and_then(|g| g.parse::<usize>().ok()).or_else(|| {
                 pane.as_deref().and_then(|p| crate::barrier::seat_of(store, p)).filter(|(l, _)| *l == w.id).map(|(_, at)| at)
@@ -420,7 +420,7 @@ fn ask_with(store: &Store, args: &Args, clock: &dyn Clock) -> i32 {
     // it — unless that seat is the one asking, which would wake it on its own
     // words.
     let report = seat.as_ref().filter(|s| !(q.for_person && me.scope() == Some(s.scope.as_str()))).map(|s| {
-        crate::cycle::Seats::say(&crate::cycle::Fleet, store, &s.scope, &for_a_governor(&q), Some(&q.id))
+        crate::cycle::Seats::say(crate::cycle::seats(), store, &s.scope, &for_a_governor(&q), Some(&q.id))
     });
 
     if wait.on {
@@ -1659,7 +1659,7 @@ fn tell_the_list(store: &Store, closed: &message::Closed, args: &Args) {
         id = closed.question.id,
         answer = closed.question.via.last().map(|h| h.note.as_str()).unwrap_or_default(),
     );
-    let r = crate::cycle::Seats::say(&crate::cycle::Fleet, store, &seat.scope, &text, Some(&closed.question.id));
+    let r = crate::cycle::Seats::say(crate::cycle::seats(), store, &seat.scope, &text, Some(&closed.question.id));
     if !args.json() {
         println!("  {}", r.said(&format!("the {} seat", r.scope), &Paint::new()));
     }
@@ -1970,7 +1970,7 @@ fn deliver(store: &Store, closed: &message::Closed, args: &Args) -> i32 {
             return crate::sent::twice(&sent, ago, &p);
         }
     }
-    let out = crate::cycle::Seats::tell_as(&crate::cycle::Fleet, &found.agent.kind, place.as_ref(), &crate::place::Seat::new(&pane), &text);
+    let out = crate::cycle::Seats::tell_as(crate::cycle::seats(), &found.agent.kind, place.as_ref(), &crate::place::Seat::new(&pane), &text);
     // The census row said idle and the backend said busy: the turn started in
     // between. The same hold, for the same reason, rather than a refusal.
     if let Err(crate::place::Refusal::NotReady(state)) = out {
@@ -2182,7 +2182,7 @@ pub fn type_at(pane: &str, text: &str) -> Option<crate::place::Result<crate::pla
     if found.agent.kind.trim().is_empty() {
         return None;
     }
-    Some(crate::cycle::Seats::tell_as(&crate::cycle::Fleet, &found.agent.kind, place.as_ref(), &crate::place::Seat::new(pane), text))
+    Some(crate::cycle::Seats::tell_as(crate::cycle::seats(), &found.agent.kind, place.as_ref(), &crate::place::Seat::new(pane), text))
 }
 
 /// How long a held answer is asked about again after a delivery that did not
@@ -2346,7 +2346,7 @@ fn asked_of(governors: &std::collections::BTreeMap<String, serde_json::Value>, s
 /// is a property of its shape.
 fn addressed(store: &Store, task: &crate::model::Task) -> String {
     let governors = store.governors();
-    match crate::cycle::Seats::answering_seat(&crate::cycle::Fleet, store, task) {
+    match crate::cycle::Seats::answering_seat(crate::cycle::seats(), store, task) {
         Some(s) => asked_of(&governors, &s),
         None => "asked of every panel — no governor above it".into(),
     }
@@ -2673,7 +2673,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 /// Tell a governor's seat a question was filed for it (`wsp submit`'s asks), kept
 /// here because this module already reaches the seat layer and `cmd_submit` may not.
 pub fn say_to_governor(store: &Store, scope: &str, q: &Message) {
-    let _ = crate::cycle::Seats::say(&crate::cycle::Fleet, store, scope, &for_a_governor(q), Some(&q.id));
+    let _ = crate::cycle::Seats::say(crate::cycle::seats(), store, scope, &for_a_governor(q), Some(&q.id));
 }
 
 // ---------------------------------------------------------------- tells through the hub (wsp-470)
