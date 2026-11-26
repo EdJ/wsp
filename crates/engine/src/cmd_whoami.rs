@@ -61,7 +61,7 @@ pub fn sign(line: String) -> String {
 /// login, no hub URL or no answer. Never reads `api.token`.
 fn resolve() -> Option<(Principal, String)> {
     // A test never dials: a developer's own login must not change what it reads.
-    if cfg!(test) {
+    if crate::base::under_test() {
         return None;
     }
     let credential = Credential::for_hub().ok()?;

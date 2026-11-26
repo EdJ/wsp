@@ -4,6 +4,7 @@
 //! `wsp-testkit` and installs the `state.db` open.
 #![allow(unused_imports)]
 
+use wsp_engine::barrier::open as barrier_open;
 use wsp_engine::cmd_message::tests::{item_json, scratch as message_scratch, task as message_task, two_questions};
 use wsp_engine::cmd_task::tests::{far, parse, refused, released, reseated, scratch, verified_row, Absent, Reads};
 use wsp_engine::cycle::tests::{list, reading, scratch as cycle_scratch, task, Exits, ENDED, KEPT, SAID, TOLD};
