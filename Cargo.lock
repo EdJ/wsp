@@ -913,6 +913,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsp-hub-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wsp-api",
+ "wsp-objects",
+ "wsp-store-contract",
+]
+
+[[package]]
 name = "wsp-machines"
 version = "0.1.0"
 dependencies = [

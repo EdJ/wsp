@@ -1,0 +1,22 @@
+[package]
+name = "wsp-hub-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "The hub's wire surface, shared by the spoke and the hub: frames, hello and login, the hub's read verbs, the identity commands, the sync, ref, id, lease and message verbs; types, encode/decode and constants only, no logic and no IO"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# An unknown verb's `args` is kept as a JSON value, so its request id stays readable.
+serde_json = "1"
+# Principals, row ids, tokens, times, subjects, event ids, refusals, the identity's ids, and
+# subscribe's `Feed` with the `State` and `Event` it carries: the frames carry them whole.
+wsp-store-contract = { path = "../store-contract" }
+# `ObjectId` (hex SHA-256 on the wire), `Refs` and `WorkspaceId`, which the sync verbs carry.
+wsp-objects = { path = "../objects" }
+
+[dev-dependencies]
+# Today's wire, which every frame of this crate is held to byte for byte (tests/wire.rs).
+wsp-api = { path = "../api" }
