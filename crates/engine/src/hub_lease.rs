@@ -1450,7 +1450,9 @@ pub mod tests {
             t.for_user = owner.map(str::to_string);
             store.save_task(&t).unwrap();
         }
-        let dialled = || listener.accept().is_ok();
+        // Takes every connection waiting: one dial can leave two, and the second must not count
+        // against a later row.
+        let dialled = || std::iter::from_fn(|| listener.accept().ok()).count() > 0;
 
         let why = before_claim(&store, "wsp-1").unwrap_err();
         assert_eq!(why, "wsp-1 is allocated to ed; it runs on their wsp");
