@@ -2956,6 +2956,12 @@ mod tests {
         let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
         let cargo = bin.join("cargo");
         std::fs::copy(sleep, &cargo).unwrap();
+        // macOS kills a copied system binary at once (its signature names the
+        // old path); signing the copy ad hoc lets it run.
+        if cfg!(target_os = "macos") {
+            let signed = std::process::Command::new("codesign").args(["-s", "-", "-f"]).arg(&cargo).output().unwrap();
+            assert!(signed.status.success(), "codesign: {}", String::from_utf8_lossy(&signed.stderr));
+        }
         let wsp = script("wsp", "(cd \"$3\" && exec \"$4\" 60) &\nwait");
         let mut check = wsp_base::calls::Command::new(&wsp)
             .args(["check", &row, &tree.display().to_string(), &cargo.display().to_string()])
