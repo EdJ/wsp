@@ -3,7 +3,8 @@
 The shared-work add-on: the spoke that logs in to a shared hub and syncs shared work (`docs/components.md`, the `spoke`
 row; `docs/multiplayer.md`). Depends on `wsp-engine` and the crates below it (`wsp-base`, `wsp-store`,
 `wsp-store-contract`, `wsp-objects`) and the hub's wire, `wsp-hub-protocol`, beside `rustls`, `rustls-native-certs` and
-`sha2` for its own hub client; not `wsp-api`, `wsp-client` or `wsp-machines`. `wsp-engine` never depends on it
+`sha2` for its own hub client; not `wsp-api`, `wsp-client`, `wsp-machines` or `wsp-seats` (it reaches the seats only
+through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-seats` depends on it
 (`tests/layering.rs`). The root installs it and registers its verbs; it re-exports each module at its old path
 (`crate::hub_lease`, `crate::cmd_login`, …) in `main.rs`.
 

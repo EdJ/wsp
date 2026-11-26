@@ -5,6 +5,8 @@
 # sit in `deps/`) is exec'd untouched.
 case "$1" in
   */deps/*) ;;
+  # cargo's newer build-dir layout puts a test binary at build/<package>/<hash>/out/ and makes no deps/.
+  */build/*/out/*) ;;
   *) exec "$@" ;;
 esac
 # A unix socket path may be 104 bytes: a long $TMPDIR (a Mac's /var/folders/..) is not used.
@@ -23,5 +25,7 @@ trap 'rm -rf "$run" 2>/dev/null || { chmod -R u+rwx "$run"; rm -rf "$run"; }' EX
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-TMPDIR=$run "$@"
+# The resolved path: on a Mac /tmp is a link to /private/tmp, and a test that compares a canonicalized
+# path with one built from $TMPDIR must see one spelling.
+TMPDIR=$(cd "$run" && pwd -P) "$@"
 exit $?

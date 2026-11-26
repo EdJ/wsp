@@ -25,7 +25,12 @@ pub fn under_test() -> bool {
 #[cfg(any(test, feature = "test-support"))]
 #[cfg_attr(test, allow(dead_code))]
 fn is_harness(exe: &std::path::Path) -> bool {
-    exe.parent().and_then(|d| d.file_name()).is_some_and(|d| d == "deps")
+    let name = |p: Option<&std::path::Path>| p.and_then(|d| d.file_name()).and_then(|n| n.to_str()).map(str::to_string);
+    let parent = exe.parent();
+    // `target/<profile>/deps/<test>` (the layout nextest and older cargo use), or cargo's newer
+    // build-dir layout, `target/<profile>/build/<package>/<hash>/out/<test>`, where no `deps` is made.
+    name(parent).as_deref() == Some("deps")
+        || (name(parent).as_deref() == Some("out") && name(parent.and_then(|p| p.parent()).and_then(|p| p.parent()).and_then(|p| p.parent())).as_deref() == Some("build"))
 }
 
 #[cfg(test)]
@@ -34,5 +39,7 @@ mod under_test_tests {
     fn only_a_binary_cargo_left_in_deps_reads_as_a_test_harness() {
         assert!(super::is_harness(&std::env::current_exe().unwrap()));
         assert!(!super::is_harness(std::path::Path::new("/w/target/debug/wsp")));
+        assert!(super::is_harness(std::path::Path::new("/w/target/debug/deps/wsp_engine-0a1b")));
+        assert!(super::is_harness(std::path::Path::new("/w/target/debug/build/wsp-engine/0a1b/out/wsp_engine-0a1b")));
     }
 }

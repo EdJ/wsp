@@ -15,6 +15,10 @@ The `seats` row of the layering map, 18 modules: `cmd_spawn` (with `Fleet`, the 
 - `room`: it stays in `wsp-engine`, since `cycle` and `waits` use `room::Gate` in product code.
 - `watch_levels`, `claims`, `prose`, `sent`: moved down into the engine by wsp-438, used from here.
 - Everything else of the run and the row verbs: `wsp-engine`.
+- The shared-work add-on (the hub's spoke: leases, the drive, the sync, `wsp login`/`hub`/`publish`/`allocate`):
+  `wsp-spoke`, never named here. Seats code asks it through the engine's `addon` (`crate::addon::get()`), as the
+  engine does: `cmd_agent`'s lease on a claim and the doctor's hub lines, `cmd_spawn`'s allocation refusal, `wake`'s
+  primary of another user, `cmd_sandbox`'s isolated login.
 
 ## Paths
 
