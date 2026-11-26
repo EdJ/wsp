@@ -48,7 +48,7 @@ fn row(id: &str, workspace: WorkspaceId) -> Entity {
 }
 
 fn path(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dir = std::env::temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("workspace-{tag}-{}.db", std::process::id()));
     for ext in ["", "-wal", "-shm"] {

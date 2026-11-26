@@ -43,7 +43,7 @@ impl Domain for Mirror {
 }
 
 fn path(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dir = std::env::temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("entities-{tag}-{}.db", std::process::id()));
     for ext in ["", "-wal", "-shm"] {

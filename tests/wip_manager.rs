@@ -69,7 +69,7 @@ esac
 const PROBES: &[&str] = &["ps", "lsof", "df", "compound-render"];
 
 fn place() -> PathBuf {
-    let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::temp_dir();
     let dir = base.join(format!("wm-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("state")).unwrap();
