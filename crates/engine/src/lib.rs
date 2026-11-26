@@ -40,6 +40,7 @@ pub mod cmd_brief;
 pub mod cmd_govern;
 pub mod cmd_hub;
 pub mod cmd_initiative;
+pub mod initiative_run;
 pub mod cmd_install;
 pub mod cmd_login;
 pub mod cmd_machine;

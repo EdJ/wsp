@@ -299,8 +299,9 @@ pub fn initiative(store: &Store, args: &Args) -> i32 {
         "plan" => plan(store, args),
         "approve" => approve(store, args),
         "changes" => changes(store, args),
+        "run" => crate::initiative_run::run(store, args),
         other => {
-            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan|approve|changes)");
+            eprintln!("wsp initiative: unknown subcommand `{other}` (add|ls|show|edit|set|link|brief|criterion|assume|increment|plan|approve|changes|run)");
             2
         }
     }
@@ -1432,6 +1433,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
                                     | approve <id> "verdict"  | changes <id> "what to change"
+                                    | run <id> [--json]  the build's feed: group running, rows, spend
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md
                                     | brief <id>  a record below a product: artefacts and

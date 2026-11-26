@@ -104,10 +104,14 @@ pub fn report(lines: &[Line], places: &HashMap<String, Place>, landed: usize, no
 
     let mut by_project: BTreeMap<String, Sum> = BTreeMap::new();
     let mut by_list: BTreeMap<String, (Option<String>, Sum)> = BTreeMap::new();
+    let mut list_today: BTreeMap<String, u64> = BTreeMap::new();
     for l in lines {
         let p = places.get(&l.seat).cloned().unwrap_or_default();
         by_project.entry(p.project.clone().unwrap_or_else(|| "unplaced".into())).or_default().add(l);
         if let Some(list) = p.list {
+            if l.ended >= today {
+                *list_today.entry(list.clone()).or_default() += l.micros;
+            }
             by_list.entry(list).or_insert_with(|| (p.project.clone(), Sum::default())).1.add(l);
         }
     }
@@ -121,7 +125,7 @@ pub fn report(lines: &[Line], places: &HashMap<String, Place>, landed: usize, no
         "daily": daily,
         "totals": { "today": from(today).json(), "7d": from(today - 6 * DAY).json(), "30d": all.json() },
         "projects": projects.iter().map(|(id, s)| json!({ "id": id, "cost": usd(s.micros), "output": s.output, "sessions": s.sessions })).collect::<Vec<_>>(),
-        "lists": lists.iter().map(|(slug, (p, s))| json!({ "slug": slug, "project": p, "cost": usd(s.micros), "output": s.output, "sessions": s.sessions })).collect::<Vec<_>>(),
+        "lists": lists.iter().map(|(slug, (p, s))| json!({ "slug": slug, "project": p, "cost": usd(s.micros), "today": usd(list_today.get(slug).copied().unwrap_or(0)), "output": s.output, "sessions": s.sessions })).collect::<Vec<_>>(),
         "rows": { "landed_30d": landed, "cost_per_landed_row": (landed > 0).then(|| (usd(all.micros) / landed as f64 * 100.0).round() / 100.0) },
     })
 }
