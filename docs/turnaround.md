@@ -807,3 +807,116 @@ slow (over 30 s) and none terminated.
 -- --list` lists, 12 of them ignored. With this row's three new tests, both runners count 4155. Doctests: nextest runs none, and the `cargo test --doc` that follows it (above) runs the ones
 `cargo test` would have, so no step loses one. The `--workspace` times below are nextest's alone; the doctest run that
 follows a `--workspace` step here (18 libraries, no Rust blocks, all passing) took 2.7 s with the targets built.
+
+## After the crate split
+
+Written by wsp-535 on 2026-11-26, at 95ad95b, in wsp-535's tree, on the same machine and toolchain (rustc 1.98.1).
+Governor `powersave`, `scaling_max_freq` 5.7 GHz = `cpuinfo_max_freq`. The seats cut (wsp-441) is on the trunk; the
+spoke cut (wsp-534) was not made.
+
+### The inner loop
+
+wsp-430's five steps, three runs each, 15:53 to 16:38. Each timed run started at load1 below 3.5 (2.91 to 3.46; load5
+4.7 to 8.6, left over from the row's own runs). "Now" is the median of three, wall time of the whole command through the
+seat's cargo shim. Steps that run tests use nextest. The edits are the same constant and string as before.
+
+| Step | Command now | wsp-430 | After phase 2 | Now | Runs 1, 2, 3 | Load1 at start |
+|---|---|---|---|---|---|---|
+| 1a. edit cycle, build | `cargo test -p wsp-engine --lib cycle:: --no-run` | 4.47 s | 3.45 s | 3.62 s | 3.62, 3.62, 3.72 | 3.33, 3.19, 3.13 |
+| 1b. the test run (184 tests) | `cargo nextest run -p wsp-engine --lib cycle::` | 12.08 s | 11.96 s | **4.62 s** | 4.62, 4.62, 4.64 | 3.46, 3.19, 3.36 |
+| 2a. edit gc, build | `cargo test -p wsp-trees --lib gc:: --no-run` | 0.68 s | 0.65 s | 1.12 s | 1.11, 1.12, 1.13 | 3.33, 3.33, 3.30 |
+| 2b. the test run (4 tests) | `cargo nextest run -p wsp-trees --lib gc::` | 0.67 s | 0.66 s | 1.12 s | 1.11, 1.12, 1.12 | 3.33, 3.33, 3.30 |
+| 3a. bin test binary after the engine edit | `cargo test --bin wsp --no-run --timings` | 4.47 s | 2.85 s | 3.83 s | 3.83, 3.83, 3.83 | 3.37, 3.37, 3.26 |
+| 3b. bin, `-Z time-passes` | `cargo rustc --profile test --bin wsp -- -Z time-passes` | 4.57 s (rustc 4.31) | 2.95 s (1.15) | 3.81 s (1.42) | 3.81, 3.82, 3.72 | 3.38, 3.38, 3.39 |
+| 3b. engine, the same | `cargo rustc --profile test -p wsp-engine --lib -- -Z time-passes` | (was the bin) | 3.54 s (3.29) | 3.71 s (3.09) | 3.71, 3.71, 3.72 | 2.99, 2.99, 2.91 |
+| 4. the affected check, core edit | `wsp check --affected --run` | 242.53 s | 162 s | **60.00 s** | 59.70, 60.09, 60.00 | 3.07, 3.42, 3.19 |
+| the affected check, seats edit | `wsp check --affected --run` | | | **29.10 s** | 28.90, 29.10, 29.20 | 3.31, 3.18, 3.17 |
+| 5. the full suite | `cargo nextest run --workspace --no-fail-fast` | 332.58 s | 334.08 s | **67.98 s** | 66.96, 67.98, 68.49 | 3.43, 3.39, 3.03 |
+
+Once: a cold `cargo test --workspace --no-run` took 83.39 s (load1 3.16, load5 8.56; before: 61.93 and 60.99 s). The
+suite lists **4164** tests (4102, then 4147); nextest ran 4152 and skipped 12, all passing in all three runs.
+
+- **The core edit's check** runs `crate:wsp-engine` 29 s, `crate:wsp` 26 s and `crate:wsp-seats` 4 s. The edit is
+  `WAKE_CAP_SECS` in `crates/engine/src/cycle.rs`. **The seats edit's check** (the message in
+  `crates/seats/src/wake.rs`) runs `wsp-seats` 4 s and `wsp` 24 to 25 s; barrier 5 read 29.30 s.
+- **162 s is not like-for-like.** wsp-442's script left its `gc.rs` edit in the tree for step 4, so that plan included
+  `wsp-trees`, and its engine step ran under `cargo test`.
+- **Short builds read slower today.** In steps 1a and 3a, wall minus cargo's own `Finished` time is about 0.55 s,
+  against 0.2 to 0.25 s in wsp-442's logs. rustc itself was not slower on the engine (3.09 against 3.29 s). The cause of the
+  extra was not established; the load was also higher (about 3.3 against 0.6 to 2.2). It covers much of 2a and 2b's rise.
+- **The doctests fail at the trunk.** `cargo test --doc --workspace` after each suite run exited 101: the indented log
+  excerpt on `watch_levels::Signal::to` (`crates/engine/src/watch_levels.rs`) is compiled as Rust. It stops there, so
+  its 1.3 s is not the doctests' full time and is left out of step 5. Filed as a follow-up.
+- **Thermal.** The package throttle count rose by 4,725 in the cold build, about 1,000 in each core check, 480 to 550 in
+  each seats check and about 4,000 in each full suite.
+
+### The builds the predictions were made on
+
+`--no-run` after the edit, three runs each, 16:40 to 16:42, at 95ad95b.
+
+| Command | Edit | Median | Runs 1, 2, 3 | Load1 at start | cargo's `Finished` |
+|---|---|---|---|---|---|
+| `cargo test --no-run` | engine | 5.13 s | 5.13, 5.03, 5.74 | 3.27, 3.33, 3.38 | 4.41 to 5.10 s |
+| `cargo test -p wsp-engine --no-run` | engine | 3.73 s | 3.73, 3.85, 3.73 | 3.09, 3.25, 3.25 | 3.14 to 3.22 s |
+| `cargo test --no-run` | seats | 3.73 s | 3.93, 3.63, 3.73 | 3.35, 3.43, 3.15 | 3.06 to 3.32 s |
+| `cargo test -p wsp-seats --no-run` | seats | 2.02 s | 2.02, 2.02, 2.02 | 2.97, 2.97, 2.90 | 1.41 to 1.45 s |
+
+### Decision 4: what each cut delivered
+
+Under half means less than 48 % of the predicted gain (Jesper's 2 % band, 26 Nov). The build predictions are cut 3's in
+"The cuts, ranked": from 4.47 s to 2.4 s for an engine edit and 1.5 s for a seats edit, with two crates. That base is
+the bin's test binary alone, so a root `cargo test --no-run`, which builds every root test target, is not strictly
+like-for-like with it.
+
+| Cut | Predicted gain | Delivered | Share | Under half? |
+|---|---|---|---|---|
+| Tests one process each (wsp-527) | `cycle::` 11.85 to 3.78 s; engine binary 133 to 25 s | 4.62 s today; 25.6 s | 90 %; 99 % | no |
+| Seats cut, narrowed check (its gate, wsp-441) | half of 57.58 s | 57.58 to 29.30 s (barrier 5); 29.10 s today | 98 %; 99 % | no |
+| Seats cut, seats edit's own build | 4.47 to 1.5 s | 2.02 s | 82 % | no |
+| **Seats cut, seats edit's root build** | 4.47 to 1.5 s | 3.73 s (wsp-441: 3.62 s) | **25 %** (29 %) | **yes** |
+| **Engine cut, engine edit's own build, as two crates** | 4.47 to 2.4 s | 3.73 s today (wsp-440: 3.35 s; wsp-442: 3.45 s) | **36 %** (54 %; 49 %) | **yes today, not on the earlier runs** |
+| **Engine cut, engine edit's root build** | 4.47 to 2.4 s | 5.13 s; bin test binary alone 3.83 s | **none; 31 %** | **yes** |
+| `wsp-spoke` (wsp-534) | none scored | not cut: core calls it on 14 lines | | not a cut |
+
+- **Named, under half:** the build gain of phase 2 (engine and seats) wherever the edit's dependents are built too. An
+  engine edit at the root is no faster than before the split, because engine, seats and the bin all rebuild.
+- **Not under half:** nextest, and the seats cut on the check it was gated on.
+- The seams (wsp-437, wsp-438, wsp-542 to wsp-545) predicted no gain of their own.
+- Minutes per row were not re-measured for any cut. That is wsp-524's stage split.
+
+### The re-rank
+
+**No further split of the core is filed: none reaches a minute per row.**
+
+Edit shares: 569 non-merge commits since 2026-11-12 that touch 1 to 40 `.rs` files (larger ones are the moves), grouped
+by where each module is now.
+
+| Set | Modules | Lines | `#[test]`s | Commits touching it | Touching only it |
+|---|---|---|---|---|---|
+| core (engine less spoke) | 81 | 109,666 | 1,510 | 48 % | 16 % |
+| spoke (in engine) | 8 | 5,555 | 41 | 5 % | 1 % |
+| seats | 18 | 56,272 | 757 | 30 % | 5 % |
+| bin (`src/`) | | | | 26 % | 7 % |
+| other crates | | | | 57 % | 28 % |
+
+Test weights, from one `cargo nextest run -p wsp-engine --lib --status-level pass` (1,548 tests, 25.6 s wall, load1
+about 3.5 to 4): the tests' own times sum to 269 s for core and 33 s for spoke. `closing` (67 s) and `check` (63 s) are
+the heaviest modules, then `hub_lease` (31 s).
+
+The bound on any further core split:
+- **The check.** The engine step is 29 s of a core edit's 60 s. Removed entirely, at 1.7 check runs per row (wsp-431),
+  that is 0.8 min on a row that edits the core, and about 0.4 min weighted by the 48 % of commits that do.
+- **The agent's own builds.** At best an engine build falls from 3.7 s to a seats-sized 2.0 s. At 14.8 builds per row
+  (the mean, wsp-431's count), that is 0.4 min, if every one followed a core edit.
+- **Together at most about 0.8 min per row**, and a real split saves less: seats and `wsp` depend on the core, so their
+  30 s of the check stays, and no seam inside the core has been counted.
+- **spoke** is the one measured seam. It is over decision 5's line limit, is touched by 5 % of commits and holds 11 %
+  of the engine's test time. Not filed.
+- **The root package's tests** (24 to 26 s) now run after every core or seats edit. Narrowing them is not a core split,
+  and removing them entirely would be 0.7 min at 1.7 runs. Not filed.
+
+The earlier re-rank otherwise stands: cut A is done (wsp-527), and the open cuts keep their rows (wsp-508, wsp-443,
+wsp-386; wsp-517 for where the suite runs). Their minutes were not recounted here.
+
+Scripts and logs: `~/.local/state/wsp/scratch/wsp-535/` (`loop/run.sh`, `loop/results.tsv`, `loop/build.sh`,
+`loop/build.tsv`, each run's log, `shares.py`, `eng-tests.log`).
