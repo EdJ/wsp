@@ -25,6 +25,13 @@
 //! child's command line: [`scrub`] takes it out of anything a dial said, and the
 //! only child this module starts is `stty`, with fixed arguments.
 //!
+//! `login --github` reads no token: it asks the hub to log the person in with
+//! GitHub (the hub runs GitHub's device flow, [`hub_client::login_github`]),
+//! prints the address to open and the code to enter, waits while the person
+//! does, and writes the user and token the hub hands back to the same file, as
+//! a token login writes them. The token is never printed. A refused login, a
+//! hub that has no GitHub login, or a code that runs out writes nothing.
+//!
 //! `login` needs no store; `logout` and `hub status` read this spoke's switch
 //! in it.
 
@@ -34,6 +41,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use crate::hub_client::{self, hub_login_in, Client, Credential, HubLogin, Silent, HUBS_FILE, HUB_CA_ENV};
+use wsp_hub_protocol::{Code, LoginDone, LoginPrompt};
 use wsp_store_contract::Principal;
 
 use wsp_engine::base::args::Args;
@@ -177,6 +185,56 @@ pub fn log_in(home: &Path, url: &str, token: &str, ca: Option<&Path>) -> Result<
     Ok(LoggedIn { url: url.trim().to_string(), user, replaced })
 }
 
+/// Log in to the hub at `url` with GitHub, under `home`: the hub runs GitHub's
+/// device flow, `prompt` is handed the address to open and the code to enter,
+/// and on `login_done` the user and token the hub hands back are written to
+/// the file as [`log_in`] writes a token's. Nothing is written on any other
+/// answer. `ca` pins a private CA for a `tls://` hub and is kept in the file.
+pub fn log_in_github(home: &Path, url: &str, ca: Option<&Path>, prompt: impl FnMut(&LoginPrompt)) -> Result<LoggedIn, String> {
+    log_in_github_with(home, url, ca, |ca| hub_client::login_github(url, ca, WAIT, prompt))
+}
+
+/// [`log_in_github`] with the login itself handed in (a test's scripted hub):
+/// `login` is given the pinned CA, made absolute, and answers the hub's
+/// `login_done` or why not.
+fn log_in_github_with(
+    home: &Path,
+    url: &str,
+    ca: Option<&Path>,
+    login: impl FnOnce(Option<&Path>) -> Result<LoginDone, Silent>,
+) -> Result<LoggedIn, String> {
+    let path = home.join(HUBS_FILE);
+    // A file that cannot be written is found before the hub, and GitHub, are bothered.
+    if !owner_only(&path)? {
+        return Err(format!("{} is wider than 0600: chmod 600 it, or remove it, and log in again", path.display()));
+    }
+    let replaced = hub_login_in(home).ok().flatten();
+    let ca = ca.map(absolute);
+    let done = login(ca.as_deref()).map_err(|s| match s {
+        Silent::Refused(r) if r.code == Code::Unsupported => format!("this hub does not log in with GitHub: {}", r.text),
+        Silent::Refused(r) => format!("the hub refused the login: {:?}: {}", r.code, r.text),
+        other => other.to_string(),
+    })?;
+    let token = done.token.0;
+    let user = done.user.trim().to_string();
+    if user.is_empty() || user.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("the hub's login names no user it could be ({:?}); nothing was written", scrub(&user, &token)));
+    }
+    if token.is_empty() || token.len() > MAX_TOKEN || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("the hub's login handed back something that is not a token; nothing was written".into());
+    }
+    write_login(home, url.trim(), &token, &user, ca.as_deref())?;
+    Ok(LoggedIn { url: url.trim().to_string(), user, replaced })
+}
+
+/// What a person is told to do while a GitHub login waits: the address, the
+/// code, and how long it lasts. It goes to stderr, beside where a token
+/// prompt would.
+pub fn github_prompt_text(url: &str, p: &LoginPrompt) -> String {
+    let lasts = if p.expires_secs >= 120 { format!("{} minutes", p.expires_secs / 60) } else { format!("{} seconds", p.expires_secs) };
+    format!("to log in to {url} with GitHub, open {} and enter the code {} (it lasts {lasts}); waiting for it…", p.url, p.code)
+}
+
 /// `path` made absolute against the working directory, which a pinned CA must
 /// be: the file is read by whatever dials next, from wherever it runs.
 fn absolute(path: &Path) -> PathBuf {
@@ -226,7 +284,7 @@ fn url_of(args: &Args) -> Result<String, String> {
     }
     match args.rest.as_slice() {
         [url] if !url.trim().is_empty() => Ok(url.trim().to_string()),
-        [] => Err("usage: wsp login <hub-url> [--ca <file>]   (the token is read from the prompt, or from stdin)".into()),
+        [] => Err("usage: wsp login <hub-url> [--github] [--ca <file>]   (the token is read from the prompt, or from stdin; --github logs in with GitHub instead)".into()),
         _ => Err("`wsp login` takes the hub's URL and nothing else: the token is read from the prompt or stdin, never from the command line".into()),
     }
 }
@@ -238,6 +296,12 @@ pub fn login(_store: &Store, args: &Args) -> i32 {
         let met = |w: String| (1, w);
         let home = home().map_err(met)?;
         let ca = args.get("ca").or_else(|| std::env::var(HUB_CA_ENV).ok()).filter(|c| !c.trim().is_empty()).map(PathBuf::from);
+        if args.has("github") {
+            if !url.starts_with("tls://") && !is_loopback(&url) {
+                eprintln!("wsp: {url} is not tls://, so the token the hub hands back crosses the network in the clear; a hub off this machine takes tls://");
+            }
+            return log_in_github(&home, &url, ca.as_deref(), |p| eprintln!("{}", github_prompt_text(&url, p))).map_err(met);
+        }
         let token = if util::stdin_is_tty() { token_from_terminal(&url) } else { token_from(&mut std::io::stdin().lock()) };
         let token = token.map_err(met)?;
         if !url.starts_with("tls://") && !is_loopback(&url) {
@@ -384,7 +448,10 @@ pub const VERBS: &[wsp_engine::verbs::Verb] = &[
             text: r##"  wsp login <hub-url> [--ca FILE]   store your token for a hub, tls://host:port:
                                     read from the prompt or stdin, never the
                                     command line. One hub per wsp: a second login
-                                    replaces the first. --ca pins a private CA"##,
+                                    replaces the first. --ca pins a private CA
+  wsp login <hub-url> --github      log in with GitHub instead: open the address
+                                    shown, enter the code; the hub's token for
+                                    you is stored, never shown"##,
         }],
     },
     wsp_engine::verbs::Verb {
@@ -618,6 +685,120 @@ mod tests {
         assert!(log_out(&home).unwrap().is_some());
         assert!(!path.exists());
         assert!(matches!(Credential::for_hub_in(None, &home), Err(Silent::NotLoggedIn(_))));
+    }
+
+    /// A hub's side of a GitHub login, scripted: its answers in order, and
+    /// every frame the client sent.
+    struct Scripted {
+        answers: std::collections::VecDeque<wsp_hub_protocol::Frame>,
+        sent: Vec<wsp_hub_protocol::Frame>,
+    }
+
+    impl wsp_hub_protocol::Connection for Scripted {
+        fn send(&mut self, frame: &wsp_hub_protocol::Frame) -> Result<(), wsp_hub_protocol::ConnError> {
+            self.sent.push(frame.clone());
+            Ok(())
+        }
+        fn recv(&mut self, _wait: Duration) -> Result<Option<wsp_hub_protocol::Frame>, wsp_hub_protocol::ConnError> {
+            self.answers.pop_front().map(Some).ok_or(wsp_hub_protocol::ConnError::Closed)
+        }
+    }
+
+    fn github_hub(answers: Vec<wsp_hub_protocol::Frame>) -> Scripted {
+        Scripted { answers: answers.into(), sent: Vec::new() }
+    }
+
+    fn device() -> LoginPrompt {
+        LoginPrompt { url: "https://github.com/login/device".into(), code: "ABCD-1234".into(), expires_secs: 900 }
+    }
+
+    /// `wsp login --github`: the prompt is shown, and the user and token the
+    /// hub hands back are written as a token login writes them, at 0600; the
+    /// token is in nothing the login says.
+    #[test]
+    fn login_github_shows_the_code_and_writes_the_hubs_user_and_token_as_a_token_login_does() {
+        use std::os::unix::fs::PermissionsExt;
+        use wsp_hub_protocol::{ApiToken, Frame};
+        let h = home_dir("github");
+        let token = "gh-token-0123456789abcdef";
+        let mut hub = github_hub(vec![
+            Frame::LoginPrompt(device()),
+            Frame::LoginDone(LoginDone { user: "ed".into(), token: ApiToken(token.into()) }),
+        ]);
+        let mut shown = Vec::new();
+        let done = log_in_github_with(&h, " tls://hub.invalid:7489 ", Some(Path::new("/etc/hub-ca.pem")), |ca| {
+            assert_eq!(ca, Some(Path::new("/etc/hub-ca.pem")));
+            hub_client::login_github_on(&mut hub, "hub.invalid:7489", Duration::from_secs(1), |p| shown.push(github_prompt_text("tls://hub.invalid:7489", p)))
+        })
+        .unwrap();
+        assert_eq!(done, LoggedIn { url: "tls://hub.invalid:7489".into(), user: "ed".into(), replaced: None });
+        assert_eq!(hub.sent.len(), 1, "the login frame and nothing else: no token is sent");
+        assert!(matches!(&hub.sent[0], Frame::Login(l) if l.method == "github"));
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].contains("https://github.com/login/device") && shown[0].contains("ABCD-1234") && shown[0].contains("15 minutes"), "{}", shown[0]);
+        assert!(!format!("{done:?}{shown:?}").contains(token));
+
+        let path = h.join(HUBS_FILE);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((doc["url"].as_str(), doc["user"].as_str(), doc["token"].as_str()), (Some("tls://hub.invalid:7489"), Some("ed"), Some(token)));
+        assert_eq!(doc["ca"], "/etc/hub-ca.pem");
+        assert!(doc["at"].as_str().is_some_and(|a| a.ends_with('Z')), "{doc}");
+        // What the dial reads is the login just written.
+        assert_eq!(Credential::for_hub_in(None, &h), Ok(Credential::User(token.into())));
+        assert_eq!(hub_login_in(&h).unwrap().unwrap().user, "ed");
+
+        // A second GitHub login replaces the first and says so.
+        let mut again = github_hub(vec![Frame::LoginDone(LoginDone { user: "ann".into(), token: ApiToken("other-token".into()) })]);
+        let done = log_in_github_with(&h, "tls://hub.invalid:7489", None, |_| hub_client::login_github_on(&mut again, "hub", Duration::from_secs(1), |_| {})).unwrap();
+        assert_eq!(done.replaced.map(|r| r.user), Some("ed".into()));
+        assert_eq!(hub_login_in(&h).unwrap().unwrap().user, "ann");
+    }
+
+    /// A refusal, a hub with no GitHub login, a code that runs out (the hub's
+    /// `unauthorised`), a connection that closes or a token that is none:
+    /// nothing is written, and the login before is left as it was.
+    #[test]
+    fn login_github_refused_or_cut_short_writes_nothing() {
+        use wsp_hub_protocol::{ApiToken, Frame, Refused};
+        let h = home_dir("github-refused");
+        write_login(&h, "tls://old.invalid:1", "old-tok", "bo", None).unwrap();
+        let before = std::fs::read_to_string(h.join(HUBS_FILE)).unwrap();
+        let refused = |code, text: &str| Frame::Refused(Refused { code, text: text.into() });
+        let cases: Vec<(Vec<Frame>, &str)> = vec![
+            (vec![Frame::LoginPrompt(device()), refused(Code::Forbidden, "mallory is not on this hub's list of GitHub users")], "refused the login: Forbidden"),
+            (vec![refused(Code::Unsupported, "no github")], "does not log in with GitHub"),
+            (vec![Frame::LoginPrompt(device()), refused(Code::Unauthorised, "the code ran out before it was entered")], "Unauthorised"),
+            (vec![Frame::LoginPrompt(device())], "closed"),
+            (vec![Frame::LoginDone(LoginDone { user: "ed".into(), token: ApiToken("two words".into()) })], "not a token"),
+            (vec![Frame::LoginDone(LoginDone { user: " ".into(), token: ApiToken("tok".into()) })], "names no user"),
+        ];
+        for (answers, says) in cases {
+            let mut hub = github_hub(answers);
+            let why = log_in_github_with(&h, "tls://hub.invalid:7489", None, |_| hub_client::login_github_on(&mut hub, "hub", Duration::from_secs(1), |_| {})).unwrap_err();
+            assert!(why.contains(says), "{why}");
+            assert!(!why.contains("two words") && !why.contains("old-tok"), "{why}");
+            assert_eq!(std::fs::read_to_string(h.join(HUBS_FILE)).unwrap(), before, "{says}: the login before is untouched");
+        }
+    }
+
+    #[test]
+    fn login_github_over_a_file_wider_than_0600_is_refused_before_the_hub_is_asked() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = home_dir("github-wide");
+        let path = h.join(HUBS_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let why = log_in_github_with(&h, "tls://hub.invalid:1", None, |_| panic!("the hub is not asked")).unwrap_err();
+        assert!(why.contains("0600"), "{why}");
+    }
+
+    #[test]
+    fn login_github_is_a_flag_the_url_follows() {
+        let args = wsp_engine::base::args::Args::parse(["login", "--github", "tls://hub.invalid:7489"].map(String::from).to_vec());
+        assert!(args.has("github"));
+        assert_eq!(url_of(&args).unwrap(), "tls://hub.invalid:7489");
     }
 
     #[test]

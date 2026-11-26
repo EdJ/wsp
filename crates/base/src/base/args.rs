@@ -95,6 +95,8 @@ pub const BOOL_FLAGS: &[&str] = &[
     "wait",
     // `wsp ask --cancel <mid> "why"` (`wsp-308`): the id and the reason follow.
     "cancel",
+    // `wsp login --github <hub-url>`: the URL follows, and must not be eaten.
+    "github",
 ];
 
 /// Flags whose value may be a lone `-`, the stream. A dash is otherwise read as
