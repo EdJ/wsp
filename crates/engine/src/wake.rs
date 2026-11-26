@@ -322,7 +322,7 @@ fn deliver_to(store: &Store, seats: &dyn Seats, scope: &str, emits: &[&Emit], at
     // and "is anybody in this seat" is a third. See [`restate`].
     if emits.is_empty() && owed_to_a_seat(store, &key) == 0 {
         restate(store, seats, scope, &key);
-        return Report::at_rest();
+        return report_at_rest();
     }
 
     // **Appended inside the lock, and what comes back is the record as it
@@ -471,11 +471,10 @@ pub fn fold_what_was_typed(store: &Store, scope: &str) -> usize {
 }
 
 /// [`Report`] is in [`crate::cycle`] since wsp-438, the type the port's
-/// [`Seats::say`] answers with; the spool's at-rest reading stays here.
-impl Report {
-    fn at_rest() -> Report {
-        Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET.into(), routed_to: None }
-    }
+/// [`Seats::say`] answers with; the spool's at-rest reading stays here. A free
+/// function, since a crate cannot `impl` a type it does not define (wsp-545).
+fn report_at_rest() -> Report {
+    Report { scope: String::new(), settled: 0, held: 0, typed_at: None, why: NOT_YET.into(), routed_to: None }
 }
 
 /// Put a sentence in a seat's spool and try to deliver it once.
