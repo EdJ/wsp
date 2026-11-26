@@ -7230,6 +7230,7 @@ mod tests {
     /// before any seat is opened.
     #[test]
     fn a_row_whose_files_are_another_projects_is_refused_at_spawn_before_a_seat() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -8908,6 +8909,7 @@ mod tests {
     /// leave it failed, and the spawn never sends a third.
     #[test]
     fn a_spawn_whose_first_order_is_dropped_sends_it_again_once() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let _quick = quick();
         let place = Dropping::new(1, true, Some(false));
@@ -9013,6 +9015,7 @@ mod tests {
     /// path `$WSP_VERDICT` names, beside `$WSP_SEAT_KIND`.
     #[test]
     fn a_spawned_members_seat_has_its_exit_path_beside_its_verdict_and_kind() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -9037,6 +9040,7 @@ mod tests {
 
     #[test]
     fn a_spawn_composes_the_brief_for_the_seat_it_opened_and_not_for_itself() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         // The seat this process is in, unset — because `Briefing::live` reads
         // exactly these, and a test that inherited a real pane from the session
@@ -9117,6 +9121,7 @@ mod tests {
     /// them; this process standing somewhere else is the case that failed.
     #[test]
     fn a_spawns_claim_records_the_seat_the_tree_and_the_kind_it_opened_and_not_where_the_caller_stood() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -9238,6 +9243,7 @@ mod tests {
     /// which is Sonnet when the entry names none. Its order is one line.
     #[test]
     fn a_leg_spawn_claims_nothing_seats_the_entry_binds_the_row_and_runs_on_sonnet() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -9312,6 +9318,7 @@ mod tests {
     /// the batch before is open, and `block` from a piece's pane leaves the row `doing`.
     #[test]
     fn a_piece_spawn_claims_nothing_seats_the_entry_binds_the_row_and_refuses_a_later_batch() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -11183,6 +11190,7 @@ mod tests {
     /// person had claimed.
     #[test]
     fn a_seat_a_governor_spawns_onto_a_row_is_its_helper_at_that_row() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-row");
         standing_in(Some("cpd-7"));
@@ -11211,6 +11219,7 @@ mod tests {
     /// `wip`. With that seat gone the row goes back to its project's walk.
     #[test]
     fn a_rows_review_reaches_the_seat_whose_work_order_started_it() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("ordered-by");
         let mut run = crate::model::Worklist::new("proc", "a process list");
@@ -11248,6 +11257,7 @@ mod tests {
     /// governor's helper with no task, drawn under that governor.
     #[test]
     fn a_seat_a_governor_spawns_with_no_row_is_its_helper_all_the_same() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-no-row");
         standing_in(Some("cpd-7"));
@@ -11270,6 +11280,7 @@ mod tests {
     /// the seat is an `agent`, not anybody's helper.
     #[test]
     fn a_seat_a_member_spawns_is_recorded_and_stays_an_agent() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-by-member");
         standing_in(Some("cpd-12"));
@@ -11291,6 +11302,7 @@ mod tests {
     /// seat and on the claim alike.
     #[test]
     fn a_persons_spawn_records_nobody_and_inherits_no_helpers_record() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-by-person");
         store.set_spawned("w9:p1", Some(&json!({ "seat": "cpd-7", "scope": "core" })));
@@ -11466,6 +11478,7 @@ mod tests {
     /// helper: the seat is said and the scope is null, as for a member's.
     #[test]
     fn a_seat_the_primary_interface_spawns_is_not_its_helper() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("primary-spawns");
         store.set_governor(crate::governors::PRIMARY, json!({ "workspace": "cpd-1", "pane": "cpd-1", "host": util::hostname() }));
@@ -11770,5 +11783,36 @@ mod tests {
         let (_, said) = take_tree(&w.dir, &|| Tree::Kept { path: util::contract(&w.dir), why: "cpd-9 is standing in it".into() }, &w, false);
         assert!(w.signalled.borrow().is_empty() && said.is_empty(), "{said:?}");
         let _ = std::fs::remove_dir_all(&w.dir);
+    }
+}
+
+/// Moved from `repair`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_repair {
+    use crate::repair::*;
+    use crate::repair::tests::*;
+    use crate::util;
+
+    /// **A seat on a backend pane, read by the real fleet** (`wsp-148`, live on
+    /// 2026-10-06). backend is out of the picture, and while the fleet still asked
+    /// it, its `Unreachable` made every such seat `Unreadable` — so compound,
+    /// jolt-app and wsp sat dead with nothing coming to fill them. Compound has
+    /// no record of the pane, which is a fact, and the seat reads `gone`.
+    #[test]
+    fn a_seat_on_a_backend_pane_reads_gone_to_the_real_fleet() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = in_flight("seat-backend-pane");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "last": {
+                    "pane": "w8K:p1", "workspace": "w8K", "kind": "claude",
+                    "host": util::hostname(), "since": "2026-08-25T22:31:09Z",
+                },
+                "vacated": "2026-08-29T11:51:45Z",
+            }),
+        );
+        assert_eq!(reading(&store, crate::cycle::seats(), "run"), Occupancy::Vacant("gone"));
+        let _ = std::fs::remove_dir_all(&store.root);
     }
 }

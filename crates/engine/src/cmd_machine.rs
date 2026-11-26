@@ -1323,6 +1323,7 @@ mod tests {
     /// else a record carries is about reaching it.
     #[test]
     fn the_seat_takes_an_agent_cap_and_nothing_else() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let store = scratch("seat-agents");
         let set_to = |kv: &str| set(&store, &Args::synth("machine", &["set", "seat", kv], &[]));
 

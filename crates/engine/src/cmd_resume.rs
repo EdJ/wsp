@@ -1840,3 +1840,32 @@ mod tests {
         assert!(p.chosen().is_empty());
     }
 }
+
+/// Moved from `cmd_task`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_cmd_task {
+    use crate::cmd_task::*;
+    use crate::cmd_task::tests::*;
+    use crate::model::Status;
+    use crate::base::args::Args;
+
+    /// `wsp-304`. compound-581 was landed, verified and released, then sent
+    /// back for a regression: it sat at `doing` with nobody on it. A reopen
+    /// of a row whose agent has gone seats one, with the kind and tier it ran.
+    #[test]
+    fn a_reopen_after_the_agent_was_released_seats_one_as_it_ran() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let store = scratch("reopenreseat");
+        released(&store, "m-1", "claimed by pane cpd-1306 · spawned at sonnet/high");
+        store.log_event("session-learned", serde_json::json!({ "id": "m-1", "kind": "opencode", "pane": "cpd-1306", "session": "s-1" }));
+
+        let args = Args::synth("reopen", &["m-1", "regression: the tab draws empty"], &[]);
+        assert_eq!(reopen(&store, &args), 0);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+        assert_eq!(
+            reseated(),
+            [["spawn", "m-1", "--agent", "--kind", "opencode", "--model", "sonnet", "--effort", "high"]],
+            "one spawn, at what it ran with"
+        );
+    }
+}

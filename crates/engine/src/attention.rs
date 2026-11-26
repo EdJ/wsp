@@ -632,7 +632,7 @@ mod tests {
     use super::*;
     // The level addressed to nobody in particular, under its own name rather
     // than a re-export out here that nothing outside these tests reads.
-    use crate::cmd_watch::EVERYONE;
+    use crate::watch_levels::EVERYONE;
     use crate::model::{Group, Task, Worklist, WorklistStatus};
 
     /// A source that answers with whatever the test is holding.
@@ -659,7 +659,9 @@ mod tests {
             self.1
                 .iter()
                 .map(|s| match self.0.task(&s.subject) {
-                    Some(t) => s.clone().to(&crate::cmd_watch::addressed_to(&index, &governors, &lists, &t, self.0.allocated_to(&t.id).as_deref())),
+                    Some(t) => s.clone().to(&crate::governors::seat_for(&governors, &index, lists.list_for(&t), t.project.as_deref(), self.0.allocated_to(&t.id).as_deref())
+                        .map(|s| s.scope)
+                        .unwrap_or_else(|| EVERYONE.to_string())),
                     None => s.clone(),
                 })
                 .collect()
@@ -667,8 +669,8 @@ mod tests {
 
         /// The pass reads [`Scope::machine`], so nothing is ever out of scope
         /// and a move arrives as the address changing under a standing level.
-        fn routing(&self) -> crate::cmd_watch::Routing {
-            crate::cmd_watch::Routing::Machine
+        fn routing(&self) -> crate::watch_levels::Routing {
+            crate::watch_levels::Routing::Machine
         }
     }
 

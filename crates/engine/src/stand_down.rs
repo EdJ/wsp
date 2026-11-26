@@ -273,6 +273,7 @@ mod tests {
         )
         .about(crate::message::About::Task("m-1".into()));
         store.save_message(&q).unwrap();
+        crate::cycle::install_tests::ANSWERS.with(|a| *a.borrow_mut() = Some("p".into()));
         assert!(flag_open(&store, "p"), "the fixture is an open hand the seat answers for");
         tick_at(&store, &idle(), T0, 30);
         tick_at(&store, &idle(), T0 + 90 * MIN, 30);
@@ -282,8 +283,7 @@ mod tests {
     #[test]
     fn something_owed_in_its_spool_keeps_the_seat() {
         let (_env, store) = world("owed");
-        crate::wake::say(&store, "p", "a question nobody has answered", None);
-        assert!(crate::wake::owed_to(&store, "p") > 0, "the fixture is owed an answer");
+        crate::cycle::install_tests::OWED.with(|o| o.borrow_mut().insert("p".into(), 1));
         tick_at(&store, &idle(), T0, 30);
         tick_at(&store, &idle(), T0 + 90 * MIN, 30);
         assert!(seated(&store, "p") && ended().is_empty());

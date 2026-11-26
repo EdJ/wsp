@@ -1724,10 +1724,10 @@ fn apply(store: &Store, plan: &Plan) -> Result<usize, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> (util::Isolated, Store) {
+    pub fn scratch(tag: &str) -> (util::Isolated, Store) {
         crate::testkit::isolated_store(&format!("verification-{tag}"))
     }
 
@@ -1848,7 +1848,7 @@ mod tests {
     }
 
     /// A Verify row filed before `wsp-188`, the way wsp filed them.
-    fn row(store: &Store, id: &str, parent: &str, created: &str, status: Status, verdict: &str) -> Task {
+    pub fn row(store: &Store, id: &str, parent: &str, created: &str, status: Status, verdict: &str) -> Task {
         let mut t = Task::new(&format!("Verify {parent}: the work"), id);
         t.parent = Some(parent.into());
         t.tags = vec![VERIFY_TAG.into()];
@@ -2125,7 +2125,7 @@ mod tests {
     // ---- `wsp-614`: a verifier's exit ------------------------------------------
 
     /// A member `m-1` at review with one pass reading it, no repository behind it.
-    fn reading(tag: &str) -> (util::Isolated, Store) {
+    pub fn reading(tag: &str) -> (util::Isolated, Store) {
         let (env, store) = scratch(tag);
         let mut t = Task::new("a member", "m-1");
         t.status_raw = "review".into();
@@ -2136,7 +2136,7 @@ mod tests {
     }
 
     /// Submit `text` for m-1 from a verifier's seat, from a file.
-    fn submit_verdict(env: &util::Isolated, store: &Store, text: &str) -> i32 {
+    pub fn submit_verdict(env: &util::Isolated, store: &Store, text: &str) -> i32 {
         let file = env.path("exit.md");
         std::fs::write(&file, text).unwrap();
         let from = file.display().to_string();
@@ -2144,11 +2144,11 @@ mod tests {
         crate::cmd_submit::submit_from(store, &args, Some("verifier"), None)
     }
 
-    fn newest(store: &Store) -> Pass {
+    pub fn newest(store: &Store) -> Pass {
         passes(&store.find_task("m-1").unwrap()).pop().unwrap()
     }
 
-    const BLOCKS: &str = "verdict: blocks\nsummary: the second caller has no test\n\nThe wiring is in; the second caller is untested.\n\ndone-when:\n- not held: the wiring is tested — no test of the second caller, src/x.rs:9\n\nchecked:\n- unit (2m): cargo test x:: — pass\n\n";
+    pub const BLOCKS: &str = "verdict: blocks\nsummary: the second caller has no test\n\nThe wiring is in; the second caller is untested.\n\ndone-when:\n- not held: the wiring is tested — no test of the second caller, src/x.rs:9\n\nchecked:\n- unit (2m): cargo test x:: — pass\n\n";
 
     #[test]
     fn a_verifier_exit_that_blocks_without_a_cause_is_refused_naming_the_line() {
@@ -2230,7 +2230,7 @@ mod tests {
 
     // ---- `wsp-341`: the hold lands the row ------------------------------------
 
-    fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
+    pub fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
         let out = wsp_base::calls::Command::new("git")
             .arg("-C").arg(dir).args(args)
             .env_remove("GIT_INDEX_FILE")
@@ -2244,7 +2244,7 @@ mod tests {
     /// A member `m-1` ready in a tree of its own, with a pass reading it, and a
     /// project whose `## Checks` are `checks` (`RAN` in a command is a file the
     /// test reads back). `trunk` is committed to master after the pass opened.
-    struct Ground {
+    pub struct Ground {
         _env: util::Isolated,
         store: Store,
         repo: std::path::PathBuf,
@@ -2253,7 +2253,7 @@ mod tests {
         ready: String,
     }
 
-    fn ground(tag: &str, checks: &str, member: &[(&str, &str)], trunk: &[(&str, &str)]) -> Ground {
+    pub fn ground(tag: &str, checks: &str, member: &[(&str, &str)], trunk: &[(&str, &str)]) -> Ground {
         // The land a hold performs reruns checks through the engine's answers, which `main` installs.
         crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
             passed: |_| Default::default(),
@@ -2330,32 +2330,32 @@ mod tests {
 
     /// The tree as `npm run check` left compounding-366's: a tracked file the
     /// checks rewrite, and a new one.
-    fn dirty_it(g: &Ground) {
+    pub fn dirty_it(g: &Ground) {
         std::fs::write(g.tree.join("f"), "rewritten by the checks\n").unwrap();
         std::fs::write(g.tree.join("shot.png"), "new\n").unwrap();
     }
 
-    fn clean_it(g: &Ground) {
+    pub fn clean_it(g: &Ground) {
         git_t(&g.tree, &["checkout", "--", "f"]);
         std::fs::remove_file(g.tree.join("shot.png")).unwrap();
     }
 
     /// The run's list, so the governor has somebody to be told.
-    fn on_a_list(g: &Ground) {
+    pub fn on_a_list(g: &Ground) {
         let mut w = crate::model::Worklist::new("run", "run");
         w.set_status(crate::model::WorklistStatus::Running);
         w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], agent: "claude".into(), ..Default::default() }]);
         g.store.save_worklist(&w).unwrap();
     }
 
-    fn told() -> Vec<String> {
+    pub fn told() -> Vec<String> {
         crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).collect())
     }
 
     /// The journal's side chain for `m-1`, written by this spoke while it was
     /// offline and now behind another user's lease (wsp-469): the state
     /// `hub_journal::refusal` reads.
-    fn side_chain_it(g: &Ground) {
+    pub fn side_chain_it(g: &Ground) {
         let mut sides = crate::hub_journal::Sides::default();
         sides.rows.insert(
             "m-1".into(),
@@ -2732,7 +2732,7 @@ mod tests {
     }
 
     /// A row at the leg cap, every leg done, at `review` as a check finds it.
-    fn at_the_leg_cap(store: &Store, id: &str) {
+    pub fn at_the_leg_cap(store: &Store, id: &str) {
         let mut t = Task::new(id, id);
         t.status_raw = Status::Review.as_str().into();
         let mut all: Vec<crate::legs::Leg> = (0..crate::legs::MAX_LEGS)
@@ -2744,7 +2744,7 @@ mod tests {
     }
 
     /// The send-back as `wsp check` makes it, then what follows it outside the lock.
-    fn sent_back_by_check(store: &Store, id: &str, verdict: &str) {
+    pub fn sent_back_by_check(store: &Store, id: &str, verdict: &str) {
         let mut t = store.find_task(id).unwrap();
         send_back(&mut t, util::now_iso(), "wsp check failed", None, verdict, Some(crate::check::CHECK_HEAD));
         store.save_task(&t).unwrap();
@@ -2790,20 +2790,5 @@ mod tests {
         legs[crate::legs::MAX_LEGS - 1].state = crate::legs::State::Pending;
         crate::legs::write(&mut t, &legs);
         assert!(stalled_at_cap(&t).is_none(), "a pending leg is the row moving");
-    }
-
-    /// And a row on no list raises a hand instead, so it never stops silently.
-    #[test]
-    fn a_send_back_at_the_leg_cap_on_no_list_raises_a_hand() {
-        let (_env, store) = scratch("cap-flag");
-        at_the_leg_cap(&store, "m-1");
-        let _ = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).count());
-        sent_back_by_check(&store, "m-1", "a step failed");
-        assert!(crate::cycle::tests::TOLD.with(|t| t.borrow().is_empty()), "no list, no governor");
-        let hands: Vec<_> = crate::message::raised(&store).into_iter().filter(|m| m.about.task() == Some("m-1")).collect();
-        assert_eq!(hands.len(), 1, "{hands:?}");
-        assert!(hands[0].text.contains("8-leg cap") && hands[0].text.contains("a step failed"), "{}", hands[0].text);
-        sent_back_by_check(&store, "m-1", "a step failed");
-        assert_eq!(crate::message::raised(&store).into_iter().filter(|m| m.about.task() == Some("m-1")).count(), 1, "once");
     }
 }

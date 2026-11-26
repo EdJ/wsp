@@ -1795,7 +1795,7 @@ mod tests {
         };
         hold("seat-a");
         let why = "claim expired: held by seat-a on this machine, last renewed 2026-11-10T10:00:00Z";
-        crate::cmd_spawn::release_lost(&store, "wsp-101", why).unwrap();
+        crate::hub_lease::tests::lose(&store, "wsp-101", why).unwrap();
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "todo");
         hold("seat-b");
         let mut t = store.task("wsp-101").unwrap();

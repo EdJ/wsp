@@ -2377,3 +2377,432 @@ pub mod tests {
         assert_eq!(walk(&g, None, &t).as_deref(), Some("robustness"));
     }
 }
+
+/// Moved from `cycle`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_cycle {
+    use crate::cycle::*;
+    use crate::cycle::tests::*;
+    use crate::model::{Status, Task, WorklistStatus};
+    use crate::store::Store;
+    use crate::util;
+
+    /// `wsp-216`, the governor's rule: a member's ask waits on its list's post
+    /// while a successor is on the way, and goes to the project's seat once
+    /// nobody is coming.
+    #[test]
+    fn a_members_ask_waits_on_a_post_being_reseated_and_goes_up_once_nobody_is_coming() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = scratch("ask-route");
+        let mut m = Task::new("m-1", "m-1");
+        m.project = Some("p".into());
+        m.set_status(Status::Doing);
+        store.save_task(&m).unwrap();
+        list(&store, &[(&["m-1"], "claude")]);
+        seated(&store, "p", "cpd-340");
+        let ask = |store: &Store| crate::cmd_govern::answering_seat(store, &store.find_task("m-1").unwrap());
+
+        // Its governor died and the reconciler has claimed the reseat.
+        store.set_governor(
+            "run",
+            serde_json::json!({ "vacated": util::now_iso(), "last": { "workspace": "cpd-7" }, "reseating": util::now_iso() }),
+        );
+        let s = ask(&store).expect("a seat answers");
+        assert_eq!((s.scope.as_str(), s.vacant), ("run", true), "it waits on the list's post, empty and being filled");
+
+        // Not yet claimed: the reconciler has counted the vacancy, and is coming.
+        store.set_governor("run", serde_json::json!({ "unseated": 1 }));
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("run"));
+
+        // The reseat failed and backed off: nobody is coming.
+        a_failed_reseat(&store, "run");
+        let s = ask(&store).expect("a seat answers");
+        assert_eq!((s.scope.as_str(), s.vacant), ("p", false), "the project's seat, which is somebody");
+        let now = store.worklist("run").unwrap();
+        assert!(nobody_coming(&store, "run").is_some_and(|why| why.starts_with("its reseat failed")));
+        assert!(!hand_it_to_the_governor(&store, &now, "a verdict"), "nor does the run's own tell wait there");
+
+        // Retried: a claim after the failure is a successor on the way again.
+        store.edit_governor("run", |rec| {
+            rec["reseating"] = serde_json::json!("2026-10-06T13:40:00Z");
+            true
+        });
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("run"));
+
+        // Stood down, and done: nobody, and the list is not a running one.
+        crate::cmd_govern::mark_stood_down(&store, "run");
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"));
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        store.edit_governor("run", |rec| rec.as_object_mut().is_some_and(|o| o.remove(crate::governors::STOOD_DOWN).is_some()));
+        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"), "a done list answers for nothing");
+    }
+}
+
+/// Moved from `repair`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_repair {
+    use crate::repair::tests::*;
+    use crate::cmd_govern;
+    use crate::place::State;
+
+    /// **`wsp-036`: a governor reseat goes through the Host `wsp spawn` does.**
+    /// retro-2's governor was reseated in cpd-241 by the daemon under
+    /// `WSP_HOST=manager`, and the manager neither journalled it nor listed it
+    /// to `wip`: `cmd_spawn::reseat` started the successor on the in-process
+    /// host whatever `WSP_HOST` said. Here the reconciler's pass finds a
+    /// running list with nobody in its seat and claims it, then the verb it
+    /// launches (`wsp govern run --reseat`) runs under a loopback manager: the
+    /// manager forks the seat (its `seat.spawn`, under the row's key), runs it,
+    /// and `wip`'s census reads it from the manager.
+    #[test]
+    fn a_governor_reseat_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (env, store) = in_flight("reseat-mgr");
+        let _inproc = Inproc;
+        // The member's project gives the list's governor a root to stand in.
+        repo(&env, &store);
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        store.save_task(&t).unwrap();
+
+        let exec = env.path("x");
+        std::fs::create_dir_all(&exec).unwrap();
+        let sup = env.path("sup");
+        wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
+        let mut cfg = wsp_manager::Config::new(&exec, "test-host");
+        cfg.port = 0;
+        cfg.sup = Some(sup);
+        let m = wsp_manager::Manager::start(cfg).expect("the manager starts on loopback");
+        let token = std::fs::read_to_string(exec.join(wsp_manager::TOKEN_FILE)).unwrap();
+        let local = crate::manager::Local {
+            host: "test-host".into(),
+            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: m.addrs()[0].port(),
+            exec_dir: exec.clone(),
+        };
+        crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
+        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
+
+        // The daemon's pass: claimed, and the reseat launched.
+        a_pass(&store, &Fake::empty());
+        assert_eq!(reseated(), vec!["run".to_string()]);
+        // Claude Code's hook, played: claude takes its order in argv and is
+        // ready when a turn runs, which under the manager its hook posts as
+        // the seat's turn begun, at the epoch the manager started it under
+        // (wsp-038; `wait_ready` hears it as an event, wsp-037). Posted once
+        // the agent is on the seat's record: its epoch then is the agent's,
+        // not that of the shell `open` put there first.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let dial = wsp_host::hooks::Dial::Manager { addr: m.addrs()[0], token_file: exec.join(wsp_manager::TOKEN_FILE) };
+        let code = std::thread::scope(|s| {
+            s.spawn(|| {
+                let seats = store.state.join(crate::place_compound::SEATS);
+                let mut posted = std::collections::BTreeSet::new();
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    for dir in std::fs::read_dir(&seats).into_iter().flatten().flatten().map(|e| e.path()) {
+                        let rec: serde_json::Value = std::fs::read_to_string(dir.join("seat.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                        let seat = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let Some(epoch) = m.seats().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch) else { continue };
+                        if rec.get("agent").is_some() && !posted.contains(&(seat.clone(), epoch.0)) {
+                            let payload = serde_json::json!({ "session_id": format!("sess-{seat}") });
+                            // Posted again on the next round until the manager takes it.
+                            if let wsp_host::hooks::Sent::Taken(_) = wsp_host::hooks::report(&dial, &seat, epoch, "UserPromptSubmit", &payload) {
+                                posted.insert((seat, epoch.0));
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+            // What it launched, run here (a test's `launch` starts nothing).
+            let code = crate::cmd_govern::govern(&store, &crate::base::args::Args::synth("govern", &["run"], &[("reseat", "true")]));
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            code
+        });
+        let said = || {
+            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            format!("cycle.log:\n{}\nmanager.log:\n{}", read(store.state_file("cycle.log")), read(m.log_path()))
+        };
+        assert_eq!(code, 0, "the reseat seated a successor: {}", said());
+        let seat = store.governors()["run"]["pane"].as_str().unwrap_or_default().to_string();
+        assert!(!seat.is_empty(), "the seat is on the record: {:?}", store.governors()["run"]);
+
+        // The manager took the seat.spawn and forked it: it runs the seat.
+        let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
+        assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "the manager forked {seat}: {spawns:?}");
+        assert!(m.seats().iter().any(|s| s.seat.0 == seat), "the manager runs {seat}: {:?}", m.seats());
+        // And `wip`'s census, which asks the manager, reads it. The census
+        // gives a manager `SILENT` (1 s) to answer and reads it silent past
+        // that, which a loaded machine overruns: asked again until the
+        // manager is heard (bounded generously, as wsp-114's waits are), and
+        // only a heard census is held to having the seat.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let reading = loop {
+            let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
+            if reading.heard() {
+                break reading;
+            }
+            assert!(std::time::Instant::now() < deadline, "wip's census never heard the manager within 120s");
+        };
+        assert!(reading.rows.contains_key(&seat), "wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
+
+        // The seat ended through the manager, as `wsp despawn` would.
+        let place = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION")).unwrap();
+        let _ = crate::place::Place::stop(&place, &crate::place::Seat::new(&seat));
+        m.stop();
+    }
+
+    /// **And filling the seat is what lifts it**, which is the only undo there is and
+    /// the reason the marker lives on the record rather than in a file of decisions:
+    /// a seat somebody is *in* has already answered the question, so `take` replacing
+    /// the record drops the sentence, and the next death is an ordinary vacancy.
+    #[test]
+    fn taking_a_stood_down_seat_lifts_the_decision_so_the_next_death_is_ordinary() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = in_flight("seat-stood-retake");
+        seated(&store, "run", "w1", "cpd-1", "", "");
+        cmd_govern::mark_stood_down(&store, "run");
+        assert!(crate::governors::stood_at(&store.governors(), "run").is_some());
+
+        // A person filling it by hand, which is `wsp govern` in the seat's own pane.
+        cmd_govern::take(&store, "run", "w1", "cpd-1").unwrap();
+        assert!(
+            crate::governors::stood_at(&store.governors(), "run").is_none(),
+            "a seat somebody is in is not a stood-down seat: {:?}",
+            store.governors()["run"]
+        );
+
+        cmd_govern::vacate(&store, "run");
+        let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
+        a_pass(&store, &gone);
+        a_pass(&store, &gone);
+        assert_eq!(reseated(), vec!["run".to_string()], "so a dead governor is repaired again");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+}
+
+/// Moved from `cmd_message`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_cmd_message {
+    use crate::cmd_message::*;
+    use crate::cmd_message::tests::*;
+    use crate::message::{self, About, Landed, Message, Party};
+    use crate::store::Store;
+    use crate::util::{self};
+
+    /// `wsp-230`. A barrier check holds no task, so it asks about the list it
+    /// is checking: the question reaches that list's governor, naming the
+    /// barrier, and the answer is written on the list's log — the one durable
+    /// home a seat with no row has — before it is taken back to the asker.
+    #[test]
+    fn a_check_asks_about_its_list_and_the_governor_is_asked_and_the_answer_lands_on_the_list() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("ask-list");
+        let store = scratch("ask-list");
+        let mut w = crate::model::Worklist::new("run", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("run", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+
+        // The check's own seat, which is who is waiting: said here rather than
+        // inherited from whatever seat runs the suite.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-77");
+        let args = crate::base::args::Args::synth("ask", &["run", "does group 1 own the chrome?"], &[("group", "1")]);
+        let code = ask(&store, &args);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+        assert_eq!(code, 0, "a worklist is somewhere for the answer to live");
+        let q = message::open_questions(&store).pop().expect("the question");
+        assert_eq!(q.about, About::Group { scope: "run".into(), group: 1 });
+        let spooled = std::fs::read_to_string(store.state.join("watches.json")).unwrap_or_default();
+        assert!(spooled.contains("barrier 1 of run") && spooled.contains(&q.id), "held for the run's seat: {spooled}");
+
+        let closed = message::answer(&store, &q.id, &Party::seat("run"), "yes, all of it").unwrap();
+        assert_eq!(closed.landed, Landed::List("run".into()));
+        let log = store.worklist("run").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("answered by") && log.contains("yes, all of it"), "{log}");
+        assert!(wire(&closed).contains("the run list's log"), "{}", wire(&closed));
+    }
+
+    #[test]
+    fn ask_with_choices_raises_a_question_that_carries_them() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let env = util::isolated("ask-choices");
+        let store = scratch("ask-choices");
+        task(&store, "lone-1");
+        // An asker has to be somewhere, and this agent's own seat is not it.
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let file = env.path("choices.json");
+        std::fs::write(&file, two_questions().to_string()).unwrap();
+        let f = file.to_string_lossy().to_string();
+
+        let bad = env.path("bad.json");
+        std::fs::write(&bad, r#"{"kind":"poll"}"#).unwrap();
+        let bad = bad.to_string_lossy().to_string();
+        let n = |store: &Store| message::all(store).len();
+        // (what, flags, the sentence typed, the exit)
+        for (what, flags, typed, code) in [
+            ("a file that is not there", vec![("person", ""), ("choices", "/nonexistent/c.json")], "", 2),
+            ("a file that is not JSON", vec![("person", ""), ("choices", "/dev/null")], "", 2),
+            ("a kind it does not know", vec![("person", ""), ("choices", bad.as_str())], "", 2),
+        ] {
+            let before = n(&store);
+            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", typed], &flags)), code, "{what}");
+            assert_eq!(n(&store), before, "{what}: nothing was raised");
+        }
+
+        // Without a sentence the questions are it, and the choices ride along.
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1"], &[("person", ""), ("choices", f.as_str())])), 0);
+        let q = message::all(&store).pop().expect("raised");
+        assert_eq!(q.text, "Which figure is the headline? Which views show the split?");
+        assert!(q.for_person);
+        let j = q.to_json();
+        assert_eq!(j["choices"]["kind"], "ask");
+        assert_eq!(j["choices"]["via"], "ask", "raised from the CLI");
+        assert_eq!(j["choices"]["questions"][1]["multi"], true);
+        assert_eq!(item_json(&store, &q)["choices"], j["choices"], "yours --json prints them");
+        assert_eq!(q.caption().text.chars().count() < 60, true, "the caption rule is unchanged: {:?}", q.caption());
+
+        // Choices are the person's: a question a seat answers takes none.
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["lone-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+        let before = n(&store);
+        let code = ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick"], &[("choices", f.as_str())]));
+        assert_eq!((code, n(&store)), (2, before), "a seat's question takes no choices");
+
+        // A sentence of its own stands, and a question without choices says null.
+        assert_eq!(
+            ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "pick one"], &[("person", ""), ("choices", f.as_str())])),
+            0
+        );
+        assert_eq!(message::all(&store).pop().unwrap().text, "pick one");
+        assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["lone-1", "no options here"], &[("person", "")])), 0);
+        let plain = message::all(&store).pop().unwrap();
+        assert!(plain.choices.is_none() && plain.to_json()["choices"].is_null());
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+    }
+
+    /// `wsp-275`'s done-when, at the verb: a plain ask on a member of a running
+    /// list goes to the list's governor and is not the person's; `--person`, and
+    /// a plain ask on a row no seat answers for, are — in `wsp yours` and in
+    /// `wsp flag --person` alike, because the flight view's badge is one count.
+    /// And `for` names the route on all three, where compound-490's plain ask
+    /// to ux-next read `for: null` and the two verbs disagreed about it.
+    #[test]
+    fn every_ask_names_whose_answer_it_waits_on_and_yours_and_flag_person_agree() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("ask-route");
+        let store = scratch("ask-route");
+        task(&store, "m-1");
+        task(&store, "lone-1");
+        let mut w = crate::model::Worklist::new("ux-next", "r");
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], ..Default::default() }]);
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
+
+        std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-893");
+        let asked = |id: &str, text: &str, flags: &[(&str, &str)]| -> String {
+            let before: Vec<String> = message::all(&store).into_iter().map(|m| m.id).collect();
+            assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &[id, text], flags)), 0);
+            message::all(&store).into_iter().map(|m| m.id).find(|m| !before.contains(m)).expect("a new question")
+        };
+        let governed = asked("m-1", "could you paste the panic?", &[]);
+        let persons = asked("m-1", "keep the bump?", &[("person", "")]);
+        let lone = asked("lone-1", "which crate?", &[]);
+        std::env::remove_var(crate::base::seat::SEAT_ENV);
+
+        let route = |id: &str| store.message(id).unwrap().to_json()["for"].clone();
+        assert_eq!(route(&governed), serde_json::json!({ "seat": "ux-next" }), "the list's governor answers it");
+        assert_eq!(route(&persons), "person");
+        assert_eq!(route(&lone), "person", "no seat answers for lone-1, so the person does");
+        assert!(store.message(&governed).unwrap().handed_to("ux-next"), "and the seat was handed it");
+
+        let ids = |v: Vec<Message>| -> Vec<String> {
+            let mut v: Vec<String> = v.into_iter().map(|m| m.id).collect();
+            v.sort();
+            v
+        };
+        let mut want = vec![persons.clone(), lone.clone()];
+        want.sort();
+        assert_eq!(ids(yours_in(&store, None)), want, "yours: the person's two and not the governor's");
+        assert_eq!(ids(message::raised_to_the_person(&store)), want, "flag --person: the same ids");
+    }
+}
+
+/// Moved from `legs`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_legs {
+    use crate::legs::*;
+    use crate::legs::tests::*;
+
+    /// `wsp-011`: a running leg whose seat is gone goes back to pending by
+    /// `wsp leg reset`, for the person, the primary or the row's governor; a
+    /// seat bound to a row and another project's governor are refused, and the
+    /// why is on the row's log.
+    #[test]
+    fn a_running_leg_whose_seat_is_gone_is_reset_by_the_person_or_the_rows_governor_only() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (env, store) = scratch("reset");
+        let order = env.home().join("order.md");
+        std::fs::write(&order, "do it").unwrap();
+        let order = order.to_string_lossy().to_string();
+        let go = |line: &[&str], pane: Option<&str>| run(&store, &parse(line), pane);
+        assert_eq!(go(&["leg", "add", "m-1", "build", "--order", &order], None), 0);
+        assert_eq!(go(&["leg", "add", "m-1", "finish", "--order", &order], None), 0);
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("p".into());
+        let mut ls = legs(&t);
+        ls[0].state = State::Done;
+        ls[1].state = State::Running;
+        ls[1].pane = Some("cpd-gone-011".into());
+        ls[1].started = Some("2026-11-17T06:00:00Z".into());
+        write(&mut t, &ls);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-5", serde_json::json!({ "task_id": "m-2", "pane_id": "cpd-5" }));
+        store.set_governor("other", serde_json::json!({ "workspace": "cpd-8", "pane": "cpd-8" }));
+        store.set_governor("p", serde_json::json!({ "workspace": "cpd-9", "pane": "cpd-9" }));
+
+        let reset = |pane: Option<&str>| go(&["leg", "reset", "m-1", "finish", "its", "seat", "closed", "as", "a", "member"], pane);
+        assert_eq!(reset(Some("cpd-5")), 1, "a seat bound to a row resets no leg");
+        assert_eq!(reset(Some("cpd-8")), 1, "another project's governor is refused");
+        assert_eq!(go(&["leg", "reset", "m-1", "finish"], Some("cpd-9")), 1, "a reset takes the reason");
+        assert_eq!(legs(&store.find_task("m-1").unwrap())[1].state, State::Running, "a refusal changes nothing");
+
+        assert_eq!(reset(Some("cpd-9")), 0, "the row's governor resets it");
+        let t = store.find_task("m-1").unwrap();
+        let l = legs(&t)[1].clone();
+        assert_eq!((l.state, l.pane, l.started), (State::Pending, None, None));
+        assert!(t.section("Log").unwrap().contains("leg finish reset by hand: its seat closed as a member"));
+
+        // Pending now, so a second reset — by the person — is refused.
+        assert_eq!(reset(None), 1);
+        assert_eq!(go(&["leg", "reset", "m-1", "build", "why"], None), 1, "a done leg is not reset");
+    }
+}
+
+/// Moved from `verification`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_verification {
+    use crate::verification::tests::*;
+
+    /// And a row on no list raises a hand instead, so it never stops silently.
+    #[test]
+    fn a_send_back_at_the_leg_cap_on_no_list_raises_a_hand() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = scratch("cap-flag");
+        at_the_leg_cap(&store, "m-1");
+        let _ = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).count());
+        sent_back_by_check(&store, "m-1", "a step failed");
+        assert!(crate::cycle::tests::TOLD.with(|t| t.borrow().is_empty()), "no list, no governor");
+        let hands: Vec<_> = crate::message::raised(&store).into_iter().filter(|m| m.about.task() == Some("m-1")).collect();
+        assert_eq!(hands.len(), 1, "{hands:?}");
+        assert!(hands[0].text.contains("8-leg cap") && hands[0].text.contains("a step failed"), "{}", hands[0].text);
+        sent_back_by_check(&store, "m-1", "a step failed");
+        assert_eq!(crate::message::raised(&store).into_iter().filter(|m| m.about.task() == Some("m-1")).count(), 1, "once");
+    }
+}

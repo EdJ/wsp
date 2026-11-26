@@ -7258,6 +7258,7 @@ mod tests {
     /// site that stopped calling `util::no_such` fails here, not in review.
     #[test]
     fn a_title_a_flag_ate_is_reported_as_a_flag_and_files_nothing() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let (_env, store) = scratch("dash-title");
         let mut demo = crate::model::Project::new("demo");
         demo.name = "demo".into();
@@ -7334,6 +7335,7 @@ mod tests {
     /// announcing the same hand to the same seat a minute later.
     #[test]
     fn a_hand_raised_under_a_seat_is_owed_by_that_seat_rather_than_only_drawn() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let (_env, store) = scratch("flag-to-seat");
         a_task(&store, "wsp-001");
         // The governor record written directly rather than through `take`:
@@ -7369,6 +7371,7 @@ mod tests {
     /// hand and the panel showed the person what the governor had been told.
     #[test]
     fn a_run_notice_says_it_is_wsps_and_for_the_seat_and_is_not_the_persons() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let (_env, store) = scratch("run-notice");
         a_task(&store, "wsp-001");
         store.set_governor(
@@ -11040,5 +11043,270 @@ mod tests {
             assert!(text.contains(line), "{line} in:\n{text}");
         }
         assert!(!text.contains("↳ working"), "a turn in flight already says working:\n{text}");
+    }
+}
+
+/// Moved from `fold`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_fold {
+    use crate::fold::*;
+    use crate::fold::mirror_tests::*;
+    use std::collections::BTreeMap;
+    use serde_json::json;
+    use wsp_host_api::Message;
+    use wsp_store_contract::{self as c, Entity, IdempotencyKey, MachineName, Principal, SeatState};
+    use crate::store::Store;
+    use crate::util;
+    use wsp_host_api::{Epoch, Key, RowId, SeatId, SeatStarted, SeatStopped};
+
+    /// wsp-094: after a machine restart the manager journalled every seat
+    /// stopped and the fold put each gone; nothing ever forgot them. The tick's
+    /// sweep forgets a gone seat with nothing to say — in the state core and in
+    /// `spawned.json` — keeps one that said something,
+    /// forgets a seat mirrored before the census word was carried, and a
+    /// second sweep finds nothing.
+    #[test]
+    fn the_sweep_forgets_seats_a_restart_left_gone_with_nothing_to_say() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let env = util::isolated("fold-sweep-mute");
+        let store = Store::open();
+        let db = open(&env.state());
+        let mut id = 0;
+        for seat in ["cpd-r1", "cpd-r2"] {
+            let s = SeatId(seat.into());
+            id += 1;
+            let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 19479, sockets: vec![] };
+            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStarted(started))));
+            id += 1;
+            let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
+            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStopped(stopped))));
+        }
+        store.set_sentence("cpd-r2", "stopped at the barrier", None);
+        // As a build before the census word mirrored it: gone, and nothing else.
+        let old = c::Seat {
+            id: c::SeatId("cpd-r3".into()),
+            machine: MachineName("h".into()),
+            kind: "claude".into(),
+            model: None,
+            state: SeatState::Gone,
+            before_lost: None,
+            row: None,
+            attempt: 0,
+            pid: Some(1),
+            fields: BTreeMap::from([("epoch".to_string(), "1".to_string())]),
+        };
+        db.apply(put_cmd(vec![Entity::Seat(old)]), IdempotencyKey("old".into()), Principal::Wsp("test".into())).unwrap();
+        assert!(store.spawned().contains_key("cpd-r1"), "the fold recorded the start");
+        assert!(state_since(&store, ["cpd-r1"]).contains_key("cpd-r1"), "and dated the gone");
+
+        let mut forgot = sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s));
+        forgot.sort();
+        assert_eq!(forgot, ["cpd-r1", "cpd-r3"]);
+        let seats = db.snapshot().unwrap().0.seats;
+        assert!(!seats.contains_key(&c::SeatId("cpd-r1".into())) && !seats.contains_key(&c::SeatId("cpd-r3".into())), "{seats:?}");
+        assert!(seats.contains_key(&c::SeatId("cpd-r2".into())), "it said something");
+        assert!(!store.spawned().contains_key("cpd-r1"));
+        assert!(store.spawned().contains_key("cpd-r2"));
+        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "nothing left to forget");
+
+        // A day after it was first seen gone, the one that said something goes too.
+        let day_ago = util::epoch_secs() - crate::cmd_agent::GONE_FOR - 60;
+        say(&store, "cpd-r2", |m| {
+            m.insert("at".into(), json!(util::iso_at(day_ago)));
+        });
+        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-r2"]);
+    }
+
+    /// A despawn of a gone seat that said something ends its record, and the
+    /// next sweep forgets it at once.
+    #[test]
+    fn the_sweep_forgets_a_despawned_seat_at_once() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let env = util::isolated("fold-sweep-despawned");
+        let store = Store::open();
+        let db = open(&env.state());
+        let s = SeatId("cpd-d1".into());
+        let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 1, sockets: vec![] };
+        fold_into(&store, Some(&db), "h", &frame(1, Message::SeatStarted(started)));
+        let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
+        fold_into(&store, Some(&db), "h", &frame(2, Message::SeatStopped(stopped)));
+        store.set_sentence("cpd-d1", "stopped at the barrier", None);
+        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "it said something");
+        store.end_spawned("cpd-d1", util::epoch_secs());
+        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-d1"]);
+    }
+}
+
+/// Moved from `ending`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_ending {
+    use crate::ending::tests::*;
+
+    /// `wsp-433`: `wsp doctor` found 26 task files with release lines and 43
+    /// worklist files with attempts marked `ended` on disk and in no commit.
+    /// The release (`release_pane`'s claim and log line) and both endings (the
+    /// row's, and the check's on its worklist) leave the store clean.
+    #[test]
+    fn a_release_and_an_attempts_end_leave_the_store_committed() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = verified("committed");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "wsp@test"],
+            &["config", "user.name", "wsp test"],
+            &["config", "commit.gpgsign", "false"],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "store"],
+        ] {
+            let ok = wsp_base::calls::Command::new("git").arg("-C").arg(&store.root).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
+            assert!(ok.success(), "git {args:?}");
+        }
+        let loose = || {
+            let out = wsp_base::calls::Command::new("git")
+                .arg("-C")
+                .arg(&store.root)
+                .args(["status", "--porcelain"])
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(loose(), "", "the baseline is clean");
+
+        // The member's ending, then the release line a seat's ending writes.
+        pass(&store, &Fake::at_rest());
+        assert!(log_of(&store, "m-1").contains("ended: verification holds"), "{}", log_of(&store, "m-1"));
+        assert_eq!(loose(), "", "the row's ending is committed");
+        let (removed, task) = crate::cmd_agent::release_pane(&store, "cpd-1");
+        assert!(removed && task.as_deref() == Some("m-1"));
+        assert!(log_of(&store, "m-1").contains("released"), "{}", log_of(&store, "m-1"));
+        assert_eq!(loose(), "", "the release line is committed");
+
+        // And a check marked ended on its worklist.
+        let mut w = store.worklist("run").unwrap();
+        let mut g = w.groups();
+        g[0].checks.push(crate::barrier::Check {
+            at: "2026-10-06T09:00:00Z".into(),
+            state: crate::barrier::State::Running,
+            read: None,
+            pane: Some("cpd-9".into()),
+            on: Some("claude sonnet/high".into()),
+            ending: crate::barrier::Ending::Standing,
+            was: None,
+            tries: 1,
+            gave_up: false,
+            suite: None,
+            run: None,
+            by: None,
+        });
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        store.git_commit("test: a check");
+        assert_eq!(loose(), "");
+        assert!(crate::barrier::mark_ended(&store, "cpd-9", true));
+        assert!(loose().is_empty(), "the attempt's end is committed: {}", loose());
+    }
+}
+
+/// Moved from `cmd_task`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_cmd_task {
+    use crate::cmd_task::*;
+    use crate::cmd_task::tests::*;
+    use crate::place::State;
+    use serde_json::json;
+    use crate::model::{Status, Task};
+    use crate::store::Store;
+    use crate::util::{self};
+
+    /// `wsp-344`: a verified row whose seat is gone — no backend has it — closes
+    /// in one call too, and ends nothing.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_gone_in_one_call() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-verified-gone");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"));
+        assert!(crate::cycle::tests::ENDED.with(|e| e.borrow().is_empty()), "nothing left to end");
+    }
+
+    /// `wsp-344`: `wsp done` on a verified row whose seat sits idle at its
+    /// prompt ends the seat (tree kept for the close's own sweep), releases the
+    /// claim and closes the row — one call, no `wsp release` first.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_idle_in_one_call() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-verified-idle");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+        crate::cycle::tests::KEPT.with(|k| k.borrow_mut().clear());
+
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Reads(vec![("cpd-9", State::Idle)])), 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"), "the claim is released");
+        assert!(!store.bindings().contains_key("cpd-9"));
+        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the idle seat is ended");
+        assert_eq!(crate::cycle::tests::KEPT.with(|k| k.borrow().clone()), vec!["cpd-9".to_string()], "its tree left to done's sweep");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("`wsp done` ended it and released the claim") && log.contains("→ done"), "{log}");
+    }
+
+    /// `wsp-509`: a verified row whose seat `locate` still finds but the Seats
+    /// port positively does not have reads as idle (`standing_as`), so the close
+    /// goes through in one call and ends the seat as an idle one.
+    #[test]
+    fn done_closes_a_verified_row_whose_seat_is_live_by_locate_but_absent_by_the_port() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-verified-absent");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        verified_row(&store);
+
+        assert_eq!(standing_as(&Absent, "cpd-9"), Standing::Idle);
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| true, &Absent), 0);
+        let t = store.task("p-001").unwrap();
+        assert_eq!(t.status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"), "the claim is released");
+        assert!(!store.bindings().contains_key("cpd-9"));
+        assert_eq!(crate::cycle::tests::ENDED.with(|e| e.borrow().clone()), vec!["cpd-9".to_string()], "the seat locate found is ended");
+        let log = t.section("Log").unwrap_or_default();
+        assert!(log.contains("`wsp done` ended it and released the claim"), "{log}");
+    }
+
+    /// `wsp-582`: `done` on a row whose seat is up refuses, names the seat and the
+    /// verb, and leaves the claim and binding exactly as they were; a seat that
+    /// is gone, or a leg's, does not stop it.
+    #[test]
+    fn done_refuses_a_row_whose_seat_is_up_and_names_it() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let _env = util::isolated("done-live-seat");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "p-001");
+        t.set_status(Status::Doing);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
+        store.set_binding("cpd-8@mb", json!({ "task_id": "p-001", "pane_id": "cpd-8@mb", "workspace_id": "cpd-8@mb" }));
+        store.set_binding("cpd-7", json!({ "task_id": "p-001", "leg": "a", "pane_id": "cpd-7", "workspace_id": "cpd-7" }));
+        store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
+
+        let alive = |s: &str| s != "cpd-gone";
+        assert_eq!(standing_on(&store, "p-001", &alive), vec!["cpd-8@mb".to_string(), "cpd-9".to_string()], "a far seat is named too, a leg's is not");
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &alive, &Reads(vec![("cpd-9", State::Idle), ("cpd-8@mb", State::Idle)])), 1, "not verified: an idle seat still refuses");
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Doing, "a refused close closes nothing");
+        assert!(store.claims().contains_key("p-001"), "and releases nothing");
+        assert!(store.bindings().contains_key("cpd-9") && store.bindings().contains_key("cpd-8@mb"));
+
+        // The seats gone: the close goes through as it always did.
+        assert_eq!(done_with(&store, &parse(&["done", "p-001"]), &|_| false, &Reads(vec![])), 0);
+        assert_eq!(store.task("p-001").unwrap().status(), Status::Done);
+        assert!(!store.claims().contains_key("p-001"));
     }
 }

@@ -1440,26 +1440,26 @@ fn cmd_show(store: &Store, args: &Args) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    fn leg(name: &str) -> Leg {
+    pub fn leg(name: &str) -> Leg {
         Leg::pending(name, &format!("do {name}"))
     }
 
-    fn with(name: &str, after: &[&str]) -> Leg {
+    pub fn with(name: &str, after: &[&str]) -> Leg {
         Leg { after: Some(after.iter().map(|s| s.to_string()).collect()), ..leg(name) }
     }
 
-    fn opus(name: &str) -> Leg {
+    pub fn opus(name: &str) -> Leg {
         Leg { policy: Policy::parse("claude opus high").unwrap(), why: Some("decides which layer owns it".into()), ..leg(name) }
     }
 
-    fn names(v: &[String]) -> Vec<&str> {
+    pub fn names(v: &[String]) -> Vec<&str> {
         v.iter().map(String::as_str).collect()
     }
 
-    fn row(body: &str) -> Task {
+    pub fn row(body: &str) -> Task {
         let mut t = Task::new("a row", "m-1");
         t.body = format!("## Overview\nthe work\n\n{body}\n## Log\n- 2026-10-18 claimed\n");
         t
@@ -1941,7 +1941,7 @@ mod tests {
 
     // ---- the verbs, against a store ----
 
-    fn scratch(tag: &str) -> (util::Isolated, Store) {
+    pub fn scratch(tag: &str) -> (util::Isolated, Store) {
         let env = util::isolated(&format!("legs-{tag}"));
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
@@ -1951,7 +1951,7 @@ mod tests {
         (env, store)
     }
 
-    fn parse(line: &[&str]) -> Args {
+    pub fn parse(line: &[&str]) -> Args {
         Args::parse(line.iter().map(|s| (*s).to_string()).collect())
     }
 
@@ -1992,49 +1992,6 @@ mod tests {
         assert_eq!(ls[4].skipped.as_deref(), Some("the split was wrong"));
         assert_eq!(ls[3].after, Some(vec![]));
         assert_eq!(go(&["leg", "bogus"]), 2);
-    }
-
-    /// `wsp-011`: a running leg whose seat is gone goes back to pending by
-    /// `wsp leg reset`, for the person, the primary or the row's governor; a
-    /// seat bound to a row and another project's governor are refused, and the
-    /// why is on the row's log.
-    #[test]
-    fn a_running_leg_whose_seat_is_gone_is_reset_by_the_person_or_the_rows_governor_only() {
-        let (env, store) = scratch("reset");
-        let order = env.home().join("order.md");
-        std::fs::write(&order, "do it").unwrap();
-        let order = order.to_string_lossy().to_string();
-        let go = |line: &[&str], pane: Option<&str>| run(&store, &parse(line), pane);
-        assert_eq!(go(&["leg", "add", "m-1", "build", "--order", &order], None), 0);
-        assert_eq!(go(&["leg", "add", "m-1", "finish", "--order", &order], None), 0);
-        let mut t = store.find_task("m-1").unwrap();
-        t.project = Some("p".into());
-        let mut ls = legs(&t);
-        ls[0].state = State::Done;
-        ls[1].state = State::Running;
-        ls[1].pane = Some("cpd-gone-011".into());
-        ls[1].started = Some("2026-11-17T06:00:00Z".into());
-        write(&mut t, &ls);
-        store.save_task(&t).unwrap();
-        store.set_binding("cpd-5", serde_json::json!({ "task_id": "m-2", "pane_id": "cpd-5" }));
-        store.set_governor("other", serde_json::json!({ "workspace": "cpd-8", "pane": "cpd-8" }));
-        store.set_governor("p", serde_json::json!({ "workspace": "cpd-9", "pane": "cpd-9" }));
-
-        let reset = |pane: Option<&str>| go(&["leg", "reset", "m-1", "finish", "its", "seat", "closed", "as", "a", "member"], pane);
-        assert_eq!(reset(Some("cpd-5")), 1, "a seat bound to a row resets no leg");
-        assert_eq!(reset(Some("cpd-8")), 1, "another project's governor is refused");
-        assert_eq!(go(&["leg", "reset", "m-1", "finish"], Some("cpd-9")), 1, "a reset takes the reason");
-        assert_eq!(legs(&store.find_task("m-1").unwrap())[1].state, State::Running, "a refusal changes nothing");
-
-        assert_eq!(reset(Some("cpd-9")), 0, "the row's governor resets it");
-        let t = store.find_task("m-1").unwrap();
-        let l = legs(&t)[1].clone();
-        assert_eq!((l.state, l.pane, l.started), (State::Pending, None, None));
-        assert!(t.section("Log").unwrap().contains("leg finish reset by hand: its seat closed as a member"));
-
-        // Pending now, so a second reset — by the person — is refused.
-        assert_eq!(reset(None), 1);
-        assert_eq!(go(&["leg", "reset", "m-1", "build", "why"], None), 1, "a done leg is not reset");
     }
 
     /// `wsp-499`: a planner, which holds no row, files legs on a row at todo, and

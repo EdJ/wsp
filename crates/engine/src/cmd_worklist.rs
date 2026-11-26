@@ -10538,7 +10538,8 @@ mod tests {
         let ids = |v: Vec<message::Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
         assert_eq!(ids(message::raised_to_the_person(&store)), vec![q.id.clone()], "flag --person lists it");
         assert_eq!(ids(crate::cmd_message::yours_in(&store, None)), vec![q.id.clone()], "and so does yours");
-        assert!(crate::wake::scopes_owed(&store).is_empty(), "no spool woken, the asker's least of all");
+        let woken = crate::cycle::install_tests::SAID_TO.with(|s| s.borrow().clone());
+        assert!(woken.is_empty(), "no spool woken, the asker's least of all: {woken:?}");
         assert!(!q.handed_to("batch"));
 
         assert_eq!(ids(message::holding_group(&store, "batch", 1)), vec![q.id.clone()]);
