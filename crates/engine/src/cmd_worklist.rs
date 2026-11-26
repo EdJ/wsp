@@ -10528,6 +10528,8 @@ mod tests {
         assert_eq!(worklist::home_of_scope(&store, "batch").as_deref(), Some("wsp"), "the walk has a home to climb");
         assert!(crate::worklist::seat_above_in(&store, "batch").is_none(), "and nobody seated on it");
 
+        // The walk reaches the asker's own list first.
+        crate::cycle::install_tests::ANSWERS.with(|a| *a.borrow_mut() = Some("batch".into()));
         std::env::set_var(crate::base::seat::SEAT_ENV, "w1:p1");
         let asked = crate::cmd_message::ask(&store, &Args::synth("ask", &["wl-001", "ship it with the panic unexplained?"], &[]));
         std::env::remove_var(crate::base::seat::SEAT_ENV);

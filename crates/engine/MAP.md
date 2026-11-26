@@ -25,13 +25,22 @@ they stay in `wsp` and use this crate, never the other way (`docs/components-upw
   empty; in this crate's own tests it is a fixed `0000000+dirty`, a stamp they can tell from none.
 - `outputs::install(cmd_report::REPORTS)`: timeline's report writers. This crate's tests install stand-ins that put
   `effort.*` and `work.html` where the real ones do; the real writers are tested in `cmd_report`.
+- `cycle::install_seats(&cmd_spawn::Fleet)`: the engine reaches seats only through `cycle::seats()`, the installed
+  `dyn Seats` (wsp-542). `main` installs first thing; a call before that panics. In a test the install is that thread's
+  own, and with none it reads `cycle::install_tests::Double`, which records `say` (`SAID_TO`), answers only what a test
+  scripted (`OWED`, `ANSWERS`) and defaults the rest: assert no other effect through it.
 - `mirror::LIST_OUTPUTS`, `LIST_SHOW`, `SEAT_WORKING`, `ROW_HOLDER`, `cmd_checkout::install_engine`: as before the cut.
 
 ## Notes
 
-- Every `pub(crate)` became `pub` in the move. `#[cfg(test)]` and `cfg!(test)` guards (spawns, ends, tells, launches,
-  the test door) hold only in this crate's tests: the root's tests run the engine as the binary does. They set
-  `WSP_NO_CYCLE` where a verb would launch, and serve an orders store in process (`orders::serve_in_process`).
+- Every `pub(crate)` became `pub` in the move.
+- `test-support` (wsp-544) gives a dependent's tests the fixtures and recorders they name; `tests/dependent.rs` lists
+  them. Guards on `base::under_test()` (`start_detached`'s among them) hold here and, with the feature, in a test
+  process run from `target/*/deps`, so in the root's unit tests too; not in the `wsp` binary its integration tests run.
+- A guard still on `cfg!(test)` (`cycle::start`, `start_check`, `trunk_tip`, `tell`, `tell_logged`, ...) holds only in
+  this crate's tests: a dependent's test that reaches one takes the real path.
+- A dependent installs the `state.db` open (`orders::tests::install_db`) and takes `testkit::repo_at` from its own
+  `wsp-testkit`: layering keeps both out of this crate's normal dependencies.
 - Paths: `include_str!` reaches the repository root as `../../../`; tests that read files do it from
   `env!("CARGO_MANIFEST_DIR")/../..`.
 - `doctest = false`: the doc blocks are prose, never run as doctests while these modules were the bin's.
@@ -40,5 +49,5 @@ they stay in `wsp` and use this crate, never the other way (`docs/components-upw
 
 ## Tests
 
-`cargo test -p wsp-engine` (about 2290). `wsp-store-sqlite` is a dev-dependency only: orders, fold and mirror tests
+`cargo test -p wsp-engine` (about 2300). `wsp-store-sqlite` is a dev-dependency only: orders, fold and mirror tests
 open a real `state.db`. `cargo test --test layering` holds the crate's links and its upward lines.

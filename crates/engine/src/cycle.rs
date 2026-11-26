@@ -6120,6 +6120,9 @@ pub mod install_tests {
         fn answering_scope(&self, _store: &Store, _task: &crate::model::Task) -> Option<String> {
             ANSWERS.with(|a| a.borrow().clone())
         }
+        fn answering_seat(&self, store: &Store, _task: &crate::model::Task) -> Option<crate::governors::Seat> {
+            ANSWERS.with(|a| a.borrow().as_deref().and_then(|s| crate::governors::seat_held(s, &store.governors())))
+        }
         fn say(&self, _store: &Store, scope: &str, text: &str, _record: Option<&str>) -> Report {
             SAID_TO.with(|s| s.borrow_mut().push((scope.to_string(), text.to_string())));
             Report::default()

@@ -3529,6 +3529,8 @@ pub mod tests {
         store.set_governor("ux-next", serde_json::json!({ "workspace": "w1", "pane": "w1:p1" }));
         store.set_governor(crate::governors::PRIMARY, serde_json::json!({ "workspace": "cpd-1", "pane": "cpd-1" }));
 
+        // A seat answers for the row, so only the asker being the primary keeps it from that seat.
+        crate::cycle::install_tests::ANSWERS.with(|a| *a.borrow_mut() = Some("ux-next".into()));
         std::env::set_var(crate::base::seat::SEAT_ENV, "cpd-1");
         assert_eq!(ask(&store, &crate::base::args::Args::synth("ask", &["m-1", "which first, 457 or 458?"], &[])), 0);
         std::env::remove_var(crate::base::seat::SEAT_ENV);
