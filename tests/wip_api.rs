@@ -341,7 +341,9 @@ fn idle_masked(line: &str) -> String {
             }
         }
     }
-    out
+    // A box under load may fail the clock's reading on either path: the segment
+    // may be there on one and not the other, so it is left out of both.
+    out.split(" · ").filter(|seg| !seg.starts_with("cpu clock ")).collect::<Vec<_>>().join(" · ")
 }
 
 /// Every child the call line counted, by name.
@@ -523,18 +525,29 @@ fn seeded(tag: &str) -> Seeded {
     let client = sb.client(Duration::from_secs(20));
 
     // One seat the manager runs, on the doing row.
-    let tcp = Tcp::new(local.socket(), token, wsp_host_api::Role::Cli, "test");
+    // It beats faster than the manager's beat of a second, or a spawn slow under load
+    // is a silent client the manager drops (the seat started, its answer lost).
+    let tcp = Tcp::new(local.socket(), token, wsp_host_api::Role::Cli, "test").with_beat(Duration::from_millis(200));
     let args: Vec<String> = vec![];
-    let spawn = Spawn {
-        key: wsp_host_api::Key { row: wsp_host_api::RowId(doing.clone()), attempt: 0 },
-        seat: SEAT,
-        kind: None,
-        cwd: sb.dir.display().to_string(),
-        env: BTreeMap::new(),
-        program: "true",
-        args: &args,
+    // A box under load may leave the stand-in sup slow past the handshake's
+    // wait: that try is killed and refused, and another attempt is made.
+    let mut tries = 0;
+    let session = loop {
+        let spawn = Spawn {
+            key: wsp_host_api::Key { row: wsp_host_api::RowId(doing.clone()), attempt: tries },
+            seat: SEAT,
+            kind: None,
+            cwd: sb.dir.display().to_string(),
+            env: BTreeMap::new(),
+            program: "true",
+            args: &args,
+        };
+        match tcp.spawn_session(&spawn) {
+            Ok(session) => break session,
+            Err(e) if tries < 3 && format!("{e:?}").contains("never announced a socket") => tries += 1,
+            Err(e) => panic!("the manager spawns the seat: {e:?}"),
+        }
     };
-    let session = tcp.spawn_session(&spawn).expect("the manager spawns the seat");
     // Its agent took a turn and ended it, as Claude Code's hooks post it: a
     // seat that has turned is idle to the manager and to the fold alike (until
     // then the manager reads it idle on its vitals and the fold, which hears
