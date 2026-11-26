@@ -356,6 +356,38 @@ follows the `-p wsp-engine` warm-up; no cargo or rustc of another seat was seen 
 - An earlier pass the same morning (loads 0.4 to 1.8) lost its wall times to a script fault. Cargo's own `Finished`
   times from it: 3.37, 3.77, 4.01 s; 3.20, 3.16, 3.17 s; 2.76, 2.67, 2.69 s, in the table's order.
 
+### After the seats cut (wsp-441)
+
+Measured 2026-11-26 at 1f9c1c0, in wsp-441's tree, on the same machine. The seats are now their own crate,
+`crates/seats` (`wsp-seats`), on `wsp-engine`. The edit is the message `"nobody is left to read it"` in
+`crates/seats/src/wake.rs`, which no test reads, with a different digit appended each run. Each command had a warm-up
+build just before its three runs. Times are wall clock of the whole cargo call. `load1` was read just before each run,
+all below 3.5. The 5-minute load was higher (4.3 to 7.7), left over from this row's own earlier runs; no `rustc` was
+running at any start.
+
+| Command, after the edit | Run 1 | Run 2 | Run 3 | Load1 at start (1, 2, 3) | Of 4.47 s |
+|---|---|---|---|---|---|
+| `cargo test --no-run` | 3.63 s | 3.62 s | 3.62 s | 3.32, 3.32, 3.30 | 81 % |
+| `cargo test -p wsp-seats --no-run` | 2.02 s | 2.02 s | 2.01 s | 3.37, 3.38, 3.38 | 45 % |
+| `cargo test -p wsp-seats` (build and 756 tests) | 5.22 s | 5.21 s | 5.22 s | 3.34, 2.90, 2.75 | |
+| `cargo test -p wsp` (build and the root package's tests) | 111.19 s | 111.89 s | 111.99 s | 3.39, 3.29, 3.43 | |
+| wsp-440, before: `cargo test --no-run`, edit in engine+seats | 3.84 s | 3.83 s | 3.75 s | 1.59, 1.62, 1.89 | 86 % |
+| wsp-440, before: `cargo test -p wsp-engine --no-run`, same edit | 3.34 s | 3.35 s | 3.56 s | 3.90, 3.75, 3.53 | 75 % |
+| wsp-430, before: `cargo test --bin wsp cycle:: --no-run` | 4.48 s | 4.37 s | 4.47 s | 2.33, 2.65, 2.50 | 100 % |
+
+- **Half of the bin-crate figure (under 2.2 s): not met by `cargo test --no-run`** (3.62 s), the command wsp-440's
+  gate was read on first. **Met by `cargo test -p wsp-seats --no-run`** (2.02 s), by 0.2 s.
+- Against wsp-440's one crate, a seats edit builds 0.2 s faster at the root and 1.3 s faster in its own crate.
+- **The narrowed check against 162 s: `wsp check --affected` itself was not timed on a seats-only diff.** Until this
+  row lands, its diff holds the whole move, and the plan is every crate. `cargo test -p wsp-seats` takes 5.2 s. If the
+  plan for a seats edit also runs the dependent `wsp`, the two commands sum to about 117 s. Which of the two the plan
+  does was not established.
+- **162 s may not be a like-for-like base.** In three whole-workspace `--affected` runs here (load1 3.21, 3.40, 3.45;
+  no wall time recorded) the `crate:wsp-engine` step read 25 to 26 s and `crate:wsp-seats` 4 s, against the 138 s
+  `wsp-engine` took inside the 162 s. The cause of that difference was not established.
+- Thermal: the package throttle count rose by 0 to 141 in the build runs, 16 to 29 in the `-p wsp-seats` test runs and
+  221 to 273 in the `-p wsp` runs.
+
 ## The cuts, ranked
 
 Written by wsp-431 on 2026-11-24, from the two sections above and wsp-429's 101 wsp rows (its `stages.json` and
