@@ -11945,6 +11945,207 @@ fn only_a_working_screen_is_ever_overruled() {
         assert!(!log.contains("fin"), "a done row owes nothing, so nothing is said: {log}");
         assert!(!log.contains("wsp: prerequisite"), "{log}");
     }
+
+    // ---- the drive lease through the run (wsp-467, wsp-486) -----------------------
+    //
+    // The run's half of the spoke's drive tests: the same scenarios through
+    // `step`, with a scripted add-on answering what the real spoke answered
+    // against a hub there (`wsp-spoke`'s `spoke::tests` holds the other half:
+    // that the real spoke gives exactly these answers and has these effects on
+    // the hub and its books).
+
+    /// A shared-work add-on scripted as a spoke logged in as `me`: it drives
+    /// the list when `drive` says so; a member `held_by` names is another
+    /// user's, recorded as running there once its lease is asked for (as the
+    /// real spoke records the hub's `held`), until it is done; a verdict pulled
+    /// for such a member counts at the barrier; a claim with `hub_token`
+    /// carries its lease. Every question is recorded.
+    struct Scripted {
+        drive: std::sync::Mutex<crate::addon::Drives>,
+        held_by: std::collections::BTreeMap<String, String>,
+        elsewhere: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        verdicts: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(drive: crate::addon::Drives, held_by: &[(&str, &str)]) -> std::sync::Arc<Scripted> {
+            std::sync::Arc::new(Scripted {
+                drive: std::sync::Mutex::new(drive),
+                held_by: held_by.iter().map(|(r, u)| (r.to_string(), u.to_string())).collect(),
+                elsewhere: Default::default(),
+                verdicts: Default::default(),
+                asked: Default::default(),
+            })
+        }
+
+        fn ask(&self, q: String) {
+            self.asked.lock().unwrap().push(q);
+        }
+
+        fn asked(&self) -> Vec<String> {
+            std::mem::take(&mut *self.asked.lock().unwrap())
+        }
+    }
+
+    impl crate::addon::SharedWork for Scripted {
+        fn drive(&self, _: &Store, w: &Worklist) -> crate::addon::Drives {
+            self.ask(format!("drive {}", w.id));
+            self.drive.lock().unwrap().clone()
+        }
+        fn leased(&self, claim: &serde_json::Value) -> bool {
+            claim.get("hub_token").is_some()
+        }
+        fn lease_member(&self, _: &Store, row: &str) -> crate::addon::Member {
+            self.ask(format!("lease {row}"));
+            match self.held_by.get(row) {
+                Some(u) => {
+                    self.elsewhere.lock().unwrap().insert(row.to_string(), u.clone());
+                    crate::addon::Member::Elsewhere(u.clone())
+                }
+                None => crate::addon::Member::Leased(crate::addon::Held { token: wsp_store_contract::Token(7), expires: util::epoch_secs() + 86_400 }),
+            }
+        }
+        fn unused(&self, _: &Store, row: &str, _: &crate::addon::Held) {
+            self.ask(format!("unused {row}"));
+        }
+        fn running_elsewhere(&self, store: &Store, row: &str) -> Option<String> {
+            let user = self.elsewhere.lock().unwrap().get(row).cloned()?;
+            let done = store.find_task(row).is_none_or(|t| t.status() == Status::Done);
+            (!done).then_some(user)
+        }
+        fn verdict_held(&self, _: &Store, row: &str) -> bool {
+            self.elsewhere.lock().unwrap().contains_key(row) && self.verdicts.lock().unwrap().contains(row)
+        }
+    }
+
+    /// Three shared rows in `todo` and the shared `run` list over them.
+    fn shared_run(store: &Store) {
+        for id in ["wsp-1", "wsp-2", "wsp-3"] {
+            let mut t = Task::new(id, id);
+            t.workspace = "shared:team".parse().unwrap();
+            store.save_task(&t).unwrap();
+        }
+        list(store, &[(&["wsp-1", "wsp-2", "wsp-3"], "claude")]);
+        let mut w = store.worklist("run").unwrap();
+        w.workspace = "shared:team".parse().unwrap();
+        store.save_worklist(&w).unwrap();
+    }
+
+    /// The run's half of Done-when 1 (wsp-467): driven here, the run starts the
+    /// two members it is leased and never the one another user's spoke holds,
+    /// neither reseats nor verifies that one, and opens the barrier once its
+    /// landing and a verdict that holds have arrived; after the drive lease
+    /// lapses, the next step asks the gate again.
+    #[test]
+    fn drive_a_shared_list_driven_here_starts_the_leased_members_and_never_the_one_held_elsewhere() {
+        let (_env, store) = scratch("drive-two");
+        let shared = Scripted::new(crate::addon::Drives::Here, &[("wsp-2", "jesper")]);
+        let _addon = crate::addon::scoped(shared.clone());
+        shared_run(&store);
+        let w = store.worklist("run").unwrap();
+
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("wsp-1".into(), "claude".into()), ("wsp-3".into(), "claude".into())], "the two Ed could lease");
+        assert_eq!(store.find_task("wsp-2").unwrap().status(), Status::Todo, "never the leased one");
+        let asked = shared.asked();
+        assert_eq!(asked[0], "drive run", "the gate is asked first: {asked:?}");
+        assert!(["lease wsp-1", "lease wsp-2", "lease wsp-3"].iter().all(|q| asked.contains(&q.to_string())), "{asked:?}");
+        assert!(!asked.iter().any(|q| q.starts_with("unused")), "every lease taken was used: {asked:?}");
+
+        // Jesper's work arrives through the sync: `doing`, with no seat here.
+        set(&store, "wsp-2", Status::Doing);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "not reseated: it runs on Jesper's wsp");
+
+        // Ed's two land and are verified here; Jesper's is not.
+        set(&store, "wsp-1", Status::Review);
+        set(&store, "wsp-3", Status::Review);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("wsp-1 · verifying".into(), "claude".into()), ("wsp-3 · verifying".into(), "claude".into())]);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        assert!(checks(&store, 1).is_empty(), "the barrier waits for Jesper's landing");
+
+        // Jesper's landing arrives, and then the verdict his spoke's verifier wrote.
+        set(&store, "wsp-2", Status::Review);
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "no verifier on Ed's spoke for Jesper's row");
+        assert!(checks(&store, 1).is_empty(), "and no barrier before its verdict");
+        // A verdict that blocks is not counted: a hold pulled and then a later
+        // block leave the spoke's book without the hold; one that holds is.
+        shared.verdicts.lock().unwrap().insert("wsp-2".into());
+        shared.verdicts.lock().unwrap().remove("wsp-2");
+        step(&store, &w, &Blind);
+        assert!(checks(&store, 1).is_empty(), "a later blocks clears the hold: the barrier waits");
+        shared.verdicts.lock().unwrap().insert("wsp-2".into());
+        step(&store, &w, &Blind);
+        assert_eq!(checks(&store, 1).len(), 1, "the barrier opens");
+        assert_eq!(spawned(), vec![("run · barrier 1".into(), "claude".into())]);
+
+        // The drive lease lapsed on the hub: the next step asks the gate again,
+        // which is where the spoke takes it again.
+        shared.asked();
+        step(&store, &w, &Blind);
+        assert_eq!(shared.asked().first().map(String::as_str), Some("drive run"), "the gate is asked on every step");
+    }
+
+    /// The run's half of wsp-486: on a list another user's spoke drives, the
+    /// run opens the verifier of the member whose lease a claim here holds,
+    /// and of no other, and writes nothing to the list.
+    #[test]
+    fn drive_the_holder_opens_a_verifier_for_a_member_of_a_list_it_does_not_drive() {
+        let (_env, store) = scratch("drive-held");
+        let shared = Scripted::new(crate::addon::Drives::Elsewhere("ed".into()), &[]);
+        let _addon = crate::addon::scoped(shared.clone());
+        shared_run(&store);
+        let mut w = store.worklist("run").unwrap();
+        w.for_user = Some("ed".into());
+        store.save_worklist(&w).unwrap();
+        for id in ["wsp-2", "wsp-3"] {
+            set(&store, id, Status::Review);
+        }
+        store.set_claim("wsp-2", serde_json::json!({ "hub_token": 5, "expires": crate::util::iso_at(crate::util::epoch_secs() + 3600) }));
+        let before = std::fs::read_to_string(store.worklist_path("run")).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("wsp-2 · verifying".into(), "claude".into())], "only the member held here");
+        assert_eq!(std::fs::read_to_string(store.worklist_path("run")).unwrap(), before, "the list untouched");
+        assert!(!shared.asked().iter().any(|q| q.starts_with("lease")), "no member is leased by a spoke that does not drive");
+    }
+
+    /// The run's half of Done-when 2 (wsp-467): without the drive (another
+    /// user's spoke holds it, or the list is allocated to another user) the run
+    /// never advances the list: no spawn, no write to it, every row in todo.
+    #[test]
+    fn drive_without_the_drive_lease_the_run_never_advances_the_list() {
+        let (_env, store) = scratch("drive-none");
+        let shared = Scripted::new(crate::addon::Drives::Elsewhere("ed".into()), &[]);
+        let _addon = crate::addon::scoped(shared.clone());
+        shared_run(&store);
+        let w = store.worklist("run").unwrap();
+        let file = || std::fs::read_to_string(store.worklist_path("run")).unwrap();
+        let before = file();
+
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty(), "nothing spawned");
+        assert_eq!(file(), before, "nothing written to the list");
+        assert!(["wsp-1", "wsp-2", "wsp-3"].iter().all(|r| store.find_task(r).unwrap().status() == Status::Todo));
+        assert_eq!(shared.asked(), vec!["drive run".to_string()], "the gate, and nothing after it");
+
+        // Allocated to ed: the gate says so (the spoke without asking the hub).
+        let mut w = store.worklist("run").unwrap();
+        w.for_user = Some("ed".into());
+        store.save_worklist(&w).unwrap();
+        let before = file();
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+        assert_eq!(file(), before);
+        // And a gate that could not ask the hub this turn advances nothing either.
+        *shared.drive.lock().unwrap() = crate::addon::Drives::NotYet("the hub did not answer".into());
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty());
+        assert_eq!(file(), before);
+    }
 }
 
 #[cfg(test)]

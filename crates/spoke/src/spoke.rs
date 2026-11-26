@@ -266,24 +266,15 @@ mod tests {
     //! their thread and drive a real hub.
     use super::*;
 
-    /// **Not compiled: the three drive tests below need the engine's own test build.** They drive `cycle::step`,
-    /// whose spawns, ends and tells are recorded rather than launched only under `cfg!(test)` of the engine
-    /// crate, and its `cycle::tests` fixtures (`Blind`, `spawned`, `checks`, `hold_all`, `list`, `scratch`,
-    /// `set`) are that build's. A crate that depends on the engine gets neither, so they cannot run from here
-    /// without changing the engine's test hooks; they are kept whole for the step that gives the run a hook
-    /// that does not depend on `cfg!(test)`.
-    #[cfg(any())]
+    /// The spoke's half of the drive-lease tests (wsp-467, wsp-486): the same
+    /// scenarios against a real hub, asking the real [`Spoke`] directly the
+    /// questions the run asks it, and reading what it did to the hub and its
+    /// books. The run's half, what `cycle::step` does with these answers, is
+    /// in the engine's `cycle` tests, under a scripted add-on that answers as
+    /// this one does here.
     mod drive {
     use super::*;
-    use wsp_engine::cycle::step;
-    use wsp_engine::cycle::tests::{checks, hold_all, list, scratch, set, spawned, Blind};
-    use wsp_engine::model::{Status, Task};
-    use std::sync::Arc;
-
-    /// The spoke as this thread's add-on, for as long as the guard lives.
-    fn spoke() -> wsp_engine::addon::Scoped {
-        wsp_engine::addon::scoped(Arc::new(Spoke::new()))
-    }
+    use wsp_engine::model::{Group, Status, Task, WorklistStatus};
 
     // ---- the drive lease (wsp-467) ------------------------------------------------
 
@@ -307,9 +298,16 @@ mod tests {
         }
     }
 
+    fn set(store: &Store, id: &str, status: Status) {
+        let mut t = store.find_task(id).unwrap();
+        t.set_status(status);
+        t.touch();
+        store.save_task(&t).unwrap();
+    }
+
     /// A served hub with `ed` and `jesper` in `shared:team`; this store a spoke
     /// logged in as `me`; three shared rows in `todo` and the `run` list over
-    /// them, shared.
+    /// them, shared and running.
     fn two_spokes(env: &wsp_engine::util::Isolated, store: &Store, me: &str) -> (wsp_hub::serve::Running, std::collections::BTreeMap<String, String>, Home) {
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
@@ -320,70 +318,70 @@ mod tests {
             t.workspace = "shared:team".parse().unwrap();
             store.save_task(&t).unwrap();
         }
-        list(store, &[(&["wsp-1", "wsp-2", "wsp-3"], "claude")]);
-        let mut w = store.worklist("run").unwrap();
+        let mut w = Worklist::new("run", "run");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[Group { members: vec!["wsp-1".into(), "wsp-2".into(), "wsp-3".into()], agent: "claude".into(), ..Group::default() }]);
         w.workspace = "shared:team".parse().unwrap();
         store.save_worklist(&w).unwrap();
         (running, tokens, home)
     }
 
-    /// Done-when 1 (wsp-467): Ed's spoke drives a shared list of three rows;
-    /// Jesper's spoke leases one; Ed's run spawns the other two and never the
-    /// leased one, neither reseats nor verifies it, and the barrier opens once
-    /// Jesper's verdict and landing arrive. The drive lease holds Jesper's spoke
-    /// off the list, and once it expires a spoke of Ed's takes it again.
+    /// The spoke's half of Done-when 1 (wsp-467): Ed's spoke takes the drive
+    /// and records itself as driver; of the three members it is leased the two
+    /// Jesper's spoke does not hold and is told the third runs on Jesper's wsp,
+    /// while it is not done; the drive lease and the two member leases keep
+    /// Jesper's spoke off them; a pulled verdict counts at the barrier only
+    /// while it holds; and once the drive lease expires, Ed's spoke lets it go
+    /// and its next gate takes it again with a higher token.
     #[test]
     fn drive_a_shared_list_is_driven_by_eds_spoke_and_the_member_jespers_spoke_leased_runs_there() {
-        let (env, store) = scratch("drive-two");
-        let _addon = spoke();
+        let (env, store) = crate::testkit::isolated_store("spoke-drive-two");
+        let spoke = Spoke::new();
+        // The spoke's own lease code asks core who is logged in
+        // (`address::logged_in_user`), which asks the installed add-on.
+        let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(Spoke::new()));
         let (running, tokens, _home) = two_spokes(&env, &store, "ed");
         let mut jesper = hub_lease::tests::dial(&running, &tokens, "jesper");
         hub_lease::take(&mut jesper, "shared:team", "wsp-2").unwrap();
         let w = store.worklist("run").unwrap();
 
-        step(&store, &w, &Blind);
-        assert_eq!(spawned(), vec![("wsp-1".into(), "claude".into()), ("wsp-3".into(), "claude".into())], "the two Ed could lease");
-        assert_eq!(store.find_task("wsp-2").unwrap().status(), Status::Todo, "never the leased one");
+        // What the run's first step asks: the gate, then each member's lease.
+        assert_eq!(spoke.drive(&store, &w), Drives::Here, "Ed's spoke drives it");
+        assert!(matches!(spoke.lease_member(&store, "wsp-1"), Member::Leased(_)), "the two Ed could lease");
+        assert!(matches!(spoke.lease_member(&store, "wsp-2"), Member::Elsewhere(ref u) if u == "jesper"), "never the leased one");
+        assert!(matches!(spoke.lease_member(&store, "wsp-3"), Member::Leased(_)));
+        assert_eq!(spoke.running_elsewhere(&store, "wsp-2").as_deref(), Some("jesper"));
         assert_eq!(hub_lease::running_elsewhere(&store, "wsp-2").as_deref(), Some("jesper"));
+        assert_eq!(spoke.driven_by(&store, &w).as_deref(), Some("ed"));
         assert_eq!(hub_lease::driven_by(&store, &w).as_deref(), Some("ed"));
         assert!(hub_lease::Book::read(&store).drives.contains_key("run"), "Ed's spoke holds drive:run");
         let why = hub_lease::take(&mut jesper, "shared:team", &hub_lease::drive_row("run")).unwrap_err();
         assert!(why.contains("ed"), "Jesper's spoke cannot take the drive: {why}");
-        // Ed's spoke holds the two it started: Jesper cannot take them.
+        // Ed's spoke holds the two it leased: Jesper cannot take them.
         assert!(hub_lease::take(&mut jesper, "shared:team", "wsp-1").unwrap_err().contains("ed"));
 
-        // Jesper's work arrives through the sync: `doing`, with no seat here.
+        // Jesper's work arrives through the sync, then his landing: still his,
+        // so the run neither reseats nor verifies it.
         set(&store, "wsp-2", Status::Doing);
-        step(&store, &w, &Blind);
-        assert!(spawned().is_empty(), "not reseated: it runs on Jesper's wsp");
-
-        // Ed's two land and are verified here; Jesper's is not.
-        set(&store, "wsp-1", Status::Review);
-        set(&store, "wsp-3", Status::Review);
-        step(&store, &w, &Blind);
-        assert_eq!(spawned(), vec![("wsp-1 · verifying".into(), "claude".into()), ("wsp-3 · verifying".into(), "claude".into())]);
-        hold_all(&store);
-        step(&store, &w, &Blind);
-        assert!(checks(&store, 1).is_empty(), "the barrier waits for Jesper's landing");
-
-        // Jesper's landing arrives, and then the verdict his spoke's verifier wrote.
+        assert_eq!(spoke.running_elsewhere(&store, "wsp-2").as_deref(), Some("jesper"), "not reseated: it runs on Jesper's wsp");
         set(&store, "wsp-2", Status::Review);
-        step(&store, &w, &Blind);
-        assert!(spawned().is_empty(), "no verifier on Ed's spoke for Jesper's row");
-        assert!(checks(&store, 1).is_empty(), "and no barrier before its verdict");
+        assert_eq!(spoke.running_elsewhere(&store, "wsp-2").as_deref(), Some("jesper"), "no verifier on Ed's spoke for Jesper's row");
+        assert!(!spoke.verdict_held(&store, "wsp-2"), "and no barrier before its verdict");
+
         // A verdict that blocks is not counted; one that holds is, as pulled (wsp-486).
         let hold = serde_json::json!({ "commit": "abc1234", "verdict": "holds" });
         hub_lease::take_verdict(&store, "wsp-2", &hold);
+        assert!(spoke.verdict_held(&store, "wsp-2"));
         hub_lease::take_verdict(&store, "wsp-2", &serde_json::json!({ "commit": "abc1234", "verdict": "blocks" }));
-        step(&store, &w, &Blind);
-        assert!(checks(&store, 1).is_empty(), "a later blocks clears the hold: the barrier waits");
+        assert!(!spoke.verdict_held(&store, "wsp-2"), "a later blocks clears the hold: the barrier waits");
         hub_lease::take_verdict(&store, "wsp-2", &hold);
-        step(&store, &w, &Blind);
-        assert_eq!(checks(&store, 1).len(), 1, "the barrier opens");
-        assert_eq!(spawned(), vec![("run · barrier 1".into(), "claude".into())]);
+        assert!(spoke.verdict_held(&store, "wsp-2"), "the barrier opens");
+        // A landed member is no longer running elsewhere.
+        set(&store, "wsp-2", Status::Done);
+        assert_eq!(spoke.running_elsewhere(&store, "wsp-2"), None);
 
         // The drive lease expires on the hub: Ed's spoke lets it go, and the
-        // next step (any spoke of Ed's) takes it again with a higher token.
+        // next gate (any spoke of Ed's) takes it again with a higher token.
         let token = hub_lease::Book::read(&store).drives["run"].token;
         running.hub().clock().advance(std::time::Duration::from_secs(8 * 86_400));
         let expired = running.hub().expire_leases().unwrap();
@@ -391,17 +389,21 @@ mod tests {
         let payload = serde_json::json!({ "row": drive.row.0, "token": drive.token.0 });
         assert!(hub_lease::follow_expired(&store, &payload));
         assert!(!hub_lease::Book::read(&store).drives.contains_key("run"));
-        step(&store, &w, &Blind);
+        assert_eq!(spoke.drive(&store, &w), Drives::Here);
         assert!(hub_lease::Book::read(&store).drives["run"].token > token, "taken again");
         running.stop();
     }
 
-    /// wsp-486: Jesper's spoke, which does not drive Ed's list, opens the
-    /// verifier of the member it holds, and of no other.
+    /// The spoke's half of wsp-486: Jesper's spoke, on a list allocated to Ed,
+    /// does not drive it, reads the claim stamped with a hub token as the one
+    /// lease it holds, and holds no drive lease.
     #[test]
     fn drive_the_holder_spoke_opens_a_verifier_for_a_member_of_a_list_it_does_not_drive() {
-        let (env, store) = scratch("drive-held");
-        let _addon = spoke();
+        let (env, store) = crate::testkit::isolated_store("spoke-drive-held");
+        let spoke = Spoke::new();
+        // The spoke's own lease code asks core who is logged in
+        // (`address::logged_in_user`), which asks the installed add-on.
+        let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(Spoke::new()));
         let (running, _tokens, _home) = two_spokes(&env, &store, "jesper");
         let mut w = store.worklist("run").unwrap();
         w.for_user = Some("ed".into());
@@ -411,19 +413,25 @@ mod tests {
         }
         store.set_claim("wsp-2", serde_json::json!({ "hub_token": 5, "expires": wsp_engine::util::iso_at(wsp_engine::util::epoch_secs() + 3600) }));
         let before = std::fs::read_to_string(store.worklist_path("run")).unwrap();
-        step(&store, &w, &Blind);
-        assert_eq!(spawned(), vec![("wsp-2 · verifying".into(), "claude".into())], "only the member held here");
+        assert_eq!(spoke.drive(&store, &w), Drives::Elsewhere("ed".into()), "not this spoke's to drive");
+        assert!(spoke.leased(&store.claims()["wsp-2"]), "only the member held here");
+        assert!(store.claims().get("wsp-3").is_none_or(|c| !spoke.leased(c)));
+        assert_eq!(spoke.running_elsewhere(&store, "wsp-2"), None, "the member is this spoke's to verify");
+        assert!(hub_lease::Book::read(&store).drives.is_empty());
         assert_eq!(std::fs::read_to_string(store.worklist_path("run")).unwrap(), before, "the list untouched");
         running.stop();
     }
 
-    /// Done-when 2 (wsp-467): a spoke without the drive lease never advances
-    /// the list — no spawn, no list change — whether another user's spoke holds
-    /// the lease or the list is allocated to another user.
+    /// The spoke's half of Done-when 2 (wsp-467): with the drive lease held by
+    /// Ed's spoke, Jesper's gate says Ed drives it, records that, and takes no
+    /// lease; allocated to Ed, it says so without asking the hub.
     #[test]
     fn drive_a_spoke_without_the_drive_lease_never_advances_the_list() {
-        let (env, store) = scratch("drive-none");
-        let _addon = spoke();
+        let (env, store) = crate::testkit::isolated_store("spoke-drive-none");
+        let spoke = Spoke::new();
+        // The spoke's own lease code asks core who is logged in
+        // (`address::logged_in_user`), which asks the installed add-on.
+        let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(Spoke::new()));
         let (running, tokens, _home) = two_spokes(&env, &store, "jesper");
         let mut ed = hub_lease::tests::dial(&running, &tokens, "ed");
         hub_lease::take(&mut ed, "shared:team", &hub_lease::drive_row("run")).unwrap();
@@ -431,25 +439,24 @@ mod tests {
         let file = || std::fs::read_to_string(store.worklist_path("run")).unwrap();
         let before = file();
 
-        step(&store, &w, &Blind);
-        assert!(spawned().is_empty(), "nothing spawned");
+        assert_eq!(spoke.drive(&store, &w), Drives::Elsewhere("ed".into()));
         assert_eq!(file(), before, "nothing written to the list");
         assert!(["wsp-1", "wsp-2", "wsp-3"].iter().all(|r| store.find_task(r).unwrap().status() == Status::Todo));
         assert_eq!(hub_lease::driven_by(&store, &w).as_deref(), Some("ed"));
+        assert_eq!(spoke.driven_by(&store, &w).as_deref(), Some("ed"));
         assert!(hub_lease::Book::read(&store).drives.is_empty());
 
-        // Allocated to ed: Jesper's spoke does not even ask the hub.
+        // Allocated to ed: Jesper's spoke does not even ask the hub, which is
+        // stopped here to show it.
         let mut w = store.worklist("run").unwrap();
         w.for_user = Some("ed".into());
         store.save_worklist(&w).unwrap();
         let before = file();
-        assert_eq!(hub_lease::drive(&store, &w), hub_lease::Drives::Elsewhere("ed".into()));
-        step(&store, &w, &Blind);
-        assert!(spawned().is_empty());
-        assert_eq!(file(), before);
         running.stop();
+        assert_eq!(hub_lease::drive(&store, &w), hub_lease::Drives::Elsewhere("ed".into()));
+        assert_eq!(spoke.drive(&store, &w), Drives::Elsewhere("ed".into()));
+        assert_eq!(file(), before);
     }
-
     }
 
     /// The spoke's half of `verification`'s side-chain test (wsp-469): a row
