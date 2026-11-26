@@ -844,9 +844,13 @@ suite lists **4164** tests (4102, then 4147); nextest ran 4152 and skipped 12, a
 - **Short builds read slower today.** In steps 1a and 3a, wall minus cargo's own `Finished` time is about 0.55 s,
   against 0.2 to 0.25 s in wsp-442's logs. rustc itself was not slower on the engine (3.09 against 3.29 s). The cause of the
   extra was not established; the load was also higher (about 3.3 against 0.6 to 2.2). It covers much of 2a and 2b's rise.
-- **The doctests fail at the trunk.** `cargo test --doc --workspace` after each suite run exited 101: the indented log
-  excerpt on `watch_levels::Signal::to` (`crates/engine/src/watch_levels.rs`) is compiled as Rust. It stops there, so
-  its 1.3 s is not the doctests' full time and is left out of step 5. Filed as a follow-up.
+- **The doctests fail only under an explicit `--doc`.** The doc step in `loop/run.sh`, `cargo test --doc --workspace`
+  after each suite run, exited 101: the indented log excerpt on `watch_levels::Signal::to`
+  (`crates/engine/src/watch_levels.rs`) is compiled as Rust. `crates/engine` and `crates/seats` set `doctest = false`
+  (wsp-440), and an explicit `--doc` runs their doc blocks anyway. A plain `cargo test` and the check steps do not run
+  them ("Cut A, measured"), which is why nothing caught it. Step 5's time is nextest's alone and leaves out every
+  doctest, including the `cargo test --doc` that a check step runs after it for the libraries with doctests on. The
+  1.3 s of the failed run is not that cost: it ran other blocks and stopped at the failure. Filed as wsp-554.
 - **Thermal.** The package throttle count rose by 4,725 in the cold build, about 1,000 in each core check, 480 to 550 in
   each seats check and about 4,000 in each full suite.
 
