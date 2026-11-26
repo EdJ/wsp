@@ -383,6 +383,7 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
         root.join("crates/wire/src"),
         root.join("crates/trees/src"),
         root.join("crates/engine/src"),
+        root.join("crates/spoke/src"),
     ]);
 
     let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
@@ -620,6 +621,22 @@ fn the_engine_links_neither_the_sqlite_crate_nor_a_binary() {
     assert!(bad.is_empty(), "wsp-engine's normal dependencies must reach none of {NEVER:?}:\n{bad}");
 }
 
+/// Core wsp does not know its shared-work add-on: `wsp-engine` reaches `wsp-spoke` through no path
+/// dependency, normal or dev, at any depth. The spoke plugs in through `addon::SharedWork`, which the
+/// root installs; a dependency the other way round would put the hub back into core.
+#[test]
+fn the_engine_does_not_reach_the_spoke() {
+    let reached = reached_from(&root().join("crates/engine"), "wsp-engine");
+    assert!(
+        !reached.contains_key("wsp-spoke"),
+        "wsp-engine must not depend on wsp-spoke, even in tests: {}",
+        reached["wsp-spoke"].join(" -> ")
+    );
+    let spoke = fs::read_to_string(root().join("crates/spoke/Cargo.toml")).unwrap();
+    assert!(spoke.lines().any(|l| l.trim() == "name = \"wsp-spoke\""), "crates/spoke is no longer the package wsp-spoke");
+    assert!(deps_named(&spoke).contains("wsp-engine"), "wsp-spoke is the add-on of wsp-engine");
+}
+
 /// `wsp-manager`, the agent manager, depends on `wsp-host-api`, `wsp-base` and
 /// `wsp-host`, and on nothing of the store or the wire (2.3 R1, d1 Q3; wsp-021).
 #[test]
@@ -746,18 +763,20 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
 /// One exception, for tests alone: `wsp-engine` (wsp-440) names it as a dev-dependency, because
 /// the engine's orders, fold and mirror tests open a real `state.db` as the daemon does; its
 /// normal dependencies never reach it (`the_engine_links_neither_the_sqlite_crate_nor_a_binary`).
+/// The same exception holds for `wsp-spoke`, whose sync tests serve the orders a hub's peers write.
 #[test]
 fn no_manifest_but_the_roots_names_the_sqlite_crate() {
     let binaries = [root().join("Cargo.toml"), root().join("crates/hub/Cargo.toml")];
-    let engine = root().join("crates/engine/Cargo.toml");
+    let tests_only = [root().join("crates/engine/Cargo.toml"), root().join("crates/spoke/Cargo.toml")];
     for m in manifests() {
         if binaries.contains(&m) {
             continue;
         }
-        if m == engine {
+        if tests_only.contains(&m) {
             assert!(
                 !path_deps(&m, false).contains_key("wsp-store-sqlite"),
-                "wsp-engine names wsp-store-sqlite as a dependency; only its tests may (docs/state-core.md section 6)"
+                "{} names wsp-store-sqlite as a dependency; only its tests may (docs/state-core.md section 6)",
+                m.display()
             );
             continue;
         }

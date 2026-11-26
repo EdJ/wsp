@@ -17,7 +17,7 @@
 //! ([`start`]); without the file nothing starts and nothing is written. Each
 //! turn (every [`TURN`], [`TURN_ENV`] to change it, and at once when a task
 //! file changes) it takes every task of a shared workspace
-//! ([`crate::mirror::by_shared_workspace`]), makes a record of each one whose
+//! ([`wsp_engine::mirror::by_shared_workspace`]), makes a record of each one whose
 //! file moved since its synced head ([`push_record`], the mirror's projection),
 //! encodes it, keeps it in `$WSP_STATE/hub/objects/`, and syncs the workspace
 //! through [`wsp_client::Client::sync`] from the synced heads ([`Heads`]). A
@@ -54,7 +54,7 @@
 //! orders machine as a tell to the seat its address names here, from the
 //! sending seat named with its user (or `person:<user>`), and acknowledged, so
 //! the hub never hands it out again. An `order.queued` for this user on the
-//! stream is a turn at once. [`crate::cmd_message`] keeps what was received
+//! stream is a turn at once. [`wsp_engine::cmd_message`] keeps what was received
 //! (`$WSP_STATE/hub/inbox.json`), so a message taken again after a lost ack
 //! is acknowledged and not told twice.
 
@@ -67,11 +67,11 @@ use wsp_client::{Client, Credential, Feed, Item, ObjectSource, SyncError, SyncRe
 use wsp_objects::{Object, ObjectId, Refs, WorkspaceId};
 use wsp_store_contract::{At, Entity, EventId, EventKind, ListId, Principal, RowId, Subject, Token, UserName};
 
-use crate::door::{user_of, Applied, Door, Heads, Refusal};
+use wsp_engine::door::{user_of, Applied, Door, Heads, Refusal};
 use crate::hub_cache::{self, Cache, Stream};
 use crate::hub_journal::{self, Entry, Journal, Leased, Side, Sides};
 use crate::reconcile::{Lease, Merging, NoLease, Objects};
-use crate::store::Store;
+use wsp_engine::store::Store;
 
 /// The record a push sends for `subject`'s row: its file whole, with the
 /// synced head as its parent (`None` for a row never synced). `None` where the
@@ -85,7 +85,7 @@ pub fn push_record(store: &Store, subject: &Subject, workspace: WorkspaceId, by:
         return None;
     }
     let text = std::fs::read_to_string(store.task_path(&id.0)).ok()?;
-    let row = crate::mirror::shared_row(&t, &text)?;
+    let row = wsp_engine::mirror::shared_row(&t, &text)?;
     let parent = Heads::read(store).head(subject).copied();
     Some(Object::Record { workspace, subject: subject.clone(), entity: Entity::Row(row), parent, by, at })
 }
@@ -100,8 +100,8 @@ pub fn push_list_record(store: &Store, subject: &Subject, workspace: WorkspaceId
         return None;
     }
     let lists = [w];
-    let texts = crate::mirror::list_texts_of(store, &lists);
-    let entity = crate::mirror::lists(&lists, &store.tasks(), &texts, &BTreeMap::new())
+    let texts = wsp_engine::mirror::list_texts_of(store, &lists);
+    let entity = wsp_engine::mirror::lists(&lists, &store.tasks(), &texts, &BTreeMap::new())
         .into_iter()
         .find(|e| matches!(e, Entity::List(l) if l.id == *id))?;
     let parent = Heads::read(store).head(subject).copied();
@@ -215,7 +215,7 @@ pub fn dial(home: &std::path::Path) -> Result<Client, String> {
     Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| e.to_string())
 }
 
-/// [`crate::cmd_message::off_machine`]'s message sent to the hub the login in
+/// [`wsp_engine::cmd_message::off_machine`]'s message sent to the hub the login in
 /// `home` names: `None` for a tell delivered here (nothing is dialled), else
 /// the hub's id for it, the user it was routed to and the address, or why it
 /// did not take it.
@@ -223,14 +223,14 @@ pub fn dial(home: &std::path::Path) -> Result<Client, String> {
 pub fn hub_tell(
     store: &Store,
     home: &std::path::Path,
-    book: &crate::address::Book,
+    book: &wsp_engine::address::Book,
     needle: &str,
     text: &str,
     re: Option<&str>,
     from: &str,
     seat: Option<String>,
 ) -> Option<Result<(String, String, String), String>> {
-    let msg = crate::cmd_message::off_machine(store, book, needle, text, re, from, seat)?;
+    let msg = wsp_engine::cmd_message::off_machine(store, book, needle, text, re, from, seat)?;
     let to = msg.to.clone();
     let sent = dial(home).and_then(|mut c| c.msg_send(msg).map_err(|e| e.to_string()));
     Some(sent.map(|(id, user)| (id, user, to)))
@@ -240,7 +240,7 @@ pub fn hub_tell(
 /// dressed `text`, from `from`, under the idempotency `key`; the order's id, or
 /// why not. Core's `cmd_message::receive` takes it, so it is the add-on
 /// interface's type.
-pub use crate::addon::Hand;
+pub use wsp_engine::addon::Hand;
 
 /// What keeps a tell for a seat's next idle under `WSP_ORDERS=files`: the
 /// seats layer's held-tell spool, which this layer cannot reach, so the daemon
@@ -259,11 +259,11 @@ pub fn install_spool(spool: Spool) {
 /// `WSP_ORDERS=store`; else the seat's held-tell spool, typed at its next
 /// idle. With no spool lent, the message stays queued on the hub.
 pub fn hand_to_orders(store: &Store) -> impl Fn(&wsp_store_contract::SeatId, &str, &Principal, &str) -> Result<String, String> + '_ {
-    move |seat, text, from, key| match crate::orders::mode() {
-        crate::orders::Mode::Store => {
-            crate::orders::send_keyed(store, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+    move |seat, text, from, key| match wsp_engine::orders::mode() {
+        wsp_engine::orders::Mode::Store => {
+            wsp_engine::orders::send_keyed(store, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
         }
-        crate::orders::Mode::Files => match SPOOL.get() {
+        wsp_engine::orders::Mode::Files => match SPOOL.get() {
             Some(spool) => {
                 spool(store, &seat.0, text);
                 Ok(format!("held for {}", seat.0))
@@ -407,7 +407,7 @@ pub fn health(
         Ok(None) => notes.push("hub certificate: none (the hub is dialled in the clear)".into()),
         Ok(Some(at)) => {
             let days = (at - now).div_euclid(86_400);
-            let line = format!("hub certificate expires {} (in {days} days)", crate::util::iso_at(at));
+            let line = format!("hub certificate expires {} (in {days} days)", wsp_engine::util::iso_at(at));
             if at - now < 7 * 86_400 {
                 warnings.push(line);
             } else {
@@ -423,12 +423,12 @@ pub fn health(
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     match status["last_ok"].as_i64() {
-        Some(at) => notes.push(format!("hub last synced {} ({} ago)", crate::util::iso_at(at), crate::util::duration_human((now - at).max(0)))),
+        Some(at) => notes.push(format!("hub last synced {} ({} ago)", wsp_engine::util::iso_at(at), wsp_engine::util::duration_human((now - at).max(0)))),
         None => notes.push("hub never synced".into()),
     }
     if let Some(at) = status["last_failure"]["at"].as_i64() {
         let why = status["last_failure"]["why"].as_str().unwrap_or("no reason given");
-        let line = format!("hub last failure {}: {why}", crate::util::iso_at(at));
+        let line = format!("hub last failure {}: {why}", wsp_engine::util::iso_at(at));
         if status["last_ok"].as_i64().is_none_or(|ok| ok < at) {
             warnings.push(line);
         } else {
@@ -447,7 +447,7 @@ pub fn health(
     held.sort_by_key(|(_, at)| *at);
     match held.first() {
         None => notes.push("hub leases held: none".into()),
-        Some((row, at)) => notes.push(format!("hub leases held: {}, soonest {row} expires {}", held.len(), crate::util::iso_at(*at))),
+        Some((row, at)) => notes.push(format!("hub leases held: {}, soonest {row} expires {}", held.len(), wsp_engine::util::iso_at(*at))),
     }
     for (row, at) in &held {
         if at - now >= 86_400 {
@@ -457,14 +457,14 @@ pub fn health(
         if seat.is_empty() || !alive(seat) {
             warnings.push(format!(
                 "hub lease on {row} expires {} and its seat is not alive: nothing renews it",
-                crate::util::iso_at(*at)
+                wsp_engine::util::iso_at(*at)
             ));
         }
     }
     let drives = crate::hub_lease::Book::read(store).drives;
     match drives.iter().min_by_key(|(_, d)| d.expires) {
         None => notes.push("hub drive leases held: none".into()),
-        Some((list, d)) => notes.push(format!("hub drive leases held: {}, soonest {list} expires {}", drives.len(), crate::util::iso_at(d.expires))),
+        Some((list, d)) => notes.push(format!("hub drive leases held: {}, soonest {list} expires {}", drives.len(), wsp_engine::util::iso_at(d.expires))),
     }
 }
 
@@ -549,7 +549,7 @@ impl Worker {
             if !self.live(store) {
                 if self.link != Link::Off {
                     self.stand_down(store);
-                    crate::store::log_line(store, "hub-sync: the hub connection is off here; the worker takes no turn until `wsp hub enable`");
+                    wsp_engine::store::log_line(store, "hub-sync: the hub connection is off here; the worker takes no turn until `wsp hub enable`");
                 }
                 std::thread::sleep(POLL);
                 due = Instant::now();
@@ -599,9 +599,9 @@ impl Worker {
         match &out {
             Ok(_) => {
                 match &self.link {
-                    Link::Down(_) => crate::store::log_line(store, &format!("hub-sync: the hub at {} answers again", self.url())),
+                    Link::Down(_) => wsp_engine::store::log_line(store, &format!("hub-sync: the hub at {} answers again", self.url())),
                     Link::Unknown if self.client.is_some() => {
-                        crate::store::log_line(store, &format!("hub-sync: syncing with the hub at {}", self.url()))
+                        wsp_engine::store::log_line(store, &format!("hub-sync: syncing with the hub at {}", self.url()))
                     }
                     _ => {}
                 }
@@ -619,7 +619,7 @@ impl Worker {
             Err(why) => {
                 self.client = None;
                 if !matches!(self.link, Link::Down(_)) {
-                    crate::store::log_line(
+                    wsp_engine::store::log_line(
                         store,
                         &format!(
                             "hub-sync: the hub at {} is unreachable ({why}); trying again from {}s to {}s apart",
@@ -645,7 +645,7 @@ impl Worker {
     /// leases of the lists this spoke drives (wsp-467).
     fn renew_leases(&mut self, store: &Store) {
         let Some(client) = self.client.as_mut() else { return };
-        let now = crate::util::epoch_secs();
+        let now = wsp_engine::util::epoch_secs();
         crate::hub_lease::renew_all(store, client, now);
         // And the drive leases of the shared lists this spoke drives (wsp-467).
         crate::hub_lease::renew_drives(store, client, now);
@@ -658,7 +658,7 @@ impl Worker {
 
     fn say_once(&mut self, store: &Store, line: String) {
         if self.said.insert(line.clone()) {
-            crate::store::log_line(store, &line);
+            wsp_engine::store::log_line(store, &line);
         }
     }
 
@@ -669,7 +669,7 @@ impl Worker {
         // them: what `wsp doctor` says of a hub that answered an hour ago.
         let before: serde_json::Value =
             std::fs::read_to_string(dir.join(STATUS_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let now = crate::util::epoch_secs();
+        let now = wsp_engine::util::epoch_secs();
         let last_ok = if matches!(self.link, Link::Up) { Some(serde_json::json!(now)) } else { before.get("last_ok").cloned() };
         let last_failure = match &self.link {
             Link::Down(w) => Some(serde_json::json!({ "at": now, "why": w })),
@@ -703,7 +703,7 @@ impl Worker {
     }
 
     /// The messages the hub queued for this user, each handed to its seat
-    /// here through `hand` ([`crate::cmd_message::receive`]) and then
+    /// here through `hand` ([`wsp_engine::cmd_message::receive`]) and then
     /// acknowledged; how many were told. One whose seat is not here now is
     /// left queued, said once, and tried again next turn; one told before (an
     /// ack that was lost) is acknowledged and not told again.
@@ -712,7 +712,7 @@ impl Worker {
         let mut done = Vec::new();
         let mut told = 0;
         for m in &mail {
-            match crate::cmd_message::receive(store, m, hand) {
+            match wsp_engine::cmd_message::receive(store, m, hand) {
                 Ok(fresh) => {
                     told += usize::from(fresh);
                     done.push(m.id.clone());
@@ -760,7 +760,7 @@ impl Worker {
         stream.position = Some(from);
         let _ = stream.write(store);
         if gap {
-            crate::store::log_line(store, &format!("hub-sync: the stream resumes at {from}, a heads diff in place of the events missed"));
+            wsp_engine::store::log_line(store, &format!("hub-sync: the stream resumes at {from}, a heads diff in place of the events missed"));
         }
         let feed = self.client()?.subscribe(Some(EventId(from)));
         self.feed = Some(feed);
@@ -829,8 +829,8 @@ impl Worker {
     /// workspace it refuses is said in the log once and the rest go on.
     fn sync_all(&mut self, store: &Store) -> Result<Turned, String> {
         self.open_feed(store)?;
-        let mut workspaces: BTreeMap<String, Vec<crate::model::Task>> =
-            crate::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
+        let mut workspaces: BTreeMap<String, Vec<wsp_engine::model::Task>> =
+            wsp_engine::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
         for w in Stream::read(store).workspaces {
             workspaces.entry(w).or_default();
         }
@@ -863,7 +863,7 @@ impl Worker {
         &mut self,
         store: &Store,
         ws: &str,
-        tasks: &[crate::model::Task],
+        tasks: &[wsp_engine::model::Task],
         by: &Principal,
         turned: &mut Turned,
     ) -> Result<(), String> {
@@ -919,7 +919,7 @@ impl Worker {
         &mut self,
         store: &Store,
         ws: &str,
-        tasks: &[crate::model::Task],
+        tasks: &[wsp_engine::model::Task],
         by: &Principal,
         objects: &ObjectDir,
         heads: &Heads,
@@ -942,7 +942,7 @@ impl Worker {
             subjects.push((Subject::Row(RowId(t.id.clone())), file_digest(store, &t.id)));
         }
         for w in store.worklists().iter().filter(|w| w.workspace.to_string() == ws) {
-            subjects.push((Subject::List(ListId(w.id.clone())), crate::door::list_digest(store, &w.id)));
+            subjects.push((Subject::List(ListId(w.id.clone())), wsp_engine::door::list_digest(store, &w.id)));
         }
         for (subject, digest) in subjects {
             included.insert(subject.clone());
@@ -1016,8 +1016,8 @@ impl Worker {
         let Some(by) = self.by.clone().or_else(|| login_principal(&self.home)) else { return };
         let objects = ObjectDir::of(store);
         let heads = Heads::read(store);
-        let mut workspaces: BTreeMap<String, Vec<crate::model::Task>> =
-            crate::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
+        let mut workspaces: BTreeMap<String, Vec<wsp_engine::model::Task>> =
+            wsp_engine::mirror::by_shared_workspace(store.tasks()).into_iter().map(|(w, t)| (w.to_string(), t)).collect();
         for w in store.worklists().iter().filter(|w| !w.workspace.is_private()) {
             workspaces.entry(w.workspace.to_string()).or_default();
         }
@@ -1088,7 +1088,7 @@ impl Worker {
                         }
                         _ => self.release_after.push((row.clone(), taken)),
                     }
-                    crate::store::log_line(
+                    wsp_engine::store::log_line(
                         store,
                         &format!("hub-sync: {}'s lease ran out while the hub was away; taken again (token {}) and pushed", row.0, taken.0),
                     );
@@ -1136,7 +1136,7 @@ impl Worker {
                 old: me.clone(),
                 mine: true,
                 token: Some(token),
-                at: crate::util::iso_at(crate::util::epoch_secs()),
+                at: wsp_engine::util::iso_at(wsp_engine::util::epoch_secs()),
             };
             match self.move_notice(store, &wid, hub, &side, by) {
                 Ok(Some(id)) => {
@@ -1158,8 +1158,8 @@ impl Worker {
             }
             Leased::forget(store, &row.0);
             let words = hub_journal::said(&side);
-            crate::store::log_line(store, &format!("hub-sync: side chain: {words}"));
-            crate::verification::tell_governor(store, &row.0, &words);
+            wsp_engine::store::log_line(store, &format!("hub-sync: side chain: {words}"));
+            wsp_engine::verification::tell_governor(store, &row.0, &words);
             sides.rows.insert(row.0.clone(), side);
             turned.sided += 1;
         }
@@ -1220,8 +1220,8 @@ impl Worker {
             return;
         }
         let words = hub_journal::said(&side);
-        crate::store::log_line(store, &format!("hub-sync: side chain: {words}"));
-        crate::verification::tell_governor(store, row, &words);
+        wsp_engine::store::log_line(store, &format!("hub-sync: side chain: {words}"));
+        wsp_engine::verification::tell_governor(store, row, &words);
         sides.rows.insert(row.to_string(), side);
     }
 
@@ -1273,7 +1273,7 @@ impl Worker {
         let ws = head.workspace.clone();
         self.forced.insert(Subject::Row(RowId(id.to_string())));
         let by = self.client()?.by().clone();
-        let tasks: Vec<crate::model::Task> = store.tasks().into_iter().filter(|t| t.workspace.to_string() == ws).collect();
+        let tasks: Vec<wsp_engine::model::Task> = store.tasks().into_iter().filter(|t| t.workspace.to_string() == ws).collect();
         self.sync_workspace(store, &ws, &tasks, &by, &mut Turned::default())?;
         match hub_cache::is_head(store, id) || store.task(id).is_none() {
             true => Err(format!("{id} was not fetched; the hub's answer is in `cycle.log`")),
@@ -1432,7 +1432,7 @@ mod tests {
     /// row as the row's id; it makes no twin of it.
     #[test]
     fn a_restarted_worker_reuses_the_journaled_record_of_an_unchanged_row() {
-        let env = crate::util::isolated("hub-sync-restart");
+        let env = wsp_engine::util::isolated("hub-sync-restart");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let dir = std::env::temp_dir().join(format!("wsp-484-restart-{}", std::process::id()));
@@ -1466,7 +1466,7 @@ mod tests {
         };
 
         // A shared row, and the hub away: a port nobody listens on.
-        let mut t = crate::model::Task::new("a shared row", "wsp-484-r1");
+        let mut t = wsp_engine::model::Task::new("a shared row", "wsp-484-r1");
         t.project = Some("wsp".into());
         t.workspace = "shared:mp".parse().unwrap();
         store.save_task(&t).unwrap();
@@ -1566,7 +1566,7 @@ mod tests {
     fn spoke_with_seat(dir: &std::path::Path, row: &str, pane: &str) -> Store {
         let store = Store::at(dir.join("wsp"), dir.join("state"));
         store.ensure_dirs().unwrap();
-        let mut t = crate::model::Task::new(&format!("row {row}"), row);
+        let mut t = wsp_engine::model::Task::new(&format!("row {row}"), row);
         t.project = Some("wsp".into());
         t.workspace = "shared:mp".parse().unwrap();
         store.save_task(&t).unwrap();
@@ -1587,9 +1587,9 @@ mod tests {
     /// back through the hub and Ed's worker tells it to the seat on e-9.
     #[test]
     fn a_tell_to_a_row_another_users_spoke_holds_is_told_there_and_its_reply_comes_back() {
-        let env = crate::util::isolated("hub-msg-two-spokes");
+        let env = wsp_engine::util::isolated("hub-msg-two-spokes");
         // Core asks the shared-work add-on: the spoke, on this thread.
-        let _addon = crate::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
+        let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
         let dir = env.home().parent().unwrap().join("two-spokes");
         let _ = std::fs::remove_dir_all(&dir);
         let (running, tokens) = message_hub(&dir);
@@ -1600,26 +1600,26 @@ mod tests {
         let jesper_home = dir.join("jesper/home");
         log_in(&jesper_home, addr, &tokens["jesper"], "jesper");
         dial(&jesper_home).unwrap().lease_take(&WorkspaceId("shared:mp".into()), &RowId("j-1".into())).unwrap();
-        let jesper_db = crate::orders::tests::db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
-        crate::orders::tests::seat(&jesper_db, "cpd-j1", wsp_store_contract::SeatState::Idle);
+        let jesper_db = crate::testkit::orders_db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
+        crate::testkit::orders_seat(&jesper_db, "cpd-j1", wsp_store_contract::SeatState::Idle);
 
         // Ed's spoke: the seat cpd-e1 on e-9; the hub said j-1 is another user's.
         let ed = spoke_with_seat(&dir.join("ed"), "e-9", "cpd-e1");
         let ed_home = dir.join("ed/home");
         log_in(&ed_home, addr, &tokens["ed"], "ed");
         crate::hub_lease::Book::edit(&ed, |b| b.elsewhere.insert("j-1".into(), "jesper".into()));
-        let ed_db = crate::orders::tests::db(&dir.join("ed/orders"), wsp_server::Mode::Owned);
-        crate::orders::tests::seat(&ed_db, "cpd-e1", wsp_store_contract::SeatState::Idle);
+        let ed_db = crate::testkit::orders_db(&dir.join("ed/orders"), wsp_server::Mode::Owned);
+        crate::testkit::orders_seat(&ed_db, "cpd-e1", wsp_store_contract::SeatState::Idle);
 
         // Ed's seat tells seat:j-1.
-        let book = crate::address::Book::read(&ed);
+        let book = wsp_engine::address::Book::read(&ed);
         let sent = hub_tell(&ed, &ed_home, &book, "seat:j-1", "is j-1 landed?", None, "seat:e-9", Some("cpd-e1".into()));
         let (id, user, to) = sent.expect("j-1 is another user's: through the hub").expect("the hub takes it");
         assert_eq!((user.as_str(), to.as_str()), ("jesper", "seat:j-1"));
 
         // Jesper's worker takes it: a tell to the seat on j-1, from Ed's seat named with Ed.
         let hand_j = |seat: &wsp_store_contract::SeatId, text: &str, from: &Principal, key: &str| {
-            crate::orders::send_keyed_in(&jesper_db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+            wsp_engine::orders::send_keyed_in(&jesper_db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
         };
         let mut jesper_worker = Worker::new(jesper_home.clone());
         assert_eq!(jesper_worker.take_messages(&jesper, &hand_j).unwrap(), 1);
@@ -1632,14 +1632,14 @@ mod tests {
         assert_eq!(orders_of(&jesper_db, "cpd-j1").len(), 1);
 
         // The seat there replies as its footer says: seat:e-9 is nothing on Jesper's spoke; the --re routes it.
-        let book = crate::address::Book::read(&jesper);
-        assert!(crate::address::resolve(&crate::address::parse("seat:e-9").unwrap(), &book).is_err(), "no e-9 here");
+        let book = wsp_engine::address::Book::read(&jesper);
+        assert!(wsp_engine::address::resolve(&wsp_engine::address::parse("seat:e-9").unwrap(), &book).is_err(), "no e-9 here");
         let back = hub_tell(&jesper, &jesper_home, &book, "seat:e-9", "landed at abc123", Some(&id), "seat:j-1", Some("cpd-j1".into()));
         let (_, user, _) = back.expect("a reply to a hub message: through the hub").expect("the hub takes it");
         assert_eq!(user, "ed");
 
         let hand_e = |seat: &wsp_store_contract::SeatId, text: &str, from: &Principal, key: &str| {
-            crate::orders::send_keyed_in(&ed_db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+            wsp_engine::orders::send_keyed_in(&ed_db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
         };
         assert_eq!(Worker::new(ed_home.clone()).take_messages(&ed, &hand_e).unwrap(), 1);
         let replies = orders_of(&ed_db, "cpd-e1");
@@ -1656,7 +1656,7 @@ mod tests {
     /// nothing.
     #[test]
     fn a_message_to_an_offline_spoke_is_told_on_reconnect_exactly_once() {
-        let env = crate::util::isolated("hub-msg-offline");
+        let env = wsp_engine::util::isolated("hub-msg-offline");
         let dir = env.home().parent().unwrap().join("offline");
         let _ = std::fs::remove_dir_all(&dir);
         let (running, tokens) = message_hub(&dir);
@@ -1666,10 +1666,10 @@ mod tests {
         // Jesper's spoke is away: his login points at a port nobody listens on.
         let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         log_in(&jesper_home, gone, &tokens["jesper"], "jesper");
-        let db = crate::orders::tests::db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
-        crate::orders::tests::seat(&db, "cpd-j1", wsp_store_contract::SeatState::Idle);
+        let db = crate::testkit::orders_db(&dir.join("jesper/orders"), wsp_server::Mode::Owned);
+        crate::testkit::orders_seat(&db, "cpd-j1", wsp_store_contract::SeatState::Idle);
         let hand = |seat: &wsp_store_contract::SeatId, text: &str, from: &Principal, key: &str| {
-            crate::orders::send_keyed_in(&db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
+            wsp_engine::orders::send_keyed_in(&db, seat, text, from, false, key).map(|o| o.0).map_err(|e| e.to_string())
         };
         let mut worker = Worker::new(jesper_home.clone());
         assert!(worker.take_messages(&jesper, &hand).is_err(), "the hub is out of reach");
@@ -1679,18 +1679,18 @@ mod tests {
         log_in(&ed_home, addr, &tokens["ed"], "ed");
         let ed = Store::at(dir.join("ed/wsp"), dir.join("ed/state"));
         ed.ensure_dirs().unwrap();
-        let book = crate::address::Book { login: Some("ed".into()), ..crate::address::Book::default() };
+        let book = wsp_engine::address::Book { login: Some("ed".into()), ..wsp_engine::address::Book::default() };
         let sent = hub_tell(&ed, &ed_home, &book, "primary:jesper", "call me", None, "person:ed", None);
         let (id, ..) = sent.expect("another user's primary").expect("queued while Jesper is away");
 
         // Jesper's primary is the seat cpd-j1 here; Jesper reconnects.
-        crate::cmd_message::tests_govern(&jesper, "primary", "cpd-j1");
+        wsp_engine::cmd_message::tests_govern(&jesper, "primary", "cpd-j1");
         log_in(&jesper_home, addr, &tokens["jesper"], "jesper");
         let mut worker = Worker::new(jesper_home.clone());
         // The first take tells it, and its ack is lost: the hub hands it out again.
         let mail = dial(&jesper_home).unwrap().msg_take().unwrap();
         assert_eq!(mail.len(), 1);
-        assert!(crate::cmd_message::receive(&jesper, &mail[0], &hand).unwrap(), "told on reconnect");
+        assert!(wsp_engine::cmd_message::receive(&jesper, &mail[0], &hand).unwrap(), "told on reconnect");
         assert_eq!(worker.take_messages(&jesper, &hand).unwrap(), 0, "taken again after the lost ack, not told again");
         let told = orders_of(&db, "cpd-j1");
         assert_eq!(told.len(), 1, "exactly once: {told:?}");
@@ -1710,11 +1710,11 @@ mod tests {
     #[test]
     fn a_local_address_never_reaches_the_hub() {
         use std::io::Read;
-        let env = crate::util::isolated("hub-msg-local");
+        let env = wsp_engine::util::isolated("hub-msg-local");
         let dir = env.home().parent().unwrap().join("local");
         let _ = std::fs::remove_dir_all(&dir);
         let store = spoke_with_seat(&dir.join("ed"), "e-9", "cpd-e1");
-        crate::cmd_message::tests_govern(&store, "primary", "cpd-p");
+        wsp_engine::cmd_message::tests_govern(&store, "primary", "cpd-p");
         let home = dir.join("ed/home");
         // The "hub": a listener that keeps every byte sent to it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1732,7 +1732,7 @@ mod tests {
                 w.1.extend_from_slice(&buf[..n]);
             }
         });
-        let mut book = crate::address::Book::read(&store);
+        let mut book = wsp_engine::address::Book::read(&store);
         book.login = Some("ed".into());
         book.remote_rows.insert("j-1".into());
         for local in ["seat:e-9", "primary", "primary:ed", "seat:nope", "governor:nobody", "cpd-e1"] {
@@ -1764,7 +1764,7 @@ mod tests {
     /// A wsp with no login says the one line and nothing about a hub.
     #[test]
     fn doctor_says_one_line_for_a_standalone_wsp() {
-        let env = crate::util::isolated("hub-doctor-standalone");
+        let env = wsp_engine::util::isolated("hub-doctor-standalone");
         let dir = env.home().parent().unwrap().join("doc-standalone");
         let _ = std::fs::remove_dir_all(&dir);
         let store = spoke_with_seat(&dir.join("s"), "s-1", "cpd-s1");
@@ -1779,13 +1779,13 @@ mod tests {
     /// or a far-off expiry is not).
     #[test]
     fn doctor_names_the_hub_the_last_sync_the_journal_and_a_lease_nothing_renews() {
-        let env = crate::util::isolated("hub-doctor-in");
+        let env = wsp_engine::util::isolated("hub-doctor-in");
         let dir = env.home().parent().unwrap().join("doc-in");
         let _ = std::fs::remove_dir_all(&dir);
         let store = spoke_with_seat(&dir.join("s"), "s-1", "cpd-s1");
         let home = dir.join("s/home");
         log_in(&home, "127.0.0.1:9".parse().unwrap(), "secret", "ann");
-        let now = crate::util::epoch_secs();
+        let now = wsp_engine::util::epoch_secs();
         std::fs::create_dir_all(store.state.join("hub")).unwrap();
         std::fs::write(
             store.state.join("hub").join(STATUS_FILE),
@@ -1799,7 +1799,7 @@ mod tests {
         .unwrap();
         store.set_claim(
             "s-1",
-            serde_json::json!({ "workspace_id": "w1", "hub_token": 7, "expires": crate::util::iso_at(now + 3600), "ttl_s": 86400 }),
+            serde_json::json!({ "workspace_id": "w1", "hub_token": 7, "expires": wsp_engine::util::iso_at(now + 3600), "ttl_s": 86400 }),
         );
 
         let (p, w, n) = said(&store, &home, now, false);

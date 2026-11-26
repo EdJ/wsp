@@ -2865,7 +2865,7 @@ pub fn tell_via_hub(store: &Store, args: &Args, needle: &str, text: &str, re: Op
 }
 
 /// A governor record putting `pane` in `scope`'s seat, for another module's test.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn tests_govern(store: &Store, scope: &str, pane: &str) {
     store.set_governor(scope, serde_json::json!({ "workspace": "w9", "pane": pane, "since": "2026-11-23" }));
 }

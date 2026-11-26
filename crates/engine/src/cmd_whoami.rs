@@ -11,16 +11,11 @@
 //! does not answer reads as no engineer, so a write is never held up by it.
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
-use wsp_client::{Client, Credential};
 use wsp_store_contract::Principal;
 
 use crate::base::args::Args;
 use crate::store::Store;
-
-/// How long a dial waits for the hub: a verb writing one line does not wait on it for long.
-const WAIT: Duration = Duration::from_secs(3);
 
 /// The engineer this process is logged in as, if its credential is an
 /// engineer token the hub knows: resolved once, through `whoami`.
@@ -57,18 +52,10 @@ pub fn sign(line: String) -> String {
     }
 }
 
-/// Who the hub says this process is, and its name: none when there is no
-/// login, no hub URL or no answer. Never reads `api.token`.
+/// Who the shared-work add-on says this process is, and its name: none when
+/// there is no add-on, no login or no answer.
 fn resolve() -> Option<(Principal, String)> {
-    // A test never dials: a developer's own login must not change what it reads.
-    if cfg!(test) {
-        return None;
-    }
-    let credential = Credential::for_hub().ok()?;
-    let url = wsp_client::hub_url().ok()?;
-    let ca = wsp_client::hub_ca().ok()?;
-    let mut client = Client::dial_hub_ca(&url, credential, ca.as_deref(), WAIT).ok()?;
-    client.whoami().ok()
+    crate::addon::get().whoami()
 }
 
 /// What `wsp whoami` prints: `person:jesper (core: engineer)`.

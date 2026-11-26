@@ -64,8 +64,8 @@ use wsp_client::{Client, Error as HubError};
 use wsp_objects::WorkspaceId as HubWorkspace;
 use wsp_store_contract::{At, EventKind, Principal, Refusal, RowId, Token};
 
-use crate::store::Store;
-use crate::util;
+use wsp_engine::store::Store;
+use wsp_engine::util;
 
 /// The claim record's field holding the hub's fencing token.
 pub const TOKEN: &str = "hub_token";
@@ -85,7 +85,7 @@ pub fn install(release: Release, alive: Alive) {
 
 /// A lease the hub granted: its token and when it runs out, in epoch seconds.
 /// The type crosses to core, so it is the add-on interface's.
-pub use crate::addon::Held;
+pub use wsp_engine::addon::Held;
 
 fn who(p: &Principal) -> String {
     match p {
@@ -305,7 +305,7 @@ pub fn push_all(store: &Store, client: &mut Client) -> Pushed {
                 }
             }
         }
-        let (kind, commit) = match (crate::repair::landed_line(&t), crate::repair::ready(&t)) {
+        let (kind, commit) = match (wsp_engine::repair::landed_line(&t), wsp_engine::repair::ready(&t)) {
             (Some(sha), _) => (EventKind::RowLanded, sha),
             (None, Some(sha)) => (EventKind::RowReviewed, sha),
             (None, None) => continue,
@@ -339,14 +339,14 @@ pub fn push_all(store: &Store, client: &mut Client) -> Pushed {
 /// The verdict of a member this spoke holds a verifier's pass for, owed to the
 /// hub and not yet sent (wsp-486): `(commit, key, word)` for the newest pass
 /// holding, or blocking a member whose earlier hold was pushed (it overrides it).
-fn held_verdict(t: &crate::model::Task, claim: &Value) -> Option<(String, String, &'static str)> {
+fn held_verdict(t: &wsp_engine::model::Task, claim: &Value) -> Option<(String, String, &'static str)> {
     let tasks = [t.clone()];
-    let commit = crate::repair::commit_of(t)?;
-    if crate::verification::verified(&tasks, &t.id) {
+    let commit = wsp_engine::repair::commit_of(t)?;
+    if wsp_engine::verification::verified(&tasks, &t.id) {
         return Some((commit.clone(), format!("verdict:{commit}"), "holds"));
     }
     let earlier = claim.get("hub_verdict").and_then(|p| p.as_str()).is_some_and(|k| k.starts_with("verdict:") && !k.ends_with(":blocks"));
-    if earlier && crate::verification::blocked(&tasks, &t.id).is_some() {
+    if earlier && wsp_engine::verification::blocked(&tasks, &t.id).is_some() {
         return Some((commit.clone(), format!("verdict:{commit}:blocks"), "blocks"));
     }
     None
@@ -362,7 +362,7 @@ pub fn verdict_held(store: &Store, row: &str) -> bool {
     let Some(verdict) = book.verdicts.get(row) else { return false };
     // A verdict is for the commit it names: a member whose current commit
     // moved on since is not verified by it.
-    match store.task(row).and_then(|t| crate::repair::commit_of(&t)) {
+    match store.task(row).and_then(|t| wsp_engine::repair::commit_of(&t)) {
         Some(now) => now.starts_with(verdict.as_str()) || verdict.starts_with(now.as_str()),
         None => true,
     }
@@ -386,12 +386,12 @@ pub fn take_verdict(store: &Store, row: &str, payload: &Value) {
 /// the row's `project`, and where the landed line says it was pushed, the
 /// `remote` and the commit on it (`remote_commit`, the same commit: the push
 /// is fast-forward only).
-fn payload_of(t: &crate::model::Task, kind: EventKind, commit: &str) -> Value {
+fn payload_of(t: &wsp_engine::model::Task, kind: EventKind, commit: &str) -> Value {
     let mut payload = json!({ "commit": commit });
     if kind != EventKind::RowLanded {
         return payload;
     }
-    if let Some(project) = crate::model::project_of(t) {
+    if let Some(project) = wsp_engine::model::project_of(t) {
         payload["project"] = json!(project);
     }
     if let Some(remote) = pushed_to(t) {
@@ -402,10 +402,10 @@ fn payload_of(t: &crate::model::Task, kind: EventKind, commit: &str) -> Value {
 }
 
 /// The remote the newest landed line of `t` names (`· pushed to <remote>`).
-fn pushed_to(t: &crate::model::Task) -> Option<String> {
+fn pushed_to(t: &wsp_engine::model::Task) -> Option<String> {
     let log = t.section("Log")?;
     let line = log.lines().filter(|l| l.contains(wsp_store::log::LANDED)).last()?;
-    let (_, after) = line.split_once(&format!(" · {} ", crate::cmd_checkout::PUSHED_TO))?;
+    let (_, after) = line.split_once(&format!(" · {} ", wsp_engine::cmd_checkout::PUSHED_TO))?;
     after.split_whitespace().next().map(str::to_string)
 }
 
@@ -423,7 +423,7 @@ pub fn fetch_landed(store: &Store, payload: &Value) -> Option<std::path::PathBuf
         if !dir.join(".git").exists() {
             continue;
         }
-        match crate::cmd_verify::git_ok(&dir, &["fetch", "--quiet", &remote]) {
+        match wsp_engine::cmd_verify::git_ok(&dir, &["fetch", "--quiet", &remote]) {
             Ok(()) => return Some(dir),
             Err(e) => wsp_store::store::log_line(
                 store,
@@ -449,7 +449,7 @@ fn drop_claim(store: &Store, row: &str, token: Token, why: &str) -> bool {
     store.set_claim(row, claim);
     match release(store, row, why) {
         Ok(()) => {
-            crate::verification::tell_governor(store, row, &format!("{row}: {why}. It is released and back to todo; the last checkpoint is in the seat's worktree."));
+            wsp_engine::verification::tell_governor(store, row, &format!("{row}: {why}. It is released and back to todo; the last checkpoint is in the seat's worktree."));
             true
         }
         Err(e) => {
@@ -562,12 +562,12 @@ impl Book {
 /// What the gate before advancing a shared list answers: `Here` (this spoke
 /// holds the drive lease, the list is private, or there is no hub),
 /// `Elsewhere(user)` or `NotYet(why)`. The add-on interface's type.
-pub use crate::addon::Drives;
+pub use wsp_engine::addon::Drives;
 
 /// The user a shared list's drive lease belongs to: its allocated user, else
 /// its publisher (the first record of it this spoke holds), else `None` (a
 /// list published here and not yet synced is this spoke's user's).
-pub fn driver_of(store: &Store, w: &crate::model::Worklist) -> Option<String> {
+pub fn driver_of(store: &Store, w: &wsp_engine::model::Worklist) -> Option<String> {
     w.for_user.clone().or_else(|| crate::hub_sync::publisher(store, &w.id))
 }
 
@@ -575,12 +575,12 @@ pub fn driver_of(store: &Store, w: &crate::model::Worklist) -> Option<String> {
 /// moves only on the spoke holding `drive:<list>`, which only a spoke of
 /// [`driver_of`]'s user takes. One held and unexpired here is used as it is
 /// (the hub-sync worker renews it); otherwise it is taken now.
-pub fn drive(store: &Store, w: &crate::model::Worklist) -> Drives {
+pub fn drive(store: &Store, w: &wsp_engine::model::Worklist) -> Drives {
     if w.workspace.is_private() {
         return Drives::Here;
     }
     let Some(home) = home().filter(|h| logged_in(h)) else { return Drives::Here };
-    let Some(me) = crate::address::logged_in_user() else { return Drives::Here };
+    let Some(me) = wsp_engine::address::logged_in_user() else { return Drives::Here };
     let driver = driver_of(store, w).unwrap_or_else(|| me.clone());
     if driver != me {
         return Drives::Elsewhere(driver);
@@ -613,7 +613,7 @@ pub fn drive(store: &Store, w: &crate::model::Worklist) -> Drives {
 /// again; the same holder keeps its token), `Elsewhere(user)` (it runs there,
 /// and the barrier waits for its landing) or `NotYet(why)`. The add-on
 /// interface's type.
-pub use crate::addon::Member;
+pub use wsp_engine::addon::Member;
 
 /// The driver leases `row` before spawning it (wsp-467). A refusal `held`
 /// records the holder, so the run neither starts, reseats nor verifies the
@@ -661,13 +661,13 @@ pub fn unused(store: &Store, row: &str, held: &Held) {
 /// `running on <user>'s wsp`.
 pub fn running_elsewhere(store: &Store, row: &str) -> Option<String> {
     let user = Book::read(store).elsewhere.get(row).cloned()?;
-    let done = store.find_task(row).is_none_or(|t| t.status() == crate::model::Status::Done);
+    let done = store.find_task(row).is_none_or(|t| t.status() == wsp_engine::model::Status::Done);
     (!done).then_some(user)
 }
 
 /// Who `worklist show` says drives `w`: the user this spoke last read it as
 /// driven by, else the one whose spoke may. `None` for a private list.
-pub fn driven_by(store: &Store, w: &crate::model::Worklist) -> Option<String> {
+pub fn driven_by(store: &Store, w: &wsp_engine::model::Worklist) -> Option<String> {
     if w.workspace.is_private() {
         return None;
     }
@@ -676,7 +676,7 @@ pub fn driven_by(store: &Store, w: &crate::model::Worklist) -> Option<String> {
         .get(&w.id)
         .cloned()
         .or_else(|| driver_of(store, w))
-        .or_else(crate::address::logged_in_user)
+        .or_else(wsp_engine::address::logged_in_user)
 }
 
 /// The drive leases this spoke holds, renewed while the daemon ticks: each on
@@ -689,7 +689,7 @@ pub fn renew_drives(store: &Store, client: &mut Client, now: i64) -> usize {
         let row = RowId(drive_row(&list));
         let running = store
             .worklist(&list)
-            .is_some_and(|w| !w.workspace.is_private() && w.status() != crate::model::WorklistStatus::Done);
+            .is_some_and(|w| !w.workspace.is_private() && w.status() != wsp_engine::model::WorklistStatus::Done);
         if !running {
             let _ = client.lease_release(&row, d.token);
             Book::edit(store, |b| b.drives.remove(&list));
@@ -808,8 +808,8 @@ pub mod tests {
     /// `despawn --lost` does, and B takes it with a higher token.
     #[test]
     fn hub_lease_two_spokes_a_held_row_is_refused_renewed_while_alive_and_follows_the_hub_on_expiry() {
-        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
-        let _env = crate::util::isolated("hub-lease-two");
+        install(|s, r, w| wsp_engine::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        let _env = wsp_engine::util::isolated("hub-lease-two");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-466-two-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -867,7 +867,7 @@ pub mod tests {
         assert!(!store.claims().contains_key("wsp-1"), "the claim is released");
         assert!(store.bindings().get("cpd-a").is_none());
         let row = store.task("wsp-1").unwrap();
-        assert_eq!(row.status(), crate::model::Status::Todo);
+        assert_eq!(row.status(), wsp_engine::model::Status::Todo);
         let log = row.section("Log").unwrap_or_default();
         assert_eq!(log.lines().filter(|l| l.contains("lease expired on the hub")).count(), 1, "{log}");
         assert!(!follow_expired(&store, &heard.payload), "once");
@@ -886,8 +886,8 @@ pub mod tests {
     /// hub's head for the row is what B left.
     #[test]
     fn hub_fence_a_verdict_and_a_landing_go_under_the_token_and_a_stale_one_is_refused_fenced() {
-        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
-        let _env = crate::util::isolated("hub-fence");
+        install(|s, r, w| wsp_engine::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        let _env = wsp_engine::util::isolated("hub-fence");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-468-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -916,7 +916,7 @@ pub mod tests {
 
         // Nothing to say yet; then a ready line is a verdict, sent once.
         assert_eq!(push_all(&store, &mut ann), Pushed::default());
-        say(format!("{} abc1234 on m-1", crate::repair::READY));
+        say(format!("{} abc1234 on m-1", wsp_engine::repair::READY));
         assert_eq!(push_all(&store, &mut ann).sent, 1);
         assert_eq!(push_all(&store, &mut ann).sent, 0, "once");
         let reviewed = head(&mut ann).expect("the verdict moved the row's head");
@@ -955,8 +955,8 @@ pub mod tests {
     /// held elsewhere at that commit, and false for one that is not held elsewhere.
     #[test]
     fn hub_verdict_a_held_verdict_is_pushed_once_and_pulled_into_the_book() {
-        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
-        let _env = crate::util::isolated("hub-verdict-held");
+        install(|s, r, w| wsp_engine::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        let _env = wsp_engine::util::isolated("hub-verdict-held");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-486-verdict-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -972,9 +972,9 @@ pub mod tests {
         stamp(&mut claim, &held);
         store.set_claim("wsp-1", claim);
         let mut t = store.task("wsp-1").unwrap();
-        t.log(&format!("{} abc1234 on m-1", crate::repair::READY));
+        t.log(&format!("{} abc1234 on m-1", wsp_engine::repair::READY));
         store.save_task(&t).unwrap();
-        crate::verification::record(&store, "wsp-1", crate::verification::State::Holds, "checked", None, None).unwrap();
+        wsp_engine::verification::record(&store, "wsp-1", wsp_engine::verification::State::Holds, "checked", None, None).unwrap();
 
         // Sent once as a verdict object, then the ready line's own event; a second pass sends nothing.
         let first = push_all(&store, &mut ann).sent;
@@ -1008,12 +1008,12 @@ pub mod tests {
         assert!(verdict_held(&ds, "wsp-1"), "held elsewhere, verdict pulled");
         assert!(!verdict_held(&ds, "wsp-2"), "no verdict for another row");
         let mut m = wsp_store::model::Task::new("wsp-1", "wsp-1");
-        m.log(&format!("{} deadbee on m-1", crate::repair::READY));
+        m.log(&format!("{} deadbee on m-1", wsp_engine::repair::READY));
         ds.save_task(&m).unwrap();
         assert!(!verdict_held(&ds, "wsp-1"), "the member moved on to another commit");
         // A later blocks for the same row overrides the earlier hold.
         let mut m = wsp_store::model::Task::new("wsp-1", "wsp-1");
-        m.log(&format!("{} abc1234 on m-1", crate::repair::READY));
+        m.log(&format!("{} abc1234 on m-1", wsp_engine::repair::READY));
         ds.save_task(&m).unwrap();
         assert!(verdict_held(&ds, "wsp-1"), "back at the held commit");
         take_verdict(&ds, "wsp-1", &json!({ "commit": "abc1234", "verdict": "blocks" }));
@@ -1074,7 +1074,7 @@ pub mod tests {
         git_t(&tree, &["add", file]);
         git_t(&tree, &["commit", "--quiet", "-m", "the work"]);
         let ready = git_t(&tree, &["rev-parse", "HEAD"]);
-        let mut p = store.project("p").unwrap_or_else(|| crate::model::Project::new("p"));
+        let mut p = store.project("p").unwrap_or_else(|| wsp_engine::model::Project::new("p"));
         p.roots = vec![repo.display().to_string()];
         p.body = format!("## Checks\n{checks}\n");
         store.save_project(&p).unwrap();
@@ -1084,30 +1084,30 @@ pub mod tests {
         if !workspace.is_empty() {
             t.workspace = workspace.parse().unwrap();
         }
-        t.log(&format!("{} {ready} on {row}", crate::repair::READY));
+        t.log(&format!("{} {ready} on {row}", wsp_engine::repair::READY));
         store.save_task(&t).unwrap();
         ready
     }
 
     fn engine() {
-        crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
+        wsp_engine::cmd_checkout::install_engine(wsp_engine::cmd_checkout::Engine {
             passed: |_| Default::default(),
             poke_task: |_, _, _| {},
             runs: |_, _| false,
-            after_land: crate::check::after_land,
-            rerun: crate::check::rerun,
+            after_land: wsp_engine::check::after_land,
+            rerun: wsp_engine::check::rerun,
             held: |_| None,
             refused: |store, row| crate::hub_journal::refusal(store, row, "land"),
         });
     }
 
-    fn landed(v: crate::cmd_checkout::Verdict) -> (crate::cmd_checkout::Landed, Vec<String>) {
+    fn landed(v: wsp_engine::cmd_checkout::Verdict) -> (wsp_engine::cmd_checkout::Landed, Vec<String>) {
         match v {
-            crate::cmd_checkout::Verdict::Landed { landed, reran } => (landed, reran),
-            crate::cmd_checkout::Verdict::Blocked(why) => panic!("blocked: {why}"),
-            crate::cmd_checkout::Verdict::Dirty(why) => panic!("dirty: {why}"),
-            crate::cmd_checkout::Verdict::Nothing => panic!("nothing landed"),
-            crate::cmd_checkout::Verdict::ByMerge(why) => panic!("by merge: {why}"),
+            wsp_engine::cmd_checkout::Verdict::Landed { landed, reran } => (landed, reran),
+            wsp_engine::cmd_checkout::Verdict::Blocked(why) => panic!("blocked: {why}"),
+            wsp_engine::cmd_checkout::Verdict::Dirty(why) => panic!("dirty: {why}"),
+            wsp_engine::cmd_checkout::Verdict::Nothing => panic!("nothing landed"),
+            wsp_engine::cmd_checkout::Verdict::ByMerge(why) => panic!("by merge: {why}"),
         }
     }
 
@@ -1117,7 +1117,7 @@ pub mod tests {
     #[test]
     fn hub_push_a_landing_that_loses_the_race_reverifies_and_lands_on_the_second_try() {
         engine();
-        let env = crate::util::isolated("hub-push-race");
+        let env = wsp_engine::util::isolated("hub-push-race");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let (remote, mine, theirs, ran) = (env.path("remote.git"), env.path("mine"), env.path("theirs"), env.path("ran.log"));
@@ -1127,7 +1127,7 @@ pub mod tests {
         let ready = ready_row(&store, &mine, "wsp-1", "shared:team", "m.txt", &format!("- always: echo always >> {}", ran.display()));
         let their = move_remote(&theirs, "t.txt");
 
-        let (l, reran) = landed(crate::cmd_checkout::land_verdict(&store, "wsp-1"));
+        let (l, reran) = landed(wsp_engine::cmd_checkout::land_verdict(&store, "wsp-1"));
         assert_eq!(reran, vec!["always".to_string()], "the checks were rerun after the rebase");
         assert_eq!(std::fs::read_to_string(&ran).unwrap(), "always\n");
         assert_ne!(l.sha, ready, "the rebase made a new commit");
@@ -1147,7 +1147,7 @@ pub mod tests {
     #[test]
     fn hub_push_a_landing_that_keeps_losing_the_race_blocks_naming_it() {
         engine();
-        let env = crate::util::isolated("hub-push-blocks");
+        let env = wsp_engine::util::isolated("hub-push-blocks");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let (remote, mine, theirs) = (env.path("remote.git"), env.path("mine"), env.path("theirs"));
@@ -1161,15 +1161,15 @@ pub mod tests {
         ready_row(&store, &mine, "wsp-1", "shared:team", "m.txt", &push);
         move_remote(&theirs, "t.txt");
 
-        let why = match crate::cmd_checkout::land_verdict(&store, "wsp-1") {
-            crate::cmd_checkout::Verdict::Blocked(why) => why,
-            crate::cmd_checkout::Verdict::Landed { reran, .. } => panic!("not blocked: landed after rerunning {reran:?}"),
+        let why = match wsp_engine::cmd_checkout::land_verdict(&store, "wsp-1") {
+            wsp_engine::cmd_checkout::Verdict::Blocked(why) => why,
+            wsp_engine::cmd_checkout::Verdict::Landed { reran, .. } => panic!("not blocked: landed after rerunning {reran:?}"),
             _ => panic!("not blocked"),
         };
         assert!(why.contains("lost the race to the shared remote 4 times") && why.contains("origin/master"), "{why}");
         assert_eq!(git_t(&theirs, &["rev-list", "--count", "master"]), "5", "the base, the first move and three reruns");
         assert_eq!(git_t(&remote, &["rev-parse", "master"]), git_t(&theirs, &["rev-parse", "master"]), "nothing of the row reached the remote");
-        assert!(crate::repair::landed_line(&store.task("wsp-1").unwrap()).is_none(), "no landed line");
+        assert!(wsp_engine::repair::landed_line(&store.task("wsp-1").unwrap()).is_none(), "no landed line");
     }
 
     /// A private row lands exactly as today: the local trunk only, no push, no
@@ -1177,7 +1177,7 @@ pub mod tests {
     #[test]
     fn hub_push_a_private_row_lands_on_the_local_trunk_only() {
         engine();
-        let env = crate::util::isolated("hub-push-private");
+        let env = wsp_engine::util::isolated("hub-push-private");
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let (remote, mine) = (env.path("remote.git"), env.path("mine"));
@@ -1185,7 +1185,7 @@ pub mod tests {
         clone_of(&remote, &mine);
         let before = git_t(&remote, &["rev-parse", "master"]);
         ready_row(&store, &mine, "t-1", "", "m.txt", "");
-        let (l, _) = landed(crate::cmd_checkout::land_verdict(&store, "t-1"));
+        let (l, _) = landed(wsp_engine::cmd_checkout::land_verdict(&store, "t-1"));
         assert_eq!(git_t(&mine, &["rev-parse", "master"]), l.sha);
         assert_eq!(git_t(&remote, &["rev-parse", "master"]), before, "nothing was pushed");
         let t = store.task("t-1").unwrap();
@@ -1201,7 +1201,7 @@ pub mod tests {
     #[test]
     fn hub_push_two_spokes_land_through_one_bare_remote_and_both_see_both_landed() {
         engine();
-        let env = crate::util::isolated("hub-push-two");
+        let env = wsp_engine::util::isolated("hub-push-two");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1225,8 +1225,8 @@ pub mod tests {
         let (ann, ann_repo, ann_home) = spoke("ann", "wsp-1", "a.txt");
         let (bo, bo_repo, bo_home) = spoke("bo", "wsp-2", "b.txt");
 
-        let (a, _) = landed(crate::cmd_checkout::land_verdict(&ann, "wsp-1"));
-        let (b, _) = landed(crate::cmd_checkout::land_verdict(&bo, "wsp-2"));
+        let (a, _) = landed(wsp_engine::cmd_checkout::land_verdict(&ann, "wsp-1"));
+        let (b, _) = landed(wsp_engine::cmd_checkout::land_verdict(&bo, "wsp-2"));
         assert_eq!(git_t(&remote, &["rev-parse", "master"]), b.sha, "bo's landing is the remote's tip");
         assert_eq!(git_t(&remote, &["rev-parse", "master~1"]), a.sha, "on top of ann's");
         assert_eq!(git_t(&ann_repo, &["rev-parse", "origin/master"]), a.sha, "ann has not fetched since");
@@ -1260,7 +1260,7 @@ pub mod tests {
 
         // Both caches show both rows landed: the own row's file, the other's head.
         for (who, s, own, other, (o, t)) in [("ann", &ann, "wsp-1", "wsp-2", (&a, &b)), ("bo", &bo, "wsp-2", "wsp-1", (&b, &a))] {
-            assert_eq!(crate::repair::landed_line(&s.task(own).unwrap()).as_deref(), Some(o.sha.as_str()), "{who}: {own}");
+            assert_eq!(wsp_engine::repair::landed_line(&s.task(own).unwrap()).as_deref(), Some(o.sha.as_str()), "{who}: {own}");
             let cache = crate::hub_cache::Cache::read(s);
             let head = cache.get(other).unwrap_or_else(|| panic!("{who}: {other} is not in the cache"));
             assert_eq!(head.landed.as_deref(), Some(t.sha.as_str()), "{who}: {other}");
@@ -1276,7 +1276,7 @@ pub mod tests {
         use wsp_objects::{encode, Object};
         use wsp_api::{Blob, RefMove};
         use wsp_store_contract::{Principal as P, Subject};
-        let _env = crate::util::isolated("hub-lease-for");
+        let _env = wsp_engine::util::isolated("hub-lease-for");
         let dir = std::env::temp_dir().join(format!("wsp-466-for-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1329,14 +1329,14 @@ pub mod tests {
     /// the row's new id with the token and the hub's expiry in it.
     #[test]
     fn hub_lease_publishing_a_claimed_row_takes_the_lease_first_and_a_refusal_publishes_nothing() {
-        let _env = crate::util::isolated("hub-lease-publish");
+        let _env = wsp_engine::util::isolated("hub-lease-publish");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-466-pub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (running, tokens) = serve(&dir);
         let home = login(&dir, &running, &tokens, "ann");
-        let ws: crate::model::WorkspaceId = "shared:team".parse().unwrap();
+        let ws: wsp_engine::model::WorkspaceId = "shared:team".parse().unwrap();
 
         let store = Store::open();
         store.ensure_dirs().unwrap();
@@ -1350,7 +1350,7 @@ pub mod tests {
         let mut bo = dial(&running, &tokens, "bo");
         let mut bos = Vec::new();
         for n in 1..=8 {
-            bos.push(take(&mut bo, "shared:team", &format!("{}-{n:03}", crate::store::INBOX_CODE)).unwrap());
+            bos.push(take(&mut bo, "shared:team", &format!("{}-{n:03}", wsp_engine::store::INBOX_CODE)).unwrap());
         }
         let why = crate::cmd_publish::publish(&store, "t-1", &ws, &home).unwrap_err();
         assert!(why.contains("nothing was published") && why.contains("bo"), "{why}");
@@ -1360,7 +1360,7 @@ pub mod tests {
 
         // bo lets go; the publish takes the lease and the claim follows the row.
         for (n, held) in (1..=8).zip(&bos) {
-            bo.lease_release(&RowId(format!("{}-{n:03}", crate::store::INBOX_CODE)), held.token).unwrap();
+            bo.lease_release(&RowId(format!("{}-{n:03}", wsp_engine::store::INBOX_CODE)), held.token).unwrap();
         }
         let made = crate::cmd_publish::publish(&store, "t-1", &ws, &home).unwrap();
         let new = made[0].1.clone();
@@ -1386,7 +1386,7 @@ pub mod tests {
         assert!(claim["ttl_s"].as_i64().unwrap() > 6 * 86_400);
     }
     /// A hub that counts what dials it, and a home logged in to it as `who`.
-    fn counted_login(env: &crate::util::Isolated, who: &str) -> (std::net::TcpListener, std::path::PathBuf) {
+    fn counted_login(env: &wsp_engine::util::Isolated, who: &str) -> (std::net::TcpListener, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1405,9 +1405,9 @@ pub mod tests {
     /// today's path.
     #[test]
     fn hub_lease_start_on_a_row_allocated_to_another_user_is_refused_before_the_hub() {
-        let env = crate::util::isolated("hub-lease-416");
+        let env = wsp_engine::util::isolated("hub-lease-416");
         // Core asks the shared-work add-on: the spoke, on this thread.
-        let _addon = crate::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
+        let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
         let (listener, home) = counted_login(&env, "jesper");
         let was = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
@@ -1425,8 +1425,8 @@ pub mod tests {
 
         let why = before_claim(&store, "wsp-1").unwrap_err();
         assert_eq!(why, "wsp-1 is allocated to ed; it runs on their wsp");
-        let args = crate::base::args::Args::parse(vec!["start".to_string(), "wsp-1".to_string()]);
-        assert_eq!(crate::cmd_task::set_status(&store, &args, wsp_store::model::Status::Doing), 1);
+        let args = wsp_engine::base::args::Args::parse(vec!["start".to_string(), "wsp-1".to_string()]);
+        assert_eq!(wsp_engine::cmd_task::set_status(&store, &args, wsp_store::model::Status::Doing), 1);
         assert_eq!(store.task("wsp-1").unwrap().status(), wsp_store::model::Status::Todo, "nothing moved");
         assert!(!dialled(), "no request reached the hub");
 

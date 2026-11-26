@@ -1,7 +1,7 @@
 //! The hub's spoke as a shared-work add-on: [`Spoke`] answers core's
 //! [`SharedWork`] questions with the `hub_*` modules, unchanged.
 //!
-//! Core never names a module of the spoke; it asks [`crate::addon::get`], which
+//! Core never names a module of the spoke; it asks [`wsp_engine::addon::get`], which
 //! `main` filled with a [`Spoke`]. Each answer is the standalone one for a
 //! private row or list, for a spoke with no login, and, for new shared work,
 //! while the hub connection is switched off ([`crate::hub_switch`]): then no
@@ -15,9 +15,9 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use crate::addon::{Drives, Elsewhere, Held, Lent, Member, SharedWork};
-use crate::model::Worklist;
-use crate::store::{log_line, Store};
+use wsp_engine::addon::{Drives, Elsewhere, Held, Lent, Member, SharedWork};
+use wsp_engine::model::Worklist;
+use wsp_engine::store::{log_line, Store};
 use crate::{hub_cache, hub_journal, hub_lease, hub_switch, hub_sync};
 
 /// The spoke. Holds only the lines it has said once, so a switched-off list is
@@ -50,6 +50,9 @@ impl Spoke {
 fn home() -> Option<PathBuf> {
     wsp_client::hub_home()
 }
+
+/// How long a `whoami` dial waits for the hub: a verb writing one line does not wait on it for long.
+const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether this machine is logged in to a hub: the login file, or the
 /// environment's URL.
@@ -84,6 +87,18 @@ impl SharedWork for Spoke {
         let home = home()?;
         let login = wsp_client::hub_login_in(&home).ok().flatten()?;
         Some(login.user).filter(|u| !u.trim().is_empty())
+    }
+
+    fn whoami(&self) -> Option<(wsp_store_contract::Principal, String)> {
+        // A test never dials: a developer's own login must not change what it reads.
+        if cfg!(test) {
+            return None;
+        }
+        let credential = wsp_client::Credential::for_hub().ok()?;
+        let url = wsp_client::hub_url().ok()?;
+        let ca = wsp_client::hub_ca().ok()?;
+        let mut client = wsp_client::Client::dial_hub_ca(&url, credential, ca.as_deref(), WHOAMI_WAIT).ok()?;
+        client.whoami().ok()
     }
 
     fn may_file_shared(&self, store: &Store) -> Result<(), String> {
@@ -250,14 +265,24 @@ mod tests {
     //! `cycle`'s tests: the run asks the add-on, so these install the spoke on
     //! their thread and drive a real hub.
     use super::*;
-    use crate::cycle::tests::{checks, hold_all, list, scratch, set, spawned, Blind};
-    use crate::cycle::step;
-    use crate::model::{Status, Task};
+
+    /// **Not compiled: the three drive tests below need the engine's own test build.** They drive `cycle::step`,
+    /// whose spawns, ends and tells are recorded rather than launched only under `cfg!(test)` of the engine
+    /// crate, and its `cycle::tests` fixtures (`Blind`, `spawned`, `checks`, `hold_all`, `list`, `scratch`,
+    /// `set`) are that build's. A crate that depends on the engine gets neither, so they cannot run from here
+    /// without changing the engine's test hooks; they are kept whole for the step that gives the run a hook
+    /// that does not depend on `cfg!(test)`.
+    #[cfg(any())]
+    mod drive {
+    use super::*;
+    use wsp_engine::cycle::step;
+    use wsp_engine::cycle::tests::{checks, hold_all, list, scratch, set, spawned, Blind};
+    use wsp_engine::model::{Status, Task};
     use std::sync::Arc;
 
     /// The spoke as this thread's add-on, for as long as the guard lives.
-    fn spoke() -> crate::addon::Scoped {
-        crate::addon::scoped(Arc::new(Spoke::new()))
+    fn spoke() -> wsp_engine::addon::Scoped {
+        wsp_engine::addon::scoped(Arc::new(Spoke::new()))
     }
 
     // ---- the drive lease (wsp-467) ------------------------------------------------
@@ -285,7 +310,7 @@ mod tests {
     /// A served hub with `ed` and `jesper` in `shared:team`; this store a spoke
     /// logged in as `me`; three shared rows in `todo` and the `run` list over
     /// them, shared.
-    fn two_spokes(env: &crate::util::Isolated, store: &Store, me: &str) -> (wsp_hub::serve::Running, std::collections::BTreeMap<String, String>, Home) {
+    fn two_spokes(env: &wsp_engine::util::Isolated, store: &Store, me: &str) -> (wsp_hub::serve::Running, std::collections::BTreeMap<String, String>, Home) {
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
         let (running, tokens) = hub_lease::tests::serve_users(&dir, &["ed", "jesper"]);
@@ -384,7 +409,7 @@ mod tests {
         for id in ["wsp-2", "wsp-3"] {
             set(&store, id, Status::Review);
         }
-        store.set_claim("wsp-2", serde_json::json!({ "hub_token": 5, "expires": crate::util::iso_at(crate::util::epoch_secs() + 3600) }));
+        store.set_claim("wsp-2", serde_json::json!({ "hub_token": 5, "expires": wsp_engine::util::iso_at(wsp_engine::util::epoch_secs() + 3600) }));
         let before = std::fs::read_to_string(store.worklist_path("run")).unwrap();
         step(&store, &w, &Blind);
         assert_eq!(spawned(), vec![("wsp-2 · verifying".into(), "claude".into())], "only the member held here");
@@ -423,6 +448,8 @@ mod tests {
         assert!(spawned().is_empty());
         assert_eq!(file(), before);
         running.stop();
+    }
+
     }
 
     /// The spoke's half of `verification`'s side-chain test (wsp-469): a row

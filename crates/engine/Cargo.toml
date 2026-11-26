@@ -22,8 +22,6 @@ wsp-server = { path = "../server" }
 wsp-api = { path = "../api" }
 wsp-client = { path = "../client" }
 wsp-view = { path = "../view" }
-# `token::mint`, the hash a hub token record keeps (cmd_hub, wsp-163).
-wsp-machines = { path = "../machines" }
 
 [dev-dependencies]
 wsp-base = { path = "../base", features = ["test-support"] }
@@ -36,10 +34,9 @@ wsp-testkit = { path = "../testkit" }
 wsp-manager = { path = "../manager" }
 # repair's reseat test posts its played hook's turn to the manager, as a real hook does.
 wsp-host = { path = "../host" }
-# The login tests (wsp-462) log in to a real hub over TLS: its library, a user and token made as its host makes them.
-wsp-hub = { path = "../hub" }
 # orders, fold and mirror tests open a real state.db, as the daemon does (tests only; the binary alone links it).
 wsp-store-sqlite = { path = "../store-sqlite" }
 
 [features]
+# `test-support`: the fixtures another crate's tests (the spoke's) use: `verification::record`, `cmd_message::tests_govern`.
 test-support = []

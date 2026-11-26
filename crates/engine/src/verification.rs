@@ -1467,7 +1467,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record(store: &Store, member: &str, state: State, text: &str, me: Option<&str>, caption: Option<&str>) -> Result<Pass, String> {
     record_checked(store, member, state, text, me, caption, Vec::new(), None)
 }

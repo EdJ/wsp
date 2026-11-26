@@ -14,8 +14,8 @@
 
 use serde_json::json;
 
-use crate::base::args::Args;
-use crate::store::Store;
+use wsp_engine::base::args::Args;
+use wsp_engine::store::Store;
 
 /// The user `row` is allocated to: its own `for:`, else the `for:` of a list
 /// that holds it and has not finished, else `None`.
@@ -34,7 +34,7 @@ pub fn allocated_elsewhere(store: &Store, row: &str) -> Option<String> {
         return None;
     }
     let to = allocated_to(store, &t.id)?;
-    let me = crate::address::logged_in_user()?;
+    let me = wsp_engine::address::logged_in_user()?;
     (to != me).then_some(to)
 }
 
@@ -95,7 +95,7 @@ pub fn allocate(store: &Store, args: &Args) -> i32 {
         return 0;
     }
 
-    if let Some(mut w) = crate::cmd_worklist::find(store, &needle) {
+    if let Some(mut w) = wsp_engine::cmd_worklist::find(store, &needle) {
         if w.workspace.is_private() {
             return refuse_private(&w.id);
         }
@@ -127,11 +127,11 @@ fn state(u: &Option<String>) -> String {
 }
 
 /// The verbs this module answers to.
-pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
+pub const VERBS: &[wsp_engine::verbs::Verb] = &[wsp_engine::verbs::Verb {
     names: &["allocate"],
     run: allocate,
-    help: &[crate::verbs::Help {
-        section: crate::verbs::Section::Tasks,
+    help: &[wsp_engine::verbs::Help {
+        section: wsp_engine::verbs::Section::Tasks,
         order: 365,
         text: r##"  wsp allocate <id> <user>|none     bind shared work to one user's agents"##,
     }],
@@ -140,13 +140,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Group, Task, Worklist};
+    use wsp_engine::model::{Group, Task, Worklist};
 
-    fn scratch(tag: &str) -> (crate::util::Isolated, Store) {
-        let env = crate::util::isolated(tag);
+    fn scratch(tag: &str) -> (wsp_engine::util::Isolated, Store) {
+        let env = wsp_engine::util::isolated(tag);
         let store = Store::open();
         store.ensure_dirs().unwrap();
-        store.save_project(&crate::model::Project::new("wsp")).unwrap();
+        store.save_project(&wsp_engine::model::Project::new("wsp")).unwrap();
         (env, store)
     }
 
@@ -239,7 +239,7 @@ mod tests {
         let (_env, store) = scratch("allocate-json");
         row(&store, "t-1", true);
         assert_eq!(run(&store, &["t-1", "ed"]), 0);
-        let v = crate::cmd_task::show_json(&store, "t-1").unwrap();
+        let v = wsp_engine::cmd_task::show_json(&store, "t-1").unwrap();
         assert_eq!(v["for"], "ed");
     }
 }

@@ -32,10 +32,10 @@ use wsp_client::Client;
 use wsp_objects::{Object, ObjectId, Refs};
 use wsp_store_contract::{Entity, Principal, Row, RowId, Subject};
 
-use crate::cmd_message::Caller;
-use crate::cmd_task;
-use crate::door::{task_of_record, user_of, Heads};
-use crate::store::Store;
+use wsp_engine::cmd_message::Caller;
+use wsp_engine::cmd_task;
+use wsp_engine::door::{task_of_record, user_of, Heads};
+use wsp_engine::store::Store;
 
 /// Events behind the hub's head that a worker still replays; past it the
 /// heads diff is the cheaper way to catch up.
@@ -180,7 +180,7 @@ pub fn head_of(row: &Row, workspace: &str, to: &ObjectId) -> Option<Head> {
         status: t.status().as_str().to_string(),
         holder: row.seat.as_ref().map(|s| s.0.clone()),
         allocation: t.for_user.clone(),
-        landed: crate::repair::landed_line(&t),
+        landed: wsp_engine::repair::landed_line(&t),
     })
 }
 
@@ -303,7 +303,7 @@ pub fn classify(
             promote(store, &mut cache, &row.id.0);
             out.whole.insert(subject);
         } else if let Err(why) = keep_head(store, &mut cache, &row, workspace, to, by) {
-            crate::store::log_line(store, &format!("hub-sync: the head of {} was not kept: {why}", row.id.0));
+            wsp_engine::store::log_line(store, &format!("hub-sync: the head of {} was not kept: {why}", row.id.0));
         } else {
             out.heads += 1;
         }
@@ -327,22 +327,22 @@ pub fn show_line(store: &Store, row: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> (crate::util::Isolated, Store) {
-        let env = crate::util::isolated(tag);
+    fn scratch(tag: &str) -> (wsp_engine::util::Isolated, Store) {
+        let env = wsp_engine::util::isolated(tag);
         let store = Store::open();
         store.ensure_dirs().unwrap();
-        store.save_project(&crate::model::Project::new("wsp")).unwrap();
+        store.save_project(&wsp_engine::model::Project::new("wsp")).unwrap();
         (env, store)
     }
 
     fn record(id: &str, title: &str, for_user: Option<&str>) -> Row {
-        let mut t = crate::model::Task::new(title, id);
+        let mut t = wsp_engine::model::Task::new(title, id);
         t.project = Some("wsp".into());
         t.workspace = "shared:mp".parse().unwrap();
         t.for_user = for_user.map(str::to_string);
         t.body = "## Overview\nthe whole text\n".into();
         let text = t.render();
-        crate::mirror::shared_row(&t, &text).expect("a shared row")
+        wsp_engine::mirror::shared_row(&t, &text).expect("a shared row")
     }
 
     fn ann() -> Principal {
@@ -381,7 +381,7 @@ mod tests {
         assert!(!t.body.contains("the whole text"), "only the head: {:?}", t.body);
         let h = Cache::read(&store);
         assert_eq!(h.get("wsp-7").map(|h| (h.title.as_str(), h.allocation.as_deref())), Some(("Someone else's work", Some("bob"))));
-        assert!(crate::door::pending(&store).is_empty(), "a head is not pushed back");
+        assert!(wsp_engine::door::pending(&store).is_empty(), "a head is not pushed back");
         assert!(show_line(&store, "wsp-7").unwrap().contains("--fetch"));
         assert!(!is_own(&store, &h, "ann", "wsp-7", Some("bob")), "bob's, not ann's");
         assert!(is_own(&store, &h, "bob", "wsp-7", Some("bob")), "allocated to bob: his");
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn a_row_made_here_is_own_and_one_with_no_file_or_claim_is_not() {
         let (_env, store) = scratch("hc-own");
-        let mut t = crate::model::Task::new("mine", "wsp-9");
+        let mut t = wsp_engine::model::Task::new("mine", "wsp-9");
         t.project = Some("wsp".into());
         store.save_task(&t).unwrap();
         let cache = Cache::default();

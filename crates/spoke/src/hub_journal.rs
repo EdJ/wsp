@@ -38,7 +38,7 @@ use wsp_api::Blob;
 use wsp_objects::{Object, ObjectId, WorkspaceId};
 use wsp_store_contract::{At, EventKind, OrderId, Principal, Subject};
 
-use crate::store::Store;
+use wsp_engine::store::Store;
 
 /// One object in the journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,7 +401,7 @@ pub fn side_of_notice(obj: &Object, me: &str) -> Option<Side> {
         mine: old == me,
         old,
         token: None,
-        at: crate::util::iso_at((at.0 / 1000) as i64),
+        at: wsp_engine::util::iso_at((at.0 / 1000) as i64),
     })
 }
 

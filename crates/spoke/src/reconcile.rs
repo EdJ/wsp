@@ -27,11 +27,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use wsp_objects::{Object, ObjectId};
 use wsp_store_contract::{Entity, RowId};
 
-use crate::cmd_message::Caller;
-use crate::cmd_task;
-use crate::door::{task_of_record, Applied, Heads, Reconcile, Refusal};
-use crate::model::{section_of, set_section_in, Task};
-use crate::store::Store;
+use wsp_engine::cmd_message::Caller;
+use wsp_engine::cmd_task;
+use wsp_engine::door::{task_of_record, Applied, Heads, Reconcile, Refusal};
+use wsp_engine::model::{section_of, set_section_in, Task};
+use wsp_engine::store::Store;
 
 /// The tag a row carries while a reconcile left a conflict on it for the user.
 pub const FLAG: &str = "conflict";
@@ -271,7 +271,7 @@ pub fn union_in_time_order(ours: &str, theirs: &str) -> String {
 fn entries(text: &str) -> (String, Vec<(String, String)>) {
     let stamp = |l: &str| -> Option<String> {
         let (d, _) = l.trim_start().strip_prefix("- ")?.split_once(' ')?;
-        crate::util::is_stamp(d).then(|| d.to_string())
+        wsp_engine::util::is_stamp(d).then(|| d.to_string())
     };
     let mut head: Vec<&str> = Vec::new();
     let mut out: Vec<(String, String)> = Vec::new();
@@ -379,7 +379,7 @@ impl Reconcile for Merging<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::door::{pending, Door, Unreconciled};
+    use wsp_engine::door::{pending, Door, Unreconciled};
     use wsp_objects::WorkspaceId as ObjWorkspace;
     use wsp_store_contract::{At, Principal, SharedName, Subject, WorkspaceId};
 
@@ -534,7 +534,7 @@ mod tests {
         let mut t = t.clone();
         t.workspace = WorkspaceId::Shared(SharedName("team".into()));
         t.project = Some("wsp".into());
-        let row = crate::mirror::rows(&[t], &BTreeMap::new(), &[], &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+        let row = wsp_engine::mirror::rows(&[t], &BTreeMap::new(), &[], &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
             .into_iter()
             .find_map(|e| match e {
                 Entity::Row(r) => Some(r),

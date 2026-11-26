@@ -28,9 +28,9 @@ use std::time::Duration;
 use wsp_client::{Client, Credential, Error as HubError};
 use wsp_objects::WorkspaceId as HubWorkspace;
 
-use crate::base::args::Args;
-use crate::model::{Task, WorkspaceId};
-use crate::store::{split_piece_id, Store, INBOX_CODE};
+use wsp_engine::base::args::Args;
+use wsp_engine::model::{Task, WorkspaceId};
+use wsp_engine::store::{split_piece_id, Store, INBOX_CODE};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -125,7 +125,7 @@ pub fn plan(store: &Store, target: &str) -> Result<Plan, String> {
 
 /// The highest number under `code` this store has used: the import door's
 /// reading, which renumbers a private row out of a shared id's way too.
-pub use crate::door::highest_local;
+pub use wsp_engine::door::highest_local;
 
 fn taken_here(store: &Store, id: &str, ids: &BTreeMap<String, String>) -> bool {
     store.task_path(id).exists() || ids.contains_key(id) || store.archived_tasks().iter().any(|t| t.id == id)
@@ -283,11 +283,11 @@ pub fn run(store: &Store, args: &Args) -> i32 {
 }
 
 /// The verbs this module answers to.
-pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
+pub const VERBS: &[wsp_engine::verbs::Verb] = &[wsp_engine::verbs::Verb {
     names: &["publish"],
     run,
-    help: &[crate::verbs::Help {
-        section: crate::verbs::Section::Machines,
+    help: &[wsp_engine::verbs::Help {
+        section: wsp_engine::verbs::Section::Machines,
         order: 105,
         text: r##"  wsp publish <row|list> --to shared:<name>   move a private row (with its sub-tasks and pieces)
                                     or list (with its members) into a shared workspace:

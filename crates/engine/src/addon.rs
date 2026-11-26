@@ -115,6 +115,13 @@ pub trait SharedWork: Send + Sync {
         None
     }
 
+    /// Who the shared side says this process is (the principal its credential
+    /// names) and the name of the server that said it: `None` standalone, with
+    /// no login, or when nothing answers. Never reads a seat's own token.
+    fn whoami(&self) -> Option<(Principal, String)> {
+        None
+    }
+
     /// Whether a new record may be filed into a shared workspace, asked by
     /// `record_workspace` once the flag or the environment named one.
     fn may_file_shared(&self, _store: &Store) -> Result<(), String> {
@@ -312,5 +319,7 @@ mod tests {
         assert!(matches!(s.lease_member(&store, "t-1"), Member::Free));
         assert!(s.send(&store, wsp_api::MsgSend { to: "primary:ed".into(), from: "wsp".into(), seat: None, text: "hi".into(), re: None }).is_err());
         assert!(s.may_file_shared(&store).is_err());
+        assert_eq!(s.user(), None);
+        assert_eq!(s.whoami(), None);
     }
 }

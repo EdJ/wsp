@@ -8,9 +8,9 @@
 //!    spoke takes no lease (a claim, `wsp start` or a spawn of a shared row is
 //!    refused, naming `wsp hub enable`), advances no shared list, files nothing
 //!    new into a shared workspace and sends no message to the hub; core reads
-//!    it as standalone ([`crate::addon::SharedWork::active`] is false).
+//!    it as standalone ([`wsp_engine::addon::SharedWork::active`] is false).
 //! 2. **Agents in flight on shared rows are parked** with `wsp park`'s own
-//!    write ([`crate::cmd_task::park`]), the reason naming the disconnect, and
+//!    write ([`wsp_engine::cmd_task::park`]), the reason naming the disconnect, and
 //!    each row's status before it is kept here so enabling can put it back.
 //!    Parking ends nothing that is running: it changes the row's status and
 //!    logs why, and a live seat keeps its claim and goes on to the end of what
@@ -51,9 +51,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use wsp_store_contract::{RowId, Token};
 
-use crate::base::args::Args;
-use crate::model::Status;
-use crate::store::Store;
+use wsp_engine::base::args::Args;
+use wsp_engine::model::Status;
+use wsp_engine::store::Store;
 use crate::{hub_journal, hub_lease, hub_sync};
 
 /// The reason a row parked by the disconnect carries in its log.
@@ -175,12 +175,12 @@ fn worker_stood_down(store: &Store) {
     loop {
         let v = read();
         let pid = v["pid"].as_u64().map(|p| p as u32);
-        let running = pid.is_some_and(|p| p != std::process::id() && crate::gc::alive(p));
+        let running = pid.is_some_and(|p| p != std::process::id() && wsp_engine::gc::alive(p));
         if !running || v["link"].as_str() == Some("off") {
             return;
         }
         if Instant::now() >= end {
-            crate::store::log_line(store, "hub disable: the sync worker did not stand down in time; flushing the journal beside it");
+            wsp_engine::store::log_line(store, "hub disable: the sync worker did not stand down in time; flushing the journal beside it");
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -195,7 +195,7 @@ pub fn disable(store: &Store, home: &Path) -> Disabled {
     let was = Switch::edit(store, |s| {
         let was = s.off;
         s.off = true;
-        s.at = Some(crate::util::epoch_secs());
+        s.at = Some(wsp_engine::util::epoch_secs());
         was
     });
     out.was_off = was.unwrap_or(false);
@@ -204,7 +204,7 @@ pub fn disable(store: &Store, home: &Path) -> Disabled {
     // 2. Park what is in flight on shared rows, with `wsp park`'s own write.
     for (row, status) in in_flight(store) {
         let args = Args::synth("park", &[row.as_str(), REASON], &[]);
-        if crate::cmd_task::park(store, &args) == 0 {
+        if wsp_engine::cmd_task::park(store, &args) == 0 {
             let _ = Switch::edit(store, |s| {
                 s.parked.insert(row.clone(), status.as_str().to_string());
             });
@@ -312,7 +312,7 @@ pub fn enable(store: &Store, home: &Path) -> Enabled {
     let was = Switch::edit(store, |s| {
         let was = !s.off;
         s.off = false;
-        s.at = Some(crate::util::epoch_secs());
+        s.at = Some(wsp_engine::util::epoch_secs());
         s.not_released.clear();
         s.unreachable = None;
         was
@@ -343,8 +343,8 @@ pub fn enable(store: &Store, home: &Path) -> Enabled {
                 t.set_status(status);
                 t.log(&format!("resumed: the hub connection is enabled again (→ {})", status.as_str()));
                 t.touch();
-                let caller = crate::cmd_message::Caller::here(store);
-                match crate::cmd_task::write_task(store, &t, "resume", &caller) {
+                let caller = wsp_engine::cmd_message::Caller::here(store);
+                match wsp_engine::cmd_task::write_task(store, &t, "resume", &caller) {
                     Ok(()) => {
                         let _ = Switch::edit(store, |s| s.parked.remove(&row));
                         out.resumed.push(row);
@@ -371,7 +371,7 @@ fn worker_running(store: &Store) -> bool {
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v["pid"].as_u64())
-        .is_some_and(|p| p as u32 != std::process::id() && crate::gc::alive(p as u32))
+        .is_some_and(|p| p as u32 != std::process::id() && wsp_engine::gc::alive(p as u32))
 }
 
 /// What `wsp hub status` says of the switch, beside the login's lines.
@@ -379,7 +379,7 @@ pub fn status_lines(store: &Store) -> Vec<String> {
     let s = Switch::read(store);
     let mut out = vec![match (s.off, s.at) {
         (false, _) => "on    enabled: shared work is taken and synced".to_string(),
-        (true, Some(at)) => format!("off   disabled since {}: no shared work is taken (`wsp hub enable`)", crate::util::iso_at(at)),
+        (true, Some(at)) => format!("off   disabled since {}: no shared work is taken (`wsp hub enable`)", wsp_engine::util::iso_at(at)),
         (true, None) => "off   disabled: no shared work is taken (`wsp hub enable`)".to_string(),
     }];
     for (row, was) in &s.parked {
@@ -449,7 +449,7 @@ mod tests {
     }
 
     fn row(store: &Store, id: &str, shared: bool, status: Status) {
-        let mut t = crate::model::Task::new(id, id);
+        let mut t = wsp_engine::model::Task::new(id, id);
         if shared {
             t.workspace = "shared:team".parse().unwrap();
         }
@@ -459,7 +459,7 @@ mod tests {
 
     /// A claim on `row` by seat `seat`, with `held` stamped where given.
     fn claim(store: &Store, row: &str, seat: &str, held: Option<&Held>) {
-        let mut c = json!({ "workspace_id": seat, "claimed_at": crate::util::now_iso() });
+        let mut c = json!({ "workspace_id": seat, "claimed_at": wsp_engine::util::now_iso() });
         wsp_store::store::stamp_claim_expiry(&mut c);
         if let Some(h) = held {
             hub_lease::stamp(&mut c, h);
@@ -472,23 +472,23 @@ mod tests {
         store.task(id).unwrap().status()
     }
 
-    use crate::addon::Held;
+    use wsp_engine::addon::Held;
 
     /// A served hub with `ann` and `bo` in `shared:team`, this store ann's
     /// spoke: `s-1` shared, in doing and claimed under ann's lease; `p-1`
     /// private, in doing and claimed; `s-2` shared and in todo, unclaimed.
     struct Rig {
-        _addon: crate::addon::Scoped,
+        _addon: wsp_engine::addon::Scoped,
         _hub_home: HubHome,
         running: wsp_hub::serve::Running,
         tokens: BTreeMap<String, String>,
         store: Store,
         home: std::path::PathBuf,
-        _env: crate::util::Isolated,
+        _env: wsp_engine::util::Isolated,
     }
 
     fn rig(tag: &str) -> Rig {
-        let env = crate::util::isolated(&format!("hub-switch-{tag}"));
+        let env = wsp_engine::util::isolated(&format!("hub-switch-{tag}"));
         let store = Store::at(env.home(), env.state());
         store.ensure_dirs().unwrap();
         let dir = env.path("hub");
@@ -496,7 +496,7 @@ mod tests {
         let (running, tokens) = hub_lease::tests::serve_users(&dir, &["ann", "bo"]);
         let home = hub_lease::tests::login(&dir, &running, &tokens, "ann");
         let hub_home = HubHome::at(&home);
-        let addon = crate::addon::scoped(Arc::new(Spoke::new()));
+        let addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
         row(&store, "s-1", true, Status::Doing);
         row(&store, "p-1", false, Status::Doing);
         row(&store, "s-2", true, Status::Todo);
@@ -531,15 +531,15 @@ mod tests {
 
         // Off: no new shared work, and core reads standalone.
         assert!(off(&r.store));
-        let spoke = crate::addon::get();
+        let spoke = wsp_engine::addon::get();
         assert!(!spoke.active(&r.store));
         let why = spoke.before_claim(&r.store, "s-2").unwrap_err();
         assert!(why.contains("wsp hub enable"), "{why}");
         assert_eq!(spoke.before_claim(&r.store, "p-1"), Ok(None), "private is as ever");
         assert!(spoke.may_file_shared(&r.store).unwrap_err().contains("disabled"));
-        let mut w = crate::model::Worklist::new("run", "run");
+        let mut w = wsp_engine::model::Worklist::new("run", "run");
         w.workspace = "shared:team".parse().unwrap();
-        assert!(matches!(spoke.drive(&r.store, &w), crate::addon::Drives::NotYet(_)), "no shared list advanced from here");
+        assert!(matches!(spoke.drive(&r.store, &w), wsp_engine::addon::Drives::NotYet(_)), "no shared list advanced from here");
         let lines = status_lines(&r.store).join("\n");
         assert!(lines.contains("disabled") && lines.contains("s-1 (was doing)"), "{lines}");
         // The login is kept.
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(status(&r.store, "s-2"), Status::Parked);
         assert!(matches!(on.replay, Some(Ok(()))), "{on:?}");
         assert_eq!(Switch::read(&r.store).parked.keys().cloned().collect::<Vec<_>>(), vec!["s-2".to_string()], "only the one still parked is remembered");
-        assert!(crate::addon::get().active(&r.store));
+        assert!(wsp_engine::addon::get().active(&r.store));
         r.running.stop();
     }
 

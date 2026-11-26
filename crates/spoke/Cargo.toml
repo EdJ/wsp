@@ -1,0 +1,30 @@
+[package]
+name = "wsp-spoke"
+version = "0.1.0"
+edition = "2021"
+description = "wsp's shared-work add-on: the spoke that logs in to a hub and syncs shared work, plugged into the engine through its SharedWork interface"
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+serde_json = "1"
+wsp-engine = { path = "../engine" }
+wsp-base = { path = "../base" }
+wsp-store = { path = "../store" }
+wsp-store-contract = { path = "../store-contract" }
+wsp-objects = { path = "../objects" }
+wsp-api = { path = "../api" }
+wsp-client = { path = "../client" }
+wsp-machines = { path = "../machines" }
+
+[dev-dependencies]
+wsp-engine = { path = "../engine", features = ["test-support"] }
+wsp-base = { path = "../base", features = ["test-support"] }
+wsp-client = { path = "../client", features = ["test-support"] }
+wsp-store = { path = "../store", features = ["test-support"] }
+wsp-testkit = { path = "../testkit" }
+wsp-hub = { path = "../hub" }
+wsp-server = { path = "../server", features = ["test-support"] }
+wsp-store-sqlite = { path = "../store-sqlite" }

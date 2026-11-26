@@ -31,8 +31,8 @@ use wsp_store_contract::{
     Command, IdentityState, Refusal, SharedName, State, TokenId, UserName,
 };
 
-use crate::base::args::Args;
-use crate::store::Store;
+use wsp_engine::base::args::Args;
+use wsp_engine::store::Store;
 
 const WAIT: Duration = Duration::from_secs(10);
 

@@ -39,7 +39,7 @@ dependencies to hold this.
   `Credential::for_hub()` is `$WSP_HUB_TOKEN`, else `token` in `~/.config/wsp/hubs.json` (a file wider than 0600 is
   `Silent::BadHubsFile`, naming it; none is `NotLoggedIn`); `hub_url()` is `$WSP_HUB_URL`, else its `url`. The
   `_in` forms take the env value and home as arguments. The hello's `by` is a hint (`$WSP_HUB_USER`, else `$USER`).
-  The file is written by `wsp login` (wsp-462, `crates/engine/src/cmd_login.rs`): `{"url", "token", "user", "at"}` and `ca` when pinned; `user` is the
+  The file is written by `wsp login` (wsp-462, `crates/spoke/src/cmd_login.rs`): `{"url", "token", "user", "at"}` and `ca` when pinned; `user` is the
   name `welcome` gave the token (`Client::by()`), which the dial never reads. `hub_login_in(home)` reads the file *without*
   its token (`HubLogin`), for `wsp hub status` and for login saying what it replaces.
 - `src/sync.rs` (wsp-459): `Client::sync(workspace, local: &Refs, source: &impl ObjectSource) -> SyncReport`:

@@ -36,9 +36,9 @@ use serde_json::json;
 use wsp_client::{hub_login_in, Client, Credential, HubLogin, Silent, HUBS_FILE, HUB_CA_ENV};
 use wsp_store_contract::Principal;
 
-use crate::base::args::Args;
-use crate::store::Store;
-use crate::util;
+use wsp_engine::base::args::Args;
+use wsp_engine::store::Store;
+use wsp_engine::util;
 
 /// How long a login waits for the hub, dial and welcome together.
 const WAIT: Duration = Duration::from_secs(10);
@@ -374,12 +374,12 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
 }
 
 /// The verbs this module answers to.
-pub const VERBS: &[crate::verbs::Verb] = &[
-    crate::verbs::Verb {
+pub const VERBS: &[wsp_engine::verbs::Verb] = &[
+    wsp_engine::verbs::Verb {
         names: &["login"],
         run: login,
-        help: &[crate::verbs::Help {
-            section: crate::verbs::Section::Machines,
+        help: &[wsp_engine::verbs::Help {
+            section: wsp_engine::verbs::Section::Machines,
             order: 100,
             text: r##"  wsp login <hub-url> [--ca FILE]   store your token for a hub, tls://host:port:
                                     read from the prompt or stdin, never the
@@ -387,27 +387,27 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     replaces the first. --ca pins a private CA"##,
         }],
     },
-    crate::verbs::Verb {
+    wsp_engine::verbs::Verb {
         names: &["logout"],
         run: logout,
-        help: &[crate::verbs::Help {
-            section: crate::verbs::Section::Machines,
+        help: &[wsp_engine::verbs::Help {
+            section: wsp_engine::verbs::Section::Machines,
             order: 110,
             text: r##"  wsp logout                        disable the hub connection (wsp hub disable),
                                     then forget the hub's token"##,
         }],
     },
-    crate::verbs::Verb {
+    wsp_engine::verbs::Verb {
         names: &["hub"],
         run: hub,
         help: &[
-            crate::verbs::Help {
-                section: crate::verbs::Section::Machines,
+            wsp_engine::verbs::Help {
+                section: wsp_engine::verbs::Section::Machines,
                 order: 120,
                 text: r##"  wsp hub status [--json]           the hub you are logged in to, and as whom; on or
                                     off, what the disconnect parked, what is unsent"##,
             },
-            crate::verbs::Help { section: crate::verbs::Section::Machines, order: 121, text: crate::cmd_hub::HELP },
+            wsp_engine::verbs::Help { section: wsp_engine::verbs::Section::Machines, order: 121, text: crate::cmd_hub::HELP },
         ],
     },
 ];

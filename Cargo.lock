@@ -815,6 +815,7 @@ dependencies = [
  "wsp-manager",
  "wsp-objects",
  "wsp-server",
+ "wsp-spoke",
  "wsp-store",
  "wsp-store-contract",
  "wsp-store-sqlite",
@@ -867,8 +868,6 @@ dependencies = [
  "wsp-client",
  "wsp-host",
  "wsp-host-api",
- "wsp-hub",
- "wsp-machines",
  "wsp-manager",
  "wsp-objects",
  "wsp-server",
@@ -954,6 +953,25 @@ dependencies = [
  "wsp-server",
  "wsp-store-conformance",
  "wsp-store-contract",
+]
+
+[[package]]
+name = "wsp-spoke"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wsp-api",
+ "wsp-base",
+ "wsp-client",
+ "wsp-engine",
+ "wsp-hub",
+ "wsp-machines",
+ "wsp-objects",
+ "wsp-server",
+ "wsp-store",
+ "wsp-store-contract",
+ "wsp-store-sqlite",
+ "wsp-testkit",
 ]
 
 [[package]]

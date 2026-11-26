@@ -60,7 +60,7 @@ mod tests {
     use super::*;
 
     fn out() -> Result<(), String> {
-        Err("not logged in: WSP_HUB_TOKEN is unset and there is no hubs.json".into())
+        Err("not logged in".into())
     }
 
     #[test]
