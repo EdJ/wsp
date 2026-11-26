@@ -2371,7 +2371,12 @@ mod tests {
         let r = deliver_through(&InProcess::with_sup(&sup), &session, &scratch.root, &seat, "go", Duration::from_millis(2500));
         assert!(t.elapsed() < Duration::from_secs(6), "bounded, not the sup's own wait");
         assert!(matches!(&r, Err(Refusal::Backend(w)) if w.contains("pending")), "{r:?}");
-        let first = fs::read_to_string(&asked).unwrap();
+        // The id wsp kept for it, not the one the sup wrote down: a sup killed at
+        // the end of the wait may not have been scheduled far enough to write
+        // `asked` at all (the verifier saw NotFound here under load, wsp-778).
+        let first = str_of(&read_json(&scratch.root.join(DELIVER_PENDING)), "id");
+        assert!(!first.is_empty(), "a wait that ran out keeps its id");
+        let first = format!("{first}\n");
 
         script_sup(&scratch, "echo \"delivered $3\"");
         assert_eq!(

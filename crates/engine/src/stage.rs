@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn a_member_the_list_landed_before_its_review_is_landed_with_its_file_count() {
         let t = task("doing", &[]);
-        let l = Landed { member: "m-1".into(), commit: Some("abc1234".into()), files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()] };
+        let l = Landed { member: "m-1".into(), commit: Some("abc1234".into()), files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()], no_commit: false };
         let mut m = member(&t, &[]);
         m.landed = Some(&l);
         assert_eq!(of_member(&m).text, "Landed — 3 files");

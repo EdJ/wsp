@@ -288,7 +288,7 @@ fn login_over_a_file_wider_than_0600_is_refused_naming_it_and_leaves_it() {
 /// What `wsp sandbox --fake --name <name>` exported, as the pairs a shell would set.
 fn sandbox_exports(rig: &Rig, name: &str) -> Vec<(String, String)> {
     let _ = rig.command(&["init"]).output().unwrap();
-    let out = rig.command(&["sandbox", "--fake", "--name", name]).output().unwrap();
+    let out = rig.command(&["sandbox", "--fake", "--name", name]).env("WSP_SANDBOX_TETHER", std::process::id().to_string()).output().unwrap();
     assert!(out.status.success(), "{}", said(&out));
     String::from_utf8_lossy(&out.stdout)
         .lines()

@@ -54,7 +54,7 @@ impl Sandbox {
         ]
         .into();
         let run = |args: &[&str], env: &BTreeMap<String, String>| {
-            Command::new(WSP).args(args).envs(env).env_remove("WSP_SEAT_ID").output().unwrap()
+            Command::new(WSP).args(args).envs(env).env_remove("WSP_SEAT_ID").env("WSP_SANDBOX_TETHER", std::process::id().to_string()).output().unwrap()
         };
         run(&["init"], &outer);
         let name = format!("m{tag}");

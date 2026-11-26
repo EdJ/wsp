@@ -2062,20 +2062,44 @@ pub fn stage_to_json(stage: &Stage) -> Value {
     })
 }
 
-/// Serve a fake until something kills the process, re-reading the stage file
-/// whenever it changes.
+/// Serve a fake until something kills the process, its socket goes, or the
+/// process it is tethered to does — re-reading the stage file whenever it
+/// changes.
 ///
 /// What `wsp sandbox --fake` runs. The file is the only way in from outside, and
 /// a change to it goes through [`Fake::restage`] like everything else — so
 /// editing a seat's state pushes exactly the events that state change would
 /// have raised, which is the whole point of it being a diff rather than a
 /// reload.
-pub fn serve_forever(socket: &Path, stage_file: Option<&Path>) -> std::io::Result<()> {
+///
+/// **It ends when its socket is gone** (wsp-778). The socket lives in the
+/// sandbox's directory, so a directory removed — `rm -rf` of a test's scratch
+/// dir, or a teardown that lost a race with one — leaves a fake answering
+/// nobody at a path nobody can reach, and ppid 1 for the rest of the boot: 167
+/// of them on 2026-11-25, load ~34. A fake whose socket is not its own any more
+/// (unlinked, or bound again by a newer one) has nothing left to serve.
+///
+/// **And when its tether dies**: `tether` is a pid (a test binary's, via
+/// `WSP_SANDBOX_TETHER`) whose death means nobody will ever tear this down —
+/// the run that was killed, or panicked past its `Drop`.
+pub fn serve_forever(socket: &Path, stage_file: Option<&Path>, tether: Option<u32>) -> std::io::Result<()> {
     let first = stage_file.and_then(read_stage).unwrap_or_default();
     let fake = Fake::bind(socket, first)?;
+    let ours = inode(socket);
     let mut stamp = stage_file.and_then(mtime);
+    let mut tick: u32 = 0;
     loop {
         std::thread::sleep(Duration::from_millis(250));
+        tick = tick.wrapping_add(1);
+        if ours.is_none() || inode(socket) != ours {
+            break;
+        }
+        // `kill -0` is a process each time, so every second rather than every tick.
+        if let Some(pid) = tether {
+            if tick % 4 == 0 && !tether_alive(pid) {
+                break;
+            }
+        }
         let Some(path) = stage_file else { continue };
         let now = mtime(path);
         if now != stamp {
@@ -2085,6 +2109,27 @@ pub fn serve_forever(socket: &Path, stage_file: Option<&Path>) -> std::io::Resul
             }
         }
     }
+    // A socket bound again is the newer fake's: dropping ours would unlink it.
+    if inode(socket) != ours {
+        std::mem::forget(fake);
+    }
+    Ok(())
+}
+
+/// The socket file's identity, so a path bound again by another fake is not
+/// mistaken for this one's.
+fn inode(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// Whether the tether is running. A `kill` that could not be asked reads as
+/// alive: a fake that outlives its run is the leak, one that dies under a live
+/// run is a failing test, and only the second would be news.
+fn tether_alive(pid: u32) -> bool {
+    use crate::host::Host;
+    crate::host::LOCAL.probe(pid).unwrap_or(true)
 }
 
 fn read_stage(path: &Path) -> Option<Stage> {

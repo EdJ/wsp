@@ -125,7 +125,7 @@ impl Sandbox {
         .into();
         bare(&outer).arg("init").output().unwrap();
         let name = format!("a{tag}");
-        let out = bare(&outer).args(["sandbox", "--fake", "--json", "--name", &name]).output().unwrap();
+        let out = bare(&outer).args(["sandbox", "--fake", "--json", "--name", &name]).env("WSP_SANDBOX_TETHER", std::process::id().to_string()).output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("sandbox json: {e}: {}", String::from_utf8_lossy(&out.stderr)));
         let env: BTreeMap<String, String> =

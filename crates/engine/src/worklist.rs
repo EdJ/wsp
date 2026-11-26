@@ -1981,12 +1981,12 @@ pub fn touched(store: &Store, members: &[String]) -> Touched {
         // entry in `landed` — the record is one entry per member, and an
         // absent entry would make the count drawn from it overstate coverage.
         let Some(task) = store.task_now(&repos.renamed, id) else {
-            out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
+            out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new(), no_commit: false });
             continue;
         };
         let trunks = task.project.as_deref().map(|p| repos.of(p)).unwrap_or_default();
         if trunks.is_empty() {
-            out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
+            out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new(), no_commit: false });
             continue;
         }
         // The branch is asked for under every name the task has had, in every
@@ -2017,14 +2017,27 @@ pub fn touched(store: &Store, members: &[String]) -> Touched {
             }
         }
         match &placed {
-            Some(commit) => out.landed.push(Landed { member: id.clone(), commit: Some(commit.clone()), files: files.iter().cloned().collect() }),
+            Some(commit) => out.landed.push(Landed {
+                member: id.clone(),
+                commit: Some(commit.clone()),
+                files: files.iter().cloned().collect(),
+                no_commit: false,
+            }),
+            // **Nothing to place, by its own account** (`wsp-777`): a measure,
+            // install or investigate row whose submission said it had nothing
+            // to land. The reflog has no land of it because there was none, and
+            // calling that unread put "could not be read back off the trunk" in
+            // front of daemon-ticks' last barrier over wsp-771, a sample.
+            None if crate::repair::landed_nothing(&task) => {
+                out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new(), no_commit: true });
+            }
             // The honest half, in both records: `unread` says it in words where
             // the report is printed, and `commit: None` says it in kind where
             // the record is kept — neither turns "we could not look" into "we
             // looked and it was clean".
             None => {
                 out.overlap.unread.push(id.clone());
-                out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new() });
+                out.landed.push(Landed { member: id.clone(), commit: None, files: Vec::new(), no_commit: false });
             }
         }
         for f in files {

@@ -835,7 +835,7 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
     // V2: nothing ahead is accepted and said.
     let nothing = c.tree.as_deref().is_some_and(|tree| matches!(crate::cmd_checkout::ready_from(store, &id, tree), Ok(None)));
     if nothing {
-        said.push("submit: nothing to land".into());
+        said.push(crate::repair::NOTHING_TO_LAND.into());
         if e.done_when.iter().flatten().any(|d| d.reason.contains('/') || d.reason.contains(".rs")) {
             eprintln!("  {}", Paint::new().yellow(&format!("{id}: the done-when cites a file while nothing is ahead of the trunk — committed?")));
         }

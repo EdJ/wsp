@@ -2800,7 +2800,7 @@ fn push_group_rows(
             // What `go` recorded at the barrier, in member counts — the same
             // numbers `wsp worklist show` draws as a line, read off the group
             // instead of out of git.
-            let placed = g.landed.iter().filter(|e| e.commit.is_some()).count();
+            let placed = g.landed.iter().filter(|e| e.accounted()).count();
             Barrier::Passed((!g.landed.is_empty()).then_some((placed, g.landed.len())))
         } else {
             Barrier::Ahead
