@@ -869,6 +869,63 @@ fn check_wait_cause(checks: &[(i64, i64, &Value)], secs: i64) -> String {
     format!("{CHECK_WAIT_CAUSE} ({} checks, {}{loads})", checks.len(), util::duration_human(secs))
 }
 
+/// Each verdict with the review its verifier was spawned by: the latest one
+/// since the verdict before that spawned one. A review typed again while the
+/// verifier read spawns none (`compound-react-122`: cr-fixes' group 1 booked
+/// its 291 s as nobody working). A verdict no spawned verifier gave has none.
+fn verifier_passes(i: &Inputs, reviews: &[i64], verdicts: &[i64]) -> Vec<(i64, i64)> {
+    let verify = format!("spawn {} --agent --verify", i.id);
+    let mut verdicts = verdicts.to_vec();
+    verdicts.sort_unstable();
+    verdicts.dedup();
+    let mut before = 0;
+    let mut out = Vec::new();
+    for v in verdicts {
+        let spawned = |x: &i64| i.first_line(x.saturating_sub(1), |l| l.starts_with(&verify)).is_some_and(|s| s <= v);
+        if let Some(r) = reviews.iter().copied().rev().filter(|x| *x <= v && *x > before).find(spawned) {
+            out.push((r, v));
+        }
+        before = v;
+    }
+    out
+}
+
+/// `t`, or the verdict of the pass `t` falls in: from a review to its verdict
+/// the row is the verifier's, so a wait that began at the review begins there
+/// (`wsp-587`: a blocked verifier's 515 s booked as the wait for the rework leg).
+fn past_pass(passes: &[(i64, i64)], t: i64) -> i64 {
+    passes.iter().find(|(r, v)| *r <= t && t < *v).map_or(t, |p| p.1)
+}
+
+/// Review → verifier → verdict, for the review at `r`.
+fn verifier_phases(i: &Inputs, r: i64, verdict: Option<i64>, out: &mut Vec<Phase>) {
+    let id = i.id.as_str();
+    let Some(s) = i.first_line(r.saturating_sub(1), |l| l.starts_with(&format!("spawn {id} --agent --verify"))) else { return };
+    // `wsp review` runs the row's own check before it spawns the verifier;
+    // the last `task-checked` between the two ends it.
+    let checked = i.kind("task-checked", id).into_iter().filter(|(t, _)| *t >= r && *t <= s).max_by_key(|(t, _)| *t);
+    match checked {
+        Some((c, event)) => {
+            out.push(Phase::work(format!("the row's own check (wsp check, run by review){}", check_start_note(event)), r, c));
+            if s > c {
+                out.push(Phase::gap("row's check ended → verifier spawn requested", c, s, wait_name(i, c, s, id)));
+            }
+        }
+        None => out.push(Phase::gap("review typed → verifier spawn requested", r, s, wait_name(i, r, s, id))),
+    }
+    // The seat's own first line, when its transcript was read; wsp's line
+    // is the fallback, and says it lags.
+    let first = i.verifiers.iter().map(|v| v.first).find(|f| *f >= s && verdict.is_none_or(|v| *f <= v));
+    let up = i.first_line(s, |l| l.contains(&format!("started {id} · verifying")));
+    let started = first.map(|f| (f, VERIFIER_START)).or(up.map(|u| (u, VERIFIER_START_LINE)));
+    if let Some((u, label)) = started {
+        out.push(Phase::work(label, s, u));
+        if let Some(v) = verdict {
+            out.push(Phase::work("verifier reads → verdict recorded (landed on a hold)", u, v));
+        }
+    }
+}
+
 /// The phases of a row, in time order.
 pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let id = i.id.as_str();
@@ -882,6 +939,8 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let released = i.kind("task-released", id).first().map(|(t, _)| *t).filter(|t| reviews.first().is_none_or(|r| t <= r));
     let released_last = i.kind("task-released", id).last().map(|(t, _)| *t);
     let learned = i.kind("session-learned", id).first().map(|(t, _)| *t);
+    let verdicts: Vec<i64> = i.kind("task-verified", id).into_iter().map(|(t, _)| t).collect();
+    let passes = verifier_passes(i, &reviews, &verdicts);
 
     // Spawn → the seat is up → its first request.
     let spawn = spawn_line(i);
@@ -913,6 +972,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     for (k, a) in seated.iter().enumerate().skip(1) {
         let prev = &seated[k - 1];
         let Some(from) = prev.review.or(prev.end) else { continue };
+        let from = past_pass(&passes, from).min(a.begin());
         let (label, why) = between_attempts(i, prev, a.claim);
         // A stretch after a review that held for the person is the person's step
         // (`wsp-311`): only what lies outside it stays rework.
@@ -971,6 +1031,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
         // The leg that ends the row ends with the review, not a `leg done`.
         let done_event = i.events.iter().find(|(t, k, d)| k == "leg-done" && d["id"] == id && d["leg"] == leg.name.as_str() && *t >= s);
+        ready = past_pass(&passes, ready).min(s);
         if ready > 0 && s > ready {
             // A review typed between two legs ran the row's own check, which
             // failed and sent the row back: that run is work, not a wait
@@ -1088,19 +1149,17 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     // The last review that a verdict followed: a row typed `wsp review` again
     // after it had landed (to say what it did for the barrier, say) has a later
     // review nothing verified.
-    let verdicts: Vec<i64> = i.kind("task-verified", id).into_iter().map(|(t, _)| t).collect();
     let review = reviews.iter().copied().rev().find(|r| verdicts.iter().any(|v| v >= r)).or_else(|| reviews.last().copied());
-    // A review typed again while the verifier read spawns none: the verifier is
-    // the earlier review's, back to the verdict before (`compound-react-122`:
-    // cr-fixes' group 1 booked its 291 s as nobody working).
-    let verify = format!("spawn {id} --agent --verify");
+    // The review its verifier was spawned by, where it was typed again since.
     let review = review.map(|r| {
-        let judged = verdicts.iter().copied().filter(|v| *v >= r).min();
-        let before = verdicts.iter().copied().filter(|v| *v < r).max().unwrap_or(0);
-        let spawned = |x: &i64| i.first_line(x.saturating_sub(1), |l| l.starts_with(&verify)).is_some_and(|s| judged.is_none_or(|v| s <= v));
-        reviews.iter().copied().rev().filter(|x| *x <= r && *x > before).find(spawned).unwrap_or(r)
+        let pass = match verdicts.iter().copied().filter(|v| *v >= r).min() {
+            Some(judged) => passes.iter().copied().find(|p| p.1 == judged),
+            // Still reading: no verdict stands between any review and this one.
+            None => verifier_passes(i, &reviews, &[i64::MAX]).first().copied(),
+        };
+        pass.map_or(r, |p| p.0)
     });
-    if let (Some(r), Some(e)) = (review, last_end) {
+    if let (Some(r), Some(e)) = (review, last_end.map(|e| past_pass(&passes, e))) {
         if r > e {
             let finishing = || "the row's own seat finishing (not wsp)".to_string();
             match capped_reopen(i, e, r).filter(|(at, end, _)| end > at) {
@@ -1120,33 +1179,12 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
     }
     let verdict = verdicts.iter().copied().find(|t| review.is_none_or(|r| *t >= r));
+    // Every earlier verifier too: one that blocked ran before the rework.
+    for (r, v) in passes.iter().copied().filter(|(r, _)| review != Some(*r)) {
+        verifier_phases(i, r, Some(v), &mut out);
+    }
     if let Some(r) = review {
-        let spawned = i.first_line(r.saturating_sub(1), |l| l.starts_with(&verify));
-        let up = spawned.and_then(|s| i.first_line(s, |l| l.contains(&format!("started {id} · verifying"))));
-        if let Some(s) = spawned {
-            // `wsp review` runs the row's own check before it spawns the verifier;
-            // the last `task-checked` between the two ends it.
-            let checked = i.kind("task-checked", id).into_iter().filter(|(t, _)| *t >= r && *t <= s).max_by_key(|(t, _)| *t);
-            match checked {
-                Some((c, event)) => {
-                    out.push(Phase::work(format!("the row's own check (wsp check, run by review){}", check_start_note(event)), r, c));
-                    if s > c {
-                        out.push(Phase::gap("row's check ended → verifier spawn requested", c, s, wait_name(i, c, s, id)));
-                    }
-                }
-                None => out.push(Phase::gap("review typed → verifier spawn requested", r, s, wait_name(i, r, s, id))),
-            }
-            // The seat's own first line, when its transcript was read; wsp's line
-            // is the fallback, and says it lags.
-            let first = i.verifiers.iter().map(|v| v.first).find(|f| *f >= s && verdict.is_none_or(|v| *f <= v));
-            let started = first.map(|f| (f, VERIFIER_START)).or(up.map(|u| (u, VERIFIER_START_LINE)));
-            if let Some((u, label)) = started {
-                out.push(Phase::work(label, s, u));
-                if let Some(v) = verdict {
-                    out.push(Phase::work("verifier reads → verdict recorded (landed on a hold)", u, v));
-                }
-            }
-        }
+        verifier_phases(i, r, verdict, &mut out);
     }
     if let Some(v) = verdict {
         if let Some(e) = i.first_line(v, |l| l.starts_with("ended ") && l.contains(&format!("which verified {id}"))) {
@@ -2575,7 +2613,7 @@ pub(crate) fn fixed_of(i: &Inputs, phases: &[Phase]) -> (Option<i64>, Option<i64
         _ => None,
     };
     // Only a phase that ends at the seat's own first line is that figure.
-    let verifier = phases.iter().find(|p| p.label == VERIFIER_START).map(|p| p.seconds());
+    let verifier = phases.iter().rev().find(|p| p.label == VERIFIER_START).map(|p| p.seconds());
     let held = holds_after_verdict(i, phases).into_iter().map(|(_, s)| s).max();
     (member, verifier, i.verifiers.iter().map(|v| v.test_secs).sum(), held)
 }
@@ -3255,6 +3293,37 @@ mod tests {
         i.events.push(ev(5000, "task-released", json!({"id": "r-1"})));
         let ph = build(&i);
         assert!(holds_after_verdict(&i, &ph).iter().all(|(seat, _)| seat.starts_with("verifier") || seat == "the verifier"), "{:?}", holds_after_verdict(&i, &ph));
+    }
+
+    /// `wsp-587`: a verifier blocked, and the rework leg it added ran after it.
+    /// Its run is the verifier's work; the wait for the leg starts at the verdict.
+    #[test]
+    fn an_earlier_verifier_that_blocked_is_work_and_the_rework_leg_waits_from_its_verdict() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k == "task-claimed");
+        i.events.extend([
+            ev(305, "task-review", json!({"id": "r-1"})),
+            ev(820, "task-verified", json!({"id": "r-1", "verdict": "blocks"})),
+            ev(900, "task-review", json!({"id": "r-1"})),
+            ev(980, "task-verified", json!({"id": "r-1", "verdict": "holds"})),
+        ]);
+        i.cycle.extend([
+            (830, "list group 1: starting leg rework of r-1".to_string()),
+            (901, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (905, "list group 1: started r-1 · verifying".to_string()),
+        ]);
+        i.legs.push(LegIn { name: "rework".into(), after: vec!["a".into()], ..Default::default() });
+        let ph = build(&i);
+        let reads: Vec<(i64, i64)> = ph.iter().filter(|p| p.label.starts_with("verifier reads")).map(|p| (p.start, p.end)).collect();
+        assert_eq!(reads, vec![(310, 820), (905, 980)], "{ph:#?}");
+        assert!(!ph.iter().any(|p| p.gap && p.start < 820 && p.end > 306), "no wait inside the first verifier's run: {ph:#?}");
+        let wait = ph.iter().find(|p| p.label == "gap before leg rework").expect("named");
+        assert_eq!((wait.start, wait.end), (820, 830));
+        // With no leg to run the rework, the wait for the next review too.
+        i.legs.pop();
+        let ph = build(&i);
+        assert!(!ph.iter().any(|p| p.gap && p.start < 820 && p.end > 306), "{ph:#?}");
+        assert!(ph.iter().any(|p| p.label == "after the last leg → review typed" && (p.start, p.end) == (820, 900)), "{ph:#?}");
     }
 
     /// compounding-114 and 117: reviewed, verified, then reviewed again (a fix
