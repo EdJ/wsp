@@ -10,7 +10,8 @@
 //! **The rule**, read off the disk by the daemon's tick so it reaches a row
 //! however its agent went: the row is at `review` or `done`, holds no claim,
 //! nobody is standing in the tree (a verifier stands in its member's tree), and
-//! the tree's branch has nothing the trunk lacks — the work is landed. The row's
+//! the tree's branch has nothing the trunk lacks, or its row records the tip as
+//! merged (a squash or rebase merge) — the work is landed. The row's
 //! own tree and its legs' trees (`<row>.<leg>`) are taken alike.
 //!
 //! **Until settled** (`wsp-341`): a member of a group wsp runs lands inside its
@@ -87,12 +88,12 @@ pub fn sweep(store: &Store, busy: &dyn Fn(&str, &Path) -> Option<String>) -> Vec
 }
 
 /// Why the tree at `dir` is not landed, or `None` when its branch holds nothing
-/// the trunk has not got.
+/// the trunk has not got, by [`cmd_checkout::unlanded`]'s reading.
 fn unlanded(repo: &Path, dir: &Path) -> Option<String> {
     let trunk: PathBuf = cmd_checkout::trunk(repo)?;
     let Some(onto) = cmd_checkout::trunk_branch(&trunk) else { return Some("the trunk is on a detached HEAD".into()) };
     let Some(branch) = cmd_checkout::trunk_branch(dir) else { return Some("the tree is on a detached HEAD".into()) };
-    let commits = cmd_checkout::ahead(&trunk, &onto, &branch);
+    let commits = cmd_checkout::unlanded(&trunk, &onto, &branch);
     (!commits.is_empty()).then(|| format!("its branch {branch} has {} commit(s) {onto} has not — not landed", commits.len()))
 }
 
@@ -273,6 +274,42 @@ mod tests {
         run(&repo, &["merge", "--quiet", "--ff-only", "p-001"]);
         assert!(matches!(sweep(&store, &free).as_slice(), [Build::Dropped { .. }]));
         assert!(!row.join("target").exists() && stranger.join("target").exists());
+    }
+
+    /// A by-merge row squash-merged: the tip stays off the trunk, and the
+    /// landing line's note is what says it landed — up to that tip only.
+    #[test]
+    fn a_squash_merged_by_merge_row_loses_its_build_output_on_its_landing_note() {
+        let (_env, store, repo) = scratch("squashed", Status::Review);
+        let mut p = store.project("p").unwrap();
+        p.lands = crate::lands::BY_MERGE.into();
+        store.save_project(&p).unwrap();
+        let row = tree_with_build(&repo, "p-001");
+        let commit = |file: &str| {
+            std::fs::write(row.join(file), "work\n").unwrap();
+            run(&row, &["add", file]);
+            run(&row, &["commit", "--quiet", "-m", file]);
+        };
+        commit("work.txt");
+        run(&repo, &["merge", "--quiet", "--squash", "p-001"]);
+        run(&repo, &["commit", "--quiet", "-m", "squashed PR"]);
+        let kept = || match sweep(&store, &free).as_slice() {
+            [Build::Kept { why, .. }] => assert!(why.contains("not landed"), "{why}"),
+            _ => panic!("expected the tree kept as not landed"),
+        };
+        kept();
+
+        let out = Command::new("git").arg("-C").arg(&row).args(["rev-parse", "HEAD"]).output().unwrap();
+        let tip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut t = store.task("p-001").unwrap();
+        t.log(&format!("{} abc on master · since def {} {tip}", crate::log::LANDED, crate::lands::MERGED));
+        store.save_task(&t).unwrap();
+
+        commit("more.txt");
+        kept();
+        run(&row, &["reset", "--quiet", "--hard", &tip]);
+        assert!(matches!(sweep(&store, &free).as_slice(), [Build::Dropped { .. }]));
+        assert!(!row.join("target").exists());
     }
 
     /// `done` rows too: `wsp done` keeps a tree it cannot take, and its build

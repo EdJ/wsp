@@ -1599,6 +1599,11 @@ pub fn verified_by_a_run(store: &Store, task: &str) -> bool {
 /// Through `Store::task_now` for the reason `touched` is: expanding a
 /// renumbering needs the *current* id, and the worklist's older name expands to
 /// nothing and would answer about a repository the work is not in.
+///
+/// **`ahead()`, not `cmd_checkout::unlanded`.** A squash-merged tip is not a
+/// commit on the trunk, so there is none to answer with; and the "· merged" note
+/// that would cover it is on a landing line, which the one caller
+/// (`repair`'s unrecorded landing) already passes the row by for.
 pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
     let mut repos = Repos::new(store);
     let task = store.task_now(&repos.renamed, id)?;

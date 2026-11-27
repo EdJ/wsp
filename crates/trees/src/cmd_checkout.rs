@@ -745,8 +745,9 @@ pub fn strays(repo: &Path, whose: &dyn Fn(&str) -> Whose) -> Vec<Stray> {
 
 /// [`ahead`], less a branch whose tip a landing line on its row covers: a PR
 /// merged by squash or rebase leaves the tip off the trunk (`wsp-513`). The
-/// stale and gc decisions ask this; a commit past that tip is work again.
-fn unlanded(repo: &Path, onto: &str, branch: &str) -> Vec<String> {
+/// stale and gc decisions ask this, as do [`holding`] and the build-output
+/// sweep; a commit past that tip is work again.
+pub fn unlanded(repo: &Path, onto: &str, branch: &str) -> Vec<String> {
     let commits = ahead(repo, onto, branch);
     if !commits.is_empty() && merged_by_note(repo, branch) {
         return Vec::new();
@@ -2416,7 +2417,7 @@ fn holding(w: &Where, by_a_run: bool, ready: Option<&str>) -> Vec<String> {
         out.push(format!("uncommitted work in {} — `wsp commit-help` first", util::contract(&w.dir)));
     }
     if let Some(branch) = w.on() {
-        match ahead(&w.trunk, &w.branch, &branch).len() {
+        match unlanded(&w.trunk, &w.branch, &branch).len() {
             0 => {}
             n => out.push(match (by_a_run, ready) {
                 (true, Some(sha)) => format!("{} not on {} — ready at {}; a verifier lands it", n_commits(n), w.branch, &sha[..sha.len().min(10)]),
@@ -4878,10 +4879,20 @@ mod tests {
 
         assert!(stale(&dir, &|_| false, &passed).is_empty(), "no note: the branch still holds work");
         assert_eq!(foresee(&dir, &tree, "master").kept.as_deref(), Some("p-001"));
+        let warned = || holding(&pick(vec![dir.clone()], "p-001").unwrap(), false, None);
+        assert_eq!(warned(), ["1 commit not on master — `wsp land p-001`?"]);
 
         let mut t = store.find_task("p-001").unwrap();
         t.log(&format!("{} abc on master · since def {} {tip}", crate::log::LANDED, crate::lands::MERGED));
         store.save_task(&t).unwrap();
+
+        assert!(warned().is_empty(), "a squash-merged tip was warned about: {:?}", warned());
+        // A commit past the noted tip is work again.
+        std::fs::write(tree.join("more.txt"), "more\n").unwrap();
+        run(&tree, &["add", "."]);
+        run(&tree, &["commit", "--quiet", "-m", "more"]);
+        assert_eq!(warned(), ["2 commits not on master — `wsp land p-001`?"]);
+        run(&tree, &["reset", "--quiet", "--hard", &tip]);
 
         let found = stale(&dir, &|_| false, &passed);
         assert_eq!(found.iter().map(|s| s.why).collect::<Vec<_>>(), [Why::Landed]);
