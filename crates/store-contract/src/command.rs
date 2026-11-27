@@ -257,6 +257,12 @@ pub enum Command {
         user: UserName,
         member: bool,
     },
+    /// Make an active user a hub admin (`admin: true`) or not. Setting what
+    /// is, is an empty decision; clearing the last active admin is `illegal`.
+    /// Added after the six above: a hub that does not run it answers
+    /// `unsupported`, and an older reader decodes it as an unknown verb.
+    #[serde(rename = "hub.user.admin")]
+    HubUserAdmin { name: UserName, admin: bool },
     /// Step 1's projection (the module docs): each of `put` is now this, and
     /// each of `gone` is no more. Not fenced; only the mirror domain decides it.
     #[serde(rename = "mirror")]

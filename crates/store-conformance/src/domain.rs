@@ -324,7 +324,7 @@ impl Domain for TestDomain {
                 let state = state.orders.get(order).map(|o| wire!(&o.state)).unwrap_or_default();
                 return Err(Refusal::Illegal { subject: Subject::Order(order.clone()), state, verb: verb(cmd) });
             }
-            Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } => {
+            Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } | Command::HubUserAdmin { name, .. } => {
                 return Err(Refusal::Illegal {
                     subject: Subject::User(name.clone()),
                     state: String::new(),

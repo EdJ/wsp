@@ -32,3 +32,6 @@
 {"type":"request","v":1,"id":32,"by":"person:ann","verb":"seat.teleport","args":{"seat":"cpd-1","to":"moon"}}
 {"type":"request","v":1,"id":33,"by":"person:ann","verb":"refs.retire","args":{"workspace":"shared:team","subject":{"row":"inbox-001"},"from":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a","successor":{"row":"wsp-071"}}}
 {"type":"request","v":1,"id":34,"by":"person:ann","verb":"refs.retire","args":{"workspace":"shared:team","subject":{"row":"wsp-071"},"from":"sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"}}
+{"type":"request","v":1,"id":35,"by":"person:ann","verb":"hub.info","args":{}}
+{"type":"request","v":1,"id":36,"key":"k-36","by":"person:ann","verb":"hub.user.admin","args":{"name":"bo","admin":true}}
+{"type":"request","v":1,"id":37,"by":"person:ann","verb":"lease.release","args":{"row":"wsp-071","token":7,"workspace":"shared:team","admin":true}}

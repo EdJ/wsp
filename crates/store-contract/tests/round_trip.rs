@@ -69,7 +69,7 @@ fn ed() -> Principal {
     Principal::Person("ed".into())
 }
 
-const COMMANDS: usize = 31;
+const COMMANDS: usize = 32;
 
 fn command(c: &Command) -> (usize, &'static str) {
     match c {
@@ -104,6 +104,7 @@ fn command(c: &Command) -> (usize, &'static str) {
         Command::HubTokenRevoke { .. } => (28, "hub.token.revoke"),
         Command::HubWorkspaceAdd { .. } => (29, "hub.workspace.add"),
         Command::HubMemberSet { .. } => (30, "hub.member.set"),
+        Command::HubUserAdmin { .. } => (31, "hub.user.admin"),
     }
 }
 
@@ -246,6 +247,14 @@ fn commands() -> Vec<Command> {
             user: UserName("ann".into()),
             member: true,
         },
+        Command::HubUserAdmin {
+            name: UserName("bo".into()),
+            admin: true,
+        },
+        Command::HubUserAdmin {
+            name: UserName("bo".into()),
+            admin: false,
+        },
     ]
 }
 
@@ -289,7 +298,7 @@ fn every_command_round_trips_under_its_verb() {
     });
 }
 
-const EVENT_KINDS: usize = 57;
+const EVENT_KINDS: usize = 58;
 
 fn event_kind(k: &EventKind) -> (usize, &'static str) {
     use EventKind::*;
@@ -351,6 +360,7 @@ fn event_kind(k: &EventKind) -> (usize, &'static str) {
         RefMoved => (54, "ref.moved"),
         LeaseExpired => (55, "lease.expired"),
         RefRetired => (56, "ref.retired"),
+        HubUserAdminSet => (57, "hub.user.admin_set"),
     }
 }
 
@@ -415,6 +425,7 @@ fn every_event_kind_round_trips_under_its_name() {
         RefMoved,
         LeaseExpired,
         RefRetired,
+        HubUserAdminSet,
     ];
     table(&kinds, EVENT_KINDS, event_kind, as_str);
     // A newer writer's kind reads as Unknown.

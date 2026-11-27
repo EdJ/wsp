@@ -20,7 +20,7 @@ use wsp_api as api;
 use wsp_hub_protocol as p;
 use wsp_hub_protocol::{
     Answer, ApiToken, Blob, Call, Code, Failure, Frame, Hello, HubMessage, IdentityCommand, IdsAlloc, LeaseHold,
-    LeaseTake, Login, LoginDone, LoginPrompt, Move, MsgSend, NoArgs, Outcome, RefMove, RefRetire, Refused, Reply, ReqId,
+    LeaseRelease, LeaseTake, Login, LoginDone, LoginPrompt, Move, MsgSend, NoArgs, Outcome, RefMove, RefRetire, Refused, Reply, ReqId,
     Request, SyncCall, Verb, Welcome,
 };
 use wsp_objects::{ObjectId, Refs, WorkspaceId};
@@ -267,8 +267,8 @@ fn every_frame_type_is_todays_bytes() {
 
 // ---------------------------------------------------------------- verbs
 
-const VERBS: usize = 4;
-const COMMANDS: usize = 6;
+const VERBS: usize = 5;
+const COMMANDS: usize = 7;
 const SYNCS: usize = 13;
 const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
 
@@ -278,6 +278,7 @@ fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
         Verb::Events { .. } => (1, "events"),
         Verb::Subscribe(_) => (2, "subscribe"),
         Verb::Whoami(_) => (3, "whoami"),
+        Verb::HubInfo(_) => (4, "hub.info"),
     }
 }
 
@@ -289,6 +290,7 @@ fn command_ordinal(c: &IdentityCommand) -> (usize, &'static str) {
         IdentityCommand::HubTokenRevoke { .. } => (3, "hub.token.revoke"),
         IdentityCommand::HubWorkspaceAdd { .. } => (4, "hub.workspace.add"),
         IdentityCommand::HubMemberSet { .. } => (5, "hub.member.set"),
+        IdentityCommand::HubUserAdmin { .. } => (6, "hub.user.admin"),
     }
 }
 
@@ -370,7 +372,7 @@ fn requests() -> Vec<Frame> {
         SyncCall::Alloc(IdsAlloc { workspace: ws(), project: "wsp".into(), n: 1, past: None }),
         SyncCall::LeaseTake(LeaseTake { workspace: ws(), row: row() }),
         SyncCall::LeaseRenew(LeaseHold { row: row(), token: Token(3) }),
-        SyncCall::LeaseRelease(LeaseHold { row: RowId("drive:wsp-list".into()), token: Token(3) }),
+        SyncCall::LeaseRelease(LeaseRelease::own(RowId("drive:wsp-list".into()), Token(3))),
         SyncCall::MsgSend(MsgSend {
             to: "seat:wsp-071".into(),
             from: "seat:wsp-470".into(),
@@ -395,6 +397,11 @@ fn requests() -> Vec<Frame> {
         successor: Some(Subject::Row(row())),
     })));
     out.push(Call::Sync(SyncCall::Retire(RefRetire { workspace: ws(), subject: Subject::Row(row()), from: an_id(2), successor: None })));
+    // The hub's b5c19f9 additions, after the frames frozen before them: `hub.info`,
+    // `hub.user.admin`, and an admin's `lease.release`.
+    out.push(Call::Verb(Verb::HubInfo(NoArgs {})));
+    out.push(Call::Command(IdentityCommand::HubUserAdmin { name: UserName("bo".into()), admin: true }));
+    out.push(Call::Sync(SyncCall::LeaseRelease(LeaseRelease { row: row(), token: Token(7), workspace: Some(ws()), admin: true })));
     out.into_iter().enumerate().map(|(i, c)| request(i as u64 + 1, c)).collect()
 }
 
@@ -427,15 +434,22 @@ fn the_verb_tables_are_the_variants_and_todays() {
             }
         }
     }
-    reads.dedup();
-    commands.dedup();
-    syncs.dedup();
+    // Each name once, in the order first met: the b5c19f9 frames come after the ones frozen before.
+    let once = |v: &mut Vec<&str>| {
+        let mut seen = BTreeSet::new();
+        v.retain(|n| seen.insert(*n));
+    };
+    once(&mut reads);
+    once(&mut commands);
+    once(&mut syncs);
     assert_eq!(reads, p::READ_VERBS);
     assert_eq!(commands, p::COMMAND_VERBS);
     assert_eq!(syncs, p::SYNC_VERBS);
     assert_eq!((p::READ_VERBS.len(), p::COMMAND_VERBS.len(), p::SYNC_VERBS.len()), (VERBS, COMMANDS, SYNCS));
-    assert!(p::READ_VERBS.iter().all(|v| api::READ_VERBS.contains(v)));
-    assert!(p::COMMAND_VERBS.iter().all(|v| api::COMMAND_VERBS.contains(v)));
+    // Of the reads and commands, all but the hub's own later additions (`hub.info`,
+    // `hub.user.admin`, which the state core's API never had) are the state core's.
+    assert!(p::READ_VERBS.iter().filter(|v| **v != "hub.info").all(|v| api::READ_VERBS.contains(v)));
+    assert!(p::COMMAND_VERBS.iter().filter(|v| **v != "hub.user.admin").all(|v| api::COMMAND_VERBS.contains(v)));
     // The state core's API has no sync verb: they are the hub's alone, spelled as the hub serves them.
     assert!(p::SYNC_VERBS.iter().all(|v| !api::READ_VERBS.contains(v) && !api::COMMAND_VERBS.contains(v)));
     assert_eq!(
@@ -446,7 +460,7 @@ fn the_verb_tables_are_the_variants_and_todays() {
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 17;
+const ANSWERS: usize = 18;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply { outcome: Outcome::Ok(a), .. }) = f else { panic!("not an ok reply: {f:?}") };
@@ -468,6 +482,7 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Messages(_) => (14, "messages"),
         Answer::Acked { .. } => (15, "acked"),
         Answer::Retired { .. } => (16, "retired"),
+        Answer::Info(_) => (17, "info"),
     }
 }
 
@@ -496,15 +511,15 @@ fn a_message(seat: Option<&str>, re: Option<&str>) -> HubMessage {
 
 fn answers() -> Vec<Frame> {
     vec![
-        ok(1, Answer::State { state: a_state(), at: EventId(411) }, vec![]),
-        ok(2, Answer::State { state: State::default(), at: EventId(0) }, vec![]),
+        ok(1, Answer::State { state: a_state(), at: EventId(411), lease_machines: BTreeMap::new() }, vec![]),
+        ok(2, Answer::State { state: State::default(), at: EventId(0), lease_machines: BTreeMap::new() }, vec![]),
         ok(3, Answer::Events { events: events(), head: EventId(411), through: EventId(405) }, vec![]),
         // The keep-alive's answer: no event.
         ok(4, Answer::Events { events: vec![], head: EventId(411), through: EventId(400) }, vec![]),
         ok(5, Answer::Subscribed, vec![]),
         ok(6, Answer::Applied, vec![412, 413]),
         ok(7, Answer::Applied, vec![]),
-        ok(8, Answer::Whoami { by: ann(), server: "wsp-hub".into() }, vec![]),
+        ok(8, Answer::Whoami { by: ann(), server: "wsp-hub".into(), admin: None }, vec![]),
         ok(9, Answer::Heads(refs()), vec![]),
         ok(10, Answer::Heads(Refs::new(ws())), vec![]),
         ok(11, Answer::Missing(vec![an_id(2)]), vec![]),
@@ -524,6 +539,43 @@ fn answers() -> Vec<Frame> {
         ok(25, Answer::Heads(retired_refs()), vec![]),
         ok(26, Answer::Retired { subject: Subject::Row(RowId("inbox-001".into())), successor: Some(Subject::Row(row())) }, vec![]),
         ok(27, Answer::Retired { subject: Subject::Row(row()), successor: None }, vec![]),
+        // The hub's b5c19f9 additions: a lease's machine in `state`, `whoami`'s `admin`, `hub.info`.
+        ok(
+            28,
+            Answer::State {
+                state: a_state(),
+                at: EventId(411),
+                lease_machines: [(LeaseName("hubrow:[\"shared:team\",\"wsp-071\"]".into()), p::Machine { id: "m-1".into(), name: "box-a".into() })].into(),
+            },
+            vec![],
+        ),
+        ok(29, Answer::Whoami { by: ann(), server: "wsp-hub".into(), admin: Some(true) }, vec![]),
+        ok(
+            30,
+            Answer::Info(p::HubInfo {
+                version: "0.1.0".into(),
+                protocol: 1,
+                server: "wsp-hub".into(),
+                quotas: p::HubQuotas {
+                    max_object_bytes: 1,
+                    max_objects_per_put: 2,
+                    max_workspace_bytes: 3,
+                    max_message_bytes: 4,
+                    max_queue: 5,
+                    max_login_tokens: 6,
+                    max_refs_per_workspace: 7,
+                    max_id_advance: 8,
+                },
+                event_days: 90,
+                lease_secs: 600,
+                sweep_secs: 30,
+                max_connections: 256,
+                max_connections_per_peer: 16,
+                login: Some(p::HubLogin { method: "github".into(), token_days: 30 }),
+                usage: vec![p::WorkspaceUsage { workspace: ws(), bytes: 1024, refs: 3 }],
+            }),
+            vec![],
+        ),
     ]
 }
 
@@ -693,7 +745,9 @@ fn the_state_cores_other_verbs_are_unknown_here_and_keep_their_id() {
         let line = format!(r#"{{"type":"request","v":1,"id":{n},"by":"person:ann","verb":"{verb}","args":{{"row":"wsp-1"}}}}"#);
         assert_eq!(unknown(&line), (n, verb.to_string(), json!({ "row": "wsp-1" })), "{verb}");
     }
-    assert_eq!(n as usize, api::READ_VERBS.len() - p::READ_VERBS.len() + api::COMMAND_VERBS.len() - p::COMMAND_VERBS.len());
+    // `hub.info` is the hub's alone: not in the state core's reads.
+    let shared = |ours: &[&str], theirs: &[&str]| ours.iter().filter(|v| theirs.contains(v)).count();
+    assert_eq!(n as usize, api::READ_VERBS.len() - shared(p::READ_VERBS, api::READ_VERBS) + api::COMMAND_VERBS.len() - shared(p::COMMAND_VERBS, api::COMMAND_VERBS));
 
     // Frames today's wsp-api writes for two of them, whole.
     let rows = api::Frame::Request(api::Request {

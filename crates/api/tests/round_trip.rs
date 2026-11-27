@@ -281,7 +281,7 @@ fn every_frame_type_round_trips() {
 
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 18;
-const COMMANDS: usize = 31;
+const COMMANDS: usize = 32;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
@@ -340,6 +340,7 @@ fn command_ordinal(c: &Command) -> (usize, &'static str) {
         Command::HubTokenRevoke { .. } => (28, "hub.token.revoke"),
         Command::HubWorkspaceAdd { .. } => (29, "hub.workspace.add"),
         Command::HubMemberSet { .. } => (30, "hub.member.set"),
+        Command::HubUserAdmin { .. } => (31, "hub.user.admin"),
     }
 }
 
@@ -542,6 +543,10 @@ fn requests() -> Vec<Frame> {
             workspace: SharedName("acme".into()),
             user: UserName("ann".into()),
             member: true,
+        },
+        Command::HubUserAdmin {
+            name: UserName("ann".into()),
+            admin: true,
         },
     ];
     let mut out: Vec<Call> = vec![];
