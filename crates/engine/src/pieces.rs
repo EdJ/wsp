@@ -142,6 +142,12 @@ pub struct Piece {
 }
 
 impl Piece {
+    /// The seat this entry may still end. Not one whose ending is written: that
+    /// id may be another seat's by now (`wsp-945`, [`crate::cycle::retire_endings`]).
+    pub fn held_seat(&self) -> Option<&str> {
+        self.pane.as_deref().filter(|_| self.ending != crate::verification::Ending::Ended)
+    }
+
     pub fn pending(n: usize, title: &str, batch: usize) -> Piece {
         Piece {
             n,

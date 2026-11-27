@@ -171,6 +171,12 @@ pub fn policy_line(p: &Policy) -> String {
 }
 
 impl Leg {
+    /// The seat this entry may still end. Not one whose ending is written: that
+    /// id may be another seat's by now (`wsp-945`, [`crate::cycle::retire_endings`]).
+    pub fn held_seat(&self) -> Option<&str> {
+        self.pane.as_deref().filter(|_| self.ending != crate::verification::Ending::Ended)
+    }
+
     /// A pending leg on the default tier.
     pub fn pending(name: &str, order: &str) -> Leg {
         Leg {
@@ -1379,7 +1385,7 @@ fn cmd_reset(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     if leg.state != State::Running {
         return refuse(format!("{name} is {}, and only a running leg can be reset", leg.state.as_str()));
     }
-    if let Some(seat) = &leg.pane {
+    if let Some(seat) = leg.held_seat() {
         let fleet = crate::cycle::seats();
         let there = !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty));
         if there && !args.has("force") {

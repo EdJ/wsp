@@ -3001,8 +3001,10 @@ pub fn end_due(ending: &crate::verification::Ending, seats: &dyn Seats, seat: &s
 }
 
 /// `seat` has just been opened, so an ending still owed under that id was an
-/// earlier occupant's: written `ended` on every leg, piece and pass naming it,
-/// and not carried out. A backend that lost its counter hands ids out again,
+/// earlier occupant's: written `ended` on every leg, piece, pass and barrier
+/// check naming it, its accepted exit's record forgotten, and none of it carried
+/// out. A leg or piece still naming the id keeps it, and `ended` is what stops a
+/// reset ending the seat (`wsp-945`, [`crate::legs::Leg::held_seat`]). A backend that lost its counter hands ids out again,
 /// and a tick that retried such an ending despawned whoever held the id by then
 /// (`wsp-935`: cpd-388, -390 and -393 each took a live barrier check with
 /// them). Every path that opens a seat calls this **before** the new seat is
@@ -3051,6 +3053,11 @@ pub fn retire_endings(store: &Store, seat: &str) {
             if !parts.is_empty() && store.save_task(&row).is_ok() {
                 dropped.extend(parts.into_iter().map(|part| format!("{part} of {}", row.id)));
             }
+        }
+        dropped.extend(crate::barrier::retire(store, seat));
+        if crate::ending::exit_owns(store).contains(seat) {
+            crate::ending::forget_exit(store, seat);
+            dropped.push("an accepted exit".to_string());
         }
         dropped
     });
@@ -3354,7 +3361,7 @@ pub fn piece_start_failed(store: &Store, w: Option<&Worklist>, row: &str, n: usi
     let seat = store
         .find_task(row)
         .and_then(|t| crate::pieces::record(&t).pieces.into_iter().find(|p| p.n == n))
-        .and_then(|p| p.pane);
+        .and_then(|p| p.held_seat().map(str::to_string));
     let ended = match &seat {
         Some(seat) => match despawn_seat(seat) {
             Ok(()) => format!("{seat} was ended"),
@@ -4784,7 +4791,7 @@ pub fn leg_start_failed(store: &Store, w: Option<&Worklist>, row: &str, name: &s
     let seat = store
         .find_task(row)
         .and_then(|t| crate::legs::legs(&t).into_iter().find(|l| l.name == name))
-        .and_then(|l| l.pane);
+        .and_then(|l| l.held_seat().map(str::to_string));
     let ended = match &seat {
         Some(seat) => match despawn_seat(seat) {
             Ok(()) => format!("{seat} was ended"),
@@ -10909,6 +10916,95 @@ fn only_a_working_screen_is_ever_overruled() {
         let cwd = cwd.display().to_string();
         let stand = crate::leg_seat::Standing { room: None, cwd: Some(&cwd), kind: "claude" };
         assert!(crate::leg_seat::attach(store, id, name, seat, &stand), "{name} was not open to seat");
+    }
+
+    /// `wsp-945`: a barrier check entry naming a pane id that is handed out
+    /// again. Neither a check that never came up nor a settled one ends the seat
+    /// holding the id now, and the open one's group gets a check of its own.
+    #[test]
+    fn a_barrier_check_owed_to_an_earlier_occupant_of_a_pane_id_does_not_despawn_the_one_that_holds_it_now() {
+        let (_env, store, w) = barrier_open("reused-check");
+        check_seated(&store, 1, "cpd-1");
+        let _ = drained(&ENDED);
+
+        retire_endings(&store, "cpd-1");
+
+        check_start_failed(&store, &w, 1, "never ready");
+        assert!(drained(&ENDED).is_empty(), "the seat holding cpd-1 now is left alone");
+
+        check_seated(&store, 1, "cpd-1");
+        crate::barrier::settle(&store, "run", 1, crate::barrier::State::Holds);
+        retire_endings(&store, "cpd-1");
+        assert!(checks_finished(&store, &Blind).is_empty());
+        assert!(drained(&ENDED).is_empty(), "nor by the tick");
+        assert_eq!(checks(&store, 1)[0].ending, crate::barrier::Ending::Ended);
+    }
+
+    #[test]
+    fn an_open_check_whose_pane_id_was_handed_out_again_is_replaced() {
+        let (_env, store, w) = barrier_open("reused-open-check");
+        check_seated(&store, 1, "cpd-1");
+        let _ = spawned();
+        retire_endings(&store, "cpd-1");
+        step(&store, &w, &Fixed::new(&[("cpd-1", State::Working)]));
+        assert_eq!(spawned().len(), 1, "the run does not wait on the seat holding cpd-1 now");
+        assert_eq!(checks(&store, 1)[0].state, crate::barrier::State::Abandoned);
+    }
+
+    /// `wsp-945`: an accepted exit's record under a pane id handed out again is
+    /// forgotten, so neither the tick nor its `Stop` helper ends the new seat.
+    #[test]
+    fn an_accepted_exit_of_an_earlier_occupant_of_a_pane_id_does_not_despawn_the_one_that_holds_it_now() {
+        struct Untouched;
+        impl Seats for Untouched {
+            fn state(&self, _seat: &str) -> Option<State> {
+                Some(State::Idle)
+            }
+            fn turn_began_since(&self, _store: &Store, _seat: &str, _since: i64) -> Option<bool> {
+                Some(false)
+            }
+            fn pids(&self, _seat: &str) -> Option<Vec<u32>> {
+                Some(vec![1])
+            }
+            fn running(&self, _pids: &[u32]) -> Vec<u32> {
+                Vec::new()
+            }
+        }
+        let (_env, store) = scratch("reused-exit");
+        task(&store, "m-1", Status::Review);
+        crate::ending::exited(&store, "cpd-1", "m-1", "member");
+        let _ = drained(&ENDED);
+
+        retire_endings(&store, "cpd-1");
+
+        assert!(crate::ending::end_exit(&store, &Untouched, "cpd-1").is_none());
+        assert!(drained(&ENDED).is_empty(), "the seat holding cpd-1 now is left alone");
+        assert!(crate::ending::exit_owns(&store).is_empty(), "so its own exit is recorded afresh");
+    }
+
+    /// `wsp-945`: a leg and a piece still naming a pane id handed out again are
+    /// reset without ending the seat, or dropping the binding, now under it.
+    #[test]
+    fn a_leg_or_piece_reset_after_its_pane_id_is_handed_out_again_does_not_despawn_the_one_that_holds_it_now() {
+        let (_env, store) = scratch("reused-reset");
+        staged(&store, "m-1", Status::Todo);
+        pieced(&store, "m-2", Status::Todo, &[(1, 1)], 3);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        seat_leg(&store, "m-1", "plan", "cpd-1");
+        seat_piece(&store, "m-2", 1, "cpd-1");
+        let _ = drained(&ENDED);
+
+        retire_endings(&store, "cpd-1");
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-3" }));
+
+        leg_start_failed(&store, Some(&w), "m-1", "plan", "never ready");
+        piece_start_failed(&store, Some(&w), "m-2", 1, "never ready");
+
+        assert!(drained(&ENDED).is_empty(), "the seat holding cpd-1 now is left alone");
+        assert!(store.bindings().contains_key("cpd-1"), "and keeps its binding");
+        assert_eq!(leg_state(&store, "m-1", "plan"), crate::legs::State::Pending);
+        assert_eq!(piece_of(&store, "m-2", 1).state, crate::pieces::State::Pending);
     }
 
     /// The fake clock, in the seat's own terms: every seat idle, its turn ended

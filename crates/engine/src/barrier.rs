@@ -148,7 +148,7 @@ pub fn would_open(g: &Group, gone: &dyn Fn(&str) -> bool) -> bool {
     match running(g) {
         None => true,
         Some(c) => match c.pane.as_deref() {
-            Some(p) => gone(p),
+            Some(p) => c.ending == Ending::Ended || gone(p),
             None => c.wait_before_next_try().is_some_and(|w| util::epoch_secs() - util::epoch_of(&c.at) > w),
         },
     }
@@ -234,7 +234,9 @@ pub fn open_within(
     let changed = change(store, &w.id, at, |g| {
         if let Some(c) = g.checks.iter_mut().rev().find(|c| c.open()) {
             match c.pane.as_deref() {
-                Some(p) if gone(p) => {
+                // Ended with the check still open: the id may be another
+                // seat's by now (`wsp-945`).
+                Some(p) if c.ending == Ending::Ended || gone(p) => {
                     if !admit() {
                         return false;
                     }
@@ -358,7 +360,8 @@ pub fn unseat(store: &Store, list: &str, at: usize) -> Option<Unseated> {
     let mut out = None;
     change(store, list, at, |g| {
         let Some(c) = g.checks.iter_mut().rev().find(|c| c.open()) else { return false };
-        let seat = c.pane.take();
+        // An ended entry's id may be another seat's by now (`wsp-945`).
+        let seat = c.pane.take().filter(|_| c.ending != Ending::Ended);
         c.ending = Ending::Standing;
         c.at = util::now_iso();
         out = Some(Unseated { seat, tries: c.tries, spent: c.spent() && !std::mem::replace(&mut c.gave_up, true) });
@@ -485,6 +488,33 @@ pub fn mark_ended(store: &Store, seat: &str, ok: bool) -> bool {
         }
         any
     })
+}
+
+/// `seat` is a new seat: every check still owed an ending under that id was an
+/// earlier occupant's, and is written `ended` (`wsp-945`). Returns what was
+/// dropped, for the log.
+pub fn retire(store: &Store, seat: &str) -> Vec<String> {
+    let owed = |c: &Check| c.pane.as_deref() == Some(seat) && c.ending != Ending::Ended;
+    let mut dropped = Vec::new();
+    for w in store.worklists() {
+        for (i, g) in w.groups().iter().enumerate() {
+            if !g.checks.iter().any(owed) {
+                continue;
+            }
+            let wrote = change(store, &w.id, i + 1, |g| {
+                let mut any = false;
+                for c in g.checks.iter_mut().filter(|c| owed(c)) {
+                    c.ending = Ending::Ended;
+                    any = true;
+                }
+                any
+            });
+            if wrote {
+                dropped.push(format!("the check on barrier {} of {}", i + 1, w.id));
+            }
+        }
+    }
+    dropped
 }
 
 /// Whether group `i` (0-based) has nothing left for a check to decide: its list

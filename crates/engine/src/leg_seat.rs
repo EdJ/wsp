@@ -82,13 +82,15 @@ pub fn unopen(store: &Store, id: &str, name: &str) {
 /// and the seat's binding to the row dropped with it: a binding left would
 /// keep telling every command that asks which task the pane is on that it is
 /// still this leg's. Returns the seat the entry named, for the caller that
-/// ends it, or `None` when the leg was not running.
+/// ends it, or `None` when the leg was not running. An entry whose ending is
+/// written names no seat of its own any more (`wsp-945`): nothing is returned
+/// to end, and the binding under that id is left alone.
 pub fn reset(store: &Store, id: &str, name: &str) -> Option<Option<String>> {
     let seat = store.locked(|| {
         let mut t = store.find_task(id)?;
         let old = legs::legs(&t);
         let new = legs::reset(&old, name).ok()?;
-        let seat = old.iter().find(|l| l.name == name).and_then(|l| l.pane.clone());
+        let seat = old.iter().find(|l| l.name == name).and_then(|l| l.held_seat().map(str::to_string));
         legs::write(&mut t, &new);
         store.save_task(&t).ok()?;
         crate::closing::clear_baton(store, id, name);

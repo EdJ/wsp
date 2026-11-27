@@ -375,8 +375,7 @@ fn cmd_reset(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     if let Err(why) = reset_piece(&old, n, &why, &actor_here(store, &t, pane), t.status()) {
         return refuse(why);
     }
-    let seat = old.pieces.iter().find(|p| p.n == n).and_then(|p| p.pane.clone());
-    if let Some(seat) = &seat {
+    if let Some(seat) = old.pieces.iter().find(|p| p.n == n).and_then(|p| p.held_seat()) {
         let fleet = crate::cycle::seats();
         let there = !fleet.absent(seat) && !matches!(fleet.state(seat), Some(crate::place::State::Gone | crate::place::State::Empty));
         if there && !args.has("force") {

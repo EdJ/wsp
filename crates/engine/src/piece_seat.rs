@@ -152,7 +152,9 @@ pub fn reset(store: &Store, id: &str, n: usize) -> Option<Option<String>> {
         let mut t = store.find_task(id)?;
         let mut rec = pieces::record(&t);
         let p = rec.pieces.iter_mut().find(|p| p.n == n && matches!(p.state, State::Running | State::Blocked))?;
-        let seat = p.pane.take();
+        // As `leg_seat::reset`: an ended entry's id is not its own (`wsp-945`).
+        let seat = p.held_seat().map(str::to_string);
+        p.pane = None;
         p.state = State::Pending;
         p.started = None;
         p.tree = None;
