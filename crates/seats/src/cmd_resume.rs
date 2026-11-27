@@ -629,7 +629,9 @@ fn bring_back(store: &Store, place: &dyn Place, via: cmd_spawn::Chosen, t: &Thre
                 // The resumed agent goes in next (wsp-079).
                 agent_next: true,
             };
-            (place.open(&order).map_err(|e| e.to_string())?, true)
+            let opened = place.open(&order).map_err(|e| e.to_string())?;
+            crate::cycle::retire_endings(store, opened.as_str());
+            (opened, true)
         }
     };
 

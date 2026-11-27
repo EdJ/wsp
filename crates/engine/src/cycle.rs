@@ -2953,6 +2953,62 @@ pub fn end_due(ending: &crate::verification::Ending, seats: &dyn Seats, seat: &s
     }
 }
 
+/// `seat` has just been opened, so an ending still owed under that id was an
+/// earlier occupant's: written `ended` on every leg, piece and pass naming it,
+/// and not carried out. A backend that lost its counter hands ids out again,
+/// and a tick that retried such an ending despawned whoever held the id by then
+/// (`wsp-935`: cpd-388, -390 and -393 each took a live barrier check with
+/// them). Every path that opens a seat calls this **before** the new seat is
+/// written on an entry of its own.
+pub fn retire_endings(store: &Store, seat: &str) {
+    use crate::verification::Ending;
+    let owed = |pane: &Option<String>, ending: &Ending| pane.as_deref() == Some(seat) && *ending != Ending::Ended;
+    let dropped = store.locked(|| {
+        let mut dropped = Vec::new();
+        for t in store.tasks_shared().iter() {
+            let Some(mut row) = store.find_task(&t.id) else { continue };
+            let mut parts = Vec::new();
+            let mut legs = crate::legs::legs(&row);
+            for l in legs.iter_mut().filter(|l| owed(&l.pane, &l.ending)) {
+                l.ending = Ending::Ended;
+                parts.push(format!("leg {}", l.name));
+            }
+            if !parts.is_empty() {
+                crate::legs::write(&mut row, &legs);
+            }
+            let mut rec = crate::pieces::record(&row);
+            let before = parts.len();
+            for p in rec.pieces.iter_mut().filter(|p| owed(&p.pane, &p.ending)) {
+                p.ending = Ending::Ended;
+                parts.push(format!("piece {}", p.n));
+            }
+            if parts.len() > before {
+                crate::pieces::write(&mut row, &rec);
+            }
+            let mut passes = crate::verification::passes(&row);
+            let before = parts.len();
+            for p in passes.iter_mut().filter(|p| owed(&p.pane, &p.ending)) {
+                p.ending = Ending::Ended;
+                parts.push(format!("the verifier opened {}", p.at));
+            }
+            if parts.len() > before {
+                crate::verification::write(&mut row, &passes);
+            }
+            if !parts.is_empty() && store.save_task(&row).is_ok() {
+                dropped.extend(parts.into_iter().map(|part| format!("{part} of {}", row.id)));
+            }
+        }
+        dropped
+    });
+    if dropped.is_empty() {
+        return;
+    }
+    for what in &dropped {
+        log_line(store, &format!("{seat} is a new seat: the ending still owed to {what}, which an earlier one ran, is dropped"));
+    }
+    store.git_commit(&format!("wsp: {seat} is a new seat, and the endings an earlier one was owed are dropped"));
+}
+
 /// Whether an ending is worth writing on its entry: not a failure after a
 /// failure, which is the same answer and would be a commit every tick.
 fn end_changed(was: &crate::verification::Ending, now: &crate::verification::Ending) -> bool {
@@ -10693,6 +10749,48 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(plan.ending, crate::verification::Ending::Ended);
         assert!(legs_finished(&store, &Exits).is_empty(), "once");
         assert!(drained(&ENDED).is_empty());
+    }
+
+    /// `wsp-935`: a pane id handed out again. What is still owed to the earlier
+    /// occupant — a done leg never tried, a done piece and a verifier whose
+    /// endings failed — is dropped when the id is opened, so no tick despawns
+    /// the seat holding it now.
+    #[test]
+    fn an_ending_recorded_for_an_earlier_occupant_of_a_pane_id_does_not_despawn_the_one_that_holds_it_now() {
+        use crate::verification::{Ending, Pass, State as Verdict};
+        let (_env, store) = scratch("reused-pane");
+        staged(&store, "m-1", Status::Todo);
+        pieced(&store, "m-2", Status::Todo, &[(1, 1)], 3);
+        task(&store, "m-3", Status::Review);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        seat_leg(&store, "m-1", "plan", "cpd-1");
+        leg_done(&store, "m-1", "plan");
+        seat_piece(&store, "m-2", 1, "cpd-1");
+        piece_done(&store, "m-2", 1);
+        let mut t = store.find_task("m-2").unwrap();
+        let mut rec = crate::pieces::record(&t);
+        rec.pieces[0].ending = Ending::Failed("it would not go".into());
+        crate::pieces::write(&mut t, &rec);
+        store.save_task(&t).unwrap();
+        let mut t = store.find_task("m-3").unwrap();
+        let mut pass = Pass::opened(None, None);
+        pass.state = Verdict::Holds;
+        pass.pane = Some("cpd-1".into());
+        pass.ending = Ending::Failed("it would not go".into());
+        crate::verification::write(&mut t, &[pass]);
+        store.save_task(&t).unwrap();
+        let _ = drained(&ENDED);
+
+        retire_endings(&store, "cpd-1");
+
+        assert!(legs_finished(&store, &Exits).is_empty());
+        assert!(pieces_finished(&store, &Exits).is_empty());
+        assert!(end_passes(&store, &Exits, "m-3", |_| true).is_empty());
+        assert!(drained(&ENDED).is_empty(), "the seat holding cpd-1 now is left alone");
+        assert_eq!(crate::legs::legs(&store.find_task("m-1").unwrap())[0].ending, Ending::Ended);
+        assert_eq!(piece_of(&store, "m-2", 1).ending, Ending::Ended);
+        assert_eq!(crate::verification::passes(&store.find_task("m-3").unwrap())[0].ending, Ending::Ended);
     }
 
     /// The manager host's fold of a seat's start for `row` (`wsp-028`), as

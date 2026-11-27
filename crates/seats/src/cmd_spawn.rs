@@ -3225,6 +3225,8 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // Before the claim, which may write this seat onto a leg or a piece.
+    crate::cycle::retire_endings(store, seat.as_str());
 
     // The claim, through the one implementation of it. It refuses on work that
     // is done, work that is blocked, and work a live agent is holding, and each
@@ -4350,6 +4352,7 @@ fn rotate_as(
             return 1;
         }
     };
+    crate::cycle::retire_endings(store, seat.as_str());
 
     // For a vacancy the slot moves *here* rather than at step 3, and the reason
     // is the two things the other two cases have and this one does not: no
@@ -7145,6 +7148,30 @@ mod tests {
         place_work(&place, &store, &Args::synth("spawn", &[], &flags));
         let cwd = place.1.borrow().first().and_then(|o| o.cwd.clone());
         assert_eq!(cwd.as_deref(), Some(most.as_str()), "the root holding most rows, not {few} and not home");
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-935`: a spawn handed an id an earlier seat had drops the ending
+    /// still owed to that one, which would otherwise despawn this one.
+    #[test]
+    fn a_spawn_drops_the_ending_still_owed_under_the_id_it_is_handed() {
+        use crate::verification::{Ending, Pass};
+        let _guard = no_backend();
+        std::env::remove_var("WSP_BACKEND_PANE_ID");
+        std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
+        let store = seat("spawn-reused-id");
+        let root = rooted(&store, "few");
+        list_of(&store, "batch", &[("t-1", "few")]);
+        let mut t = store.find_task("t-1").unwrap();
+        let mut pass = Pass::opened(None, None);
+        pass.pane = Some("w9:p1".into());
+        crate::verification::write(&mut t, &[pass]);
+        store.save_task(&t).unwrap();
+        let place = Started(std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let flags = [("project", "batch"), ("govern", "true"), ("kind", "opencode")];
+        place_work(&place, &store, &Args::synth("spawn", &[], &flags));
+        assert_eq!(place.1.borrow().first().and_then(|o| o.cwd.clone()), Some(root), "a seat was opened");
+        assert_eq!(crate::verification::passes(&store.find_task("t-1").unwrap())[0].ending, Ending::Ended);
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
