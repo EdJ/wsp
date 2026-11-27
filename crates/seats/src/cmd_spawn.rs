@@ -2773,18 +2773,6 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
         }
     };
-    // A leg's seat claims nothing, but its row is a shared row's all the same,
-    // and the hub's to lease (wsp-896): taken before anything is written, as a
-    // claim's is, so a row another user's spoke holds is refused here and one
-    // run as legs reads held while any leg runs. Each leg's start takes it
-    // again, which the hub answers for its own holder as a renewal; the lease
-    // goes back once the row leaves `doing` (`hub_lease::finished`).
-    if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref().filter(|_| leg_rec.is_some())) {
-        if let Err(why) = crate::addon::get().before_claim(store, task) {
-            eprintln!("wsp: not starting leg {name} of {task}: {why}");
-            return 1;
-        }
-    }
     let entry_tier = leg_rec.as_ref().map(leg_seat::tier_of).or_else(|| piece_rec.as_ref().map(crate::piece_seat::tier_of));
     let kind = match &entry_tier {
         Some(t) => t.0.clone(),
@@ -3191,8 +3179,25 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
     // The leg is written `running` under the store lock before its seat exists,
     // so it is the key a retried spawn finds, and taken back if no seat comes.
     if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref()) {
+        let was_todo = store.find_task(task).is_some_and(|t| t.status() == crate::model::Status::Todo);
         if let Err(why) = leg_seat::open(store, task, name) {
             eprintln!("wsp: {why}");
+            return 1;
+        }
+        // A leg's seat claims nothing, but a shared row is the hub's to lease
+        // all the same (wsp-896), so another user's spoke is refused it and it
+        // reads held while any leg runs. Taken once the leg is open and the row
+        // `doing`: taken on a `todo` row, the sync worker could give it back as
+        // finished (`hub_lease::finished`) before the open. Each leg's start
+        // takes it again, which the hub answers its own holder as a renewal; it
+        // goes back once the row leaves `doing`. Refused, the open is undone and
+        // the row left as it was.
+        if let Err(why) = crate::addon::get().before_claim(store, task) {
+            leg_seat::unopen(store, task, name);
+            if was_todo {
+                put_back_todo(store, task);
+            }
+            eprintln!("wsp: not starting leg {name} of {task}: {why}");
             return 1;
         }
         crate::leg_tree::record(store, task, name, &prepared);
@@ -6160,6 +6165,20 @@ impl Fleet {
             .flatten();
         crate::cycle::overrule(raw, finished, util::epoch_secs())
     }
+}
+
+
+/// A row a leg's open moved from `todo` to `doing`, put back when the leg did
+/// not start after all (its hub lease was refused): `todo`, said in its log.
+fn put_back_todo(store: &Store, id: &str) {
+    store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return };
+        if t.status() == crate::model::Status::Doing {
+            t.set_status(crate::model::Status::Todo);
+            t.log("→ todo: its leg did not start, the hub lease was refused");
+            let _ = store.save_task(&t);
+        }
+    });
 }
 
 #[cfg(test)]

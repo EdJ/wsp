@@ -513,10 +513,8 @@ impl TestHub {
 
     /// The lease on shared row `row`, as the admin's state has it: its holder and token.
     pub fn lease_of(&self, row: &str) -> Option<(Principal, wsp_hub_protocol::Token)> {
-        // A hub names a row's lease with the row quoted in it, or (one built
-        // before that) as `row:<id>`.
-        let (needle, plain) = (format!("\"{row}\""), format!("row:{row}"));
-        self.state().leases.into_values().find(|l| l.name.0.contains(&needle) || l.name.0 == plain).map(|l| (l.holder, l.token))
+        let needle = format!("\"{row}\"");
+        self.state().leases.into_values().find(|l| l.name.0.contains(&needle)).map(|l| (l.holder, l.token))
     }
 
     /// The hub's state, as its admin reads it.

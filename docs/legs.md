@@ -42,11 +42,13 @@ What the revision changed from the chain design (29779a8, decision d1 on
 - **A leg holds no claim.** It is recorded on its entry, the way a verifier
   is recorded on its pass, because a row has one claim and two legs cannot
   both hold it (*A leg is a seat*). A shared row's hub lease is taken all the
-  same (wsp-896): each leg's spawn asks `lease.take` before anything is
-  written, as a claim does, so another user's spoke is refused the row while
-  a leg runs; the lease is kept in the spoke's book, renewed while a leg runs,
-  and given back once the row leaves `doing` (its last leg's review or a
-  block), see `docs/multiplayer.md`, *Taking*.
+  same (wsp-896): each leg's spawn asks `lease.take` once the leg is open
+  and the row `doing` (refused, the open is undone and the row left as it
+  was), so another user's spoke is refused the row while a leg runs. The
+  lease is kept in the spoke's book, renewed while a leg runs, and given
+  back once the row leaves `doing` (its last leg's review or a block), as
+  `wsp start`'s lease goes back at `done` or `park`
+  (`crates/spoke/src/hub_lease.rs`, `finished` and `renew_legs`).
 - **A leg that can run beside another gets a tree of its own**, branched from
   the row's branch. Its branch is merged back before the leg that waits on it
   opens (*Trees*).
