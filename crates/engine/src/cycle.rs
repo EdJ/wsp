@@ -1753,9 +1753,14 @@ fn seat_of(store: &Store, to: &str) -> String {
 /// same thing again hold one order (the caller's key is per list, group and
 /// what it is about). Nothing waits for the answer; the order's state is the
 /// record of whether the seat heard.
+///
+/// Typed through [`crate::repair::type_to_seat`], so the text is cleaned and a
+/// sentence `wsp tell` refuses is reported once under the same key.
 fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) {
     if let Some(door) = crate::refusals::door(store) {
         let seat = seat_of(store, check);
+        let text = util::said_plainly(text);
+        let text = text.as_ref();
         match door.send(&seat, text, &format!("{key}:{seat}")) {
             Ok(sent) if sent.fresh => log_line(store, &format!("told {check}: {what} (order {})", sent.id.0)),
             Ok(_) => {}
@@ -1763,36 +1768,13 @@ fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) {
         }
         return;
     }
-    if cfg!(test) {
-        #[cfg(test)]
-        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((check.to_string(), text.to_string())));
-        return;
-    }
-    let Ok(exe) = wsp_base::util::self_exe() else { return };
-    let mut child = match wsp_base::calls::Command::new(exe)
-        .args(["tell", check, "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log_line(store, &format!("tell {check}: could not run `wsp tell` ({e})"));
-            return;
-        }
-    };
-    if let Some(mut to) = child.stdin.take() {
-        use std::io::Write;
-        let _ = writeln!(to, "{text}");
-    }
-    match child.wait_with_output() {
-        Ok(o) if o.status.success() => log_line(store, &format!("told {check}: {what}")),
-        Ok(o) => log_line(store, &format!(
-            "told {check}: not delivered — {}",
-            util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
-        )),
-        Err(e) => log_line(store, &format!("told {check}: not delivered — {e}")),
+    use crate::repair::Typed;
+    let once = format!("{key}:{}", seat_of(store, check));
+    match crate::repair::type_to_seat(store, check, text, Some(&once)) {
+        Typed::Yes => log_line(store, &format!("told {check}: {what}")),
+        Typed::NoRun(e) => log_line(store, &format!("tell {check}: could not run `wsp tell` ({e})")),
+        Typed::No(why) => log_line(store, &format!("told {check}: not delivered — {why}")),
+        Typed::Unsayable | Typed::InTest => {}
     }
 }
 
@@ -12457,6 +12439,72 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert!(spawned().is_empty());
         assert_eq!(file(), before);
+    }
+}
+
+#[cfg(test)]
+mod tell_seat_tests {
+    use super::tests::{list, scratch, task, MEMBER_TOLD, TELL_PROSE_REFUSED, TOLD};
+    use super::*;
+
+    const SAID: &str = "the land failed:\nRebasing (1/2)\rRebasing (2/2)\r\x1b[31merror:\x1b[0m could not apply 17079a4\n\
+        remote: Counting objects: 100% (30/30), done.";
+
+    /// `wsp-933`: terminal output reaches the seat cleaned.
+    #[test]
+    fn terminal_output_told_to_a_seat_arrives_cleaned() {
+        let (_env, store) = scratch("seat-cleaned");
+        task(&store, "m-1", Status::Doing);
+        store.set_binding("cpd-9", serde_json::json!({ "task_id": "m-1" }));
+        tell_seat(&store, "cpd-9", SAID, "what", "k");
+        let told = MEMBER_TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(told, vec![("cpd-9".to_string(), "the land failed:\nerror: could not apply 17079a4".to_string())]);
+    }
+
+    /// `wsp-933`: a refused tell is on the row, and the next ticks neither type
+    /// it again nor tell the governor.
+    #[test]
+    fn a_refused_tell_to_a_seat_is_reported_once_across_ticks() {
+        let (_env, store) = scratch("seat-refused");
+        task(&store, "m-1", Status::Doing);
+        list(&store, &[(&["m-1"], "claude")]);
+        store.set_binding("cpd-9", serde_json::json!({ "task_id": "m-1" }));
+        TOLD.with(|t| t.borrow_mut().clear());
+        TELL_PROSE_REFUSED.with(|r| r.set(true));
+        for _ in 0..3 {
+            tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:1");
+        }
+        TELL_PROSE_REFUSED.with(|r| r.set(false));
+        // Cleared hook: still not retried.
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:1");
+        assert!(MEMBER_TOLD.with(|t| t.borrow().is_empty()));
+        let governed = TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(governed.iter().filter(|l| l.contains("cpd-9") && l.contains("NOT told")).count(), 1, "{governed:?}");
+        let log = store.find_task("m-1").unwrap().section("Log").unwrap();
+        assert_eq!(log.matches(crate::repair::TELL_UNSAYABLE).count(), 1, "{log}");
+    }
+
+    /// The barrier check as the run seats it: no row and no binding, so the
+    /// line goes on the list's log and is looked for there.
+    #[test]
+    fn a_refused_tell_to_a_barrier_check_with_no_row_is_on_the_list_once() {
+        let (_env, store) = scratch("check-refused");
+        task(&store, "m-1", Status::Review);
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        assert!(crate::barrier::open(&store, &w, 1, None, None, &|_| false).is_some());
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups[0].checks[0].pane = Some("cpd-9".into());
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        TOLD.with(|t| t.borrow_mut().clear());
+        TELL_PROSE_REFUSED.with(|r| r.set(true));
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:1");
+        tell_seat(&store, "cpd-9", "the group moved", "the group moved under it", "barrier:run:1");
+        TELL_PROSE_REFUSED.with(|r| r.set(false));
+        assert_eq!(TOLD.with(|t| t.borrow_mut().drain(..).filter(|l| l.contains("NOT told")).count()), 1);
+        let log = store.worklist("run").unwrap().section("Log").unwrap();
+        assert_eq!(log.matches(crate::repair::TELL_UNSAYABLE).count(), 1, "{log}");
     }
 }
 

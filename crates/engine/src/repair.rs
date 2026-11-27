@@ -1769,36 +1769,129 @@ fn stamp_of(line: &str) -> Option<i64> {
 /// the case this exists for and `wsp tell` refuses it for exactly that reason;
 /// the respawn is the fallback, on a later tick.
 pub fn tell_member(store: &Store, id: &str, text: &str) {
+    match type_to_seat(store, id, text, None) {
+        Typed::Yes => stamp(store, &format!("told {id}: it has the sentence")),
+        Typed::NoRun(e) => stamp(store, &format!("tell {id}: could not run `wsp tell` ({e})")),
+        Typed::No(why) => stamp(store, &format!("told {id}: not delivered — {why}")),
+        // Said where it was refused; a test's tell stops short of a process.
+        Typed::Unsayable | Typed::InTest => {}
+    }
+}
+
+/// What [`type_to_seat`] came to.
+pub(crate) enum Typed {
+    Yes,
+    /// `wsp tell` could not be run.
+    NoRun(String),
+    /// It ran and did not deliver.
+    No(String),
+    /// Its prose check refused the sentence, now or on an earlier tick: the
+    /// governor has it and there is nothing for the caller to say.
+    Unsayable,
+    InTest,
+}
+
+/// `wsp tell <to> -` with one of the run's own sentences, which may hold a
+/// command's output: cleaned first, and a refusal by `wsp tell`'s prose check
+/// reported once, as [`crate::cmd_task::deliver_as`] does for a send-back.
+///
+/// `once` names the sentence for a caller that comes back every tick: refused
+/// once under it, it is not typed again.
+pub(crate) fn type_to_seat(store: &Store, to: &str, text: &str, once: Option<&str>) -> Typed {
+    let mark = once.map(|k| format!(" [{k}]")).unwrap_or_default();
+    let (row, list) = whose_seat(store, to);
+    if !mark.is_empty() {
+        let log = match &row {
+            Some(id) => store.find_task(id).and_then(|t| t.section("Log")),
+            None => list.as_ref().and_then(|w| store.worklist(&w.id)).and_then(|w| w.section("Log")),
+        };
+        if log.is_some_and(|l| l.lines().any(|l| l.contains(TELL_UNSAYABLE) && l.ends_with(&mark))) {
+            return Typed::Unsayable;
+        }
+    }
+    let text = util::said_plainly(text);
+    let text = text.as_ref();
+    let unsayable = |why: &str| {
+        // The line reads as the end of a pending send-back, which this was not.
+        let owed = row.as_deref().and_then(|id| store.find_task(id)).is_some_and(|t| undelivered_reason(&t).is_some());
+        let then = match &row {
+            Some(id) => format!("`wsp show {id}` has the refusal; say what it needs to hear with `wsp tell {to} -`."),
+            None => format!("Say what it needs to hear with `wsp tell {to} -`."),
+        };
+        let u = crate::cmd_task::Unsaid { to, row: row.as_deref(), list: list.as_ref(), mark: &mark, then: &then };
+        crate::cmd_task::report_unsayable(store, &u, why);
+        if let Some(id) = row.as_deref().filter(|_| owed) {
+            note_tell_pending(store, id);
+        }
+        Typed::Unsayable
+    };
     if cfg!(test) {
         #[cfg(test)]
-        return crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), text.to_string())));
+        {
+            // `wsp tell`'s own check of what it reads on stdin.
+            let refused = util::terminal_output(text).or_else(|| {
+                crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.get()).then(|| util::TERMINAL_OUTPUT.to_string())
+            });
+            if let Some(why) = refused {
+                return unsayable(&why);
+            }
+            crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((to.to_string(), text.to_string())));
+        }
+        return Typed::InTest;
     }
-    let Ok(exe) = wsp_base::util::self_exe() else { return };
+    let exe = match wsp_base::util::self_exe() {
+        Ok(exe) => exe,
+        Err(e) => return Typed::NoRun(e.to_string()),
+    };
     let child = wsp_base::calls::Command::new(exe)
-        .args(["tell", id, "-"])
+        .args(["tell", to, "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => {
-            stamp(store, &format!("tell {id}: could not run `wsp tell` ({e})"));
-            return;
-        }
+        Err(e) => return Typed::NoRun(e.to_string()),
     };
-    if let Some(mut to) = child.stdin.take() {
+    if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        let _ = writeln!(to, "{text}");
+        let _ = writeln!(stdin, "{text}");
     }
     match child.wait_with_output() {
-        Ok(o) if o.status.success() => stamp(store, &format!("told {id}: it has the sentence")),
-        Ok(o) => stamp(store, &format!(
-            "told {id}: not delivered — {}",
-            util::truncate(String::from_utf8_lossy(&o.stderr).trim(), 120)
-        )),
-        Err(e) => stamp(store, &format!("told {id}: not delivered — {e}")),
+        Ok(o) if o.status.success() => Typed::Yes,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            if err.contains(util::TERMINAL_OUTPUT) {
+                return unsayable(&err);
+            }
+            Typed::No(util::truncate(err.trim(), 120))
+        }
+        Err(e) => Typed::No(e.to_string()),
     }
+}
+
+/// The row and the list a tell to `to` is about: `to` is a row, or a seat bound
+/// to one, or a verifier's seat, or a barrier check's, which has only a list.
+fn whose_seat(store: &Store, to: &str) -> (Option<String>, Option<Worklist>) {
+    let bound = || store.bindings().get(to).and_then(|b| b.get("task_id")?.as_str().map(str::to_string));
+    let verifying = || {
+        store.tasks_shared().iter()
+            .filter(|t| t.body.contains("## Verification"))
+            .find(|t| crate::verification::passes(t).iter().any(|p| p.pane.as_deref() == Some(to)))
+            .map(|t| t.id.clone())
+    };
+    let row = store
+        .find_task(to)
+        .map(|t| t.id)
+        .or_else(|| bound().filter(|id| store.find_task(id).is_some()))
+        .or_else(verifying);
+    let list = row.as_deref().and_then(|id| store.find_task(id)).and_then(|t| crate::cycle::list_of(store, &t));
+    let list = list.or_else(|| {
+        store.worklists().into_iter().find(|w| {
+            w.groups().iter().any(|g| crate::barrier::running(g).is_some_and(|c| c.pane.as_deref() == Some(to)))
+        })
+    });
+    (row, list)
 }
 
 // ---- a landed row left at doing ------------------------------------------
@@ -2989,6 +3082,49 @@ impl Seats for Absent {
         }]);
         store.save_worklist(&w).unwrap();
         w
+    }
+
+    /// `wsp-933`: terminal output reaches the member cleaned.
+    #[test]
+    fn terminal_output_told_to_a_member_arrives_cleaned() {
+        let (_env, store) = scratch("member-cleaned");
+        member(&store, "m-1", Status::Doing);
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().clear());
+        tell_member(&store, "m-1", "the land failed:\nRebasing (1/2)\rRebasing (2/2)\r\x1b[31merror:\x1b[0m could not apply");
+        let told = crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(told, vec![("m-1".to_string(), "the land failed:\nerror: could not apply".to_string())]);
+    }
+
+    /// `wsp-933`: a refused tell goes to the governor once, is on the row, and
+    /// the tick's retry leaves it; a send-back already pending stays pending.
+    #[test]
+    fn a_refused_tell_to_a_member_is_reported_once_and_not_retried() {
+        let (_env, store) = scratch("member-refused");
+        member(&store, "m-1", Status::Doing);
+        list(&store, &["m-1"], "claude");
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().clear());
+        crate::cycle::tests::TOLD.with(|t| t.borrow_mut().clear());
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(true));
+        tell_member(&store, "cpd-1", "finish, or say what is left");
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(false));
+        retry_undelivered_tells(&store, &crate::cycle::tests::Blind);
+        assert!(crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow().is_empty()));
+        let governed = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(governed.iter().filter(|l| l.contains("cpd-1") && l.contains("NOT told")).count(), 1, "{governed:?}");
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.section("Log").unwrap().matches(TELL_UNSAYABLE).count(), 1);
+        assert!(undelivered_reason(&t).is_none(), "nothing is left to retry");
+
+        // A pending send-back is still owed after another sentence is refused.
+        let mut t = store.find_task("m-1").unwrap();
+        t.log(&format!("{} the rebase", crate::cycle::SENT_BACK));
+        store.save_task(&t).unwrap();
+        note_tell_pending(&store, "m-1");
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(true));
+        tell_member(&store, "m-1", "another sentence");
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(false));
+        assert!(undelivered_reason(&store.find_task("m-1").unwrap()).is_some());
     }
 
     pub fn member(store: &Store, id: &str, status: Status) {

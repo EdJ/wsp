@@ -1973,23 +1973,50 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
 /// pass that check and the next idle tick would type the same words, so it is
 /// said once: on the row, in the run's log, and to whoever governs the list.
 fn unsayable(store: &Store, id: &str, why: &str) -> Told {
+    let w = store.find_task(id).and_then(|t| crate::cycle::list_of(store, &t));
+    let then = format!("`wsp show {id}` has the reason; say it to the seat with `wsp tell {id} -`.");
+    report_unsayable(store, &Unsaid { to: id, row: Some(id), list: w.as_ref(), mark: "", then: &then }, why);
+    Told::Unsayable
+}
+
+/// A sentence of wsp's that `wsp tell` refused: who it was for, and where that
+/// is recorded.
+pub(crate) struct Unsaid<'a> {
+    /// What `wsp tell` was given: a row or a seat.
+    pub to: &'a str,
+    /// The row that carries the line; a barrier check's seat has none, and
+    /// `list`'s log carries it.
+    pub row: Option<&'a str>,
+    pub list: Option<&'a crate::model::Worklist>,
+    /// Ends the line, for a caller that looks for it before saying the same again.
+    pub mark: &'a str,
+    /// What the governor can do about it.
+    pub then: &'a str,
+}
+
+pub(crate) fn report_unsayable(store: &Store, u: &Unsaid, why: &str) {
     let why = util::truncate(&util::fold(&util::said_plainly(why)), 160);
-    crate::store::log_line(store, &format!("tell {id}: not delivered, and not retried — {why}"));
+    let to = u.to;
+    crate::store::log_line(store, &format!("tell {to}: not delivered, and not retried — {why}"));
+    let line = format!("{}: {why}{}", crate::repair::TELL_UNSAYABLE, u.mark);
     store.locked(|| {
-        let Some(mut t) = store.find_task(id) else { return };
-        let _ = crate::log::note(store, &mut t, &format!("{}: {why}", crate::repair::TELL_UNSAYABLE));
+        if let Some(mut t) = u.row.and_then(|id| store.find_task(id)) {
+            let _ = crate::log::note(store, &mut t, &line);
+        } else if let Some(mut w) = u.list.and_then(|w| store.worklist(&w.id)) {
+            let _ = crate::log::note_to_list(store, &mut w, &line);
+        }
     });
+    let seat = if u.row == Some(to) { format!("{to}'s seat") } else { format!("seat {to}") };
     let text = format!(
-        "{id}'s seat was NOT told: `wsp tell` refused wsp's own sentence ({why}), and wsp will not retry it. \
-         `wsp show {id}` has the reason; say it to the seat with `wsp tell {id} -`."
+        "{seat} was NOT told: `wsp tell` refused wsp's own sentence ({why}), and wsp will not retry it. {}",
+        u.then
     );
-    match store.find_task(id).and_then(|t| crate::cycle::list_of(store, &t)) {
-        Some(w) => crate::cycle::tell(store, &w, &text),
+    match u.list {
+        Some(w) => crate::cycle::tell(store, w, &text),
         None => {
-            crate::cycle::notice_on_row(store, id, &text);
+            crate::cycle::notice_on_row(store, u.row.unwrap_or(to), &text);
         }
     }
-    Told::Unsayable
 }
 
 /// Reads its prose the same way `note` does — see [`payload_source`].
