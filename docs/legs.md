@@ -654,7 +654,9 @@ seats' sums, so read `unmeasured` for those.
 pass is appended as a row `{task, role:"verifier", leg:null, at, pane, ran_at,
 turns, input_tokens, output_tokens, cache_tokens, cache_write_tokens,
 usd_micros, exact, seconds, outcome}` with the same null rules. Every attempt row
-has `cache_write_tokens`, `usd_micros` and `exact` as described above.
+has `cache_write_tokens`, `usd_micros` and `exact` as described above. A member
+row's exact figures are the session of its pane id that ran from the attempt's
+opening, as a Seat's are; two attempts that read one session are both inexact.
 
 ## Seen
 

@@ -253,26 +253,35 @@ fn live(store: &Store, a: &mut Attempt) {
     }
 }
 
-/// The `attempts --json` objects. The token and dollar keys are exact, from
-/// `cmd_burn::reading(pane)` (live burn, else the stop ledger), when the pane
-/// served only one attempt among `rows`: then `input_tokens` is fresh input
-/// alone, `cache_write_tokens` is kept apart, and `exact` is true. A pane that
-/// served two attempts, or has no reading, keeps the log clause's rounded
-/// figures (input there includes cache writes) and says `exact: false`.
-fn attempts_json(rows: &[Attempt]) -> Vec<serde_json::Value> {
-    attempts_json_with(rows, &|pane| crate::cmd_burn::reading(pane))
+/// The `attempts --json` objects. The token and dollar keys are exact where the
+/// attempt has a session of its own (`cmd_cost::Sessions::reading`, tied to
+/// when it opened, never the pane id's newest): then `input_tokens` is fresh
+/// input alone, `cache_write_tokens` is kept apart, and `exact` is true. Two
+/// attempts that read one session, or an attempt with none, keep the log
+/// clause's rounded figures (input there includes cache writes) and say
+/// `exact: false`; with no clause either they are null, unmeasured.
+fn attempts_json(store: &Store, rows: &[Attempt]) -> Vec<serde_json::Value> {
+    let sessions = crate::cmd_cost::Sessions::of(store);
+    attempts_json_with(rows, &|pane, opened| sessions.reading(pane, opened))
 }
 
 fn attempts_json_with(
     rows: &[Attempt],
-    read: &dyn Fn(&str) -> Option<serde_json::Value>,
+    read: &dyn Fn(&str, i64) -> Option<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
+    let readings: Vec<Option<serde_json::Value>> = rows
+        .iter()
+        .map(|a| if a.pane.is_empty() { None } else { read(&a.pane, util::epoch_of(&a.at)) })
+        .collect();
     rows.iter()
-        .map(|a| {
-            let alone = !a.pane.is_empty() && rows.iter().filter(|b| b.pane == a.pane).count() == 1;
-            let exact = if alone { read(&a.pane) } else { None };
-            let num = |k: &str| exact.as_ref().and_then(|r| r.get(k)).and_then(|v| v.as_u64());
-            let (input, output, cache, write, micros) = match &exact {
+        .zip(&readings)
+        .map(|(a, reading)| {
+            // One session read by two attempts is neither's to count in full.
+            let shared = rows.iter().zip(&readings).filter(|(b, r)| b.pane == a.pane && *r == reading).count() > 1;
+            let exact = reading.as_ref().filter(|_| !shared);
+            let clause = |n: u64| (!a.spend.nothing()).then_some(n);
+            let num = |k: &str| exact.and_then(|r| r.get(k)).and_then(|v| v.as_u64());
+            let (input, output, cache, write, micros) = match exact {
                 Some(_) => (
                     json!(num("input")),
                     json!(num("output")),
@@ -281,9 +290,9 @@ fn attempts_json_with(
                     json!(num("cost")),
                 ),
                 None => (
-                    json!(a.spend.input),
-                    json!(a.spend.output),
-                    json!(a.spend.cache),
+                    json!(clause(a.spend.input)),
+                    json!(clause(a.spend.output)),
+                    json!(clause(a.spend.cache)),
                     json!(null),
                     json!(a.spend.micros),
                 ),
@@ -335,8 +344,8 @@ fn attempt_rows(store: &Store, tasks: &[Task]) -> Vec<Attempt> {
 }
 
 /// The objects `--json` prints: the attempts, then each task's verifier passes.
-fn attempts_objects(rows: &[Attempt], tasks: &[Task]) -> Vec<serde_json::Value> {
-    let mut out = attempts_json(rows);
+fn attempts_objects(store: &Store, rows: &[Attempt], tasks: &[Task]) -> Vec<serde_json::Value> {
+    let mut out = attempts_json(store, rows);
     out.extend(crate::cmd_cost::verifier_rows(tasks));
     out
 }
@@ -358,7 +367,7 @@ pub fn attempts(store: &Store, args: &Args) -> i32 {
     let rows = attempt_rows(store, &tasks);
 
     if args.json() {
-        println!("{}", json!({ "attempts": attempts_objects(&rows, &tasks) }));
+        println!("{}", json!({ "attempts": attempts_objects(store, &rows, &tasks) }));
         return 0;
     }
 
@@ -814,7 +823,7 @@ mod tests {
         let a = attempts_of(&t);
         assert_eq!(a.iter().map(|a| a.packet).collect::<Vec<_>>(), [true, true, false]);
         assert_eq!(a[0].spawned, "sonnet/high", "the packet clause is not part of the tier");
-        let json = attempts_json_with(&a, &|_| None);
+        let json = attempts_json_with(&a, &|_, _| None);
         assert_eq!(json[0]["packet"], true);
         assert_eq!(json[2]["packet"], false);
         assert_eq!(json[0]["packet_bytes"], serde_json::Value::Null, "a claim from before sizes were written");
@@ -839,7 +848,7 @@ mod tests {
         let parse = |line: &[&str]| Args::parse(line.iter().map(|s| (*s).to_string()).collect());
         let objects = |args: &Args| {
             let tasks = wanted(&store, args).unwrap();
-            attempts_objects(&attempt_rows(&store, &tasks), &tasks)
+            attempts_objects(&store, &attempt_rows(&store, &tasks), &tasks)
         };
         let all = objects(&parse(&["attempts", "--all", "--json"]));
         let some = objects(&parse(&["attempts", "--task", "t-1,t-3", "--json"]));
@@ -865,7 +874,7 @@ mod tests {
         let rows = attempts_of(&t);
         let burn = json!({ "turns": 9, "input": 1_234_567, "output": 59_999, "cache_read": 4_999_999,
             "cache_write": 265_433, "cost": 777_001 });
-        let out = attempts_json_with(&rows, &|pane| (pane == "cpd-1" || pane == "cpd-2").then(|| burn.clone()));
+        let out = attempts_json_with(&rows, &|pane, _| (pane == "cpd-1" || pane == "cpd-2").then(|| burn.clone()));
         assert_eq!(out.len(), 3);
         let a = &out[0];
         assert_eq!(a["exact"], true);
@@ -878,8 +887,40 @@ mod tests {
             assert_eq!(shared["exact"], false, "two attempts, one pane");
             assert!(shared["cache_write_tokens"].is_null());
         }
-        let none = attempts_json_with(&rows[..1], &|_| None);
+        let none = attempts_json_with(&rows[..1], &|_, _| None);
         assert_eq!(none[0]["exact"], false);
+    }
+
+    /// `wsp-955`: one pane id handed out three times. Each member row reads the
+    /// session that ran from its own opening, named alone or beside the others;
+    /// the one whose line is lost is unmeasured.
+    #[test]
+    fn member_rows_on_a_reused_pane_id_each_read_their_own_session() {
+        let env = crate::util::isolated("attempts-reused");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        for (id, day) in [("t-1", "17"), ("t-2", "20"), ("t-3", "23")] {
+            let mut t = Task::new(id, id);
+            t.body = format!("## Log\n- 2026-11-{day}T10:00:00Z claimed by pane cpd-7\n- 2026-11-{day}T11:00:00Z released after 1h\n");
+            store.save_task(&t).unwrap();
+        }
+        let line = |day: &str, cost: u64| {
+            json!({ "seat": "cpd-7", "ended": format!("2026-11-{day}T10:30:00Z"), "session_id": "", "transcript": "",
+                "turns": 3, "input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "cost": cost })
+            .to_string()
+        };
+        std::fs::write(env.state().join(crate::place_super::SPENT_FILE), format!("{}\n{}\n", line("17", 100), line("23", 900))).unwrap();
+        let read = |ids: &str| {
+            let args = Args::parse(["attempts", "--task", ids, "--json"].map(String::from).to_vec());
+            let tasks = wanted(&store, &args).unwrap();
+            attempts_objects(&store, &attempt_rows(&store, &tasks), &tasks)
+                .iter()
+                .map(|o| (o["exact"] == true, o["usd_micros"].as_u64(), o["input_tokens"].as_u64()))
+                .collect::<Vec<_>>()
+        };
+        let (first, lost, last) = ((true, Some(100), Some(1)), (false, None, None), (true, Some(900), Some(1)));
+        assert_eq!(read("t-1,t-2,t-3"), [first, lost, last]);
+        assert_eq!([read("t-1"), read("t-2"), read("t-3")], [[first], [lost], [last]]);
     }
 
     /// The two clauses this task added, read back off the lines they were
