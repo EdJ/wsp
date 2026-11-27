@@ -538,12 +538,16 @@ pub fn run(store: &Store, list: &str, at: usize) -> i32 {
 
     if decision.pass {
         barrier::note_run(store, list, at, suite, Some("wsp"));
-        if pass(store, list, &g, &plan, count, &file) {
-            log_line(store, &format!("{list} group {at}: passed by wsp with no agent — {count} check(s) green, every member holds, no stop prose"));
-            return 0;
+        match pass(store, list, at, &g, &plan, count, &file) {
+            Ok(()) => {
+                log_line(store, &format!("{list} group {at}: passed by wsp with no agent — {count} check(s) green, every member holds, no stop prose"));
+                return 0;
+            }
+            Err(why) => {
+                barrier::note_run(store, list, at, suite, Some(""));
+                log_line(store, &not_recorded_line(list, at, &why));
+            }
         }
-        barrier::note_run(store, list, at, suite, Some(""));
-        log_line(store, &format!("{list} group {at}: wsp could not record the pass, so its agent is asked"));
     } else {
         barrier::note_run(store, list, at, suite, None);
     }
@@ -742,8 +746,47 @@ fn scope_note(
     note
 }
 
-/// Record the pass through `wsp worklist go`, the one way a barrier is passed.
-fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet: &std::path::Path) -> bool {
+/// How long [`record`] waits before it asks `go` again: one of the daemon's ticks.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a `wsp worklist go` answered.
+struct Answer {
+    code: Option<i32>,
+    out: String,
+    err: String,
+}
+
+fn not_recorded_line(list: &str, at: usize, why: &str) -> String {
+    format!("{list} group {at}: wsp could not record the pass, so its agent is asked — {why}")
+}
+
+/// Read `go`'s answer for group `at`. A member still holding the group (its
+/// verdict is in and its landing is not) is passing: `go` is asked once more a
+/// tick later. `go` exits 0 there, so the words are what say nothing passed.
+/// Anything else that did not pass is answered with why, at once.
+fn record(at: usize, tick: std::time::Duration, mut go: impl FnMut() -> std::io::Result<Answer>) -> Result<(), String> {
+    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut retried = false;
+    loop {
+        let a = go().map_err(|e| format!("`worklist go` did not start: {e}"))?;
+        if a.code != Some(0) {
+            let code = a.code.map_or_else(|| "none (ended by a signal)".to_string(), |c| c.to_string());
+            let said = one_line(if a.err.trim().is_empty() { &a.out } else { &a.err });
+            return Err(format!("`worklist go` exit {code}: {said}"));
+        }
+        let holding = format!("is still holding group {at}");
+        let Some(held) = a.out.lines().find(|l| l.contains("nothing to pass:") && l.trim_end().ends_with(&holding)) else { return Ok(()) };
+        if retried {
+            return Err(format!("`worklist go` passed nothing, twice a tick apart: {}", one_line(held)));
+        }
+        retried = true;
+        std::thread::sleep(tick);
+    }
+}
+
+/// Record the pass through `wsp worklist go`, the one way a barrier is passed,
+/// or say why it was not recorded.
+fn pass(store: &Store, list: &str, at: usize, g: &Group, plan: &Plan, count: usize, packet: &std::path::Path) -> Result<(), String> {
     let projects: Vec<&str> = plan.units.iter().map(|u| u.project.as_str()).collect();
     let sentence = format!(
         "Passed by wsp with no agent. All {} member(s) hold ({}); {count} check(s) ran at the trunk in {} and every one passed; \
@@ -763,24 +806,24 @@ fn pass(store: &Store, list: &str, g: &Group, plan: &Plan, count: usize, packet:
     let dir = store.state_file("barrier");
     let file = dir.join(format!("{list}-verdict.md"));
     let _ = std::fs::create_dir_all(&dir);
-    if std::fs::write(&file, &sentence).is_err() {
-        return false;
-    }
-    let Ok(exe) = wsp_base::util::self_exe() else { return false };
+    std::fs::write(&file, &sentence).map_err(|e| format!("verdict file not written: {}: {e}", util::contract(&file)))?;
+    let exe = wsp_base::util::self_exe().map_err(|e| format!("self_exe failed: {e}"))?;
     if cfg!(test) {
-        return false;
+        return Err("a test does not run `worklist go`".to_string());
     }
-    wsp_base::calls::Command::new(exe)
-        .args(["worklist", "go", list, "--from"])
-        .arg(&file)
-        .args(["--caption", &caption])
-        .env_remove(crate::base::seat::SEAT_ENV)
-        .env_remove("WSP_BACKEND_PANE_ID")
-        .env_remove("WSP_BACKEND_WORKSPACE_ID")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    record(at, RETRY_AFTER, || {
+        let o = wsp_base::calls::Command::new(&exe)
+            .args(["worklist", "go", list, "--from"])
+            .arg(&file)
+            .args(["--caption", &caption])
+            .env_remove(crate::base::seat::SEAT_ENV)
+            .env_remove("WSP_BACKEND_PANE_ID")
+            .env_remove("WSP_BACKEND_WORKSPACE_ID")
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        Ok(Answer { code: o.status.code(), out: text(&o.stdout), err: text(&o.stderr) })
+    })
 }
 
 #[cfg(test)]
@@ -915,6 +958,58 @@ mod tests {
 
     fn landed(member: &str, files: &[&str]) -> Landed {
         Landed { member: member.into(), commit: None, files: files.iter().map(|f| f.to_string()).collect(), no_commit: false }
+    }
+
+    fn answer(code: i32, out: &str, err: &str) -> std::io::Result<Answer> {
+        Ok(Answer { code: Some(code), out: out.into(), err: err.into() })
+    }
+
+    #[test]
+    fn a_pass_that_was_not_recorded_says_why_in_the_log_line() {
+        let now = std::time::Duration::ZERO;
+        let mut asked = 0;
+        let why = record(2, now, || {
+            asked += 1;
+            answer(1, "", "wsp: barrier 2 of run is held on the person — 1 open\n     m-1  which?\n")
+        })
+        .unwrap_err();
+        assert_eq!(asked, 1, "a refusal is not asked again");
+        assert_eq!(
+            not_recorded_line("run", 2, &why),
+            "run group 2: wsp could not record the pass, so its agent is asked — `worklist go` exit 1: wsp: barrier 2 of run is held on the person — 1 open m-1 which?"
+        );
+        let why = record(2, now, || Err(std::io::Error::other("no such file"))).unwrap_err();
+        assert_eq!(why, "`worklist go` did not start: no such file");
+
+        let (_env, store) = world("unwritten", "exit 0\n", "");
+        let w = store.worklist("run").unwrap();
+        let plan = plan(&store, &w, 1);
+        std::fs::create_dir_all(store.state_file("barrier").join("run-verdict.md")).unwrap();
+        let why = pass(&store, "run", 1, &w.groups()[0], &plan, 1, std::path::Path::new("packet.md")).unwrap_err();
+        assert!(why.starts_with("verdict file not written: "), "{why}");
+    }
+
+    #[test]
+    fn a_member_still_holding_the_group_is_waited_on_a_tick_and_asked_again() {
+        let held = "nothing to pass: pj-001 (review) is still holding group 2\n";
+        let tick = std::time::Duration::from_millis(30);
+        let mut answers = vec![answer(0, "passed\n", ""), answer(0, held, "")];
+        let started = Instant::now();
+        assert_eq!(record(2, tick, || answers.pop().unwrap()), Ok(()));
+        assert!(answers.is_empty() && started.elapsed() >= tick, "asked twice, a tick apart");
+
+        let mut asked = 0;
+        let why = record(2, std::time::Duration::ZERO, || {
+            asked += 1;
+            answer(0, held, "")
+        })
+        .unwrap_err();
+        assert_eq!(asked, 2, "one retry, then the agent");
+        assert!(why.ends_with("nothing to pass: pj-001 (review) is still holding group 2"), "{why}");
+
+        // Somebody else passed group 2 and the next group is at work: not a miss.
+        let next = "nothing to pass: pj-003 (doing) is still holding group 3\n";
+        assert_eq!(record(2, std::time::Duration::ZERO, || answer(0, next, "")), Ok(()));
     }
 
     fn facts<'a>(stop: &'a str) -> Facts<'a> {
