@@ -2243,10 +2243,22 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
 /// it: a row cut or moved to another place is a new wait there.
 const PARKED_WAIT: &str = "wsp: the run waits on this parked row:";
 
-/// The headline of the person's item about a parked member of `list`, and what
-/// finds it again once the wait is over.
+/// The headline of the person's item about a parked member of `list`, or one
+/// unparked and still claimed, and what finds it again once the wait is over.
 fn parked_headline(row: &str, list: &str) -> String {
-    format!("{row} is parked and the {list} run waits on it")
+    format!("the {list} run waits on {row} and will not start it")
+}
+
+/// A row parked while somebody held it and moved back to `todo` with the claim
+/// still held (`wsp park` releases nothing). The run starts a `todo` row only
+/// when nobody claims it. A claim or a start since the park is a new holder.
+fn unparked_but_claimed(store: &Store, id: &str, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    let Some(t) = store.find_task(id).filter(|t| t.status() == Status::Todo && claims.contains_key(&t.id)) else {
+        return false;
+    };
+    let log = t.section("Log").unwrap_or_default();
+    let last = log.lines().map(|l| undated(l.trim())).filter(|l| l.starts_with("parked: ") || fresh_start(l)).last();
+    last.is_some_and(|l| l.starts_with("parked: "))
 }
 
 /// Close the open items about this run's parked members that `over` names.
@@ -2269,25 +2281,33 @@ fn lapse_parked(store: &Store, list: &str, why: &str, over: impl Fn(&str) -> boo
 /// member is parked too, or finished and verified. The row is not unparked
 /// here — a park is somebody's decision, and the person is given the verb.
 ///
+/// A member unparked while its claim stands is not started either, and is said
+/// at once with the verb that ends the claim ([`unparked_but_claimed`]): nothing
+/// here ends a seat, so none is started beside one.
+///
 /// Once per reason and group, in `cycle.log` and to the person alike; a changed
-/// reason replaces the item, and a member no longer parked here has its item
-/// closed. The item is a question for the person, so it is in `wsp yours` and
+/// reason replaces the item, and a member the run no longer waits on this way
+/// has its item closed. The item is a question for the person, so it is in `wsp yours` and
 /// holds the group's barrier while it is open.
 fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     use crate::message::{self, About, Kind, Message, Party, Waiting};
     let parked = |s: &worklist::Standing| s.settlement == worklist::Settlement::Open(Status::Parked);
+    let claims = store.claims();
+    let stranded = |s: &worklist::Standing| unparked_but_claimed(store, &s.id, &claims);
+    let waits = |s: &worklist::Standing| parked(s) || stranded(s);
     lapse_parked(store, &w.id, "the run no longer waits on it as a parked row", |row| {
-        !pos.members.iter().any(|s| s.id == row && parked(s))
+        !pos.members.iter().any(|s| s.id == row && waits(s))
     });
     let tasks = store.tasks_shared();
-    let only_parked = pos.members.iter().all(|s| parked(s) || (s.finished() && crate::cycle::verified(&tasks, &s.id)));
+    let only_parked = pos.members.iter().all(|s| waits(s) || (s.finished() && crate::cycle::verified(&tasks, &s.id)));
     let mut repos = None;
-    for s in pos.members.iter().filter(|s| parked(s)) {
+    for s in pos.members.iter().filter(|s| waits(s)) {
+        let stranded = stranded(s);
         let Some(t) = store.find_task(&s.id) else { continue };
         let (done, owed): (Vec<&str>, Vec<&str>) =
             t.after.iter().map(String::as_str).partition(|o| crate::after::landed(store, &mut repos, o));
         let due = !done.is_empty() && owed.is_empty();
-        if !due && !only_parked {
+        if !stranded && !due && !only_parked {
             continue;
         }
         let prerequisite = if due {
@@ -2303,17 +2323,28 @@ fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             Some(r) => format!("{prerequisite}; parked: \"{}\"", util::truncate(r, 200)),
             None => prerequisite,
         };
+        let (state, why) = match stranded {
+            true => ("unparked but still claimed", "the run starts a todo row only when nobody claims it".to_string()),
+            false => ("parked", why),
+        };
         let place = format!("{PARKED_WAIT} {} group {at}:", w.id);
-        if !said_once_per_reason(store, &s.id, &place, &format!("{place} {why}")) {
+        if !said_once_per_reason(store, &s.id, &place, &format!("{place} {state}, {why}")) {
             continue;
         }
-        let verbs = format!(
-            "`wsp unpark {row}` puts it back to todo and the run starts it; `wsp worklist cut {list} {row} --why \"…\"` \
-             takes it out of the group.",
-            row = s.id,
-            list = w.id
-        );
-        stamp(store, &format!("{} group {at}: waits on {}: parked, {why}. {verbs}", w.id, s.id));
+        let cut = format!("`wsp worklist cut {} {} --why \"…\"` takes it out of the group.", w.id, s.id);
+        let verbs = match stranded {
+            true => format!(
+                "`wsp despawn {row}` ends the seat that holds it and the run then starts it (`wsp release {row}` where \
+                 no seat is left to end); {cut}",
+                row = s.id
+            ),
+            false => format!(
+                "`wsp unpark {row}` puts it back to todo and the run starts it once nobody claims it (`wsp despawn {row}` \
+                 ends a seat still holding it); {cut}",
+                row = s.id
+            ),
+        };
+        stamp(store, &format!("{} group {at}: waits on {}: {state}, {why}. {verbs}", w.id, s.id));
         lapse_parked(store, &w.id, "the reason the run waits on it changed", |row| row == s.id);
         let text = format!("{}\n\nGroup {at}: {why}.\n\n{verbs}", parked_headline(&s.id, &w.id));
         let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new("", &s.id))
@@ -5227,6 +5258,35 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         assert!(store.clear_claim("m-3"));
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert_eq!(items(&store), asked);
+    }
+
+    /// `wsp-851`: a seat standing idle on the row it parked keeps the claim
+    /// through `wsp unpark`, so the run does not start it: said and asked once,
+    /// naming `wsp despawn`, and closed when the claim has ended.
+    #[test]
+    fn a_member_unparked_while_still_claimed_is_said_and_asked_about() {
+        let (_env, store) = scratch("parkedstranded");
+        held_by_a_parked_member(&store, &[]);
+        store.set_claim("m-3", serde_json::json!({ "workspace": "cpd-1" }));
+        let idle = Fake::new(&[("cpd-1", Some(State::Idle))]);
+        tick(&store, &idle, &mut Pass::new());
+        assert_eq!(items(&store).len(), 1);
+        stamped();
+
+        let args = crate::base::args::Args::synth("unpark", &["m-3"], &[]);
+        assert_eq!(crate::cmd_task::unpark(&store, &args), 0);
+        for _ in 0..3 {
+            tick(&store, &idle, &mut Pass::new());
+        }
+        let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("waits on m-3: unparked")).collect();
+        assert!(said.len() == 1 && said[0].contains("wsp despawn m-3"), "{said:?}");
+        let asked = items(&store);
+        assert!(asked.len() == 1 && asked[0].contains("wsp despawn m-3"), "{asked:?}");
+        assert!(store.claims().contains_key("m-3"), "nothing here ends the seat");
+
+        assert!(store.clear_claim("m-3"));
+        tick(&store, &idle, &mut Pass::new());
+        assert!(items(&store).is_empty(), "{:?}", items(&store));
     }
 
     /// `wsp-851`: the cut the notice offers moves the row to a group of its
