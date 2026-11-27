@@ -1090,6 +1090,16 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     // review nothing verified.
     let verdicts: Vec<i64> = i.kind("task-verified", id).into_iter().map(|(t, _)| t).collect();
     let review = reviews.iter().copied().rev().find(|r| verdicts.iter().any(|v| v >= r)).or_else(|| reviews.last().copied());
+    // A review typed again while the verifier read spawns none: the verifier is
+    // the earlier review's, back to the verdict before (`compound-react-122`:
+    // cr-fixes' group 1 booked its 291 s as nobody working).
+    let verify = format!("spawn {id} --agent --verify");
+    let review = review.map(|r| {
+        let judged = verdicts.iter().copied().filter(|v| *v >= r).min();
+        let before = verdicts.iter().copied().filter(|v| *v < r).max().unwrap_or(0);
+        let spawned = |x: &i64| i.first_line(x.saturating_sub(1), |l| l.starts_with(&verify)).is_some_and(|s| judged.is_none_or(|v| s <= v));
+        reviews.iter().copied().rev().filter(|x| *x <= r && *x > before).find(spawned).unwrap_or(r)
+    });
     if let (Some(r), Some(e)) = (review, last_end) {
         if r > e {
             let finishing = || "the row's own seat finishing (not wsp)".to_string();
@@ -1111,7 +1121,7 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     }
     let verdict = verdicts.iter().copied().find(|t| review.is_none_or(|r| *t >= r));
     if let Some(r) = review {
-        let spawned = i.first_line(r.saturating_sub(1), |l| l.starts_with(&format!("spawn {id} --agent --verify")));
+        let spawned = i.first_line(r.saturating_sub(1), |l| l.starts_with(&verify));
         let up = spawned.and_then(|s| i.first_line(s, |l| l.contains(&format!("started {id} · verifying"))));
         if let Some(s) = spawned {
             // `wsp review` runs the row's own check before it spawns the verifier;

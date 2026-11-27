@@ -1689,6 +1689,39 @@ mod tests {
         assert!(out[0]["turns"].is_null());
     }
 
+    /// cr-fixes' group 1 (`compound-react-122`): one member, a verifier of one
+    /// turn and 291 s, the review typed again while it read, and the barrier
+    /// started at the verdict.
+    #[test]
+    fn a_verifiers_run_is_working_though_the_review_was_typed_again_while_it_read() {
+        let (_e, store, w) = list("reviewed-again", &["r-1"]);
+        let (review, verdict) = (1000 + 434, 1000 + 434 + 291);
+        let ev = |t: i64, kind: &str| (t, kind.to_string(), json!({"id": "r-1"}));
+        let i = crate::timeline::Inputs {
+            id: "r-1".into(),
+            events: vec![ev(1002, "task-claimed"), ev(review, "task-review"), ev(review + 45, "task-review"), ev(verdict, "task-verified")],
+            cycle: vec![
+                (1000, "spawn r-1 --agent --kind claude".into()),
+                (review, "spawn r-1 --agent --verify --kind claude".into()),
+                (review + 1, "list group 1: started r-1 · verifying".into()),
+                (verdict, "list group 1: started list · barrier 1".into()),
+                (verdict, "spawn list --agent --check 1 --kind claude".into()),
+                (verdict + 19, "ended cpd-2, which verified r-1 (holds)".into()),
+                (verdict + 56, "tell list: Barrier 1 of list passed".into()),
+            ],
+            group: Some(("list".into(), 1, vec!["r-1".into()])),
+            ..Default::default()
+        };
+        let phases = crate::timeline::build(&i);
+        let fig = |_: &str| crate::timeline::figures_of(&phases, &Default::default());
+        let v = effort_over(&store, &w, None, &fig, json!({}));
+        let wall = &v["groups"][0]["wall_buckets"];
+        // The seat's 432 s from its claim, and the verifier's 291 s.
+        assert_eq!(wall["working_seconds"], 432 + 291, "{wall}");
+        let unstarted = wall["waiting_by"].to_string();
+        assert!(!unstarted.contains("the barrier not yet started"), "{wall}");
+    }
+
     #[test]
     fn a_member_with_an_empty_record_but_a_measured_seat_is_filled_from_the_seat_and_not_working_its_span() {
         use crate::timeline::RowFigures;
