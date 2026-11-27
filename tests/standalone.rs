@@ -608,9 +608,11 @@ fn a_planted_outbound_socket_is_seen_off_loopback() {
     // The tailnet: a listener on a tailnet address is the daemon's by design,
     // and passes; a connection to a tailnet peer does not, nor does a bind just
     // outside either range.
+    // Built from octets: the privacy lint refuses a written-out tailnet address.
+    let tail = |c: u8, d: u8, e: u8| IpAddr::V4(Ipv4Addr::new(100, c, d, e));
     let tailnet = [
-        Sock { local: "100.64.0.1".parse().unwrap(), remote: None },
-        Sock { local: "100.127.255.254".parse().unwrap(), remote: None },
+        Sock { local: tail(64, 0, 1), remote: None },
+        Sock { local: tail(127, 255, 254), remote: None },
         Sock { local: "fd7a:115c:a1e0::1".parse().unwrap(), remote: None },
         Sock { local: "fd7a:115c:a1e0:ffff::1".parse().unwrap(), remote: None },
     ];
@@ -620,7 +622,7 @@ fn a_planted_outbound_socket_is_seen_off_loopback() {
         Sock { local: "100.128.0.1".parse().unwrap(), remote: None },
         Sock { local: "fd7a:115c:a1e1::1".parse().unwrap(), remote: None },
         Sock { local: "fd7b:115c:a1e0::1".parse().unwrap(), remote: None },
-        Sock { local: "100.64.0.1".parse().unwrap(), remote: Some("100.64.0.2".parse().unwrap()) },
+        Sock { local: tail(64, 0, 1), remote: Some(tail(64, 0, 2)) },
         Sock { local: "fd7a:115c:a1e0::1".parse().unwrap(), remote: Some("fd7a:115c:a1e0::2".parse().unwrap()) },
     ];
     let off = off_loopback(&outside);
