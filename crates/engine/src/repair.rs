@@ -4821,6 +4821,37 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         assert!(crate::verifier_packet::build(&store, &t).is_none());
     }
 
+    /// A row whose legs or pieces all had trees of their own has no commit made
+    /// on its branch, only the join. Landed by hand, it still records its tip.
+    #[test]
+    fn a_member_whose_work_arrived_by_a_join_records_its_own_tip() {
+        for part in ["m-1.a", "m-1-2"] {
+            let (env, store) = scratch("joined");
+            let repo = repo(&env, &store);
+            crate::testkit::repo(&repo);
+            git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+            git_in(&repo, &["branch", "m-1"]);
+            git_in(&repo, &["checkout", "--quiet", "-b", part, "m-1"]);
+            git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "the part's work"]);
+            git_in(&repo, &["checkout", "--quiet", "m-1"]);
+            git_in(&repo, &["merge", "--quiet", "--no-edit", part]);
+            git_in(&repo, &["branch", "--quiet", "-D", part]);
+            git_in(&repo, &["checkout", "--quiet", "master"]);
+            git_in(&repo, &["merge", "--quiet", "--ff-only", "m-1"]);
+            let sha = git_in(&repo, &["rev-parse", "m-1"]);
+            let mut t = Task::new("m-1", "m-1");
+            t.project = Some("p".into());
+            t.set_status(Status::Review);
+            store.save_task(&t).unwrap();
+            list(&store, &["m-1"], "claude");
+
+            tick(&store, &Fake::empty(), &mut Pass::new());
+
+            let t = store.find_task("m-1").unwrap();
+            assert_eq!(landed(&t), Some(sha), "{part}: {}", row_log(&store, "m-1"));
+        }
+    }
+
     /// Two roots: the row's branch in the first is level with its trunk, and its
     /// work is a commit on the second's branch of the same name.
     #[cfg(test)] // `testkit::repo` is engine's dev-dependency

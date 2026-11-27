@@ -1536,13 +1536,18 @@ pub fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether a commit was ever made on `branch`, by its reflog. A branch cut and
-/// never committed on has only its creation there, and the fast-forwards and
-/// rebases that keep it level with the trunk add no commit of its own.
-pub fn committed_on(repo: &Path, branch: &str) -> bool {
+/// Whether the row's work ever reached `branch`, by its reflog: a commit made on
+/// it, or a leg or piece of `row` ([`own_part`]) joined into it, which may be a
+/// fast-forward that makes no commit there. A branch cut and never committed on
+/// has only its creation, and the fast-forwards and rebases that keep it level
+/// with the trunk add no work of its own.
+pub fn committed_on(repo: &Path, branch: &str, row: &[&str]) -> bool {
     const MADE: [&str; 4] = ["commit", "cherry-pick", "revert", "am"];
     git(repo, &["reflog", "show", "--format=%gs", &format!("refs/heads/{branch}")]).is_some_and(|said| {
-        said.lines().any(|l| l.split([':', ' ']).next().is_some_and(|action| MADE.contains(&action)))
+        said.lines().any(|l| {
+            l.split([':', ' ']).next().is_some_and(|action| MADE.contains(&action))
+                || l.strip_prefix("merge ").and_then(|m| m.split_once(':')).is_some_and(|(from, _)| own_part(from, row))
+        })
     })
 }
 
@@ -2558,12 +2563,17 @@ fn brings_history(dir: &Path, onto: &str, row: &[&str]) -> bool {
         .is_some_and(|merges| !merges.lines().all(|subject| joins_own(subject, row)))
 }
 
-/// Whether a merge commit's subject says it joined a leg (`<row>.<leg>`) or a
-/// piece (`<row>-<n>`) of the row into it. Read off the subject git writes,
-/// since the joined branch is deleted once it is merged. `row` is every name the
-/// row goes by: its id, and its branch where a renumbering left them apart.
+/// Whether a merge commit's subject says it joined a leg or a piece of the row
+/// into it ([`own_part`]). Read off the subject git writes, since the joined
+/// branch is deleted once it is merged.
 fn joins_own(subject: &str, row: &[&str]) -> bool {
-    let Some(branch) = subject.strip_prefix("Merge branch '").and_then(|s| s.split('\'').next()) else { return false };
+    subject.strip_prefix("Merge branch '").and_then(|s| s.split('\'').next()).is_some_and(|b| own_part(b, row))
+}
+
+/// Whether `branch` is a leg (`<row>.<leg>`) or a piece (`<row>-<n>`) of the row.
+/// `row` is every name the row goes by: its id, and its branch where a
+/// renumbering left them apart.
+fn own_part(branch: &str, row: &[&str]) -> bool {
     row.iter().any(|row| {
         let Some(rest) = branch.strip_prefix(row) else { return false };
         rest.strip_prefix('.').is_some_and(|leg| !leg.is_empty())

@@ -1594,7 +1594,7 @@ pub fn verified_by_a_run(store: &Store, task: &str) -> bool {
 /// a member named by the worklist's own text — or `None` while any of it is
 /// still outstanding.
 ///
-/// **Only a branch something was committed on answers**
+/// **Only a branch the row's work reached answers**
 /// ([`cmd_checkout::committed_on`]). One cut at the trunk tip and never
 /// committed on is level with the trunk too, and its tip is the trunk's: a row
 /// with no commit, or whose work is on another repository's branch, would be
@@ -1620,9 +1620,11 @@ pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
     let mut repos = Repos::new(store);
     let task = store.task_now(&repos.renamed, id)?;
     let trunks = task.project.as_deref().map(|p| repos.of(p)).unwrap_or_default();
+    let names = repos.branches(&task.id);
+    let row: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut landed = None;
     for trunk in trunks {
-        for branch in repos.branches(&task.id) {
+        for branch in &names {
             let spec = format!("refs/heads/{branch}");
             if git(&trunk.dir, &["rev-parse", "--verify", "--quiet", &spec]).is_none() {
                 continue;
@@ -1630,7 +1632,7 @@ pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
             if !cmd_checkout::ahead(&trunk.dir, &trunk.branch, &branch).is_empty() {
                 return None;
             }
-            if landed.is_none() && cmd_checkout::committed_on(&trunk.dir, &branch) {
+            if landed.is_none() && cmd_checkout::committed_on(&trunk.dir, branch, &row) {
                 let tip = git(&trunk.dir, &["rev-parse", &spec])?;
                 landed = Some((tip.trim().to_string(), trunk.branch.clone()));
             }
