@@ -2304,6 +2304,27 @@ fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> 
             return 2;
         }
     }
+    // The rule steps the row's own diff calls for (layering, readonly, help),
+    // run in the member's seat at the commit it is ready at (`wsp-858`): a red
+    // one keeps the row from review and from its verifier.
+    if ready_line.is_some() {
+        if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
+            let anyway = args.get("anyway").filter(|w| w != "true" && !w.trim().is_empty());
+            match rule_gate(store, &t, anyway.as_deref()) {
+                Ok(said) => {
+                    for line in said {
+                        eprintln!("wsp: {line}");
+                    }
+                }
+                Err(lines) => {
+                    for line in lines {
+                        eprintln!("{line}");
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
     // From a leg's seat the row is not finished while a sibling runs, and from
     // the last running leg the rest are skipped (`docs/legs.md`, *A leg is a
     // seat*). Refused before the row moves.
@@ -2401,6 +2422,94 @@ pub fn blocked_refusal(id: &str, pass: &crate::verification::Pass) -> Vec<String
         "  if you disagree with it: `wsp review {id} --anyway \"why\" \"account\"` puts it up as it is, logged, and the governor hears of it"
     ));
     out
+}
+
+/// The log line a review refused on a red rule step writes (`wsp-858`),
+/// followed by the commit and the steps: `<this> <sha> (layering)`.
+pub const RULE_RED: &str = "review refused, a rule step red at";
+
+/// The commit the newest rule-step refusal on the row was read at.
+fn rule_red_at(t: &Task) -> Option<String> {
+    let log = t.section("Log")?;
+    log.lines()
+        .rev()
+        .find_map(|l| l.split_once(RULE_RED).and_then(|(_, r)| r.split_whitespace().next().map(str::to_string)))
+}
+
+/// The rule steps (layering, readonly, help) the row's diff calls for, run in
+/// its seat at the commit its tree stands at (`wsp-858`). `Ok` is what to say
+/// and the review goes on: the steps were green, skipped (a cold `target/`, a
+/// limit), or put up over with `--anyway`. `Err` is the refusal: a step red
+/// now, or the same commit a red one already refused, unchanged.
+fn rule_gate(store: &Store, t: &Task, anyway: Option<&str>) -> Result<Vec<String>, Vec<String>> {
+    use crate::cmd_verify::git;
+    let Some(tree) = crate::cmd_checkout::member_tree(store, &t.id) else { return Ok(Vec::new()) };
+    let Some(tip) = git(&tree, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()) else { return Ok(Vec::new()) };
+    let short: String = tip.chars().take(12).collect();
+    let note = |line: String| {
+        store.locked(|| {
+            if let Some(mut m) = store.find_task(&t.id) {
+                m.log(&line);
+                let _ = store.save_task(&m);
+            }
+        });
+    };
+    // Put up again unchanged after a red: refused from the record, not run again.
+    if rule_red_at(t).is_some_and(|at| crate::verification::same_commit(&at, &tip)) {
+        return match anyway {
+            Some(why) => {
+                note(format!("anyway: reviewed at {short} over a red rule step: {}", fold(why)));
+                Ok(vec![format!("rule steps not run again at {short}, put up over their red: {}", fold(why))])
+            }
+            None => Err(vec![
+                format!("wsp: {} is at {short}, where its last review was refused on a red rule step, and nothing has changed since", t.id),
+                format!("  the step's output is in the row's log (`wsp show {}`)", t.id),
+                "  fix what it found and commit (`wsp commit-help`), then `wsp review` again".into(),
+                format!("  if the red is the tree's and not the row's: `wsp review {} --anyway \"why\" \"account\"`", t.id),
+            ]),
+        };
+    }
+    let Some(trunk) = crate::base::git::trunk(&tree) else { return Ok(Vec::new()) };
+    let Some(branch) = crate::base::git::trunk_branch(&trunk) else { return Ok(Vec::new()) };
+    let Some(base) = git(&tree, &["merge-base", &branch, &tip]).map(|s| s.trim().to_string()) else { return Ok(Vec::new()) };
+    let steps = crate::check::rule_steps_at(&tree, &base, &tip);
+    if steps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut said = Vec::new();
+    let mut red: Vec<(crate::check::Step, String)> = Vec::new();
+    for step in &steps {
+        let log = store.state.join("review-rules").join(format!("{}-{}.log", t.id, step.name));
+        match crate::check::run_at_review(&tree, step, &log) {
+            crate::check::AtReview::Green => said.push(format!("{} green in the seat at {short} (`{}`)", step.name, step.command)),
+            crate::check::AtReview::Skipped(why) => said.push(why),
+            crate::check::AtReview::Red(tail) => red.push((step.clone(), tail)),
+        }
+    }
+    if red.is_empty() {
+        return Ok(said);
+    }
+    let names: Vec<&str> = red.iter().map(|(s, _)| s.name.as_str()).collect();
+    if let Some(why) = anyway {
+        note(format!("anyway: reviewed at {short} over a red rule step ({}): {}", names.join(", "), fold(why)));
+        said.push(format!("{} red in the seat at {short}, put up over it: {}", names.join(", "), fold(why)));
+        return Ok(said);
+    }
+    let tails: Vec<String> = red.iter().map(|(s, tail)| format!("`{}`: {}", s.command, fold(tail))).collect();
+    note(format!("{RULE_RED} {tip} ({}) — {}", names.join(", "), util::truncate(&tails.join("; "), 600)));
+    let mut out = vec![format!(
+        "wsp: {} not moved to review — {} red in its seat at {short}, so no verifier is started for it",
+        t.id,
+        names.join(", ")
+    )];
+    for (step, tail) in &red {
+        out.push(format!("  `{}`:", step.command));
+        out.extend(tail.lines().filter(|l| !l.trim().is_empty()).map(|l| format!("  | {l}")));
+    }
+    out.extend(said.iter().map(|l| format!("  {l}")));
+    out.push("  fix what it found and commit (`wsp commit-help`), then `wsp review` again".into());
+    out.push(format!("  if the red is the tree's and not the row's: `wsp review {} --anyway \"why\" \"account\"`", t.id));
+    Err(out)
 }
 
 /// Deliberately not yet — the other half of what `block` used to mean.
@@ -4695,6 +4804,141 @@ pub mod tests {
         assert!(log.contains(&format!("{} {tip} on wsp-101", crate::repair::READY)), "{log}");
         let repo = tree.parent().unwrap().parent().unwrap();
         assert_ne!(git_at(repo, &["rev-parse", "master"]), tip, "nothing reached the trunk");
+    }
+
+    /// A member `wsp-101` of a running group whose trunk keeps the layering
+    /// test and the component map, and whose one commit adds `src/newmod.rs`
+    /// — with its component row when `with_row`. `extra` files go in the same
+    /// commit.
+    #[cfg(test)]
+    fn a_member_adding_a_module(tag: &str, with_row: bool, extra: &[(&str, &str)]) -> (crate::util::Isolated, Store, std::path::PathBuf) {
+        let env = crate::util::isolated(tag);
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let repo = env.path("repo");
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        crate::testkit::repo(&repo);
+        std::fs::write(repo.join(crate::check::LAYERING_FILE), "// the layering test\n").unwrap();
+        std::fs::write(repo.join("docs/components.md"), "| old | src/old.rs |\n").unwrap();
+        std::fs::write(repo.join("src/old.rs"), "\n").unwrap();
+        git_at(&repo, &["add", "."]);
+        git_at(&repo, &["commit", "--quiet", "-m", "first"]);
+        let tree = repo.join(".worktrees").join("wsp-101");
+        git_at(&repo, &["worktree", "add", "--quiet", "-b", "wsp-101", &tree.display().to_string(), "master"]);
+        std::fs::write(tree.join("src/newmod.rs"), "pub fn f() {}\n").unwrap();
+        if with_row {
+            std::fs::write(tree.join("docs/components.md"), "| old | src/old.rs |\n| newmod | src/newmod.rs |\n").unwrap();
+        }
+        for (path, text) in extra {
+            std::fs::write(tree.join(path), text).unwrap();
+        }
+        git_at(&tree, &["add", "."]);
+        git_at(&tree, &["commit", "--quiet", "-m", "wsp-101: a module"]);
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        let mut t = Task::new("a member", "wsp-101");
+        t.project = Some("p".into());
+        t.status_raw = "doing".into();
+        t.caption = Some("A member that adds a module".into());
+        store.save_task(&t).unwrap();
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["wsp-101".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        (env, store, tree)
+    }
+
+    /// The layering test as a unit test can run it: red, with the test's own
+    /// message, while the component map lacks the new module.
+    #[cfg(test)]
+    const FAKE_LAYERING: &str = "grep -q newmod docs/components.md || { echo 'modules with no component in docs/components.md: src/newmod'; exit 1; }";
+
+    #[cfg(test)]
+    fn rule_run(command: &str, limit_secs: u64) {
+        crate::check::TEST_RULE_RUN.with(|r| *r.borrow_mut() = Some((command.into(), std::time::Duration::from_secs(limit_secs))));
+    }
+
+    /// `wsp-858` (1): a row that adds a module absent from docs/components.md
+    /// is refused at `wsp review` with the layering output; it stays at doing
+    /// and is not ready, so no verifier opens on it.
+    #[test]
+    fn a_row_adding_a_module_without_its_component_is_refused_at_review_and_gets_no_verifier() {
+        let (_env, store, tree) = a_member_adding_a_module("review-layering-red", false, &[]);
+        rule_run(FAKE_LAYERING, 30);
+        let tip = git_at(&tree, &["rev-parse", "HEAD"]);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 1);
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "doing", "and it did not move");
+        assert!(crate::repair::ready(&t).is_none(), "not ready, so the cycle owes it no verifier");
+        let log = t.section("Log").unwrap();
+        assert!(log.contains(&format!("{RULE_RED} {tip} (layering)")), "{log}");
+        assert!(log.contains("modules with no component in docs/components.md: src/newmod"), "the layering output is kept: {log}");
+    }
+
+    /// `wsp-858` (2): the same row with its component row added reaches review,
+    /// ready at its commit, as today.
+    #[test]
+    fn a_row_adding_a_module_with_its_component_reaches_review_and_its_verifier() {
+        let (_env, store, tree) = a_member_adding_a_module("review-layering-green", true, &[]);
+        rule_run(FAKE_LAYERING, 30);
+        let tip = git_at(&tree, &["rev-parse", "HEAD"]);
+        let t = store.task("wsp-101").unwrap();
+        let said = rule_gate(&store, &t, None).unwrap();
+        assert!(said.iter().any(|l| l.starts_with("layering green in the seat")), "{said:?}");
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 0);
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "review");
+        assert_eq!(crate::repair::ready(&t).as_deref(), Some(tip.as_str()), "ready, so its verifier opens");
+        assert!(!t.section("Log").unwrap().contains(RULE_RED));
+    }
+
+    /// `wsp-858` (3): a commit whose last review was refused on a red rule step
+    /// is not put up again unchanged — refused from the record, even where the
+    /// step would now pass — and a new commit goes through.
+    #[test]
+    fn a_commit_refused_on_a_red_rule_step_is_not_marked_ready_again_unchanged() {
+        let (_env, store, tree) = a_member_adding_a_module("review-layering-again", false, &[]);
+        rule_run(FAKE_LAYERING, 30);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 1);
+        rule_run("true", 30);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 1, "the same commit, unchanged");
+        let t = store.task("wsp-101").unwrap();
+        assert_eq!(t.status_raw, "doing");
+        let lines = rule_gate(&store, &t, None).unwrap_err();
+        assert!(lines[0].contains("refused on a red rule step, and nothing has changed since"), "{lines:?}");
+        std::fs::write(tree.join("docs/components.md"), "| old | src/old.rs |\n| newmod | src/newmod.rs |\n").unwrap();
+        git_at(&tree, &["commit", "--quiet", "-am", "wsp-101: its component"]);
+        rule_run(FAKE_LAYERING, 30);
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 0, "a new commit is read again");
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "review");
+    }
+
+    /// `wsp-858` (4): a rule step not run in the seat — a cold `target/`, or
+    /// stopped at its limit — is said in the review's output, and the review
+    /// goes on: the verifier's check runs it.
+    #[test]
+    fn a_rule_step_skipped_in_the_seat_is_said_at_review() {
+        let (_env, store, _tree) = a_member_adding_a_module("review-layering-cold", false, &[("Cargo.lock", "# cold\n")]);
+        rule_run(FAKE_LAYERING, 30);
+        let t = store.task("wsp-101").unwrap();
+        let said = rule_gate(&store, &t, None).unwrap();
+        assert!(said.iter().any(|l| l.contains("layering not run in the seat: the tree's target/ is cold")), "{said:?}");
+        assert_eq!(review(&store, &parse(&["review", "wsp-101", "done, nothing left"])), 0);
+        assert_eq!(store.task("wsp-101").unwrap().status_raw, "review");
+    }
+
+    /// `wsp-858` (4), the limit: a step stopped at its limit in the seat is
+    /// said as not finished, never as red.
+    #[test]
+    fn a_rule_step_stopped_at_its_limit_in_the_seat_is_said_and_not_red() {
+        let (_env, store, _tree) = a_member_adding_a_module("review-layering-limit", false, &[]);
+        rule_run("sleep 5", 1);
+        let t = store.task("wsp-101").unwrap();
+        let said = rule_gate(&store, &t, None).unwrap();
+        assert!(said.iter().any(|l| l.contains("layering not finished in the seat: stopped at its 1s limit")), "{said:?}");
     }
 
     /// compounding-617: a `## Checks` line that runs `wsp check` on its own row

@@ -851,6 +851,89 @@ pub fn structure_steps(read: &dyn Fn(&str) -> Option<String>, changed: &[String]
     out
 }
 
+// ---- the rule steps at review (wsp-858) -------------------------------------
+//
+// wsp-844 and wsp-345 each reached their verifier with the layering test red
+// and were sent back for it, 8-13 minutes of a 33 minute list. The rule steps
+// below are the ones a row's own diff calls for and no `## Checks` line names,
+// so `wsp review` runs them in the member's seat, at the commit it is putting
+// up, and a red one keeps the row from review and from its verifier.
+
+/// What a rule step said in the member's seat at review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AtReview {
+    Green,
+    /// Red: the tail of its output.
+    Red(String),
+    /// Not run, or not run to its end: why, for the review's output.
+    Skipped(String),
+}
+
+/// The most a rule step may take in a seat at review. The layering test is a
+/// second on a warm `target/`; past this the build is the cost, and the
+/// verifier's and the barrier's runs are left to find it.
+pub const REVIEW_RULE_LIMIT: Duration = Duration::from_secs(4 * 60);
+
+/// The rule-derived steps (help, layering, readonly) the diff from `base` to
+/// `sha` in `repo` calls for: the same [`structure_steps`] and
+/// [`layering_step`] a landing's check plans, and no rule of its own.
+pub fn rule_steps_at(repo: &Path, base: &str, sha: &str) -> Vec<Step> {
+    let mut changed: Vec<String> = git(repo, &["diff", "--name-only", base, sha])
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    changed.sort();
+    changed.dedup();
+    let at_sha = |path: &str| git(repo, &["show", &format!("{sha}:{path}")]);
+    let mut steps = structure_steps(&at_sha, &changed);
+    let in_base = |path: &str| git(repo, &["cat-file", "-e", &format!("{base}:{path}")]).is_some();
+    if let Some(l) = layering_step(&|p| at_sha(p).is_some(), &in_base, &changed) {
+        if !steps.iter().any(|s| s.command == l.command) {
+            steps.push(l);
+        }
+    }
+    steps
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own command for every rule step at review, and its limit: the
+    /// real ones are `cargo test`, which a unit test does not build.
+    pub static TEST_RULE_RUN: std::cell::RefCell<Option<(String, Duration)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run one rule step in the member's `tree`, its output to `log`: skipped on a
+/// cold `target/` (a build of minutes in the seat), and stopped at
+/// [`REVIEW_RULE_LIMIT`] and said as skipped, never as red.
+pub fn run_at_review(tree: &Path, step: &Step, log: &Path) -> AtReview {
+    if Start::of(tree, Vec::new()).target == "cold" {
+        return AtReview::Skipped(format!("{} not run in the seat: the tree's target/ is cold, a build of minutes — the verifier's check runs it", step.name));
+    }
+    #[allow(unused_mut)]
+    let mut step = Step { limit: REVIEW_RULE_LIMIT, ..step.clone() };
+    #[cfg(test)]
+    if let Some((command, limit)) = TEST_RULE_RUN.with(|r| r.borrow().clone()) {
+        step.command = command;
+        step.limit = limit;
+    }
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let ran = run_step(tree, &step, log, &Runner::Inproc);
+    match &ran.done {
+        Done::Passed => AtReview::Green,
+        Done::Failed { timed_out: true, .. } => AtReview::Skipped(format!(
+            "{} not finished in the seat: stopped at its {}s limit at review — the verifier's check runs it",
+            step.name,
+            step.limit.as_secs()
+        )),
+        d if d.is_red() => AtReview::Red(ran.tail.clone()),
+        _ => AtReview::Skipped(format!("{} not run in the seat: {}", step.name, why_failed(&ran))),
+    }
+}
+
 /// The steps of a re-plan after the trunk moved that the rebase can have
 /// affected, given `pulled_in` (what the rebase brought from the trunk) and
 /// `ours` (what the branch changes): a project rule whose glob matches a pulled-in
