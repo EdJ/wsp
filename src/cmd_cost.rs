@@ -114,6 +114,34 @@ fn check_seconds(seat: &str, opened: &str) -> Option<i64> {
     (start > 0 && end >= start).then_some(end - start)
 }
 
+/// The seat a `cycle.log` line says ended, and whether it ended as a barrier's
+/// check: an accepted exit's line names its kind, and the tick's ending of a
+/// leg, piece or verifier names the row. `None` for any other line.
+fn seat_ending(line: &str) -> Option<(&str, bool)> {
+    if let Some((_, rest)) = line.split_once(crate::ending::EXIT_ENDED) {
+        let (kind, seat) = rest.split_once(" (")?.1.split_once(')')?.0.split_once(", ")?;
+        return Some((seat, kind == "check"));
+    }
+    if let Some((_, rest)) = line.split_once("the seat of an accepted exit had already gone — ") {
+        let (seat, rest) = rest.split_once(" (")?;
+        return Some((seat, rest.split_once(')')?.0 == "check"));
+    }
+    let (seat, what) = line.strip_prefix("ended ")?.split_once(", which ")?;
+    (what.starts_with("ran leg ") || what.starts_with("ran piece ") || what.starts_with("verified ")).then_some((seat, false))
+}
+
+/// `cycle.log`'s seat endings as `(epoch, seat, as a check)`, in file order.
+fn seat_endings(store: &Store) -> Vec<(i64, String, bool)> {
+    let text = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let (ts, rest) = l.split_once(' ')?;
+            let (seat, check) = seat_ending(rest)?;
+            Some((util::epoch_of(ts), seat.to_string(), check))
+        })
+        .collect()
+}
+
 /// One governor seat of a list: the workspace, the group it counts toward, the
 /// pass it sat through (see [`governors`]), the seconds it held the slot, and
 /// each stretch `[from, to)` it held it — `to` is 0 while it still does
@@ -221,9 +249,17 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
         e.fig = fig_of(&seat, None, Some(seconds));
         out.push(e);
     }
+    let endings = seat_endings(store);
     for (i, g) in groups.iter().enumerate() {
         for c in &g.checks {
             let Some(pane) = c.pane.as_deref() else { continue };
+            // An entry can name a seat that went on to work a row (`wsp-847`):
+            // what the seat first ended as, from the check's opening, says
+            // whether it was this barrier's.
+            let opened = util::epoch_of(&c.at);
+            if endings.iter().find(|(t, seat, _)| *t >= opened && seat == pane).is_some_and(|e| !e.2) {
+                continue;
+            }
             let mut e = entry(i + 1, None, "barrier", pane);
             e.tier = c.on.clone().unwrap_or_default();
             e.shared = !counted.insert(pane.to_string());
@@ -762,5 +798,77 @@ mod tests {
         let j = cost_json("run", &es, 2);
         assert_eq!(j["groups"][1]["barrier"][0]["measured"], true);
         assert_eq!(j["groups"][0]["barrier"][0]["measured"], false);
+    }
+
+    /// A check entry on group 1 for each of `panes`, all opened at `at`.
+    fn checked(store: &Store, at: &str, panes: &[&str]) {
+        let mut w = store.worklist("run").unwrap();
+        let mut gs = w.groups();
+        for pane in panes {
+            let mut c = crate::barrier::Check::opened(None, None);
+            c.at = at.into();
+            c.pane = Some(pane.to_string());
+            gs[0].checks.push(c);
+        }
+        w.set_groups(&gs);
+        store.save_worklist(&w).unwrap();
+    }
+
+    fn cycle_log(state: &std::path::Path, lines: &[&str]) {
+        std::fs::write(state.join("cycle.log"), lines.join("\n") + "\n").unwrap();
+    }
+
+    /// `wsp-847`, trunk-green's barrier 1: four check entries, three naming
+    /// seats that worked another list's row.
+    #[test]
+    fn only_the_seat_that_ended_as_the_check_is_booked_to_the_barrier() {
+        let (env, store) = fixture("cost-borrowed");
+        let st = env.state();
+        // Each seat's ending, seconds after the check opened at 02:00:00.
+        for (seat, ended) in [("cpd-388", "02:03:20"), ("cpd-390", "02:04:10"), ("cpd-393", "02:04:16"), ("cpd-394", "02:05:56")] {
+            use std::io::Write;
+            let line = json!({ "seat": seat, "ended": format!("2026-11-27T{ended}Z"), "session_id": seat, "turns": 3, "output": 1 });
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(st.join(crate::place_super::SPENT_FILE)).unwrap();
+            writeln!(f, "{line}").unwrap();
+        }
+        checked(&store, "2026-11-27T02:00:00Z", &["cpd-388", "cpd-390", "cpd-393", "cpd-394"]);
+        cycle_log(&st, &[
+            "2026-11-27T02:00:00Z spawn run --agent --check 1",
+            "2026-11-27T02:00:01Z spawn run --agent --check 1",
+            "2026-11-27T02:00:02Z spawn run --agent --check 1",
+            "2026-11-27T02:00:03Z spawn run --agent --check 1",
+            "2026-11-27T02:03:20Z ended cpd-388, which ran leg build of wsp-075",
+            "2026-11-27T02:04:10Z wsp-075: ended: its exit was accepted at 2026-11-27T02:04:00Z (verifier, cpd-390), no pid of it running and its tree kept",
+            "2026-11-27T02:04:16Z ended cpd-393, which verified wsp-075 (holds)",
+            "2026-11-27T02:05:56Z run barrier 1: ended: its exit was accepted at 2026-11-27T02:05:50Z (check, cpd-394), no pid of it running and its tree kept",
+        ]);
+        let es = entries(&store, "run").unwrap();
+        assert_eq!(seen(&es, "barrier"), vec![("cpd-394".into(), 1)]);
+        let j = cost_json("run", &es, 2);
+        assert_eq!(j["groups"][0]["barrier"].as_array().unwrap().len(), 1, "{j}");
+        let report = crate::cmd_report::effort(&store, &store.worklist("run").unwrap(), None);
+        assert_eq!(report["totals"]["standing_seats"]["check_seconds"].as_f64(), Some(356.0), "{report}");
+    }
+
+    #[test]
+    fn a_seat_whose_ending_names_a_rows_leg_or_verifier_is_never_a_barrier_seat() {
+        let (env, store) = fixture("cost-not-check");
+        checked(&store, "2026-11-27T02:00:00Z", &["cpd-1", "cpd-2", "cpd-3", "cpd-4", "cpd-5", "cpd-6", "cpd-7", "cpd-8"]);
+        cycle_log(&env.state(), &[
+            // Before the check opened: not an ending of the seat it names.
+            "2026-11-27T01:00:00Z ended cpd-7, which verified wsp-075 (holds)",
+            "2026-11-27T02:01:00Z ended cpd-1, which ran leg build of wsp-075",
+            "2026-11-27T02:01:00Z ended cpd-2, which ran piece 2 of wsp-075",
+            "2026-11-27T02:01:00Z ended cpd-3, which verified wsp-075 (blocks), on a later try",
+            "2026-11-27T02:01:00Z wsp-075: ended: its exit was accepted at 2026-11-27T02:00:50Z (member, cpd-4), no pid of it running and its tree kept",
+            "2026-11-27T02:01:00Z wsp-075: the seat of an accepted exit had already gone — cpd-5 (verifier) was ended by something else, or closed by hand",
+            "2026-11-27T02:01:00Z run barrier 1: ended: its exit was accepted at 2026-11-27T02:00:50Z (check, cpd-6), no pid of it running and its tree kept",
+            // A check that ended as one stays one, whatever the id ran after.
+            "2026-11-27T02:01:00Z run barrier 1: ended: its exit was accepted at 2026-11-27T02:00:50Z (check, cpd-8), no pid of it running and its tree kept",
+            "2026-11-27T03:00:00Z ended cpd-8, which verified wsp-075 (holds)",
+        ]);
+        let es = entries(&store, "run").unwrap();
+        let got: Vec<String> = seen(&es, "barrier").into_iter().map(|s| s.0).collect();
+        assert_eq!(got, ["cpd-6", "cpd-7", "cpd-8"]);
     }
 }
