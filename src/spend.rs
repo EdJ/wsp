@@ -7,13 +7,15 @@
 //! ([`crate::cmd_burn`]), dated by `ended`. A session is one ledger line; a seat
 //! still up is in no day yet (`wsp burn` has it).
 //!
-//! **Each line is placed by the seat that spent it**, by the join
+//! **Each line is placed by the entry whose session it is**, by the join
 //! `wsp attempts --cost` and `wsp worklist cost` make ([`crate::cmd_cost`]): a
 //! list's governor and barrier-check seats, a row's verifier passes, then a
-//! row's attempts (claims and legs), first one wins. A row is in the first list
-//! that holds it; its project is its own, else its list's home. A seat none of
-//! those name is `unplaced`. Only rows written since the window opened are
-//! read, which is what keeps this under a second on a store of thousands.
+//! row's attempts (claims and legs), first one wins. Seat ids are handed out
+//! again, so an entry holds the session [`Sessions::reading`] reads for it, not
+//! every line of its id (`wsp-932`). A row is in the first list that holds it;
+//! its project is its own, else its list's home. A line no entry reads is
+//! `unplaced`. Only the passes and attempts of rows written since the window
+//! opened are asked after.
 //!
 //! **A landed row** is one with a verifier's `holds` decided in the 30 days;
 //! the cost per landed row is the 30 days' cost over them.
@@ -24,6 +26,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::cmd_attempts::attempts_of;
+use crate::cmd_cost::Sessions;
 use crate::store::Store;
 pub use wsp_view::spend::{Line, Place};
 use crate::util::{self, Paint};
@@ -54,9 +57,38 @@ pub fn ledger(state: &Path) -> Vec<Line> {
         .collect()
 }
 
-/// Every seat the store can place, by seat id (the order is in the module
-/// docs), and the rows with a `holds` decided at or after `since`.
-fn places(store: &Store, since: i64) -> (HashMap<String, Place>, usize) {
+/// What a session is placed under: its seat id alone names every seat that has
+/// had it.
+fn session_key(seat: &str, ended: i64) -> String {
+    format!("{seat}@{ended}")
+}
+
+/// The sessions the store's entries have placed so far.
+struct Placer {
+    sessions: Sessions,
+    /// The latest of the lines to place, by seat id: an entry opened after it
+    /// read none of them, and is not asked after.
+    latest: HashMap<String, i64>,
+    out: HashMap<String, Place>,
+}
+
+impl Placer {
+    /// The session of the entry that opened on `pane` at `at` is `place`'s,
+    /// unless an entry before it holds it.
+    fn put(&mut self, pane: &str, at: &str, place: impl FnOnce() -> Place) {
+        let opened = util::epoch_of(at);
+        if self.latest.get(pane).is_none_or(|t| *t < opened) {
+            return;
+        }
+        let Some(ended) = self.sessions.reading(pane, opened).and_then(|r| r["ended"].as_str().map(util::epoch_of)) else { return };
+        self.out.entry(session_key(pane, ended)).or_insert_with(place);
+    }
+}
+
+/// The place of every session of `lines` an entry reads, by [`session_key`]
+/// (the order is in the module docs), and the rows with a `holds` decided at or
+/// after `since`.
+fn places(store: &Store, lines: &[Line], since: i64) -> (HashMap<String, Place>, usize) {
     let heads = store.task_heads();
     let lists = store.worklists();
     let index = crate::resolve::Index::new(store.projects());
@@ -66,7 +98,12 @@ fn places(store: &Store, since: i64) -> (HashMap<String, Place>, usize) {
         .map(|w| (w.id.clone(), crate::worklist::home_with(w, &index, |id| project_of.get(id).map(|p| (*p).clone())).map(|h| h.project)))
         .collect();
     let at_list = |id: &str| Place { list: Some(id.to_string()), project: home.get(id).cloned().flatten() };
-    let mut out: HashMap<String, Place> = HashMap::new();
+    let mut latest: HashMap<String, i64> = HashMap::new();
+    for l in lines {
+        let t = latest.entry(l.seat.clone()).or_default();
+        *t = (*t).max(l.ended);
+    }
+    let mut placer = Placer { sessions: Sessions::of(store), latest, out: HashMap::new() };
 
     // A governor's seat: a list's when the scope is a list (the seats
     // `cmd_cost::governors` counts for it, which reads the log once a list),
@@ -75,7 +112,7 @@ fn places(store: &Store, since: i64) -> (HashMap<String, Place>, usize) {
     for e in events.lines().filter(|l| l.contains("\"governor-set\"")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
         let (Some(p), Some(ws)) = (e["data"]["project"].as_str(), e["data"]["workspace"].as_str()) else { continue };
         let place = if home.contains_key(p) { at_list(p) } else { Place { list: None, project: Some(p.to_string()) } };
-        out.entry(ws.to_string()).or_insert(place);
+        placer.put(ws, e["ts"].as_str().unwrap_or(""), || place);
     }
     let mut list_of: HashMap<String, String> = HashMap::new();
     for w in &lists {
@@ -83,8 +120,10 @@ fn places(store: &Store, since: i64) -> (HashMap<String, Place>, usize) {
         for m in groups.iter().flat_map(|g| g.members.iter()) {
             list_of.entry(m.clone()).or_insert_with(|| w.id.clone());
         }
-        for pane in groups.iter().flat_map(|g| g.checks.iter()).filter_map(|c| c.pane.clone()) {
-            out.entry(pane).or_insert_with(|| at_list(&w.id));
+        for c in groups.iter().flat_map(|g| g.checks.iter()) {
+            if let Some(pane) = c.pane.as_deref() {
+                placer.put(pane, &c.at, || at_list(&w.id));
+            }
         }
     }
 
@@ -106,16 +145,18 @@ fn places(store: &Store, since: i64) -> (HashMap<String, Place>, usize) {
         }) {
             landed += 1;
         }
-        for pane in passes.into_iter().filter_map(|p| p.pane) {
-            out.entry(pane).or_insert_with(|| row(t));
+        for pass in passes {
+            if let Some(pane) = pass.pane.as_deref() {
+                placer.put(pane, &pass.at, || row(t));
+            }
         }
     }
     for t in &tasks {
         for a in attempts_of(t).into_iter().filter(|a| !a.never_took() && !a.pane.is_empty()) {
-            out.entry(a.pane).or_insert_with(|| row(t));
+            placer.put(&a.pane, &a.at, || row(t));
         }
     }
-    (out, landed)
+    (placer.out, landed)
 }
 
 /// The report as of `now`, in the shape compound draws.
@@ -128,8 +169,16 @@ pub fn report(store: &Store, now: i64) -> Value {
 pub fn reading(store: &Store, now: i64) -> wsp_view::reading::Spend {
     let today = now - now.rem_euclid(DAY);
     let since = today - (WINDOW - 1) * DAY;
-    let lines: Vec<Line> = ledger(&store.state).into_iter().filter(|l| l.ended >= since && l.ended < today + DAY).collect();
-    let (places, landed) = places(store, since);
+    let mut lines: Vec<Line> = ledger(&store.state).into_iter().filter(|l| l.ended >= since && l.ended < today + DAY).collect();
+    let (places, landed) = places(store, &lines, since);
+    // A placed line goes out under its session's key, which is what `places`
+    // is keyed by.
+    for l in &mut lines {
+        let key = session_key(&l.seat, l.ended);
+        if places.contains_key(&key) {
+            l.seat = key;
+        }
+    }
     wsp_view::reading::Spend { lines, places: places.into_iter().collect(), landed }
 }
 
@@ -220,6 +269,7 @@ mod tests {
             t.body = format!("## Log\n{log}");
             if id == "m-1" {
                 let mut p = crate::verification::Pass::opened(None, None);
+                p.at = "2026-11-03T00:00:00Z".into();
                 p.pane = Some("cpd-4".into());
                 p.state = crate::verification::State::Holds;
                 p.decided = Some("2026-11-03T00:00:00Z".into());
@@ -349,6 +399,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(st.join("spent.jsonl")).unwrap().lines().count(), 2);
         let t = report(&store, util::epoch_secs())["totals"]["30d"].clone();
         assert_eq!((t["sessions"].as_u64(), t["cost"].as_f64()), (Some(2), Some(7.0)), "{t}");
+    }
+
+    /// `wsp-932`: a barrier check's seat id handed out again, days later, to
+    /// another row's seat: each line counts where its own session ran.
+    #[test]
+    fn a_reused_seat_id_places_each_session_with_its_own_entry() {
+        let env = util::isolated("spend-reused");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("m-2", "m-2");
+        t.project = Some("other".into());
+        t.body = "## Log\n- 2026-11-10T10:00:00Z claimed by pane cpd-7\n- 2026-11-10T10:40:00Z → review\n".into();
+        store.save_task(&t).unwrap();
+        let mut check = crate::barrier::Check::opened(None, None);
+        check.at = "2026-11-02T10:00:00Z".into();
+        check.pane = Some("cpd-7".into());
+        let mut w = Worklist::new("early", "early");
+        w.set_groups(&[Group { checks: vec![check], ..Group::default() }]);
+        store.save_worklist(&w).unwrap();
+        let mut w = Worklist::new("later", "later");
+        w.set_groups(&[Group { members: vec!["m-2".into()], ..Group::default() }]);
+        store.save_worklist(&w).unwrap();
+        let st = env.state();
+        line(&st, "cpd-7", "2026-11-02T10:30:00Z", "claude-opus-5-5", 1_000_000, 100);
+        line(&st, "cpd-7", "2026-11-10T10:30:00Z", "claude-opus-5-5", 9_000_000, 900);
+        let lists = |r: &Value| -> Vec<(String, f64)> {
+            r["lists"].as_array().unwrap().iter().map(|l| (l["slug"].as_str().unwrap().to_string(), l["cost"].as_f64().unwrap())).collect()
+        };
+        let r = report(&store, util::epoch_of(NOW));
+        assert_eq!(lists(&r), [("later".to_string(), 9.0), ("early".to_string(), 1.0)]);
+        // The check's own line lost: the later seat's is not read for it.
+        std::fs::remove_file(st.join("spent.jsonl")).unwrap();
+        line(&st, "cpd-7", "2026-11-10T10:30:00Z", "claude-opus-5-5", 9_000_000, 900);
+        assert_eq!(lists(&report(&store, util::epoch_of(NOW))), [("later".to_string(), 9.0)]);
     }
 
     #[test]

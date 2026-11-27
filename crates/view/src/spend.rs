@@ -15,6 +15,8 @@ const WINDOW: i64 = 30;
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Line {
+    /// The key its place is under: the seat id, or `<id>@<ended>` once the CLI
+    /// has placed this one session of it (ids are handed out again).
     pub seat: String,
     pub ended: i64,
     pub model: String,

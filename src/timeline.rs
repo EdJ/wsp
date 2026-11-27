@@ -1652,12 +1652,16 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             1 => start_in(&ev, l),
             _ => i.passes.iter().filter(|(g, _)| *g + 1 == *n).map(|(_, t)| *t).min(),
         });
-        if let Some(w) = store.worklist(l) {
+        // Read only inside a hold ([`seat_stop`]). A check's stop is its own
+        // session's: its seat id is handed out again (`wsp-932`).
+        if let Some(w) = store.worklist(l).filter(|_| !i.holds.is_empty()) {
+            let sessions = crate::cmd_cost::Sessions::of(store);
             for (n, g) in w.groups().iter().enumerate() {
                 for c in &g.checks {
                     let Some(pane) = c.pane.as_deref() else { continue };
-                    let ended = crate::cmd_burn::reading_in(&store.state, pane).and_then(|r| r["ended"].as_str().map(util::epoch_of)).filter(|t| *t > 0).unwrap_or(0);
-                    i.check_ends.push((n + 1, util::epoch_of(&c.at), ended));
+                    let opened = util::epoch_of(&c.at);
+                    let ended = sessions.reading(pane, opened).and_then(|r| r["ended"].as_str().map(util::epoch_of)).filter(|t| *t > 0).unwrap_or(0);
+                    i.check_ends.push((n + 1, opened, ended));
                 }
             }
         }
@@ -2796,6 +2800,33 @@ mod tests {
 
     fn ev(t: i64, kind: &str, d: Value) -> (i64, String, Value) {
         (t, kind.into(), d)
+    }
+
+    /// `wsp-932`: a barrier check's seat id handed out again, days later, to
+    /// another row's seat: the check's stop is its own session's, or unread.
+    #[test]
+    fn a_check_seat_stops_with_its_own_session_not_a_later_one_of_its_id() {
+        let env = util::isolated("timeline-reused");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        store.save_task(&crate::model::Task::new("r-1", "r-1")).unwrap();
+        let mut other = crate::model::Task::new("r-2", "r-2");
+        other.body = "## Log\n- 2026-11-23T10:00:00Z claimed by pane cpd-7\n".into();
+        store.save_task(&other).unwrap();
+        let mut check = crate::barrier::Check::opened(None, None);
+        check.at = "2026-11-17T10:00:00Z".into();
+        check.pane = Some("cpd-7".into());
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_groups(&[crate::model::Group { members: vec!["r-1".into()], checks: vec![check], ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        std::fs::write(env.state().join("events.jsonl"), json!({ "kind": "worklist-held", "ts": "2026-11-17T10:10:00Z", "data": { "id": "run" } }).to_string() + "\n").unwrap();
+        let line = |ended: &str, cost: u64| json!({ "seat": "cpd-7", "ended": ended, "session_id": "", "turns": 3, "cost": cost }).to_string() + "\n";
+        let ledger = env.state().join(crate::place_super::SPENT_FILE);
+        let opened = util::epoch_of("2026-11-17T10:00:00Z");
+        std::fs::write(&ledger, line("2026-11-17T10:30:00Z", 100) + &line("2026-11-23T10:30:00Z", 900)).unwrap();
+        assert_eq!(gather(&store, "r-1").check_ends, [(1, opened, util::epoch_of("2026-11-17T10:30:00Z"))]);
+        std::fs::write(&ledger, line("2026-11-23T10:30:00Z", 900)).unwrap();
+        assert_eq!(gather(&store, "r-1").check_ends, [(1, opened, 0)]);
     }
 
     /// `wsp-901`: `wsp timeline` on an archived row printed where the file was
