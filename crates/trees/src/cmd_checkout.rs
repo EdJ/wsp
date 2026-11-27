@@ -2502,7 +2502,7 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     if git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok() {
         return Prepared::Unchanged;
     }
-    if let Some(said) = merge_refusal(&w.dir, &w.branch, "wsp submit") {
+    if let Some(said) = merge_refusal(&w.dir, &w.branch, &[&w.task, &branch], "wsp submit") {
         return Prepared::Refused(format!("wsp: {said}"));
     }
     if let Err(e) = rebase_onto(&w.dir, &w.branch) {
@@ -2516,16 +2516,19 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
 }
 
 /// What sends back a branch holding a merge commit once `onto` has moved past
-/// it, or `None` for a linear branch and for one that already contains `onto`.
-/// `git rebase` replays a merge's commits one by one and drops the merge, so
-/// such a branch is never rebased: its author merges `onto` in, and the land is
-/// then a fast-forward. `again` is the verb that follows.
-fn merge_refusal(dir: &Path, onto: &str, again: &str) -> Option<String> {
+/// it, or `None` for a branch with no merge to keep and for one that already
+/// contains `onto`. `git rebase` replays a merge's commits one by one and drops
+/// the merge, so such a branch is never rebased: its author merges `onto` in,
+/// and the land is then a fast-forward. `again` is the verb that follows.
+///
+/// The merges that join `row`'s own leg and piece branches back are not ones to
+/// keep ([`joins_own`]): a branch holding only those is rebased.
+fn merge_refusal(dir: &Path, onto: &str, row: &[&str], again: &str) -> Option<String> {
     if git_ok(dir, &["merge-base", "--is-ancestor", onto, "HEAD"]).is_ok() {
         return None;
     }
-    let merges = git(dir, &["rev-list", "--merges", "--max-count=1", &format!("{onto}..HEAD")])?;
-    if merges.trim().is_empty() {
+    let merges = git(dir, &["log", "--merges", "--format=%s", &format!("{onto}..HEAD")])?;
+    if merges.lines().all(|subject| joins_own(subject, row)) {
         return None;
     }
     Some(format!(
@@ -2533,6 +2536,19 @@ fn merge_refusal(dir: &Path, onto: &str, again: &str) -> Option<String> {
          wsp: in {}: `git merge {onto}`, resolve what conflicts, commit, then `{again}` again. Do not run `git rebase {onto}`",
         util::contract(dir)
     ))
+}
+
+/// Whether a merge commit's subject says it joined a leg (`<row>.<leg>`) or a
+/// piece (`<row>-<n>`) of the row into it. Read off the subject git writes,
+/// since the joined branch is deleted once it is merged. `row` is every name the
+/// row goes by: its id, and its branch where a renumbering left them apart.
+fn joins_own(subject: &str, row: &[&str]) -> bool {
+    let Some(branch) = subject.strip_prefix("Merge branch '").and_then(|s| s.split('\'').next()) else { return false };
+    row.iter().any(|row| {
+        let Some(rest) = branch.strip_prefix(row) else { return false };
+        rest.strip_prefix('.').is_some_and(|leg| !leg.is_empty())
+            || rest.strip_prefix('-').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// How many times a rebase is tried when git refuses it for a lock held by
@@ -2853,7 +2869,7 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
         if mode != Mode::FastForward
             && (rebase_in_progress(&w.dir) || git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err())
         {
-            if let Some(said) = merge_refusal(&w.dir, &w.branch, "wsp land") {
+            if let Some(said) = merge_refusal(&w.dir, &w.branch, &[&w.task, &on], "wsp land") {
                 return Ok(Err(Refusal::RebaseConflict(said)));
             }
             if let Err(e) = rebase_onto(&w.dir, &w.branch) {
@@ -2880,6 +2896,9 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
                 return Ok(Err(r));
             }
         }
+        // The trunk before the land. Not `<tip>~N`: that walks first parents
+        // only, and overshoots where the commits landed hold a merge.
+        let before = git(&w.trunk, &["rev-parse", &w.branch]).map(|s| s.trim().to_string());
         // `--ff-only` in the trunk rather than a push: the trunk is a checked-out
         // working tree, and this is the one form of update that refuses rather
         // than silently overwriting a file somebody has open there.
@@ -2900,9 +2919,9 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
             }
             return Ok(Err(Refusal::NotFastForward(msg)));
         }
-        Ok(Ok(landed))
+        Ok(Ok((landed, before)))
     });
-    let landed = match result {
+    let (landed, base) = match result {
         Ok(Ok(l)) => l,
         Ok(Err(refusal)) => return Err(refusal),
         Err(e) => return Err(Refusal::NotFastForward(e)),
@@ -2912,7 +2931,9 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
     // of the commit procedure, and it is the check that has caught a wrong
     // commit twice — a fifth file riding along, invisible to `git diff --cached`
     // because that compares against HEAD as it was when you staged.
-    let files: Vec<String> = git(&w.trunk, &["show", "--stat", "--format=", &format!("{}~{}..{}", w.branch, landed.len(), w.branch)])
+    let files: Vec<String> = base
+        .as_ref()
+        .and_then(|b| git(&w.trunk, &["show", "--stat", "--format=", &format!("{b}..{}", w.branch)]))
         .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default();
 
@@ -2930,9 +2951,8 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
     // `--ff-only`, and naming the trunk is what a reader checking the claim
     // will compare against.
     let sha = git(&w.trunk, &["rev-parse", &on]).map(|s| s.trim().to_string()).unwrap_or_default();
-    // The commit before the ones that landed, so `wsp check` can read which
-    // paths this landing changed (`wsp-324`).
-    let base = git(&w.trunk, &["rev-parse", &format!("{sha}~{}", landed.len())]).map(|b| b.trim().to_string());
+    // `base`, the commit before the ones that landed, is so `wsp check` can read
+    // which paths this landing changed (`wsp-324`).
     if !sha.is_empty() {
         if let Some(mut t) = store.find_task(&w.task) {
             let line = format!("{} {sha} on {on}", crate::log::LANDED);
@@ -3257,7 +3277,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
         if dirty(&w.dir) {
             return Verdict::Dirty(dirty_refusal(&tree, &dirty_files(&w.dir)));
         }
-        if let Some(said) = merge_refusal(&w.dir, &w.branch, "wsp submit") {
+        if let Some(said) = merge_refusal(&w.dir, &w.branch, &[&w.task, &w.on().unwrap_or_default()], "wsp submit") {
             return Verdict::Blocked(format!("wsp: {said}"));
         }
         let old_head = git(&w.dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
@@ -3567,6 +3587,66 @@ mod tests {
         commit(&dir, "shared.txt", "theirs again");
         let Prepared::Refused(said) = rebase_ready(&store, "p-001") else { panic!("not sent back") };
         assert!(said.contains("`git rebase master`") && !said.contains("git merge"), "{said}");
+    }
+
+    /// A row whose only merges joined its own legs and pieces is rebased as a
+    /// linear one is, once the trunk moves past it.
+    #[test]
+    fn a_row_with_joined_legs_and_pieces_is_rebased_and_lands() {
+        let env = util::isolated("co-joinrow");
+        let dir = lane(&env, "p", "p-001");
+        let store = Store::open();
+        let tree = checkout_dir(&dir, "p-001");
+        ensure(&dir, &tree, "p-001", "master").unwrap();
+        let commit = |at: &Path, file: &str| {
+            std::fs::write(at.join(file), file).unwrap();
+            run(at, &["add", file]);
+            run(at, &["commit", "--quiet", "-m", file]);
+        };
+        // Two siblings joined as `leg_tree::join` does, their branches deleted.
+        let join = |round: &str| {
+            let names = [format!("p-001.{round}"), "p-001-2".to_string()];
+            for name in &names {
+                run(&tree, &["checkout", "--quiet", "-b", name, "p-001"]);
+                commit(&tree, &format!("{name}-{round}.txt"));
+                run(&tree, &["checkout", "--quiet", "p-001"]);
+            }
+            for name in &names {
+                run(&tree, &["merge", "--quiet", "--no-edit", name]);
+                run(&tree, &["branch", "--quiet", "-D", name]);
+            }
+            let merges = git(&tree, &["rev-list", "--merges", "master..HEAD"]).unwrap();
+            assert!(!merges.trim().is_empty(), "no merge to rebase over");
+        };
+        let rebased = |before: &str| {
+            assert!(git_ok(&dir, &["merge-base", "--is-ancestor", before, "HEAD"]).is_ok());
+            assert_eq!(git(&dir, &["rev-list", "--merges", &format!("{before}..HEAD")]).unwrap().trim(), "");
+        };
+        let trunk_moves = |file: &str| {
+            commit(&dir, file);
+            git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+        };
+
+        join("a");
+        let before = trunk_moves("one.txt");
+        assert!(matches!(rebase_ready(&store, "p-001"), Prepared::Rebased { .. }), "not rebased");
+        let w = pick(vec![dir.clone()], "p-001").unwrap();
+        assert!(land_task(&store, &w, Mode::Rebase).is_ok());
+        rebased(&before);
+
+        join("b");
+        let before = trunk_moves("two.txt");
+        let Verdict::Landed { landed, .. } = land_verdict(&store, "p-001") else { panic!("not landed") };
+        assert_eq!(landed.base.as_deref(), Some(before.as_str()));
+        rebased(&before);
+
+        // Landed with the trunk unmoved, the joins are kept, and the base is
+        // still the trunk as it was.
+        join("c");
+        let before = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let Ok(landed) = land_task(&store, &w, Mode::Rebase) else { panic!("not landed") };
+        assert_eq!(landed.base.as_deref(), Some(before.as_str()));
+        assert!(!landed.files.iter().any(|f| f.contains("two.txt")), "{:?}", landed.files);
     }
 
     /// `wsp-571`: an `index.lock` held for a moment is waited out, not a

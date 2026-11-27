@@ -5418,7 +5418,10 @@ bringing in an upstream branch). When `master` moves past a branch holding a
 merge commit, `wsp submit`, `wsp land` and a `holds` verdict send it back and
 leave it as it was, because a rebase would drop the merge: `git merge master` in
 its tree, resolve, commit, then `wsp submit` (or `wsp land`) again. Do not
-`git rebase master`. A linear branch is rebased as above.
+`git rebase master`. A linear branch is rebased as above, and so is one whose
+only merges are the ones joining its own leg and piece branches (`<task>.<leg>`,
+`<task>-<n>`, known by git's `Merge branch '…'` subject): that rebase drops them.
+They reach the trunk only when the branch lands while it still contains `master`.
 
 It also prints the diffstat of what actually reached the trunk, which is step 4
 of the procedure above and the check that caught a wrong commit on two
