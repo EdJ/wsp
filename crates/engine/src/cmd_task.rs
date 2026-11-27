@@ -4406,7 +4406,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     crate::verbs::Verb {
         names: &["unpark"],
         run: unpark,
-        help: &[],
+        help: &[
+            crate::verbs::Help {
+                section: crate::verbs::Section::Tasks,
+                order: 221,
+                text: r##"  wsp unpark <id>                   a parked row, back to todo"##,
+            },
+        ],
     },
     crate::verbs::Verb {
         names: &["review"],

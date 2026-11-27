@@ -145,6 +145,7 @@ TASKS
   wsp park <id> "reason"            not yet, deliberately — say what brings
                                     it back. Open work, sorted last and drawn
                                     quiet, and not counted as wanting you
+  wsp unpark <id>                   a parked row, back to todo
   wsp decide <task|proj> "…"      record what was settled, and why
   wsp decide <t|p> "…" --supersedes d1   …and which earlier one it replaces
   wsp note <id> "text"              append to the log

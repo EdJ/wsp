@@ -2239,7 +2239,8 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
 // ---- a parked member the barrier waits on --------------------------------
 
 /// The marker on a parked member's `## Log` for what `cycle.log` and the
-/// person were last told about the run waiting on it.
+/// person were last told about the run waiting on it. The list and group follow
+/// it: a row cut or moved to another place is a new wait there.
 const PARKED_WAIT: &str = "wsp: the run waits on this parked row:";
 
 /// The headline of the person's item about a parked member of `list`, and what
@@ -2268,10 +2269,12 @@ fn lapse_parked(store: &Store, list: &str, why: &str, over: impl Fn(&str) -> boo
 /// member is parked too, or finished and verified. The row is not unparked
 /// here — a park is somebody's decision, and the person is given the verb.
 ///
-/// Once per reason, in `cycle.log` and to the person alike; a changed reason
-/// replaces the item, and a member no longer parked here has its item closed.
+/// Once per reason and group, in `cycle.log` and to the person alike; a changed
+/// reason replaces the item, and a member no longer parked here has its item
+/// closed. The item is a question for the person, so it is in `wsp yours` and
+/// holds the group's barrier while it is open.
 fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
-    use crate::message::{self, About, Kind, Message, Party};
+    use crate::message::{self, About, Kind, Message, Party, Waiting};
     let parked = |s: &worklist::Standing| s.settlement == worklist::Settlement::Open(Status::Parked);
     lapse_parked(store, &w.id, "the run no longer waits on it as a parked row", |row| {
         !pos.members.iter().any(|s| s.id == row && parked(s))
@@ -2300,7 +2303,8 @@ fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             Some(r) => format!("{prerequisite}; parked: \"{}\"", util::truncate(r, 200)),
             None => prerequisite,
         };
-        if !said_once_per_reason(store, &s.id, PARKED_WAIT, &format!("{PARKED_WAIT} {why}")) {
+        let place = format!("{PARKED_WAIT} {} group {at}:", w.id);
+        if !said_once_per_reason(store, &s.id, &place, &format!("{place} {why}")) {
             continue;
         }
         let verbs = format!(
@@ -2312,8 +2316,12 @@ fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         stamp(store, &format!("{} group {at}: waits on {}: parked, {why}. {verbs}", w.id, s.id));
         lapse_parked(store, &w.id, "the reason the run waits on it changed", |row| row == s.id);
         let text = format!("{}\n\nGroup {at}: {why}.\n\n{verbs}", parked_headline(&s.id, &w.id));
-        let m = Message::new(Party::wsp(), Kind::Note, &text).about(About::Task(s.id.clone()));
-        let _ = message::raise(store, &m);
+        let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new("", &s.id))
+            .about(About::Task(s.id.clone()))
+            .for_the_person();
+        if let Err(e) = message::raise(store, &q) {
+            stamp(store, &format!("{} group {at}: the wait on {} could not be raised to the person: {e}", w.id, s.id));
+        }
     }
 }
 
@@ -5143,7 +5151,7 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
     }
 
     fn items(store: &Store) -> Vec<String> {
-        crate::message::raised(store).into_iter().filter(|m| m.is_open() && m.about.task() == Some("m-3")).map(|m| m.text).collect()
+        crate::message::for_the_person(store).into_iter().filter(|m| m.about.task() == Some("m-3")).map(|m| m.text).collect()
     }
 
     /// `wsp-851`: the third member is parked on a prerequisite that has landed.
@@ -5203,6 +5211,34 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         store.save_task(&t).unwrap();
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert_eq!(items(&store).len(), 1, "a new park is a new wait");
+    }
+
+    /// `wsp-851`: the cut the notice offers moves the row to a group of its
+    /// own; once the run is there it waits on it again, and says so again.
+    #[test]
+    fn a_parked_member_cut_into_a_later_group_is_said_again_there() {
+        let (_env, store) = scratch("parkedcut");
+        held_by_a_parked_member(&store, &[]);
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(said_of_the_parked().len(), 1);
+
+        let args = crate::base::args::Args::synth("worklist", &["cut", "run", "m-3"], &[("why", "not this group")]);
+        assert_eq!(crate::cmd_worklist::cut_by(&store, &args, &[], None), 0);
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert!(items(&store).is_empty(), "{:?}", items(&store));
+
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups[0].verdict = "passed".into();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        stamped();
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let said = said_of_the_parked();
+        assert!(said.len() == 1 && said[0].starts_with("run group 2:"), "{said:?}");
+        let asked = items(&store);
+        assert!(asked.len() == 1 && asked[0].contains("Group 2:"), "{asked:?}");
     }
 
     /// **A verifier that blocked is named as the block, not as a missing
