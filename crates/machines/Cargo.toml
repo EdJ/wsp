@@ -8,9 +8,7 @@ description = "The state core's machines (docs/state-core.md sections 3 and 6) a
 path = "src/lib.rs"
 
 [dependencies]
-# Section 6: the contract only, and no IO in the domains (tests/layering.rs; `token::mint` reads /dev/urandom, on purpose).
+# Section 6: the contract only, and no IO in the domains (tests/layering.rs).
 wsp-store-contract = { path = "../store-contract" }
 # An event's payload is a `serde_json::Value` (the contract's own dependency, not a new one).
 serde_json = "1"
-# `token::hash` is the hex SHA-256 (the hub's token records and `wsp-objects` already use it).
-sha2 = "0.10"

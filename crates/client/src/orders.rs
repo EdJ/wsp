@@ -155,7 +155,7 @@ impl Client {
                 down_since = None;
             }
             match item {
-                Some(Item::State { state, .. } | Item::Resync { state, .. }) => {
+                Some(Item::State { state, .. }) => {
                     held = state.orders.get(id).cloned();
                 }
                 Some(Item::Event(e)) if e.subject == Subject::Order(id.clone()) => {

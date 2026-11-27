@@ -13,7 +13,7 @@
 //! synced, a parent that is not the head, or a local write since the head not
 //! yet pushed) is the two sides having moved apart, and goes to [`Reconcile`]
 //! (wsp-176), which writes what it decides; the door writes nothing of its own
-//! for it. [`crate::reconcile::Merging`] is the one that merges.
+//! for it. The spoke's merging reconcile is the one that merges.
 //!
 //! **Not pushed back.** The spoke keeps, per subject, the head it last synced
 //! and the digest of the file that head left ([`Heads`], in the state
@@ -101,6 +101,20 @@ impl<'a> Door<'a> {
 
     /// `obj`, delivered by the hub on `by`'s behalf, into the files.
     pub fn import(&self, obj: &Object, by: &Principal) -> Result<Applied, Refusal> {
+        self.import_as(obj, by, false)
+    }
+
+    /// `obj` written whole over a file the caller keeps at its row's path only
+    /// as a placeholder (the spoke's head-only stub, wsp-465): imported as if
+    /// there were no file, in the one atomic write [`cmd_task::file_new`] ends
+    /// in, so a reader finds the placeholder or the row and never neither.
+    /// The placeholder's synced head is not the record's parent and is not
+    /// asked; the record's own head and file are recorded after the write.
+    pub fn import_over(&self, obj: &Object, by: &Principal) -> Result<Applied, Refusal> {
+        self.import_as(obj, by, true)
+    }
+
+    fn import_as(&self, obj: &Object, by: &Principal, over: bool) -> Result<Applied, Refusal> {
         let Object::Record { subject, entity, parent, .. } = obj else {
             return Err(Refusal::NotYet("an event".into()));
         };
@@ -119,7 +133,7 @@ impl<'a> Door<'a> {
         let caller = Caller::hub(&user_of(by));
         let mut heads = Heads::read(self.store);
         self.make_way(&row.id.0)?;
-        let local = self.store.task(&row.id.0);
+        let local = if over { None } else { self.store.task(&row.id.0) };
         let mut t = task_of_record(row).ok_or_else(|| Refusal::Unreadable(row.id.clone()))?;
         // The file is still the one the synced head left: no local write since.
         let unmoved = |heads: &Heads, subject: &Subject| heads.file(subject) == file_digest(self.store, &row.id.0);
@@ -165,7 +179,7 @@ impl<'a> Door<'a> {
         }
         let Some((code, _)) = id.rsplit_once('-') else { return Ok(()) };
         let ids = self.store.renamed_ids();
-        let mut n = crate::cmd_publish::highest_local(self.store, code) + 1;
+        let mut n = highest_local(self.store, code) + 1;
         let fresh = loop {
             let cand = format!("{code}-{n:03}");
             if !self.store.task_path(&cand).exists() && !ids.contains_key(&cand) && !self.store.archived_tasks().iter().any(|t| t.id == cand) {
@@ -347,6 +361,21 @@ pub fn pending(store: &Store) -> Vec<Subject> {
             (!t.workspace.is_private() && moved).then_some(subject)
         })
         .collect()
+}
+
+/// The highest number under `code` this store has used: a row live or archived,
+/// the project's counter, and an id `ids.json` knows.
+pub fn highest_local(store: &Store, code: &str) -> u64 {
+    let prefix = format!("{code}-");
+    let num = |id: &str| id.strip_prefix(&prefix).filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).and_then(|n| n.parse::<u64>().ok());
+    let mut top = store.projects().iter().filter(|p| p.code() == code).map(|p| p.seq as u64).max().unwrap_or(0);
+    for t in store.tasks().iter().chain(store.archived_tasks().iter()) {
+        top = top.max(num(&t.id).unwrap_or(0));
+    }
+    for (k, v) in store.renamed_ids() {
+        top = top.max(num(&k).unwrap_or(0)).max(num(&v).unwrap_or(0));
+    }
+    top
 }
 
 #[cfg(test)]

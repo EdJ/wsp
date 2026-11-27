@@ -1,21 +1,24 @@
 # wsp-engine
 
-The engine, the phase 2 cut (`docs/components.md` §5, wsp-440; the seats left for `wsp-seats` at wsp-441). Depends
-on `wsp-base`, `wsp-store`, `wsp-wire`, `wsp-trees` and the state core's crates (`wsp-store-contract`, `wsp-api`,
-`wsp-client`, `wsp-server`, `wsp-view`, `wsp-machines`, `wsp-objects`, `wsp-host-api`). The root re-exports each module
-at its old path (`crate::cycle`, `crate::cmd_task`, …), so no caller changed.
+The engine, the phase 2 cut (`docs/components.md` §5, wsp-440; the seats left for `wsp-seats` at wsp-441, the hub's
+spoke side for `wsp-spoke`). Depends on `wsp-base`, `wsp-store`, `wsp-wire`, `wsp-trees` and the state core's crates
+(`wsp-store-contract`, `wsp-api`, `wsp-client`, `wsp-server`, `wsp-view`, `wsp-objects`, `wsp-host-api`). The root
+re-exports each module at its old path (`crate::cycle`, `crate::cmd_task`, …), so no caller changed.
 
 ## Holds
 
-The `engine` row of the layering map, 88 modules: the run (`worklist`, `cycle`, `repair`, `verification`, `legs`,
+The `engine` row of the layering map, 80 modules: the run (`worklist`, `cycle`, `repair`, `verification`, `legs`,
 `leg_seat`, `stage`, `barrier*`, `check`, `closing`, `ending`, `hold*`), the row and list verbs (`cmd_task`,
-`cmd_worklist`, `cmd_message`, `cmd_submit`, …), orders, `fold`, `mirror`, `deliver`, the hub's spoke side (`hub_*`,
-`cmd_hub`, `cmd_login`), `room` (cycle and waits use `room::Gate`), `watch_levels`, `sent`, `claims`, `prose`, `disk`.
+`cmd_worklist`, `cmd_message`, `cmd_submit`, …), orders, `fold`, `mirror`, `deliver`, the import door (`door`), the
+shared-work add-on interface (`addon`), which the add-on fills (it is in `wsp-spoke`, which depends on this crate and
+is never named here), `room` (cycle and waits use `room::Gate`), `watch_levels`, `sent`, `claims`, `prose`, `disk`.
 
 ## Does not hold
 
 The seats (`cmd_spawn`, `cmd_agent`, `agent_commands`, `wake`, `cmd_govern`, `cmd_watch`, `memory`, …): `wsp-seats`,
 built on this crate, which never names it (`tests/layering.rs`); see `crates/seats/MAP.md`.
+The hub's spoke side (`hub_*`, `cmd_hub`, `cmd_login`, `cmd_publish`, `cmd_allocate`, `reconcile`, `spoke`):
+`wsp-spoke`, built on this crate and reached only through `addon` (`tests/layering.rs`).
 `timeline`, `surface` and `top` (`cmd_report`, `panel`, `daemon`, `main`, …) stay in `wsp`. Neither reaches back
 (`docs/components-upward.txt` has no line out of it).
 
@@ -30,6 +33,11 @@ built on this crate, which never names it (`tests/layering.rs`); see `crates/sea
   own, and with none it reads `cycle::install_tests::Double`, which records `say` (`SAID_TO`), answers only what a test
   scripted (`OWED`, `ANSWERS`) and defaults the rest: assert no other effect through it.
 - `mirror::LIST_OUTPUTS`, `LIST_SHOW`, `SEAT_WORKING`, `ROW_HOLDER`, `cmd_checkout::install_engine`: as before the cut.
+- `addon::install(Arc::new(wsp_spoke::spoke::Spoke::new()))`, in the root's `main`: the shared-work add-on (crate
+  `wsp-spoke`), which core asks through `addon::get` and never by its modules. Unset, every answer is the standalone one. The daemon starts its background work with one
+  `addon::get().start(store, Lent { .. })`. This crate's tests run standalone unless a test puts an add-on on its
+  own thread with `addon::scoped`. Behind `test-support` this crate exports the fixtures the spoke's tests use:
+  `verification::record`, `cmd_message::tests_govern`.
 
 ## Notes
 

@@ -123,12 +123,12 @@ struct Sandbox {
     /// Without it `artefact::root()` falls back to the real
     /// `~/.compound/artefacts`, and a sandbox list writes over a real one.
     artefacts: PathBuf,
-    /// Where the hub login is kept: `WSP_HUB_HOME`. `wsp login` writes
-    /// `<hub_home>/.config/wsp/hubs.json` and every reader looks there, so two
-    /// sandboxes hold two logins and none of them touches the developer's own
-    /// `~/.config/wsp/hubs.json` (wsp-490). `HOME` itself is left alone: the
-    /// commit identity, `git` config and an agent's own credentials are under it.
-    hub_home: PathBuf,
+    /// What the shared-work add-on sets to keep its own state in the sandbox
+    /// (`addon::SharedWork::isolate`): the spoke's hub login, so two sandboxes
+    /// hold two logins and none of them touches the developer's own (wsp-490).
+    /// `HOME` itself is left alone: the commit identity, `git` config and an
+    /// agent's own credentials are under it. Empty standalone.
+    isolated: Vec<(String, String)>,
     /// The binary under test — whichever one is running right now.
     bin: PathBuf,
     /// The directory holding the `wsp` symlink, which goes first on `PATH`.
@@ -145,7 +145,7 @@ impl Sandbox {
             home: dir.join("wsp"),
             state: dir.join("state"),
             artefacts: dir.join("artefacts"),
-            hub_home: dir.join("hub"),
+            isolated: crate::addon::get().isolate(&dir),
             shim: dir.join("bin"),
             socket: PathBuf::new(),
             bin,
@@ -168,10 +168,12 @@ impl Sandbox {
             ("WSP_HOME".into(), self.home.display().to_string()),
             ("WSP_STATE".into(), self.state.display().to_string()),
             ("WSP_ARTEFACTS".into(), self.artefacts.display().to_string()),
-            (wsp_client::HUB_HOME_ENV.into(), self.hub_home.display().to_string()),
             ("WSP_BIN".into(), self.bin.display().to_string()),
             ("PATH".into(), path_with(&self.shim, std::env::var("PATH").ok().as_deref())),
         ]
+        .into_iter()
+        .chain(self.isolated.iter().cloned())
+        .collect()
     }
 
     /// The environment a command runs in here: the instance, and where to
@@ -859,7 +861,9 @@ fn up(store: &Store, args: &Args) -> i32 {
     println!("export WSP_HOME={}", sb.home.display());
     println!("export WSP_STATE={}", sb.state.display());
     println!("export WSP_ARTEFACTS={}", sb.artefacts.display());
-    println!("export {}={}", wsp_client::HUB_HOME_ENV, sb.hub_home.display());
+    for (k, v) in &sb.isolated {
+        println!("export {k}={v}");
+    }
     println!("export WSP_BIN={}", sb.bin.display());
     println!("export PATH={}:$PATH", sb.shim.display());
     let forget = forget_keys();
@@ -1268,6 +1272,14 @@ mod tests {
     /// --reap` that ends everybody's real claims.
     #[test]
     fn nothing_in_it_points_at_the_live_instance() {
+        // An add-on that keeps a login, as the spoke does.
+        struct Login;
+        impl crate::addon::SharedWork for Login {
+            fn isolate(&self, dir: &Path) -> Vec<(String, String)> {
+                vec![("WSP_HUB_HOME".into(), dir.join("hub").display().to_string())]
+            }
+        }
+        let _addon = crate::addon::scoped(std::sync::Arc::new(Login));
         let dir = scratch("env");
         let mut sb = sandbox_at(&dir, "wsp-w1");
         sb.socket = sb.dir.join("backend.sock");

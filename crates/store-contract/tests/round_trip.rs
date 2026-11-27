@@ -289,7 +289,7 @@ fn every_command_round_trips_under_its_verb() {
     });
 }
 
-const EVENT_KINDS: usize = 56;
+const EVENT_KINDS: usize = 57;
 
 fn event_kind(k: &EventKind) -> (usize, &'static str) {
     use EventKind::*;
@@ -350,6 +350,7 @@ fn event_kind(k: &EventKind) -> (usize, &'static str) {
         HubMemberSet => (53, "hub.member.set"),
         RefMoved => (54, "ref.moved"),
         LeaseExpired => (55, "lease.expired"),
+        RefRetired => (56, "ref.retired"),
     }
 }
 
@@ -413,6 +414,7 @@ fn every_event_kind_round_trips_under_its_name() {
         HubMemberSet,
         RefMoved,
         LeaseExpired,
+        RefRetired,
     ];
     table(&kinds, EVENT_KINDS, event_kind, as_str);
     // A newer writer's kind reads as Unknown.

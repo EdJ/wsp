@@ -331,3 +331,38 @@ fn refs_are_data_that_round_trip() {
     ]});
     assert!(serde_json::from_value::<Refs>(twice).is_err());
 }
+
+/// Retired subjects: written after the heads, the key left out when there is
+/// none (so the bytes are as before), `successor` left out when none; read
+/// back the same; a reader of the old shape passes the key over.
+#[test]
+fn retired_subjects_are_an_additive_key_of_refs() {
+    let mut refs = Refs::new(ws());
+    refs.set(s("pp-007"), h(1));
+    let plain = serde_json::to_string(&refs).unwrap();
+    assert!(!plain.contains("retired"), "{plain}");
+
+    refs.retired.insert(s("inbox-001"), Some(s("pp-007")));
+    refs.retired.insert(s("inbox-002"), None);
+    let text = serde_json::to_string(&refs).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            r#"{{"workspace":"shared:core","heads":[{{"subject":{{"row":"pp-007"}},"head":"{}"}}],"retired":[{{"subject":{{"row":"inbox-001"}},"successor":{{"row":"pp-007"}}}},{{"subject":{{"row":"inbox-002"}}}}]}}"#,
+            h(1)
+        )
+    );
+    assert_eq!(serde_json::from_str::<Refs>(&text).unwrap(), refs);
+
+    // The old shape, which knows no `retired`, reads the heads and passes it over.
+    #[derive(serde::Deserialize)]
+    struct Old {
+        heads: Vec<serde_json::Value>,
+    }
+    assert_eq!(serde_json::from_str::<Old>(&text).unwrap().heads.len(), 1);
+
+    // A subject retired and with a head is refused.
+    let both = json!({"workspace": "shared:core", "heads": [{"subject": {"row": "wsp-1"}, "head": h(1)}],
+        "retired": [{"subject": {"row": "wsp-1"}}]});
+    assert!(serde_json::from_value::<Refs>(both).is_err());
+}

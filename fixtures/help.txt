@@ -179,7 +179,9 @@ TASKS
   wsp allocate <id> <user>|none     bind shared work to one user's agents
   wsp whoami                        who the hub says you are (person:<engineer>)
   wsp next [-p proj]                highest-priority actionable task
-  wsp rm <id>                       retire it to the archive
+  wsp rm <id> [--force]             retire it to the archive; a shared row is
+                                    retired on the hub for everyone too, for good,
+                                    which --force confirms
   wsp archive [--days N] [-n] [--full]
                                     sweep done tasks older than 30d into
                                     archive/tasks/<month>/; --days 0 for every
@@ -572,19 +574,33 @@ MACHINES
                                     read from the prompt or stdin, never the
                                     command line. One hub per wsp: a second login
                                     replaces the first. --ca pins a private CA
+  wsp login <hub-url> --github      log in with GitHub instead: open the address
+                                    shown, enter the code; the hub's token for
+                                    you is stored, never shown; --json also
+                                    prints the address and code as a JSON line
   wsp publish <row|list> --to shared:<name>   move a private row (with its sub-tasks and pieces)
                                     or list (with its members) into a shared workspace:
                                     new ids from the hub, old ones still resolve. Refused
                                     when logged out, already shared, or not a member; a claimed
                                     row takes the hub's lease first and is refused if it is held
-  wsp logout                        forget the hub's token; a sync worker stops
-  wsp hub status [--json]           the hub you are logged in to, and as whom
+  wsp logout                        disable the hub connection (wsp hub disable),
+                                    then forget the hub's token
+  wsp logout --dry-run [--json]     what the logout's disable would do; does nothing
+  wsp hub status [--json]           the hub you are logged in to, and as whom; on or
+                                    off, what the disconnect parked, what is unsent
   wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
   wsp hub user ls                      the hub's users and their live tokens
   wsp hub user revoke <name>           revoke a user and every token of its
   wsp hub token <name>                 a new token for a user, the old ones revoked
   wsp hub workspace add <name>         a shared workspace
   wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
+  wsp hub disable                      stop taking shared work here, cleanly: shared
+                                       rows in flight parked, the journal flushed,
+                                       leases given back; the login is kept
+  wsp hub disable --dry-run [--json]   what disable would park, end and give back,
+                                       and the journal it would send; does nothing
+  wsp hub enable                       take part again: parked rows resumed where
+                                       their lease can be taken
 
 WORKLISTS
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,

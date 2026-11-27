@@ -7,12 +7,13 @@ pub use wsp_engine::{base, choices, input, risk, util};
 pub use wsp_engine::{agent_kind, caption, checks, decisions, governors, lands, lapse, lease, log, message, model, resolve, sharing, store, tags, verbs};
 pub use wsp_engine::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
 pub use wsp_engine::{fake, far, host, host_tcp, launchd, manager, place, place_compound, place_super, systemd, tunnel};
+// The shared-work add-on is reached through `addon` alone: the spoke (`wsp-spoke`) is never named here.
 pub use wsp_engine::{
-    address, affected, after, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, claims, classify,
-    closing, cmd_allocate, cmd_hub, cmd_initiative, cmd_login, cmd_mandate, cmd_message, cmd_migrate, cmd_publish, cmd_submit, cmd_task, cmd_whoami,
-    cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close, hub_cache, hub_journal, hub_lease,
-    hub_sync, inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close,
-    piece_seat, pieces, prose, reconcile, record_workspace, refusals, repair, retro_yours, room, scope, scratch, sent, size_check, split, stage, stand_down,
+    addon, address, affected, after, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, claims, classify,
+    closing, cmd_initiative, cmd_mandate, cmd_message, cmd_migrate, cmd_submit, cmd_task, cmd_whoami,
+    cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close,
+    initiative_run, inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close,
+    piece_seat, pieces, prose, record_workspace, refusals, repair, retro_yours, room, scope, scratch, sent, size_check, split, stage, stand_down,
     starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, watch_levels, worklist,
 };
 

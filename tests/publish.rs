@@ -1,13 +1,14 @@
 //! `wsp publish <row|list> --to shared:<name>` (wsp-185): a private row or list
 //! goes into a shared workspace under ids the hub hands out. Refused while
 //! logged out (naming `wsp login`) and for a record already shared; the happy
-//! path runs against the client crate's in-memory hub.
+//! path runs against a real hub run as an external program
+//! (`wsp_spoke::testhub`: `WSP_HUB_BIN` or `WSP_HUB_IMAGE`), the caller a member
+//! of `shared:core`.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use wsp_client::testing::{FakeHub, FAKE_HUB_TOKEN};
+use wsp_spoke::testhub::{Setup, TestHub};
 
 const WSP: &str = env!("CARGO_BIN_EXE_wsp");
 
@@ -43,12 +44,10 @@ impl Rig {
         c.output().unwrap()
     }
 
-    fn login_to(&self, url: &str) {
-        let conf = self.dir.join("home/.config/wsp");
-        std::fs::create_dir_all(&conf).unwrap();
-        let file = conf.join("hubs.json");
-        std::fs::write(&file, format!(r#"{{"url": "{url}", "token": "{FAKE_HUB_TOKEN}"}}"#)).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    /// Logged in to `hub` as `ann`, a member of `shared:core`.
+    fn login_to(&self, hub: &TestHub) {
+        let token = hub.seed_members(&["core"], &["ann"])["ann"].clone();
+        hub.login(&self.dir.join("home"), "ann", &token);
     }
 
     fn file(&self, dir: &str, id: &str) -> String {
@@ -84,8 +83,8 @@ fn publishing_while_logged_out_is_refused_naming_login_and_changes_nothing() {
 #[test]
 fn publishing_a_shared_row_is_refused() {
     let rig = Rig::new("shared");
-    let hub = FakeHub::start();
-    rig.login_to(&format!("tcp://{}", hub.addr()));
+    let Some(hub) = TestHub::start(Setup::default()) else { return };
+    rig.login_to(&hub);
     let o = rig.run(&["add", "one", "-p", "pp", "--workspace", "shared:core"], &[]);
     assert!(o.status.success(), "{}", said(&o));
     let o = rig.run(&["publish", "pp-001", "--to", "shared:other"], &[]);
@@ -97,8 +96,8 @@ fn publishing_a_shared_row_is_refused() {
 #[test]
 fn a_row_and_its_subtask_take_hub_ids_and_the_old_ones_still_resolve() {
     let rig = Rig::new("happy");
-    let hub = FakeHub::start();
-    rig.login_to(&format!("tcp://{}", hub.addr()));
+    let Some(hub) = TestHub::start(Setup::default()) else { return };
+    rig.login_to(&hub);
     assert!(rig.run(&["add", "the row", "-p", "pp"], &[]).status.success());
     assert!(rig.run(&["add", "the sub", "--parent", "pp-001"], &[]).status.success());
     assert!(rig.run(&["add", "other", "-p", "pp"], &[]).status.success());
@@ -121,7 +120,7 @@ fn a_row_and_its_subtask_take_hub_ids_and_the_old_ones_still_resolve() {
     assert!(said(&shown).contains("pp-004"), "{}", said(&shown));
 
     // Nothing is pushed by publish: the hub holds no object.
-    assert_eq!(hub.hub().len(), 0);
+    assert_eq!(hub.data_files().iter().filter(|(p, _)| p.starts_with("objects")).count(), 0);
 
     // And a second publish of the same row is refused as shared.
     let again = rig.run(&["publish", "pp-004", "--to", "shared:core"], &[]);
@@ -131,8 +130,8 @@ fn a_row_and_its_subtask_take_hub_ids_and_the_old_ones_still_resolve() {
 #[test]
 fn a_list_goes_with_its_members() {
     let rig = Rig::new("list");
-    let hub = FakeHub::start();
-    rig.login_to(&format!("tcp://{}", hub.addr()));
+    let Some(hub) = TestHub::start(Setup::default()) else { return };
+    rig.login_to(&hub);
     assert!(rig.run(&["add", "member", "-p", "pp"], &[]).status.success());
     let o = rig.run(&["worklist", "new", "wl", "a list"], &[]);
     assert!(o.status.success(), "{}", said(&o));

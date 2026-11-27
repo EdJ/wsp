@@ -147,7 +147,7 @@ fn add_kind(store: &Store, args: &Args, kind: &str) -> i32 {
         }
     }
     // Private unless said otherwise; a child project is where its parent is (wsp-172).
-    match crate::record_workspace::of_new(args.get("workspace").as_deref(), parent_ws.as_ref()) {
+    match crate::record_workspace::of_new(store, args.get("workspace").as_deref(), parent_ws.as_ref()) {
         Ok(w) => p.workspace = w,
         Err(why) => {
             eprintln!("wsp: {why}");

@@ -12,11 +12,9 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
 
 ## Holds
 
-- `src/lib.rs`: `Server::start(store, Config { addrs, state_dir, port, instance, beat, views, sync, gate, peers })`, `Views` (the
+- `src/lib.rs`: `Server::start(store, Config { addrs, state_dir, port, instance, beat, views })`, `Views` (the
   view verbs' documents, handed in by whatever starts the server: the daemon passes the CLI's own functions,
-  wsp-307), `SyncVerbs` (the hub's sync verbs), `Gate` (who a hello is, where its token decides it: the hub's
-  `auth`, wsp-161; `hello` resolves the principal, `admits` vets each request, `owns` names commands applied
-  beside the orders machine's), `Server::{addrs,
+  wsp-307), `Server::{addrs,
   token, clients, log_path, stop}`, `StartError`. Also `allowed` (the peer and bind rule: `127.0.0.0/8`, `::1`,
   `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, copied from the manager), `ensure_token` (`api.token`: 32 random bytes as
   hex, 0600, narrowed back and logged when widened), `DEFAULT_PORT` (7488, one past the manager's), `LOG_FILE`
@@ -25,13 +23,12 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   wsp server with this token (instance …, head …)", "a wsp server with another token", "something that is not a
   wsp server"). Accepting is non-blocking with a 25 ms poll, so `stop` needs no self-connect. A peer outside
   `allowed` is closed before it is read.
-- `src/conn.rs`: one connection. `hello` comes first: a wrong token is `refused unauthorised` (with a `Gate`, a
-  token the gate names nobody with; the principal it names replaces the hello's `by`), another protocol
+- `src/conn.rs`: one connection. `hello` comes first: a wrong token is `refused unauthorised`, another protocol
   is `refused protocol`, and any other first frame is `refused malformed`. Each of these closes the connection. A
   good hello gets `welcome { server, protocol, head, by }`, `by` the connection's principal. After that, each request gets one reply by id. A read verb
   is one store call. `lists`, `asks`, `machines`, and `orders` with no seat have no `Reads` verb, so they read the
   one `snapshot`. A command verb is `unsupported`, an unknown verb is `unsupported`, and a known verb with bad
-  `args` is `malformed`. `throttle`, `spend` and `show` are answered by `Config::views` whole (its `Err` as the
+  `args` is `malformed` (a hub's verb, `sync.heads` and the rest, is an unknown verb here). `throttle`, `spend` and `show` are answered by `Config::views` whole (its `Err` as the
   reply's `err`), `unsupported` without one. `wip` is answered from `src/wip.rs`'s cut cached by head; a cut past
   the line is kept as `SNAPSHOT_PART` pieces, `wip {}` answers the first with `parts`, `wip { at, part }` the rest,
   and the connection pins the cut it began on until its last part (wsp-783). A request whose `by` is not the connection's is `forbidden`, and one whose `v` is not 1 is
@@ -43,10 +40,8 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
   wsp-702) or the first page after `from`. `follow` then runs on a thread of its own and writes through the
   connection's shared writer. It follows the head with `wait_for` (at most 200 ms per wait), reads with
   `events_after` from the last id sent, and sends a `Feed::Beat` every beat. It ends with the connection, and
-  closes the connection when a write or the store fails. With a `Gate` whose `readable` names workspaces (the hub's),
-  a `Watch` scopes the subscription (wsp-174): the snapshot to those workspaces, each event by its `workspace`, a
-  record that left them as `Feed::Gone`, one that moved in as a whole `mirror.put`, and a change of the principal's
-  workspaces (a `Member` or `Workspace` event) as a `Feed::Resync` at the head.
+  closes the connection when a write or the store fails. A subscription reads everything: `Feed::Resync` and
+  `Feed::Gone` are a hub's scoped frames, which this server never sends.
 - `src/tcp.rs`: `Tcp`, the carrier. It is newline JSON over a `TcpStream` and implements `wsp_api::Connection`, with
   `dial`, `recv_line`, `send_line`, `try_clone`, `shutdown` and the 16 MB line cap. It is `pub` for wsp-client's
   tests. It copies `wsp-host`'s carrier, because that one is typed to the manager's `Frame`.
@@ -83,11 +78,8 @@ a dev-dependency. It never links `wsp-store-sqlite`, `wsp-store`, `wsp-wire`, `w
 - **Case 6 with `Mirror` is a test of its own.** The suite's `case_snapshot` folds with `TestDomain` and drives
   `row.add`, which `Mirror` refuses, so the test drives mirrors, leases, claims and texts and folds with `Mirror`.
 
-## TLS (wsp-461)
+## What it does not serve
 
-`src/tls.rs`: `server_config(cert, key)`, a `rustls::ServerConfig` (the `ring` provider) from PEM files, which the hub
-puts in `Config::tls`. With it `conn::serve` accepts each connection inside TLS (`tcp::Tcp::accept_tls`): one
-`ServerConnection` per stream, shared by the stream's handles behind a mutex that the reader takes only to hand it the
-bytes it read (it waits on the socket without it), so a feed's writes are not held up by a read. The handshake is the
-first `recv_line`. `testing.rs` (behind `test-support`) is a generated CA and a `localhost` certificate for tests. The
-peer rule (`Config::admits`) is the same with or without TLS: the daemon sets no `tls` and no `peers`.
+The hub is a program of its own repository. The gate a hub's hello went through, the hook its sync verbs were
+answered by, TLS, configurable peer ranges, the cutting of a revoked token's connections and scoped subscriptions
+were this crate's while the old in-tree hub ran on it, and left with it: the daemon set none of them.

@@ -442,16 +442,22 @@ pub fn run(store: &Store, verbose: bool) -> i32 {
     // none of it, and nothing here ends the run.
     let _api = start_api(store);
     let _fold = crate::fold::start(store, _api.as_ref().map(|a| a.db.clone()));
-    // Spoke mode (wsp-464): with a login in `~/.config/wsp/hubs.json`, one
-    // thread syncs the shared workspaces with it. Without one, nothing starts.
-    // What the hub-lease follower cannot reach from below (wsp-466).
-    crate::hub_lease::install(|s, row, why| crate::cmd_spawn::release_lost(s, row, why).map(|_| ()), seat_alive);
-    // And the held-tell spool a message from another user waits in under
+    // The shared-work add-on's background work (the spoke's sync worker,
+    // wsp-464: one thread while `~/.config/wsp/hubs.json` holds a login, and
+    // nothing without one), lent what it cannot reach from below: ending a
+    // claim as `despawn --lost` does and whether a seat is alive (wsp-466), and
+    // the held-tell spool a message from another user waits in under
     // `WSP_ORDERS=files` (wsp-470).
-    crate::hub_sync::install_spool(|s, seat, text| {
-        crate::wake::hold_tell(s, seat, text);
-    });
-    let _sync = crate::hub_sync::start(store);
+    let _sync = crate::addon::get().start(
+        store,
+        crate::addon::Lent {
+            release: |s, row, why| crate::cmd_spawn::release_lost(s, row, why).map(|_| ()),
+            alive: seat_alive,
+            spool: |s, seat, text| {
+                crate::wake::hold_tell(s, seat, text);
+            },
+        },
+    );
 
     // Every executor's ssh master, held open on this machine. Inert until
     // somebody runs `wsp machine add`; see `crate::tunnel`.
@@ -767,8 +773,8 @@ fn renew_claims(store: &Store, now: i64, census: impl FnOnce() -> Option<crate::
         .claims()
         .iter()
         .filter(|(task, _)| store.claim_expires(task).is_some_and(|at| at - now < ttl - margin))
-        // A claim with a hub lease is renewed by the hub's word, not here (wsp-466).
-        .filter(|(_, rec)| rec.get(crate::hub_lease::TOKEN).is_none())
+        // A claim with the add-on's lease is renewed by the hub's word, not here (wsp-466).
+        .filter(|(_, rec)| !crate::addon::get().leased(rec))
         .filter_map(|(task, rec)| Some((task.clone(), claim_seat_id(rec)?.to_string())))
         .collect();
     if due.is_empty() {

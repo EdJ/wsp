@@ -8,8 +8,10 @@
 use std::collections::{HashMap, HashSet};
 
 pub(crate) use wsp_trees::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
-pub(crate) use wsp_engine::{address, affected, after, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, classify, closing, cmd_allocate, cmd_hub, cmd_initiative, cmd_login, cmd_mandate, cmd_message, cmd_migrate, cmd_publish, cmd_submit, cmd_task, cmd_whoami, cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close, hub_cache, hub_journal, hub_lease, hub_sync, inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close, piece_seat, pieces, reconcile, record_workspace, refusals, repair, retro_yours, room, scope, scratch, size_check, split, stage, stand_down, starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, worklist};
+pub(crate) use wsp_engine::{addon, address, affected, after, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, classify, closing, cmd_initiative, cmd_mandate, cmd_message, cmd_migrate, cmd_submit, cmd_task, cmd_whoami, cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close, inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close, piece_seat, pieces, record_workspace, refusals, repair, retro_yours, room, scope, scratch, size_check, split, stage, stand_down, starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, worklist};
 pub(crate) use wsp_seats::{agent_commands, cmd_agent, cmd_attend, cmd_brief, cmd_govern, cmd_install, cmd_machine, cmd_project, cmd_resume, cmd_role, cmd_sandbox, cmd_spawn, cmd_stamp, cmd_watch, kind_attention, kind_data, memory, wake};
+// The shared-work add-on, in its own crate (neither the engine nor the seats name it); re-exported at the old paths.
+pub(crate) use wsp_spoke::{cmd_allocate, cmd_hub, cmd_login, cmd_publish, hub_cache, hub_journal, hub_lease, hub_switch, hub_sync, reconcile, spoke};
 mod base;
 pub(crate) use wsp_base::{choices, input, risk, util};
 pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lands, lapse, lease, log, message, model, resolve, sharing, store, tags, verbs};
@@ -102,7 +104,7 @@ fn die_on_broken_pipe() {
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
 const LOOKS_FIRST: &str =
-    "archive, checkout, initiative plan, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
+    "archive, checkout, hub disable, initiative plan, install, logout, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -215,6 +217,12 @@ fn dry_run(args: &Args) -> (bool, String) {
         "initiative" => named(sub == "plan" && args.rest.get(1).map(String::as_str) != Some("show")),
         "machine" | "machines" => named(false),
         "agent" => named(true),
+        // The shared-work add-on's disconnect: `hub disable` parks rows, ends
+        // agents and gives leases back, and `logout` does that disable before
+        // it removes the login, a set computed from the rows in flight that no
+        // other verb prints. Both print it under `-n` (`cmd_hub::preview_text`).
+        "hub" => named(sub == "disable"),
+        "logout" => (true, args.cmd.clone()),
         _ => (false, args.cmd.clone()),
     }
 }
@@ -459,6 +467,9 @@ fn main() {
     die_on_broken_pipe();
     let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
     let _ = wsp_engine::base::stamp::BUILD_STAMP.set(base::stamp::build_stamp);
+    // The shared-work add-on: the hub's spoke. Core asks it through `addon`
+    // and names none of its modules; with no login it answers as standalone.
+    addon::install(std::sync::Arc::new(spoke::Spoke::new()));
     let _ = mirror::LIST_OUTPUTS.set(cmd_report::list_outputs);
     outputs::install(cmd_report::REPORTS);
     let _ = mirror::LIST_SHOW.set(cmd_worklist::show_facts);
@@ -471,7 +482,7 @@ fn main() {
         after_land: check::after_land,
         rerun: check::rerun,
         held: |store| cmd_agent::locate(&cmd_agent::Whereabouts::live(store)).task.map(|t| t.id),
-        refused: |store, row| hub_journal::refusal(store, row, "land"),
+        refused: |store, row| addon::get().refusal(store, row, "land"),
     });
 
     place::install_above(place::Above {

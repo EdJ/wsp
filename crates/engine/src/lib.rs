@@ -18,6 +18,7 @@ pub mod testkit {
     pub use wsp_testkit::{git, repo, repo_at};
 }
 
+pub mod addon;
 pub mod address;
 pub mod affected;
 pub mod after;
@@ -34,15 +35,11 @@ pub mod check;
 pub mod claims;
 pub mod classify;
 pub mod closing;
-pub mod cmd_allocate;
-pub mod cmd_hub;
 pub mod cmd_initiative;
 pub mod initiative_run;
-pub mod cmd_login;
 pub mod cmd_mandate;
 pub mod cmd_message;
 pub mod cmd_migrate;
-pub mod cmd_publish;
 pub mod cmd_submit;
 pub mod cmd_task;
 pub mod cmd_whoami;
@@ -63,12 +60,6 @@ pub mod follow_up;
 pub mod history;
 pub mod hold;
 pub mod hold_close;
-// After a `stale` (wsp-176): the merge, and the push and stale glue; called by the sync worker (wsp-464, wsp-469).
-#[allow(dead_code)]
-pub mod hub_cache;
-pub mod hub_journal;
-pub mod hub_lease;
-pub mod hub_sync;
 pub mod inner;
 pub mod leg_seat;
 pub mod leg_tree;
@@ -88,7 +79,6 @@ pub mod piece_seat;
 pub mod pieces;
 pub mod prose;
 #[allow(dead_code)]
-pub mod reconcile;
 pub mod record_workspace;
 pub mod refusals;
 pub mod repair;

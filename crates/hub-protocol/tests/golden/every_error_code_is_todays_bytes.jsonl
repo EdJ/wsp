@@ -1,0 +1,25 @@
+{"type":"reply","id":1,"err":{"code":"stale","text":"Stale","refusal":{"code":"stale","lease":"row:wsp-071","current":4}},"events":[]}
+{"type":"reply","id":2,"err":{"code":"too_old","text":"TooOld","refusal":{"code":"too_old","oldest":100}},"events":[]}
+{"type":"reply","id":3,"err":{"code":"conflict","text":"Conflict","refusal":{"code":"conflict","current":"r9"}},"events":[]}
+{"type":"reply","id":4,"err":{"code":"held","text":"Held","refusal":{"code":"held","lease":"row:wsp-071","holder":{"person":"bo"}}},"events":[]}
+{"type":"reply","id":5,"err":{"code":"not_found","text":"NotFound","refusal":{"code":"not_found","subject":{"lease":"row:wsp-071"}}},"events":[]}
+{"type":"reply","id":6,"err":{"code":"not_found","text":"NotFound"},"events":[]}
+{"type":"reply","id":7,"err":{"code":"illegal","text":"Illegal","refusal":{"code":"illegal","subject":{"user":"bo"},"state":"revoked","verb":"hub.token.issue"}},"events":[]}
+{"type":"reply","id":8,"err":{"code":"forbidden","text":"Forbidden","refusal":{"code":"forbidden","by":{"person":"ann"}}},"events":[]}
+{"type":"reply","id":9,"err":{"code":"forbidden","text":"Forbidden"},"events":[]}
+{"type":"reply","id":10,"err":{"code":"invalid","text":"Invalid","refusal":{"code":"invalid","reason":"no key"}},"events":[]}
+{"type":"reply","id":11,"err":{"code":"invalid","text":"Invalid"},"events":[]}
+{"type":"reply","id":12,"err":{"code":"malformed","text":"Malformed"},"events":[]}
+{"type":"refused","code":"malformed","text":"the first frame must be hello"}
+{"type":"reply","id":13,"err":{"code":"unauthorised","text":"Unauthorised"},"events":[]}
+{"type":"refused","code":"unauthorised","text":""}
+{"type":"reply","id":14,"err":{"code":"protocol","text":"Protocol"},"events":[]}
+{"type":"refused","code":"protocol","text":"this server speaks protocol 1, not 2"}
+{"type":"reply","id":15,"err":{"code":"unsupported","text":"Unsupported"},"events":[]}
+{"type":"refused","code":"unsupported","text":"this hub has no login"}
+{"type":"reply","id":16,"err":{"code":"backend","text":"Backend"},"events":[]}
+{"type":"refused","code":"backend","text":"8 logins are running"}
+{"type":"reply","id":17,"err":{"code":"fenced","text":"Fenced"},"events":[]}
+{"type":"reply","id":18,"err":{"code":"too_large","text":"TooLarge"},"events":[]}
+{"type":"reply","id":19,"err":{"code":"unknown","text":"Unknown"},"events":[]}
+{"type":"refused","code":"forbidden","text":"ann is not on this hub's list"}

@@ -802,7 +802,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 name = "wsp"
 version = "0.1.0"
 dependencies = [
- "rustls",
  "serde_json",
  "wsp-api",
  "wsp-base",
@@ -810,12 +809,11 @@ dependencies = [
  "wsp-engine",
  "wsp-host",
  "wsp-host-api",
- "wsp-hub",
- "wsp-machines",
  "wsp-manager",
  "wsp-objects",
  "wsp-seats",
  "wsp-server",
+ "wsp-spoke",
  "wsp-store",
  "wsp-store-contract",
  "wsp-store-sqlite",
@@ -832,7 +830,6 @@ dependencies = [
  "serde",
  "serde_json",
  "wsp-api",
- "wsp-objects",
  "wsp-store-contract",
 ]
 
@@ -847,12 +844,8 @@ dependencies = [
 name = "wsp-client"
 version = "0.1.0"
 dependencies = [
- "rustls",
- "rustls-native-certs",
  "serde_json",
  "wsp-api",
- "wsp-client",
- "wsp-objects",
  "wsp-server",
  "wsp-store-conformance",
  "wsp-store-contract",
@@ -868,8 +861,6 @@ dependencies = [
  "wsp-client",
  "wsp-host",
  "wsp-host-api",
- "wsp-hub",
- "wsp-machines",
  "wsp-manager",
  "wsp-objects",
  "wsp-server",
@@ -900,18 +891,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "wsp-hub"
+name = "wsp-hub-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "wsp-api",
- "wsp-client",
- "wsp-machines",
  "wsp-objects",
- "wsp-server",
  "wsp-store-contract",
- "wsp-store-sqlite",
 ]
 
 [[package]]
@@ -919,7 +906,6 @@ name = "wsp-machines"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "sha2",
  "wsp-store-contract",
 ]
 
@@ -968,14 +954,31 @@ dependencies = [
 name = "wsp-server"
 version = "0.1.0"
 dependencies = [
- "rcgen",
- "rustls",
  "serde_json",
  "wsp-api",
  "wsp-machines",
- "wsp-server",
  "wsp-store-conformance",
  "wsp-store-contract",
+]
+
+[[package]]
+name = "wsp-spoke"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "sha2",
+ "wsp-base",
+ "wsp-engine",
+ "wsp-hub-protocol",
+ "wsp-objects",
+ "wsp-server",
+ "wsp-store",
+ "wsp-store-contract",
+ "wsp-store-sqlite",
+ "wsp-testkit",
 ]
 
 [[package]]

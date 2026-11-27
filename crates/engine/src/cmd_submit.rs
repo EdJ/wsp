@@ -1820,7 +1820,16 @@ mod tests {
         };
         hold("seat-a");
         let why = "claim expired: held by seat-a on this machine, last renewed 2026-11-10T10:00:00Z";
-        crate::hub_lease::tests::lose(&store, "wsp-101", why).unwrap();
+        // What the seats' `release_lost` leaves (they are above the engine): the
+        // binding and claim gone, the row back at todo with the reason logged.
+        for seat in store.panes_for_task("wsp-101") {
+            store.clear_binding(&seat);
+        }
+        store.clear_claim("wsp-101");
+        let mut t = store.task("wsp-101").unwrap();
+        t.set_status(crate::model::Status::Todo);
+        t.log(why);
+        store.save_task(&t).unwrap();
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "todo");
         hold("seat-b");
         let mut t = store.task("wsp-101").unwrap();

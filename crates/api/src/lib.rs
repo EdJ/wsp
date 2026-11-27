@@ -6,8 +6,8 @@
 //! A contract crate under `docs/components.md` R2: types, a trait and
 //! constants, and no IO. It names nothing of the workspace but
 //! `wsp-store-contract`, whose types (rows, seats, events, commands, refusals,
-//! `Feed`) it carries, and `wsp-objects` (pure, no IO), whose ids, refs and
-//! workspaces the sync verbs carry ([`sync`], wsp-459). Every change to this crate is a change to the contract
+//! `Feed`) it carries. The hub's wire is no part of it: that is
+//! `wsp-hub-protocol`, which the spoke speaks. Every change to this crate is a change to the contract
 //! (R5): a row of its own. A field added later is `#[serde(default)]` so that
 //! an older peer's frames still decode; a code added later decodes as
 //! [`Code::Unknown`]; a change an older peer cannot decode bumps [`PROTOCOL`].
@@ -42,15 +42,10 @@ use serde_json::Value;
 
 mod conn;
 pub mod principal;
-pub mod sync;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use conn::{pair, Memory};
 pub use conn::{ConnError, Connection, MAX_LINE};
-pub use sync::{
-    fence_subject, fenced_by, fenced_event, msg_subject, row_id, Blob, HubMessage, IdsAlloc, LeaseHold, LeaseTake, Move, MsgSend,
-    ObjectId, RefMove, Refs, SyncCall, WorkspaceId, FENCE_TOKEN, MAX_IDS, SYNC_VERBS,
-};
 
 pub use wsp_store_contract::{
     Applied, Ask, AskKind, AskState, Command, Event, EventId, Feed, IdempotencyKey, List, ListFilter,
@@ -263,18 +258,15 @@ pub struct Request {
 /// What a request asks: `verb` and `args`, beside the envelope's fields.
 ///
 /// Decoded in this order: a read verb ([`Verb`]), then a command ([`Command`]),
-/// then a sync verb ([`SyncCall`]), then [`Call::Unknown`], which keeps the
-/// request's `id` readable so the server can answer it: [`Code::Malformed`]
-/// when the verb is in [`READ_VERBS`], [`COMMAND_VERBS`] or [`SYNC_VERBS`] (its
-/// `args` did not fit), and [`Code::Unsupported`] when it is in none.
+/// then [`Call::Unknown`], which keeps the request's `id` readable so the
+/// server can answer it: [`Code::Malformed`] when the verb is in
+/// [`READ_VERBS`] or [`COMMAND_VERBS`] (its `args` did not fit), and
+/// [`Code::Unsupported`] when it is in none (a hub's verb among them).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Call {
     Verb(Verb),
     Command(Command),
-    /// The hub's sync verbs (wsp-459): objects by hash and refs moved from
-    /// the head the writer saw.
-    Sync(SyncCall),
     Unknown {
         verb: String,
         #[serde(default)]
@@ -521,33 +513,6 @@ pub enum Answer {
         by: Principal,
         server: String,
     },
-    /// `sync.heads`: the workspace's refs, each subject's head.
-    Heads(Refs),
-    /// `sync.have`: the ids asked about that the hub does not hold.
-    Missing(Vec<ObjectId>),
-    /// `sync.put`: how many of the objects were written; one already held is
-    /// not, so a second put of the same objects stores none.
-    Stored { stored: u32 },
-    /// `sync.get`: the objects asked for that the hub holds.
-    Objects(Vec<Blob>),
-    /// `refs.move`: moved, or stale with the head there is.
-    Move(Move),
-    /// `ids.alloc`: the ids handed out, in increasing order.
-    Ids(Vec<String>),
-    /// `lease.take` and `lease.renew`: the row's fencing token and when the
-    /// lease expires, on the hub's clock.
-    Lease {
-        token: wsp_store_contract::Token,
-        expires: wsp_store_contract::At,
-    },
-    /// `lease.release`: the lease is not the caller's any more.
-    Released,
-    /// `msg.send`: the message's id on the hub and the user it was routed to.
-    Queued { id: String, user: String },
-    /// `msg.take`: the messages queued for the caller, oldest first.
-    Messages(Vec<HubMessage>),
-    /// `msg.ack`: how many of the ids left the caller's queue.
-    Acked { acked: u32 },
 }
 
 /// What `err` carries: `{ code, text }` (4.1), and the contract's refusal
@@ -588,11 +553,6 @@ pub enum Code {
     Unsupported,
     /// The store failed (the contract's `Error::Backend`); a retry may pass.
     Backend,
-    /// A verdict or a landing pushed under a lease token that is not the row's
-    /// current one (wsp-468): the writer lost its lease, or never held it, and
-    /// has not noticed. Carries no contract refusal; the text names the current
-    /// token. Nothing was written.
-    Fenced,
     /// The reply would be a line longer than [`MAX_LINE`], which the client
     /// could not read (wsp-377): nothing was sent in its place but this. The
     /// text says how long it was and how to ask for less (`rows` pages with

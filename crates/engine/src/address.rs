@@ -110,11 +110,10 @@ pub struct Book {
 impl Book {
     pub fn read(store: &Store) -> Book {
         let login = logged_in_user();
-        let drive = crate::hub_lease::Book::read(store);
-        let mut remote_rows: BTreeSet<String> = drive.elsewhere.keys().cloned().collect();
-        remote_rows.extend(crate::hub_cache::Cache::read(store).rows().map(|(r, _)| r.clone()));
+        let elsewhere = crate::addon::get().elsewhere(store);
+        let remote_rows: BTreeSet<String> = elsewhere.rows;
         let me = login.as_deref().map(str::trim).unwrap_or_default();
-        let remote_lists = drive.driven_by.iter().filter(|(_, u)| u.trim() != me).map(|(l, _)| l.clone()).collect();
+        let remote_lists = elsewhere.lists.iter().filter(|(_, u)| u.trim() != me).map(|(l, _)| l.clone()).collect();
         Book {
             governors: store.governors(),
             claims: store.claims(),
@@ -176,12 +175,11 @@ fn remote(address: String, what: impl Into<String>) -> Named {
     Named { pane: address, what: what.into(), remote: true }
 }
 
-/// The user `hubs.json` says this machine is logged in as. A login that cannot
-/// be read is no login here; `wsp login` is what the refusal names either way.
+/// The user this machine is logged in as on the shared side, as the
+/// shared-work add-on reads its login. A login that cannot be read is no login
+/// here; `wsp login` is what the refusal names either way. None standalone.
 pub fn logged_in_user() -> Option<String> {
-    let home = wsp_client::hub_home()?;
-    let login = wsp_client::hub_login_in(&home).ok().flatten()?;
-    Some(login.user).filter(|u| !u.trim().is_empty())
+    crate::addon::get().user()
 }
 
 /// `primary:<user>`: the local primary seat for the user logged in here, the

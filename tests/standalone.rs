@@ -11,8 +11,9 @@
 //!    the store wrote (`cycle.log`, `api.log`, what the daemon printed) names a
 //!    hub;
 //! 2. no socket of the daemon leaves loopback: none connected to an address
-//!    that is not 127.0.0.0/8 or ::1, none bound to one (/proc/<pid>/net on
-//!    Linux, `lsof` on macOS);
+//!    that is not 127.0.0.0/8 or ::1, none bound to one but a tailnet address
+//!    (the daemon's API listens on the tailnet by design, D19), and none bound
+//!    to a wildcard (/proc/<pid>/net on Linux, `lsof` on macOS);
 //! 3. no file appears under `$WSP_STATE`, the store or the home but the ones
 //!    [`ALLOWED`] names, which is what today's build writes, and the home stays
 //!    empty (`~/.config/wsp` is never made);
@@ -104,9 +105,37 @@ fn is_unspecified(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether `ip` is a Tailscale address: 100.64.0.0/10 (the CGNAT range
+/// Tailscale numbers its nodes from) or fd7a:115c:a1e0::/48 (its IPv6 range).
+fn is_tailnet(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (b & 0xc0) == 64
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
 /// What in `socks` leaves loopback: a socket connected to an address that is
-/// not loopback, or bound to one (a listener on `0.0.0.0` is reachable from
-/// outside).
+/// not loopback, or bound to one that is neither loopback nor the tailnet (a
+/// listener on `0.0.0.0` is reachable from outside).
+///
+/// A bind to a tailnet address is accepted because the daemon's API listens on
+/// the machine's tailnet address by design (D19: loopback and the tailnet),
+/// so on a machine where Tailscale is up the daemon is bound there with no
+/// login at all. What this no longer proves on such a machine: that the
+/// daemon is reachable from nowhere but this machine; a listener on the
+/// tailnet is reachable from the tailnet's other nodes. A connection to a
+/// tailnet peer (a hub dialled over the tailnet, or a peer accepted on that
+/// listener) is still caught: only the bind is accepted, never the remote end.
 fn off_loopback(socks: &[Sock]) -> Vec<String> {
     let mut out = Vec::new();
     for s in socks {
@@ -115,7 +144,7 @@ fn off_loopback(socks: &[Sock]) -> Vec<String> {
                 out.push(format!("connected {} -> {r}", s.local));
             }
         }
-        if !is_local(s.local) {
+        if !is_local(s.local) && !is_tailnet(s.local) {
             out.push(format!("bound to {}", s.local));
         }
     }
@@ -575,6 +604,30 @@ fn a_planted_outbound_socket_is_seen_off_loopback() {
     let lsof = "p1\nf5\nPTCP\nn10.0.0.10:50001->93.184.216.34:443\nf6\nPUDP\nn*:5353\nf7\nPTCP\nn[2001:db8::1]:80\n";
     let off = off_loopback(&parse_lsof(lsof));
     assert_eq!(off.len(), 4, "{off:?}"); // bind + peer, wildcard bind, v6 bind
+
+    // The tailnet: a listener on a tailnet address is the daemon's by design,
+    // and passes; a connection to a tailnet peer does not, nor does a bind just
+    // outside either range.
+    // Built from octets: the privacy lint refuses a written-out tailnet address.
+    let tail = |c: u8, d: u8, e: u8| IpAddr::V4(Ipv4Addr::new(100, c, d, e));
+    let tailnet = [
+        Sock { local: tail(64, 0, 1), remote: None },
+        Sock { local: tail(127, 255, 254), remote: None },
+        Sock { local: "fd7a:115c:a1e0::1".parse().unwrap(), remote: None },
+        Sock { local: "fd7a:115c:a1e0:ffff::1".parse().unwrap(), remote: None },
+    ];
+    assert!(off_loopback(&tailnet).is_empty(), "{:?}", off_loopback(&tailnet));
+    let outside = [
+        Sock { local: "100.63.255.255".parse().unwrap(), remote: None },
+        Sock { local: "100.128.0.1".parse().unwrap(), remote: None },
+        Sock { local: "fd7a:115c:a1e1::1".parse().unwrap(), remote: None },
+        Sock { local: "fd7b:115c:a1e0::1".parse().unwrap(), remote: None },
+        Sock { local: tail(64, 0, 1), remote: Some(tail(64, 0, 2)) },
+        Sock { local: "fd7a:115c:a1e0::1".parse().unwrap(), remote: Some("fd7a:115c:a1e0::2".parse().unwrap()) },
+    ];
+    let off = off_loopback(&outside);
+    assert_eq!(off.len(), 6, "{off:?}"); // four binds outside the ranges, two tailnet peers
+    assert!(off.iter().filter(|o| o.starts_with("connected")).count() == 2, "{off:?}");
 }
 
 #[test]

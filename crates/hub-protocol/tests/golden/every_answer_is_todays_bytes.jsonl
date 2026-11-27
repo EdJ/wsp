@@ -1,0 +1,27 @@
+{"type":"reply","id":1,"ok":{"state":{"state":{"rows":{},"lists":{},"seats":{},"claims":{},"orders":{},"asks":{},"runs":[],"machines":{},"leases":{"hubrow:[\"shared:team\",\"wsp-071\"]":{"name":"hubrow:[\"shared:team\",\"wsp-071\"]","holder":{"person":"ann"},"token":4,"expires":1800000000000}},"users":{"ann":{"name":"ann","state":"active","admin":true},"bo":{"name":"bo","state":"revoked","admin":false}},"credentials":{"t-ann":{"id":"t-ann","user":"ann","hash":"abababababababababababababababababababababababababababababababab","state":"active","issued":1763400000000,"revoked":null},"t-bo":{"id":"t-bo","user":"bo","hash":"abababababababababababababababababababababababababababababababab","state":"revoked","issued":1763400000000,"revoked":1763400100000}},"workspaces":{"team":{"name":"team"}},"members":{"team":["ann"]}},"at":411}},"events":[]}
+{"type":"reply","id":2,"ok":{"state":{"state":{"rows":{},"lists":{},"seats":{},"claims":{},"orders":{},"asks":{},"runs":[],"machines":{},"leases":{},"users":{},"credentials":{},"workspaces":{},"members":{}},"at":0}},"events":[]}
+{"type":"reply","id":3,"ok":{"events":{"events":[{"id":401,"at":1763400000401,"principal":{"person":"ann"},"kind":"ref.moved","subject":{"row":"wsp-071"},"workspace":"shared:team","payload":{"subject":{"row":"wsp-071"},"to":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a","workspace":"shared:team"}},{"id":402,"at":1763400000402,"principal":{"person":"ann"},"kind":"lease.expired","subject":{"lease":"row:wsp-071"},"workspace":"shared:team","payload":{"holder":{"person":"ann"},"row":"wsp-071","token":4,"workspace":"shared:team"}},{"id":403,"at":1763400000403,"principal":{"person":"ann"},"kind":"order.queued","subject":{"user":"bo"},"workspace":"shared:team","payload":{"id":"hm-1","user":"bo"}},{"id":404,"at":1763400000404,"principal":{"person":"ann"},"kind":"hub.token.revoked","subject":{"credential":"t-bo"},"payload":null},{"id":405,"at":1763400000405,"principal":{"person":"ann"},"kind":"hub.member.set","subject":{"member":{"workspace":"team","user":"bo"}},"payload":{"member":true}}],"head":411,"through":405}},"events":[]}
+{"type":"reply","id":4,"ok":{"events":{"events":[],"head":411,"through":400}},"events":[]}
+{"type":"reply","id":5,"ok":"subscribed","events":[]}
+{"type":"reply","id":6,"ok":"applied","events":[412,413]}
+{"type":"reply","id":7,"ok":"applied","events":[]}
+{"type":"reply","id":8,"ok":{"whoami":{"by":"person:ann","server":"wsp-hub"}},"events":[]}
+{"type":"reply","id":9,"ok":{"heads":{"workspace":"shared:team","heads":[{"subject":{"row":"wsp-071"},"head":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"},{"subject":{"lease":"row:wsp-071"},"head":"sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"}]}},"events":[]}
+{"type":"reply","id":10,"ok":{"heads":{"workspace":"shared:team","heads":[]}},"events":[]}
+{"type":"reply","id":11,"ok":{"missing":["sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"]},"events":[]}
+{"type":"reply","id":12,"ok":{"stored":{"stored":1}},"events":[]}
+{"type":"reply","id":13,"ok":{"objects":[{"id":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","bytes":"e30="},{"id":"sha256:2b4c342f5433ebe591a1da77e013d1b72475562d48578dca8b84bac6651c3cb9","bytes":"AP8HgA=="}]},"events":[]}
+{"type":"reply","id":14,"ok":{"move":{"moved":{"head":"sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"}}},"events":[]}
+{"type":"reply","id":15,"ok":{"move":{"stale":{"head":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"}}},"events":[]}
+{"type":"reply","id":16,"ok":{"move":{"stale":{"head":null}}},"events":[]}
+{"type":"reply","id":17,"ok":{"ids":["wsp-185","wsp-186"]},"events":[]}
+{"type":"reply","id":18,"ok":{"ids":[]},"events":[]}
+{"type":"reply","id":19,"ok":{"lease":{"token":4,"expires":1800000000000}},"events":[]}
+{"type":"reply","id":20,"ok":"released","events":[]}
+{"type":"reply","id":21,"ok":{"queued":{"id":"hm-1","user":"bo"}},"events":[]}
+{"type":"reply","id":22,"ok":{"messages":[{"id":"hm-1","to":"seat:wsp-071","user":"bo","from_user":"ann","from":"seat:wsp-470","seat":"%3","text":"is it landed?","re":"hm-0","at":1800000000000},{"id":"hm-1","to":"seat:wsp-071","user":"bo","from_user":"ann","from":"seat:wsp-470","text":"is it landed?","at":1800000000000}]},"events":[]}
+{"type":"reply","id":23,"ok":{"messages":[]},"events":[]}
+{"type":"reply","id":24,"ok":{"acked":{"acked":1}},"events":[]}
+{"type":"reply","id":25,"ok":{"heads":{"workspace":"shared:team","heads":[{"subject":{"row":"wsp-071"},"head":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"},{"subject":{"lease":"row:wsp-071"},"head":"sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"}],"retired":[{"subject":{"row":"inbox-001"},"successor":{"row":"wsp-071"}},{"subject":{"row":"inbox-002"}}]}},"events":[]}
+{"type":"reply","id":26,"ok":{"retired":{"subject":{"row":"inbox-001"},"successor":{"row":"wsp-071"}}},"events":[]}
+{"type":"reply","id":27,"ok":{"retired":{"subject":{"row":"wsp-071"}}},"events":[]}

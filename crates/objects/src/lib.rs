@@ -279,11 +279,22 @@ fn write_scalar(value: &Value, out: &mut Vec<u8>) {
 /// theirs to fence. Serialized as `{"workspace": ..., "heads": [{"subject": ...,
 /// "head": "sha256:..."}, ...]}` in subject order, since a subject is not a
 /// string and so cannot key a JSON map.
+///
+/// **Retired subjects.** A subject its workspace no longer has (a row moved
+/// to a new id, say) is in `retired`, with the subject it continues as where
+/// there is one, and in no head. Written after the heads as `"retired":
+/// [{"subject": ..., "successor": ...}, ...]`, `successor` left out where
+/// there is none, and the whole key left out where nothing is retired, so
+/// refs with none are the bytes they always were; a reader that does not know
+/// the key passes it over.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "RefsForm", try_from = "RefsForm")]
 pub struct Refs {
     pub workspace: WorkspaceId,
     pub heads: BTreeMap<Subject, ObjectId>,
+    /// The retired subjects, each with the subject it continues as (none:
+    /// it is gone, and continues as nothing).
+    pub retired: BTreeMap<Subject, Option<Subject>>,
 }
 
 impl Refs {
@@ -292,6 +303,7 @@ impl Refs {
         Refs {
             workspace,
             heads: BTreeMap::new(),
+            retired: BTreeMap::new(),
         }
     }
 
@@ -309,6 +321,15 @@ impl Refs {
 struct RefsForm {
     workspace: WorkspaceId,
     heads: Vec<Head>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired: Vec<Retired>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Retired {
+    subject: Subject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor: Option<Subject>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -326,6 +347,11 @@ impl From<Refs> for RefsForm {
                 .into_iter()
                 .map(|(subject, head)| Head { subject, head })
                 .collect(),
+            retired: refs
+                .retired
+                .into_iter()
+                .map(|(subject, successor)| Retired { subject, successor })
+                .collect(),
         }
     }
 }
@@ -333,7 +359,8 @@ impl From<Refs> for RefsForm {
 impl TryFrom<RefsForm> for Refs {
     type Error = Error;
 
-    /// Refused when a subject is named twice: which head would it have?
+    /// Refused when a subject is named twice: which head would it have? A
+    /// subject both with a head and retired is refused too.
     fn try_from(form: RefsForm) -> Result<Refs> {
         let mut refs = Refs::new(form.workspace);
         for Head { subject, head } in form.heads {
@@ -343,6 +370,14 @@ impl TryFrom<RefsForm> for Refs {
                 )));
             }
             refs.heads.insert(subject, head);
+        }
+        for Retired { subject, successor } in form.retired {
+            if refs.heads.contains_key(&subject) || refs.retired.contains_key(&subject) {
+                return Err(Error::Malformed(format!(
+                    "subject {subject:?} is retired and has a head, or is retired twice"
+                )));
+            }
+            refs.retired.insert(subject, successor);
         }
         Ok(refs)
     }

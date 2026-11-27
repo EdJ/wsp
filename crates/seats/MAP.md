@@ -6,15 +6,21 @@ members it names directly (`wsp-base`, `wsp-store`, `wsp-wire`, `wsp-host-api`, 
 
 ## Holds
 
-The `seats` row of the layering map, 18 modules: `cmd_spawn` (with `Fleet`, the engine's `Seats` impl), `cmd_agent`,
+The `seats` row of the layering map, 19 modules: `cmd_spawn` (with `Fleet`, the engine's `Seats` impl), `cmd_agent`,
 `agent_commands`, `wake`, `cmd_govern`, `cmd_watch`, `cmd_machine`, `cmd_sandbox`, `cmd_install`, `cmd_brief`,
-`cmd_resume`, `cmd_role`, `cmd_project`, `cmd_stamp`, `cmd_attend`, `kind_attention`, `kind_data`, `memory`.
+`cmd_resume`, `cmd_role`, `cmd_project`, `cmd_stamp`, `cmd_attend`, `kind_attention`, `kind_data`, `memory`, `seat_block` (wsp-788:
+a seat blocked at a question raised to the person in yours; it uses `cmd_agent` and `cmd_spawn`, so it sits here,
+not in the engine where master first put it).
 
 ## Does not hold
 
 - `room`: it stays in `wsp-engine`, since `cycle` and `waits` use `room::Gate` in product code.
 - `watch_levels`, `claims`, `prose`, `sent`: moved down into the engine by wsp-438, used from here.
 - Everything else of the run and the row verbs: `wsp-engine`.
+- The shared-work add-on (the hub's spoke: leases, the drive, the sync, `wsp login`/`hub`/`publish`/`allocate`):
+  `wsp-spoke`, never named here. Seats code asks it through the engine's `addon` (`crate::addon::get()`), as the
+  engine does: `cmd_agent`'s lease on a claim and the doctor's hub lines, `cmd_spawn`'s allocation refusal, `wake`'s
+  primary of another user, `cmd_sandbox`'s isolated login.
 
 ## Paths
 

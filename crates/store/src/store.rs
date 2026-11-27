@@ -1765,9 +1765,19 @@ impl Store {
         let mut files = 0usize;
         let mut refs = 0usize;
 
-        // The task files themselves move first, so that nothing below is
+        // The record of what became what goes down before any file moves: a
+        // reader (`resolve_task`, another process's `wsp show <old>`) finds
+        // the old file until it moves and the new one through `ids.json`
+        // after, never neither. Written last, as it was, a reader between a
+        // file's move and the end of the walk below found no task by either
+        // id. A move that fails puts the record back as it was.
+        let ids_before = fs::read(self.ids_path()).ok();
+        self.record_renamed(map)?;
+
+        // The task files themselves move next, so that nothing below is
         // reading a path that is about to stop existing. `id:` inside the file
         // is rewritten by the same substitution as everything else.
+        let moved = (|| -> std::io::Result<()> {
         for (from, to) in map {
             let (a, b) = (self.task_path(from), self.task_path(to));
             if a.exists() {
@@ -1785,6 +1795,19 @@ impl Store {
                 self.wrote(a);
                 self.wrote(b);
             }
+        }
+        Ok(())
+        })();
+        if let Err(e) = moved {
+            match &ids_before {
+                Some(bytes) => {
+                    let _ = fs::write(self.ids_path(), bytes);
+                }
+                None => {
+                    let _ = fs::remove_file(self.ids_path());
+                }
+            }
+            return Err(e);
         }
         // The archive holds ids in the same space and is cited by live prose,
         // so it moves too. A `~2` suffix marks a record filed beside an earlier
@@ -1840,6 +1863,14 @@ impl Store {
             }
         }
 
+        // The moved files now say their new ids inside.
+        #[cfg(test)]
+        AFTER_MOVE.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(self)
+            }
+        });
+
         // Ephemeral state keys tasks by id too — a claim, a binding, a raised
         // hand, a message, the event log. It is not committed, so it is
         // rewritten under the same lock everything else takes rather than with
@@ -1866,11 +1897,15 @@ impl Store {
             }
         });
 
-        // And the record of what became what. Chains are collapsed as they are
-        // added: if `inbox-003` already pointed at `data-014` and `data-014` is
-        // now becoming something else, `inbox-003` is repointed at the end of
-        // the chain rather than at a link in it, so a lookup stays one step and
-        // can never land on an id that no longer exists.
+        Ok((files, refs))
+    }
+
+    /// `map` added to `ids.json`, the record of what became what. Chains are
+    /// collapsed as they are added: if `inbox-003` already pointed at
+    /// `data-014` and `data-014` is now becoming something else, `inbox-003`
+    /// is repointed at the end of the chain rather than at a link in it, so a
+    /// lookup stays one step and can never land on an id that no longer exists.
+    fn record_renamed(&self, map: &BTreeMap<String, String>) -> std::io::Result<()> {
         let mut ids = self.renamed_ids();
         for (_, v) in ids.iter_mut() {
             if let Some(end) = map.get(v.as_str()) {
@@ -1886,8 +1921,7 @@ impl Store {
         );
         write_atomic(&self.ids_path(), &serde_json::to_string_pretty(&json).unwrap_or_default())?;
         self.wrote(self.ids_path());
-
-        Ok((files, refs))
+        Ok(())
     }
 
     /// Renumber `map` and file what it renamed in `workspace` (wsp-185, the
@@ -4312,6 +4346,14 @@ fn stdout_meta() -> Option<std::fs::Metadata> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// A test's look at the store once [`Store::rename_tasks`] has moved the
+    /// files and rewritten the ids in them: the window a reader once found
+    /// neither id in.
+    static AFTER_MOVE: std::cell::RefCell<Option<Box<dyn Fn(&Store)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Group, WorklistStatus};
@@ -4322,6 +4364,42 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A reader between a renaming's file moves and the end of its walk finds
+    /// the task by its old id: the record of what became what is written
+    /// before any file moves. (Written last, `wsp show <old>` in that window
+    /// said "no such task": the hub sync renaming a provisional id at
+    /// reconnect, `tests/hub_sync.rs`.)
+    #[test]
+    fn rename_a_reader_mid_rename_finds_the_task_by_its_old_id() {
+        let store = scratch("rename-mid");
+        let t = Task::new("renamed under a reader", "alpha-002");
+        store.save_task(&t).unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let saw = seen.clone();
+        AFTER_MOVE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |s: &Store| {
+                // Another process reads the files as they are: a fresh store on the same paths.
+                let fresh = Store::at(s.root.clone(), s.state.clone());
+                *saw.borrow_mut() = Some(matches!(fresh.resolve_task("alpha-002"), Found::One(t) if t.title == "renamed under a reader"));
+            }))
+        });
+        store.rename_tasks(&BTreeMap::from([("alpha-002".to_string(), "alpha-003".to_string())])).unwrap();
+        AFTER_MOVE.with(|h| *h.borrow_mut() = None);
+        assert_eq!(*seen.borrow(), Some(true), "mid-rename, the old id finds the task");
+        assert!(matches!(store.resolve_task("alpha-002"), Found::One(t) if t.id == "alpha-003"));
+    }
+
+    /// A move that fails (its destination is a real task) leaves `ids.json` as it was.
+    #[test]
+    fn rename_a_failed_move_puts_the_record_back() {
+        let store = scratch("rename-fail");
+        store.save_task(&Task::new("one", "alpha-001")).unwrap();
+        store.save_task(&Task::new("two", "alpha-002")).unwrap();
+        assert!(store.rename_tasks(&BTreeMap::from([("alpha-001".to_string(), "alpha-002".to_string())])).is_err());
+        assert!(store.renamed_ids().is_empty(), "{:?}", store.renamed_ids());
+        assert!(matches!(store.resolve_task("alpha-001"), Found::One(t) if t.title == "one"));
     }
 
     /// `wsp-185`: a renumbering into a workspace stamps a row and its sub-task

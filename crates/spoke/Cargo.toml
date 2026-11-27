@@ -1,0 +1,39 @@
+[package]
+name = "wsp-spoke"
+version = "0.1.0"
+edition = "2021"
+description = "wsp's shared-work add-on: the spoke that logs in to a hub and syncs shared work, plugged into the engine through its SharedWork interface"
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+serde_json = "1"
+wsp-engine = { path = "../engine" }
+wsp-base = { path = "../base" }
+wsp-store = { path = "../store" }
+wsp-store-contract = { path = "../store-contract" }
+wsp-objects = { path = "../objects" }
+# The hub's wire, which `hub_client` speaks and nothing else.
+wsp-hub-protocol = { path = "../hub-protocol" }
+# TLS: a hub URL of `tls://` is dialled over it, with the platform's roots or a pinned CA.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-native-certs = "0.8"
+# `hub_client::token::hash`, the hex SHA-256 a hub token record keeps.
+sha2 = "0.10"
+# `testhub`'s throwaway CA, behind `test-support`.
+rcgen = { version = "0.14", optional = true }
+
+[features]
+# `testhub`: a real hub run as an external program, for this crate's tests and the root's.
+test-support = ["dep:rcgen"]
+
+[dev-dependencies]
+rcgen = "0.14"
+wsp-engine = { path = "../engine", features = ["test-support"] }
+wsp-base = { path = "../base", features = ["test-support"] }
+wsp-store = { path = "../store", features = ["test-support"] }
+wsp-testkit = { path = "../testkit" }
+wsp-server = { path = "../server" }
+wsp-store-sqlite = { path = "../store-sqlite" }

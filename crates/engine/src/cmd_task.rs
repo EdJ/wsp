@@ -159,7 +159,7 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     // Private unless said otherwise; a sub-task is where its parent is (wsp-172).
     // Before an id exists, so a refusal leaves nothing reserved.
     let beside = parent.as_ref().or(found_by.as_ref()).map(|p| &p.workspace);
-    let workspace = match crate::record_workspace::of_new(args.get("workspace").as_deref(), beside) {
+    let workspace = match crate::record_workspace::of_new(store, args.get("workspace").as_deref(), beside) {
         Ok(w) => w,
         Err(why) => {
             eprintln!("wsp: {why}");
@@ -167,7 +167,10 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         }
     };
 
-    let id = match store.alloc_task_id(project.as_deref()) {
+    // A shared row's id is the shared side's to give (its counter is one for
+    // everybody filing into the project); a private row's is the local
+    // counter's. Before anything is written, so a refusal leaves nothing.
+    let id = match new_row_id(store, project.as_deref(), &workspace, parent.as_ref().map(|p| p.id.as_str())) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("wsp: cannot allocate id: {e}");
@@ -244,6 +247,16 @@ pub fn add_from(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
 /// The write `add` ends in, for a task already made: its file, the event and
 /// the commit, for `caller`. A caller from the hub (wsp-175) also has the row's
 /// log say so, `added by <user> via the hub`; one here writes what it always has.
+/// The id a new row in `workspace` takes: the shared-work add-on's when it
+/// gives one (a shared row's comes from the hub's counter), else the local
+/// counter's. Reserved either way; `Err` is why not, with nothing written.
+pub fn new_row_id(store: &Store, project: Option<&str>, workspace: &crate::model::WorkspaceId, parent: Option<&str>) -> Result<String, String> {
+    match crate::addon::get().new_row_id(store, project, workspace, parent)? {
+        Some(id) => Ok(id),
+        None => store.alloc_task_id(project).map_err(|e| e.to_string()),
+    }
+}
+
 pub fn file_new(store: &Store, t: &mut Task, caller: &crate::cmd_message::Caller) -> std::io::Result<()> {
     if caller.via_hub {
         t.log(&format!("added {}", caller.byline()));
@@ -371,7 +384,7 @@ pub fn list(store: &Store, args: &Args) -> i32 {
     if let Some(s) = &scope {
         println!("{}", p.dim(&scope_line(s, &tasks)));
     }
-    print_tasks(&tasks, &all, &p, scope.is_none());
+    print_tasks(&tasks, &all, &p, scope.is_none(), &crate::addon::get().marks(store));
     // Follow-ups nothing will run (`wsp-345`): found by a closed row, on no
     // list and under no seat. Named under the rows, whatever the scope, since
     // a row nobody runs is lost wherever it is filed.
@@ -709,7 +722,7 @@ pub fn inbox(store: &Store, args: &Args) -> i32 {
         return 0;
     }
     println!("{}", p.dim(&format!("inbox  ({})", tasks.len())));
-    print_tasks(&tasks, &store.tasks(), &p, false);
+    print_tasks(&tasks, &store.tasks(), &p, false, &crate::addon::get().marks(store));
     0
 }
 
@@ -728,15 +741,15 @@ pub fn paint_prio(p: &Paint, prio: Priority) -> String {
 /// the count on a parent is not a fact about the list — see
 /// [`crate::resolve::open_under_review`], where `wsp ls -s review` printing
 /// `(1 open)` over four is the case they were one argument for.
-fn print_tasks(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) {
-    for l in task_lines(shown, all, p, show_project) {
+fn print_tasks(shown: &[Task], all: &[Task], p: &Paint, show_project: bool, marks: &std::collections::BTreeMap<String, String>) {
+    for l in task_lines(shown, all, p, show_project, marks) {
         println!("{l}");
     }
 }
 
 /// The rows, as text. Separate from printing them so the count on a parent is
 /// something a test can read — which is what this exists for.
-fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Vec<String> {
+fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool, marks: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let idw = shown.iter().map(|t| t.id.chars().count()).max().unwrap_or(12);
     // Children under their parent, indented. The parent carries what is still
     // open beneath it, because a one-line parent that says nothing about its
@@ -760,11 +773,16 @@ fn task_lines(shown: &[Task], all: &[Task], p: &Paint, show_project: bool) -> Ve
             other => p.dim(&util::pad(other.as_str(), 8)),
         };
         let prio = paint_prio(p, t.priority());
-        let project = if show_project {
+        let mut project = if show_project {
             p.dim(&format!("  [{}]", t.project.clone().unwrap_or_else(|| "inbox".into())))
         } else {
             String::new()
         };
+        // What the shared-work add-on wants seen at a glance (a shared row
+        // still on a local id): one dim word after the rest.
+        if let Some(m) = marks.get(&t.id) {
+            project.push_str(&p.dim(&format!("  ({m})")));
+        }
         out.push(format!(
             "  {} {} {} {}{}{}{}",
             p.dim(&util::pad(&t.id, idw)),
@@ -828,6 +846,16 @@ pub fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
     // Only where allocated (`wsp allocate`), as the file carries it.
     if let Some(u) = &t.for_user {
         v["for"] = Value::String(u.clone());
+    }
+    // A shared row: what the shared-work add-on knows of it here (who holds
+    // it, whether it is a head only, whether it is mine), as the feed's row has it.
+    if !t.workspace.is_private() {
+        let addon = crate::addon::get();
+        let f = addon.row_facts(store).remove(&t.id).unwrap_or_default();
+        let mine = crate::addon::mine(&f, t.for_user.as_deref(), addon.user().as_deref());
+        for (k, val) in crate::addon::json_of(&f, mine) {
+            v[k] = val;
+        }
     }
     // Both ends of a follow-up (`wsp-345`), each only where there is one, so a
     // row that has neither prints what it did.
@@ -897,14 +925,19 @@ pub fn show(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    // A row the synced cache keeps as a head only (wsp-465), brought whole.
-    if args.has("fetch") && crate::hub_cache::is_head(store, &t.id) {
-        if let Err(why) = crate::hub_sync::fetch(store, &t.id) {
-            eprintln!("wsp: {why}");
-            return 1;
-        }
-        if let Some(whole) = store.task(&t.id) {
-            t = whole;
+    // A row the shared-work add-on keeps as a stub only (wsp-465), brought whole.
+    if args.has("fetch") {
+        match crate::addon::get().fetch(store, &t.id) {
+            Some(Err(why)) => {
+                eprintln!("wsp: {why}");
+                return 1;
+            }
+            Some(Ok(())) => {
+                if let Some(whole) = store.task(&t.id) {
+                    t = whole;
+                }
+            }
+            None => {}
         }
     }
 
@@ -928,12 +961,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     }
     println!("{} {}", p.dim(&util::pad("created", 9)), t.created);
     println!("{} {}", p.dim(&util::pad("updated", 9)), t.updated);
-    // A head says so, above everything it does not have.
-    if let Some(line) = crate::hub_cache::show_line(store, &t.id) {
-        println!("{} {}", p.dim(&util::pad("hub", 9)), line);
-    }
-    // A side chain (wsp-469): this row's offline work went to the hub beside it.
-    if let Some(line) = crate::hub_journal::show_line(store, &t.id) {
+    // What the shared-work add-on says of the row: a stub says so, above
+    // everything it does not have, and a side chain (wsp-469) says where this
+    // row's offline work went.
+    for line in crate::addon::get().show_lines(store, &t.id) {
         println!("{} {}", p.dim(&util::pad("hub", 9)), line);
     }
     // Above the prose rather than after it. Everything below this point reads
@@ -1314,6 +1345,9 @@ pub fn write_task(store: &Store, t: &Task, verb: &str, caller: &crate::cmd_messa
         json!({ "id": t.id, "project": t.project, "status": t.status().as_str(), "title": t.title, "by": caller.by }),
     );
     store.git_commit(&format!("wsp: {verb} {} — {}", t.id, t.title));
+    // A shared row's lease that no claim holds (`wsp start`'s) goes back once
+    // its work is over: the add-on decides.
+    crate::addon::get().row_moved(store, &t.id);
     // `wsp-134`: a review or a block may be the step a run was waiting on.
     if matches!(verb, "review" | "blocked") {
         crate::cycle::poke_task(store, &t.id, verb);
@@ -1337,7 +1371,7 @@ pub fn set_status(store: &Store, args: &Args, status: Status) -> i32 {
     // (wsp-466): refused, naming the holder, with nothing changed.
     if status == Status::Doing {
         if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
-            if let Err(why) = crate::hub_lease::before_claim(store, &t.id) {
+            if let Err(why) = crate::addon::get().before_claim(store, &t.id) {
                 eprintln!("wsp: {verb}: {why}");
                 return 1;
             }
@@ -1467,7 +1501,7 @@ pub fn standing_on(store: &Store, id: &str, live: &dyn Fn(&str) -> bool) -> Vec<
 pub fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader: &dyn crate::cycle::Seats) -> i32 {
     if let Some(t) = args.rest.first().and_then(|needle| store.find_task(needle)) {
         // Another user leased it while this spoke was offline (wsp-469).
-        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "done") {
+        if let Some(why) = crate::addon::get().refusal(store, &t.id, "done") {
             return refuse_done(args, &t.id, &why, 0, Vec::new());
         }
         let seats = standing_on(store, &t.id, live);
@@ -2006,7 +2040,7 @@ pub fn review(store: &Store, args: &Args) -> i32 {
             eprintln!("{why}");
             return 1;
         }
-        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "review") {
+        if let Some(why) = crate::addon::get().refusal(store, &t.id, "review") {
             eprintln!("{why}");
             return 1;
         }
@@ -2124,7 +2158,7 @@ pub fn accept(store: &Store, args: &Args, account: &str, said: Option<&str>) -> 
 fn accept_now(store: &Store, args: &Args, account: &str, said: Option<&str>) -> i32 {
     // A row copied to an executor is reviewed only at the tree `verify` ran on.
     if let Some(t) = args.rest.first().and_then(|n| store.find_task(n)) {
-        if let Some(why) = crate::hub_journal::refusal(store, &t.id, "submit") {
+        if let Some(why) = crate::addon::get().refusal(store, &t.id, "submit") {
             eprintln!("{why}");
             return 1;
         }
@@ -2733,23 +2767,41 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     // written, so that the log each task keeps can name the id it is about to
     // take — a rename recorded only in the file it renamed is a rename nobody
     // reading the old id can follow.
+    //
+    // A shared row's new id is the shared side's to give, as it is when one is
+    // filed straight into the project (`new_row_id`, the hub's counter, or a
+    // provisional local id when the hub cannot be asked); a private row's is
+    // the local counter's. Taken from the local counter, a shared row's id is
+    // one another person filing into the same project may be given too.
     let mut renumber: std::collections::BTreeMap<String, String> = Default::default();
     if let Some(into) = &target {
-        let mut filing: Vec<String> = Vec::new();
+        let mut filing: Vec<&Task> = Vec::new();
         if is_inbox_id(&subject.id) {
-            filing.push(subject.id.clone());
+            filing.push(&subject);
         }
         for id in crate::resolve::descendants_of(&tasks, &subject.id) {
-            if is_inbox_id(&id) {
-                filing.push(id);
+            if let Some(kid) = tasks.iter().find(|t| t.id == id).filter(|t| is_inbox_id(&t.id)) {
+                filing.push(kid);
             }
         }
         for old in filing {
-            match store.alloc_task_id(Some(into)) {
+            // The parent it will have: a provisional parent makes it provisional.
+            let parent = match (&new_parent, old.id == subject.id) {
+                (Some(p), true) => p.as_ref().map(|p| p.id.clone()),
+                _ => old.parent.clone(),
+            };
+            match new_row_id(store, Some(into), &old.workspace, parent.as_deref()) {
                 Ok(new) => {
-                    renumber.insert(old, new);
+                    renumber.insert(old.id.clone(), new);
                 }
                 Err(e) => {
+                    // The ids already reserved go back: nothing was written yet.
+                    for new in renumber.values() {
+                        let path = store.task_path(new);
+                        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                     eprintln!("wsp: cannot allocate an id in {into}: {e}");
                     return 1;
                 }
@@ -3343,6 +3395,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // A row the shared side holds for others too: what removing it does there
+    // is said first, and done only under `--force`.
+    let removal = crate::addon::get().removing(store, &t.id);
+    if let (Some(r), false) = (&removal, args.has("force")) {
+        eprintln!("wsp: {} — pass --force to remove it", r.warning);
+        return 1;
+    }
     let filed = match store.archive_task(&t) {
         Ok(name) => name,
         Err(e) => {
@@ -3360,13 +3419,22 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     store.log_event("task-removed", json!({ "id": t.id, "project": t.project, "title": t.title }));
     store.git_commit(&format!("wsp: rm {} — {}", t.id, t.title));
     if args.json() {
-        println!("{}", json!({ "removed": t.id, "archived": true, "filed_as": filed }));
-    } else if filed == t.id {
-        println!("removed {} (archived)", t.id);
+        let mut doc = json!({ "removed": t.id, "archived": true, "filed_as": filed });
+        if let Some(r) = &removal {
+            doc["shared"] = json!(r.done);
+        }
+        println!("{doc}");
     } else {
-        // Say it rather than let it pass: the archive already held that id,
-        // which means two tasks have worn it.
-        println!("removed {} (archived as {filed} — that id was already in the archive)", t.id);
+        if filed == t.id {
+            println!("removed {} (archived)", t.id);
+        } else {
+            // Say it rather than let it pass: the archive already held that id,
+            // which means two tasks have worn it.
+            println!("removed {} (archived as {filed} — that id was already in the archive)", t.id);
+        }
+        if let Some(r) = &removal {
+            println!("{}", r.done);
+        }
     }
     0
 }
@@ -4311,7 +4379,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Tasks,
                 order: 380,
-                text: r##"  wsp rm <id>                       retire it to the archive"##,
+                text: r##"  wsp rm <id> [--force]             retire it to the archive; a shared row is
+                                    retired on the hub for everyone too, for good,
+                                    which --force confirms"##,
             },
         ],
     },
@@ -4407,6 +4477,61 @@ pub mod tests {
         let stage = &rows[0]["stage"];
         assert_eq!((&stage["word"], &stage["since"]), (&json!("started"), &json!("2026-10-08T08:00:00Z")), "{rows:?}");
         assert_ne!(stage["at"], stage["since"], "at stays the record's time");
+    }
+
+    /// A shared-work add-on that knows who holds `s-1` (bo on box-b) and that
+    /// `s-2` is allocated to ann, who is the user here.
+    struct Holds;
+
+    impl crate::addon::SharedWork for Holds {
+        fn user(&self) -> Option<String> {
+            Some("ann".into())
+        }
+        fn row_facts(&self, _: &Store) -> std::collections::BTreeMap<String, crate::addon::RowFacts> {
+            let held = crate::addon::RowFacts { held_by: Some("bo".into()), held_on: Some("box-b".into()), held_until: Some(1_900_000_000), ..Default::default() };
+            [("s-1".to_string(), held)].into()
+        }
+    }
+
+    /// `ls --json`'s rows carry the shared-row facts the feed's rows do (both
+    /// are `mirror::row_half`'s, `docs/multiplayer.md` "What a desktop app
+    /// reads"): `mine` and `head_only` (`"true"`/`"false"`) on every shared row,
+    /// `held_by`, `held_on` and `held_until` where known, and a private row none.
+    #[test]
+    fn ls_json_rows_carry_the_shared_row_facts_the_feed_rows_do() {
+        let _iso = crate::util::isolated("ls-facts");
+        let store = scratch("ls-facts");
+        for (id, ws, for_user) in [("s-1", "shared:team", None), ("s-2", "shared:team", Some("ann")), ("s-3", "", None)] {
+            let mut t = Task::new(id, id);
+            if !ws.is_empty() {
+                t.workspace = ws.parse().unwrap();
+            }
+            t.for_user = for_user.map(str::to_string);
+            store.save_task(&t).unwrap();
+        }
+        let _a = crate::addon::scoped(std::sync::Arc::new(Holds));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rows_json(&store, &store.tasks())).unwrap();
+        let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
+        let facts = |id: &str| ["mine", "head_only", "held_by", "held_on", "held_until"].map(|k| row(id).get(k).cloned());
+        let s = |v: &str| Some(json!(v));
+        assert_eq!(facts("s-1"), [s("false"), s("false"), s("bo"), s("box-b"), s(&crate::util::iso_at(1_900_000_000))], "{}", row("s-1"));
+        assert_eq!(facts("s-2"), [s("true"), s("false"), None, None, None], "allocated to ann: {}", row("s-2"));
+        assert_eq!(facts("s-3"), [None, None, None, None, None], "a private row: {}", row("s-3"));
+    }
+
+    /// `show --json` of an id a row was moved from (`ids.json`, as `wsp mv` and
+    /// a shared row's publish or retire record it) is the row it was moved to,
+    /// as text `show` is: both resolve through `Store::resolve_task`, and the
+    /// document's `id` is the new id, which is how it says which row it is.
+    #[test]
+    fn show_json_of_an_old_id_is_the_row_it_was_moved_to_under_its_new_id() {
+        let _iso = crate::util::isolated("show-moved");
+        let store = scratch("show-moved");
+        store.save_task(&Task::new("A moved row", "aa-001")).unwrap();
+        store.rename_tasks(&[("aa-001".to_string(), "bb-007".to_string())].into()).unwrap();
+        assert!(store.task("aa-001").is_none() && store.task("bb-007").is_some());
+        let v = show_json(&store, "aa-001").expect("the old id resolves");
+        assert_eq!((v["id"].clone(), v["title"].clone()), (json!("bb-007"), json!("A moved row")));
     }
 
     /// `ls --json` gives a staged row the `legs` objects `show --json` has, and an
@@ -4760,6 +4885,49 @@ pub mod tests {
         assert_eq!(store.tasks().len(), 1);
     }
 
+    /// A shared-work add-on that lets shared rows be filed and gives each one
+    /// the id it is scripted with, or refuses.
+    struct Ids(Result<&'static str, &'static str>);
+
+    impl crate::addon::SharedWork for Ids {
+        fn may_file_shared(&self, _: &Store) -> Result<(), String> {
+            Ok(())
+        }
+        fn new_row_id(&self, _: &Store, _: Option<&str>, ws: &crate::model::WorkspaceId, _: Option<&str>) -> Result<Option<String>, String> {
+            if ws.is_private() {
+                return Ok(None);
+            }
+            self.0.map(|id| Some(id.to_string())).map_err(str::to_string)
+        }
+    }
+
+    /// `wsp add` takes a new row's id from the shared-work add-on where it gives
+    /// one (a shared row's from the hub), writes nothing when it refuses, and
+    /// takes the local counter for a private row and with no add-on.
+    #[test]
+    fn add_takes_a_shared_rows_id_from_the_addon_and_writes_nothing_when_it_refuses() {
+        let _iso = crate::util::isolated("add-ids");
+        let store = scratch("add-ids");
+        store.save_project(&crate::model::Project::new("pp")).unwrap();
+        {
+            let _a = crate::addon::scoped(std::sync::Arc::new(Ids(Ok("pp-042"))));
+            assert_eq!(add(&store, &parse(&["add", "shared work", "-p", "pp", "--workspace", "shared:team"])), 0);
+            let t = store.task("pp-042").expect("filed under the add-on's id");
+            assert_eq!((t.title.as_str(), t.workspace.to_string().as_str()), ("shared work", "shared:team"));
+            assert_eq!(add(&store, &parse(&["add", "my own", "-p", "pp"])), 0);
+            assert!(store.tasks().iter().any(|t| t.title == "my own" && t.id != "pp-042" && t.workspace.is_private()), "a private row takes the local counter");
+        }
+        let before = store.tasks().len();
+        {
+            let _a = crate::addon::scoped(std::sync::Arc::new(Ids(Err("you are not a member of shared:team"))));
+            assert_eq!(add(&store, &parse(&["add", "refused", "-p", "pp", "--workspace", "shared:team"])), 1);
+            assert_eq!(store.tasks().len(), before, "a refusal writes nothing");
+        }
+        let _a = crate::addon::scoped(std::sync::Arc::new(crate::addon::Standalone));
+        assert_eq!(add(&store, &parse(&["add", "alone", "-p", "pp"])), 0);
+        assert!(store.tasks().iter().any(|t| t.title == "alone"));
+    }
+
     #[test]
     fn only_adds_own_flags_on_the_end_of_a_title_are_read_as_swallowed() {
         assert_eq!(flag_in_title("Agents view --parent compound-403").as_deref(), Some("--parent compound-403"));
@@ -4969,7 +5137,7 @@ pub mod tests {
         let all = store.tasks();
         let shown: Vec<Task> =
             all.iter().filter(|t| t.status() == Status::Review).cloned().collect();
-        let lines = task_lines(&shown, &all, &Paint::plain(), false);
+        let lines = task_lines(&shown, &all, &Paint::plain(), false, &Default::default());
 
         let parent_line = lines.iter().find(|l| l.contains("fork-003")).expect("the parent");
         assert!(
