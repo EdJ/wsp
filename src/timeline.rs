@@ -608,6 +608,7 @@ fn spawn_line(i: &Inputs) -> Option<i64> {
 
 const VERIFIER_START: &str = "verifier seat start (spawn → its first transcript line)";
 const VERIFIER_START_LINE: &str = "verifier seat start (spawn → wsp's started line; the seat's first line unread, so this lags it)";
+const VERIFIER_NO_START: &str = "verifier seat start and reading (spawn → verdict; no start line read)";
 const VERIFIER_HELD: &str = "verdict → verifier seat ended (clean-up, alongside what follows)";
 
 /// One seating of a row's seat (`compounding-217`): the claim, and the release
@@ -929,15 +930,24 @@ fn verifier_phases(i: &Inputs, r: i64, verdict: Option<i64>, out: &mut Vec<Phase
         None => out.push(Phase::gap("review typed → verifier spawn requested", r, s, wait_name(i, r, s, id))),
     }
     // The seat's own first line, when its transcript was read; wsp's line
-    // is the fallback, and says it lags.
-    let first = i.verifiers.iter().map(|v| v.first).find(|f| *f >= s && verdict.is_none_or(|v| *f <= v));
-    let up = i.first_line(s, |l| l.contains(&format!("started {id} · verifying")));
+    // is the fallback, and says it lags. Neither is looked for past the
+    // verdict. One `started` line names everything a tick started, so the
+    // row need not be first on it.
+    let within = |t: &i64| verdict.is_none_or(|v| *t <= v);
+    let first = i.verifiers.iter().map(|v| v.first).find(|f| *f >= s && within(f));
+    let step = format!(" {id} · verifying");
+    let up = i.first_line(s, |l| l.contains(": started ") && l.contains(&step)).filter(within);
     let started = first.map(|f| (f, VERIFIER_START)).or(up.map(|u| (u, VERIFIER_START_LINE)));
-    if let Some((u, label)) = started {
-        out.push(Phase::work(label, s, u));
-        if let Some(v) = verdict {
-            out.push(Phase::work("verifier reads → verdict recorded (landed on a hold)", u, v));
+    match (started, verdict) {
+        (Some((u, label)), _) => {
+            out.push(Phase::work(label, s, u));
+            if let Some(v) = verdict {
+                out.push(Phase::work("verifier reads → verdict recorded (landed on a hold)", u, v));
+            }
         }
+        // The waits were cut around this run, so it is placed whole.
+        (None, Some(v)) if v > s => out.push(Phase::work(VERIFIER_NO_START, s, v)),
+        _ => {}
     }
 }
 
@@ -3352,6 +3362,40 @@ mod tests {
         for v in ph.iter().filter(|p| !p.gap && p.label.starts_with("verifier")) {
             assert!(!ph.iter().any(|p| p.gap && !p.shared && p.start < v.end && p.end > v.start), "a wait over {v:?}: {ph:#?}");
         }
+    }
+
+    /// An earlier blocked verifier whose `started` line names another row
+    /// first, or that has none: its phases end at its verdict and cover the run.
+    #[test]
+    fn an_earlier_verifiers_run_is_covered_to_its_verdict_whatever_its_start_line() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k == "task-claimed");
+        i.events.extend([
+            ev(305, "task-review", json!({"id": "r-1"})),
+            ev(820, "task-verified", json!({"id": "r-1", "verdict": "blocks"})),
+            ev(900, "task-review", json!({"id": "r-1"})),
+            ev(980, "task-verified", json!({"id": "r-1", "verdict": "holds"})),
+        ]);
+        i.legs.clear();
+        i.cycle.retain(|(t, _)| *t < 300);
+        i.cycle.extend([
+            (306, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (901, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (905, "list group 1: started r-1 · verifying".to_string()),
+        ]);
+        let run = |ph: &[Phase]| -> Vec<(i64, i64)> {
+            ph.iter().filter(|p| !p.gap && p.label.starts_with("verifier") && p.label != VERIFIER_HELD && p.start < 820).map(|p| (p.start, p.end)).collect()
+        };
+        // No line at all.
+        let ph = build(&i);
+        no_wait_over_a_verifier(&ph);
+        assert_eq!(run(&ph), vec![(306, 820)], "{ph:#?}");
+        // The row second on its line.
+        i.cycle.push((310, "list group 1: started r-0 · verifying r-1 · verifying".to_string()));
+        i.cycle.sort_by_key(|(t, _)| *t);
+        let ph = build(&i);
+        no_wait_over_a_verifier(&ph);
+        assert_eq!(run(&ph), vec![(306, 310), (310, 820)], "{ph:#?}");
     }
 
     /// `compound-react-132`: reviewed, reopened and reviewed again before a
