@@ -6,7 +6,9 @@
 //! `stop()` appends to), kept apart as input, output, cache read and cache write
 //! and never summed into one number. A seat with no reading falls back to the
 //! rounded clause its log line or pass carries (`exact: false`), and with
-//! neither it is *unmeasured*, which is not zero.
+//! neither it is *unmeasured*, which is not zero: a member's row with such a
+//! seat has no cost (null, with `why`), and a group's or the list's total is
+//! what was read, marked a floor.
 //!
 //! **A governor counts in full toward the group the run stood at when it was
 //! seated** (wsp-264): one plus the highest `passed` of the list's earlier
@@ -292,6 +294,8 @@ struct Sum {
     seconds: i64,
     seats: usize,
     unmeasured: usize,
+    /// Measured seats with tokens and no price: their cost is not in `usd`.
+    unpriced: usize,
     /// Seats whose seated seconds were not read: `seconds` is a floor then.
     seconds_unread: usize,
     inexact: usize,
@@ -317,14 +321,38 @@ impl Sum {
             s.cache_read += e.fig.cache_read.unwrap_or(0);
             s.cache_write += e.fig.cache_write.unwrap_or(0);
             s.usd += e.fig.usd.unwrap_or(0);
+            s.unpriced += usize::from(e.fig.usd.is_none());
         }
         s
     }
+    /// Why `usd` is not the whole cost; `None` where every seat's was read.
+    fn why(&self) -> Option<String> {
+        let mut why = Vec::new();
+        if self.unmeasured > 0 {
+            why.push(format!("{} of {} seats unmeasured", self.unmeasured, self.seats));
+        }
+        if self.unpriced > 0 {
+            why.push(format!("{} of {} seats with no price", self.unpriced, self.seats));
+        }
+        (!why.is_empty()).then(|| why.join(", "))
+    }
+    /// A member's row cost: the whole of it, or none.
+    fn row_json(&self) -> Value {
+        let mut v = self.json();
+        if self.why().is_some() {
+            v["usd_micros"] = Value::Null;
+        }
+        v
+    }
+    /// A group's or the list's total: a floor where a seat's cost is missing,
+    /// and null where none was read at all.
     fn json(&self) -> Value {
+        let why = self.why();
+        let usd = (why.is_none() || self.unmeasured + self.unpriced < self.seats).then_some(self.usd);
         json!({
             "input_tokens": self.input, "output_tokens": self.output,
             "cache_tokens": self.cache_read, "cache_write_tokens": self.cache_write,
-            "usd_micros": self.usd, "turns": self.turns, "seconds": self.seconds,
+            "usd_micros": usd, "floor": why.is_some(), "why": why, "turns": self.turns, "seconds": self.seconds,
             "seats": self.seats, "unmeasured": self.unmeasured, "seconds_unread": self.seconds_unread, "inexact": self.inexact,
         })
     }
@@ -353,7 +381,7 @@ pub fn cost_json(slug: &str, es: &[Entry], groups: usize) -> Value {
                 "members": member_ids(&of).iter().map(|m| json!({
                     "task": m,
                     "seats": of.iter().filter(|e| e.member.as_deref() == Some(m)).map(|e| entry_json(e)).collect::<Vec<_>>(),
-                    "total": Sum::of(of.iter().copied().filter(|e| e.member.as_deref() == Some(m))).json(),
+                    "total": Sum::of(of.iter().copied().filter(|e| e.member.as_deref() == Some(m))).row_json(),
                 })).collect::<Vec<_>>(),
                 "barrier": of.iter().filter(|e| e.role == "barrier").map(|e| entry_json(e)).collect::<Vec<_>>(),
                 "governor": of.iter().filter(|e| e.role == "governor").map(|e| entry_json(e)).collect::<Vec<_>>(),
@@ -393,6 +421,8 @@ fn line(p: &Paint, what: &str, tier: &str, f: &Fig, note: &str) -> String {
     format!("  {}  {}  {}  {}", util::pad(what, 28), util::pad(tier, 16), body, p.dim(note))
 }
 
+/// The total's line; where a seat's cost is missing the figure is marked `≥`,
+/// or left out where none was read, and the note says why.
 fn sum_line(p: &Paint, what: &str, s: &Sum) -> String {
     let mut note = format!("{} seats", s.seats);
     if s.unmeasured > 0 {
@@ -405,7 +435,14 @@ fn sum_line(p: &Paint, what: &str, s: &Sum) -> String {
         input: Some(s.input), output: Some(s.output), cache_read: Some(s.cache_read), cache_write: Some(s.cache_write),
         usd: Some(s.usd), turns: s.turns, seconds: Some(s.seconds), exact: true, measured: true,
     };
-    p.bold(&line(p, what, "", &f, "")) + &format!("  {}", p.dim(&note))
+    let mut l = line(p, what, "", &f, "");
+    if let Some(why) = s.why() {
+        let read = util::money_human(s.usd);
+        let floor = if s.unmeasured + s.unpriced < s.seats { format!("≥{read}") } else { "—".to_string() };
+        l = l.replacen(&util::pad(&read, 8), &util::pad(&floor, 8), 1);
+        note.push_str(&format!(" · cost is a floor: {why}"));
+    }
+    p.bold(&l) + &format!("  {}", p.dim(&note))
 }
 
 fn render(slug: &str, es: &[Entry], groups: usize) -> String {
@@ -645,6 +682,63 @@ mod tests {
         assert_eq!(legs.len(), 1, "{legs:?}");
         let sum = Sum::of(es.iter());
         assert_eq!((sum.seats, sum.unmeasured, sum.seconds), (1, 0, 15 * 60), "{es:?}");
+    }
+
+    /// A seat's line as `stop()` banks it, its directory already gone.
+    fn banked(state: &std::path::Path, id: &str, output: u64) {
+        use std::io::Write;
+        let line = json!({ "seat": id, "ended": "2026-10-18T03:00:00Z", "session_id": id, "turns": 3, "input": 10, "output": output, "cache_read": 5, "cache_write": 2, "cost": output * 100 });
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(state.join(crate::place_super::SPENT_FILE)).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    #[test]
+    fn a_verifier_a_rework_and_a_worker_seat_with_a_banked_line_are_measured() {
+        let (env, store) = fixture("cost-banked");
+        for (seat, output) in [("cpd-751", 10), ("cpd-760", 20), ("cpd-758", 30)] {
+            banked(&env.state(), seat, output);
+        }
+        claims(&store, "m-1", &[("cpd-751", true), ("cpd-760", true)]);
+        verifier(&store, "m-1", "cpd-758");
+        let j = cost_json("run", &entries(&store, "run").unwrap(), 2);
+        let m = &j["groups"][0]["members"][0];
+        let got: Vec<_> = m["seats"].as_array().unwrap().iter().map(|s| (s["role"].as_str().unwrap(), s["measured"] == true, s["input_tokens"].as_u64(), s["output_tokens"].as_u64(), s["usd_micros"].as_u64())).collect();
+        assert_eq!(got, vec![
+            ("verifier", true, Some(10), Some(30), Some(3_000)),
+            ("worker", true, Some(10), Some(10), Some(1_000)),
+            ("rework", true, Some(10), Some(20), Some(2_000)),
+        ]);
+        assert_eq!((m["total"]["usd_micros"].as_u64(), m["total"]["floor"].as_bool()), (Some(6_000), Some(false)), "{m}");
+        assert!(m["total"]["why"].is_null());
+    }
+
+    #[test]
+    fn a_row_with_an_unmeasured_seat_has_no_cost_and_the_totals_are_floors() {
+        let (env, store) = fixture("cost-floor");
+        banked(&env.state(), "cpd-1", 40);
+        claims(&store, "m-1", &[("cpd-1", true)]);
+        verifier(&store, "m-1", "cpd-2");
+        verifier(&store, "m-2", "cpd-3");
+        let es = entries(&store, "run").unwrap();
+        let j = cost_json("run", &es, 2);
+        let row = &j["groups"][0]["members"][0]["total"];
+        assert_eq!((&row["usd_micros"], row["why"].as_str()), (&Value::Null, Some("1 of 2 seats unmeasured")), "{row}");
+        let none = &j["groups"][1]["members"][0]["total"];
+        assert!(none["usd_micros"].is_null() && j["groups"][1]["total"]["usd_micros"].is_null(), "nothing read is not 0: {j}");
+        let t = &j["total"];
+        assert_eq!((t["usd_micros"].as_u64(), t["floor"].as_bool(), t["why"].as_str()), (Some(4_000), Some(true), Some("2 of 3 seats unmeasured")), "{t}");
+        let table = render("run", &es, 2);
+        assert!(table.contains("≥$") && table.contains("cost is a floor: 2 of 3 seats unmeasured"), "{table}");
+    }
+
+    #[test]
+    fn a_measured_seat_with_no_price_leaves_its_row_without_a_cost() {
+        let mut e = Sum { seats: 1, unpriced: 1, ..Sum::default() };
+        assert_eq!(e.row_json()["usd_micros"], Value::Null);
+        assert_eq!(e.json()["why"], "1 of 1 seats with no price");
+        e.seats = 2;
+        e.usd = 7;
+        assert_eq!((e.row_json()["usd_micros"].clone(), e.json()["usd_micros"].clone()), (Value::Null, json!(7)));
     }
 
     #[test]

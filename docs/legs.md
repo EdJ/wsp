@@ -632,7 +632,8 @@ Seat  { "role": "worker"|"rework"|"leg"|"verifier"|"barrier"|"governor",
         "usd_micros": int|null, "turns": int, "seconds": int }
 
 Total { "input_tokens", "output_tokens", "cache_tokens", "cache_write_tokens",
-        "usd_micros": int,             // sums of measured seats; 0 when none, so read `unmeasured`
+        "usd_micros": int|null,        // the measured seats' sum; see `floor` below
+        "floor": bool, "why": string|null, // a seat's cost is missing (unmeasured or unpriced)
         "turns": int, "seconds": int,
         "seats": int,                  // seats counted
         "unmeasured": int,             // counted seats with no figures at all
@@ -643,7 +644,11 @@ Total { "input_tokens", "output_tokens", "cache_tokens", "cache_write_tokens",
 `measured: false` has every figure null (the seat ended before the ledger, or
 never read); `measured: true, exact: false` is the rounded clause fallback, with
 `cache_write_tokens` null and `usd_micros` null where the runtime published none.
-A Total of 0 with `unmeasured > 0` is a floor, not a fact.
+A member's Total with such a seat has `usd_micros: null` and `why`: a row's cost
+is whole or not given. A group's or the list's Total is then a floor (`floor:
+true`), and null where no seat's cost was read; `effort.json` repeats the list's
+as `totals.usd_floor` and `totals.usd_why`. Token figures stay the measured
+seats' sums, so read `unmeasured` for those.
 
 `attempts <task> --json` rows all carry `role: "member"` now, and each verifier
 pass is appended as a row `{task, role:"verifier", leg:null, at, pane, ran_at,

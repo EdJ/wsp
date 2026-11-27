@@ -67,6 +67,19 @@ fn usd(micros: Option<u64>) -> String {
     micros.map_or("unmeasured".into(), |m| format!("${:.2}", m as f64 / 1_000_000.0))
 }
 
+/// A total's cost: whole, or `at least` what was read where a seat's is
+/// missing, with why; never `$0.00` for what was not read.
+fn total_usd(micros: &Value, floor: &Value, why: &Value) -> String {
+    if floor != true {
+        return usd(micros.as_u64());
+    }
+    let why = why.as_str().unwrap_or("a seat's cost is missing");
+    match micros.as_u64() {
+        Some(m) => format!("at least {} ({why})", usd(Some(m))),
+        None => format!("unmeasured ({why})"),
+    }
+}
+
 /// A figure, or "not measured" where it is null: never a 0 for what was not read.
 fn or_unread(v: &Value, f: &dyn Fn(u64) -> String) -> String {
     v.as_u64().map_or_else(|| "not measured".to_string(), f)
@@ -378,7 +391,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "generated": util::now_iso(),
         "status": w.status().as_str(),
         "scope": {
-            "cost": "whole row: every seat — members, verifiers, barrier checks, governors",
+            "cost": "whole row: every seat — members, verifiers, barrier checks, governors. A member whose row has a seat unmeasured or unpriced has no cost (cost.groups[].members[].total.usd_micros null, with why); a group's or the list's total is then a floor (floor, why; totals.usd_floor, totals.usd_why), null where nothing was read",
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
             "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start: governor_wall_windows is how many there were and governor_wall_windows_unread how many had no governor transcript read; the governor_* sums are over the windows read, and null (not measured, never 0) where none was. A window is null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, and then the session ids the ledger (spent.jsonl) banked at each stop are read, so the figures are a floor",
@@ -403,6 +416,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "turns": total["turns"],
             "usd_micros": total["usd_micros"],
             "unmeasured_seats": total["unmeasured"],
+            "usd_floor": total["floor"],
+            "usd_why": total["why"],
             "transcripts_missing": missing_sessions,
             "full_suite_runs": suites_total,
             "pass_to_last_start_seconds": held,
@@ -799,6 +814,15 @@ fn against(now: &Value, slug: &str) -> Value {
         let (a, b) = (n(&now["totals"], k), n(&then["totals"], k));
         json!({ "now": a, "baseline": b, "ratio": (b > 0).then(|| (a as f64 / b as f64 * 100.0).round() / 100.0) })
     };
+    // A cost not read is null and not 0, and a ratio over a floor says so.
+    let mut cost = ratio("usd_micros");
+    for (k, side) in [("now", now), ("baseline", &then)] {
+        if side["totals"]["usd_micros"].is_null() {
+            cost[k] = Value::Null;
+            cost["ratio"] = Value::Null;
+        }
+    }
+    cost["floor"] = json!(now["totals"]["usd_floor"] == true || then["totals"]["usd_floor"] == true);
     let wait_sum = |v: &Value| -> u64 { v["waits"].as_array().map_or(0, |a| a.iter().map(|w| n(w, "seconds")).sum()) };
     let (wa, wb) = (wait_sum(now), wait_sum(&then));
     json!({
@@ -807,7 +831,7 @@ fn against(now: &Value, slug: &str) -> Value {
         "idle_seconds": ratio("idle_seconds"), "gap_seconds": ratio("gap_seconds"),
         "input_tokens": ratio("input_tokens"), "output_tokens": ratio("output_tokens"),
         "cache_read_tokens": ratio("cache_read_tokens"), "cache_write_tokens": ratio("cache_write_tokens"),
-        "turns": ratio("turns"), "usd_micros": ratio("usd_micros"), "full_suite_runs": ratio("full_suite_runs"),
+        "turns": ratio("turns"), "usd_micros": cost, "full_suite_runs": ratio("full_suite_runs"),
         "spawn_to_first_line_median_seconds": ratio("spawn_to_first_line_median_seconds"),
         "verifier_spawn_to_first_line_median_seconds": ratio("verifier_spawn_to_first_line_median_seconds"),
         "verifier_test_seconds": ratio("verifier_test_seconds"),
@@ -858,7 +882,7 @@ pub fn effort_html(v: &Value) -> String {
             vec!["cache read".into(), n(t, "cache_read_tokens").to_string()],
             vec!["cache write".into(), n(t, "cache_write_tokens").to_string()],
             vec!["turns".into(), n(t, "turns").to_string()],
-            vec!["USD".into(), usd(t["usd_micros"].as_u64())],
+            vec!["USD".into(), total_usd(&t["usd_micros"], &t["usd_floor"], &t["usd_why"])],
             vec!["unmeasured seats".into(), n(t, "unmeasured_seats").to_string()],
             vec!["transcripts not found".into(), n(t, "transcripts_missing").to_string()],
             vec!["full suites run in member or verifier seats".into(), n(t, "full_suite_runs").to_string()],
@@ -955,7 +979,7 @@ pub fn effort_html(v: &Value) -> String {
     b.push_str("<h2>3 · Per group, then per member</h2>");
     for g in v["groups"].as_array().into_iter().flatten() {
         let c = &g["cost"];
-        b.push_str(&format!("<h3>group {} · wall {} · model {} · tools {} · {} · {} turns · {} full suite(s) in seats</h3>", g["group"], hms(n(g, "wall_seconds") as i64), hms(n(g, "model_seconds") as i64), hms(n(g, "tool_seconds") as i64), usd(c["usd_micros"].as_u64()), n(c, "turns"), n(g, "full_suite_runs")));
+        b.push_str(&format!("<h3>group {} · wall {} · model {} · tools {} · {} · {} turns · {} full suite(s) in seats</h3>", g["group"], hms(n(g, "wall_seconds") as i64), hms(n(g, "model_seconds") as i64), hms(n(g, "tool_seconds") as i64), esc(&total_usd(&c["usd_micros"], &c["floor"], &c["why"])), n(c, "turns"), n(g, "full_suite_runs")));
         let rows: Vec<Vec<String>> = g["members"].as_array().into_iter().flatten().map(|m| vec![m["task"].as_str().unwrap_or("").into(), hms(n(m, "wall_seconds") as i64), hms(n(m, "model_seconds") as i64), hms(n(m, "gap_seconds") as i64), n(m, "tokens_in").to_string(), n(m, "tokens_out").to_string(), n(m, "full_suite_runs").to_string()]).collect();
         b.push_str(&table(&["member", "wall", "model", "gaps", "tokens in", "tokens out", "full suites"], &rows));
         let gw = &g["governor_wall"];
@@ -992,7 +1016,7 @@ pub fn effort_html(v: &Value) -> String {
     } else {
         let rows: Vec<Vec<String>> = ["wall_seconds", "model_seconds", "idle_seconds", "gap_seconds", "waits_seconds", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "turns", "usd_micros", "full_suite_runs"]
             .iter()
-            .map(|k| vec![k.to_string(), bl[*k]["now"].to_string(), bl[*k]["baseline"].to_string(), bl[*k]["ratio"].as_f64().map_or("—".into(), |r| format!("×{r}"))])
+            .map(|k| vec![if bl[*k]["floor"] == true { format!("{k} (a floor)") } else { k.to_string() }, bl[*k]["now"].to_string(), bl[*k]["baseline"].to_string(), bl[*k]["ratio"].as_f64().map_or("—".into(), |r| format!("×{r}"))])
             .collect();
         b.push_str(&format!("<p>against {}</p>", esc(bl["list"].as_str().unwrap_or(""))));
         b.push_str(&table(&["figure", "this pass", "baseline", "ratio"], &rows));
@@ -1353,6 +1377,20 @@ mod tests {
         for h in ["1 · Totals", "2 · Waits", "3 · Per group", "4 · Rework", "5 · Against a baseline", "6 · Conditions", "missing: the record carries no load"] {
             assert!(html.contains(h), "effort.html lacks {h}");
         }
+    }
+
+    #[test]
+    fn a_list_with_an_unmeasured_seat_says_its_cost_is_a_floor() {
+        let (_e, store, w) = list("floor", &["r-1"]);
+        let total = |usd: Value| json!({ "usd_micros": usd, "floor": true, "why": "1 of 2 seats unmeasured", "unmeasured": 1 });
+        let cost = |usd: Value| json!({ "total": total(usd.clone()), "groups": [{ "group": 1, "total": total(usd), "members": [] }] });
+        let v = effort_over(&store, &w, None, &|_| Default::default(), cost(json!(2_500_000)));
+        assert_eq!((v["totals"]["usd_floor"].clone(), v["totals"]["usd_why"].clone()), (json!(true), json!("1 of 2 seats unmeasured")));
+        let html = effort_html(&v);
+        assert_eq!(html.matches("at least $2.50 (1 of 2 seats unmeasured)").count(), 2, "the totals and the group: {html}");
+        let v = effort_over(&store, &w, None, &|_| Default::default(), cost(Value::Null));
+        let html = effort_html(&v);
+        assert!(html.contains("<td>unmeasured (1 of 2 seats unmeasured)</td>") && !html.contains("$0.00 ·"), "{html}");
     }
 
     #[test]
