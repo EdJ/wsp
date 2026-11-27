@@ -169,7 +169,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let cut = util::epoch_secs();
 
     for (gi, g) in groups.iter().enumerate() {
-        let (mut gwall, mut gmodel, mut gtool) = (0i64, 0i64, 0i64);
+        let (mut gmodel, mut gtool) = (0i64, 0i64);
         let mut gsuites = 0u64;
         let mut members: Vec<Value> = Vec::new();
         let mut sweep: Vec<crate::wallbuckets::MemberIn> = Vec::new();
@@ -197,7 +197,6 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             gsuites += suites;
             suites_total += suites;
             let tool: i64 = f.tools.values().sum();
-            gwall += f.wall - f.shared;
             gmodel += f.model_secs;
             gtool += tool;
             model += f.model_secs;
@@ -272,7 +271,6 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             fixed_held.extend(f.verdict_to_despawn);
         }
         if let Some(sh) = shared {
-            gwall += sh.shared;
             gap += sh.shared_gap;
             idle += sh.shared;
             for (k, v) in &sh.shared_waits {
@@ -305,7 +303,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             }
         }
         group_json.push(json!({
-            "group": gi + 1, "wall_seconds": gwall, "model_seconds": gmodel, "tool_seconds": gtool,
+            "group": gi + 1, "model_seconds": gmodel, "tool_seconds": gtool,
             "cost": gcost, "full_suite_runs": gsuites, "members": members,
             "kind": g.kind, "barrier_scope": note.as_ref().map(|n| n.json()).unwrap_or(Value::Null),
             "wall_buckets": walls.last().and_then(|x| x.as_ref()).map_or(Value::Null, wall_json),
@@ -327,6 +325,12 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         let gw = named_wall(sweep, *open, Some(cut.max(close)), &parks, li, true, groups[li].agent == "manual");
         group_json[li]["wall_buckets"] = gw.as_ref().map_or(Value::Null, wall_json);
         walls[li] = gw;
+    }
+    // A group's wall is its window, not its members' walls added up: they run
+    // side by side (`wsp-854`). Read after the cut above, so a list still
+    // running reads one figure here and in the buckets. Not started: 0.
+    for (gj, gw) in group_json.iter_mut().zip(&walls) {
+        gj["wall_seconds"] = json!(gw.as_ref().map_or(0, |g| g.close - g.open));
     }
     let wall = if end > start { end - start } else { 0 };
     // The buckets tile the windows from the first group's open to the last
@@ -1687,9 +1691,27 @@ mod tests {
         let waits = v["waits"].as_array().unwrap();
         assert_eq!(waits.iter().map(|w| w["seconds"].as_i64().unwrap()).sum::<i64>(), 70);
         assert_eq!(t["idle_seconds"], (500 - 340 - 50) + (480 - 340 - 50) + 340, "the run is idle for the seats once");
-        assert_eq!(v["groups"][0]["wall_seconds"], (500 - 340) + (480 - 340) + 340);
         // Each member's own line still holds the phases it saw.
         assert_eq!(v["groups"][0]["members"][0]["gap_seconds"], 50);
+    }
+
+    /// `wsp-854`: three members run side by side (turnaround's group 1), so the
+    /// group's wall is its window, not the 8864 s their walls add to; with one
+    /// group that is the list's wall.
+    #[test]
+    fn a_groups_wall_is_its_window_and_not_its_members_walls_added_up() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, w) = list("window", &["r-1", "r-2", "r-3"]);
+        let fig = |id: &str| {
+            let wall = if id == "r-3" { 1064 } else { 3900 };
+            RowFigures { start: 100, end: 100 + wall, wall, spans: vec![Span { start: 100, end: 100 + wall, class: Class::Seat }], measured: true, ..Default::default() }
+        };
+        let v = effort_with(&store, &w, None, &fig);
+        let g = &v["groups"][0];
+        assert_eq!(g["wall_seconds"], 3900, "{g}");
+        assert_eq!(g["wall_seconds"], g["wall_buckets"]["window_seconds"]);
+        assert_eq!(g["wall_seconds"], v["totals"]["wall_seconds"]);
     }
 
     #[test]
@@ -1838,6 +1860,9 @@ mod tests {
         assert_eq!(t["wall_seconds"], 2520, "first spawn to the last pass: {t}");
         assert_eq!(t["last_verdict_wall_seconds"], 300);
         assert_eq!(b["wall_seconds"], t["wall_seconds"], "one wall for the list");
+        let walls: Vec<i64> = v["groups"].as_array().unwrap().iter().map(|g| g["wall_seconds"].as_i64().unwrap()).collect();
+        assert_eq!(walls, vec![110, 2410], "each group's window, pass to pass");
+        assert_eq!(walls.iter().sum::<i64>(), t["wall_seconds"].as_i64().unwrap());
         assert_eq!(b["attributed_seconds"], b["wall_seconds"], "{b}");
         assert_eq!(b["unattributed_seconds"], 0);
         assert_eq!(v["groups"][1]["wall_buckets"]["barrier_run_seconds"], 0, "a manual group ran no barrier");
