@@ -1771,7 +1771,7 @@ pub fn manager_jobs(state: &Path) -> Result<Option<&'static dyn crate::host::Hos
 /// `<state>/inproc` as `choose_jobs(Inproc)`'s are, and the tree root `/`, so a
 /// build runs in the tree where it is (wsp-057's d1, as `check`'s steps do).
 /// One per state, leaked once.
-fn inproc_anywhere(state: &Path) -> &'static dyn crate::host::Host {
+pub(crate) fn inproc_anywhere(state: &Path) -> &'static dyn crate::host::Host {
     use std::sync::{Mutex, OnceLock};
     static HOSTS: OnceLock<Mutex<BTreeMap<PathBuf, &'static crate::host::InProcess>>> = OnceLock::new();
     let mut map = HOSTS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().unwrap_or_else(|e| e.into_inner());

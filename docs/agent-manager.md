@@ -1307,6 +1307,9 @@ run". The decision: **a cwd or tree outside the root runs in this process, as on
 rule for a check). The root was not widened to cover the state directory, since a root of `/` confines no job. The
 shim also does not stop and say how to proceed, because nothing it could say would let the build run.
 - **The manager's jobs stay under its root.** Nothing outside the root is sent to the manager.
+- **`wsp verify` (wsp-861).** Each of its jobs whose directory is outside the root, a warm tree under the state
+  directory among them, runs on the in-process runner. No table another verify reads holds such a job, so the
+  warm tree's lock is touched while it runs.
 - **`throttle run`.** `Jobs::outside` is `wsp-host`'s runner in this process (`inproc_anywhere`, its root `/`).
   `as_job` sends a run whose cwd is not under the manager's root there, and a run under the root still goes to the
   manager. The decision (slots, nice, job cap) is the same. A heavy run's holds are marked `here`, and `live_by`

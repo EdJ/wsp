@@ -255,10 +255,16 @@ use crate::sharing::{self, Share};
 /// from `job.ended`; nothing is spawned or killed here, and a warm tree's lock
 /// names the run, whose liveness is that host's job table. The host is the
 /// manager's, or `wsp-host`'s runner in this process under `WSP_JOBS=inproc`
-/// and on a host with no manager ([`jobs_host`]).
+/// and on a host with no manager ([`jobs_host`]). A job in a directory outside
+/// the tree root runs in this process whichever of them that is (wsp-361's
+/// rule, wsp-861).
 /// One verify's jobs: the host they go to and the run they belong to.
 struct Jobs<'a> {
     host: &'a dyn wsp_wire::host::Host,
+    /// Where a job in a directory outside the tree root goes: `wsp-host`'s
+    /// runner in this process, its tree root `/`. Its table is this process's
+    /// alone, so [`keeping`] holds a warm tree for such a job.
+    outside: &'a dyn wsp_wire::host::Host,
     /// The key's row and attempt and the mark every job name ends with
     /// (`verify:<what>:<n>@<mark>`); also what a warm lock names.
     run: sharing::Run,
@@ -278,8 +284,8 @@ struct Jobs<'a> {
 const BUILD_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 impl<'a> Jobs<'a> {
-    fn new(host: &'a dyn wsp_wire::host::Host, run: sharing::Run) -> Jobs<'a> {
-        Jobs { host, run, sent: std::sync::atomic::AtomicU32::new(0), path: None }
+    fn new(host: &'a dyn wsp_wire::host::Host, outside: &'a dyn wsp_wire::host::Host, run: sharing::Run) -> Jobs<'a> {
+        Jobs { host, outside, run, sent: std::sync::atomic::AtomicU32::new(0), path: None }
     }
 
     /// The next job's key, `verify:<what>:<n>@<mark>`.
@@ -323,8 +329,16 @@ impl<'a> Jobs<'a> {
         timeout: Duration,
         seen: &mut dyn FnMut(&str),
     ) -> Result<(wsp_wire::host::JobEnded, String), String> {
-        // The place comes from `place_of`, never from a path joined here.
-        let at = place_of(Whose::Row(&self.run.row), TreeKind::Verify, dir)?.at;
+        // Under the tree root the place comes from `place_of`, never from a
+        // path joined here. Outside it nothing crosses to the manager: the job
+        // runs in this process, the directory where it is (wsp-861).
+        let (host, at) = if outside_tree_root(dir) {
+            let on = wsp_wire::host::HostId(self.run.host.clone());
+            let at = dir_under(&on, dir, Path::new("/")).ok_or_else(|| format!("{} is no directory to run in", util::contract(dir)))?;
+            (self.outside, wsp_wire::host::JobAt::Dir(at))
+        } else {
+            (self.host, place_of(Whose::Row(&self.run.row), TreeKind::Verify, dir)?.at)
+        };
         // `env -u K -- K=V … cmd`: the values wsp mints cross on the argv
         // (host-api `JobRun`), and the caller's private index does not.
         let mut full: Vec<String> = vec!["env".into(), "-u".into(), "GIT_INDEX_FILE".into(), "--".into()];
@@ -345,7 +359,7 @@ impl<'a> Jobs<'a> {
             text.push_str(&o.text);
             seen(&o.text);
         };
-        let ended = self.host.run_job(&run, &mut sink).map_err(|e| format!("{e:?}"))?;
+        let ended = host.run_job(&run, &mut sink).map_err(|e| format!("{e:?}"))?;
         // The log is the whole of it; `job.output` is a view a slow reader can
         // have gaps in. It is on this host, so it is read when it is there.
         let log = std::fs::read_to_string(&ended.log.path).ok().filter(|l| l.len() >= text.len());
@@ -357,7 +371,32 @@ impl<'a> Jobs<'a> {
 // a verifier and a barrier take a job's place from (wsp-053). It answers a
 // `HostDir` on the row's host relative to that host's tree root, never a
 // path on wsp's machine.
-use crate::job_place::{host_of, place_of, TreeKind, Whose};
+use crate::job_place::{dir_under, host_of, outside_tree_root, place_of, TreeKind, Whose};
+
+/// How often [`keeping`] touches a warm tree's lock: well inside
+/// [`sharing::SETUP_GRACE`], which is all that holds it for a reader whose
+/// table has no job of this run.
+const KEEP_EVERY: Duration = Duration::from_secs(20);
+
+/// Run `job` in `tree`, holding `warm`'s lock while it runs where the job is
+/// in no table another verify reads (`tree` outside the tree root, wsp-861):
+/// the lock is touched every `every`, so it is not taken for free once the
+/// setup grace is past, and is free a grace after this process is killed. A
+/// job the manager runs is read from its table and nothing is touched.
+fn keeping<T>(warm: Option<&sharing::Warm>, tree: &Path, every: Duration, job: impl FnOnce() -> T) -> T {
+    let Some(warm) = warm.filter(|_| outside_tree_root(tree)) else { return job() };
+    std::thread::scope(|s| {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        s.spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(every) {
+                warm.touch();
+            }
+        });
+        let out = job();
+        drop(done);
+        out
+    })
+}
 
 /// `to` as seen from `from`, both on the jobs' host: how a job names its
 /// target directory and a test binary without a path on wsp's machine.
@@ -1388,7 +1427,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
     // anything is claimed: a warm lock says which kind of holder it is.
     let run = this_run(checkout.as_deref(), &key);
     let runs = match jobs_host(&store.state, &run) {
-        Ok(host) => Jobs::new(host, run),
+        Ok(host) => Jobs::new(host, crate::throttle::inproc_anywhere(&store.state), run),
         Err(e) => {
             eprintln!("wsp: verify's jobs: {e}");
             return 2;
@@ -1661,7 +1700,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
                 break;
             }
         }
-        let (ok, text) = cargo_job(&runs, &tree, &target, argv, !json_out, &share);
+        let (ok, text) = keeping(warm.as_ref(), &tree, KEEP_EVERY, || cargo_job(&runs, &tree, &target, argv, !json_out, &share));
         output.push_str(&text);
         if !ok {
             failed = Some(name);
@@ -1687,7 +1726,7 @@ pub fn verify(store: &Store, args: &Args) -> i32 {
         if let Some(first) = failed_tests.first() {
             let held = warm.as_ref().is_none_or(|w| w.touch());
             if held {
-                alone = rerun_alone(&runs, &tree, &target, &first.name, &share);
+                alone = keeping(warm.as_ref(), &tree, KEEP_EVERY, || rerun_alone(&runs, &tree, &target, &first.name, &share));
             }
         }
     }
@@ -1984,7 +2023,7 @@ bench::b: benchmark
         let host: &'static crate::host::InProcess =
             Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&dir.join("jobs-exec"), &root)));
         let run = sharing::Run { host: util::hostname(), row: "t".into(), attempt: 0, mark: "m".into() };
-        Jobs::new(host, run)
+        Jobs::new(host, host, run)
     }
 
     /// The warm-tree tests' run, on host `h` with no job yet: a lock it takes
@@ -2662,7 +2701,12 @@ mod jobs_tests {
     /// the shim is sent to the seat's manager, which refuses this test's tree
     /// as outside its root (wsp-395).
     fn jobs_for(host: &dyn Host, run: sharing::Run) -> Jobs<'_> {
-        let mut jobs = Jobs::new(host, run);
+        // The runner in this process, as the command makes it, its files beside
+        // the test's tree root, which its [`Place`] removes.
+        let exec = crate::job_place::tree_root().with_file_name(format!("here-{}", run.mark));
+        let here: &'static crate::host::InProcess =
+            Box::leak(Box::new(crate::host::InProcess::new().with_jobs(&exec, Path::new("/"))));
+        let mut jobs = Jobs::new(host, here, run);
         jobs.path = Some(crate::throttle::without_shims("cargo", &std::env::var("PATH").unwrap_or_default()));
         jobs
     }
@@ -2775,7 +2819,8 @@ mod jobs_tests {
     /// A verify job takes its place from `place_of(row, verify)`: a
     /// `HostDir` naming the row's host and a path relative to that host's
     /// tree root, never a path on wsp's machine; and the job runs there. A
-    /// tree outside the root is no place.
+    /// tree outside the root is no place, and a job there is not sent to the
+    /// manager.
     #[test]
     fn a_verify_job_takes_its_place_from_place_of_and_names_the_rows_host() {
         let place = Place::new("place");
@@ -2802,7 +2847,10 @@ mod jobs_tests {
         let outside = place.top.join("elsewhere");
         std::fs::create_dir_all(&outside).unwrap();
         assert!(place_of(Whose::Row("wsp-054"), TreeKind::Verify, &outside).is_err(), "a tree outside the root is no place");
-        assert!(jobs.run("pwd", JobClass::Check, &outside, &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {}).is_err());
+        let (ended, out) = jobs.run("pwd", JobClass::Check, &outside, &[], vec!["pwd".into()], Duration::from_secs(30), &mut |_| {}).unwrap();
+        assert_eq!(ended.exit, Some(0), "{out}");
+        assert_eq!(PathBuf::from(out.trim()).canonicalize().unwrap(), outside.canonicalize().unwrap(), "it ran where it is");
+        assert_eq!(rows_of(&tcp, &jobs.run).len(), 1, "only the run under the root reached the manager");
         assert_eq!(relative(&place.tree(), &place.root.join("w").join("target")), PathBuf::from("../target"));
         m.stop();
     }
@@ -2843,6 +2891,62 @@ mod jobs_tests {
         assert_eq!(ended.exit, Some(0));
         assert!(out.contains("jobs=1 idx=unset"), "{out}");
         m.stop();
+    }
+
+    /// wsp-861: under `WSP_JOBS=manager`, `--release`'s step in a warm tree
+    /// outside the manager's tree root (the state directory, where the
+    /// projects are not under home) runs in this process, and nothing of it
+    /// reaches the manager.
+    #[test]
+    fn a_release_build_in_a_warm_tree_outside_the_tree_root_runs_in_this_process() {
+        let place = Place::new("outside");
+        rooted(&place);
+        let warm = place.state().join("warm").join("h").join("t-0");
+        let (tree, target) = (warm.join("tree"), warm.join("target"));
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        std::fs::write(tree.join("src/lib.rs"), "").unwrap();
+        let (m, tcp) = manager(&place);
+        let me = run("wsp-861", "o1");
+        let runs = jobs_for(&tcp, me.clone());
+        let argv = &["build", "--release", "--quiet", "--offline"];
+        let (ok, text) = cargo_job(&runs, &tree, &target, argv, false, &sharing::unregistered());
+        assert!(ok, "{text}");
+        assert!(target.join("release").join("libt.rlib").is_file(), "built where verify put it");
+        assert!(rows_of(&tcp, &me).is_empty(), "nothing reached the manager");
+        assert_eq!(rows_of(runs.outside, &me).len(), 1, "one job, in this process");
+        m.stop();
+    }
+
+    /// wsp-861: a job in this process is in no table another verify reads, so
+    /// the warm tree's lock is touched while it runs; under the root the
+    /// manager's table answers and the lock is left alone.
+    #[test]
+    fn a_warm_trees_lock_is_kept_while_a_job_outside_the_tree_root_runs() {
+        let place = Place::new("keep");
+        rooted(&place);
+        let me = run("wsp-861", "k1");
+        let none = |_: &str| Some(Vec::new());
+        let live = sharing::Live { me: &me, table: &none };
+        let warm = sharing::warm(&place.state(), Path::new("t"), 1, live).unwrap();
+        let lock = std::fs::read_dir(place.state().join("warm"))
+            .unwrap()
+            .flat_map(|h| std::fs::read_dir(h.unwrap().path()).unwrap())
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "lock"))
+            .unwrap();
+        let old = std::time::SystemTime::now() - sharing::SETUP_GRACE * 2;
+        let backdate = || std::fs::OpenOptions::new().append(true).open(&lock).unwrap().set_modified(old).unwrap();
+        let touched = || std::fs::metadata(&lock).unwrap().modified().unwrap() > old + sharing::SETUP_GRACE;
+        let every = Duration::from_millis(10);
+
+        backdate();
+        std::fs::create_dir_all(place.root.join("w").join("tree")).unwrap();
+        keeping(Some(&warm), &place.tree(), every, || std::thread::sleep(Duration::from_millis(100)));
+        assert!(!touched(), "under the root: the manager's table answers");
+
+        assert!(keeping(Some(&warm), &place.state(), every, || within(Duration::from_secs(5), touched)), "touched while it ran");
+        assert!(sharing::warm(&place.state(), Path::new("t"), 1, live).is_none(), "and so still held");
     }
 
     /// The build's output is handed on while the job runs, not when it ends:
