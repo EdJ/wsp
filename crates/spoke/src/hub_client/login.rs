@@ -205,6 +205,51 @@ pub(crate) fn hub_addr(url: &str) -> Result<(String, bool), Silent> {
     Ok((addr.to_string(), secure))
 }
 
+/// The file of what the hub's last welcome said of the login's user, under the
+/// home directory, beside `hubs.json` and not in it (no token is rewritten to
+/// keep it): `{"url", "user", "admin", "at"}`, `admin` `null` where the hub
+/// did not say (one older than the welcome's `admin`). It is the login's:
+/// `wsp login` drops it and keeps its own welcome's, the worker's dial keeps
+/// each welcome's, `wsp logout` removes it, and it is read only for a login
+/// of the same url and user ([`kept_admin`]).
+pub const WELCOME_FILE: &str = ".config/wsp/welcome.json";
+
+/// Keep what `client`'s welcome said under `home`, for the login to `url`.
+/// Best effort: a home that cannot be written keeps nothing, and status then
+/// says the hub did not say.
+pub fn keep_welcome(home: &Path, url: &str, client: &super::Client) {
+    let Principal::Person(user) = client.by() else { return };
+    let path = home.join(WELCOME_FILE);
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let body = serde_json::json!({
+        "url": url.trim(),
+        "user": user,
+        "admin": client.admin(),
+        "at": wsp_base::util::iso_at(wsp_base::util::epoch_secs()),
+    });
+    let tmp = dir.join(format!(".welcome.json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, body.to_string()).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Whether the hub's last welcome to `login` said its user is a hub admin;
+/// None where nothing is kept for this login (its url and user) or the hub
+/// did not say.
+pub fn kept_admin(home: &Path, login: &HubLogin) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(WELCOME_FILE)).ok()?).ok()?;
+    let same = v["url"].as_str() == Some(login.url.trim()) && v["user"].as_str() == Some(login.user.as_str());
+    same.then(|| v["admin"].as_bool()).flatten()
+}
+
+/// Drop what a welcome said (a new login, a logout).
+pub fn forget_welcome(home: &Path) {
+    let _ = std::fs::remove_file(home.join(WELCOME_FILE));
+}
+
 /// Who the hello says it is for, as a hint the hub ignores.
 pub(crate) fn hint() -> Principal {
     let name = std::env::var(HUB_USER_ENV).or_else(|_| std::env::var("USER")).unwrap_or_default();

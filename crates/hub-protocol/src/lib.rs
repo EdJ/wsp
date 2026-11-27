@@ -10,7 +10,8 @@
 //! ([`conn`]'s framing rule). A frame is tagged by `type`.
 //!
 //! - The client's first frame is [`Hello`] (naming the client's
-//!   [`Machine`], where it knows it), answered [`Welcome`] or [`Refused`]
+//!   [`Machine`], where it knows it), answered [`Welcome`] (saying, from a
+//!   hub that does, whether the user is a hub admin) or [`Refused`]
 //!   (and then closed); or [`Login`], answered with
 //!   [`LoginPrompt`] and then [`LoginDone`] or [`Refused`], and closed.
 //! - After a welcome the client sends [`Request`]s, each answered by one
@@ -211,7 +212,7 @@ impl Machine {
 /// The longest [`Machine`] id or name, in bytes.
 pub const MAX_MACHINE: usize = 256;
 
-/// `welcome { server, protocol, head, by, machine? }`.
+/// `welcome { server, protocol, head, by, machine?, admin? }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
     /// The instance's name.
@@ -229,6 +230,13 @@ pub struct Welcome {
     /// that does not key leases by machine (an additive field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<Machine>,
+    /// Whether the user the connection is from is an active admin of the hub,
+    /// as the hub read it at the hello (a change while the connection is open
+    /// shows at the next one). `false` for any principal that is not such a
+    /// user. Absent from a hub older than it (an additive field), which reads
+    /// as not said, never as `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<bool>,
 }
 
 /// `refused { code, text }`.

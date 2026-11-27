@@ -198,7 +198,10 @@ pub fn dial(home: &std::path::Path) -> Result<Client, String> {
     let url = hub_client::hub_url_in(env(hub_client::HUB_URL_ENV), home).map_err(|e| e.to_string())?;
     let cred = Credential::for_hub_in(env(hub_client::HUB_TOKEN_ENV), home).map_err(|e| e.to_string())?;
     let ca = hub_client::hub_ca_in(env(hub_client::HUB_CA_ENV), home).map_err(|e| e.to_string())?;
-    Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| said_of(&e))
+    let client = Client::dial_hub_ca(&url, cred, ca.as_deref(), DIAL_WAIT).map_err(|e| said_of(&e))?;
+    // What the welcome said of the user (whether a hub admin), for `wsp hub status`.
+    hub_client::keep_welcome(home, &url, &client);
+    Ok(client)
 }
 
 /// How a refused login begins, in every word the spoke says of it: the hub

@@ -134,6 +134,8 @@ fn write_login(home: &Path, url: &str, token: &str, user: &str, ca: Option<&Path
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{}: {e}", path.display()));
     }
+    // A new login knows nothing of what the hub told the last one.
+    hub_client::forget_welcome(home);
     Ok(())
 }
 
@@ -185,6 +187,7 @@ pub fn log_in(home: &Path, url: &str, token: &str, ca: Option<&Path>) -> Result<
         }
     };
     write_login(home, url.trim(), token, &user, ca.as_deref(), METHOD_TOKEN)?;
+    hub_client::keep_welcome(home, url, &client);
     Ok(LoggedIn { url: url.trim().to_string(), user, replaced })
 }
 
@@ -368,6 +371,7 @@ pub fn log_out(home: &Path) -> Result<Option<Option<HubLogin>>, String> {
     // What it was is only for the saying; a file that does not read is removed all the same.
     let was = hub_login_in(home).ok().flatten();
     std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    hub_client::forget_welcome(home);
     Ok(Some(was))
 }
 
@@ -454,10 +458,11 @@ pub fn status_text(login: &Option<HubLogin>) -> String {
 ///   user.
 /// - `machine`: `{id, name}`, what every hello names (`hub_client::machine`);
 ///   `id` `null` before the first dial has made one.
-/// - `admin`: always `null`: no frame a hub sends an ordinary client says
-///   whether its user is an admin (`welcome` and `whoami` name the principal
-///   alone, and the stream's state carries no users), so this is not known
-///   here without trying an admin verb.
+/// - `admin`: `true` or `false`, what the hub's last `welcome` to this login
+///   said (`hub_client::WELCOME_FILE`, kept by `wsp login` and by each dial
+///   the sync worker makes, dropped by a new login and by `wsp logout`);
+///   `null` where nothing is kept for this login, or the hub is older than
+///   the welcome's `admin` and did not say.
 pub fn account_json(store: &Store, login: &HubLogin, home: Option<&Path>) -> serde_json::Map<String, serde_json::Value> {
     let kept = crate::hub_members::Members::read(store).filter(|m| m.user == login.user);
     let mut out = serde_json::Map::new();
@@ -471,7 +476,7 @@ pub fn account_json(store: &Store, login: &HubLogin, home: Option<&Path>) -> ser
             "name": crate::hub_client::machine::name_of(&util::hostname()),
         }),
     );
-    out.insert("admin".into(), serde_json::Value::Null);
+    out.insert("admin".into(), json!(home.and_then(|h| hub_client::kept_admin(h, login))));
     out
 }
 
@@ -874,7 +879,7 @@ mod tests {
     }
 
     /// `wsp hub status --json`'s account facts, each from what is kept here;
-    /// `admin` is null, since no hub frame says it.
+    /// `admin` is null with no welcome kept.
     #[test]
     fn hub_status_account_facts_are_what_is_kept_and_admin_is_not_known() {
         let (_env, store) = wsp_engine::testkit::isolated_store("status-account");
@@ -895,5 +900,65 @@ mod tests {
         // Another user's kept workspaces are not this login's.
         crate::hub_members::Members { user: "bo".into(), workspaces: ["shared:x".to_string()].into(), at: 1 }.write(&store).unwrap();
         assert_eq!(serde_json::Value::Object(account_json(&store, &login, Some(&h)))["workspaces"], json!(null));
+    }
+
+    /// `wsp hub status --json`'s `admin` against a real hub: what the hub's
+    /// welcome said, kept per login (a new login drops what the last one was
+    /// told, and keeps what its own welcome says), kept again by the worker's
+    /// dial, and gone at logout.
+    #[test]
+    fn hub_status_admin_is_what_the_welcome_said_kept_per_login_and_dropped_at_logout() {
+        let (_env, store) = wsp_engine::testkit::isolated_store("status-admin");
+        let dir = home_dir("admin");
+        let Some(hub) = TlsHub::start(&["ann"]) else { return };
+        let home = dir.join("home");
+        let admin = |home: &Path| {
+            let login = hub_login_in(home).unwrap().expect("logged in");
+            serde_json::Value::Object(account_json(&store, &login, Some(home)))["admin"].clone()
+        };
+
+        log_in(&home, &hub.url, hub._hub.admin_token(), Some(&hub.ca)).unwrap();
+        assert_eq!(admin(&home), json!(true), "the hub's admin");
+        log_in(&home, &hub.url, &hub.tokens["ann"], Some(&hub.ca)).unwrap();
+        assert_eq!(admin(&home), json!(false), "an ordinary user: the second login's own welcome, not the first's");
+
+        // The worker's dial keeps what each welcome says.
+        std::fs::remove_file(home.join(hub_client::WELCOME_FILE)).unwrap();
+        assert_eq!(admin(&home), json!(null), "nothing kept");
+        let c = crate::hub_sync::dial(&home).unwrap();
+        assert_eq!(c.admin(), Some(false));
+        assert_eq!(admin(&home), json!(false), "kept by the worker's dial");
+
+        // A login written without a dial (as a GitHub login's is) knows nothing of the last one.
+        write_login(&home, &hub.url, &hub._hub.admin_token(), "root", Some(&hub.ca), METHOD_GITHUB).unwrap();
+        assert_eq!(admin(&home), json!(null), "a new login drops what the last was told");
+
+        // Logout drops it.
+        log_in(&home, &hub.url, hub._hub.admin_token(), Some(&hub.ca)).unwrap();
+        assert_eq!(admin(&home), json!(true));
+        log_out(&home).unwrap();
+        assert!(!home.join(hub_client::WELCOME_FILE).exists(), "logout removes what the welcome said");
+    }
+
+    /// A hub older than the welcome's `admin` says nothing of it: `null`, not `false`.
+    #[test]
+    fn hub_status_admin_is_null_where_the_hub_does_not_say() {
+        use std::io::{BufRead, Write};
+        let (_env, store) = wsp_engine::testkit::isolated_store("status-admin-old");
+        let home = home_dir("admin-old").join("home");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let old = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut hello = String::new();
+            std::io::BufReader::new(s.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            assert!(hello.contains(r#""type":"hello""#), "{hello}");
+            // The welcome a hub sent before it said whether its user is an admin.
+            (&s).write_all(b"{\"type\":\"welcome\",\"server\":\"old-hub\",\"protocol\":1,\"head\":0,\"by\":\"person:ann\"}\n").unwrap();
+        });
+        log_in(&home, &url, "tok-old", None).unwrap();
+        old.join().unwrap();
+        let login = hub_login_in(&home).unwrap().unwrap();
+        assert_eq!(serde_json::Value::Object(account_json(&store, &login, Some(&home)))["admin"], json!(null));
     }
 }

@@ -39,8 +39,8 @@ pub mod token;
 
 pub use dial::{hub_cert_expiry, login_github, login_github_on, Silent};
 pub use login::{
-    hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, Credential, HubLogin, HUBS_FILE, HUB_CA_ENV,
-    HUB_HOME_ENV, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV, TOKEN_ENV,
+    forget_welcome, hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, keep_welcome, kept_admin, Credential, HubLogin,
+    HUBS_FILE, HUB_CA_ENV, HUB_HOME_ENV, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV, TOKEN_ENV, WELCOME_FILE,
 };
 pub use subscribe::{Feed, Item};
 pub use sync::{ObjectSource, Stale, SyncError, SyncReport, IDS_PER_REQUEST, PUT_BYTES};
@@ -128,6 +128,9 @@ pub struct Client {
     /// The machine the hub's first `welcome` said it holds this connection's
     /// leases on (none from a hub that keys leases by user alone).
     held_on: Option<wsp_hub_protocol::Machine>,
+    /// Whether the hub's first `welcome` said this connection's user is a hub
+    /// admin; none from a hub that does not say.
+    admin: Option<bool>,
 }
 
 impl Client {
@@ -181,6 +184,7 @@ impl Client {
             server: open.welcome.server,
             head: open.welcome.head,
             held_on: open.welcome.machine,
+            admin: open.welcome.admin,
         })
     }
 
@@ -193,6 +197,12 @@ impl Client {
     /// on: the hello's, where the hub keys leases by machine.
     pub fn held_on(&self) -> Option<&wsp_hub_protocol::Machine> {
         self.held_on.as_ref()
+    }
+
+    /// Whether the hub's `welcome` said this connection's user is a hub admin
+    /// (the first one's); None from a hub older than the field, which does not say.
+    pub fn admin(&self) -> Option<bool> {
+        self.admin
     }
 
     /// The instance the hub named in its `welcome` (the first one's).

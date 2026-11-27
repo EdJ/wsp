@@ -247,8 +247,8 @@ fn frames() -> Vec<Frame> {
             protocol: 2,
             machine: None,
         }),
-        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(411), by: Some(ann()), machine: None }),
-        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(0), by: None, machine: None }),
+        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(411), by: Some(ann()), machine: None, admin: None }),
+        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(0), by: None, machine: None, admin: None }),
         Frame::Refused(Refused { code: Code::Unauthorised, text: "the token is revoked".into() }),
         Frame::Refused(Refused { code: Code::Malformed, text: String::new() }),
         request(1, Call::Verb(Verb::Whoami(NoArgs {}))),
@@ -766,7 +766,7 @@ fn a_verb_without_arguments_decodes_either_way() {
 #[test]
 fn peers_of_other_versions_decode() {
     let welcome = decode(r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4}"#);
-    assert_eq!(welcome, Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: 1, head: EventId(4), by: None, machine: None }));
+    assert_eq!(welcome, Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: 1, head: EventId(4), by: None, machine: None, admin: None }));
     let refused = decode(r#"{"type":"refused","code":"unauthorised"}"#);
     assert_eq!(refused, Frame::Refused(Refused { code: Code::Unauthorised, text: String::new() }));
     let newer = decode(r#"{"type":"refused","code":"quota","text":"x"}"#);
@@ -820,7 +820,7 @@ fn the_machine_is_an_additive_field_of_hello_and_welcome() {
     assert_eq!(decode(line), hello(Some(m.clone())));
     assert_eq!(serde_json::to_string(&hello(None)).unwrap(), r#"{"type":"hello","token":"t","by":"person:ann","client":"wsp 0.1.0","protocol":1}"#);
 
-    let welcome = |machine| Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(4), by: Some(ann()), machine });
+    let welcome = |machine| Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(4), by: Some(ann()), machine, admin: None });
     let line = r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4,"by":"person:ann","machine":{"id":"m-7f3a","name":"ann-laptop"}}"#;
     assert_eq!(serde_json::to_string(&welcome(Some(m.clone()))).unwrap(), line);
     assert_eq!(decode(line), welcome(Some(m)));
@@ -831,6 +831,30 @@ fn the_machine_is_an_additive_field_of_hello_and_welcome() {
         other => panic!("{other:?}"),
     }
     assert_eq!(p::MAX_MACHINE, 256);
+}
+
+/// Whether the welcomed user is a hub admin: an additive field of the
+/// welcome, `true` or `false` from a hub that says, absent from one older
+/// than it (and in every frame above), which reads as not said. The lines
+/// are the hub repository's own test's, byte for byte.
+#[test]
+fn admin_is_an_additive_field_of_welcome() {
+    let welcome = |admin| Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(4), by: Some(ann()), machine: None, admin });
+    for (admin, line) in [
+        (Some(true), r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4,"by":"person:ann","admin":true}"#),
+        (Some(false), r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4,"by":"person:ann","admin":false}"#),
+    ] {
+        assert_eq!(serde_json::to_string(&welcome(admin)).unwrap(), line);
+        assert_eq!(decode(line), welcome(admin));
+    }
+    let older = r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4,"by":"person:ann"}"#;
+    assert_eq!(serde_json::to_string(&welcome(None)).unwrap(), older);
+    assert_eq!(decode(older), welcome(None), "an older hub's welcome: not said");
+    let both = r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4,"by":"person:ann","machine":{"id":"m-7f3a","name":"ann-laptop"},"admin":false}"#;
+    match decode(both) {
+        Frame::Welcome(w) => assert_eq!((w.machine.map(|m| m.id), w.admin), (Some("m-7f3a".to_string()), Some(false))),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

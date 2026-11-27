@@ -476,7 +476,7 @@ mod tests {
     fn a_github_login_that_hears_nothing_or_another_frame_or_a_closed_connection_fails_by_name() {
         let mut quiet = Scripted::new(vec![Ok(None)]);
         assert_eq!(login_github_on(&mut quiet, "hub", Duration::from_millis(1), |_| {}), Err(Silent::NoWelcome("hub".into())));
-        let welcome = Welcome { server: "old-hub".into(), protocol: PROTOCOL, head: wsp_hub_protocol::EventId(0), by: None, machine: None };
+        let welcome = Welcome { server: "old-hub".into(), protocol: PROTOCOL, head: wsp_hub_protocol::EventId(0), by: None, machine: None, admin: None };
         let mut old = Scripted::new(vec![Ok(Some(Frame::Welcome(welcome)))]);
         assert!(matches!(login_github_on(&mut old, "hub", Duration::from_secs(1), |_| {}), Err(Silent::NotAServer(_))));
         let mut gone = Scripted::new(vec![Ok(Some(Frame::LoginPrompt(prompt()))), Err(ConnError::Closed)]);

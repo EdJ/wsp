@@ -28,7 +28,7 @@ through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-
 - `reconcile` — the merging reconcile the door calls
 - `hub_client` — the spoke's own client of the hub, speaking `wsp-hub-protocol` only: the TLS/TCP dial with a pinned
   CA, hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, the
-  login file and `WSP_HUB_*` (`hubs.json`), the machine every hello names (`machine`, `machine.json`), certificate expiry, the GitHub login, and token mint/hash
+  login file and `WSP_HUB_*` (`hubs.json`), the machine every hello names (`machine`, `machine.json`), what the last welcome said of the user (whether a hub admin, `welcome.json`), certificate expiry, the GitHub login, and token mint/hash
 - `cmd_login`, `cmd_hub`, `cmd_publish`, `cmd_allocate` — the verbs of the shared side (`wsp login`, with a token or
   `--github`, `logout`, `hub`, `publish`, `allocate`)
 - `testhub` (behind `test-support`, and in this crate's tests) — a real hub for tests, run as an external program:
