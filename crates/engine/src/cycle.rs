@@ -2965,7 +2965,14 @@ pub fn retire_endings(store: &Store, seat: &str) {
     let owed = |pane: &Option<String>, ending: &Ending| pane.as_deref() == Some(seat) && *ending != Ending::Ended;
     let dropped = store.locked(|| {
         let mut dropped = Vec::new();
-        for t in store.tasks_shared().iter() {
+        // Read off the snapshot first: most spawns find nothing, and only a
+        // row that names the id is read again to be written.
+        let named = |t: &&Task| {
+            crate::legs::legs(t).iter().any(|l| owed(&l.pane, &l.ending))
+                || crate::pieces::record(t).pieces.iter().any(|p| owed(&p.pane, &p.ending))
+                || crate::verification::passes(t).iter().any(|p| owed(&p.pane, &p.ending))
+        };
+        for t in store.tasks_shared().iter().filter(named) {
             let Some(mut row) = store.find_task(&t.id) else { continue };
             let mut parts = Vec::new();
             let mut legs = crate::legs::legs(&row);
