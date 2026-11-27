@@ -106,6 +106,14 @@ esac
 /// wait. So the fake's first start is waited on here, on its answer and on no
 /// clock, and [`start`] gives the manager's handshake the test's own [`WAIT`].
 fn place(tag: &str) -> (PathBuf, PathBuf) {
+    // A suite run from inside a seat inherits that seat's variables, and the
+    // manager's children (the fake sup, `ps`) read them: start from a clean shell.
+    for key in [
+        "WSP_HOST", "WSP_MANAGER_ADDR", "WSP_MANAGER_DIR", "WSP_SEAT_ID", "WSP_SEAT_KIND", "WSP_SEAT_EPOCH", "WSP_EXIT",
+        "WSP_VERDICT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE",
+    ] {
+        std::env::remove_var(key);
+    }
     let base = std::env::temp_dir();
     let dir = base.join(format!("wm-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);

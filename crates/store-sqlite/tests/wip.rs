@@ -1,7 +1,7 @@
 //! `wip_snapshot` (wsp-695): what `wip` draws of the state, cut in SQL. Open rows, lists
 //! not finished and finished lists marked `WIP_SEATED` keep their bodies, every other row
-//! and list loses its `WIP_BODIES` fields and
-//! keeps the rest, only
+//! loses its `WIP_BODIES` fields and keeps the rest, every other finished list is left out
+//! (wsp-783), only
 //! raised asks come back, seats and claims are whole, and the rest is empty. `snapshot()` is
 //! unchanged beside it, and the in-memory store cuts the same state to the same reply.
 //!
@@ -233,18 +233,16 @@ fn wip_snapshot_keeps_bodies_on_open_rows_alone_and_raised_asks_alone() {
     assert_eq!(wip.rows[&RowId("done-body".into())].fields["tags"], "verify");
 
     // A list not finished is whole: its body is the only way back to its worklist.
-    assert_eq!(wip.lists.keys().collect::<Vec<_>>(), whole.lists.keys().collect::<Vec<_>>());
     let running = ListId("wsp-read-api".into());
     assert_eq!(wip.lists[&running], whole.lists[&running], "a running list is whole");
     assert_eq!(wip.lists[&running].fields["body"], "# the list's file");
-    // A finished list without its text, groups whole.
-    let list = &wip.lists[&ListId("old-list".into())];
-    let whole_list = &whole.lists[&ListId("old-list".into())];
-    for k in WIP_BODIES {
-        assert!(!list.fields.contains_key(k), "a finished list keeps no `{k}`");
-    }
-    assert_eq!(list.fields, fields(&[("title", "old"), ("status", "done")]));
-    assert_eq!((&list.groups, list.state), (&whole_list.groups, whole_list.state));
+    // A finished list nobody sits on is left out (wsp-783): wip reads no list from it.
+    assert!(whole.lists.contains_key(&ListId("old-list".into())));
+    assert_eq!(
+        wip.lists.keys().map(|l| l.0.as_str()).collect::<Vec<_>>(),
+        ["seated-list", "wsp-read-api"],
+        "every list but the finished one no seat sits on"
+    );
     // A finished list a seat still sits on (`WIP_SEATED`) is whole, as wip reads it.
     let seated = ListId("seated-list".into());
     assert_eq!(wip.lists[&seated], whole.lists[&seated], "a finished list with a seat on it is whole");

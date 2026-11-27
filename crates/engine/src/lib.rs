@@ -36,6 +36,7 @@ pub mod claims;
 pub mod classify;
 pub mod closing;
 pub mod cmd_initiative;
+pub mod initiative_run;
 pub mod cmd_mandate;
 pub mod cmd_message;
 pub mod cmd_migrate;

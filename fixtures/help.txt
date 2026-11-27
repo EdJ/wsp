@@ -13,6 +13,10 @@ PROJECTS
                                     | increment edit <id> I1 ["caption"] [--criteria …] [--list …] | increment rm <id> I1
                                     | plan show <id> [--json]  increments → lists → groups → rows
                                     | approve <id> "verdict"  | changes <id> "what to change"
+                                    | align show <id> [I<n>] [--json]  the stop list, lists, commits, state
+                                    | align pass <id> I<n> "verdict"|- [--fix-next "note"]  start n+1
+                                    | align back <id> I<n> "note"|-  a change request; n+1 stays held
+                                    | run <id> [--json]  the build's feed: group running, rows, spend
                                     | plan <id> [--changes "…"|-] [--model M] [--dry-run]  seat a
                                     planner (opus) on the order in docs/initiative-plan.md
                                     | brief <id>  a record below a product: artefacts and
@@ -568,19 +572,29 @@ MACHINES
                                     read from the prompt or stdin, never the
                                     command line. One hub per wsp: a second login
                                     replaces the first. --ca pins a private CA
+  wsp login <hub-url> --github      log in with GitHub instead: open the address
+                                    shown, enter the code; the hub's token for
+                                    you is stored, never shown
   wsp publish <row|list> --to shared:<name>   move a private row (with its sub-tasks and pieces)
                                     or list (with its members) into a shared workspace:
                                     new ids from the hub, old ones still resolve. Refused
                                     when logged out, already shared, or not a member; a claimed
                                     row takes the hub's lease first and is refused if it is held
-  wsp logout                        forget the hub's token; a sync worker stops
-  wsp hub status [--json]           the hub you are logged in to, and as whom
+  wsp logout                        disable the hub connection (wsp hub disable),
+                                    then forget the hub's token
+  wsp hub status [--json]           the hub you are logged in to, and as whom; on or
+                                    off, what the disconnect parked, what is unsent
   wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
   wsp hub user ls                      the hub's users and their live tokens
   wsp hub user revoke <name>           revoke a user and every token of its
   wsp hub token <name>                 a new token for a user, the old ones revoked
   wsp hub workspace add <name>         a shared workspace
   wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
+  wsp hub disable                      stop taking shared work here, cleanly: shared
+                                       rows in flight parked, the journal flushed,
+                                       leases given back; the login is kept
+  wsp hub enable                       take part again: parked rows resumed where
+                                       their lease can be taken
 
 WORKLISTS
   wsp worklist new <slug> "title"   a queue of groups of tasks, run in order,
@@ -729,8 +743,9 @@ WORKLISTS
                                     exception-to-the-small-row wording needs
                                     legs, pieces or sub-tasks, or `--whole --why
                                     "…"` on the add. No word: the mode and hits
-  wsp worklist after <slug> <other|none>
-                                    start <slug> only once <other> is complete
+  wsp worklist after <slug> <other>[,<other>…]|none
+                                    start <slug> only once every <other> is
+                                    complete (several: commas or more words)
   wsp worklist edit <slug> [--prio high|normal|low] [--alone|--no-alone] [--no-retro]
                                     where a planned list queues (high first, then
                                     the earlier planned) and whether it waits for

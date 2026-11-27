@@ -2642,9 +2642,10 @@ pub struct Worklist {
     /// `prio:` — `high` or `low`; absent is `normal` (`wsp-383`). The queue's
     /// first key, ahead of when a list was planned.
     pub prio: Option<String>,
-    /// `after:` — the slug of a list that must be complete before this one
-    /// may start (`wsp-383`).
-    pub after: Option<String>,
+    /// `after:` — the slugs of the lists that must all be complete before this
+    /// one may start (`wsp-383`, several in `wsp-734`). Stored as one line,
+    /// comma-separated; a line with one slug is what every list had before.
+    pub after: Vec<String>,
     /// `alone:` — `on` or `off` where a hand said, absent where nobody did and
     /// the project's default stands (`wsp-383`).
     pub alone: Option<bool>,
@@ -2678,6 +2679,18 @@ pub struct Worklist {
     pub body: String,
 }
 
+/// The lists a stored `after:` names: split on commas and whitespace, empty
+/// words and repeats dropped, in the order written.
+pub fn split_after(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in raw.split(|c: char| c == ',' || c.is_whitespace()).map(str::trim).filter(|w| !w.is_empty()) {
+        if !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
+        }
+    }
+    out
+}
+
 impl Worklist {
     pub fn new(id: &str, title: &str) -> Worklist {
         Worklist {
@@ -2694,7 +2707,7 @@ impl Worklist {
             outputs: None,
             planned: None,
             prio: None,
-            after: None,
+            after: Vec::new(),
             alone: None,
             lands: None,
             no_retro: false,
@@ -2772,7 +2785,7 @@ impl Worklist {
             outputs: doc.opt("outputs").filter(|p| !p.trim().is_empty()),
             planned: doc.opt("planned").filter(|p| !p.trim().is_empty()),
             prio: doc.opt("prio").map(|p| p.trim().to_ascii_lowercase()).filter(|p| matches!(p.as_str(), "high" | "low")),
-            after: doc.opt("after").map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+            after: doc.opt("after").map(|p| split_after(&p)).unwrap_or_default(),
             alone: doc.opt("alone").and_then(|a| match a.trim().to_ascii_lowercase().as_str() {
                 "on" | "true" | "yes" => Some(true),
                 "off" | "false" | "no" => Some(false),
@@ -2817,8 +2830,8 @@ impl Worklist {
         if let Some(p) = &self.prio {
             d.set_str("prio", p);
         }
-        if let Some(a) = &self.after {
-            d.set_str("after", a);
+        if !self.after.is_empty() {
+            d.set_str("after", &self.after.join(", "));
         }
         if let Some(a) = self.alone {
             d.set_str("alone", if a { "on" } else { "off" });
@@ -3768,6 +3781,24 @@ before each build, with a persistent CARGO_TARGET_DIR beside it.\n"
         assert_eq!(got.groups(), w.groups(), "the queue survives the disk");
         assert_eq!(got.groups()[1].cap, Some(2));
         assert!(got.section("Log").unwrap().contains("robustness-069 passed"));
+    }
+
+    /// `after:` holds several lists (`wsp-734`), and a file with one slug, the
+    /// only thing written before, reads as a list of one.
+    #[test]
+    fn a_worklists_after_reads_one_slug_or_several_and_writes_them_back() {
+        let read = |after: &str| {
+            let mut w = Worklist::new("c", "C");
+            w.after = split_after(after);
+            Worklist::from_doc(&fm::parse(&w.render()), "c").after
+        };
+        assert_eq!(read("a"), ["a"], "an old single value reads the same");
+        assert_eq!(read("a, b"), ["a", "b"]);
+        assert_eq!(read("a,b  c,a"), ["a", "b", "c"], "commas or spaces, a repeat once");
+        assert!(read("").is_empty() && read(" , ").is_empty());
+        let one = Worklist::from_doc(&fm::parse("---\ntitle: C\nafter: solo\n---\n"), "c");
+        assert_eq!(one.after, ["solo"]);
+        assert!(one.render().contains("after: solo"), "one slug is written as it always was");
     }
 
     /// A group carries two blocks of prose and they are one exchange: `stop:`

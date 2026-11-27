@@ -6,9 +6,11 @@ members it names directly (`wsp-base`, `wsp-store`, `wsp-wire`, `wsp-host-api`, 
 
 ## Holds
 
-The `seats` row of the layering map, 18 modules: `cmd_spawn` (with `Fleet`, the engine's `Seats` impl), `cmd_agent`,
+The `seats` row of the layering map, 19 modules: `cmd_spawn` (with `Fleet`, the engine's `Seats` impl), `cmd_agent`,
 `agent_commands`, `wake`, `cmd_govern`, `cmd_watch`, `cmd_machine`, `cmd_sandbox`, `cmd_install`, `cmd_brief`,
-`cmd_resume`, `cmd_role`, `cmd_project`, `cmd_stamp`, `cmd_attend`, `kind_attention`, `kind_data`, `memory`.
+`cmd_resume`, `cmd_role`, `cmd_project`, `cmd_stamp`, `cmd_attend`, `kind_attention`, `kind_data`, `memory`, `seat_block` (wsp-788:
+a seat blocked at a question raised to the person in yours; it uses `cmd_agent` and `cmd_spawn`, so it sits here,
+not in the engine where master first put it).
 
 ## Does not hold
 

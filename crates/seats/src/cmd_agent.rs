@@ -1406,7 +1406,10 @@ fn tell_seat(
     // The one state a message must not be sent into: a blocked agent has a
     // permission dialog holding the keyboard, so the text would be typed at it.
     if let Some(wait) = crate::waiting::on_screen(row.state) {
-        eprintln!("wsp: {what} is {} — answer that first", wait.sentence());
+        match crate::seat_block::blocked_on(store, &seat) {
+            Some(q) => eprintln!("wsp: {what} is waiting on a question to the person — answer that first: {q}"),
+            None => eprintln!("wsp: {what} is {} — answer that first", wait.sentence()),
+        }
         eprintln!("     `wsp peek {peek}` shows what it is asking");
         return 1;
     }
@@ -1555,15 +1558,21 @@ fn left_for_the_daemon(store: &Store, args: &Args, p: &Paint, sent: &Sent, id: &
         }),
     );
     crate::store::log_line(store, &format!("told {}: order {} left for the daemon ({n} waiting), from {}", sent.what, id.0, sent.from));
+    let blocked = crate::seat_block::blocked_on(store, &sent.pane);
     match args.json() {
-        true => println!("{}", json!({ "held": true, "pane": sent.pane, "waiting": n })),
-        false => println!(
-            "{} {} has not answered yet — left for the daemon as order {} ({n} waiting), typed under deliver:{}",
-            p.yellow("…"),
-            sent.what,
-            id.0,
-            sent.pane
-        ),
+        true => println!("{}", json!({ "held": true, "pane": sent.pane, "waiting": n, "blocked": blocked })),
+        false => {
+            println!(
+                "{} {} has not answered yet — left for the daemon as order {} ({n} waiting), typed under deliver:{}",
+                p.yellow("…"),
+                sent.what,
+                id.0,
+                sent.pane
+            );
+            if let Some(q) = blocked {
+                println!("  the seat is waiting on a question to the person: {q}");
+            }
+        }
     }
     0
 }
@@ -4254,10 +4263,11 @@ fn wip_reads_api() -> bool {
 fn api_state(store: &Store) -> Result<wsp_store_contract::State, String> {
     let mut client = wsp_client::Client::dial(&store.state, wsp_store_contract::Principal::Wsp("wip".into()), API_BUDGET)
         .map_err(|e| e.to_string())?;
-    match client.request("wip", json!({})).map_err(|e| e.to_string())?.outcome {
-        wsp_api::Outcome::Ok(wsp_api::Answer::Wip { state, .. }) => Ok(state),
-        wsp_api::Outcome::Ok(_) => Err("`wip` was answered with another verb's answer".into()),
-        wsp_api::Outcome::Err(f) => Err(format!("`wip` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
+    // Through the client's `wip`, which reads a cut past one line in its parts (wsp-783).
+    match client.wip() {
+        Ok((state, _)) => Ok(state),
+        Err(wsp_client::Error::Failed(f)) => Err(format!("`wip` was refused: {:?} {}", f.code, f.text).trim_end().to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

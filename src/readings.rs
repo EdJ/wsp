@@ -322,7 +322,7 @@ mod tests {
         line("asks {}", b, t);
         let (b, t) = timed(&|| {
             let (state, at) = db.wip_snapshot().unwrap();
-            Answer::Wip { state, at }
+            Answer::Wip { state, at, parts: None }
         });
         line("wip (unchanged)", b, t);
 

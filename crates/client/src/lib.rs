@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use wsp_api::{
-    Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId,
+    Answer, ApiToken, Call, ConnError, Connection, Failure, Frame, IdempotencyKey, NoArgs, Outcome, Reply, ReqId, WipArgs,
     Request, Verb, PROTOCOL,
 };
 use wsp_store_contract::{Ask, AskKind, AskState, List, ListFilter, Principal, Reading, Refusal, Row, RowFilter, State};
@@ -52,6 +52,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// no `limit` (wsp-377). The server cuts a page shorter where the rows would
 /// take its reply past `MAX_LINE`, so this caps the count, not the bytes.
 pub const ROWS_PAGE: u32 = 1000;
+
+/// How many times [`Client::wip`] begins a read in parts again when the
+/// server has let the cut go before its last part was asked (wsp-783). The
+/// connection keeps the cut it began on, so that is one that redialled.
+pub const WIP_TRIES: u32 = 3;
 
 /// Why a request got no reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,13 +228,34 @@ impl Client {
     }
 
     /// The `wip` verb: open rows whole, every other row and every list
-    /// without its bodies, open asks only, seats and claims whole, and the
-    /// event id that cut is consistent at. A smaller reply than `state` on a
-    /// large store, which is what keeps it under `MAX_LINE`.
+    /// without its bodies (finished lists no seat sits on left out), open
+    /// asks only, seats and claims whole, and the event id that cut is
+    /// consistent at. A cut past one line comes in parts (wsp-783): each is
+    /// asked by the first's `at` and absorbed in order, so the caller gets
+    /// the cut whole. A part refused `stale` (the server let that cut go)
+    /// starts the read again, up to [`WIP_TRIES`] times.
     pub fn wip(&mut self) -> Result<(State, wsp_api::EventId), Error> {
-        let reply = self.send_call(Call::Verb(Verb::Wip(NoArgs {})), None)?;
+        let mut tries = 0;
+        'again: loop {
+            tries += 1;
+            let (mut state, at, parts) = self.wip_part(WipArgs::default())?;
+            for part in 1..parts {
+                match self.wip_part(WipArgs { at: Some(at), part: Some(part) }) {
+                    Ok((piece, on, _)) if on == at => state.absorb(piece),
+                    Ok((_, on, _)) => return Err(Error::Unexpected(format!("wip part {part} of {} came at {}", at.0, on.0))),
+                    Err(Error::Failed(f)) if f.code == wsp_api::Code::Stale && tries < WIP_TRIES => continue 'again,
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok((state, at));
+        }
+    }
+
+    /// One `wip` reply: its state, the head it is at, and how many parts the cut is in.
+    fn wip_part(&mut self, args: WipArgs) -> Result<(State, wsp_api::EventId, u32), Error> {
+        let reply = self.send_call(Call::Verb(Verb::Wip(args)), None)?;
         match reply.outcome {
-            Outcome::Ok(Answer::Wip { state, at }) => Ok((state, at)),
+            Outcome::Ok(Answer::Wip { state, at, parts }) => Ok((state, at, parts.unwrap_or(1))),
             Outcome::Ok(other) => Err(Error::Unexpected(format!("wip was answered {other:?}"))),
             Outcome::Err(f) => Err(orders::refused(f)),
         }

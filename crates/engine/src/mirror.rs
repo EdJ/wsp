@@ -573,7 +573,7 @@ fn lists_with(
             put(&mut f, "status", status.as_str());
             put(&mut f, "project", w.project.as_deref().unwrap_or(""));
             put(&mut f, "prio", w.prio.as_deref().unwrap_or(""));
-            put(&mut f, "after", w.after.as_deref().unwrap_or(""));
+            put(&mut f, "after", &w.after.join(", "));
             put(&mut f, "alone", &w.alone.map(|a| a.to_string()).unwrap_or_default());
             put(&mut f, "created", &w.created);
             put(&mut f, "planned", w.planned.as_deref().unwrap_or(""));
@@ -1908,8 +1908,8 @@ mod tests {
     /// wsp-695: `wip_snapshot` over lists as the mirror writes them. A list
     /// that is not finished comes back with its `body`, so [`list_of`] reads
     /// back the very `Worklist` the files hold (wip's running list, homes and
-    /// governor come from it); a finished one comes back without its text,
-    /// which `list_of` reads as no list, as wip draws nothing from it.
+    /// governor come from it); a finished one is left out (wsp-783): without
+    /// its text `list_of` read no list from it, as wip draws nothing from it.
     #[test]
     fn wip_snapshot_keeps_a_running_lists_body_so_list_of_reads_it_back_and_cuts_a_finished_ones() {
         use c::{Commands, Reads};
@@ -1935,10 +1935,8 @@ mod tests {
         let want = files.iter().find(|w| w.id == "list-a").unwrap();
         assert_eq!(format!("{back:?}"), format!("{want:?}"), "list_of reads back the running list the files hold");
 
-        let finished = &cut.lists[&ListId("list-old".into())];
-        assert_eq!((finished.state, finished.groups.len()), (ListState::Finished, 1), "a finished list keeps its state and groups");
-        assert!(c::WIP_BODIES.iter().all(|k| !finished.fields.contains_key(*k)), "a finished list loses its text");
-        assert!(list_of(finished).is_none(), "so list_of reads no list from it");
+        assert!(!cut.lists.contains_key(&ListId("list-old".into())), "a finished list nobody sits on is left out");
+        assert_eq!(cut.lists.values().filter_map(list_of).count(), 1, "wip reads the running list alone, as it did");
     }
 
     /// wsp-695: a list that has just finished can still have seats on it, and
@@ -1980,10 +1978,10 @@ mod tests {
             db.wip_snapshot().unwrap().0
         };
         let got = cut(&s, "seated");
-        let kept = |id: &str| got.lists[&ListId(id.into())].fields.contains_key(BODY);
+        let kept = |id: &str| got.lists.get(&ListId(id.into())).is_some_and(|l| l.fields.contains_key(BODY));
         assert!(kept("list-checked"), "a standing check keeps its finished list whole");
         assert!(kept("list-governed"), "a filled governor's post keeps its finished list whole");
-        assert!(!kept("list-old"), "a finished list nobody sits on loses its text");
+        assert!(!got.lists.contains_key(&ListId("list-old".into())), "a finished list nobody sits on is left out");
 
         let lists: Vec<Worklist> = got.lists.values().filter_map(list_of).collect();
         let seats = crate::barrier::seats(&lists);
@@ -1991,7 +1989,7 @@ mod tests {
         assert!(lists.iter().any(|l| l.id == "list-governed"), "wip still reads the governor's scope as a list");
 
         // The check ends and the post is vacated: nothing is seated, and the
-        // next re-read cuts both lists as it cuts any finished one.
+        // next re-read leaves both out, as it does any finished one (wsp-783).
         let mut w = s.worklist("list-checked").unwrap();
         let mut gs = w.groups();
         gs[1].checks[0].ending = wsp_store::checks::Ending::Ended;
@@ -2000,8 +1998,7 @@ mod tests {
         s.set_governor("list-governed", json!({ "vacated": "2026-11-20T09:30:00Z", "last": { "workspace": "w-9", "pane": "cpd-78" } }));
         let got = cut(&s, "ended");
         for id in ["list-checked", "list-governed"] {
-            let l = &got.lists[&ListId(id.into())];
-            assert!(c::WIP_BODIES.iter().all(|k| !l.fields.contains_key(*k)) && !l.fields.contains_key(c::WIP_SEATED), "{id} is cut once nobody sits on it");
+            assert!(!got.lists.contains_key(&ListId(id.into())), "{id} is left out once nobody sits on it");
         }
     }
 

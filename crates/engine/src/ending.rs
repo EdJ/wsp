@@ -2756,6 +2756,17 @@ pub mod tests {
             .unwrap()
     }
 
+    /// Copy a system binary to run under another name. macOS kills a copied
+    /// system binary at once (its signature names the old path), so on macOS
+    /// the copy is signed ad hoc.
+    fn copy_signed(from: &str, to: &std::path::Path) {
+        std::fs::copy(from, to).unwrap();
+        if cfg!(target_os = "macos") {
+            let signed = std::process::Command::new("codesign").args(["-s", "-", "-f"]).arg(to).output().unwrap();
+            assert!(signed.status.success(), "codesign: {}", String::from_utf8_lossy(&signed.stderr));
+        }
+    }
+
     /// The pids under `parent`, read now.
     pub fn children_of(parent: u32) -> Vec<u32> {
         crate::check_tree::exes().into_iter().filter(|(_, pp, _)| *pp == parent).map(|r| r.0).collect()
@@ -2893,7 +2904,7 @@ pub mod tests {
         // named wsp-307's, a dev tool the sweep stops by name.
         let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
         let cargo = bin.join("cargo");
-        std::fs::copy(sleep, &cargo).unwrap();
+        copy_signed(sleep, &cargo);
         let wsp = script("wsp", "(cd \"$3\" && exec \"$4\" 60) &\nwait");
         let mut check = wsp_base::calls::Command::new(&wsp)
             .args(["check", &row, &tree.display().to_string(), &cargo.display().to_string()])
@@ -2966,7 +2977,7 @@ pub mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
         let npm = bin.join("npm");
-        std::fs::copy(sleep, &npm).unwrap();
+        copy_signed(sleep, &npm);
         // The verifier's agent, its tool shell, and the npm that shell runs.
         let mut agent = wsp_base::calls::Command::new("sh")
             .args(["-c", "sh -c \"$0 60; true\"; true", &npm.display().to_string()])
@@ -3039,7 +3050,7 @@ pub mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
         let npm = bin.join("npm");
-        std::fs::copy(sleep, &npm).unwrap();
+        copy_signed(sleep, &npm);
         let mut agent = agent_in(&tree);
         // `nohup npm 60 &` from a shell that exits at once, as `probe/dev.sh`.
         let detached = |seat: &str| -> u32 {
@@ -3118,7 +3129,7 @@ pub mod tests {
         // names it `npm`: what descends from a process standing in the tree.
         let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| std::path::Path::new(p).exists()).unwrap();
         let npm = bin.join("npm");
-        std::fs::copy(sleep, &npm).unwrap();
+        copy_signed(sleep, &npm);
         std::env::set_var(crate::host_tcp::JOBS_ENV, "inproc");
         let runner = crate::check::Runner::chosen(&store, crate::check::Whose::Row(&row), crate::check::TreeKind::Check, &tree, None);
         std::env::remove_var(crate::host_tcp::JOBS_ENV);
@@ -3212,9 +3223,9 @@ pub mod tests {
         // `ps` names each by the file it runs: an `npm` that is a `sleep`, a
         // `wsp-manager` that is a shell, both outside the tree.
         let npm = bin.join("npm");
-        std::fs::copy(find(&["/bin/sleep", "/usr/bin/sleep"]), &npm).unwrap();
+        copy_signed(&find(&["/bin/sleep", "/usr/bin/sleep"]), &npm);
         let manager = bin.join("wsp-manager");
-        std::fs::copy(find(&["/bin/sh", "/usr/bin/sh"]), &manager).unwrap();
+        copy_signed(&find(&["/bin/sh", "/usr/bin/sh"]), &manager);
         let exit = root.join("exec").join("jobs").join(format!("{row}+0+check%3Aweb-chrome_check@1.2.3.exit"));
         // `wsp-host`'s wrapper, word for word, as the manager starts it.
         let wrapper = "e=$1; shift\n\"$@\"\ns=$?\n{ echo \"exit $s\"; times; } > \"$e.tmp\" 2>/dev/null && mv -f \"$e.tmp\" \"$e\"\nkill -KILL 0";

@@ -331,9 +331,10 @@ pub enum Verb {
     /// What `wip` draws of `state` (wsp-695), as the store's
     /// `Reads::wip_snapshot` says: open rows whole, the rest as heads, lists
     /// whole but finished ones no seat still sits on without their text, only
-    /// raised asks, the seats and claims; small enough
-    /// for one line under [`MAX_LINE`] where `state`'s whole domain is not.
-    Wip(#[serde(default)] NoArgs),
+    /// raised asks, the seats and claims. Finished lists no seat sits on are
+    /// left out (wsp-783). A cut too long for one line under [`MAX_LINE`] is
+    /// answered in parts ([`WipArgs`]); [`Answer::Wip`]'s `parts` says so.
+    Wip(#[serde(default)] WipArgs),
     /// `wsp throttle --json`'s document: this machine's build throttle and
     /// the readings it acts on (wsp-307). Answered [`Answer::Throttle`].
     Throttle(#[serde(default)] NoArgs),
@@ -393,6 +394,36 @@ impl<'de> Deserialize<'de> for NoArgs {
         // `deserialize_option`, so that `args` left out (serde's missing
         // field) reads as none rather than failing.
         d.deserialize_option(Nothing)
+    }
+}
+
+/// `wip { at?, part? }` (wsp-783). Asked with neither, the reply is the cut
+/// at the server's head: whole where it fits a line, else its first part,
+/// whose [`Answer::Wip`] says how many `parts` there are. The rest are asked
+/// one by one with `at` (that reply's) and `part` (1 up to `parts - 1`), and
+/// the cut is the parts [`absorbed`](wsp_store_contract::State::absorb) in
+/// order. A part of a cut the server no longer holds is refused
+/// [`Code::Stale`]: ask again with neither. Read from `{}`, `null` or no
+/// `args` at all, as `NoArgs` was before it; left out of the wire when unset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct WipArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<EventId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for WipArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Given {
+            #[serde(default)]
+            at: Option<EventId>,
+            #[serde(default)]
+            part: Option<u32>,
+        }
+        // Through `Option`, so that `null` and `args` left out read as the default.
+        Ok(Option::<Given>::deserialize(d)?.map(|g| WipArgs { at: g.at, part: g.part }).unwrap_or_default())
     }
 }
 
@@ -460,6 +491,12 @@ pub enum Answer {
     Wip {
         state: State,
         at: EventId,
+        /// How many parts the cut at `at` is in, on each of them, when it is
+        /// more than one (wsp-783): `state` is then the part asked, and
+        /// [`WipArgs`] says how to ask the others. Left out of the wire for a
+        /// cut that fits one line, so that reply is the bytes it always was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parts: Option<u32>,
     },
     /// `throttle`: the document `wsp throttle --json` prints, the same value,
     /// so that printed pretty it is the same bytes.

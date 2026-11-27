@@ -19,66 +19,105 @@
 //!
 //! It sits above the store, so every backend (the SQLite store, `MemStore`,
 //! the hub's) is cached alike.
+//!
+//! A cut too long for one line (wsp-783: 26 MB on the live store, past the
+//! 16 MiB [`MAX_LINE`]) is kept as its parts, each a [`SNAPSHOT_PART`] of the
+//! state as `subscribe` splits a snapshot, each carrying how many there are.
+//! `wip {}` is answered the first; the client asks the rest by the cut's head
+//! (`wip { at, part }`), and the connection keeps the cut it began on until
+//! its last part is read, so the head moving meanwhile does not tear it.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use wsp_api::{Answer, ReqId};
-use wsp_store_contract::{EventId, Result, Store};
+use wsp_api::{Answer, ReqId, MAX_LINE};
+use wsp_store_contract::{EventId, Result, State, Store, SNAPSHOT_PART};
 
 use crate::Shared;
 
-/// The last `wip` answer, as the JSON of the reply's `ok`, and the head it is
-/// consistent at.
-#[derive(Default)]
-pub(crate) struct Cache(Mutex<Option<(EventId, Arc<Vec<u8>>)>>);
+/// One cut, serialised: the head it is consistent at, and the JSON of each
+/// reply's `ok`, one per part (one alone for a cut that fits a line).
+#[derive(Debug)]
+pub(crate) struct Cut {
+    pub(crate) at: EventId,
+    pub(crate) parts: Vec<Vec<u8>>,
+}
 
-/// What the cache holds: the head a cut is consistent at, and its bytes.
-type Held = Option<(EventId, Arc<Vec<u8>>)>;
+/// The last `wip` cut.
+#[derive(Default)]
+pub(crate) struct Cache(Mutex<Held>);
+
+/// What the cache holds: the last cut, if any has been asked for.
+type Held = Option<Arc<Cut>>;
+
+/// Room left in a line for the reply around a cut's `ok`
+/// (`{"type":"reply","id":…,"ok":…,"events":[]}` and its newline).
+const SLACK: usize = 1024;
 
 impl Cache {
     fn held(&self) -> MutexGuard<'_, Held> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The `ok` of a `wip` reply, as JSON: the cached bytes while they are cut
-    /// at the store's head (or past the head this call read), else a fresh
-    /// cut, kept. Callers that arrive while a cut runs, theirs or [`follow`]'s,
+    /// The cut a `wip` is answered from: the cached one while it is cut at
+    /// the store's head (or past the head this call read), else a fresh cut,
+    /// kept. Callers that arrive while a cut runs, theirs or [`follow`]'s,
     /// wait for it rather than cut again.
-    pub(crate) fn answer(&self, store: &(dyn Store + Send + Sync)) -> Result<Arc<Vec<u8>>> {
+    pub(crate) fn answer(&self, store: &(dyn Store + Send + Sync)) -> Result<Arc<Cut>> {
         let mut held = self.held();
         let head = store.head()?;
-        if let Some((at, bytes)) = held.as_ref() {
-            if *at >= head {
-                return Ok(bytes.clone());
+        if let Some(cut) = held.as_ref() {
+            if cut.at >= head {
+                return Ok(cut.clone());
             }
         }
         cut(store, &mut held)
+    }
+
+    /// The cut held, when it is the one at `at`: what a part is read from on
+    /// a connection that did not begin on it.
+    pub(crate) fn at(&self, at: EventId) -> Option<Arc<Cut>> {
+        self.held().as_ref().filter(|c| c.at == at).cloned()
     }
 
     /// Cut afresh when something has asked for `wip` and the cut held is
     /// behind the store's head; `true` when it cut.
     pub(crate) fn refresh(&self, store: &(dyn Store + Send + Sync)) -> Result<bool> {
         let mut held = self.held();
-        let Some((at, _)) = held.as_ref() else { return Ok(false) };
-        if *at >= store.head()? {
+        let Some(cut) = held.as_ref() else { return Ok(false) };
+        if cut.at >= store.head()? {
             return Ok(false);
         }
-        cut(store, &mut held).map(|_| true)
+        self::cut(store, &mut held).map(|_| true)
     }
 }
 
 /// Cut the state row for `wip`, serialise the answer, and keep it in `held`.
-fn cut(store: &(dyn Store + Send + Sync), held: &mut Held) -> Result<Arc<Vec<u8>>> {
+fn cut(store: &(dyn Store + Send + Sync), held: &mut Held) -> Result<Arc<Cut>> {
     let (state, at) = store.wip_snapshot()?;
-    let answer = Answer::Wip { state, at };
-    let bytes = Arc::new(serde_json::to_vec(&answer).map_err(|e| wsp_store_contract::Error::Backend {
-        reason: format!("the wip answer did not serialise: {e}"),
-    })?);
+    let cut = Arc::new(Cut { at, parts: parts(state, at)? });
     // Keyed by the cut's own head: an event folded between the head read and
     // the cut leaves the cache one behind, so the next call cuts again.
-    *held = Some((at, bytes.clone()));
-    Ok(bytes)
+    *held = Some(cut.clone());
+    Ok(cut)
+}
+
+/// The `ok` of each reply that carries `state`: one [`Answer::Wip`] with no
+/// `parts` when its line fits under [`MAX_LINE`], the bytes it always was;
+/// else one per [`SNAPSHOT_PART`] piece of it, each naming how many there
+/// are, so that no line is past the limit however large the store grows.
+pub(crate) fn parts(state: State, at: EventId) -> Result<Vec<Vec<u8>>> {
+    let json = |answer: &Answer| {
+        serde_json::to_vec(answer).map_err(|e| wsp_store_contract::Error::Backend {
+            reason: format!("the wip answer did not serialise: {e}"),
+        })
+    };
+    if state.json_len() + SLACK <= MAX_LINE {
+        return Ok(vec![json(&Answer::Wip { state, at, parts: None })?]);
+    }
+    let pieces = state.split(SNAPSHOT_PART);
+    let n = Some(pieces.len() as u32);
+    pieces.into_iter().map(|state| json(&Answer::Wip { state, at, parts: n })).collect()
 }
 
 /// How often [`follow`] looks at `stopping`, and how long it backs off when the store fails.
@@ -153,7 +192,7 @@ mod tests {
     fn the_line_is_the_reply_frame_byte_for_byte() {
         let store = MemStore::new();
         let (state, at) = store.wip_snapshot().unwrap();
-        let answer = Answer::Wip { state, at };
+        let answer = Answer::Wip { state, at, parts: None };
         let ok = serde_json::to_vec(&answer).unwrap();
         for id in [0, 7, u64::MAX] {
             let frame = Frame::Reply(Reply { id: ReqId(id), outcome: Outcome::Ok(answer.clone()), events: vec![] });

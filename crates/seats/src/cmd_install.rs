@@ -2071,7 +2071,7 @@ mod tests {
     /// settings and a `--tree-root` covering the registered project roots.
     #[test]
     fn the_managers_launcher_carries_the_throttles_job_capacities_and_the_tree_root() {
-        let d = scratch("manager-jobs");
+        let d = scratch("manager-jobs").canonicalize().unwrap();
         let store = Store::at(d.join("home"), d.join("state"));
         let settings = crate::throttle::Settings { slots: Some(3), checks: Some(5), ..Default::default() };
         settings.save(&store.state).unwrap();

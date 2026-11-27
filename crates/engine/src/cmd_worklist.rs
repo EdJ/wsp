@@ -2791,7 +2791,7 @@ fn listing_of(store: &Store, listed: &[worklist::Listed], waits: &[(String, Opti
             unwritten: l.at.unwritten.clone(),
             activity: l.activity,
             prio: crate::waits::Prio::of(&l.list).word().to_string(),
-            after: l.list.after.clone(),
+            after: Some(l.list.after.join(", ")).filter(|a| !a.is_empty()),
             queue: waits.iter().position(|(id, _)| *id == l.list.id).map(|n| wsp_view::worklist::Queue {
                 n: n + 1,
                 waits: waits[n].1.as_ref().map(|w| w.text()),
@@ -3159,8 +3159,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
                 order: 190,
-                text: r##"  wsp worklist after <slug> <other|none>
-                                    start <slug> only once <other> is complete"##,
+                text: r##"  wsp worklist after <slug> <other>[,<other>…]|none
+                                    start <slug> only once every <other> is
+                                    complete (several: commas or more words)"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Worklists,
@@ -7267,8 +7268,8 @@ fn queue_report(args: &Args, w: &Worklist, what: &str) -> i32 {
         println!("{}", json!({ "worklist": w.id, "what": what, "prio": crate::waits::Prio::of(w).word(), "after": w.after, "alone": alone }));
     } else {
         let mut bits = vec![format!("prio {}", crate::waits::Prio::of(w).word())];
-        if let Some(a) = &w.after {
-            bits.push(format!("after {a}"));
+        if !w.after.is_empty() {
+            bits.push(format!("after {}", w.after.join(", ")));
         }
         if let Some(a) = alone {
             bits.push(format!("alone {a}"));
@@ -7278,13 +7279,16 @@ fn queue_report(args: &Args, w: &Worklist, what: &str) -> i32 {
     0
 }
 
-/// `wsp worklist after <slug> <other|none>` — start `slug` only once `other`
-/// is complete, or stop saying so. A name that is no list, the list itself,
-/// and a chain that comes back round are refused: each is a list that would
-/// wait for ever.
+/// `wsp worklist after <slug> <other>[,<other>…]|none` — start `slug` only
+/// once every `other` is complete, or stop saying so. The others are one
+/// word with commas, several words, or `--after` repeated; the word replaces
+/// what the list was after. A name that is no list, the list itself, and a
+/// chain that comes back round are refused: each is a list that would wait
+/// for ever.
 pub fn after(store: &Store, args: &Args) -> i32 {
-    let (Some(needle), Some(other)) = (args.rest.get(1).cloned(), args.rest.get(2).cloned()) else {
-        eprintln!("usage: wsp worklist after <slug> <other|none>");
+    let words: Vec<String> = args.rest.iter().skip(2).cloned().collect();
+    let (Some(needle), false) = (args.rest.get(1).cloned(), words.is_empty()) else {
+        eprintln!("usage: wsp worklist after <slug> <other>[,<other>…]|none");
         return 2;
     };
     let w = match worklist_or_why(store, &needle) {
@@ -7294,37 +7298,46 @@ pub fn after(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let target = match other.trim().to_ascii_lowercase().as_str() {
-        "none" | "-" => None,
-        _ => match worklist_or_why(store, &other) {
-            Ok(o) => Some(o),
-            Err(why) => {
-                eprintln!("{why}");
-                return 1;
+    let named: Vec<String> = words.iter().flat_map(|x| crate::model::split_after(x)).collect();
+    let clear = named.len() == 1 && matches!(named[0].to_ascii_lowercase().as_str(), "none" | "-");
+    let mut targets: Vec<Worklist> = Vec::new();
+    if !clear {
+        for other in &named {
+            match worklist_or_why(store, other) {
+                Ok(o) => {
+                    if !targets.iter().any(|t| t.id == o.id) {
+                        targets.push(o);
+                    }
+                }
+                Err(why) => {
+                    eprintln!("{why}");
+                    return 1;
+                }
             }
-        },
-    };
-    if let Some(o) = &target {
-        let mut at = Some(o.clone());
-        let mut hops = 0;
-        while let Some(l) = at {
+        }
+    }
+    for o in &targets {
+        // Every list `o` waits on, however far back: `w` among them is a ring.
+        let mut seen: Vec<String> = Vec::new();
+        let mut todo = vec![o.clone()];
+        while let Some(l) = todo.pop() {
             if l.id == w.id {
                 eprintln!("wsp: `{}` after `{}` would wait for itself", w.id, o.id);
                 return 1;
             }
-            hops += 1;
-            if hops > 64 {
-                break;
+            if seen.contains(&l.id) || seen.len() > 256 {
+                continue;
             }
-            at = l.after.as_deref().and_then(|a| store.worklist(a));
+            seen.push(l.id.clone());
+            todo.extend(l.after.iter().filter_map(|a| store.worklist(a)));
         }
     }
     let saved = store.locked(|| -> Result<Worklist, String> {
         let mut w = store.worklist(&w.id).ok_or_else(|| format!("wsp: `{}` is gone", w.id))?;
-        w.after = target.as_ref().map(|o| o.id.clone());
-        w.log(&match &w.after {
-            Some(o) => format!("after {o}"),
-            None => "no longer after any list".to_string(),
+        w.after = targets.iter().map(|o| o.id.clone()).collect();
+        w.log(&match w.after.is_empty() {
+            false => format!("after {}", w.after.join(", ")),
+            true => "no longer after any list".to_string(),
         });
         store.save_worklist(&w).map_err(|e| format!("wsp: write failed: {e}"))?;
         Ok(w)
@@ -7337,7 +7350,7 @@ pub fn after(store: &Store, args: &Args) -> i32 {
         }
     };
     store.log_event("worklist-edited", json!({ "id": w.id, "what": "after", "after": w.after }));
-    store.git_commit(&format!("wsp: worklist {} after {}", w.id, w.after.as_deref().unwrap_or("none")));
+    store.git_commit(&format!("wsp: worklist {} after {}", w.id, if w.after.is_empty() { "none".to_string() } else { w.after.join(", ") }));
     queue_report(args, &w, "after")
 }
 
@@ -11877,9 +11890,24 @@ mod tests {
         // `next <slug>` says the same, and the JSON carries it.
         assert_eq!(run(&store, &["next", "blocked"]), 0);
         let w = store.worklist("blocked").unwrap();
-        assert_eq!(w.after.as_deref(), Some("early"));
+        assert_eq!(w.after, ["early"]);
         assert_eq!(run(&store, &["after", "blocked", "none"]), 0);
-        assert_eq!(store.worklist("blocked").unwrap().after, None);
+        assert!(store.worklist("blocked").unwrap().after.is_empty());
+
+        // Several lists (`wsp-734`): commas, more words, a repeat counted once;
+        // the list waits for every one, and a ring through any is refused.
+        assert_eq!(run(&store, &["after", "blocked", "early,late"]), 0);
+        assert_eq!(store.worklist("blocked").unwrap().after, ["early", "late"]);
+        assert_eq!(run(&store, &["after", "blocked", "late", "urgent", "late"]), 0);
+        assert_eq!(store.worklist("blocked").unwrap().after, ["late", "urgent"]);
+        assert_eq!(run(&store, &["after", "urgent", "early,blocked"]), 1, "a ring through the second is refused");
+        assert_eq!(run(&store, &["after", "blocked", "late,nothing-by-that-name"]), 1, "one unknown refuses the lot");
+        assert_eq!(store.worklist("blocked").unwrap().after, ["late", "urgent"], "and writes nothing");
+        let lines = drawn(&store, false);
+        let at = |id: &str| lines.iter().position(|l| l.starts_with(id)).unwrap_or_else(|| panic!("{id} in {lines:?}"));
+        assert!(lines[at("blocked")].contains("after late, urgent"), "{lines:?}");
+        assert_eq!(run(&store, &["after", "blocked", "none"]), 0);
+        assert!(store.worklist("blocked").unwrap().after.is_empty());
 
         // alone and not alone are stored; both together are refused.
         assert_eq!(flagged(&store, &["edit", "late"], &[("alone", "true")]), 0);

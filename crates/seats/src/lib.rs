@@ -12,7 +12,7 @@ pub use wsp_engine::{
     addon, address, affected, after, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, claims, classify,
     closing, cmd_initiative, cmd_mandate, cmd_message, cmd_migrate, cmd_submit, cmd_task, cmd_whoami,
     cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close,
-    inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close,
+    initiative_run, inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close,
     piece_seat, pieces, prose, record_workspace, refusals, repair, retro_yours, room, scope, scratch, sent, size_check, split, stage, stand_down,
     starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, watch_levels, worklist,
 };
@@ -49,4 +49,5 @@ pub mod cmd_watch;
 pub mod kind_attention;
 pub mod kind_data;
 pub mod memory;
+pub mod seat_block;
 pub mod wake;

@@ -15,7 +15,7 @@ dependencies to hold this.
 
 - `src/lib.rs`: `Client::dial(state_dir, by, wait)`, `Client::{request, request_keyed, set_timeout, server, head,
   subscribe, wip, throttle, spend, show}`, `Error` (`Timeout`, `Lost`, `Silent`, `Args`, `Refused`, `Failed`, `Unexpected`),
-  `ViewError` (`Request`, `Refused`, `Answer`), `REQUEST_TIMEOUT`. `throttle()`, `spend()` and `show(id)` return the
+  `ViewError` (`Request`, `Refused`, `Answer`), `REQUEST_TIMEOUT`. `wip()` reads a cut past the line in its parts and absorbs them (wsp-783), starting again on a `stale` part up to `WIP_TRIES` times. `throttle()`, `spend()` and `show(id)` return the
   documents `wsp throttle --json`, `wsp spend --json` and `wsp show <id> --json` print, as the `Value` (wsp-307); a
   refusal (`not_found`, `unsupported` from a server without them) is `ViewError::Refused`. `request(verb, args)` builds the
   envelope from a verb name and JSON `args` (so a verb this build does not know still goes out, and the server

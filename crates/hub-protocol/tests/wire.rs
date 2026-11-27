@@ -710,7 +710,7 @@ fn the_state_cores_other_verbs_are_unknown_here_and_keep_their_id() {
 /// one, since it never takes the verb.
 #[test]
 fn the_state_cores_other_answers_do_not_decode_here() {
-    for answer in [api::Answer::Rows(vec![]), api::Answer::Wip { state: State::default(), at: EventId(1) }, api::Answer::Throttle(json!({}))] {
+    for answer in [api::Answer::Rows(vec![]), api::Answer::Wip { state: State::default(), at: EventId(1), parts: None }, api::Answer::Throttle(json!({}))] {
         let line = serde_json::to_string(&api::Frame::Reply(api::Reply { id: api::ReqId(1), outcome: api::Outcome::Ok(answer), events: vec![] })).unwrap();
         assert!(serde_json::from_str::<Frame>(&line).is_err(), "{line}");
     }
