@@ -5,6 +5,9 @@ When a worklist clears, wsp opens a **retro seat** on it (a sonnet/high agent, r
 in buckets, the biggest stalls, per-row spawn and idle figures) and attributes the
 wall to causes within 10 %.
 
+The last barrier writes `effort.json` before its pass is recorded, so the clear writes it
+again, from the reading its packet is built from, retro or none (wsp-852).
+
 - `wsp retro <list> --packet` prints what the seat reads; `--check` says whether the list
   is eligible. `wsp retro <list>` (or `show`) reads the retro that ran and starts nothing; `wsp retro start <list> [--replaces ROW]` starts one by hand, and is refused over a retro row still open or at review unless named, and from a verifier seat.
 - `--no-retro` on a list (or `retro=off`) turns it off. One retro per clear, and only for lists big enough.

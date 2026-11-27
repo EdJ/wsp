@@ -1028,9 +1028,14 @@ pub fn effort_html(v: &Value) -> String {
 /// Write `effort.json` and `effort.html`; the paths. `note` is the version's
 /// note: "effort report, at group 2 of 5".
 pub fn write_effort(store: &Store, w: &Worklist, baseline: Option<&str>, note: &str) -> Result<(PathBuf, PathBuf), String> {
-    let v = effort(store, w, baseline);
-    let j = write(&w.id, "effort.json", &serde_json::to_string_pretty(&v).unwrap_or_default(), note)?;
-    let h = write(&w.id, "effort.html", &effort_html(&v), note)?;
+    write_effort_of(&w.id, &effort(store, w, baseline), note)
+}
+
+/// [`write_effort`] of a reading already taken, so that what is kept and what is
+/// quoted from it are one reading (`wsp-852`).
+pub(crate) fn write_effort_of(list: &str, v: &Value, note: &str) -> Result<(PathBuf, PathBuf), String> {
+    let j = write(list, "effort.json", &serde_json::to_string_pretty(v).unwrap_or_default(), note)?;
+    let h = write(list, "effort.html", &effort_html(v), note)?;
     Ok((h, j))
 }
 

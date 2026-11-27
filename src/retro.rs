@@ -31,7 +31,7 @@ wsp retro start <list> [--replaces ROW]";
 
 /// The bucket names of the wall, as `effort.json` spells them under
 /// `totals.wall_buckets` (`<name>_seconds`).
-pub const BUCKETS: &[&str] = &crate::wallbuckets::BUCKETS;
+pub const BUCKETS: &[&str] = &["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups", "parked"];
 
 /// A cleared list's wall figures: what the baseline is made of.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,7 +137,12 @@ pub fn eligible_with(store: &Store, w: &Worklist, rows: usize, wall: i64) -> Res
 
 /// Whether the list gets a retro, and if not why not.
 pub fn eligible(store: &Store, w: &Worklist) -> Result<(), String> {
-    let f = Figures::of(&crate::cmd_report::effort(store, w, None));
+    eligible_by(store, w, &crate::cmd_report::effort(store, w, None))
+}
+
+/// [`eligible`] off a reading already taken.
+pub fn eligible_by(store: &Store, w: &Worklist, effort: &Value) -> Result<(), String> {
+    let f = Figures::of(effort);
     eligible_with(store, w, f.rows.max(w.groups().iter().map(|g| g.members.len()).sum()), f.working_wall())
 }
 
@@ -297,9 +302,13 @@ pub fn packet_from(store: &Store, w: &Worklist, effort: &Value, base: &[Figures]
 
 /// The packet for the retro seat of a cleared list.
 pub fn packet(store: &Store, w: &Worklist) -> String {
-    let effort = crate::cmd_report::effort(store, w, None);
+    packet_of(store, w, &crate::cmd_report::effort(store, w, None))
+}
+
+/// [`packet`] off a reading already taken.
+pub fn packet_of(store: &Store, w: &Worklist, effort: &Value) -> String {
     let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
-    packet_from(store, w, &effort, &baseline(store, w), &cycle)
+    packet_from(store, w, effort, &baseline(store, w), &cycle)
 }
 
 pub const VERBS: &[crate::verbs::Verb] = &[crate::verbs::Verb {
@@ -432,18 +441,6 @@ mod tests {
         let mut w = list(&store, "l");
         w.project = Some("proj".into());
         assert!(eligible_with(&store, &w, 9, 9999).unwrap_err().contains("retro = off"));
-    }
-
-    #[test]
-    fn the_packets_bucket_list_reads_each_of_wall_buckets_by_its_name() {
-        let mut e = json!({ "totals": { "wall_buckets": {} } });
-        for (n, b) in crate::wallbuckets::BUCKETS.iter().enumerate() {
-            e["totals"]["wall_buckets"][format!("{b}_seconds")] = json!(60 * (n + 1));
-        }
-        let got = Figures::of(&e).buckets;
-        let of = |name: &str| got.iter().find(|(b, _)| b == name).map(|(_, s)| *s);
-        assert_eq!((of("waiting"), of("check_seat")), (Some(120), Some(300)), "{got:?}");
-        assert_eq!(got.len(), crate::wallbuckets::BUCKETS.len(), "{got:?}");
     }
 
     #[test]

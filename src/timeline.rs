@@ -89,6 +89,10 @@ pub(crate) struct Inputs {
     /// why)`: inside a barrier's check seat, a person's step and not the seat's
     /// work (`wsp-090`).
     pub holds: Vec<(i64, i64, String)>,
+    /// The barriers of the row's list that were passed, `(group, when)`, off
+    /// the `worklist-go` that recorded each. `go` writes it before the line
+    /// telling the pass, and a report read in between has the pass (`wsp-852`).
+    pub passes: Vec<(usize, i64)>,
     /// The group's barrier check seats as their own readings have them, `(group,
     /// opened, ended)`: `ended` is the seat's stop (its burn reading's `ended`,
     /// what `standing_seats` reads), 0 where none is read. A hold written while
@@ -208,6 +212,11 @@ pub(crate) fn list_events(store: &Store, kinds: &[&str]) -> Vec<(i64, String, Va
         }
     }
     ev
+}
+
+/// The barriers of `list` an event log says were passed, `(group, when)`.
+fn passes_in(events: &[(i64, String, Value)], list: &str) -> Vec<(usize, i64)> {
+    events.iter().filter(|(_, k, d)| k == "worklist-go" && d["id"].as_str() == Some(list)).filter_map(|(t, _, d)| Some((d["passed"].as_u64()? as usize, *t))).collect()
 }
 
 /// The holds of `list` in an event log's lines, in order, `(start, end, why)`:
@@ -1177,7 +1186,8 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             }
             k = n;
         }
-        let pass = i.first_line(from, |l| l.starts_with(&format!("tell {list}: Barrier {at} of {list}")));
+        let recorded = i.passes.iter().filter(|(n, t)| n == at && *t >= from).map(|(_, t)| *t).min();
+        let pass = recorded.or_else(|| i.first_line(from, |l| l.starts_with(&format!("tell {list}: Barrier {at} of {list}"))));
         let others = if last > verdict.unwrap_or(0) { " (other members' verdicts came later)" } else { "" };
         if let Some(&(end, _)) = found.last() {
             let mut prev = first_from.max(0).min(from);
@@ -1597,6 +1607,7 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
         let ev = list_events(store, &["worklist-parked", "worklist-resumed", "worklist-held", "worklist-go"]);
         i.parks = parks_of(&ev, l, util::epoch_secs());
         i.holds = holds_of(&ev, l, util::epoch_secs());
+        i.passes = passes_in(&ev, l);
         if let Some(w) = store.worklist(l) {
             for (n, g) in w.groups().iter().enumerate() {
                 for c in &g.checks {

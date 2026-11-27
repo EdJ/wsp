@@ -99,7 +99,7 @@ pub fn html(_store: &Store, w: &Worklist, s: &Value) -> String {
 }
 
 /// A row for the retro seat to sit on: its packet is the row's overview.
-fn seat_row(store: &Store, w: &Worklist) -> Result<Task, String> {
+fn seat_row(store: &Store, w: &Worklist, effort: &Value) -> Result<Task, String> {
     let project = crate::worklist::home(store, w).map(|h| h.project).or_else(|| w.project.clone());
     let id = store.alloc_task_id(project.as_deref()).map_err(|e| format!("cannot allocate id: {e}"))?;
     let mut t = Task::new(&format!("Timing retro of {}", w.id), &id);
@@ -109,7 +109,7 @@ fn seat_row(store: &Store, w: &Worklist) -> Result<Task, String> {
     if project.is_none() {
         t.status_raw = "inbox".into();
     }
-    crate::model::set_section_in(&mut t.body, "Overview", retro::packet(store, w).trim());
+    crate::model::set_section_in(&mut t.body, "Overview", retro::packet_of(store, w, effort).trim());
     store.save_task(&t).map_err(|e| format!("write failed: {e}"))?;
     store.log_event("task-added", json!({ "id": t.id, "project": t.project, "title": t.title }));
     Ok(t)
@@ -120,16 +120,25 @@ fn seat_row(store: &Store, w: &Worklist) -> Result<Task, String> {
 /// list — which the run starts; nothing is spawned here (`wsp-558`). `by_hand` skips
 /// the guards (and the one-per-clear record) but not the evidence.
 pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, String> {
-    if !by_hand {
-        retro::eligible(store, w)?;
+    // One reading for the guards, the packet, the record and the list's own
+    // `effort.json`. The last barrier wrote that file before its pass was
+    // recorded, so it is written again here, retro or none (`wsp-852`).
+    let effort = crate::cmd_report::effort(store, w, None);
+    if crate::outputs::declared(w).iter().any(|o| o.name == "effort") {
+        if let Err(why) = crate::cmd_report::write_effort_of(&w.id, &effort, "effort report, at the retro") {
+            store.log_event("effort-not-written", json!({ "list": w.id, "why": why }));
+        }
     }
-    let t = seat_row(store, w)?;
+    if !by_hand {
+        retro::eligible_by(store, w, &effort)?;
+    }
+    let t = seat_row(store, w, &effort)?;
     let on = crate::retro_series::place_retro(store, &t.id, t.project.as_deref())?;
     let mut w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
     w.retro = Some((util::now_iso(), t.id.clone()));
     w.log(&format!("timing retro — {} on {on} {}", t.id, if by_hand { "by hand" } else { "at the clear" }));
     store.save_worklist(&w).map_err(|e| format!("write failed: {e}"))?;
-    let f = Figures::of(&crate::cmd_report::effort(store, &w, None));
+    let f = Figures::of(&effort);
     let mut s = match state(&w.id) {
         Value::Object(o) => Value::Object(o),
         _ => json!({ "filed": [], "notes": [] }),
@@ -615,6 +624,49 @@ mod tests {
         let lines = crate::retro_yours::yours_lines(&store);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("l cleared in") && lines[0].contains("1 defects on retro-2") && lines[0].contains("0 questions"), "{}", lines[0]);
+    }
+
+    /// cr-events-3 (`wsp-852`): `effort.json` is written at the last barrier,
+    /// the pass is recorded after it, and the file the list keeps read 10 min
+    /// of check seat where its retro's packet read 18. The clear is launched
+    /// before the line telling the pass, so only the event says it here.
+    #[test]
+    fn the_effort_json_a_cleared_list_keeps_reads_the_pass_as_its_retro_packet_does() {
+        let (_env, store) = crate::testkit::isolated_store("retro-one-reading");
+        let mut w = Worklist::new("l", "A list");
+        w.body = "## Groups\n\n- 1 a-1\n".into();
+        w.set_status(crate::model::WorklistStatus::Running);
+        store.save_worklist(&w).unwrap();
+        let mut t = Task::new("row a-1", "a-1");
+        t.status_raw = "done".into();
+        store.save_task(&t).unwrap();
+        let at = |m: u32| format!("2026-11-23T10:{m:02}:00Z");
+        let append = |file: &str, line: String| {
+            use std::io::Write;
+            std::fs::create_dir_all(&store.state).unwrap();
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(store.state_file(file)).unwrap();
+            writeln!(f, "{line}").unwrap();
+        };
+        let event = |m: u32, kind: &str, data: Value| append("events.jsonl", json!({ "ts": at(m), "kind": kind, "data": data }).to_string());
+        event(0, "task-claimed", json!({ "id": "a-1" }));
+        event(5, "task-review", json!({ "id": "a-1" }));
+        event(10, "task-verified", json!({ "id": "a-1" }));
+        append("cycle.log", format!("{} l group 1: barrier run — 0 step(s), 0 reused, 0 ran, 0 failed, 0s · scope: full", at(10)));
+        append("cycle.log", format!("{} spawn l --agent --check 1 --kind claude", at(10)));
+        let kept = || -> Value { serde_json::from_str(&std::fs::read_to_string(dir("l").join("effort.json")).unwrap()).unwrap() };
+        let of = |v: &Value| (v["totals"]["wall_buckets"]["waiting_seconds"].as_i64(), v["totals"]["wall_buckets"]["check_seat_seconds"].as_i64());
+
+        crate::cmd_report::write_effort(&store, &w, None, "effort report, at the last barrier").unwrap();
+        let before = of(&kept());
+        event(18, "worklist-go", json!({ "id": "l", "passed": 1 }));
+        w.set_status(crate::model::WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        start(&store, &w, true).unwrap();
+
+        let s = state("l");
+        let packet = (s["buckets"]["waiting"].as_i64(), s["buckets"]["check_seat"].as_i64());
+        assert_eq!(of(&kept()), packet, "the file and the packet are one reading (written before the pass: {before:?})");
+        assert_eq!(packet.1, Some(8 * 60), "the check seat runs to the pass");
     }
 
     #[test]
