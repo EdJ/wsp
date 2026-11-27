@@ -179,7 +179,9 @@ TASKS
   wsp allocate <id> <user>|none     bind shared work to one user's agents
   wsp whoami                        who the hub says you are (person:<engineer>)
   wsp next [-p proj]                highest-priority actionable task
-  wsp rm <id>                       retire it to the archive
+  wsp rm <id> [--force]             retire it to the archive; a shared row is
+                                    retired on the hub for everyone too, for good,
+                                    which --force confirms
   wsp archive [--days N] [-n] [--full]
                                     sweep done tasks older than 30d into
                                     archive/tasks/<month>/; --days 0 for every
