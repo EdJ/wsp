@@ -4741,6 +4741,13 @@ about nine minutes), so a row is checked in **three tiers**:
    them at the trunk's tip and writes nothing; the barrier row is the one that
    calls it and records what it ran.
 
+**A step that ran no test is red.** Where a step's output shows cargo test,
+cargo nextest, Vitest or Playwright and that runner ran no test at all, the step
+fails and names the filter, whatever it exited with: a filter that matches
+nothing (a module moved to another crate) checks nothing. A command that means to
+run none ends with `# may-run-0-tests`. The steps wsp derives from the changed
+paths (`crate:<name>`, `vitest:related`) are not held to it.
+
 Which paths a landing changed is the diff from the `since <commit>` that `wsp
 land` now writes on the row's `landed` line, or, for a row landed before that,
 the trunk's commits that name the row's id (`--since <commit>` names the base

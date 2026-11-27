@@ -478,7 +478,7 @@ pub fn run(store: &Store, list: &str, at: usize) -> i32 {
                 for (item, ran) in items.iter().zip(ran) {
                     if let Done::TreeMissing(_) = &ran.done {
                         could_not.push(format!("{} — {}", u.project, check::why_failed(ran)));
-                    } else if matches!(ran.done, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_)) {
+                    } else if ran.done.is_red() {
                         failed.push(item.step.name.clone());
                         blames.push(blame(item, ran, &landed));
                     }

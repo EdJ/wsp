@@ -1412,7 +1412,9 @@ impl<'a> Jobs<'a> {
     /// where it wraps one, which may send a job of its own first
     /// ([`Jobs::metadata`]).
     pub fn run_of(&self, step: &Step, dir: &Path) -> JobRun {
-        let script = runner_script(&step.command, |cd| self.metadata(step, dir, cd));
+        // The opt-out is a shell comment, and the wrapped script goes on after
+        // the command, so it is taken off first.
+        let script = runner_script(without_opt_out(&step.command), |cd| self.metadata(step, dir, cd));
         self.sh_job(step, dir, script.unwrap_or_else(|| step.command.clone()))
     }
 
@@ -1566,6 +1568,10 @@ pub enum Done {
     /// there rather than left to its limit (`wsp-609`): the process tree it had,
     /// one `pid command` per line.
     Hung(String),
+    /// A test runner ran no test at all ([`ran_no_tests`], `wsp-969`): the
+    /// step checked nothing, whatever it exited with. The reason, naming what
+    /// the command selected.
+    NoTests(String),
     /// The tree the step was to run in was not there (`wsp-067`): the volume
     /// went away or the tree was removed under the run. An environment fault, as
     /// "limit too tight" is, and not a failed step: the row is not sent back for
@@ -1578,7 +1584,7 @@ pub enum Done {
 impl Done {
     /// Anything that stops a run: a red step or one that could not start.
     pub fn is_red(&self) -> bool {
-        matches!(self, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_))
+        matches!(self, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) | Done::NoTests(_))
     }
 
     /// Anything after which the next step is not run: a red step, or a tree
@@ -1808,7 +1814,8 @@ pub fn by_nextest(command: &str) -> Option<ByNextest> {
     }
     let words: Vec<&str> = rest.split_whitespace().collect();
     let ["cargo", "test", args @ ..] = words.as_slice() else { return None };
-    // A filter matching nothing passes, as it does under `cargo test`.
+    // A filter matching nothing exits 0, as under `cargo test`, so the doctests
+    // still follow; [`ran_no_tests`] judges the run from its output.
     let mut out: Vec<String> = ["cargo", "nextest", "run", "--no-tests=pass", "--ignore-default-filter"].map(String::from).to_vec();
     let mut doc = Doc::default();
     let (mut narrowed, mut filters, mut after_dashes) = (false, 0, false);
@@ -2049,6 +2056,13 @@ fn ran_of_job(dir: &Path, step: &Step, log: &Path, end: &JobEnded, start: Instan
     if end.timed_out {
         return ran(Done::Failed { exit: None, timed_out: true }, tail);
     }
+    if !may_run_no_tests(step) {
+        if let Some(runner) = ran_no_tests(log, end.exit == Some(0)) {
+            let why = no_tests_why(runner, &step.command);
+            tail = format!("{tail}\n{why}");
+            return ran(Done::NoTests(why), tail);
+        }
+    }
     match end.exit {
         Some(0) => ran(Done::Passed, tail),
         Some(code) => match failed_to_start(Some(code), &tail) {
@@ -2060,6 +2074,105 @@ fn ran_of_job(dir: &Path, step: &Step, log: &Path, end: &JobEnded, start: Instan
             ran(Done::Failed { exit: None, timed_out: false }, tail)
         }
     }
+}
+
+/// The comment that ends a step's command when running no test is what it is
+/// for: `label (5m): cargo test --features x # may-run-0-tests`.
+pub const MAY_RUN_NO_TESTS: &str = "# may-run-0-tests";
+
+/// `command` without its [`MAY_RUN_NO_TESTS`].
+fn without_opt_out(command: &str) -> &str {
+    command.trim_end().strip_suffix(MAY_RUN_NO_TESTS).map_or(command, str::trim_end)
+}
+
+/// Whether `step` may run no test: it says so, or it is one wsp derived from
+/// the changed paths ([`crate::affected::derived`], the only rule step with no
+/// `on`), which names no filter to be stale and which nobody can opt out: a
+/// crate with no tests, or a source no Vitest file reaches.
+fn may_run_no_tests(step: &Step) -> bool {
+    without_opt_out(&step.command) != step.command || (step.of == Of::Rule && step.on.is_empty())
+}
+
+/// The test runner whose output in `log` says it ran no test at all, summed
+/// over every binary and run of that runner: libtest's `running N tests` and
+/// nextest's `N tests run` together, Vitest's `Tests` line and its "No test
+/// files found", Playwright's `Running N tests`. A command that failed
+/// (`passed` false) is read this way only where the runner failed for want of
+/// tests; any other failure stays its own.
+fn ran_no_tests(log: &Path, passed: bool) -> Option<&'static str> {
+    use std::io::{BufRead, BufReader};
+    const CARGO: usize = 0;
+    const VITEST: usize = 1;
+    const PLAYWRIGHT: usize = 2;
+    let mut ran: [Option<u64>; 3] = [None; 3];
+    let mut refused = [false; 3];
+    let mut add = |runner: usize, n: u64| ran[runner] = Some(ran[runner].unwrap_or(0) + n);
+    for line in BufReader::new(std::fs::File::open(log).ok()?).split(b'\n').map_while(Result::ok) {
+        let line = plain_text(&String::from_utf8_lossy(&line));
+        let line = line.trim();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["running", n, "test" | "tests"] => n.parse().into_iter().for_each(|n| add(CARGO, n)),
+            ["Running", n, "test" | "tests", "using", ..] => n.parse().into_iter().for_each(|n| add(PLAYWRIGHT, n)),
+            ["Summary", ..] if line.contains(" run: ") => {
+                let count = line.split_once("] ").and_then(|(_, r)| r.split_whitespace().next());
+                count.and_then(|n| n.split('/').next()?.parse().ok()).into_iter().for_each(|n| add(CARGO, n));
+            }
+            _ => {}
+        }
+        // Vitest's summary line has two spaces after `Tests`.
+        if let Some(counts) = line.strip_prefix("Tests  ") {
+            let words: Vec<&str> = counts.split_whitespace().collect();
+            let n = words.windows(2).filter(|w| w[1] == "passed" || w[1] == "failed").filter_map(|w| w[0].parse::<u64>().ok()).sum();
+            add(VITEST, n);
+        }
+        if line.starts_with("No test files found") {
+            add(VITEST, 0);
+            refused[VITEST] = true;
+        }
+        if line.starts_with("Error: No tests found") || line.starts_with("Error: no tests found") {
+            add(PLAYWRIGHT, 0);
+            refused[PLAYWRIGHT] = true;
+        }
+        if line == "error: no tests to run" {
+            add(CARGO, 0);
+            refused[CARGO] = true;
+        }
+    }
+    ["cargo test", "vitest", "playwright"]
+        .into_iter()
+        .enumerate()
+        .find(|&(i, _)| ran[i] == Some(0) && (passed || refused[i]))
+        .map(|(_, name)| name)
+}
+
+/// A line without its terminal colour codes.
+fn plain_text(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            chars.by_ref().find(|c| c.is_ascii_alphabetic());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Why a step that ran no test failed, naming the filter: what its command
+/// gives the runner.
+fn no_tests_why(runner: &str, command: &str) -> String {
+    let filter = ["cargo nextest run", "cargo test", "vitest run", "vitest", "playwright test"]
+        .iter()
+        .find_map(|r| command.split_once(r))
+        .map(|(_, rest)| rest.split(['&', ';', '|', '\n']).next().unwrap_or_default().trim())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| command.trim());
+    format!(
+        "{runner} ran 0 tests: the filter `{filter}` matches no test — fix the line (a module may have moved to another crate), \
+         or end it with `{MAY_RUN_NO_TESTS}` if running none is meant"
+    )
 }
 
 /// Whether an exit says the command never ran: not found (127) or not
@@ -2228,6 +2341,7 @@ pub fn why_failed(r: &Ran) -> String {
         Done::Failed { exit: Some(n), .. } => format!("exit {n}"),
         Done::Failed { exit: None, .. } => "no exit status".into(),
         Done::Malformed(why) => format!("malformed: {why}"),
+        Done::NoTests(why) => why.clone(),
         Done::Hung(pids) => format!("hung (no output, no CPU) — pids {}", pids.lines().filter_map(|l| l.split_whitespace().next()).collect::<Vec<_>>().join(" ")),
         Done::TreeMissing(path) => format!("tree missing: {path}"),
         _ => String::new(),
@@ -2260,6 +2374,7 @@ pub fn account(ran: &[Ran]) -> String {
             }
             (Done::Passed, Some((why, _))) => ("✓", format!("{}s · passed on a second run, the first was {why}", secs(r.took))),
             (Done::Malformed(why), _) => ("✗", format!("malformed — the line cannot start: {why}")),
+            (Done::NoTests(_), _) => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
             (Done::Hung(_), _) => ("✗", format!("{}s · {}", secs(r.took), why_failed(r))),
             (Done::TreeMissing(_), _) => ("?", format!("{}s · {} — an environment fault, not a failed step", secs(r.took), why_failed(r))),
             (Done::Failed { .. }, first) => {
@@ -2705,7 +2820,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             let (mark, tail) = match &r.done {
                 Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
                 Done::Passed => (p.green("✓"), String::new()),
-                Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
+                Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) | Done::NoTests(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
                 Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
             };
@@ -3163,7 +3278,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
     let ran = run_all(&tree, &steps, &dir.join("last.log"), None, &runner, |r| {
         let (mark, tail) = match &r.done {
             Done::Passed => (p.green("✓"), String::new()),
-            Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
+            Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) | Done::NoTests(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
             Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
             Done::Skipped => (p.dim("–"), " · skipped".to_string()),
         };
@@ -3950,6 +4065,53 @@ mod tests {
         assert_eq!(asked(&said), ["test -p on --lib cycle::"], "{said}");
         assert_eq!((&ran.done, ran.via), (&Done::Passed, Some("cargo test")));
         assert!(line(&ran).starts_with(&format!("✓ s · {command} · by cargo test · ")), "{}", line(&ran));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wsp-969's done-when: a step whose runner ran no test fails and says
+    /// which filter, whatever it exited with; one that ran any, or says it may
+    /// run none, or is wsp's own derived step, does not.
+    #[test]
+    fn a_step_whose_test_runner_ran_no_test_fails_naming_the_filter() {
+        let _env = util::isolated("check-no-tests");
+        let (dir, log) = scratch_log("no-tests");
+        let run = |output: &str, exit: u8, tail: &str| {
+            std::fs::write(dir.join("out"), output).unwrap();
+            run_step(&dir, &sh(&format!("cat out; exit {exit} {tail}"), 30), &log, &Runner::Inproc)
+        };
+        let empty = [
+            ("cargo test", 0, "running 0 tests\n\ntest result: ok. 0 passed; 9 filtered out\nrunning 0 tests\n"),
+            ("cargo test", 0, "    Starting 0 tests across 1 binary (9 tests skipped)\n\u{1b}[32;1m     Summary\u{1b}[0m [   0.003s] 0 tests run: 0 passed, 9 skipped\nrunning 0 tests\n"),
+            ("cargo test", 4, "     Summary [   0.003s] 0 tests run: 0 passed, 9 skipped\nerror: no tests to run\n"),
+            ("vitest", 0, "No test files found, exiting with code 0\n"),
+            ("vitest", 1, "No test files found, exiting with code 1\n"),
+            ("vitest", 0, " Test Files  1 skipped (1)\n      Tests  3 skipped (3)\n"),
+            ("playwright", 1, "Error: No tests found\n"),
+        ];
+        for (runner, exit, output) in empty {
+            let ran = run(output, exit, "");
+            let Done::NoTests(why) = &ran.done else { panic!("{output}: {:?}", ran.done) };
+            assert!(why.starts_with(&format!("{runner} ran 0 tests: the filter ")), "{why}");
+            assert!(ran.done.is_red() && ran.tail.ends_with(why.as_str()), "{}", ran.tail);
+            assert!(account(std::slice::from_ref(&ran)).starts_with("✗ s · "), "{}", account(&[ran]));
+        }
+        for some in [
+            "running 0 tests\nrunning 2 tests\nrunning 0 tests\n",
+            "     Summary [   1.2s] 3 tests run: 3 passed, 9 skipped\nrunning 0 tests\n",
+            "      Tests  2 passed | 1 skipped (3)\n",
+            "Running 4 tests using 2 workers\n",
+            "Compiling x\n",
+        ] {
+            assert_eq!(run(some, 0, "").done, Done::Passed, "{some}");
+        }
+        // Another failure stays itself, and the opt-out is read.
+        assert_eq!(run("running 0 tests\n", 1, "").done, Done::Failed { exit: Some(1), timed_out: false });
+        assert_eq!(run("running 0 tests\n", 0, MAY_RUN_NO_TESTS).done, Done::Passed);
+        let derived = Step { of: Of::Rule, ..sh("echo 'running 0 tests'", 30) };
+        assert_eq!(run_step(&dir, &derived, &log, &Runner::Inproc).done, Done::Passed);
+        assert!(no_tests_why("cargo test", "cd x && cargo test --bin wsp cycle:: && true").contains("`--bin wsp cycle::`"));
+        let wrapped = runner_script(without_opt_out(&format!("cargo test -p on --lib {MAY_RUN_NO_TESTS}")), |_| None).unwrap();
+        assert!(wrapped.ends_with("cargo test -p on --lib; fi"), "{wrapped}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
