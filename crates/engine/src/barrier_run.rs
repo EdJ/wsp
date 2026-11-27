@@ -809,6 +809,13 @@ fn pass(store: &Store, list: &str, at: usize, g: &Group, plan: &Plan, count: usi
     std::fs::write(&file, &sentence).map_err(|e| format!("verdict file not written: {}: {e}", util::contract(&file)))?;
     let exe = wsp_base::util::self_exe().map_err(|e| format!("self_exe failed: {e}"))?;
     if cfg!(test) {
+        #[cfg(test)]
+        if tests::GO.with_borrow(Option::is_some) {
+            return record(at, std::time::Duration::ZERO, || {
+                tests::GO.with_borrow_mut(|g| g.iter_mut().for_each(|g| g.push(sentence.clone())));
+                tests::answer(0, "passed\n", "")
+            });
+        }
         return Err("a test does not run `worklist go`".to_string());
     }
     record(at, RETRY_AFTER, || {
@@ -834,6 +841,10 @@ mod tests {
         /// A test's own manager for the barrier's steps (`WSP_JOBS=manager`),
         /// kept to its thread: `wsp-host`'s runner in this process.
         pub(super) static MANAGER: std::cell::Cell<Option<&'static dyn crate::host::Host>> = const { std::cell::Cell::new(None) };
+
+        /// A test's own `worklist go`: while set, each ask answers that it
+        /// passed and leaves its verdict here.
+        pub(super) static GO: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     }
 
     /// Runs `f` with the barrier's steps sent as jobs to a manager whose tree
@@ -960,7 +971,7 @@ mod tests {
         Landed { member: member.into(), commit: None, files: files.iter().map(|f| f.to_string()).collect(), no_commit: false }
     }
 
-    fn answer(code: i32, out: &str, err: &str) -> std::io::Result<Answer> {
+    pub(super) fn answer(code: i32, out: &str, err: &str) -> std::io::Result<Answer> {
         Ok(Answer { code: Some(code), out: out.into(), err: err.into() })
     }
 
@@ -1010,6 +1021,38 @@ mod tests {
         // Somebody else passed group 2 and the next group is at work: not a miss.
         let next = "nothing to pass: pj-003 (doing) is still holding group 3\n";
         assert_eq!(record(2, std::time::Duration::ZERO, || answer(0, next, "")), Ok(()));
+    }
+
+    /// The state attention-noise barrier 2 was in when its pass was lost
+    /// (2026-11-18): every step reused and green, every member holding, no stop
+    /// prose, a group behind it.
+    #[test]
+    fn a_barrier_with_every_step_reused_and_every_member_holding_is_passed_by_wsp_with_no_agent() {
+        let (_env, store) = world("self-pass", "exit 0\n", "");
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups.push(Group { members: vec!["pj-003".into()], agent: "claude opus high".into(), ..Default::default() });
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+        for id in ["pj-001", "pj-002"] {
+            crate::verification::record(&store, id, crate::verification::State::Holds, "holds", None, None).unwrap();
+        }
+        let plan = plan(&store, &w, 1);
+        assert!(ran_of(run_unit(&store, &plan.units[0], "barrier run 1")).iter().all(|r| r.done == Done::Passed));
+        assert!(barrier::open_within(&store, &w, 1, Some("abc".into()), None, barrier::Mechanical::Yes, &|_: &str| false, &|| true).is_some());
+        let _ = crate::cycle::tests::drained(&crate::cycle::tests::SAID);
+
+        GO.set(Some(Vec::new()));
+        let code = run(&store, "run", 1);
+        let asked = GO.take().unwrap();
+        let said = crate::cycle::tests::drained(&crate::cycle::tests::SAID);
+
+        assert_eq!(code, 0);
+        assert!(said.iter().any(|l| l.contains("3 step(s), 3 reused, 0 ran, 0 failed")), "{said:?}");
+        assert!(said.iter().any(|l| l.contains("run group 1: passed by wsp with no agent")), "{said:?}");
+        assert!(!said.iter().any(|l| l.contains("its agent is asked") || l.contains("spawn")), "{said:?}");
+        assert_eq!(asked.len(), 1, "`go` was asked once");
+        assert!(asked[0].starts_with("Passed by wsp with no agent. All 2 member(s) hold (pj-001, pj-002)"), "{}", asked[0]);
     }
 
     fn facts<'a>(stop: &'a str) -> Facts<'a> {
