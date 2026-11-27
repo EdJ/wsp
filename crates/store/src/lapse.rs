@@ -137,10 +137,14 @@ pub fn seat_ended(store: &Store, pane: &str) -> Vec<String> {
 /// A claim on `task` ended: whoever held it is not on it any more, so what was
 /// asked while holding it is closed. What others raised *about* the row is not
 /// — a governor's note on the row is still true; only a row *finishing* closes
-/// those, and that is [`row_moved`].
+/// those, and that is [`row_moved`]. Nor is what wsp raised with no pane behind
+/// it: it names the row in [`Waiting::task`] and nobody asked it while holding
+/// the claim, so it stands after the release (`wsp-851`: a parked row's own seat
+/// letting go closed the person's question about it).
 pub fn claim_ended(store: &Store, task: &str) -> Vec<String> {
     close_where(store, &Party::seat_gone(), |m| {
-        m.waiting.as_ref().is_some_and(|w| w.task == task).then(|| AGENT_CLOSED.to_string())
+        let held = m.waiting.as_ref().is_some_and(|w| w.task == task && !(w.pane.is_empty() && m.from == Party::wsp()));
+        held.then(|| AGENT_CLOSED.to_string())
     })
 }
 

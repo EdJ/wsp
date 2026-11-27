@@ -5213,6 +5213,22 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         assert_eq!(items(&store).len(), 1, "a new park is a new wait");
     }
 
+    /// `wsp-851`: a seat that parked its own row still holds the claim when the
+    /// person is asked; letting go leaves the question open.
+    #[test]
+    fn a_parked_member_is_still_asked_about_once_its_claim_is_released() {
+        let (_env, store) = scratch("parkedclaim");
+        held_by_a_parked_member(&store, &[]);
+        store.set_claim("m-3", serde_json::json!({ "workspace": "cpd-1" }));
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        let asked = items(&store);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+
+        assert!(store.clear_claim("m-3"));
+        tick(&store, &Fake::empty(), &mut Pass::new());
+        assert_eq!(items(&store), asked);
+    }
+
     /// `wsp-851`: the cut the notice offers moves the row to a group of its
     /// own; once the run is there it waits on it again, and says so again.
     #[test]
