@@ -4519,6 +4519,21 @@ pub mod tests {
         assert_eq!(facts("s-3"), [None, None, None, None, None], "a private row: {}", row("s-3"));
     }
 
+    /// `show --json` of an id a row was moved from (`ids.json`, as `wsp mv` and
+    /// a shared row's publish or retire record it) is the row it was moved to,
+    /// as text `show` is: both resolve through `Store::resolve_task`, and the
+    /// document's `id` is the new id, which is how it says which row it is.
+    #[test]
+    fn show_json_of_an_old_id_is_the_row_it_was_moved_to_under_its_new_id() {
+        let _iso = crate::util::isolated("show-moved");
+        let store = scratch("show-moved");
+        store.save_task(&Task::new("A moved row", "aa-001")).unwrap();
+        store.rename_tasks(&[("aa-001".to_string(), "bb-007".to_string())].into()).unwrap();
+        assert!(store.task("aa-001").is_none() && store.task("bb-007").is_some());
+        let v = show_json(&store, "aa-001").expect("the old id resolves");
+        assert_eq!((v["id"].clone(), v["title"].clone()), (json!("bb-007"), json!("A moved row")));
+    }
+
     /// `ls --json` gives a staged row the `legs` objects `show --json` has, and an
     /// unstaged row none at all.
     #[test]
