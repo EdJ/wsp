@@ -295,9 +295,8 @@ pub fn actor_of(rec: &Record, pane: Option<&str>) -> Option<usize> {
 /// The one command that ends a piece, in words.
 pub fn ending_clause(task: &str) -> String {
     format!(
-        "End with `wsp piece done --note FILE --caption \"...\"` (or `wsp review {task} \"...\"`, which is the same with the \
-         account as the note): it runs your `check:` lines in this tree and is refused while one is red. A piece never moves \
-         the row's status; if you cannot go on, `wsp block {task} \"...\"` blocks your piece and not the row."
+        "End with `wsp piece done --note FILE --caption \"...\"`: it runs your `check:` lines in this tree and is \
+         refused while one is red. A piece never moves the row's status; if you cannot go on, `wsp block {task} \"...\"` blocks your piece and not the row."
     )
 }
 

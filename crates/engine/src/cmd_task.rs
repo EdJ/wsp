@@ -2444,9 +2444,9 @@ pub fn blocked_refusal(id: &str, pass: &crate::verification::Pass) -> Vec<String
     )];
     out.extend(crate::cycle::verdict_head(&pass.text).lines().map(|l| format!("  | {l}")));
     out.push(format!("  the whole verdict is under ## Verification (`wsp show {id}`)"));
-    out.push("  fix what it found and commit (`wsp commit-help`), then `wsp review` again".into());
+    out.push("  fix what it found and commit (`wsp commit-help`), then `wsp submit` again".into());
     out.push(format!(
-        "  if you disagree with it: `wsp review {id} --anyway \"why\" \"account\"` puts it up as it is, logged, and the governor hears of it"
+        "  if you disagree with it: `wsp submit {id} --anyway \"why\"` puts it up as it is, logged, and the governor hears of it"
     ));
     out
 }
@@ -2491,8 +2491,8 @@ fn rule_gate(store: &Store, t: &Task, anyway: Option<&str>) -> Result<Vec<String
             None => Err(vec![
                 format!("wsp: {} is at {short}, where its last review was refused on a red rule step, and nothing has changed since", t.id),
                 format!("  the step's output is in the row's log (`wsp show {}`)", t.id),
-                "  fix what it found and commit (`wsp commit-help`), then `wsp review` again".into(),
-                format!("  if the red is the tree's and not the row's: `wsp review {} --anyway \"why\" \"account\"`", t.id),
+                "  fix what it found and commit (`wsp commit-help`), then `wsp submit` again".into(),
+                format!("  if the red is the tree's and not the row's: `wsp submit {} --anyway \"why\"`", t.id),
             ]),
         };
     }
@@ -2534,8 +2534,8 @@ fn rule_gate(store: &Store, t: &Task, anyway: Option<&str>) -> Result<Vec<String
         out.extend(tail.lines().filter(|l| !l.trim().is_empty()).map(|l| format!("  | {l}")));
     }
     out.extend(said.iter().map(|l| format!("  {l}")));
-    out.push("  fix what it found and commit (`wsp commit-help`), then `wsp review` again".into());
-    out.push(format!("  if the red is the tree's and not the row's: `wsp review {} --anyway \"why\" \"account\"`", t.id));
+    out.push("  fix what it found and commit (`wsp commit-help`), then `wsp submit` again".into());
+    out.push(format!("  if the red is the tree's and not the row's: `wsp submit {} --anyway \"why\"`", t.id));
     Err(out)
 }
 

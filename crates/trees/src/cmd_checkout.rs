@@ -199,9 +199,9 @@ pub const LANDING: &str = "A row ends with its own agent's `wsp land`, which reb
      done by hand.";
 
 /// What a member of a group wsp runs is told instead of [`LANDING`]: it does not
-/// land. `wsp review` is its whole last step, and the verifier that reads its
+/// land. `wsp submit` is its whole last step, and the verifier that reads its
 /// tree lands it on a hold.
-pub const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp review`, which records the commit it is \
+pub const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp submit`, which records the commit it is \
      ready at and does not land: a verifier reads your tree, and its `wsp verified --holds` lands the row \
      (rebased on the trunk, checks rerun where the trunk moved). A block sends the row back with nothing on the \
      trunk. Never `wsp land` it yourself, and never land by hand.";
@@ -209,15 +209,15 @@ pub const READY_FLOW: &str = "A row in a run wsp runs ends with `wsp review`, wh
 /// Which way a row ends, the one fact every text about ending reads (`wsp-379`).
 ///
 /// A member of a group wsp runs a verifier for (`Placing::run`) ends with
-/// `wsp review` and never lands: the verifier's `--holds` does. A row in no such
+/// `wsp submit` and never lands: the verifier's `--holds` does. A row in no such
 /// run lands itself, then reviews. The banner, the packet's work order and the
 /// sentences wsp says about a member that did not end properly all ask this,
 /// so no two of them can tell the same row opposite things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
-    /// A member of a verified run: `wsp review` ends it, the verifier lands it.
+    /// A member of a verified run: `wsp submit` ends it, the verifier lands it.
     Verified,
-    /// Any other row: its own `wsp land`, then `wsp review`.
+    /// Any other row: its own `wsp land`, then `wsp submit`.
     Own,
 }
 
@@ -243,7 +243,7 @@ impl Flow {
     /// The `tree` row of the banner.
     pub fn tree(self) -> &'static str {
         match self {
-            Flow::Verified => "your own, and it is the whole project — commit freely; `wsp review` marks it ready and a verifier lands it, and `git show master:<path>` reads the trunk",
+            Flow::Verified => "your own, and it is the whole project — commit freely; `wsp submit` marks it ready and a verifier lands it, and `git show master:<path>` reads the trunk",
             Flow::Own => "your own, and it is the whole project — commit freely; `wsp land` puts it on the trunk, and `git show master:<path>` reads it",
         }
     }
@@ -252,12 +252,12 @@ impl Flow {
     pub fn order_end(self, task: &str) -> String {
         match self {
             Flow::Verified => format!(
-                "Then commit and end with `wsp review {task} \"...\"` (or `-` and the summary on stdin): \
+                "Then commit and end with `wsp submit {task}`, its exit written to `$WSP_EXIT` as the packet's `Your exit` says: \
                  never `wsp land` it, the verifier that reads your tree lands it."
             ),
             Flow::Own => format!(
-                "Then commit, run `wsp land {task}`, and end with `wsp review {task} \"...\"` \
-                 (or `-` and the summary on stdin): the land alone leaves the row waiting."
+                "Then commit, run `wsp land {task}`, and end with `wsp submit {task}`, its exit written to `$WSP_EXIT` as \
+                 the packet's `Your exit` says: the land alone leaves the row waiting."
             ),
         }
     }
@@ -266,7 +266,7 @@ impl Flow {
     pub fn owes(self, id: &str) -> String {
         match self {
             Flow::Verified => format!(
-                "Its work is not recorded ready: it commits what is left in its tree and ends with `wsp review {id}` \
+                "Its work is not recorded ready: it commits what is left in its tree and ends with `wsp submit {id}` \
                  again, and wsp starts the verifier on that. The verifier lands it, never the member."
             ),
             Flow::Own => format!(
@@ -1443,7 +1443,7 @@ fn check_wrote_said(dir: &Path) -> Option<String> {
         by_steps.entry(steps).or_default().push(name);
     }
     let mut out = String::from(
-        "\n  do not commit what a check step wrote: look, delete what it wrote, and have it write under $WSP_SCRATCH; then `wsp review` again",
+        "\n  do not commit what a check step wrote: look, delete what it wrote, and have it write under $WSP_SCRATCH; then `wsp submit` again",
     );
     if !own.is_empty() {
         let own: Vec<&str> = own.iter().map(String::as_str).collect();
@@ -2421,7 +2421,7 @@ fn holding(w: &Where, by_a_run: bool, ready: Option<&str>) -> Vec<String> {
             0 => {}
             n => out.push(match (by_a_run, ready) {
                 (true, Some(sha)) => format!("{} not on {} — ready at {}; a verifier lands it", n_commits(n), w.branch, &sha[..sha.len().min(10)]),
-                (true, None) => format!("{} not on {} — `wsp review` marks it ready; a verifier lands it", n_commits(n), w.branch),
+                (true, None) => format!("{} not on {} — `wsp submit` marks it ready; a verifier lands it", n_commits(n), w.branch),
                 _ => format!("{} not on {} — `wsp land {}`?", n_commits(n), w.branch, w.task),
             }),
         }
@@ -2454,7 +2454,7 @@ pub fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option<(Strin
             return Err(format!("{} is not clean, so there is no commit to be ready at{said}", util::contract(&w.dir)));
         }
         return Err(format!(
-            "{} has uncommitted work — commit it (`wsp commit-help`), then `wsp review` again: a verifier reads the tree at the commit you are ready at",
+            "{} has uncommitted work — commit it (`wsp commit-help`), then `wsp submit` again: a verifier reads the tree at the commit you are ready at",
             util::contract(&w.dir)
         ));
     }
@@ -2495,7 +2495,7 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
             return Prepared::Refused(format!("wsp: {tree} is not clean, so the rebase onto {} could not be made{said}", w.branch));
         }
         return Prepared::Refused(format!(
-            "wsp: {tree} has uncommitted work, so the rebase onto {} could not be made — commit it (`wsp commit-help`), then `wsp review` again",
+            "wsp: {tree} has uncommitted work, so the rebase onto {} could not be made — commit it (`wsp commit-help`), then `wsp submit` again",
             w.branch
         ));
     }
@@ -2504,7 +2504,7 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     }
     if let Err(e) = rebase_onto(&w.dir, &w.branch) {
         let said = abort_rebase(&w.dir, &w.branch, &e);
-        return Prepared::Refused(format!("wsp: {said}\nresolve it in {tree}, then `wsp review` again"));
+        return Prepared::Refused(format!("wsp: {said}\nresolve it in {tree}, then `wsp submit` again"));
     }
     match git(&w.dir, &["rev-parse", "HEAD"]) {
         Some(head) => Prepared::Rebased { head: head.trim().to_string(), branch },
@@ -3074,7 +3074,7 @@ fn still_wants_review(status: Option<crate::model::Status>, task: &str) -> Optio
     use crate::model::Status::*;
     match status? {
         Inbox | Todo | Doing | Blocked | Parked => {
-            Some(format!("landed, not finished: end the row with `wsp review {task} \"...\"`"))
+            Some(format!("landed, not finished: end the row with `wsp submit {task}`"))
         }
         Review | Done => None,
     }
@@ -3206,7 +3206,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
                 }
                 Err(Refusal::Raced(said)) => Verdict::Blocked(format!(
                     "wsp: the hold could not land {task}: it lost the race to the shared remote {} times — {said}; nothing was landed, \
-                     `wsp review` again when the remote settles",
+                     `wsp submit` again when the remote settles",
                     races + 1
                 )),
                 Err(Refusal::NotFastForward(_)) if moved(&w) => continue,
@@ -3219,7 +3219,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
         if rebases == ROUNDS {
             return Verdict::Blocked(format!(
                 "wsp: {} moved {ROUNDS} times while its checks ran — the trunk is moving faster than they finish, so nothing was landed; \
-                 `wsp review` again when it settles",
+                 `wsp submit` again when it settles",
                 w.branch
             ));
         }
@@ -3232,7 +3232,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
         if let Err(e) = rebase_onto(&w.dir, &w.branch) {
             let said = abort_rebase(&w.dir, &w.branch, &e);
             return Verdict::Blocked(format!(
-                "wsp: {} moved since the rebase and the rebase does not apply: {said}\nresolve it in {tree}, then `wsp review` again",
+                "wsp: {} moved since the rebase and the rebase does not apply: {said}\nresolve it in {tree}, then `wsp submit` again",
                 w.branch
             ));
         }
@@ -3247,7 +3247,7 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
             Rerun::Unplanned(why) => {
                 return Verdict::Blocked(format!(
                     "wsp: {} moved and the rebase pulled in {} path(s), but the checks it can affect could not be planned: {why} — nothing was landed; \
-                     `wsp review` again once that is fixed",
+                     `wsp submit` again once that is fixed",
                     w.branch,
                     pulled_in.len()
                 ))
@@ -3373,7 +3373,7 @@ mod tests {
     fn a_land_on_a_row_still_being_worked_names_wsp_review_last() {
         use crate::model::Status;
         let line = still_wants_review(Some(Status::Doing), "wsp-9").unwrap();
-        assert!(line.contains("`wsp review wsp-9 ") && line.is_ascii(), "{line}");
+        assert!(line.contains("`wsp submit wsp-9`") && line.is_ascii(), "{line}");
         assert_eq!(still_wants_review(Some(Status::Review), "wsp-9"), None, "already reviewed");
         assert_eq!(still_wants_review(Some(Status::Done), "wsp-9"), None);
         assert_eq!(still_wants_review(None, "wsp-9"), None, "not in the store");

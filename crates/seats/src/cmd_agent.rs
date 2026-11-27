@@ -5218,7 +5218,7 @@ fn state_verb(store: &Store, _args: &Args) -> i32 {
 /// <id>` here passed it on to a member as "finish with `wsp done`" — a verb
 /// agents are denied by the decision of 2026-08-19, so the member stopped and
 /// the row sat at `doing`. It says whose verb each is, and what a member does.
-const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a member finishes with wsp review";
+const REVIEW_VERBS: &str = "the person's: wsp done <id> · wsp reopen <id> — a member finishes with wsp submit";
 
 /// What the STATE column says of a seat whose prompt holds text nobody sent.
 const UNSENT_WORD: &str = "typed, not sent";
@@ -10096,7 +10096,7 @@ mod tests {
         let line = text.lines().find(|l| l.contains("REVIEW")).expect("a REVIEW line");
         assert!(line.contains("the person's"), "{line}");
         assert!(line.contains("wsp done <id>"), "{line}");
-        assert!(line.contains("a member finishes with wsp review"), "{line}");
+        assert!(line.contains("a member finishes with wsp submit"), "{line}");
     }
 
     /// `--terse` cuts the blocked list to its count and nothing else. `wip` is

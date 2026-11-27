@@ -234,7 +234,7 @@ pub fn done_allowed(role: &Role, status: Status, owes: Option<bool>) -> Result<(
     match role {
         Role::Outside => Ok(()),
         Role::Governor(_) => Err("done is Ed's bookkeeping; a governor finishes nothing with it".into()),
-        Role::Seat => Err("a member finishes with `wsp review`".into()),
+        Role::Seat => Err("a member finishes with `wsp submit`".into()),
         Role::Primary => {
             if status != Status::Review {
                 return Err(format!("the primary seat marks done only rows at review — this one is {}", status.as_str()));
@@ -838,7 +838,7 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                 section: crate::verbs::Section::Tasks,
                 order: 200,
                 text: r##"  wsp done <id> [--force]           the person's verb (a member finishes with
-                                    `wsp review`); complete; --force over open sub-tasks. Its
+                                    `wsp submit`); complete; --force over open sub-tasks. Its
                                     worktree and branch go too when the work is
                                     on the trunk and nobody is in it; otherwise
                                     kept and said why. --keep-tree leaves it"##,

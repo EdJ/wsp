@@ -143,7 +143,7 @@ pub fn caption_of(baton: &str) -> String {
 /// ASCII, because a leg's order goes out in argv.
 pub fn how_to_close(task: &str, last: bool) -> String {
     let what = match last {
-        true => "it ends the row, as `wsp review` did",
+        true => "it ends the row",
         false => "it closes the leg, as `wsp leg done` did, with the file as the baton",
     };
     format!("{} ({what}).", submit_words(task))
@@ -1003,7 +1003,7 @@ fn flag_member(store: &Store, t: &crate::model::Task, seat: &str, evidence: &str
     if !flag_once(store, &format!("member/{}/{}", t.id, start.unwrap_or(0))) {
         return;
     }
-    let fix = format!("The close is `wsp review {}` from the member's seat once the tree is committed and the verdict is written, or `wsp reopen {} \"what is owed\"`.", t.id, t.id);
+    let fix = format!("The close is `wsp submit {}` from the member's seat once the tree is committed and the verdict is written, or `wsp reopen {} \"what is owed\"`.", t.id, t.id);
     flag_about(store, &t.id, "the member", seat, evidence, &fix, None, governor);
 }
 

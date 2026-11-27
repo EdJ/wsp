@@ -1049,9 +1049,27 @@ mod tests {
     fn the_order_is_one_line_naming_the_verb_and_the_row() {
         let o = order("wsp-9", Flow::Own);
         assert!(!o.contains('\n') && o.contains("`wsp packet wsp-9`"));
-        assert!(o.contains("`wsp land wsp-9`") && o.contains("`wsp review wsp-9 "), "{o}");
+        assert!(o.contains("`wsp land wsp-9`") && o.contains("`wsp submit wsp-9`"), "{o}");
         assert!(!o.contains("as your brief says"), "a short start carries almost no brief: {o}");
         assert!(o.is_ascii(), "a spawn once hung on one character");
+    }
+
+    /// `wsp-928`: the order said `wsp review` while the packet's exit said
+    /// `wsp submit`. Both name one verb and one exit, in both flows.
+    #[test]
+    fn a_members_packet_and_its_order_name_one_closing_verb_and_one_exit() {
+        let dir = tree("closing", &[("src/a.rs", "pub fn a() {}\n")]);
+        let t = retro("Make the size show.", "file: src/a.rs");
+        let packet = build(&t, &dir).unwrap();
+        assert!(packet.contains("`wsp submit t-1` alone") && packet.contains("## Your exit"), "{packet}");
+        assert!(!packet.contains("wsp review"), "{packet}");
+        for verified in [true, false] {
+            let o = order_for(&t, &dir, Flow::of(verified));
+            assert!(o.contains("end with `wsp submit t-1`"), "{o}");
+            assert!(o.contains("$WSP_EXIT") && o.contains("`Your exit`"), "{o}");
+            assert!(!o.contains("wsp review") && !o.contains('\n') && o.is_ascii(), "{o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A tree under the temp dir with `files` written in it, for the scope tests.
@@ -1089,7 +1107,7 @@ mod tests {
         let o = order_for(&missed, &dir, Flow::of(true));
         assert!(o.contains(SEARCH_RULE) && !o.contains(NARROW), "{o}");
         assert!(o.contains("search the tree") && o.contains("read only what that search finds") && o.contains("say in your exit"), "{o}");
-        assert!(o.contains("`wsp packet t-1`") && o.contains("`wsp review t-1 ") && !o.contains('\n') && o.is_ascii(), "{o}");
+        assert!(o.contains("`wsp packet t-1`") && o.contains("`wsp submit t-1`") && !o.contains('\n') && o.is_ascii(), "{o}");
         let printed = build(&missed, &dir).unwrap();
         assert_eq!(printed.matches(SEARCH_RULE).count(), 1, "the print says it too: {printed}");
 
@@ -1224,19 +1242,19 @@ A test over a leg record whose seat ended at T and whose line stays `running` to
     }
 
     /// `wsp-379`: the order and the banner are one decision. A verified member
-    /// is told to end with `wsp review` and never to land, in both; a plain row
+    /// is told to end with `wsp submit` and never to land, in both; a plain row
     /// is told to land, in both.
     #[test]
     fn a_verified_member_and_a_plain_row_are_each_told_one_flow_by_order_and_banner() {
         let verified = order("wsp-9", Flow::of(true));
-        assert!(verified.contains("`wsp review wsp-9 ") && verified.contains("never `wsp land`"), "{verified}");
+        assert!(verified.contains("`wsp submit wsp-9`") && verified.contains("never `wsp land`"), "{verified}");
         assert!(!verified.contains("run `wsp land"), "{verified}");
         assert_eq!(Flow::of(true).banner(), crate::cmd_checkout::READY_FLOW);
         assert!(Flow::of(true).banner().contains("Never `wsp land`"));
         assert!(Flow::of(true).tree().contains("a verifier lands it"));
 
         let plain = order("wsp-9", Flow::of(false));
-        assert!(plain.contains("run `wsp land wsp-9`") && plain.contains("`wsp review wsp-9 "), "{plain}");
+        assert!(plain.contains("run `wsp land wsp-9`") && plain.contains("`wsp submit wsp-9`"), "{plain}");
         assert!(!plain.contains("never `wsp land`"), "{plain}");
         assert_eq!(Flow::of(false).banner(), crate::cmd_checkout::LANDING);
         assert!(Flow::of(false).tree().contains("`wsp land` puts it on the trunk"));

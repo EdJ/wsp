@@ -361,7 +361,7 @@ fn done(store: &Store, args: &Args, task: &str, pane: Option<&str>) -> Result<()
     }
     let ready = legs::ready(&new);
     match (ready.is_empty(), legs::lasts(&new).first() == Some(&name)) {
-        (_, true) => println!("  {}", p.dim(&format!("{name} is the last leg — `wsp review {} \"…\"` ends the row", t.id))),
+        (_, true) => println!("  {}", p.dim(&format!("{name} is the last leg — `wsp submit {}` ends the row", t.id))),
         (true, false) => println!("  {}", p.dim("nothing is ready yet — legs still running hold the rest")),
         (false, false) => println!("  {}", p.dim(&format!("ready: {}", ready.join(", ")))),
     }
@@ -584,15 +584,19 @@ pub fn brief_lines(tasks: &[Task], pane: &str) -> Option<Vec<String>> {
     let last = legs::lasts(&all).first() == Some(&name);
     let verb = match last {
         true => format!(
-            "you are the last leg: `wsp review {} \"…\"` closes your leg and ends the row (if you add a leg after yourself, \
-             `wsp leg done` instead)",
+            "`wsp submit {}` - you are the last leg: it closes your leg and ends the row (if you add a leg after \
+             yourself, the same submit closes only your leg). Its exit is a member's (`summary:`, the account, \
+             `done-when:`, `checks:`, `asks:`, `owed:`)",
             t.id
         ),
-        false => format!("`wsp leg done {} --caption \"…\"`", t.id),
+        false => format!(
+            "`wsp submit {}` - it closes the leg. Its exit (`summary:`, the account, `checks:`, `owed:`) is the \
+             baton: at most {cap} characters, pointers not a plan",
+            t.id
+        ),
     };
     out.push(format!(
-        "finish: commit, then {verb} — a baton of at most {cap} characters, pointers not a plan, \
-         written first with a heredoc into $WSP_BATON, which the closing verb reads. \
+        "finish: commit, then {verb}, written first with a heredoc into $WSP_EXIT, which the closing verb reads. \
          The closing verb is its own Bash call, never chained after another command",
     ));
     Some(out)
@@ -626,6 +630,7 @@ mod tests {
         assert!(mid.contains("`wsp submit m-1 --dry-run` once") && mid.contains("closes the leg"), "{mid}");
         let last = order_line("m-1", "build", false, true);
         assert!(last.contains("last leg: end with `wsp submit m-1`") && last.contains("ends the row"), "{last}");
+        assert!(!last.contains("wsp review"), "{last}");
         assert!(!last.contains('\n') && last.is_ascii(), "{last:?}");
     }
 
@@ -715,13 +720,13 @@ mod tests {
         assert!(brief.contains("baton from scout:\nthree layers: store"), "{brief}");
         assert!(brief.contains("your order: decide"), "{brief}");
         assert!(brief_lines(&tasks, "cpd-99").is_none(), "no block for a seat that is no leg's");
-        assert!(brief.contains("finish: commit, then `wsp leg done m-1") && !brief.contains("wsp review"), "{brief}");
+        assert!(brief.contains("finish: commit, then `wsp submit m-1`") && brief.contains("$WSP_EXIT") && !brief.contains("wsp review"), "{brief}");
 
-        // Plan, then build, which is the last leg and types review.
+        // Plan, then build, which is the last leg.
         assert_eq!(done("cpd-32", Some("plan made"), None), 0);
         seat_leg(&store, &tree, "build", "cpd-33");
         let last = brief_lines(&store.tasks(), "cpd-33").unwrap().join("\n");
-        assert!(last.contains("you are the last leg: `wsp review m-1") && !last.contains("then `wsp leg done"), "{last}");
+        assert!(last.contains("then `wsp submit m-1` - you are the last leg") && !last.contains("wsp review") && !last.contains("wsp leg done"), "{last}");
         on_review(&store, "m-1", "built it", Some("cpd-33")).unwrap();
         let ls = legs::legs(&store.find_task("m-1").unwrap());
         assert!(ls.iter().all(|l| l.state == State::Done), "{ls:?}");

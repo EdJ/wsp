@@ -4006,7 +4006,7 @@ pub fn sent_back_order(t: &Task) -> Option<String> {
         // Not a verdict: the member asked, and was answered (`wsp-635`).
         return Some(ascii_line(&format!(
             " {id} was blocked on a question and the run reopened it, so it is yours to carry on: {reason}. \
-             The decision is under ## Decisions (`wsp show {id}`). Act on it, commit, and `wsp review {id}` when done.",
+             The decision is under ## Decisions (`wsp show {id}`). Act on it, commit, and `wsp submit {id}` when done.",
             id = t.id,
         )));
     }
@@ -4017,7 +4017,7 @@ pub fn sent_back_order(t: &Task) -> Option<String> {
         .unwrap_or_default();
     let text = format!(
         " {id} was sent back to doing, so it is yours to fix: {reason}.{verdict} The whole verdict is under ## Verification (`wsp show {id}`). \
-         Fix what it found and commit; `wsp review {id}` is refused at a commit a verifier already blocked, unchanged.",
+         Fix what it found and commit; `wsp submit {id}` is refused at a commit a verifier already blocked, unchanged.",
         id = t.id,
     );
     Some(ascii_line(&text))
@@ -6810,7 +6810,7 @@ pub mod tests {
         t.log("claimed by pane cpd-9");
         store.save_task(&t).unwrap();
         let said = sent_back_order(&store.find_task("m-1").unwrap()).expect("a sent-back row gives its seat the reason");
-        assert!(said.contains("sent back") && said.contains("## Verification") && said.contains("wsp review m-1"), "{said}");
+        assert!(said.contains("sent back") && said.contains("## Verification") && said.contains("wsp submit m-1"), "{said}");
         assert!(said.is_ascii() && !said.contains('\n'), "{said:?}");
         let head = passes_on(&store, "m-1")[0].text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().to_string();
         assert!(head.is_empty() || said.contains(&head), "the verdict's head is in it: {said}");
@@ -10612,7 +10612,7 @@ fn only_a_working_screen_is_ever_overruled() {
         let told = drained(&TOLD);
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(told[0].contains("m-1 is at review with 1 commit not on master"), "{}", told[0]);
-        assert!(told[0].contains("`wsp review m-1`") && !told[0].contains("`wsp land m-1`"), "{}", told[0]);
+        assert!(told[0].contains("`wsp submit m-1`") && !told[0].contains("`wsp land m-1`"), "{}", told[0]);
 
         git(&["merge", "--ff-only", "--quiet", "m-1"]);
         told_about_task(&store, "m-1", "review");

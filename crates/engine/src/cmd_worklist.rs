@@ -6637,7 +6637,7 @@ fn followup_blocking(store: &Store, args: &Args, id: &str, at: usize, row: &str,
     println!(
         "  {}",
         p.dim(&format!(
-            "wsp starts and verifies them, and a fresh check reads the group once they land — finish with `wsp review {row} -`"
+            "wsp starts and verifies them, and a fresh check reads the group once they land — finish with `wsp submit {row}`"
         ))
     );
     if !ending.is_empty() {

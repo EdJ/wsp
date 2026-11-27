@@ -2261,7 +2261,7 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         // marker keys both, so it hears this as often as the seat does.
         tell_member(store, &s.id, &format!(
             "wsp: {} is at {} but not on the trunk — {why} — so no verifier can start and the {} run \
-             waits on you. {} Never `wsp land` it or land by hand; if `wsp review` is refused, `wsp ask` about it. \
+             waits on you. {} Never `wsp land` it or land by hand; if `wsp submit` is refused, `wsp ask` about it. \
              If nothing has been recorded {} min from now and this seat is idle or gone, wsp lands \
              it for you when the rebase is clean, and flags the person when it is not.",
             s.id,
@@ -4795,7 +4795,7 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         tick(&store, &Fake::empty(), &mut Pass::new());
         assert!(key(&store, "m-1").is_none(), "there is no landing to record");
         assert!(
-            governed().iter().any(|g| g.contains("`wsp review m-1`") && !g.contains("`wsp land m-1`")),
+            governed().iter().any(|g| g.contains("`wsp submit m-1`") && !g.contains("`wsp land m-1`")),
             "and the run is told to land it instead: {:?}",
             governed()
         );
@@ -4828,13 +4828,13 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         );
         let gov = governed();
         assert_eq!(gov.len(), 1, "and told: {gov:?}");
-        assert!(gov[0].contains("`wsp review m-1`") && !gov[0].contains("`wsp land m-1`"), "{}", gov[0]);
+        assert!(gov[0].contains("`wsp submit m-1`") && !gov[0].contains("`wsp land m-1`"), "{}", gov[0]);
         // `wsp-226`: and the member, on its own pane, because a governor does
         // not relay and the member is the one who can land.
         let told = member_told();
         assert_eq!(told.len(), 1, "the member is told too: {told:?}");
         assert_eq!(told[0].0, "m-1", "on its own pane: {told:?}");
-        assert!(told[0].1.contains("`wsp review m-1`") && !told[0].1.contains("`wsp land m-1`"), "with the line that moves it: {}", told[0].1);
+        assert!(told[0].1.contains("`wsp submit m-1`") && !told[0].1.contains("`wsp land m-1`"), "with the line that moves it: {}", told[0].1);
 
         // `wsp-338`: said once per reason, in the log as to the seat — a line a
         // minute for the same wait was the retro-8 noise.
@@ -4874,7 +4874,7 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
             // One status line per tick at most, and never two that disagree.
             assert!(lines.len() <= 1, "tick {n}: one line for the row, not two: {lines:?}");
             assert!(!lines.iter().any(|l| l.contains("nothing was started for it")), "tick {n}: the repair's twin line is gone: {lines:?}");
-            let ordered = lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count();
+            let ordered = lines.iter().filter(|l| l.contains("ends with `wsp submit m-1`")).count();
             assert_eq!(ordered, usize::from(n == 0), "tick {n}: the order is given once: {lines:?}");
             assert!(member_told().is_empty(), "tick {n}: nothing holds m-1, so nothing is sent to it");
             let gov = governed();
@@ -4946,7 +4946,7 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         assert_eq!(status.len(), 1, "the status once: {lines:#?}");
         assert!(status[0].contains("m-1 is at done with 10 commits not on master"), "the one state it has: {}", status[0]);
         assert!(!lines.iter().any(|l| l.contains("is at review")), "never a second, contradicting state: {lines:#?}");
-        assert!(lines.iter().filter(|l| l.contains("ends with `wsp review m-1`")).count() <= 1, "the order at most once");
+        assert!(lines.iter().filter(|l| l.contains("ends with `wsp submit m-1`")).count() <= 1, "the order at most once");
         let gov = governed();
         assert_eq!(gov.len(), 2, "the seat told twice in all, no seat and the refusal: {gov:#?}");
         let refused = lines.iter().find(|l| l.contains("could not land it")).expect("the refusal is logged");
