@@ -101,6 +101,20 @@ impl<'a> Door<'a> {
 
     /// `obj`, delivered by the hub on `by`'s behalf, into the files.
     pub fn import(&self, obj: &Object, by: &Principal) -> Result<Applied, Refusal> {
+        self.import_as(obj, by, false)
+    }
+
+    /// `obj` written whole over a file the caller keeps at its row's path only
+    /// as a placeholder (the spoke's head-only stub, wsp-465): imported as if
+    /// there were no file, in the one atomic write [`cmd_task::file_new`] ends
+    /// in, so a reader finds the placeholder or the row and never neither.
+    /// The placeholder's synced head is not the record's parent and is not
+    /// asked; the record's own head and file are recorded after the write.
+    pub fn import_over(&self, obj: &Object, by: &Principal) -> Result<Applied, Refusal> {
+        self.import_as(obj, by, true)
+    }
+
+    fn import_as(&self, obj: &Object, by: &Principal, over: bool) -> Result<Applied, Refusal> {
         let Object::Record { subject, entity, parent, .. } = obj else {
             return Err(Refusal::NotYet("an event".into()));
         };
@@ -119,7 +133,7 @@ impl<'a> Door<'a> {
         let caller = Caller::hub(&user_of(by));
         let mut heads = Heads::read(self.store);
         self.make_way(&row.id.0)?;
-        let local = self.store.task(&row.id.0);
+        let local = if over { None } else { self.store.task(&row.id.0) };
         let mut t = task_of_record(row).ok_or_else(|| Refusal::Unreadable(row.id.clone()))?;
         // The file is still the one the synced head left: no local write since.
         let unmoved = |heads: &Heads, subject: &Subject| heads.file(subject) == file_digest(self.store, &row.id.0);

@@ -151,9 +151,9 @@ impl Spoke {
         }
     }
 
-    /// `show` finds the row and it is no head. It finds none for a moment while
-    /// the head's stub is gone and the sync has not yet adopted the row, so a
-    /// wait asks this and not [`Spoke::ok`].
+    /// `show` finds the row and it is no head. The stub stays until the whole
+    /// row is written over it (`hub_cache`), so `show` finds one or the other
+    /// throughout; a wait still asks this, since the row is a head until then.
     fn whole(&self, row: &str) -> bool {
         let (ok, out) = self.run(&["show", row]);
         ok && !out.contains("head only")

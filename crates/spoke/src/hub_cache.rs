@@ -9,8 +9,13 @@
 //! status, holder and allocation, kept in `$WSP_STATE/hub/heads.json`
 //! ([`Cache`]) and shown in `ls` as a file with no body (a stub the door never
 //! pushes back: [`crate::hub_sync::push_record`] sends nothing for a head).
-//! `wsp show <id> --fetch` makes it whole, as does leasing or allocating it
-//! ([`promote`]: the stub goes and the next sync adopts the row's objects).
+//! `wsp show <id> --fetch` makes it whole, as does leasing or allocating it:
+//! [`classify`] hands the row to the sync whole, which imports the hub's line
+//! with the first record written over the stub in one atomic write
+//! (`Door::import_over`), and only then drops the cache entry ([`drop_head`]).
+//! The stub stays until the whole row replaces it, so a reader (`wsp show`)
+//! finds the head or the row at every step, never neither, and a turn the hub
+//! cuts short leaves the head as it was.
 //!
 //! **Why a field of the cache and not of `sync.heads`.** The hub's heads are ids
 //! only, and widening the wire's `sync.heads` is the hub's row, not the
@@ -221,19 +226,13 @@ pub fn keep_head(store: &Store, cache: &mut Cache, row: &Row, workspace: &str, t
     heads.write(store).map_err(|e| e.to_string())
 }
 
-/// A head becomes the spoke's own: its stub, synced head and cache entry go, so
-/// that the next sync finds a row it lacks and adopts it, objects and all.
-pub fn promote(store: &Store, cache: &mut Cache, row: &str) {
-    if cache.0.remove(row).is_none() {
-        return;
+/// A head the sync has made whole: its cache entry goes, once the row's file
+/// is the whole row (the stub was written over, never removed first).
+pub fn drop_head(store: &Store, row: &str) {
+    let mut cache = Cache::read(store);
+    if cache.0.remove(row).is_some() {
+        let _ = cache.write(store);
     }
-    let path = store.task_path(row);
-    let _ = std::fs::remove_file(&path);
-    store.wrote(path);
-    let mut heads = Heads::read(store);
-    heads.remove(&Subject::Row(RowId(row.to_string())));
-    let _ = heads.write(store);
-    let _ = cache.write(store);
 }
 
 /// What one workspace's classification decided.
@@ -241,15 +240,19 @@ pub fn promote(store: &Store, cache: &mut Cache, row: &str) {
 pub struct Classified {
     /// Subjects the sync takes whole: new own rows (and `forced`).
     pub whole: BTreeSet<Subject>,
+    /// Of `whole`, the rows kept here as heads until now: their stubs stay
+    /// until the sync writes the whole row over them.
+    pub promoting: BTreeSet<Subject>,
     /// Heads written or moved.
     pub heads: usize,
 }
 
 /// Sort the hub's heads of `workspace` into whole and head. A subject the
 /// spoke has no file for, or holds only as a head at another id, is read from
-/// its one head object: own, it goes to the sync whole (`promote`d first if it
-/// was a head); otherwise its head is kept. `forced` is taken whole as asked
-/// (`wsp show --fetch`).
+/// its one head object: own, it goes to the sync whole (and to `promoting` if
+/// it was a head, its stub left in place); otherwise its head is kept.
+/// `forced` is taken whole as asked (`wsp show --fetch`). Nothing here removes
+/// a file.
 pub fn classify(
     store: &Store,
     client: &mut Client,
@@ -265,7 +268,9 @@ pub fn classify(
     for (subject, to) in &hub.heads {
         let Subject::Row(id) = subject else { continue };
         if forced.contains(subject) {
-            promote(store, &mut cache, &id.0);
+            if cache.is_head(&id.0) {
+                out.promoting.insert(subject.clone());
+            }
             out.whole.insert(subject.clone());
             continue;
         }
@@ -273,7 +278,7 @@ pub fn classify(
             Some(h) if h.head == to.to_string() => {
                 // Unchanged; leased or allocated since it was kept: whole.
                 if is_own(store, &cache, me, &id.0, h.allocation.as_deref()) {
-                    promote(store, &mut cache, &id.0);
+                    out.promoting.insert(subject.clone());
                     out.whole.insert(subject.clone());
                 }
             }
@@ -300,7 +305,9 @@ pub fn classify(
         };
         let allocation = task_of_record(&row).and_then(|t| t.for_user);
         if is_own(store, &cache, me, &row.id.0, allocation.as_deref()) {
-            promote(store, &mut cache, &row.id.0);
+            if cache.is_head(&row.id.0) {
+                out.promoting.insert(subject.clone());
+            }
             out.whole.insert(subject);
         } else if let Err(why) = keep_head(store, &mut cache, &row, workspace, to, by) {
             wsp_engine::store::log_line(store, &format!("hub-sync: the head of {} was not kept: {why}", row.id.0));
@@ -387,18 +394,34 @@ mod tests {
         assert!(is_own(&store, &h, "bob", "wsp-7", Some("bob")), "allocated to bob: his");
     }
 
+    /// The whole row is written over the stub by the door, then the cache
+    /// entry goes: the file is there throughout, and the synced head is the
+    /// record's.
     #[test]
-    fn promoting_a_head_takes_its_stub_so_the_next_sync_adopts_the_row() {
+    fn a_head_made_whole_is_written_over_its_stub_and_then_leaves_the_cache() {
         let (_env, store) = scratch("hc-promote");
         let row = record("wsp-8", "Taken on", None);
         let mut cache = Cache::default();
         keep_head(&store, &mut cache, &row, "shared:mp", ObjectId::of(b"h"), &ann()).unwrap();
-        assert!(store.task("wsp-8").is_some());
-        promote(&store, &mut cache, "wsp-8");
-        assert!(store.task("wsp-8").is_none(), "the stub is gone");
+        assert!(store.task("wsp-8").is_some_and(|t| !t.body.contains("the whole text")));
+        let obj = Object::Record {
+            workspace: wsp_objects::WorkspaceId("shared:mp".into()),
+            subject: Subject::Row(RowId("wsp-8".into())),
+            entity: Entity::Row(row),
+            parent: None,
+            by: ann(),
+            at: wsp_store_contract::At(1),
+        };
+        let door = wsp_engine::door::Door::new(&store, &wsp_engine::door::Unreconciled);
+        assert!(door.import(&obj, &ann()).is_err(), "over a stub, a plain import is a divergence");
+        door.import_over(&obj, &ann()).expect("written over the stub");
+        assert!(store.task("wsp-8").is_some_and(|t| t.body.contains("the whole text")), "whole");
+        assert!(Cache::read(&store).is_head("wsp-8"), "the entry stays until the caller drops it");
+        drop_head(&store, "wsp-8");
         assert!(!Cache::read(&store).is_head("wsp-8"));
-        assert!(Heads::read(&store).head(&Subject::Row(RowId("wsp-8".into()))).is_none());
+        assert_eq!(Heads::read(&store).head(&Subject::Row(RowId("wsp-8".into()))), Some(&wsp_objects::encode(&obj).0));
         assert!(show_line(&store, "wsp-8").is_none());
+        assert!(wsp_engine::door::pending(&store).is_empty(), "the import is nothing to push back");
     }
 
     #[test]

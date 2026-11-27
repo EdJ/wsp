@@ -565,6 +565,10 @@ pub struct Worker {
     release_after: Vec<(RowId, Token)>,
     /// Rows whose lease the hub would not say this turn: nothing of them pushed.
     held_back: BTreeSet<Subject>,
+    /// A test's look at the store between the steps of one workspace's sync,
+    /// by the step's name: what a reader of the files sees there.
+    #[cfg(test)]
+    seam: Option<Box<dyn FnMut(&Store, &str)>>,
 }
 
 impl Worker {
@@ -584,6 +588,16 @@ impl Worker {
             by: None,
             release_after: Vec::new(),
             held_back: BTreeSet::new(),
+            #[cfg(test)]
+            seam: None,
+        }
+    }
+
+    /// The test's look at `store` after the step `step`; nothing outside a test.
+    fn seam(&mut self, _store: &Store, _step: &str) {
+        #[cfg(test)]
+        if let Some(f) = self.seam.as_mut() {
+            f(_store, _step);
         }
     }
 
@@ -978,10 +992,12 @@ impl Worker {
             }
         };
         turned.heads += classified.heads;
+        self.seam(store, "classified");
         // What the journal holds from before (an outage, a crash), settled by
         // each row's lease and put in order, before anything new is pushed.
         self.settle(store, ws, &hub, by, turned)?;
         let heads = Heads::read(store);
+        let promoting = classified.promoting.clone();
         let (mut local, pushing, included) = self.pending(store, ws, tasks, by, &objects, &heads, classified.whole);
         for (subject, id) in Sides::read(store).notice_heads(ws) {
             local.set(subject, id);
@@ -996,7 +1012,8 @@ impl Worker {
                 return Ok(());
             }
         };
-        self.keep(store, &objects, &heads, &pushing, &report, by, turned);
+        self.seam(store, "synced");
+        self.keep(store, &objects, &heads, &pushing, &promoting, &report, by, turned);
         self.after_push(store, &report)
     }
 
@@ -1376,7 +1393,9 @@ impl Worker {
     }
 
     /// What a sync's report leaves in the store: the moved heads synced, the
-    /// hub's objects kept, its heads through the door, the rest reconciled.
+    /// hub's objects kept, its heads through the door, the rest reconciled. A
+    /// row of `promoting` (a head made whole) takes the hub's whole line, its
+    /// first record written over the stub and the cache entry dropped after.
     #[allow(clippy::too_many_arguments)]
     fn keep(
         &mut self,
@@ -1384,6 +1403,7 @@ impl Worker {
         objects: &ObjectDir,
         before: &Heads,
         pushing: &BTreeMap<Subject, (ObjectId, Option<ObjectId>)>,
+        promoting: &BTreeSet<Subject>,
         report: &SyncReport,
         by: &Principal,
         turned: &mut Turned,
@@ -1419,11 +1439,13 @@ impl Worker {
                 continue;
             }
             // The hub's line from the head this spoke synced, oldest first, so
-            // each import follows the one before it.
+            // each import follows the one before it. A stub's synced head is
+            // the head it was read from, not a file of the row: its whole line.
+            let over = promoting.contains(s);
             let mut line = Vec::new();
             let mut at = Some(head);
             while let Some(id) = at {
-                if Some(&id) == before.head(s) {
+                if !over && Some(&id) == before.head(s) {
                     break;
                 }
                 let Some(obj) = Objects::object(objects, &id) else { break };
@@ -1451,14 +1473,24 @@ impl Worker {
                 }
                 continue;
             }
-            for obj in line.iter().rev() {
-                match door.import(obj, by) {
+            let mut whole = over;
+            for (n, obj) in line.iter().rev().enumerate() {
+                let imported = match over && n == 0 {
+                    true => door.import_over(obj, by),
+                    false => door.import(obj, by),
+                };
+                match imported {
                     Ok(_) => turned.adopted += 1,
                     Err(r) => {
                         self.say_once(store, format!("hub-sync: the hub's {s:?} was not taken: {r:?}"));
+                        whole = false;
                         break;
                     }
                 }
+            }
+            // Whole now: the head's cache entry goes, after the file is the row.
+            if let (true, Subject::Row(row)) = (whole && !line.is_empty(), s) {
+                hub_cache::drop_head(store, &row.0);
             }
         }
         if sides != sides_were {
@@ -1577,6 +1609,107 @@ mod tests {
         assert!(held(&journal) <= 1 && journal.by_subject().get(&subject).is_none_or(|(_, es)| es.iter().all(|e| e.id == id)), "no twin in the journal");
         drop(hub);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the stub-to-whole swap ----
+
+    /// Ann's spoke and Bo's, members of `mp`: Bo's row `wsp-1` pushed to the
+    /// hub and kept on Ann's spoke as a head (its stub, and the cache entry).
+    /// `None` when no hub is named.
+    fn a_head_on_anns_spoke(tag: &str) -> Option<(TestHub, wsp_engine::util::Isolated, Store, PathBuf, BTreeMap<String, String>)> {
+        let hub = TestHub::start(Setup::default())?;
+        let tokens = hub.seed_members(&["mp"], &["ann", "bo"]);
+        let env = wsp_engine::util::isolated(tag);
+        let dir = env.path("spokes");
+        let side = |who: &str| {
+            let store = Store::at(dir.join(who).join("wsp"), dir.join(who).join("state"));
+            store.ensure_dirs().unwrap();
+            let home = dir.join(who).join("home");
+            hub.login(&home, who, &tokens[who]);
+            (store, home)
+        };
+        let (bo, bo_home) = side("bo");
+        let mut t = wsp_engine::model::Task::new("Bo's work", "wsp-1");
+        t.project = Some("wsp".into());
+        t.workspace = "shared:mp".parse().unwrap();
+        t.body = "## Overview\nthe whole text\n".into();
+        bo.save_task(&t).unwrap();
+        Worker::new(bo_home).turn(&bo).expect("bo's turn");
+        let (ann, ann_home) = side("ann");
+        Worker::new(ann_home.clone()).turn(&ann).expect("ann's turn");
+        assert!(hub_cache::is_head(&ann, "wsp-1"), "a head on ann's spoke");
+        assert!(ann.task("wsp-1").is_some_and(|t| !t.body.contains("the whole text")), "its stub, without the text");
+        Some((hub, env, ann, ann_home, tokens))
+    }
+
+    /// What a reader of Ann's files sees at each step of a turn: whether
+    /// `show` finds the row, and whether it is still a head.
+    type Seen = std::rc::Rc<std::cell::RefCell<Vec<(String, bool, bool)>>>;
+
+    fn watching(worker: &mut Worker, row: &'static str) -> Seen {
+        let seen: Seen = Default::default();
+        let s = seen.clone();
+        worker.seam = Some(Box::new(move |store: &Store, step: &str| {
+            s.borrow_mut().push((step.to_string(), store.task(row).is_some(), hub_cache::is_head(store, row)));
+        }));
+        seen
+    }
+
+    /// `wsp show --fetch` on a head: at no step of the swap is the row gone
+    /// from the files. Before, `promote` took the stub away while the turn
+    /// still had the hub's objects to fetch and import, and `show` found no row.
+    #[test]
+    fn a_fetched_head_is_a_row_at_every_step_of_the_swap() {
+        let Some((_hub, _env, ann, home, _)) = a_head_on_anns_spoke("swap-fetch") else { return };
+        let mut worker = Worker::new(home);
+        let seen = watching(&mut worker, "wsp-1");
+        worker.fetch(&ann, "wsp-1").expect("fetched");
+        let seen = seen.borrow().clone();
+        assert!(!seen.is_empty(), "the seam was not reached");
+        for (step, found, _) in &seen {
+            assert!(found, "after {step} a reader finds no wsp-1: {seen:?}");
+        }
+        let t = ann.task("wsp-1").expect("whole");
+        assert!(t.body.contains("the whole text"), "{}", t.body);
+        assert!(!hub_cache::is_head(&ann, "wsp-1"), "the cache entry goes once the row is whole");
+    }
+
+    /// A head that became Ann's own (she claimed it) is swapped on her next
+    /// turn the same way: a row at every step.
+    #[test]
+    fn a_claimed_head_is_a_row_at_every_step_of_the_swap() {
+        let Some((_hub, _env, ann, home, _)) = a_head_on_anns_spoke("swap-claim") else { return };
+        ann.set_claim("wsp-1", serde_json::json!({ "workspace_id": "w1" }));
+        let mut worker = Worker::new(home);
+        let seen = watching(&mut worker, "wsp-1");
+        worker.turn(&ann).expect("ann's turn");
+        let seen = seen.borrow().clone();
+        assert!(!seen.is_empty(), "the seam was not reached");
+        for (step, found, _) in &seen {
+            assert!(found, "after {step} a reader finds no wsp-1: {seen:?}");
+        }
+        assert!(ann.task("wsp-1").is_some_and(|t| t.body.contains("the whole text")), "whole");
+        assert!(!hub_cache::is_head(&ann, "wsp-1"));
+    }
+
+    /// A fetch the hub cuts short between deciding and importing leaves the
+    /// head as it was: the stub and its cache entry, not a missing row.
+    #[test]
+    fn a_fetch_the_hub_cuts_short_leaves_the_head() {
+        let Some((hub, _env, ann, home, _)) = a_head_on_anns_spoke("swap-cut") else { return };
+        let hub = std::rc::Rc::new(std::cell::RefCell::new(Some(hub)));
+        let mut worker = Worker::new(home);
+        let h = hub.clone();
+        worker.seam = Some(Box::new(move |_: &Store, step: &str| {
+            if step == "classified" {
+                // The hub goes away: the rest of the turn cannot reach it.
+                h.borrow_mut().take();
+            }
+        }));
+        assert!(worker.fetch(&ann, "wsp-1").is_err(), "the hub went away mid-fetch");
+        assert!(ann.task("wsp-1").is_some(), "the row is still there");
+        assert!(hub_cache::is_head(&ann, "wsp-1"), "still a head, as `show` says");
+        assert!(hub_cache::show_line(&ann, "wsp-1").is_some());
     }
 
     // ---- messages through the hub (wsp-470) ----
