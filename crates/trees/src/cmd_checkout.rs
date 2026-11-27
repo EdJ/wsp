@@ -2502,6 +2502,9 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     if git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok() {
         return Prepared::Unchanged;
     }
+    if let Some(said) = merge_refusal(&w.dir, &w.branch, "wsp submit") {
+        return Prepared::Refused(format!("wsp: {said}"));
+    }
     if let Err(e) = rebase_onto(&w.dir, &w.branch) {
         let said = abort_rebase(&w.dir, &w.branch, &e);
         return Prepared::Refused(format!("wsp: {said}\nresolve it in {tree}, then `wsp submit` again"));
@@ -2510,6 +2513,26 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
         Some(head) => Prepared::Rebased { head: head.trim().to_string(), branch },
         None => Prepared::Unchanged,
     }
+}
+
+/// What sends back a branch holding a merge commit once `onto` has moved past
+/// it, or `None` for a linear branch and for one that already contains `onto`.
+/// `git rebase` replays a merge's commits one by one and drops the merge, so
+/// such a branch is never rebased: its author merges `onto` in, and the land is
+/// then a fast-forward. `again` is the verb that follows.
+fn merge_refusal(dir: &Path, onto: &str, again: &str) -> Option<String> {
+    if git_ok(dir, &["merge-base", "--is-ancestor", onto, "HEAD"]).is_ok() {
+        return None;
+    }
+    let merges = git(dir, &["rev-list", "--merges", "--max-count=1", &format!("{onto}..HEAD")])?;
+    if merges.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{onto} moved past this branch, which holds a merge commit, so it was not rebased: a rebase drops the merge\n\
+         wsp: in {}: `git merge {onto}`, resolve what conflicts, commit, then `{again}` again. Do not run `git rebase {onto}`",
+        util::contract(dir)
+    ))
 }
 
 /// How many times a rebase is tried when git refuses it for a lock held by
@@ -2821,11 +2844,18 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
 
     let remote = shared_remote(store, &w.task);
     let result = landing(store, || {
-        // Rebase first, so what reaches the trunk is a fast-forward and the
-        // trunk can never gain a merge commit from here. This is also where two
+        // Rebase first, so what reaches the trunk is a fast-forward and no
+        // merge commit is ever made here. This is also where two
         // agents who edited one file meet, which is the arrangement working
         // rather than failing.
-        if mode != Mode::FastForward {
+        // A branch already containing the trunk is not rebased at all: git
+        // would replay, and so drop, any merge commit it holds.
+        if mode != Mode::FastForward
+            && (rebase_in_progress(&w.dir) || git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err())
+        {
+            if let Some(said) = merge_refusal(&w.dir, &w.branch, "wsp land") {
+                return Ok(Err(Refusal::RebaseConflict(said)));
+            }
             if let Err(e) = rebase_onto(&w.dir, &w.branch) {
                 let said = if mode == Mode::ForRun {
                     abort_rebase(&w.dir, &w.branch, &e)
@@ -3227,6 +3257,9 @@ pub fn land_verdict(store: &Store, task: &str) -> Verdict {
         if dirty(&w.dir) {
             return Verdict::Dirty(dirty_refusal(&tree, &dirty_files(&w.dir)));
         }
+        if let Some(said) = merge_refusal(&w.dir, &w.branch, "wsp submit") {
+            return Verdict::Blocked(format!("wsp: {said}"));
+        }
         let old_head = git(&w.dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
         let old_base = git(&w.dir, &["merge-base", &w.branch, "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
         if let Err(e) = rebase_onto(&w.dir, &w.branch) {
@@ -3486,6 +3519,54 @@ mod tests {
         assert!(said.contains("is as it was"), "{said}");
         assert!(!said.contains("a sibling of the main checkout"), "not the hook's line: {said}");
         assert!(!git(&wt, &["status"]).unwrap().contains("rebase in progress"), "left mid-rebase");
+    }
+
+    /// A branch holding a merge commit lands by fast-forward while it contains
+    /// the trunk; once the trunk moves past it, it is sent back to merge, and a
+    /// linear branch is still sent to rebase.
+    #[test]
+    fn a_merge_row_the_trunk_moved_past_is_told_to_merge_and_keeps_its_merge() {
+        let env = util::isolated("co-mergerow");
+        let dir = lane(&env, "p", "p-001");
+        let store = Store::open();
+        let tree = checkout_dir(&dir, "p-001");
+        ensure(&dir, &tree, "p-001", "master").unwrap();
+        let commit = |at: &Path, file: &str, text: &str| {
+            std::fs::write(at.join(file), text).unwrap();
+            run(at, &["add", file]);
+            run(at, &["commit", "--quiet", "-m", text]);
+        };
+        let head = |at: &Path| git(at, &["rev-parse", "HEAD"]).unwrap();
+        run(&tree, &["checkout", "--quiet", "-b", "side"]);
+        commit(&tree, "side.txt", "side");
+        run(&tree, &["checkout", "--quiet", "p-001"]);
+        commit(&tree, "shared.txt", "mine");
+        run(&tree, &["merge", "--quiet", "--no-ff", "-m", "merge side", "side"]);
+        commit(&dir, "shared.txt", "theirs");
+
+        let before = head(&tree);
+        let Prepared::Refused(said) = rebase_ready(&store, "p-001") else { panic!("not sent back") };
+        assert!(said.contains("`git merge master`") && said.contains("Do not run `git rebase master`"), "{said}");
+        let w = pick(vec![dir.clone()], "p-001").unwrap();
+        for mode in [Mode::Rebase, Mode::ForRun] {
+            let Err(r) = land_task(&store, &w, mode) else { panic!("landed") };
+            assert!(r.text().contains("`git merge master`"), "{}", r.text());
+        }
+        let Verdict::Blocked(said) = land_verdict(&store, "p-001") else { panic!("not blocked") };
+        assert!(said.contains("`git merge master`") && !said.contains("--continue"), "{said}");
+        assert_eq!(head(&tree), before, "the branch was moved");
+
+        assert!(git_ok(&tree, &["merge", "--quiet", "master"]).is_err(), "a conflict to resolve");
+        commit(&tree, "shared.txt", "both");
+        let merged = head(&tree);
+        assert!(land_task(&store, &w, Mode::Rebase).is_ok());
+        assert_eq!(head(&dir), merged, "a fast-forward, merges kept");
+
+        // A linear branch the trunk moved past into a conflict.
+        commit(&tree, "shared.txt", "mine again");
+        commit(&dir, "shared.txt", "theirs again");
+        let Prepared::Refused(said) = rebase_ready(&store, "p-001") else { panic!("not sent back") };
+        assert!(said.contains("`git rebase master`") && !said.contains("git merge"), "{said}");
     }
 
     /// `wsp-571`: an `index.lock` held for a moment is waited out, not a

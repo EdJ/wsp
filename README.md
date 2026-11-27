@@ -5407,10 +5407,18 @@ raising.
 Branches are short and land early, because review stays whole-tree (Ed,
 2026-08-17). A reviewer reading the trunk against long-lived per-task branches
 would be reading a tree none of the work is in. `land` rebases onto the trunk
-and fast-forwards the trunk onto that, so the trunk stays linear and never gains
-a merge commit from here — and the rebase is where two agents who edited one
+and fast-forwards the trunk onto that, so it never makes a merge commit of its
+own and linear branches keep the trunk linear — and the rebase is where two agents who edited one
 file finally meet. That is the arrangement working: the collision that used to
 be a silent sweep is now a conflict, in your own tree, with both sides named.
+
+**A branch that contains `master` lands by fast-forward** and is not rebased, so
+any merge commits it holds reach the trunk as they are (a merge row, such as one
+bringing in an upstream branch). When `master` moves past a branch holding a
+merge commit, `wsp submit`, `wsp land` and a `holds` verdict send it back and
+leave it as it was, because a rebase would drop the merge: `git merge master` in
+its tree, resolve, commit, then `wsp submit` (or `wsp land`) again. Do not
+`git rebase master`. A linear branch is rebased as above.
 
 It also prints the diffstat of what actually reached the trunk, which is step 4
 of the procedure above and the check that caught a wrong commit on two
