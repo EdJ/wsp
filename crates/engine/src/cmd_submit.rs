@@ -142,7 +142,7 @@ pub fn submit_from(store: &Store, args: &Args, kind: Option<&str>, me: Option<St
     };
     // A check's row is its list (or the barrier's subject), not a task.
     if kind == Kind::Check {
-        return submit_check(store, args, needle);
+        return submit_check(store, args, needle, me.as_deref());
     }
     let t = match store.task_or_why(needle) {
         Ok(t) => t,
@@ -1288,18 +1288,42 @@ fn check_body(e: &Exit) -> String {
     j.text
 }
 
+/// The barrier a check's submit is for, and its seat's entry on it: the one
+/// `<list>-check-<n>` names, else the one `me` was seated on, else the one the
+/// list stands at. **The seat's before the list's** (`wsp-898`): a check that
+/// ran `worklist go` first leaves the list standing at the next group.
+fn check_barrier(store: &Store, w: &crate::model::Worklist, needle: &str, me: Option<&str>) -> (usize, Option<crate::barrier::Check>) {
+    let groups = w.groups();
+    let named = crate::barrier::parse_subject(needle).filter(|(l, n)| *l == w.id && *n <= groups.len()).map(|(_, n)| n);
+    let seated = groups
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| named.is_none_or(|n| n == i + 1))
+        .flat_map(|(i, g)| g.checks.iter().filter(|c| me.is_some() && c.pane.as_deref() == me).map(move |c| (i + 1, c)))
+        // A pane id seen twice: the later check is the one in it.
+        .max_by(|a, b| a.1.at.cmp(&b.1.at));
+    if let Some((n, c)) = seated {
+        return (n, Some(c.clone()));
+    }
+    let at = named.unwrap_or_else(|| crate::worklist::position(store, w, crate::worklist::Reading::Landed).at.unwrap_or(0));
+    let open = groups.get(at.saturating_sub(1)).and_then(crate::barrier::running).cloned();
+    (at, open)
+}
+
 /// `wsp submit <list>` from a barrier check's seat: `go` and `hold` are the
 /// verbs, run with the exit's account; `followup` stays a flag to the person,
 /// because the rows it names are not ones wsp can guess.
-fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
+fn submit_check(store: &Store, args: &Args, needle: &str, me: Option<&str>) -> i32 {
     use crate::exit::Verdict;
     let Some(w) = check_list(store, needle) else {
         eprintln!("wsp: no list `{needle}` — a check submits for its list (or `<list>-check-<n>`)");
         return 1;
     };
-    let pos = crate::worklist::position(store, &w, crate::worklist::Reading::Landed);
-    let at = pos.at.unwrap_or(0);
-    let open = w.groups().into_iter().nth(at.saturating_sub(1)).and_then(|g| crate::barrier::running(&g).map(|c| util::epoch_of(&c.at)));
+    let (at, check) = check_barrier(store, &w, needle, me);
+    let open = check.map(|c| util::epoch_of(&c.at));
+    // A barrier already passed has nothing for `go` or `hold` to move, and
+    // either verb would act on whatever the list stands at now.
+    let decided = at >= 1 && crate::barrier::moot(&w, &w.groups(), at - 1);
     let key = crate::barrier::subject(&w.id, at);
     let kept = closing::verdict_path(store, &key, closing::Kind::Check);
     let (text, from) = match read_exit_at(args, &key, kept.clone(), open) {
@@ -1319,6 +1343,7 @@ fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
     let verdict = e.verdict.unwrap_or(Verdict::Followup);
     if args.has("dry-run") {
         let what = match verdict {
+            Verdict::Go | Verdict::Hold if decided => "was already decided: the seat closed, nothing else moved",
             Verdict::Go => "passed: `wsp worklist go`",
             Verdict::Hold => "held: `wsp worklist hold`",
             _ => "a follow-up, flagged to the person",
@@ -1337,7 +1362,22 @@ fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
             return 1;
         }
         crate::cycle::tell(store, &w, &format!("barrier {at}'s check asks for a follow-up: {} — the person is flagged", e.summary));
-        println!("✓ {} barrier {at} submitted — a follow-up, flagged to the person; the barrier stays open", w.id);
+        let barrier = if decided { "the barrier was already decided" } else { "the barrier stays open" };
+        println!("✓ {} barrier {at} submitted — a follow-up, flagged to the person; {barrier}", w.id);
+        return 0;
+    }
+    if decided {
+        let said = format!("{} barrier {at} was already decided — this `{}` moved nothing", w.id, verdict.word());
+        let seat = closing(store, &key, "check", me);
+        crate::store::log_line(store, &said);
+        // A hold that arrives late is still something somebody should read.
+        if verdict == Verdict::Hold {
+            crate::cycle::tell(store, &w, &format!("{said}: {}", e.summary));
+        }
+        if let Some(line) = end_my_seat(store, &key, "check", seat.as_deref()) {
+            crate::store::log_line(store, &format!("{} barrier {at}: {line}", w.id));
+        }
+        println!("✓ {said}");
         return 0;
     }
     let file = kept.with_extension("body");
@@ -1353,7 +1393,7 @@ fn submit_check(store: &Store, args: &Args, needle: &str) -> i32 {
     let a = Args::synth("worklist", &[verb, w.id.as_str()], &[("from", &path), ("caption", &e.summary)]);
     // Recorded first: `go` arranges the ending of every check standing on the
     // barrier, and this one is its exit's to end.
-    let seat = closing(store, &key, "check", None);
+    let seat = closing(store, &key, "check", me);
     let code = match verdict {
         Verdict::Go => crate::cmd_worklist::go(store, &a),
         _ => crate::cmd_worklist::hold(store, &a),
@@ -1979,5 +2019,67 @@ mod tests {
         let warned = review_of(bare);
         assert!(warned.iter().any(|l| l.contains("no `done-when:`")), "{warned:#?}");
         assert_eq!(warned, submit_of(&exit_of_review(bare)));
+    }
+
+    /// A running list `run` of two groups, group 1's check open in `cpd-4`.
+    fn checked(tag: &str) -> (crate::util::Isolated, Store) {
+        let env = crate::util::isolated(tag);
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        for (id, status) in [("c-1", "done"), ("c-2", "doing")] {
+            let mut t = Task::new("c", id);
+            t.status_raw = status.into();
+            store.save_task(&t).unwrap();
+        }
+        let group = |m: &str| Group { members: vec![m.into()], agent: "claude".into(), ..Default::default() };
+        let mut w = Worklist::new("run", "run");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[group("c-1"), group("c-2")]);
+        store.save_worklist(&w).unwrap();
+        assert!(crate::barrier::open_within(&store, &w, 1, None, None, crate::barrier::Mechanical::No, &|_: &str| false, &|| true).is_some());
+        assert!(crate::barrier::name_seat(&store, "run", 1, "cpd-4"));
+        (env, store)
+    }
+
+    /// The check in `cpd-4` runs `worklist go`, then submits `verdict`.
+    fn go_then_submit(env: &crate::util::Isolated, store: &Store, verdict: &str) -> i32 {
+        let go = Args::synth("worklist", &["go", "run", "the group holds"], &[("caption", "Group one holds")]);
+        assert_eq!(crate::cmd_worklist::go(store, &go), 0);
+        let file = env.path("exit.md");
+        let cause = if verdict == "hold" { "\ncause: work — a test fails\n" } else { "" };
+        std::fs::write(&file, format!("verdict: {verdict}\nsummary: what the check read\n\nIt read group one.\n\nchecked:\n- suite (2m): cargo test — pass\n{cause}")).unwrap();
+        let from = file.display().to_string();
+        let args = Args::synth("submit", &["run"], &[("from", &from)]);
+        submit_from(store, &args, Some("check"), Some("cpd-4".into()))
+    }
+
+    fn check_records(store: &Store) -> (String, String) {
+        let read = |name: &str| std::fs::read_to_string(store.state_file(name)).unwrap_or_default();
+        (read("exits.json"), read("cycle.log"))
+    }
+
+    #[test]
+    fn a_check_that_ran_go_before_submit_is_booked_under_its_own_barrier() {
+        let (env, store) = checked("submit-check-after-go");
+        assert_eq!(go_then_submit(&env, &store, "go"), 0);
+        let (exits, log) = check_records(&store);
+        assert!(exits.contains("run-check-1") && !exits.contains("run-check-2"), "{exits}");
+        assert!(log.contains("run barrier 1 was already decided"), "{log}");
+        assert!(log.contains("run barrier 1: submit: the check seat cpd-4 is closing"), "{log}");
+        assert!(!log.contains("barrier 2"), "{log}");
+        let groups = store.worklist("run").unwrap().groups();
+        assert!(groups[1].verdict.is_empty() && groups[1].checks.is_empty(), "{:?}", groups[1]);
+    }
+
+    #[test]
+    fn a_hold_submitted_after_the_barrier_was_passed_leaves_the_next_group_running() {
+        let (env, store) = checked("submit-check-late-hold");
+        assert_eq!(go_then_submit(&env, &store, "hold"), 0);
+        let w = store.worklist("run").unwrap();
+        assert_eq!(w.status(), WorklistStatus::Running, "nothing is held");
+        assert!(w.groups()[1].verdict.is_empty());
+        let (exits, log) = check_records(&store);
+        assert!(exits.contains("run-check-1") && !exits.contains("run-check-2"), "{exits}");
+        assert!(log.contains("run barrier 1 was already decided — this `hold` moved nothing"), "{log}");
     }
 }
