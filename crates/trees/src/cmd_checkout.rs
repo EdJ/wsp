@@ -2515,20 +2515,17 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     }
 }
 
-/// What sends back a branch holding a merge commit once `onto` has moved past
-/// it, or `None` for a branch with no merge to keep and for one that already
-/// contains `onto`. `git rebase` replays a merge's commits one by one and drops
-/// the merge, so such a branch is never rebased: its author merges `onto` in,
-/// and the land is then a fast-forward. `again` is the verb that follows.
-///
-/// The merges that join `row`'s own leg and piece branches back are not ones to
-/// keep ([`joins_own`]): a branch holding only those is rebased.
+/// What sends back a branch holding a merge to keep ([`brings_history`]) once
+/// `onto` has moved past it, or `None` for any other branch and for one that
+/// already contains `onto`. `git rebase` replays a merge's commits one by one
+/// and drops the merge, so such a branch is never rebased: its author merges
+/// `onto` in, and the land is then a fast-forward. `again` is the verb that
+/// follows.
 fn merge_refusal(dir: &Path, onto: &str, row: &[&str], again: &str) -> Option<String> {
     if git_ok(dir, &["merge-base", "--is-ancestor", onto, "HEAD"]).is_ok() {
         return None;
     }
-    let merges = git(dir, &["log", "--merges", "--format=%s", &format!("{onto}..HEAD")])?;
-    if merges.lines().all(|subject| joins_own(subject, row)) {
+    if !brings_history(dir, onto, row) {
         return None;
     }
     Some(format!(
@@ -2536,6 +2533,15 @@ fn merge_refusal(dir: &Path, onto: &str, row: &[&str], again: &str) -> Option<St
          wsp: in {}: `git merge {onto}`, resolve what conflicts, commit, then `{again}` again. Do not run `git rebase {onto}`",
         util::contract(dir)
     ))
+}
+
+/// Whether the branch holds a merge past `onto` that brings in other history,
+/// which a rebase would lose. The merges that join `row`'s own leg and piece
+/// branches back are not ones: a branch holding only those is a linear one to
+/// every land, and rebased as one.
+fn brings_history(dir: &Path, onto: &str, row: &[&str]) -> bool {
+    git(dir, &["log", "--merges", "--format=%s", &format!("{onto}..HEAD")])
+        .is_some_and(|merges| !merges.lines().all(|subject| joins_own(subject, row)))
 }
 
 /// Whether a merge commit's subject says it joined a leg (`<row>.<leg>`) or a
@@ -2864,11 +2870,12 @@ fn land_task(store: &Store, w: &Where, mode: Mode) -> Result<Landed, Refusal> {
         // merge commit is ever made here. This is also where two
         // agents who edited one file meet, which is the arrangement working
         // rather than failing.
-        // A branch already containing the trunk is not rebased at all: git
-        // would replay, and so drop, any merge commit it holds.
-        if mode != Mode::FastForward
-            && (rebase_in_progress(&w.dir) || git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_err())
-        {
+        // A branch already containing the trunk with a merge to keep is not
+        // rebased at all: git would replay, and so drop, that merge.
+        let keeps = !rebase_in_progress(&w.dir)
+            && git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok()
+            && brings_history(&w.dir, &w.branch, &[&w.task, &on]);
+        if mode != Mode::FastForward && !keeps {
             if let Some(said) = merge_refusal(&w.dir, &w.branch, &[&w.task, &on], "wsp land") {
                 return Ok(Err(Refusal::RebaseConflict(said)));
             }
@@ -3640,13 +3647,21 @@ mod tests {
         assert_eq!(landed.base.as_deref(), Some(before.as_str()));
         rebased(&before);
 
-        // Landed with the trunk unmoved, the joins are kept, and the base is
-        // still the trunk as it was.
-        join("c");
+        // The trunk unmoved: `wsp land` still flattens the joins.
+        for (round, mode) in [("c", Mode::Rebase), ("d", Mode::ForRun)] {
+            join(round);
+            let before = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+            assert!(land_task(&store, &w, mode).is_ok());
+            rebased(&before);
+        }
+
+        // A holds verdict on an unmoved trunk fast-forwards them as they are,
+        // and the base and diffstat across those merges start at the trunk.
+        join("e");
         let before = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        let Ok(landed) = land_task(&store, &w, Mode::Rebase) else { panic!("not landed") };
+        let Verdict::Landed { landed, .. } = land_verdict(&store, "p-001") else { panic!("not landed") };
         assert_eq!(landed.base.as_deref(), Some(before.as_str()));
-        assert!(!landed.files.iter().any(|f| f.contains("two.txt")), "{:?}", landed.files);
+        assert!(!landed.files.iter().any(|f| f.contains("d-d.txt")), "{:?}", landed.files);
     }
 
     /// `wsp-571`: an `index.lock` held for a moment is waited out, not a
