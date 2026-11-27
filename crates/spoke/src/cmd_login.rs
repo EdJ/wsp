@@ -110,14 +110,17 @@ fn owner_only(path: &Path) -> Result<bool, String> {
 /// Write `hubs.json` under `home`: a new file at 0600 renamed over the old one,
 /// so there is no moment a reader finds it wider or half written. A file that
 /// is there and wider than 0600 is refused and left as it is.
-fn write_login(home: &Path, url: &str, token: &str, user: &str, ca: Option<&Path>) -> Result<(), String> {
+fn write_login(home: &Path, url: &str, token: &str, user: &str, ca: Option<&Path>, method: &str) -> Result<(), String> {
     let path = home.join(HUBS_FILE);
     if !owner_only(&path)? {
         return Err(format!("{} is wider than 0600: chmod 600 it, or remove it, and log in again", path.display()));
     }
     let dir = path.parent().expect("a file under a directory");
     make_dir(dir)?;
-    let mut doc = json!({ "url": url, "token": token, "user": user, "at": util::iso_at(util::epoch_secs()) });
+    // `method`: how the token was had (`token`: typed or piped; `github`: the
+    // hub's device flow), for `wsp hub status`. A file written before it was
+    // kept has none, and status says so.
+    let mut doc = json!({ "url": url, "token": token, "user": user, "at": util::iso_at(util::epoch_secs()), "method": method });
     if let Some(ca) = ca {
         doc["ca"] = json!(ca.display().to_string());
     }
@@ -181,7 +184,7 @@ pub fn log_in(home: &Path, url: &str, token: &str, ca: Option<&Path>) -> Result<
             ))
         }
     };
-    write_login(home, url.trim(), token, &user, ca.as_deref())?;
+    write_login(home, url.trim(), token, &user, ca.as_deref(), METHOD_TOKEN)?;
     Ok(LoggedIn { url: url.trim().to_string(), user, replaced })
 }
 
@@ -223,8 +226,21 @@ fn log_in_github_with(
     if token.is_empty() || token.len() > MAX_TOKEN || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("the hub's login handed back something that is not a token; nothing was written".into());
     }
-    write_login(home, url.trim(), &token, &user, ca.as_deref())?;
+    write_login(home, url.trim(), &token, &user, ca.as_deref(), METHOD_GITHUB)?;
     Ok(LoggedIn { url: url.trim().to_string(), user, replaced })
+}
+
+/// `hubs.json`'s `method` for a token typed or piped to `wsp login`.
+pub const METHOD_TOKEN: &str = "token";
+/// `hubs.json`'s `method` for a token the hub handed back from GitHub's device flow.
+pub const METHOD_GITHUB: &str = "github";
+
+/// The one JSON line `wsp login <url> --github --json` prints on stdout when
+/// the hub hands it the device-flow prompt, before it waits: what the human
+/// sentence on stderr says, as fields.
+/// `{"prompt":{"verification_url":…,"code":…,"expires_secs":…}}`.
+pub fn github_prompt_json(p: &LoginPrompt) -> serde_json::Value {
+    json!({ "prompt": { "verification_url": p.url, "code": p.code, "expires_secs": p.expires_secs } })
 }
 
 /// What a person is told to do while a GitHub login waits: the address, the
@@ -300,7 +316,17 @@ pub fn login(store: &Store, args: &Args) -> i32 {
             if !url.starts_with("tls://") && !is_loopback(&url) {
                 eprintln!("wsp: {url} is not tls://, so the token the hub hands back crosses the network in the clear; a hub off this machine takes tls://");
             }
-            return log_in_github(&home, &url, ca.as_deref(), |p| eprintln!("{}", github_prompt_text(&url, p))).map_err(met);
+            let json = args.json();
+            return log_in_github(&home, &url, ca.as_deref(), |p| {
+                eprintln!("{}", github_prompt_text(&url, p));
+                // The app reads this line before the login waits, so it goes out now.
+                if json {
+                    use std::io::Write;
+                    println!("{}", github_prompt_json(p));
+                    let _ = std::io::stdout().flush();
+                }
+            })
+            .map_err(met);
         }
         let token = if util::stdin_is_tty() { token_from_terminal(&url) } else { token_from(&mut std::io::stdin().lock()) };
         let token = token.map_err(met)?;
@@ -410,6 +436,38 @@ pub fn status_text(login: &Option<HubLogin>) -> String {
     }
 }
 
+/// The account facts `wsp hub status --json` gives beside the login, each
+/// from what this machine keeps and none from a dial:
+///
+/// - `method`: `token` or `github`, as `wsp login` wrote it into `hubs.json`;
+///   `null` for a login written before it was kept.
+/// - `workspaces`: the shared workspaces the hub last said the user is a
+///   member of (`$WSP_STATE/hub/members.json`, refreshed by each sync turn),
+///   with `workspaces_at` when; both `null` where nothing is kept for this
+///   user.
+/// - `machine`: `{id, name}`, what every hello names (`hub_client::machine`);
+///   `id` `null` before the first dial has made one.
+/// - `admin`: always `null`: no frame a hub sends an ordinary client says
+///   whether its user is an admin (`welcome` and `whoami` name the principal
+///   alone, and the stream's state carries no users), so this is not known
+///   here without trying an admin verb.
+pub fn account_json(store: &Store, login: &HubLogin, home: Option<&Path>) -> serde_json::Map<String, serde_json::Value> {
+    let kept = crate::hub_members::Members::read(store).filter(|m| m.user == login.user);
+    let mut out = serde_json::Map::new();
+    out.insert("method".into(), json!(login.method));
+    out.insert("workspaces".into(), json!(kept.as_ref().map(|m| m.workspaces.iter().collect::<Vec<_>>())));
+    out.insert("workspaces_at".into(), json!(kept.as_ref().map(|m| util::iso_at(m.at))));
+    out.insert(
+        "machine".into(),
+        json!({
+            "id": home.and_then(crate::hub_client::machine::kept_id),
+            "name": crate::hub_client::machine::name_of(&util::hostname()),
+        }),
+    );
+    out.insert("admin".into(), serde_json::Value::Null);
+    out
+}
+
 pub fn hub(store: &Store, args: &Args) -> i32 {
     match args.rest.first().map(String::as_str) {
         Some("status") if args.rest.len() == 1 => {}
@@ -432,7 +490,13 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
             if args.json() {
                 let doc = match &login {
                     None => json!({ "logged_in": false, "connection": crate::hub_switch::status_json(store) }),
-                    Some(l) => json!({ "logged_in": true, "url": l.url, "user": l.user, "at": l.at, "ca": l.ca, "connection": crate::hub_switch::status_json(store) }),
+                    Some(l) => {
+                        let mut doc = json!({ "logged_in": true, "url": l.url, "user": l.user, "at": l.at, "ca": l.ca, "connection": crate::hub_switch::status_json(store) });
+                        if let Some(o) = doc.as_object_mut() {
+                            o.extend(account_json(store, l, home().ok().as_deref()));
+                        }
+                        doc
+                    }
                 };
                 println!("{doc}");
             } else {
@@ -541,13 +605,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let h = home_dir("write");
         let path = h.join(HUBS_FILE);
-        write_login(&h, "tls://hub.invalid:1", "tok-a", "ann", None).unwrap();
+        write_login(&h, "tls://hub.invalid:1", "tok-a", "ann", None, METHOD_TOKEN).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         let l = hub_login_in(&h).unwrap().unwrap();
         assert_eq!((l.url.as_str(), l.user.as_str()), ("tls://hub.invalid:1", "ann"));
         assert!(l.at.ends_with('Z'), "{}", l.at);
-        write_login(&h, "tls://hub.invalid:2", "tok-b", "bo", Some(Path::new("/etc/ca.pem"))).unwrap();
+        write_login(&h, "tls://hub.invalid:2", "tok-b", "bo", Some(Path::new("/etc/ca.pem")), METHOD_TOKEN).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let l = hub_login_in(&h).unwrap().unwrap();
         assert_eq!((l.url.as_str(), l.user.as_str(), l.ca.as_deref()), ("tls://hub.invalid:2", "bo", Some("/etc/ca.pem")));
@@ -568,7 +632,7 @@ mod tests {
         assert!(why.contains(&path.display().to_string()) && why.contains("0600"), "{why}");
         assert!(!why.contains("new-tok") && !why.contains("old-tok"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"url":"tls://old.invalid:1","token":"old-tok"}"#);
-        assert!(write_login(&h, "tls://hub.invalid:1", "new-tok", "ann", None).is_err());
+        assert!(write_login(&h, "tls://hub.invalid:1", "new-tok", "ann", None, METHOD_TOKEN).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
@@ -576,7 +640,7 @@ mod tests {
     fn login_logout_removes_the_file_and_says_what_it_was() {
         let h = home_dir("logout");
         assert_eq!(log_out(&h).unwrap(), None);
-        write_login(&h, "tls://hub.invalid:1", "tok-a", "ann", None).unwrap();
+        write_login(&h, "tls://hub.invalid:1", "tok-a", "ann", None, METHOD_TOKEN).unwrap();
         let was = log_out(&h).unwrap().unwrap().unwrap();
         assert_eq!((was.url.as_str(), was.user.as_str()), ("tls://hub.invalid:1", "ann"));
         assert!(!h.join(HUBS_FILE).exists());
@@ -592,7 +656,7 @@ mod tests {
     fn login_status_names_the_hub_and_user_and_has_no_token_to_name() {
         assert!(status_text(&None).starts_with("not logged in"));
         let h = home_dir("status");
-        write_login(&h, "tls://hub.invalid:1", "tok-sekrit", "ann", None).unwrap();
+        write_login(&h, "tls://hub.invalid:1", "tok-sekrit", "ann", None, METHOD_TOKEN).unwrap();
         let l = hub_login_in(&h).unwrap();
         let said = status_text(&l);
         assert!(said.contains("tls://hub.invalid:1") && said.contains("ann"), "{said}");
@@ -730,6 +794,12 @@ mod tests {
         // What the dial reads is the login just written.
         assert_eq!(Credential::for_hub_in(None, &h), Ok(Credential::User(token.into())));
         assert_eq!(hub_login_in(&h).unwrap().unwrap().user, "ed");
+        assert_eq!(hub_login_in(&h).unwrap().unwrap().method.as_deref(), Some(METHOD_GITHUB), "the login says how it was had");
+        // `--json`'s line for the prompt: the sentence's facts as fields.
+        assert_eq!(
+            github_prompt_json(&device()).to_string(),
+            r#"{"prompt":{"code":"ABCD-1234","expires_secs":900,"verification_url":"https://github.com/login/device"}}"#
+        );
 
         // A second GitHub login replaces the first and says so.
         let mut again = github_hub(vec![Frame::LoginDone(LoginDone { user: "ann".into(), token: ApiToken("other-token".into()) })]);
@@ -745,7 +815,7 @@ mod tests {
     fn login_github_refused_or_cut_short_writes_nothing() {
         use wsp_hub_protocol::{ApiToken, Frame, Refused};
         let h = home_dir("github-refused");
-        write_login(&h, "tls://old.invalid:1", "old-tok", "bo", None).unwrap();
+        write_login(&h, "tls://old.invalid:1", "old-tok", "bo", None, METHOD_TOKEN).unwrap();
         let before = std::fs::read_to_string(h.join(HUBS_FILE)).unwrap();
         let refused = |code, text: &str| Frame::Refused(Refused { code, text: text.into() });
         let cases: Vec<(Vec<Frame>, &str)> = vec![
@@ -792,5 +862,29 @@ mod tests {
         for url in ["tcp://hub.example:7489", "10.0.0.5:7489"] {
             assert!(!is_loopback(url), "{url}");
         }
+    }
+
+    /// `wsp hub status --json`'s account facts, each from what is kept here;
+    /// `admin` is null, since no hub frame says it.
+    #[test]
+    fn hub_status_account_facts_are_what_is_kept_and_admin_is_not_known() {
+        let (_env, store) = wsp_engine::testkit::isolated_store("status-account");
+        let h = home_dir("account");
+        write_login(&h, "tls://hub.invalid:1", "tok-sekrit", "ann", None, METHOD_TOKEN).unwrap();
+        let login = hub_login_in(&h).unwrap().unwrap();
+        let none = serde_json::Value::Object(account_json(&store, &login, Some(&h)));
+        assert_eq!(none["method"], "token");
+        assert_eq!((none["workspaces"].clone(), none["workspaces_at"].clone(), none["admin"].clone()), (json!(null), json!(null), json!(null)));
+        assert_eq!(none["machine"]["id"], json!(null), "no dial has made one yet");
+        crate::hub_members::Members { user: "ann".into(), workspaces: ["shared:team".to_string()].into(), at: 1_800_000_000 }.write(&store).unwrap();
+        let id = crate::hub_client::machine::this(&h).unwrap().id;
+        let doc = serde_json::Value::Object(account_json(&store, &login, Some(&h)));
+        assert_eq!(doc["workspaces"], json!(["shared:team"]));
+        assert_eq!(doc["workspaces_at"], json!(util::iso_at(1_800_000_000)));
+        assert_eq!(doc["machine"]["id"], json!(id));
+        assert!(!doc.to_string().contains("tok-sekrit"));
+        // Another user's kept workspaces are not this login's.
+        crate::hub_members::Members { user: "bo".into(), workspaces: ["shared:x".to_string()].into(), at: 1 }.write(&store).unwrap();
+        assert_eq!(serde_json::Value::Object(account_json(&store, &login, Some(&h)))["workspaces"], json!(null));
     }
 }

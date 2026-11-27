@@ -111,6 +111,7 @@ struct Login {
     ca: Option<String>,
     user: Option<String>,
     at: Option<String>,
+    method: Option<String>,
 }
 
 /// What `hubs.json` says of a login, the token left out: for `wsp hub status`
@@ -125,6 +126,9 @@ pub struct HubLogin {
     pub at: String,
     /// The pinned CA file, if the login names one.
     pub ca: Option<String>,
+    /// How the token was had, as `wsp login` wrote it: `token` or `github`.
+    /// None in a file written before it was kept, or by hand.
+    pub method: Option<String>,
 }
 
 /// The login under `home`, without its token; None when there is no file.
@@ -135,7 +139,7 @@ pub fn hub_login_in(home: &Path) -> Result<Option<HubLogin>, Silent> {
     let Some(url) = l.url.filter(|u| !u.is_empty()) else {
         return Err(Silent::BadHubsFile(format!("{} names no url", home.join(HUBS_FILE).display())));
     };
-    Ok(Some(HubLogin { url, user: l.user.unwrap_or_default(), at: l.at.unwrap_or_default(), ca: l.ca.filter(|c| !c.is_empty()) }))
+    Ok(Some(HubLogin { url, user: l.user.unwrap_or_default(), at: l.at.unwrap_or_default(), ca: l.ca.filter(|c| !c.is_empty()), method: l.method.filter(|m| !m.is_empty()) }))
 }
 
 fn home() -> PathBuf {
@@ -178,7 +182,7 @@ fn read_login(home: &Path) -> Result<Option<Login>, Silent> {
     if !v.is_object() {
         return Err(Silent::BadHubsFile(format!("{} is not a login: not an object", path.display())));
     }
-    Ok(Some(Login { url: field("url"), token: field("token"), ca: field("ca"), user: field("user"), at: field("at") }))
+    Ok(Some(Login { url: field("url"), token: field("token"), ca: field("ca"), user: field("user"), at: field("at"), method: field("method") }))
 }
 
 /// The `host:port` a hub's URL names, and whether it is dialled over TLS:
