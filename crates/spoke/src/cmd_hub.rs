@@ -3,6 +3,7 @@
 //! ```text
 //! wsp hub state                         the admin's snapshot: the hub, people, workspaces, leases
 //! wsp hub user add <name> [--admin]     add a user, issue its token, print it once
+//!          [--no-token]                  … or issue none (they log in with GitHub)
 //! wsp hub user ls                       the hub's people, their token records and workspaces
 //! wsp hub user revoke <name>            revoke the user and every token of its
 //! wsp hub user admin <name> [--remove]  make an active user a hub admin, or not
@@ -199,10 +200,16 @@ fn issue(client: &mut Client, user: &str) -> Result<Minted, Said> {
     Ok(Minted { user: user.to_string(), id: id.0, token: secret })
 }
 
-fn user_add(client: &mut Client, name: &str, admin: bool) -> Result<Done, Said> {
+/// `hub.user.add`, then (unless `no_token`) `hub.token.issue`: the hub takes
+/// them as two commands, so a person who will log in with GitHub is added
+/// with no token at all (`--no-token`) and their first GitHub login is theirs.
+fn user_add(client: &mut Client, name: &str, admin: bool, no_token: bool) -> Result<Done, Said> {
     send(client, Command::HubUserAdd { name: UserName(name.to_string()), admin })?;
-    let token = issue(client, name).map_err(|why| why.after(&format!("{name} was added, but its token was not issued (`wsp hub token {name}` issues one)")))?;
     let kind = if admin { "admin " } else { "" };
+    if no_token {
+        return Ok(Done { lines: vec![format!("{kind}user {name} added, with no token: {name} logs in with GitHub, or `wsp hub token {name}` issues one")], ..Done::default() });
+    }
+    let token = issue(client, name).map_err(|why| why.after(&format!("{name} was added, but its token was not issued (`wsp hub token {name}` issues one)")))?;
     Ok(Done { lines: vec![format!("{kind}user {name} added")], token: Some(token), ..Done::default() })
 }
 
@@ -496,12 +503,14 @@ fn read(lines: Vec<String>, doc: Value) -> Done {
     Done { lines, fields, read: true, ..Done::default() }
 }
 
-const USAGE: &str = "usage: wsp hub state | user add <name> [--admin] | user ls | user revoke <name> | user admin <name> [--remove] | token <name> | token revoke <id> | workspace add <name> | workspace ls | member add|rm <workspace> <user> | lease ls | lease release <row> [--workspace W] | events [--from N] [--limit N] [--kind K] [--workspace W] [--person U] [--row R] [--since T]";
+const USAGE: &str = "usage: wsp hub state | user add <name> [--admin] [--no-token] | user ls | user revoke <name> | user admin <name> [--remove] | token <name> | token revoke <id> | workspace add <name> | workspace ls | member add|rm <workspace> <user> | lease ls | lease release <row> [--workspace W] | events [--from N] [--limit N] [--kind K] [--workspace W] [--person U] [--row R] [--since T]";
 
 /// The flags a verb reads beside its words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Opts {
     pub admin: bool,
+    /// `user add <name> --no-token`: add the person, issue no token.
+    pub no_token: bool,
     /// `user admin <name> --remove`: clear the flag.
     pub remove: bool,
     /// `lease release <row> --workspace W`.
@@ -515,7 +524,7 @@ pub struct Opts {
 pub fn run_words(client: &mut Client, words: &[&str], opts: &Opts) -> Result<Done, Said> {
     match words {
         ["state"] => hub_state(client, &opts.url),
-        ["user", "add", name] => user_add(client, name, opts.admin),
+        ["user", "add", name] => user_add(client, name, opts.admin, opts.no_token),
         ["user", "ls"] => user_ls(client),
         ["user", "revoke", name] => user_revoke(client, name),
         ["user", "admin", name] => user_admin(client, name, !opts.remove),
@@ -529,6 +538,39 @@ pub fn run_words(client: &mut Client, words: &[&str], opts: &Opts) -> Result<Don
         ["lease", "release", row] => lease_release(client, row, opts.workspace.as_deref()),
         ["events"] => events(client, &opts.events),
         _ => Err(Said::new("usage", USAGE)),
+    }
+}
+
+/// The admin verbs this wsp has, each as its words are typed without its
+/// operands, for `wsp hub status --json`'s `admin_verbs`: an app that runs
+/// `wsp hub` through a closed list reads which of its acts this wsp can do
+/// before it offers them, instead of finding a missing one by its usage line
+/// (exit 2). Every one is [`known`] with its operands.
+pub const ADMIN_VERBS: &[&str] = &[
+    "state", "events", "user add", "user ls", "user revoke", "user admin", "token", "token revoke", "workspace add", "workspace ls", "member add", "member rm",
+    "lease ls", "lease release",
+];
+
+/// A name a write would make that starts with `-`: wsp reads such a word as a
+/// flag, so every verb after would need `--` to name it. The hub takes any
+/// name up to its length limit; wsp makes none it could not name back.
+fn flag_like(words: &[&str]) -> Option<String> {
+    match words {
+        ["user", "add", name] | ["workspace", "add", name] if name.starts_with('-') => {
+            Some(format!("a name may not begin with `-` ({name}): wsp reads such a word as a flag"))
+        }
+        _ => None,
+    }
+}
+
+/// The value flags `words` reads: each must take a word off the command line.
+/// `--workspace -x` is `--workspace` with no value and a flag `-x`, and a
+/// value flag with none would read as the word `true`.
+fn value_flags(words: &[&str]) -> &'static [&'static str] {
+    match words {
+        ["lease", "release", _] => &["workspace"],
+        ["events"] => &["from", "limit", "kind", "workspace", "person", "row", "since"],
+        _ => &[],
     }
 }
 
@@ -598,8 +640,21 @@ pub fn run(_store: &Store, args: &Args) -> i32 {
         eprintln!("wsp: {USAGE}");
         return 2;
     }
+    if let Some(flag) = value_flags(&words).iter().find(|f| args.given(f) && !args.valued.contains(**f)) {
+        eprintln!("wsp: hub: --{flag} takes a value (a value that begins with `-` is read as a flag)");
+        return 2;
+    }
     let json = args.json();
-    let mut opts = Opts { admin: words.starts_with(&["user", "add"]) && args.has("admin"), ..Opts::default() };
+    if let Some(why) = flag_like(&words) {
+        let said = Said::new("invalid", why);
+        eprintln!("wsp: hub: {said}");
+        if json {
+            println!("{}", said.json());
+        }
+        return 1;
+    }
+    let adding = words.starts_with(&["user", "add"]);
+    let mut opts = Opts { admin: adding && args.has("admin"), no_token: adding && args.has("no-token"), ..Opts::default() };
     if words.starts_with(&["user", "admin"]) {
         opts.remove = args.has("remove");
     }
@@ -765,7 +820,8 @@ fn enabled_text(e: &crate::hub_switch::Enabled, json: bool) -> String {
 /// (the one verb `hub`, whose `status` is the login's).
 pub const HELP: &str = r##"  wsp hub state [--json]               the admin's snapshot: the hub's name, who asks,
                                        where its trail starts; people, workspaces, leases
-  wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
+  wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in);
+                [--no-token]           with --no-token none: they log in with GitHub
   wsp hub user ls [--json]             the hub's people: role, state, token records
                                        (id, method, issued, revoked), workspaces
   wsp hub user revoke <name>           revoke a user and every token of its
@@ -861,6 +917,26 @@ mod tests {
             assert_eq!(why.message, "forbidden: person:ed is not an admin of this hub", "{words:?}");
             assert_eq!(why.json()["error"]["by"], json!("person:ed"));
         }
+    }
+
+    /// `--no-token`: `hub.user.add` alone. The person is on the hub with no token record (they will log in with GitHub), the
+    /// JSON's token is null, and `wsp hub token <name>` still issues one later.
+    #[test]
+    fn a_person_added_with_no_token_has_no_token_record_and_can_be_issued_one_later() {
+        let Some(hub) = Hub::start("no-token") else { return };
+        let mut root = hub.dial(&hub.root).unwrap();
+        let added = run_words(&mut root, &["user", "add", "ed"], &Opts { no_token: true, ..Opts::default() }).unwrap();
+        assert!(added.token.is_none());
+        assert_eq!(doc(&added)["token"], Value::Null);
+        assert_eq!(added.lines, ["user ed added, with no token: ed logs in with GitHub, or `wsp hub token ed` issues one"]);
+        let users = doc(&w(&mut root, &["user", "ls"]).unwrap())["users"].clone();
+        let ed = users.as_array().unwrap().iter().find(|u| u["name"] == "ed").cloned().unwrap();
+        assert_eq!((ed["state"].clone(), ed["live_tokens"].clone(), ed["tokens"].clone()), (json!("active"), json!(0), json!([])));
+        let again = w(&mut root, &["token", "ed"]).unwrap();
+        assert_eq!(doc(&again)["revoked"], json!([]));
+        hub.dial(&token_of(&again)).expect("the token issued later logs in");
+        let admin = run_words(&mut root, &["user", "add", "fay"], &Opts { admin: true, no_token: true, ..Opts::default() }).unwrap();
+        assert!(admin.token.is_none() && admin.lines[0].starts_with("admin user fay added, with no token"));
     }
 
     #[test]
@@ -1202,5 +1278,48 @@ mod tests {
         assert!(known(&["state"]) && known(&["events"]) && known(&["lease", "ls"]) && known(&["workspace", "ls"]) && known(&["token", "revoke", "t-ed-1"]));
         assert!(!known(&["user"]) && !known(&["member", "set", "a", "b"]) && !known(&[]) && !known(&["user", "add"]));
         assert!(!known(&["token", "revoke"]) && !known(&["workspace", "ls", "x"]) && !known(&["events", "x"]));
+    }
+
+    /// `admin_verbs` names only verbs this wsp runs: each, with an operand where it takes one, is `known`.
+    #[test]
+    fn every_admin_verb_listed_is_known() {
+        fn operands(v: &'static str) -> Vec<&'static str> {
+            let mut w: Vec<&str> = v.split(' ').collect();
+            match v {
+                "member add" | "member rm" => w.extend(["team", "ed"]),
+                "user add" | "user revoke" | "user admin" | "token" | "token revoke" | "workspace add" | "lease release" => w.push("x1"),
+                _ => {}
+            }
+            w
+        }
+        for v in ADMIN_VERBS {
+            assert!(known(&operands(v)), "{v}");
+        }
+        for words in [&["state"][..], &["events"], &["user", "ls"], &["lease", "ls"], &["workspace", "ls"]] {
+            assert!(ADMIN_VERBS.contains(&words.join(" ").as_str()), "{words:?}");
+        }
+    }
+
+    /// A name wsp would make that it could only name back after `--`: refused before anything is dialled.
+    #[test]
+    fn a_name_that_begins_with_a_dash_is_not_made() {
+        assert!(flag_like(&["user", "add", "-x"]).is_some_and(|w| w.contains("may not begin with `-`")));
+        assert!(flag_like(&["workspace", "add", "--admin"]).is_some());
+        assert!(flag_like(&["user", "add", "ed"]).is_none() && flag_like(&["user", "add", "e-d"]).is_none());
+        // A name the hub has already (made another way) is named back with `--`: only the making is refused.
+        assert!(flag_like(&["user", "revoke", "-x"]).is_none());
+        let args = Args::parse(["hub", "user", "revoke", "--json", "--", "-x"].iter().map(|s| s.to_string()).collect());
+        assert_eq!((args.rest.as_slice(), args.json()), (&["user".to_string(), "revoke".into(), "-x".into()][..], true));
+    }
+
+    #[test]
+    fn a_value_flag_with_no_value_is_named() {
+        let parse = |v: &[&str]| Args::parse(v.iter().map(|s| s.to_string()).collect());
+        let a = parse(&["hub", "lease", "release", "r1", "--workspace", "-x"]);
+        assert!(value_flags(&["lease", "release", "r1"]).iter().any(|f| a.given(f) && !a.valued.contains(*f)), "--workspace took no value");
+        let b = parse(&["hub", "lease", "release", "r1", "--workspace", "team"]);
+        assert!(!value_flags(&["lease", "release", "r1"]).iter().any(|f| b.given(f) && !b.valued.contains(*f)));
+        let c = parse(&["hub", "events", "--person"]);
+        assert!(value_flags(&["events"]).iter().any(|f| c.given(f) && !c.valued.contains(*f)));
     }
 }

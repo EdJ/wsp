@@ -503,7 +503,7 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
         }
         Ok(login) => {
             if args.json() {
-                let doc = match &login {
+                let mut doc = match &login {
                     None => json!({ "logged_in": false, "connection": crate::hub_switch::status_json(store) }),
                     Some(l) => {
                         let mut doc = json!({ "logged_in": true, "url": l.url, "user": l.user, "at": l.at, "ca": l.ca, "connection": crate::hub_switch::status_json(store) });
@@ -513,6 +513,8 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
                         doc
                     }
                 };
+                // This wsp's own: the `wsp hub` admin verbs it has, logged in or not (the hub still decides each).
+                doc["admin_verbs"] = json!(crate::cmd_hub::ADMIN_VERBS);
                 println!("{doc}");
             } else {
                 println!("{}", status_text(&login));

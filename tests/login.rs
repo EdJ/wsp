@@ -530,3 +530,74 @@ fn hub_admin_flag_release_and_info_through_the_cli() {
     let status = json(&run(&["hub", "status", "--json"]));
     assert_eq!(status["admin"], serde_json::json!(true));
 }
+
+/// What an admin's acts on themselves do to their own login, as processes against a real hub, and what an app reading `wsp hub
+/// status --json` is told up front: `admin_verbs`. A new token for yourself revokes the token this wsp logs in with (an issued
+/// one): every dial after is refused `unauthorised`. Taking your own admin away: the next read is `forbidden`, and `admin` false.
+/// Revoking yourself: `unauthorised`, for good. Also a name that begins with `-` is never made, `--` names one the hub has, and a
+/// value flag with no value is named, and `user add --no-token` makes a person with no token. `--nocapture` prints each command.
+#[test]
+fn hub_admin_acts_on_yourself_and_the_words_wsp_reads_as_flags() {
+    use wsp_spoke::testhub::protocol::IdentityCommand;
+    use wsp_spoke::testhub::user;
+    let Some(rig) = Rig::new("self", &[]) else { return };
+    let run = |args: &[&str]| {
+        let out = rig.command(args).output().unwrap();
+        eprintln!("$ wsp {}\n[exit {}]\n{}{}", args.join(" "), out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let json = |o: &Output| -> serde_json::Value { serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {}", said(o))) };
+    let unauthorised = |o: &Output| {
+        assert_eq!(o.status.code(), Some(1), "{}", said(o));
+        assert_eq!(json(o)["error"]["code"], "unauthorised", "{}", said(o));
+    };
+    // Not logged in, wsp still says which admin verbs it has.
+    let verbs = json(&run(&["hub", "status", "--json"]))["admin_verbs"].clone();
+    assert!(["state", "events", "user add", "user admin", "token", "token revoke", "lease release"].iter().all(|v| verbs.as_array().unwrap().contains(&serde_json::json!(v))), "{verbs}");
+
+    rig._hub.apply(IdentityCommand::HubUserAdd { name: user("ann"), admin: true });
+    rig._hub.apply(IdentityCommand::HubUserAdd { name: user("bo"), admin: true });
+    let ca = rig.ca.display().to_string();
+    let login = |token: &str| assert!(rig.run(&["login", &rig.url, "--ca", &ca], &format!("{token}\n")).0.status.success());
+    login(&rig._hub.issue("ann"));
+    let status = json(&run(&["hub", "status", "--json"]));
+    assert_eq!((status["method"].clone(), status["admin"].clone(), status["admin_verbs"].clone()), (serde_json::json!("token"), serde_json::json!(true), verbs));
+
+    // A new token for yourself: done, and the token this wsp logs in with is among those revoked.
+    let t = json(&run(&["hub", "token", "ann", "--json"]));
+    assert_eq!(t["revoked"].as_array().unwrap().len(), 1, "{t}");
+    let out = run(&["hub", "state", "--json"]);
+    unauthorised(&out);
+    assert!(json(&out)["error"]["message"].as_str().unwrap().contains("revoked"));
+    login(t["token"]["token"].as_str().unwrap());
+    assert!(run(&["hub", "state", "--json"]).status.success(), "the new token logs in");
+
+    // Words that begin with `-`: a name is not made; `--` names one the hub has; a value flag with none is named.
+    let out = run(&["hub", "user", "add", "--json", "--", "-x"]);
+    assert_eq!((out.status.code(), json(&out)["error"]["code"].clone()), (Some(1), serde_json::json!("invalid")));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("may not begin with `-`"));
+    assert_eq!(run(&["hub", "user", "add", "-x"]).status.code(), Some(2), "read as a flag: usage, nothing dialled");
+    rig._hub.apply(IdentityCommand::HubUserAdd { name: user("-y"), admin: false });
+    assert_eq!(json(&run(&["hub", "user", "revoke", "--json", "--", "-y"]))["already"], serde_json::json!(false));
+    let out = run(&["hub", "lease", "release", "r1", "--workspace", "-x", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--workspace takes a value"), "{}", said(&out));
+
+    // --no-token: on the hub with no token record.
+    let added = json(&run(&["hub", "user", "add", "--no-token", "cy", "--json"]));
+    assert_eq!(added["token"], serde_json::Value::Null);
+    let users = json(&run(&["hub", "user", "ls", "--json"]))["users"].clone();
+    assert!(users.as_array().unwrap().iter().any(|u| u["name"] == "cy" && u["tokens"] == serde_json::json!([])), "{users}");
+
+    // Your own admin taken away: the next read is forbidden, and the status says admin false.
+    assert!(run(&["hub", "user", "admin", "ann", "--remove", "--json"]).status.success());
+    let out = run(&["hub", "state", "--json"]);
+    assert_eq!((out.status.code(), json(&out)["error"]["code"].clone()), (Some(1), serde_json::json!("forbidden")));
+    assert_eq!(json(&run(&["hub", "status", "--json"]))["admin"], serde_json::json!(false));
+
+    // Yourself revoked (bo still an admin): every dial after is unauthorised, and no new token can be had on that login.
+    rig._hub.apply(IdentityCommand::HubUserAdmin { name: user("ann"), admin: true });
+    assert_eq!(json(&run(&["hub", "user", "revoke", "ann", "--json"]))["already"], serde_json::json!(false));
+    unauthorised(&run(&["hub", "state", "--json"]));
+    unauthorised(&run(&["hub", "token", "ann", "--json"]));
+}

@@ -56,6 +56,8 @@ pub const BOOL_FLAGS: &[&str] = &[
     // the `--ending` a rotation starts behind itself, and `--take`, which
     // `wsp govern core --take` puts after the scope it takes.
     "govern", "remove", "rotate", "ending", "take",
+    // `wsp hub user add --no-token <name>` must not read the name as its value.
+    "no-token",
     // `wsp spawn --primary` takes no positional, and `--primary --kind x`
     // must not read `--kind` as its value.
     "primary",

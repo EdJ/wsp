@@ -590,7 +590,8 @@ MACHINES
                                     off, what the disconnect parked, what is unsent
   wsp hub state [--json]               the admin's snapshot: the hub's name, who asks,
                                        where its trail starts; people, workspaces, leases
-  wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
+  wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in);
+                [--no-token]           with --no-token none: they log in with GitHub
   wsp hub user ls [--json]             the hub's people: role, state, token records
                                        (id, method, issued, revoked), workspaces
   wsp hub user revoke <name>           revoke a user and every token of its
