@@ -953,6 +953,9 @@ struct Players {
 impl Players {
     fn play(&mut self, rig: &HubRig, s: &Spoke) {
         let rows = s.rows();
+        // As in the gate test, a seat reviews once the list has started: a
+        // review before it writes no `wsp: ready`, and no verifier follows.
+        let started = s.run(&["worklist", "show", LIST]).1.lines().any(|l| l.starts_with("status") && l.contains("executing"));
         let title = |id: &str| -> String {
             rows.iter().find(|r| r["id"].as_str() == Some(id)).and_then(|r| r["title"].as_str()).unwrap_or("").to_string()
         };
@@ -965,11 +968,12 @@ impl Players {
             let key = format!("{}:{id}", s.user);
             // As the gate test: a seat works its row once the row is whole here.
             let whole = || !s.show(id).contains("head only");
-            if !self.reviewed.contains(&key) && s.claimed(id) && s.repo.join(".worktrees").join(id).is_dir() && whole() {
+            if started && !self.reviewed.contains(&key) && s.claimed(id) && s.repo.join(".worktrees").join(id).is_dir() && whole() {
                 if let Some(seat) = s.seat_of(id) {
                     s.commit_in_tree(id, &format!("{id}.txt"));
                     let (ok, out) = s.as_seat(&seat, &["review", id, &format!("Wrote {id}.txt; nothing left.")], "");
                     assert!(ok, "rehearsal: {}'s seat reviews {id}: {out}", s.user);
+                    assert!(s.show(id).contains("wsp: ready"), "rehearsal: {id} is marked ready on {}'s spoke: {}", s.user, s.show(id));
                     self.reviewed.insert(key.clone());
                 }
             }
@@ -1058,4 +1062,5 @@ fn the_two_machine_script_runs_on_the_sandbox_with_every_step_ok() {
         assert!(both.contains(&format!("== step {step}:")), "step {step} ran:\n{both}");
     }
     assert!(players.cut && players.restored, "the helper's script asked for the link to be cut and restored:\n{both}");
+    println!("owner (ed):\n{eds}\nhelper (jesper):\n{jespers}");
 }
