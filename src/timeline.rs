@@ -108,6 +108,41 @@ pub(crate) struct Inputs {
     /// to `leg X ended after N` (`wsp-335`): the record that a seat came up for
     /// a leg where no `session-learned` was written for it.
     pub leg_seats: Vec<LegSeat>,
+    /// `(epoch, leg, pane)` of every `leg X started by pane P` line on the row's
+    /// log, the starts that were dropped or superseded too (`wsp-902`).
+    pub leg_panes: Vec<(i64, String, String)>,
+    /// Where the row's log says an attempt at a leg was ended with the leg not
+    /// done: a reset by hand, or a spawn that failed (`wsp-902`).
+    pub leg_marks: Vec<LegMark>,
+}
+
+/// One line of the row's log that ended an attempt at a leg.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LegMark {
+    pub at: i64,
+    pub leg: String,
+    /// What the line said, after the leg's name.
+    pub said: String,
+}
+
+/// The `leg X reset by hand: why` and `wsp could not spawn leg X (try N)` lines
+/// of a row's log.
+fn leg_marks(log: &str) -> Vec<LegMark> {
+    log.lines()
+        .filter_map(|l| {
+            let (stamp, rest) = l.trim().strip_prefix("- ")?.split_once(' ')?;
+            if !util::is_stamp(stamp) {
+                return None;
+            }
+            let (leg, said) = if let Some(h) = rest.strip_prefix("wsp could not spawn leg ") {
+                (h.rsplit_once(" (try ")?.0, "could not be spawned".to_string())
+            } else {
+                let (leg, why) = rest.strip_prefix("leg ")?.split_once(" reset by hand: ")?;
+                (leg, format!("reset by hand: {why}"))
+            };
+            (!leg.contains(' ')).then(|| LegMark { at: util::epoch_of(stamp), leg: leg.to_string(), said })
+        })
+        .collect()
 }
 
 /// One seat a leg ran in, off the row's log (`wsp-335`).
@@ -314,10 +349,16 @@ pub(crate) const CAPPED_REOPEN: &str = "reopened at the leg cap with no member s
 /// line that ended it.
 fn seat_ended_after(i: &Inputs, up: i64) -> Option<(String, i64)> {
     let pane = i.kind("session-learned", &i.id).into_iter().find(|(t, _)| *t == up).and_then(|(_, d)| d["pane"].as_str().map(str::to_string))?;
+    let at = pane_ended_after(i, &pane, up)?;
+    Some((pane, at))
+}
+
+/// When the cycle log says seat `pane` ended, at or after `up`.
+fn pane_ended_after(i: &Inputs, pane: &str, up: i64) -> Option<i64> {
     let exit = format!("{} ", crate::ending::EXIT_ENDED);
     let named = format!(", {pane})");
     let ended = format!("ended {pane}");
-    let at = i.cycle.iter().filter(|(t, _)| *t >= up).find_map(|(t, l)| {
+    i.cycle.iter().filter(|(t, _)| *t >= up).find_map(|(t, l)| {
         if let Some((_, rest)) = l.split_once(&exit) {
             let (at, tail) = rest.split_once(" (")?;
             let accepted = util::epoch_of(at);
@@ -326,8 +367,108 @@ fn seat_ended_after(i: &Inputs, up: i64) -> Option<(String, i64)> {
             return tail.split_once(')').is_some_and(|(who, _)| format!(", {who})").ends_with(&named)).then_some(when);
         }
         (l == &ended || l.starts_with(&format!("{ended},"))).then_some(*t)
-    })?;
-    Some((pane, at))
+    })
+}
+
+/// The cause of a stretch from a leg's reset to its next start.
+pub(crate) const LEG_RESET: &str = "a leg reset, not started again";
+/// The cause of a stretch between a leg's attempts that a hold of the list covers.
+pub(crate) const LIST_HELD: &str = "the list held";
+/// The cause of a stretch between a leg's attempts with the row parked.
+pub(crate) const ROW_PARKED: &str = "the row parked";
+
+/// When the row itself stood parked, from each `task-parked` to what took the
+/// row up again.
+fn row_parked_spans(i: &Inputs) -> Vec<(i64, i64)> {
+    let mut evs: Vec<&(i64, String, Value)> = i.events.iter().filter(|(_, _, d)| d["id"] == i.id.as_str()).collect();
+    evs.sort_by_key(|e| e.0);
+    let mut out = Vec::new();
+    let mut from: Option<i64> = None;
+    for (t, k, _) in evs {
+        match k.as_str() {
+            "task-parked" => {
+                from.get_or_insert(*t);
+            }
+            "task-todo" | "task-doing" | "task-claimed" | "task-reopen" | "task-reopened" => {
+                if let Some(f) = from.take() {
+                    out.push((f, *t));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(f) = from {
+        out.push((f, i64::MAX));
+    }
+    out
+}
+
+/// The stretch `from..to` between two attempts at leg `name`, cut where what
+/// held it changes: the list held, the list parked, the row parked, and else
+/// `why`, what ended the attempt before it.
+fn between_leg_attempts(i: &Inputs, name: &str, from: i64, to: i64, why: &str) -> Vec<Phase> {
+    let parked = row_parked_spans(i);
+    let mut cuts = vec![from, to];
+    let edges = i.holds.iter().flat_map(|h| [h.0, h.1]).chain(i.parks.iter().flat_map(|p| [p.start, p.end])).chain(parked.iter().flat_map(|p| [p.0, p.1]));
+    cuts.extend(edges.filter(|t| *t > from && *t < to));
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out: Vec<Phase> = Vec::new();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (what, cause) = if let Some((s, _, said)) = i.holds.iter().find(|h| h.0 <= a && a < h.1) {
+            let said = if said.is_empty() { "no reason given".to_string() } else { cut_at_word(said, 300) };
+            ("list held", format!("{LIST_HELD} — since {}: {said}", clock(*s)))
+        } else if let Some(p) = i.parks.iter().find(|p| p.start <= a && a < p.end) {
+            ("list parked", format!("{PARKED_LIST} — {}", p.words()))
+        } else if let Some((s, _)) = parked.iter().find(|p| p.0 <= a && a < p.1) {
+            ("row parked", format!("{ROW_PARKED} — since {}", clock(*s)))
+        } else {
+            ("not running", why.to_string())
+        };
+        match out.last_mut().filter(|p| p.waiting_for.as_deref() == Some(cause.as_str())) {
+            Some(p) => p.end = b,
+            None => out.push(Phase::gap(format!("leg {name}: {what} from {}", clock(a)), a, b, cause)),
+        }
+    }
+    out
+}
+
+/// One attempt at leg `name`, started at `s`, that did not close the leg, and
+/// the stretch after it up to `next` (the leg's next start; `None` where there
+/// is none yet). It ran to its own end: the reset, or the line that ended its
+/// seat, whichever came first. Returns the phases and where they stop.
+fn ended_attempt(i: &Inputs, name: &str, s: i64, next: Option<i64>, nth: String) -> (Vec<Phase>, i64) {
+    let bound = next.unwrap_or(i64::MAX);
+    // The row log's start line is written within a moment of the cycle log's.
+    let logged = i.leg_panes.iter().find(|(t, l, _)| l == name && *t >= s - 2 && *t < bound).map(|(_, _, p)| p.clone());
+    let learned = i.kind("session-learned", &i.id).into_iter().find(|(t, _)| *t >= s && *t < bound);
+    let seated = logged.is_some() || learned.is_some();
+    let pane = logged.or_else(|| learned.and_then(|(_, d)| d["pane"].as_str().map(str::to_string)));
+    let mark = i.leg_marks.iter().find(|m| m.leg == name && m.at > s && m.at <= bound);
+    let gone = pane.as_deref().and_then(|p| {
+        let despawn = format!("despawn {p} (");
+        let despawned = i.cycle.iter().find(|(t, l)| *t >= s && l.starts_with(&despawn)).map(|(t, _)| *t);
+        pane_ended_after(i, p, s).into_iter().chain(despawned).min().filter(|e| *e <= bound)
+    });
+    let end = match gone.into_iter().chain(mark.map(|m| m.at)).min().or(next) {
+        Some(e) if seated => e,
+        _ => s,
+    };
+    let why = match (mark, gone) {
+        (Some(m), _) => format!("{LEG_RESET} — leg {name} {} ({})", cut_at_word(&m.said, 200), clock(m.at)),
+        (None, Some(e)) => format!("{LEG_SEAT_ENDED} — {} ended at {} (not work)", pane.as_deref().unwrap_or("its seat"), util::iso_at(e)),
+        (None, None) => format!("leg {name}: no seat came up (not work)"),
+    };
+    let mut out = Vec::new();
+    if end > s {
+        out.push(Phase::work(format!("leg {name} ({nth})"), s, end));
+    }
+    if let Some(n) = next.filter(|n| *n > end) {
+        out.extend(between_leg_attempts(i, name, end, n, &why));
+    }
+    let stop = next.map_or(end, |n| n.max(end));
+    (out, stop)
 }
 
 /// The seat the row's log names for leg `name` started at `s` and closed at
@@ -777,8 +918,12 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
         let added = i.events.iter().find(|(_, k, d)| k == "leg-added" && d["id"] == id && d["leg"] == leg.name.as_str()).map(|(t, _, _)| *t);
         let waits: Vec<String> = if leg.after.is_empty() && n > 0 && !i.legs[n - 1].skipped { vec![i.legs[n - 1].name.clone()] } else { leg.after.clone() };
-        let started = i.first_line(added.unwrap_or(0), |l| l.contains(&format!("starting leg {} of {id}", leg.name)));
-        let Some(s) = started else { continue };
+        // One start per attempt: a reset leg is started again (`wsp-902`).
+        let starting = format!("starting leg {} of {id}", leg.name);
+        let mut starts: Vec<i64> = i.cycle.iter().filter(|(t, l)| *t >= added.unwrap_or(0) && l.contains(&starting)).map(|(t, _)| *t).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let Some(&s) = starts.first() else { continue };
         // The waits as the row has them now: one that finished after this leg
         // had started was edited since (`wsp leg after`), and is not what held
         // it back.
@@ -790,12 +935,6 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
         // The leg that ends the row ends with the review, not a `leg done`.
         let done_event = i.events.iter().find(|(t, k, d)| k == "leg-done" && d["id"] == id && d["leg"] == leg.name.as_str() && *t >= s);
-        // A close that came late (`wsp-372`) carries when the baton was written:
-        // the leg's work ended then, and the rest is the stall, not work.
-        let baton_at = done_event.and_then(|(t, _, d)| d["baton_at"].as_i64().filter(|b| *b >= s && b < t));
-        let finished = baton_at
-            .or_else(|| done_event.map(|(t, _, _)| *t))
-            .or_else(|| reviews.iter().copied().find(|r| *r >= s));
         if ready > 0 && s > ready {
             // A review typed between two legs ran the row's own check, which
             // failed and sent the row back: that run is work, not a wait
@@ -813,6 +952,32 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
                 out.push(Phase::gap(label, from, s, wait_name(i, from, s, id)));
             }
         }
+        // Every start before the last is an attempt that ran to its own end;
+        // the last is the one the leg's close is read against, unless it was
+        // reset too and nothing started the leg again.
+        if let Some((closed, _, _)) = done_event {
+            starts.retain(|t| t <= closed);
+        }
+        let attempts_made = starts.len();
+        let last_start = starts.last().copied().unwrap_or(s);
+        let live = done_event.is_some() || !i.leg_marks.iter().any(|m| m.leg == leg.name && m.at > last_start);
+        let ended = if live { attempts_made.saturating_sub(1) } else { attempts_made };
+        for k in 0..ended {
+            let next = starts.get(k + 1).copied().or_else(|| reviews.iter().copied().find(|r| *r > starts[k]));
+            let (phases, stop) = ended_attempt(i, &leg.name, starts[k], next, format!("attempt {} of {attempts_made}", k + 1));
+            out.extend(phases);
+            if !live {
+                last_end = Some(last_end.map_or(stop, |e| e.max(stop)));
+            }
+        }
+        if !live {
+            continue;
+        }
+        let s = last_start;
+        // A close that came late (`wsp-372`) carries when the baton was written:
+        // the leg's work ended then, and the rest is the stall, not work.
+        let baton_at = done_event.and_then(|(t, _, d)| d["baton_at"].as_i64().filter(|b| *b >= s && b < t));
+        let finished = baton_at.or_else(|| done_event.map(|(t, _, _)| *t)).or_else(|| reviews.iter().copied().find(|r| *r >= s));
         // A seat that came up only after the leg had ended is not this leg's.
         let up = i.first_learned_after(s).filter(|u| finished.is_none_or(|f| *u <= f));
         // No `session-learned`, but the leg's own entry names the seat that ran
@@ -1408,6 +1573,8 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .map(|(d, _)| (util::epoch_of(&d.at), d.id, d.text))
             .collect();
         i.leg_seats = leg_seats_of(&t);
+        i.leg_panes = crate::cmd_attempts::attempts_of(&t).into_iter().filter(|a| !a.pane.is_empty()).filter_map(|a| Some((util::epoch_of(&a.at), a.leg?, a.pane))).collect();
+        i.leg_marks = t.section("Log").map(|l| leg_marks(&l)).unwrap_or_default();
         i.legs = crate::legs::legs(&t)
             .into_iter()
             .map(|l| LegIn { skipped: l.skipped.is_some(), after: l.after.clone().unwrap_or_default(), name: l.name })
@@ -2550,6 +2717,65 @@ mod tests {
         events.push(ev(2300, "task-review", json!({"id": id})));
         events.push(ev(2400, "task-verified", json!({"id": id, "verdict": "holds"})));
         Inputs { id: id.into(), events, cycle, ..Default::default() }
+    }
+
+    /// crate-split's `wsp-441`, leg `move`: three resets by hand, a park with a
+    /// hold of the list inside it, an unpark and a fourth start (`wsp-902`).
+    #[test]
+    fn a_reset_leg_is_one_leg_phase_per_attempt_and_the_stretch_between_is_named_for_what_held_it() {
+        let id = "wsp-441";
+        let at = |hms: &str| util::epoch_of(&format!("2026-11-26T{hms}Z"));
+        let start = |hms: &str| (at(hms), format!("crate-split group 5: starting leg move of {id}"));
+        let ev = |hms: &str, kind: &str, d: Value| (at(hms), kind.to_string(), d);
+        let log = "- 2026-11-26T00:44:54Z leg move reset by hand: blocked on wsp-834\n\
+                   - 2026-11-26T00:46:57Z leg move reset by hand: reseated before it landed\n\
+                   - 2026-11-26T00:48:56Z leg move reset by hand: parked until it lands\n";
+        let marks = leg_marks(log);
+        assert_eq!(marks.iter().map(|m| (m.at, m.leg.as_str())).collect::<Vec<_>>(), [(at("00:44:54"), "move"), (at("00:46:57"), "move"), (at("00:48:56"), "move")]);
+        let panes = [("00:23:26", "cpd-958"), ("00:44:54", "cpd-962"), ("00:46:57", "cpd-963"), ("07:45:15", "cpd-984")];
+        let i = Inputs {
+            id: id.into(),
+            events: vec![
+                ev("00:47:14", "task-parked", json!({"id": id})),
+                ev("07:44:50", "task-todo", json!({"id": id})),
+                ev("08:01:15", "leg-done", json!({"id": id, "leg": "move"})),
+            ],
+            cycle: vec![
+                start("00:23:26"),
+                start("00:44:54"),
+                (at("00:46:56"), format!("despawn cpd-962 ({id}) by the governor of crate-split")),
+                start("00:46:57"),
+                start("07:45:15"),
+            ],
+            legs: vec![LegIn { name: "move".into(), ..Default::default() }],
+            leg_panes: panes.iter().map(|(t, p)| (at(t), "move".to_string(), p.to_string())).collect(),
+            leg_seats: vec![LegSeat { leg: "move".into(), pane: "cpd-984".into(), start: at("07:45:15"), end: Some(at("08:01:15")) }],
+            leg_marks: marks,
+            holds: vec![(at("02:15:11"), at("05:39:03"), "/tmp inodes near full".into())],
+            ..Default::default()
+        };
+        let ph = build(&i);
+        let legs: Vec<(i64, i64)> = ph.iter().filter(|p| !p.gap && p.label.starts_with("leg ")).map(|p| (p.start, p.end)).collect();
+        let want = [("00:23:26", "00:44:54"), ("00:44:54", "00:46:56"), ("00:46:57", "00:48:56"), ("07:45:15", "08:01:15")].map(|(a, b)| (at(a), at(b)));
+        assert_eq!(legs, want, "{ph:?}");
+        let gaps: Vec<(i64, i64, &str)> = ph.iter().filter(|p| p.gap && p.start >= at("00:48:56")).map(|p| (p.start, p.end, p.waiting_for.as_deref().unwrap())).collect();
+        let spans: Vec<(i64, i64)> = gaps.iter().map(|g| (g.0, g.1)).collect();
+        assert_eq!(spans, [("00:48:56", "02:15:11"), ("02:15:11", "05:39:03"), ("05:39:03", "07:44:50"), ("07:44:50", "07:45:15")].map(|(a, b)| (at(a), at(b))), "{gaps:?}");
+        assert!(gaps[0].2.starts_with(ROW_PARKED) && gaps[2].2.starts_with(ROW_PARKED), "{gaps:?}");
+        assert!(gaps[1].2.starts_with(LIST_HELD) && gaps[1].2.contains("/tmp inodes"), "{gaps:?}");
+        assert!(gaps[3].2.starts_with(LEG_RESET), "{gaps:?}");
+        let spans = ph.iter().map(crate::wallbuckets::Span::of).collect();
+        let m = crate::wallbuckets::MemberIn { id: id.into(), spans, measured: true, ..Default::default() };
+        let g = crate::wallbuckets::group_wall(&[m], None, Some(at("08:01:15"))).unwrap();
+        assert_eq!(g.legs, want.iter().map(|(a, b)| b - a).sum::<i64>());
+        assert!(g.waits.iter().any(|((_, c), s)| c.contains(LIST_HELD) && *s == at("05:39:03") - at("02:15:11")), "{:?}", g.waits);
+
+        // Reset and not started again: the attempt still ends at its reset.
+        let mut open = i;
+        open.events.retain(|(_, k, _)| k != "leg-done");
+        open.cycle.retain(|(t, _)| *t < at("07:45:15"));
+        let last = build(&open).into_iter().filter(|p| !p.gap && p.label.starts_with("leg ")).map(|p| p.end).max();
+        assert_eq!(last, Some(at("00:48:56")));
     }
 
     /// A row released before its review and started again is two seats, and the
