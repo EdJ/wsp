@@ -2542,6 +2542,25 @@ pub fn park(store: &Store, args: &Args) -> i32 {
     code
 }
 
+/// `wsp unpark <id>`: a parked row, and only a parked one, back to `todo`.
+pub fn unpark(store: &Store, args: &Args) -> i32 {
+    let Some(needle) = args.rest.first() else {
+        eprintln!("usage: wsp unpark <id>");
+        return 2;
+    };
+    match store.task_or_why(needle) {
+        Ok(t) if t.status() == Status::Parked => set_status(store, args, Status::Todo),
+        Ok(t) => {
+            eprintln!("wsp: {} is at {}, not parked", t.id, t.status().as_str());
+            1
+        }
+        Err(why) => {
+            eprintln!("{why}");
+            1
+        }
+    }
+}
+
 /// Is this payload naming a stream to read the prose from, rather than being
 /// the prose?
 ///
@@ -4383,6 +4402,11 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     quiet, and not counted as wanting you"##,
             },
         ],
+    },
+    crate::verbs::Verb {
+        names: &["unpark"],
+        run: unpark,
+        help: &[],
     },
     crate::verbs::Verb {
         names: &["review"],

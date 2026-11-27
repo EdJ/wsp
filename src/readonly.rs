@@ -39,7 +39,7 @@ pub const READ_ONLY: &[&str] = &[
 /// Verbs that write, or that write for some of their forms.
 #[allow(dead_code)] // read by the test; the list is the record
 pub const ACTIONS: &[&str] = &[
-    "add", "decide", "note", "start", "block", "park", "review", "reopen", "todo", "mv", "tag", "ref", "prio", "allocate", "next", "edit",
+    "add", "decide", "note", "start", "block", "park", "unpark", "review", "reopen", "todo", "mv", "tag", "ref", "prio", "allocate", "next", "edit",
     "rename", "caption", "rm", "archive", "ask", "answer", "yours", "ack", "watch", "verified", "check", "spawn", "despawn",
     "attend", "claim", "release", "pin", "unpin", "agent", "doctor", "say", "tell", "flag", "reconcile",
     "attempts", "leg", "install", "daemon", "brief", "commit-help", "machine", "migrate", "code", "retro", "packet", "sandbox",
