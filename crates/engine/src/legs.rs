@@ -1399,6 +1399,7 @@ fn cmd_reset(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
         return refuse(format!("{name} could not be reset: it is no longer running"));
     }
     crate::starts::forgive(store, &label(&t.id, name));
+    crate::closing::forgive_ended(store, &t.id, name);
     store.locked(|| {
         if let Some(mut row) = store.find_task(&t.id) {
             let _ = crate::log::note(store, &mut row, &format!("leg {name} reset by hand: {}", crate::util::fold(&why)));

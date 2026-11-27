@@ -25,6 +25,10 @@
 //!   dirty tree, a refused close are all a flag to the person, at once.
 //! - **A session that ended with its leg open** is settled on the tick that
 //!   sees it, with no idle timer.
+//! - **A leg whose seat ended leaving no baton and no tree** (`wsp-850`) has
+//!   nothing to close or guess at: it is reset and started again, once
+//!   ([`ended_empty`]). The second time it is flagged and left. `wsp leg reset`
+//!   forgives the count ([`forgive_ended`]).
 //!
 //! # The other three closing verbs (`wsp-374`)
 //!
@@ -498,9 +502,10 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let Some(seat) = l.pane.clone() else { continue };
             let baton = fresh_baton(store, &t.id, &l.name, l.started.as_deref());
             let start = l.started.as_deref().map(util::epoch_of);
-            let item = Item { key: format!("{}/{}", t.id, l.name), row: &t.id, seat: &seat, written: baton, start, raise: None };
+            // Keyed by seat too: a leg started again is a new item, owed its own tell and flag.
+            let item = Item { key: format!("{}/{}/{seat}", t.id, l.name), row: &t.id, seat: &seat, written: baton, start, raise: None };
             let tell = |idle: i64| tell_to_close(store, &t.id, &l.name, &seat, idle);
-            let close = |why: Why| settle(store, &t.id, &l.name, &seat, baton, why, now);
+            let close = |why: Why| settle(store, seats, &t.id, &l.name, &seat, baton, why, now);
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
         }
     }
@@ -757,7 +762,8 @@ fn leg_exit(store: &Store, row: &str, baton: &str) -> Result<Option<String>, Vec
 /// Close the leg for a seat that did not, if that is safe, else flag the person.
 /// Returns whether the item is dealt with (closed or flagged), which is when it
 /// is not looked at again.
-fn settle(store: &Store, row: &str, leg: &str, seat: &str, baton_at: Option<i64>, why: Why, now: i64) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn settle(store: &Store, seats: &dyn Seats, row: &str, leg: &str, seat: &str, baton_at: Option<i64>, why: Why, now: i64) -> bool {
     let path = baton_path(store, row, leg);
     let baton = std::fs::read_to_string(&path).unwrap_or_default();
     let (_, tree) = tree_of(store, seat);
@@ -774,7 +780,11 @@ fn settle(store: &Store, row: &str, leg: &str, seat: &str, baton_at: Option<i64>
         };
         format!("{head}; {baton}; {} ({note})", why.words())
     };
-    let safe = matches!(tree, Tree::Clean(_) | Tree::NotGit) && baton_at.is_some() && !baton.trim().is_empty();
+    let handed = baton_at.is_some() && !baton.trim().is_empty();
+    if matches!(why, Why::Ended) && matches!(tree, Tree::Unknown) && !handed {
+        return ended_empty(store, seats, row, leg, seat, &evidence("it ended this way before, so it is not started again"), now);
+    }
+    let safe = matches!(tree, Tree::Clean(_) | Tree::NotGit) && handed;
     if !safe {
         flag(store, row, leg, seat, &evidence("wsp does not guess, so it is not closed"));
         return true;
@@ -811,6 +821,69 @@ fn settle(store: &Store, row: &str, leg: &str, seat: &str, baton_at: Option<i64>
             true
         }
     }
+}
+
+/// How many times a leg's seat ended with no baton and no tree before wsp stops
+/// starting it again and flags the person.
+const ENDED_EMPTY_TRIES: u64 = 2;
+
+fn ended_path(store: &Store) -> PathBuf {
+    store.state.join("closing-ended.json")
+}
+
+/// Change the counts of empty endings, keyed `row/leg`, under the store lock.
+fn ended_counts<T>(store: &Store, f: impl FnOnce(&mut serde_json::Map<String, Value>) -> T) -> T {
+    store.locked(|| {
+        let mut m: serde_json::Map<String, Value> =
+            std::fs::read_to_string(ended_path(store)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let before = m.clone();
+        let out = f(&mut m);
+        if m != before {
+            let _ = std::fs::create_dir_all(&store.state);
+            let _ = std::fs::write(ended_path(store), Value::Object(m).to_string());
+        }
+        out
+    })
+}
+
+/// Forget a leg's empty endings: a person reset it, so its next start is the first.
+pub fn forgive_ended(store: &Store, row: &str, leg: &str) {
+    ended_counts(store, |m| {
+        m.remove(&format!("{row}/{leg}"));
+    });
+}
+
+/// A leg whose seat ended with no baton and no tree (`wsp-850`): the first time
+/// it is reset and started again, with a line on the row's log; the next time it
+/// is flagged and left running, so nothing starts it a third time. Returns
+/// whether the item is dealt with, as [`settle`] does.
+fn ended_empty(store: &Store, seats: &dyn Seats, row: &str, leg: &str, seat: &str, evidence: &str, now: i64) -> bool {
+    let key = format!("{row}/{leg}");
+    let times = ended_counts(store, |m| {
+        let n = m.get(&key).and_then(Value::as_u64).unwrap_or(0) + 1;
+        m.insert(key.clone(), json!(n));
+        n
+    });
+    if times >= ENDED_EMPTY_TRIES {
+        flag(store, row, leg, seat, evidence);
+        return true;
+    }
+    if crate::leg_seat::reset(store, row, leg).is_none() {
+        return true;
+    }
+    let line = format!("leg {leg}'s seat ended at {} with no baton; reset and restarted, attempt {}", clock(now), times + 1);
+    store.locked(|| {
+        if let Some(mut t) = store.find_task(row) {
+            let _ = crate::log::note(store, &mut t, &line);
+        }
+    });
+    crate::store::log_line(store, &format!("{row}: {line} ({seat})"));
+    store.git_commit(&format!("wsp: {row} leg {leg} reset, its seat ended with no baton"));
+    // A row no list runs is started here; a list's row is its list's step.
+    if crate::cycle::start_inside(store, row, seats).is_empty() {
+        crate::cycle::poke_task(store, row, "leg-reset");
+    }
+    false
 }
 
 /// The item needs a person: a note about the row, in the log and to the list's
@@ -1206,6 +1279,76 @@ mod tests {
         assert!(!running(&store));
         let log = store.find_task("m-1").unwrap().section("Log").unwrap();
         assert!(log.contains("closed by wsp: session ended"), "{log}");
+    }
+
+    /// `staged`'s row with its leg started 131 s ago and its seat's binding
+    /// gone, which is a seat that ended 60 s ago leaving no tree and no baton.
+    fn staged_empty(env: &util::Isolated) -> Store {
+        let (store, _tree) = staged(env);
+        let mut t = store.find_task("m-1").unwrap();
+        let mut ls = legs::legs(&t);
+        ls[0].started = Some(util::iso_at(util::epoch_secs() - 131));
+        legs::write(&mut t, &ls);
+        store.save_task(&t).unwrap();
+        store.clear_binding("cpd-1");
+        crate::cycle::tests::SPAWNED.with(|s| s.borrow_mut().clear());
+        store
+    }
+
+    fn spawned_legs() -> usize {
+        crate::cycle::tests::SPAWNED.with(|s| s.borrow().len())
+    }
+
+    /// The restarted leg seated in `seat`, bound to no tree.
+    fn reseat(store: &Store, seat: &str) {
+        let stand = crate::leg_seat::Standing { room: None, cwd: None, kind: "claude" };
+        assert!(crate::leg_seat::attach(store, "m-1", "build", seat, &stand));
+    }
+
+    #[test]
+    fn a_leg_whose_seat_ended_with_no_baton_and_no_tree_is_reset_and_started_again() {
+        let env = util::isolated("closing-ended-empty");
+        let store = staged_empty(&env);
+        tick_at(&store, &Fake(RefCell::new(None), true), util::epoch_secs());
+        assert_eq!(spawned_legs(), 1, "started again on that tick");
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(legs::legs(&t)[0].pane, None, "the ended seat is off the entry");
+        let log = t.section("Log").unwrap();
+        assert!(log.contains("leg build's seat ended at ") && log.contains("with no baton; reset and restarted, attempt 2"), "{log}");
+        assert!(crate::message::raised(&store).is_empty(), "nobody is asked the first time");
+    }
+
+    #[test]
+    fn a_leg_that_ends_empty_twice_flags_the_person_once_and_is_not_started_a_third_time() {
+        let env = util::isolated("closing-ended-twice");
+        let store = staged_empty(&env);
+        // On a list with no seat of its own.
+        let mut w = Worklist::new("a run", "cr-1");
+        w.set_status(WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["m-1".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        assert!(!store.governors().contains_key("cr-1"), "no seat on the list");
+        let gone = Fake(RefCell::new(None), true);
+        tick_at(&store, &gone, util::epoch_secs());
+        assert_eq!(legs::legs(&store.find_task("m-1").unwrap())[0].state, LegState::Pending, "reset, for the list's step to start");
+        // The list's step opens and seats it; this stands in for that.
+        crate::leg_seat::open(&store, "m-1", "build").unwrap();
+        reseat(&store, "cpd-2");
+        let started = spawned_legs();
+        let now = util::epoch_secs();
+        tick_at(&store, &gone, now);
+        tick_at(&store, &gone, now + 600);
+        assert!(running(&store), "left as it is for the person");
+        assert_eq!(legs::legs(&store.find_task("m-1").unwrap())[0].pane.as_deref(), Some("cpd-2"));
+        assert_eq!(spawned_legs(), started, "not started a third time");
+        let theirs = crate::message::raised_to_the_person(&store);
+        assert_eq!(theirs.len(), 1, "flagged once, and it is the person's: {theirs:?}");
+        assert!(theirs[0].text.contains("ended this way before"), "{}", theirs[0].text);
+        let said = crate::cycle::tests::SAID.with(|s| s.borrow().clone());
+        assert_eq!(said.iter().filter(|l| l.contains("leg build of m-1: needs a person")).count(), 1, "{said:?}");
+        // A person's reset forgives the count.
+        forgive_ended(&store, "m-1", "build");
+        assert!(ended_counts(&store, |m| m.is_empty()));
     }
 
     #[test]
