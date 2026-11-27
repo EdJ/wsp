@@ -133,11 +133,24 @@ pub(crate) struct Park {
     pub open: bool,
 }
 
+/// The reason a report quotes, whole where it has `cap` characters or fewer and
+/// else cut between two words and ended with `…`: never mid-word (`wsp-856`). A
+/// first word longer than the cap leaves the `…` alone.
+fn cut_at_word(text: &str, cap: usize) -> String {
+    let text = text.trim();
+    let Some((end, next)) = text.char_indices().nth(cap) else { return text.to_string() };
+    let mut head = &text[..end];
+    if !next.is_whitespace() {
+        head = head.rfind(char::is_whitespace).map_or("", |i| &head[..i]);
+    }
+    format!("{}…", head.trim_end())
+}
+
 impl Park {
     /// What it was, for a cause or a bucket: who, when, why, until when.
     pub(crate) fn words(&self) -> String {
         let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
-        let why: String = self.why.trim().chars().take(140).collect();
+        let why = cut_at_word(&self.why, 140);
         let until = if self.open { "still parked".to_string() } else { format!("resumed at {}", at(self.end)) };
         format!("the list was parked by {} at {}, {until}{}", self.by, at(self.start), if why.is_empty() { String::new() } else { format!(": {why}") })
     }
@@ -260,7 +273,7 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
         i.cycle.iter().filter(|(t, _)| *t >= from && *t <= to).filter_map(|(_, l)| l.split_once(&head).map(|(_, w)| w.trim().to_string())).last()
     });
     if let Some(held) = hold.filter(|h| !h.is_empty()) {
-        let held: String = held.chars().take(300).collect();
+        let held = cut_at_word(&held, 300);
         format!("{}{held}", crate::wallbuckets::BARRIER_HOLD)
     } else if let Some(after) = cap {
         let held = cap_holders(i, &after, to);
@@ -489,10 +502,9 @@ fn person_step(i: &Inputs, since: i64, from: i64, to: i64) -> Option<(i64, i64, 
     let at = |t: i64| util::iso_at(t).get(11..16).unwrap_or_default().to_string();
     let holds: Vec<&(i64, String, String)> = i.decisions.iter().filter(|(t, _, x)| *t >= since && *t < to && holds_for_person(x)).collect();
     if let (Some(first), Some(last)) = (holds.first(), holds.last()) {
-        let text: String = last.2.trim().chars().take(160).collect();
-        let more = if last.2.trim().chars().count() > 160 { "…" } else { "" };
+        let text = cut_at_word(&last.2, 160);
         let id = if last.1.is_empty() { "a decision".to_string() } else { format!("decision {}", last.1) };
-        let words = format!("{id} at {}: {text}{more}, until the next seat was claimed at {}", at(last.0), at(to));
+        let words = format!("{id} at {}: {text}, until the next seat was claimed at {}", at(last.0), at(to));
         return (first.0.max(from) < to).then(|| (first.0.max(from), to, words));
     }
     let id = i.id.as_str();
@@ -1080,7 +1092,7 @@ fn check_seat(i: &Inputs, label: String, from: i64, to: i64, list: &str, at: usi
         if a > cur {
             out.push(Phase::work(label.clone(), cur, a).shared());
         }
-        let why: String = why.chars().take(200).collect();
+        let why = cut_at_word(why, 200);
         let until = if b < to { format!("started again at {}", hhmm(b)) } else { "still held at the pass".to_string() };
         let cause = format!(
             "{}{HELD_FOR_STEP} — barrier {at} of {list} held at {}{stopped}, {until}{}",
@@ -3193,6 +3205,29 @@ mod tests {
             assert_eq!(waited, 43_079, "about 718 min, its own cause ({by_reading}): {g:?}");
             assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
         }
+    }
+
+    /// omarchy-env's hold, cut at 200 characters, read "… is not running it
+    /// yet. T" in effort.json (`wsp-856`).
+    #[test]
+    fn a_long_hold_reason_is_cut_between_words_and_ends_in_an_ellipsis() {
+        let why = "cause: env — the installed wsp, daemon and manager are 0c38be7, older than all three members, so the barrier ran the code they replace. Hold. The code is right but the machine is not running it yet. The barrier at 8b0aa22 refused";
+        let mut i = row();
+        i.group = Some(("list".into(), 3, vec!["r-1".into()]));
+        i.cycle.push((1000, "list group 3: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()));
+        i.cycle.push((1010, "spawn list --agent --check 3 --kind claude".into()));
+        i.cycle.push((9000, "tell list: Barrier 3 of list passed".into()));
+        i.holds = vec![(2000, 8000, why.into())];
+        let ph = build(&i);
+        let cause = ph.iter().find_map(|p| p.waiting_for.as_deref().filter(|w| w.contains(HELD_FOR_STEP))).unwrap_or_else(|| panic!("{ph:?}"));
+        assert!(cause.ends_with("is not running it yet.…"), "{cause}");
+
+        assert_eq!(cut_at_word("  a short reason ", 20), "a short reason");
+        assert_eq!(cut_at_word("exactly ten", 11), "exactly ten", "at the cap is whole");
+        assert_eq!(cut_at_word("one two three", 7), "one two…", "the cap fell between two words");
+        assert_eq!(cut_at_word("one two three", 6), "one…");
+        assert_eq!(cut_at_word("— é ünbroken", 6), "— é…");
+        assert_eq!(cut_at_word("unbrokenword", 4), "…");
     }
 
     #[test]

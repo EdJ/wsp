@@ -1815,6 +1815,40 @@ mod tests {
         assert!(html.contains("wall without the park"), "{html}");
     }
 
+    /// A cause past its cap reads the same wherever effort.json carries it, and
+    /// is cut between words (`wsp-856`).
+    #[test]
+    fn a_long_wait_cause_is_cut_between_words_and_reads_the_same_everywhere() {
+        use crate::timeline::{Inputs, SeatReport};
+        let (_e, store, w) = list("longcause", &["r-1"]);
+        let t0: i64 = 1_000_000_000;
+        let why = "the list stops here for a person. ".repeat(20);
+        let i = Inputs {
+            id: "r-1".into(),
+            group: Some(("longcause".into(), 1, vec!["r-1".into()])),
+            cycle: vec![
+                (t0 + 1000, "longcause group 1: barrier run — 1 step(s), 0 reused, 1 ran, 0 failed, 60s".into()),
+                (t0 + 1010, "spawn longcause --agent --check 1 --kind claude".into()),
+                (t0 + 9000, "tell longcause: Barrier 1 of longcause passed".into()),
+            ],
+            events: [(110, "task-claimed"), (305, "task-review"), (380, "task-verified")].iter().map(|(t, k)| (t0 + t, k.to_string(), json!({"id": "r-1"}))).collect(),
+            holds: vec![(t0 + 2000, t0 + 8000, why.clone())],
+            ..Default::default()
+        };
+        let phases = crate::timeline::build(&i);
+        let v = effort_with(&store, &w, None, &|_| crate::timeline::figures_of(&phases, &SeatReport::default()));
+        let held = |a: &Value, k: &str| -> String {
+            a.as_array().into_iter().flatten().filter_map(|x| x[k].as_str()).find(|c| c.contains(crate::timeline::HELD_FOR_STEP)).unwrap_or_else(|| panic!("{v}")).to_string()
+        };
+        let cause = held(&v["waits"], "cause");
+        let (_, quoted) = cause.split_once(": the list stops").unwrap_or_else(|| panic!("{cause}"));
+        let kept = format!("the list stops{}", quoted.strip_suffix('…').unwrap_or_else(|| panic!("{cause}")));
+        assert!(why.starts_with(&format!("{kept} ")), "cut between words: {cause}");
+        assert_eq!(held(&v["groups"][0]["wall_buckets"]["waiting_by"], "cause"), cause);
+        assert_eq!(held(&v["totals"]["wall_buckets"]["waiting_by_cause"], "cause"), cause);
+        assert_eq!(held(&v["totals"]["wall_buckets"]["named"], "what"), format!("the group — {cause}"));
+    }
+
     #[test]
     fn a_manual_groups_wait_for_its_pass_is_named_and_the_list_has_one_wall_to_that_pass() {
         use crate::timeline::RowFigures;
