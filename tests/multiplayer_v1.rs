@@ -35,7 +35,10 @@
 //!    files are modules of this binary, and the step runs them in a child of it.
 //!
 //! The person's step (two real machines, `scripts/mp-gate.sh`) is the
-//! `two-machines` leg's.
+//! `two-machines` leg's. [`the_two_machine_script_runs_on_the_sandbox_with_every_step_ok`]
+//! rehearses that script here: owner on Ed's spoke, helper on Jesper's, side by
+//! side on a sandbox of its own, with the agents' work and the cut link played
+//! as this test plays them.
 
 // Step 8's tests, compiled into this binary so the gate can run them in order.
 #[allow(dead_code, unused_imports)]
@@ -200,19 +203,21 @@ fn pipe(mut from: TcpStream, mut into: TcpStream) {
 /// The hub over TLS, its users' tokens, the shared remote.
 struct HubRig {
     dir: PathBuf,
+    tag: String,
     hub: TestHub,
     tokens: BTreeMap<String, String>,
     remote: PathBuf,
 }
 
 impl HubRig {
-    /// `None` when no hub is named: the test is skipped.
-    fn up() -> Option<HubRig> {
+    /// `None` when no hub is named: the test is skipped. `tag` keeps two
+    /// tests of this binary, run side by side, out of each other's files.
+    fn up(tag: &str) -> Option<HubRig> {
         let hub = TestHub::start(Setup::default().tls())?;
         let core: &[&str] = &["core"];
         let tokens = hub.seed(&["core"], &[("ed", core), ("jesper", core)]);
         // Under /tmp, as the other hub tests: a fake's socket path must fit a sockaddr.
-        let dir = PathBuf::from("/tmp").join(format!("mv1-{}", std::process::id()));
+        let dir = PathBuf::from("/tmp").join(format!("mv1{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -227,7 +232,7 @@ impl HubRig {
         git(&seed, &["add", "."]);
         git(&seed, &["commit", "-q", "-m", "trunk"]);
         git(&seed, &["push", "-q", "origin", "master"]);
-        Some(HubRig { dir, hub, tokens, remote })
+        Some(HubRig { dir, tag: tag.into(), hub, tokens, remote })
     }
 
     fn addr(&self) -> SocketAddr {
@@ -298,7 +303,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
 // ─────────────────────────────── a spoke ───────────────────────────────
 
 fn bare(env: &BTreeMap<String, String>, home: &Path) -> Command {
-    let mut c = Command::new(WSP);
+    bare_of(Path::new(WSP), env, home)
+}
+
+/// `program` under a spoke's environment, as [`bare`] runs `wsp`.
+fn bare_of(program: &Path, env: &BTreeMap<String, String>, home: &Path) -> Command {
+    let mut c = Command::new(program);
     for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("WSP_") || k.starts_with("COMPOUND_") || k.starts_with("CLAUDE")) {
         c.env_remove(k);
     }
@@ -349,7 +359,7 @@ impl Spoke {
         ]
         .into();
         bare(&outer, &home).arg("init").output().unwrap();
-        let name = format!("mv1{}{}", &who[..1], std::process::id());
+        let name = format!("mv1{}{}{}", rig.tag, &who[..1], std::process::id());
         let out = bare(&outer, &home).args(["sandbox", "--fake", "--json", "--name", &name]).env("WSP_SANDBOX_TETHER", std::process::id().to_string()).output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("sandbox json: {e}: {}", String::from_utf8_lossy(&out.stderr)));
@@ -882,7 +892,7 @@ fn step_8_the_standalone_and_privacy_tests_still_pass() {
 
 #[test]
 fn the_v1_gate_runs_end_to_end_on_two_spokes_and_one_hub() {
-    let Some(rig) = HubRig::up() else { return };
+    let Some(rig) = HubRig::up("") else { return };
     let mut ed = Spoke::up(&rig, "ed");
     let mut jesper = Spoke::up(&rig, "jesper");
     ed.start_daemon();
@@ -900,4 +910,152 @@ fn the_v1_gate_runs_end_to_end_on_two_spokes_and_one_hub() {
     step_7_jesper_offline_mid_row_and_his_journal_fast_forwards(&rig, &ed, &jesper);
     drop((ed, jesper));
     step_8_the_standalone_and_privacy_tests_still_pass();
+}
+
+// ──────────────────────── the two-machine script, rehearsed ────────────────────────
+
+/// `scripts/mp-gate.sh <role>` on this spoke, as its person would run it: the
+/// spoke's environment, this build's `wsp` first on `PATH`, `MP_GATE_YES=1`
+/// (the prompts only print), its output to `<spoke>/gate.out`.
+fn run_gate_script(s: &Spoke, role: &str) -> Child {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/mp-gate.sh");
+    let bin = Path::new(WSP).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = std::fs::File::create(s.dir.join("gate.out")).unwrap();
+    let err = out.try_clone().unwrap();
+    let mut c = bare_of(Path::new("bash"), &s.env, &s.home);
+    c.arg(&script)
+        .args([role, "--project", "alpha", "--workspace", "core", "--list", LIST, "--repo", s.repo.to_str().unwrap()])
+        .current_dir(&s.dir)
+        .env("PATH", path)
+        .env("MP_GATE_YES", "1")
+        .env("MP_GATE_WAIT", WAIT.as_secs().to_string())
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    c.spawn().unwrap()
+}
+
+/// What the people and their agents do while the two scripts run, done once
+/// each as the gate test does it: a seat on one of the list's rows commits its
+/// file and reviews; a verifier pass gets its verdict; a tell typed into a seat
+/// is answered with the command its footer names; and Jesper's link to the hub
+/// is cut and restored when his script asks for it.
+#[derive(Default)]
+struct Players {
+    reviewed: BTreeSet<String>,
+    verdicts: BTreeSet<String>,
+    replied: BTreeSet<String>,
+    cut: bool,
+    restored: bool,
+}
+
+impl Players {
+    fn play(&mut self, rig: &HubRig, s: &Spoke) {
+        let rows = s.rows();
+        let title = |id: &str| -> String {
+            rows.iter().find(|r| r["id"].as_str() == Some(id)).and_then(|r| r["title"].as_str()).unwrap_or("").to_string()
+        };
+        for r in &rows {
+            let Some(id) = r["id"].as_str() else { continue };
+            let t = r["title"].as_str().unwrap_or("");
+            if !["Row one", "Row two", "Row three"].contains(&t) {
+                continue;
+            }
+            let key = format!("{}:{id}", s.user);
+            // As the gate test: a seat works its row once the row is whole here.
+            let whole = || !s.show(id).contains("head only");
+            if !self.reviewed.contains(&key) && s.claimed(id) && s.repo.join(".worktrees").join(id).is_dir() && whole() {
+                if let Some(seat) = s.seat_of(id) {
+                    s.commit_in_tree(id, &format!("{id}.txt"));
+                    let (ok, out) = s.as_seat(&seat, &["review", id, &format!("Wrote {id}.txt; nothing left.")], "");
+                    assert!(ok, "rehearsal: {}'s seat reviews {id}: {out}", s.user);
+                    self.reviewed.insert(key.clone());
+                }
+            }
+            if self.reviewed.contains(&key) && !self.verdicts.contains(&key) && s.show(id).contains("## Verification") {
+                let verdict = "summary: the file is there and says what it should\n\nI read the row's one commit: it adds the file its review names.\n";
+                let (ok, out) = s.as_seat("", &["verified", id, "--holds", "--from", "-", "--caption", "the work holds"], verdict);
+                assert!(ok, "rehearsal: the verdict on {id} on {}'s spoke: {out}", s.user);
+                self.verdicts.insert(key);
+            }
+        }
+        // A tell typed into a seat on a message row: its agent replies as the
+        // footer says, from the seat it was typed into.
+        for line in s.typed() {
+            let Some((id, _)) = line.split_once(' ') else { continue };
+            if self.replied.contains(id) || !line.contains("is the third row landed") {
+                continue;
+            }
+            let Some(footer) = line.split("reply: ").nth(1) else { continue };
+            let words: Vec<&str> = footer.split_whitespace().collect();
+            let (Some(to), Some(re)) = (words.get(2), words.iter().skip_while(|w| **w != "--re").nth(1)) else { continue };
+            let answer = rows.iter().filter_map(|r| r["id"].as_str()).find(|i| title(i).starts_with("Answer for "));
+            let Some(seat) = answer.and_then(|a| s.seat_of(a)) else { continue };
+            let (ok, out) = s.as_seat(&seat, &["tell", to, "--re", re.trim_end_matches(']'), "-"], "yes, it is on the shared trunk");
+            assert!(ok, "rehearsal: {}'s seat replies to {to}: {out}", s.user);
+            self.replied.insert(id.to_string());
+        }
+        // The helper's person cuts the link, and restores it, when asked.
+        let said = std::fs::read_to_string(s.dir.join("gate.out")).unwrap_or_default();
+        if !self.cut && said.contains(">>   cut this machine's link") {
+            s.proxy.cut();
+            self.cut = true;
+        }
+        if self.cut && !self.restored && said.contains(">>   restore the link") {
+            s.proxy.point_at(Some(rig.addr()));
+            self.restored = true;
+        }
+    }
+}
+
+/// The two-machine leg's script, rehearsed on this sandbox: `mp-gate.sh owner`
+/// on Ed's spoke and `mp-gate.sh helper` on Jesper's, side by side, each ends
+/// with every step `ok`.
+#[test]
+fn the_two_machine_script_runs_on_the_sandbox_with_every_step_ok() {
+    let Some(rig) = HubRig::up("s") else { return };
+    let mut ed = Spoke::up(&rig, "ed");
+    let mut jesper = Spoke::up(&rig, "jesper");
+    ed.start_daemon();
+    jesper.start_daemon();
+    for s in [&ed, &jesper] {
+        s.wait("setup", "a first sync turn", WAIT, |s| s.turns() >= 1);
+    }
+    let mut owner = run_gate_script(&ed, "owner");
+    let mut helper = run_gate_script(&jesper, "helper");
+    let mut players = Players::default();
+    let end = Instant::now() + Duration::from_secs(600);
+    let (mut o, mut h) = (None, None);
+    while o.is_none() || h.is_none() {
+        if Instant::now() > end {
+            let _ = owner.kill();
+            let _ = helper.kill();
+        }
+        players.play(&rig, &ed);
+        players.play(&rig, &jesper);
+        o = o.or_else(|| owner.try_wait().unwrap());
+        h = h.or_else(|| helper.try_wait().unwrap());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let said = |s: &Spoke| std::fs::read_to_string(s.dir.join("gate.out")).unwrap_or_default();
+    let (eds, jespers) = (said(&ed), said(&jesper));
+    let both = format!(
+        "owner (ed):\n{eds}\nhelper (jesper):\n{jespers}\ned's cycle.log (tail):\n{}\njesper's cycle.log (tail):\n{}\ned's list:\n{}",
+        tail(&ed.cycle_log(), 40),
+        tail(&jesper.cycle_log(), 40),
+        ed.run(&["worklist", "show", LIST]).1,
+    );
+    let shows: Vec<String> = [&ed, &jesper]
+        .iter()
+        .flat_map(|s| s.rows().into_iter().filter_map(|r| r["id"].as_str().map(str::to_string)).map(move |id| format!("{} {id}:\n{}", s.user, tail(&s.show(&id), 25))))
+        .collect();
+    let both = format!("{both}\nplayed: reviewed {:?} verdicts {:?} replied {:?}\n{}", players.reviewed, players.verdicts, players.replied, shows.join("\n"));
+    assert!(o.unwrap().success() && eds.contains("mp-gate: owner finished"), "the owner's script ends ok:\n{both}");
+    assert!(h.unwrap().success() && jespers.contains("mp-gate: helper finished"), "the helper's script ends ok:\n{both}");
+    assert!(!both.contains("FAIL"), "no step failed:\n{both}");
+    for step in 1..=8 {
+        assert!(both.contains(&format!("== step {step}:")), "step {step} ran:\n{both}");
+    }
+    assert!(players.cut && players.restored, "the helper's script asked for the link to be cut and restored:\n{both}");
 }

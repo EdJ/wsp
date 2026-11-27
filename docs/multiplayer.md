@@ -161,7 +161,7 @@ The hub (`wsp-hub serve --config <file>`) serves TLS when its config names a cer
 
 ### The v1 gate on two real machines (wsp-419)
 
-`tests/multiplayer_v1.rs` runs the v1 scenario in a sandbox: a real hub over TLS, two spokes, a bare repository as the shared remote. The same scenario, by two people on two real machines against a deployed hub, is the other half of the gate, and `scripts/mp-gate.sh` is what each of them runs. Nothing here or in the script names a machine or an address; the hub is whatever its URL says. The script has not been run end to end against a hub: expect to fix wording or output parsing on its first run.
+`tests/multiplayer_v1.rs` runs the v1 scenario in a sandbox: a real hub over TLS, two spokes, a bare repository as the shared remote. The same scenario, by two people on two real machines against a deployed hub, is the other half of the gate, and `scripts/mp-gate.sh` is what each of them runs. Nothing here or in the script names a machine or an address; the hub is whatever its URL says. The script is rehearsed in the sandbox: `the_two_machine_script_runs_on_the_sandbox_with_every_step_ok` in the same test file runs it as owner on one spoke and helper on the other, side by side, playing the agents' work and the cut link as the gate test does. It has not yet been run against a deployed hub.
 
 **Set up, once.**
 
@@ -187,13 +187,13 @@ scripts/mp-gate.sh helper --project <slug> --workspace <ws> --list <name>    # o
 | 1 | makes three rows and a list in the private workspace, publishes the list to the shared one | |
 | 2 | | shows the list and its three rows |
 | 3 | | leases two rows and spawns them on its own seats |
-| 4 | shows those two held by the other user, does not start them, drives the list (`worklist go`) and starts the third | shows the list driven by the owner |
+| 4 | waits until two rows are held by the other user (`held_by`, from the hub's lease events), drives the list (`worklist go`), starts the third, and shows the two as running on the other user's wsp without starting them | waits for the list to run, reads it as driven by the owner and the third as held by the owner |
 | 5 | its run verifies the third row; the landing is pushed to the shared remote; the barrier opens | its run verifies its two, each landing pushed; both caches show all three landed |
-| 6 | the seat on the third row receives a `tell seat:<row>` from the helper's seat; its agent replies with the `--re` command in the footer | the helper's seat tells it, and waits for the reply |
-| 7 | sees the helper's work from the outage | adds a fourth row, is asked to cut the link, works offline, is asked to restore it; the journal fast-forwards |
+| 6 | seats a shared row of its own, `Answer for <third row>`; that seat receives a `tell seat:<row>` from the helper's seat, and its agent replies with the `--re` command in the footer | seats a shared row of its own, `Ask for <third row>`; its seat tells the owner's row and waits for the reply's line (`↳ … seat:<row>`) in `tell --log` |
+| 7 | sees the helper's work from the outage (`Row four for <third row>, finished offline`) | adds a fourth row, is asked to cut the link and waits until the link reads down, renames it offline and sees the journal hold it, is asked to restore it; the journal fast-forwards |
 | 8 | | (not run here: `cargo test --test multiplayer_v1`, below, runs wsp-463's standalone test and wsp-180's privacy test) |
 
-Each seat's agent works its row from the row's note, which the owner's script writes. No verdict is given by hand: each spoke's run opens the verifier on the rows it holds (see *List driving*). A rerun uses a fresh `--list` name. `MP_GATE_WAIT` is the seconds a wait gives the other side or an agent (900 by default).
+Each seat's agent works its row from the row's note, which the owner's script writes. Step 6 seats a row on each side for the message because wsp ends a member's seat once its verdict holds, so the three rows' seats may be gone by then; once the reply is seen each side ends its own message row's seat and closes the row (`wsp despawn <row>`, then `wsp done <row>`); where either is refused, the script prints those two commands to run by hand. No verdict is given by hand: each spoke's run opens the verifier on the rows it holds (see *List driving*). A rerun uses a fresh `--list` name. `MP_GATE_WAIT` is the seconds a wait gives the other side or an agent (900 by default).
 
 The sandbox test needs a hub named, `WSP_HUB_BIN` or `WSP_HUB_IMAGE` (*Testing against it*, above): without one it is skipped with a notice, step 8 with it, so set `WSP_HUB_REQUIRED=1` where it must run. The hub must be a current build: one whose config lacks `lease_secs` or `max_connections_per_peer` is refused by the test harness at start.
 
