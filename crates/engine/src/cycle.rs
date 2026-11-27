@@ -2867,7 +2867,8 @@ fn run_legs(
     gate: &crate::room::Gate,
 ) -> Vec<String> {
     let mut started = Vec::new();
-    for o in take_legs(store, row, rows, within, gate) {
+    let mut openings = take_legs(store, row, rows, within, gate).into_iter();
+    for o in openings.by_ref() {
         let label = crate::legs::label(row, &o.name);
         let by = at.map(|(w, n)| format!("{} group {n}: ", w.id)).unwrap_or_default();
         let again = if o.again { " again: the last start never seated it" } else { "" };
@@ -2878,8 +2879,15 @@ fn run_legs(
             Some(why) => {
                 log_line(store, &format!("FAILED spawn leg {} of {row}: {why}", o.name));
                 leg_start_failed(store, at.map(|(w, _)| w), row, &o.name, &why);
+                if crate::resolve::row_own_refusal(&why).is_some() {
+                    break;
+                }
             }
         }
+    }
+    // Left only by a refusal of the row's own: opened and not to be tried.
+    for o in openings {
+        crate::leg_seat::unopen(store, row, &o.name);
     }
     started
 }
@@ -3301,7 +3309,8 @@ fn run_pieces(
         close_batches(store, at, row);
     }
     let mut started = Vec::new();
-    for o in take_pieces(store, row, rows, within, gate) {
+    let mut openings = take_pieces(store, row, rows, within, gate).into_iter();
+    for o in openings.by_ref() {
         let label = crate::pieces::Piece::pending(o.n, "", 0).id(row);
         let by = at.map(|(w, n)| format!("{} group {n}: ", w.id)).unwrap_or_default();
         let again = if o.again { " again: the last start never seated it" } else { "" };
@@ -3312,8 +3321,14 @@ fn run_pieces(
             Some(why) => {
                 log_line(store, &format!("FAILED spawn piece {} of {row}: {why}", o.n));
                 piece_start_failed(store, at.map(|(w, _)| w), row, o.n, &why);
+                if crate::resolve::row_own_refusal(&why).is_some() {
+                    break;
+                }
             }
         }
+    }
+    for o in openings {
+        crate::piece_seat::unopen(store, row, o.n);
     }
     started
 }
@@ -3371,6 +3386,10 @@ pub fn piece_start_failed(store: &Store, w: Option<&Worklist>, row: &str, n: usi
         None => "it had no seat to end".to_string(),
     };
     crate::piece_seat::reset(store, row, n);
+    if let Some(sentence) = crate::resolve::row_own_refusal(why) {
+        row_refused(store, w.map(|w| w.id.as_str()), row, &format!(" --piece {n}"), sentence);
+        return;
+    }
     let m = crate::starts::missed(store, &label);
     let why = util::truncate(why, 300);
     let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |s| format!("it starts again in {}", crate::barrier::span(s)));
@@ -4461,7 +4480,7 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
     log_line(store, &format!("FAILED spawn {}{id}: {why}", if verify { "a verifier on " } else { "" }));
     // The row's own cause is not retried: it is blocked and asked about.
     if let (Undo::Member, Some(sentence)) = (&undo, crate::resolve::row_own_refusal(&why)) {
-        row_refused(store, owned.0, id, sentence);
+        row_refused(store, Some(owned.0), id, "", sentence);
         return false;
     }
     let saved = store.locked(|| {
@@ -4499,12 +4518,14 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
 /// the project it was refused in. [`restart_the_moved`] reads it.
 const REFUSED_IN: &str = "blocked: no seat can be started in project ";
 
-/// A member's start was refused for a cause of its own (`compound-react-126`):
-/// it is the same on every try, and `wsp mv`, which clears it, is refused to
+/// A start on a row — the member's, or one of its legs' or pieces' — was
+/// refused for a cause of the row's own (`compound-react-126`, `wsp-965`): it is the same on every try, and `wsp mv`, which clears it, is refused to
 /// agents. So on the first refusal the row is blocked with the refusal's
 /// sentence, the person is asked and the list's seat told. Blocked, it holds no
-/// place of the group's cap, and the other members start.
-fn row_refused(store: &Store, list: &str, id: &str, why: &str) {
+/// place of the group's cap, and the other members start. `list` is the run it
+/// is in, when it is in one; `part` is the flag that names the leg or piece to
+/// `wsp spawn`, which starts a row nobody's list runs.
+fn row_refused(store: &Store, list: Option<&str>, id: &str, part: &str, why: &str) {
     use crate::message::{self, About, Kind, Message, Party, Waiting};
     let to = why.split_once("file it with `-p ").and_then(|(_, r)| r.split_once('`')).map_or("<project>", |(p, _)| p);
     let step = format!("wsp mv {id} -p {to}");
@@ -4520,19 +4541,24 @@ fn row_refused(store: &Store, list: &str, id: &str, why: &str) {
     let Some(project) = blocked else { return };
     store.log_event("task-blocked", serde_json::json!({ "id": id, "project": project, "status": "blocked" }));
     store.git_commit(&format!("wsp: block {id} — its start is refused"));
+    let then = match list {
+        Some(list) => format!("the {list} run starts it at its next step."),
+        None => format!("`wsp todo {id}` and then `wsp spawn {id} --agent{part}` start it."),
+    };
     let text = format!(
         "{id} cannot be started in {project}: run `{step}`\n\n{why}\n\n\
-         Agents are refused `wsp mv`. Once it is moved, the {list} run starts it at its next step."
+         Agents are refused `wsp mv`. Once it is moved, {then}"
     );
     let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new("", id)).about(About::Task(id.to_string())).for_the_person();
     match message::raise(store, &q) {
         Ok(()) => crate::cmd_message::asked_of_the_person(store, &q, id),
-        Err(e) => log_line(store, &format!("{list}: {id}: could not ask the person to move it: {e}")),
+        Err(e) => log_line(store, &format!("{id}: could not ask the person to move it: {e}")),
     }
-    if let Some(w) = store.worklist(list) {
+    if let Some(w) = list.and_then(|l| store.worklist(l)) {
         tell(store, &w, &format!(
-            "wsp blocked {id} in the {list} run after one try and asked the person: {why}. \
-             It is not tried again until a person runs `{step}`; the group's other members go on."
+            "wsp blocked {id} in the {} run after one try and asked the person: {why}. \
+             It is not tried again until a person runs `{step}`; the group's other members go on.",
+            w.id
         ));
     }
 }
@@ -4879,6 +4905,10 @@ pub fn leg_start_failed(store: &Store, w: Option<&Worklist>, row: &str, name: &s
         None => "it had no seat to end".to_string(),
     };
     crate::leg_seat::reset(store, row, name);
+    if let Some(sentence) = crate::resolve::row_own_refusal(why) {
+        row_refused(store, w.map(|w| w.id.as_str()), row, &format!(" --leg {name}"), sentence);
+        return;
+    }
     let m = crate::starts::missed(store, &label);
     let why = util::truncate(why, 300);
     let wait = m.again_in.map_or_else(|| "it is not tried again".to_string(), |s| format!("it starts again in {}", crate::barrier::span(s)));
@@ -11583,6 +11613,62 @@ fn only_a_working_screen_is_ever_overruled() {
         step(&store, &w, &Blind);
         assert_eq!(ids(spawned()), ["m-1-1".to_string()]);
         assert!(drained(&SAID).iter().any(|l| l.contains("starting piece 1 of m-1 again")));
+    }
+
+    /// `wsp-965`: a leg's or a piece's start refused for the row's own project is
+    /// tried once, as a member's is, in a list and outside one.
+    #[test]
+    fn a_leg_or_piece_start_refused_for_the_rows_project_is_blocked_after_one_try() {
+        for pieces in [false, true] {
+            let (_env, store) = scratch(if pieces { "pieces-wrongproject" } else { "legs-wrongproject" });
+            match pieces {
+                true => pieced(&store, "m-1", Status::Todo, &[(1, 1), (2, 1)], 3),
+                false => staged(&store, "m-1", Status::Todo),
+            }
+            task(&store, "m-2", Status::Todo);
+            let mut t = store.find_task("m-1").unwrap();
+            t.project = Some("compound-react".into());
+            store.save_task(&t).unwrap();
+            let w = list(&store, &[(&["m-1", "m-2"], "claude x1")]);
+            let part = if pieces { "m-1-1".to_string() } else { crate::legs::label("m-1", "plan") };
+            let said = crate::resolve::wrong_project("compound-react", "wsp");
+            FAIL.with(|f| *f.borrow_mut() = Some(format!("wsp: not starting it: {said}")));
+            FAIL_ON.with(|f| *f.borrow_mut() = Some("m-1".into()));
+            step(&store, &w, &Blind);
+            assert_eq!(ids(spawned()), [part.clone(), "m-2".to_string()], "one try, and m-1 holds no place of the x1");
+            assert!(!crate::starts::held(&store, &part), "no backoff");
+            step(&store, &w, &Blind);
+            assert!(spawned().is_empty(), "not tried again");
+
+            let t = store.find_task("m-1").unwrap();
+            assert_eq!(t.status(), Status::Blocked);
+            assert!(t.blocked_question().unwrap().contains("file it with `-p wsp`"), "{:?}", t.blocked_question());
+            match pieces {
+                true => assert!([1, 2].iter().all(|n| piece_of(&store, "m-1", *n).state == crate::pieces::State::Pending)),
+                false => assert_eq!(leg_of(&store, "m-1", "plan").state, crate::legs::State::Pending),
+            }
+            let asks = crate::message::about_task(&store, "m-1");
+            assert_eq!(asks.iter().filter(|q| q.is_open() && q.for_person).count(), 1);
+            assert!(asks.iter().any(|q| q.text.contains("wsp mv m-1 -p wsp")));
+
+            FAIL.with(|f| *f.borrow_mut() = None);
+            FAIL_ON.with(|f| *f.borrow_mut() = None);
+            set(&store, "m-2", Status::Done);
+            let mut t = store.find_task("m-1").unwrap();
+            t.project = Some("wsp".into());
+            store.save_task(&t).unwrap();
+            step(&store, &w, &Blind);
+            assert!(ids(spawned()).contains(&part), "the next start after the move");
+        }
+
+        let (_env, store) = scratch("legs-wrongproject-nolist");
+        staged(&store, "m-1", Status::Todo);
+        seat_leg_open(&store, "m-1", "plan", "cpd-9");
+        let said = crate::resolve::wrong_project("compound-react", "wsp");
+        leg_start_failed(&store, None, "m-1", "plan", &said);
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Blocked);
+        let asks = crate::message::about_task(&store, "m-1");
+        assert!(asks.iter().any(|q| q.text.contains("wsp spawn m-1 --agent --leg plan")));
     }
 
     /// The tick ends a done piece's seat once, and records it on the entry.
