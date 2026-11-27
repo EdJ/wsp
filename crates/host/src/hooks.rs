@@ -388,6 +388,9 @@ impl Fold {
             epoch: post.epoch,
             tokens: Tokens { input: after.1, output: after.2, cache_read: after.3, cache_write: after.4 },
             cost_micros: cost_of(&rec),
+            session_id: str_of(&rec, "session_id"),
+            transcript: str_of(&rec, "transcript"),
+            model: str_of(&rec, "model"),
         }))
     }
 }

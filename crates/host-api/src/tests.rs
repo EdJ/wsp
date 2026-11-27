@@ -292,6 +292,9 @@ fn table() -> Vec<Frame> {
                     cache_write: 4_000,
                 },
                 cost_micros: 1_250_000,
+                session_id: "5d0c7a52".into(),
+                transcript: "/t/5d0c7a52.jsonl".into(),
+                model: "claude-opus-5-5".into(),
             }),
         ),
         event(
@@ -801,6 +804,19 @@ fn peers_of_other_versions_decode() {
     );
 
     assert!(serde_json::from_str::<Frame>(r#"{"type":"seat.teleport","seat":"cpd-1"}"#).is_err());
+
+    // wsp-865: a manager from before sends spend without its session,
+    // transcript or model; they read empty, and empty ones go unsent.
+    let spent: Frame = serde_json::from_str(
+        r#"{"id":4,"type":"seat.spent","seat":"cpd-1","epoch":3,"tokens":{"input":1,"output":2},"cost_micros":7}"#,
+    )
+    .unwrap();
+    match &spent.msg {
+        Message::SeatSpent(s) => assert_eq!((s.session_id.as_str(), s.transcript.as_str(), s.model.as_str()), ("", "", "")),
+        m => panic!("decoded as {m:?}"),
+    }
+    let line = serde_json::to_string(&spent).unwrap();
+    assert!(!line.contains("session_id") && !line.contains("model"), "{line}");
 }
 
 #[test]

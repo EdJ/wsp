@@ -595,12 +595,26 @@ pub struct SeatSaid {
 
 /// Spend so far for this start of the seat. Cost is in millionths of a US
 /// dollar, so that it adds up exactly.
+///
+/// The session, transcript and model are the tally's, so the ledger line the
+/// stop banks says which session spent it and on which model (wsp-865). Each
+/// is empty where the tally has none, and absent on the wire then: a manager
+/// from before sends none, and its spend still reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatSpent {
     pub seat: SeatId,
     pub epoch: Epoch,
     pub tokens: Tokens,
     pub cost_micros: u64,
+    /// The agent's session id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    /// The transcript's path on the seat's host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transcript: String,
+    /// The model the last request counted ran on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

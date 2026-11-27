@@ -398,7 +398,18 @@ fn the_hook_command_posts_to_the_manager_which_journals_turn_said_spent_and_did(
     let turn = |edge, order: Option<&str>| {
         Message::Turn(Turn { seat: seat.clone(), epoch, edge, at: At(0), order: order.map(|o| OrderId(o.into())) })
     };
-    let spent = |tokens, cost_micros| Message::SeatSpent(SeatSpent { seat: seat.clone(), epoch, tokens, cost_micros });
+    // The tally's session, transcript and model ride along (wsp-865).
+    let spent = |tokens, cost_micros| {
+        Message::SeatSpent(SeatSpent {
+            seat: seat.clone(),
+            epoch,
+            tokens,
+            cost_micros,
+            session_id: "5d0c7a52-1b9e-4c1f-9a35-2f6f0e4b7c11".into(),
+            transcript: transcript.to_string_lossy().into_owned(),
+            model: model.into(),
+        })
+    };
     let want = vec![
         // No order was delivered to this seat: its turn names none (the order
         // id is tests/seats.rs's, through a delivery).

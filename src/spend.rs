@@ -307,6 +307,28 @@ mod tests {
         assert!(unreadable_note(&st).unwrap().starts_with("3 unreadable ledger lines"), "{:?}", unreadable_note(&st));
     }
 
+    /// wsp-865: a line banked from a burn record that names its model is
+    /// filed under that model's family; one that names none is "other".
+    #[test]
+    fn a_banked_line_with_a_model_is_filed_under_its_family() {
+        let env = util::isolated("spend-model");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let st = env.state();
+        for (seat, model, cost) in [("cpd-1", "claude-sonnet-5-5", 2_000_000), ("cpd-2", "", 1_000_000)] {
+            let dir = st.join("seats").join(seat);
+            std::fs::create_dir_all(&dir).unwrap();
+            let rec = json!({ "session_id": format!("s-{seat}"), "transcript": format!("/t/{seat}.jsonl"), "model": model,
+                              "turns": 2, "input": 10, "output": 100, "cost": cost, "epoch": 1 });
+            std::fs::write(dir.join(crate::host::BURN_FILE), rec.to_string()).unwrap();
+            crate::host::bank_burn(&dir);
+        }
+        let r = report(&store, util::epoch_secs());
+        let today = r["daily"].as_array().unwrap().last().unwrap()["by_model"].clone();
+        assert_eq!((today["sonnet"]["sessions"].as_u64(), today["sonnet"]["cost"].as_f64()), (Some(1), Some(2.0)), "{today}");
+        assert_eq!((today["other"]["sessions"].as_u64(), today["other"]["cost"].as_f64()), (Some(1), Some(1.0)), "{today}");
+    }
+
     /// wsp-864: a seat's name comes round again and its burn record has no
     /// session id, so a later seat of the name erases and hides nothing.
     #[test]

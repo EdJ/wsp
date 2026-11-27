@@ -12,7 +12,7 @@
 //! | `seat.refused` | `spawned.json` (`refused`) |
 //! | `turn` | the seat's `said.json` (`working`/`idle`), `manager/<host>.turns.json`, `burn.json`'s `turns` |
 //! | `seat.said` | the seat's `said.json` (`said`, `said_at`) |
-//! | `seat.spent` | the seat's `burn.json` (tokens and cost) |
+//! | `seat.spent` | the seat's `burn.json` (tokens, cost, and the session, transcript and model the stop banks) |
 //! | `seat.stopped` | `spent.jsonl` (the burn banked), `said.json` (`gone`), `manager/<host>.ended.json` |
 //! | `seat.did` | `manager/<host>.did.jsonl`, one line per digest |
 //! | `seat.stuck` | `manager/<host>.stuck.json`, the newest per seat |
@@ -707,6 +707,13 @@ fn apply(store: &Store, host: &str, msg: &Message) {
             m.insert("cache_write".into(), json!(s.tokens.cache_write));
             m.insert("cost".into(), json!(s.cost_micros));
             m.insert("epoch".into(), json!(s.epoch.0));
+            // Which session and model, for the line the stop banks. A manager
+            // from before sends none, and what is held stands.
+            for (k, v) in [("session_id", &s.session_id), ("transcript", &s.transcript), ("model", &s.model)] {
+                if !v.is_empty() {
+                    m.insert(k.into(), json!(v));
+                }
+            }
         }),
         Message::SeatStopped(s) => {
             let seat = s.seat.0.as_str();
@@ -914,6 +921,9 @@ pub mod tests {
                 epoch: e,
                 tokens: Tokens { input: 100, output: 20, cache_read: 5, cache_write: 2 },
                 cost_micros: 1234,
+                session_id: String::new(),
+                transcript: String::new(),
+                model: String::new(),
             }),
             Message::Turn(Turn { seat: s.clone(), epoch: e, edge: TurnEdge::Ended, at: At(1_700_000_002_000), order: None }),
             Message::SeatDid(SeatDid {
@@ -1063,7 +1073,15 @@ pub mod tests {
         let dir = seat_dir(&store, "cpd-f1").unwrap();
         let mut send = |msg: Message| fold_to(&store, &mut sub, m.emit(msg).unwrap().0);
         let spent = |cost_micros: u64| {
-            Message::SeatSpent(SeatSpent { seat: seat(), epoch: Epoch(1), tokens: Tokens { input: 100, output: 20, cache_read: 5, cache_write: 2 }, cost_micros })
+            Message::SeatSpent(SeatSpent {
+                seat: seat(),
+                epoch: Epoch(1),
+                tokens: Tokens { input: 100, output: 20, cache_read: 5, cache_write: 2 },
+                cost_micros,
+                session_id: String::new(),
+                transcript: String::new(),
+                model: String::new(),
+            })
         };
         let ledger = || std::fs::read_to_string(store.state.join(crate::host::SPENT_FILE)).unwrap();
 
@@ -1081,6 +1099,62 @@ pub mod tests {
         assert!(ledger().contains("\"cost\":30"), "{}", ledger());
         sub.close();
         m.stop();
+    }
+
+    /// The ledger line a seat's turn, its `seat.spent` and its `seat.stopped`
+    /// leave, folded from a loopback manager.
+    fn banked_after(tag: &str, session_id: &str, transcript: &str, model: &str) -> Value {
+        let env = util::isolated(tag);
+        let store = Store::open();
+        let exec = env.state().join("exec");
+        let m = manager(&exec, 0);
+        let mut sub = Subscription::new(m.addrs()[0], token(&exec), HOST, &store.state, "test");
+        let mut send = |msg: Message| fold_to(&store, &mut sub, m.emit(msg).unwrap().0);
+        send(Message::Turn(Turn { seat: seat(), epoch: Epoch(1), edge: TurnEdge::Began, at: At(1_700_000_000_000), order: None }));
+        send(Message::SeatSpent(SeatSpent {
+            seat: seat(),
+            epoch: Epoch(1),
+            tokens: Tokens { input: 100, output: 20, cache_read: 5, cache_write: 2 },
+            cost_micros: 40,
+            session_id: session_id.into(),
+            transcript: transcript.into(),
+            model: model.into(),
+        }));
+        send(Message::SeatStopped(SeatStopped { seat: seat(), epoch: Epoch(1), exit: Some(0), ended: vec![], renderer_left: false }));
+        let ledger = std::fs::read_to_string(store.state.join(crate::host::SPENT_FILE)).unwrap();
+        sub.close();
+        m.stop();
+        assert_eq!(ledger.lines().count(), 1, "{ledger}");
+        serde_json::from_str(ledger.trim()).unwrap()
+    }
+
+    /// wsp-865: the session, transcript and model `seat.spent` carries are on
+    /// the line the stop banks, where `wsp spend` and the governor's sources
+    /// read them.
+    #[test]
+    fn a_seats_session_transcript_and_model_reach_the_ledger_line() {
+        let line = banked_after("fold-bank-session", "5d0c7a52", "/t/5d0c7a52.jsonl", "claude-opus-5-5");
+        assert_eq!(line["session_id"], "5d0c7a52", "{line}");
+        assert_eq!(line["transcript"], "/t/5d0c7a52.jsonl", "{line}");
+        assert_eq!(line["model"], "claude-opus-5-5", "{line}");
+        assert_eq!((line["cost"].as_u64(), line["turns"].as_u64()), (Some(40), Some(1)), "{line}");
+    }
+
+    /// wsp-865: a manager from before sends `seat.spent` with none of them; it
+    /// still folds, and the line banks them empty, which its readers read as
+    /// unread (no session, no transcript) and as model "other".
+    #[test]
+    fn a_seat_spent_from_before_banks_empty_strings() {
+        let old: Frame = serde_json::from_str(
+            r#"{"id":1,"type":"seat.spent","seat":"cpd-f1","epoch":1,"tokens":{"input":100,"output":20},"cost_micros":40}"#,
+        )
+        .unwrap();
+        let Message::SeatSpent(s) = old.msg else { panic!("{old:?}") };
+        let line = banked_after("fold-bank-before", &s.session_id, &s.transcript, &s.model);
+        for k in ["session_id", "transcript", "model"] {
+            assert_eq!(line[k], "", "{k}: {line}");
+        }
+        assert_eq!(line["cost"].as_u64(), Some(40), "{line}");
     }
 
     /// wsp-029: a seat the manager adopts from the in-process host goes out
