@@ -150,9 +150,24 @@ fn home() -> PathBuf {
 /// `$WSP_HUB_HOME` when it is set and not empty, which is how a sandbox keeps
 /// its login apart from the developer's and from every other sandbox's,
 /// else `$HOME`. None when neither is set.
+///
+/// Under test ([`wsp_engine::base::under_test`]: a cargo test harness, never
+/// a `wsp` binary) `$HOME` is never it: `$HOME` is the home of whoever runs the
+/// suite, and a test that sets no `$WSP_HUB_HOME` (a [`crate::testhub`] dial, a
+/// raw client) would read their login and make `machine.json` there. Such a
+/// test has a hub home of the process's own instead, under its temp directory
+/// (`.cargo/test-run` removes it with the process), one for the process as
+/// `$HOME` is one: every unisolated dial of it is the same machine.
 pub fn hub_home() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    env(HUB_HOME_ENV).or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    if let Some(home) = env(HUB_HOME_ENV) {
+        return Some(home);
+    }
+    if wsp_engine::base::under_test() {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        return Some(TEST_HOME.get_or_init(|| std::env::temp_dir().join(format!("wsp-hub-home-{}", std::process::id()))).clone());
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// The login `hubs.json` holds; None when there is no such file.
@@ -257,7 +272,7 @@ pub(crate) fn hint() -> Principal {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn home(name: &str, mode: u32, body: &str) -> PathBuf {
@@ -272,6 +287,77 @@ mod tests {
     }
 
     const LOGIN: &str = r#"{"url":"tcp://hub.invalid:7000","user":"ed","token":"from-file"}"#;
+
+    /// `$HOME` at `home` and `$WSP_HUB_HOME` unset while it lives, both put
+    /// back however the test ends. Held under the env lock of `isolated`.
+    pub(crate) struct NotIsolated(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
+    impl NotIsolated {
+        pub(crate) fn at(home: &Path) -> NotIsolated {
+            let was = NotIsolated(std::env::var_os("HOME"), std::env::var_os(HUB_HOME_ENV));
+            std::env::set_var("HOME", home);
+            std::env::remove_var(HUB_HOME_ENV);
+            was
+        }
+    }
+
+    impl Drop for NotIsolated {
+        fn drop(&mut self) {
+            for (key, was) in [("HOME", self.0.take()), (HUB_HOME_ENV, self.1.take())] {
+                match was {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Everything under `dir`, relative to it.
+    pub(crate) fn everything_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    todo.push(p.clone());
+                }
+                out.push(p.strip_prefix(dir).unwrap().to_path_buf());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A test that sets no `$WSP_HUB_HOME` of its own never reads or writes the
+    /// hub home's files under `$HOME`, the home of whoever runs the suite
+    /// (`machine.json` once appeared in a developer's real home after a run):
+    /// under test the hub home is the process's own, under its temp directory.
+    #[test]
+    fn under_test_with_no_hub_home_set_the_hub_home_is_never_home() {
+        let env = wsp_base::util::isolated("hub-home-not-home");
+        let home = env.path("home");
+        std::fs::create_dir_all(home.join(".config/wsp")).unwrap();
+        // A login in that $HOME, as a developer's own: a test must not read it either.
+        std::fs::write(home.join(HUBS_FILE), LOGIN).unwrap();
+        std::fs::set_permissions(home.join(HUBS_FILE), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        let before = everything_under(&home);
+        let _not = NotIsolated::at(&home);
+
+        let hub = hub_home().expect("a hub home");
+        assert!(!hub.starts_with(&home), "under test the hub home was $HOME: {}", hub.display());
+        assert!(hub.starts_with(std::env::temp_dir()), "{} is not under the test's temp directory", hub.display());
+        assert_eq!(hub_home(), Some(hub.clone()), "one hub home for the process");
+        // Every file kept in the hub home goes there.
+        super::super::machine::this(&hub).unwrap();
+        assert!(hub.join(super::super::machine::MACHINE_FILE).exists());
+        assert_eq!(hub_login_in(&hub).ok().flatten().map(|l| l.user), None, "the developer's login is not read");
+        assert_eq!(everything_under(&home), before, "nothing was made in $HOME");
+
+        // A test that sets one is that home, as a sandbox's is.
+        std::env::set_var(HUB_HOME_ENV, env.path("mine"));
+        assert_eq!(hub_home(), Some(env.path("mine")));
+    }
 
     #[test]
     fn the_environment_comes_before_the_file() {

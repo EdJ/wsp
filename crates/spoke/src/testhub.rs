@@ -1008,4 +1008,24 @@ mod tests {
         assert!(!hub.log().is_empty(), "the hub writes api.log");
         assert!(hub.data_files().iter().any(|(p, _)| p.starts_with("objects") || p.ends_with("api.log")));
     }
+
+    /// The fixture's dials, as every test that seeds a hub makes them, with no
+    /// `$WSP_HUB_HOME` set: `$HOME` (the home of whoever runs the suite) stays
+    /// as it was. The hello's machine id is kept, as it is on every dial, but
+    /// in the process's own hub home and never in `$HOME/.config/wsp`.
+    #[test]
+    fn testhub_dials_with_no_hub_home_set_leave_home_untouched() {
+        use crate::hub_client::login::tests::{everything_under, NotIsolated};
+        let env = wsp_base::util::isolated("testhub-home-untouched");
+        let home = env.path("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _not = NotIsolated::at(&home);
+        let Some(hub) = TestHub::start(Setup::default()) else { return };
+        let tokens = hub.seed_members(&["team"], &["ann"]);
+        let mut ann = hub.client(&tokens["ann"]);
+        assert_eq!(ann.whoami().unwrap().0, Principal::Person("ann".into()));
+        let kept = crate::hub_client::hub_home().unwrap();
+        assert!(crate::hub_client::machine::kept_id(&kept).is_some(), "the dial named a machine, kept in {}", kept.display());
+        assert_eq!(everything_under(&home), Vec::<PathBuf>::new(), "a test's dial wrote into $HOME");
+    }
 }

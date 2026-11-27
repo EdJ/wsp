@@ -401,13 +401,14 @@ mod tests {
 
     // ---- the drive lease (wsp-467) ------------------------------------------------
 
-    /// `HOME` pointed at a spoke's login for the test, put back however it ends.
+    /// `$WSP_HUB_HOME` pointed at a spoke's login for the test, put back however
+    /// it ends (under test `$HOME` is never the hub home: `hub_client::hub_home`).
     struct Home(Option<std::ffi::OsString>);
 
     impl Home {
         fn at(home: &std::path::Path) -> Home {
-            let was = std::env::var_os("HOME");
-            std::env::set_var("HOME", home);
+            let was = std::env::var_os(crate::hub_client::HUB_HOME_ENV);
+            std::env::set_var(crate::hub_client::HUB_HOME_ENV, home);
             Home(was)
         }
     }
@@ -415,8 +416,8 @@ mod tests {
     impl Drop for Home {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
+                Some(h) => std::env::set_var(crate::hub_client::HUB_HOME_ENV, h),
+                None => std::env::remove_var(crate::hub_client::HUB_HOME_ENV),
             }
         }
     }

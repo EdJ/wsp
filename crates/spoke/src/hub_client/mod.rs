@@ -30,7 +30,7 @@ use wsp_hub_protocol::{
 };
 
 mod dial;
-mod login;
+pub(crate) mod login;
 pub mod machine;
 mod subscribe;
 mod sync;

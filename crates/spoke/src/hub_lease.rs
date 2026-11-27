@@ -1609,8 +1609,8 @@ pub mod tests {
         // Core asks the shared-work add-on: the spoke, on this thread.
         let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
         let (listener, home) = counted_login(&env, "jesper");
-        let was = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let was = std::env::var_os(crate::hub_client::HUB_HOME_ENV);
+        std::env::set_var(crate::hub_client::HUB_HOME_ENV, &home);
         let store = Store::open();
         store.ensure_dirs().unwrap();
         for (id, ws, owner) in [("wsp-1", "shared:team", Some("ed")), ("wsp-2", "shared:team", None), ("t-1", "", Some("ed")), ("wsp-3", "shared:team", Some("jesper"))] {
@@ -1643,8 +1643,8 @@ pub mod tests {
         assert!(!dialled());
 
         match was {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
+            Some(h) => std::env::set_var(crate::hub_client::HUB_HOME_ENV, h),
+            None => std::env::remove_var(crate::hub_client::HUB_HOME_ENV),
         }
     }
 }
