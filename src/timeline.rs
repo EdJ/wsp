@@ -118,6 +118,13 @@ pub(crate) struct Inputs {
     /// Where the row's log says an attempt at a leg was ended with the leg not
     /// done: a reset by hand, or a spawn that failed (`wsp-902`).
     pub leg_marks: Vec<LegMark>,
+    /// Where the row's group window opens: the previous group's pass, off its
+    /// `worklist-go`; `None` for the first group, whose window opens at its
+    /// first start. What the row did, or waited, before it is the previous
+    /// window's, and its phases are read from here on (`wsp-857`: read-api's
+    /// wsp-373 first spawned days before its window, and the days were booked
+    /// as a gap the buckets never reached).
+    pub window: Option<i64>,
 }
 
 /// One line of the row's log that ended an attempt at a leg.
@@ -947,7 +954,9 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         // The waits as the row has them now: one that finished after this leg
         // had started was edited since (`wsp leg after`), and is not what held
         // it back.
-        let mut ready = added.unwrap_or(0).max(released.unwrap_or(0));
+        // A leg added before the row's group window opened was not ready until
+        // it did (`wsp-857`: turnaround's wsp-802, legs added days ahead).
+        let mut ready = added.unwrap_or(0).max(released.unwrap_or(0)).max(i.window.unwrap_or(0));
         for w in &waits {
             if let Some((_, t)) = done.iter().find(|(d, t)| d == w && *t <= s) {
                 ready = ready.max(*t);
@@ -1256,7 +1265,20 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     }
     let _ = begin;
     out.sort_by_key(|p| (p.start, p.end));
+    clip_to_window(&mut out, i.window);
     out
+}
+
+/// The phases from the group window's start on (`wsp-857`): one that ended
+/// before it is the previous window's and goes, one that straddles it starts
+/// there. A row with nothing after the window keeps what it has, so its
+/// timeline still reads.
+fn clip_to_window(out: &mut Vec<Phase>, window: Option<i64>) {
+    let Some(w) = window.filter(|w| out.iter().any(|p| p.end > *w)) else { return };
+    out.retain(|p| p.end > w);
+    for p in out.iter_mut() {
+        p.start = p.start.max(w);
+    }
 }
 
 /// A barrier's check seat from `from` to `to`, less the stretches its list
@@ -1608,6 +1630,7 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
         i.parks = parks_of(&ev, l, util::epoch_secs());
         i.holds = holds_of(&ev, l, util::epoch_secs());
         i.passes = passes_in(&ev, l);
+        i.window = group.as_ref().and_then(|(_, n, _)| i.passes.iter().filter(|(g, _)| *g + 1 == *n).map(|(_, t)| *t).min());
         if let Some(w) = store.worklist(l) {
             for (n, g) in w.groups().iter().enumerate() {
                 for c in &g.checks {
@@ -2683,6 +2706,66 @@ pub const VERBS: &[crate::verbs::Verb] = &[
     },
 ];
 
+/// Rows read as phases from inputs built by hand, for the tests here and in
+/// the effort report's (`wsp-857`).
+#[cfg(test)]
+pub(crate) mod shapes {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(t: i64, kind: &str, d: Value) -> (i64, String, Value) {
+        (t, kind.into(), d)
+    }
+
+    /// read-api's wsp-373: spawned at `t0`, released before review, and seated
+    /// again for its group 90 s after the window opened at `window`; reviewed
+    /// 1000 s in and verified at 1100.
+    pub(crate) fn spawned_ahead(id: &str, t0: i64, window: Option<i64>) -> Inputs {
+        let w = window.unwrap_or(t0 + 400_000);
+        Inputs {
+            id: id.into(),
+            events: vec![
+                ev(t0 + 10, "task-claimed", json!({"id": id, "pane": "p1"})),
+                ev(t0 + 12, "session-learned", json!({"id": id, "pane": "p1", "session": "s1"})),
+                ev(t0 + 300, "task-released", json!({"id": id})),
+                ev(w + 100, "task-claimed", json!({"id": id, "pane": "p2"})),
+                ev(w + 102, "session-learned", json!({"id": id, "pane": "p2", "session": "s2"})),
+                ev(w + 1000, "task-review", json!({"id": id})),
+                ev(w + 1100, "task-verified", json!({"id": id, "verdict": "holds"})),
+            ],
+            cycle: vec![(t0, format!("starting {id} on claude (new)")), (w + 90, format!("starting {id} on claude (new)"))],
+            window,
+            ..Default::default()
+        }
+    }
+
+    /// turnaround's wsp-802: never seated itself, its legs `a` and `b` added at
+    /// `t0`, days before its group window opened at `window`; leg `a` started
+    /// 100 s into the window, `b` after it, and the row reviewed at 900.
+    pub(crate) fn legs_added_ahead(id: &str, t0: i64, window: Option<i64>) -> Inputs {
+        let w = window.unwrap_or(t0 + 400_000);
+        Inputs {
+            id: id.into(),
+            events: vec![
+                ev(t0, "leg-added", json!({"id": id, "leg": "a"})),
+                ev(t0, "leg-added", json!({"id": id, "leg": "b"})),
+                ev(w + 500, "leg-done", json!({"id": id, "leg": "a"})),
+                ev(w + 900, "task-review", json!({"id": id})),
+                ev(w + 1000, "task-verified", json!({"id": id, "verdict": "holds"})),
+            ],
+            cycle: vec![(w + 100, format!("list group 2: starting leg a of {id}")), (w + 510, format!("list group 2: starting leg b of {id}"))],
+            legs: vec![LegIn { name: "a".into(), ..Default::default() }, LegIn { name: "b".into(), ..Default::default() }],
+            window,
+            ..Default::default()
+        }
+    }
+
+    /// The figures the effort report reads, off the phases [`build`] makes.
+    pub(crate) fn figures(i: &Inputs) -> RowFigures {
+        figures_of(&build(i), &SeatReport::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2741,6 +2824,50 @@ mod tests {
         events.push(ev(2300, "task-review", json!({"id": id})));
         events.push(ev(2400, "task-verified", json!({"id": id, "verdict": "holds"})));
         Inputs { id: id.into(), events, cycle, ..Default::default() }
+    }
+
+    /// `wsp-857`, read-api's wsp-373: a row first spawned days before its
+    /// group window is read from the window on. The days are the previous
+    /// window's, not a gap of this one.
+    #[test]
+    fn a_member_spawned_days_before_its_window_is_read_from_the_window_and_its_gap_starts_there() {
+        let (t0, w) = (1_000_000, 1_400_000);
+        let before = build(&shapes::spawned_ahead("r-2", t0, None));
+        assert_eq!(before.first().map(|p| p.start), Some(t0), "with no window the row reads from its first spawn");
+        let ph = build(&shapes::spawned_ahead("r-2", t0, Some(w)));
+        assert!(ph.iter().all(|p| p.start >= w), "nothing before the window: {ph:#?}");
+        let gap = &ph[0];
+        assert!(gap.gap && gap.waiting_for.as_deref().is_some_and(|c| c.starts_with(PARKED_CAUSE)), "{gap:#?}");
+        assert_eq!((gap.start, gap.end), (w, w + 90), "the gap is read from the window's start to the next spawn");
+        let f = shapes::figures(&shapes::spawned_ahead("r-2", t0, Some(w)));
+        assert_eq!((f.start, f.wall, f.gap, f.between_attempts), (w, 1000, 90, 90));
+        assert_eq!(f.waits.values().sum::<i64>(), 90);
+    }
+
+    /// `wsp-857`, turnaround's wsp-802: a row never seated itself, whose legs
+    /// were added days before its group: its first leg is ready from the
+    /// window, not from the leg-added time.
+    #[test]
+    fn a_never_started_members_first_leg_is_ready_from_its_group_window_not_the_leg_added_time() {
+        let (t0, w) = (1_000_000, 1_400_000);
+        let before = build(&shapes::legs_added_ahead("r-2", t0, None));
+        assert_eq!(before.first().map(|p| (p.start, p.label.as_str())), Some((t0, "gap before leg a")), "{before:#?}");
+        let ph = build(&shapes::legs_added_ahead("r-2", t0, Some(w)));
+        let first = &ph[0];
+        assert_eq!((first.label.as_str(), first.start, first.end), ("gap before leg a", w, w + 100), "{ph:#?}");
+        assert!(ph.iter().all(|p| p.start >= w), "{ph:#?}");
+        assert!(ph.iter().any(|p| p.label.starts_with("leg a") && p.start == w + 100), "{ph:#?}");
+    }
+
+    /// A row with nothing after its window keeps its phases, so its timeline
+    /// still reads.
+    #[test]
+    fn a_row_with_nothing_after_its_window_keeps_its_phases() {
+        let t0 = 1_000_000;
+        let ph = build(&shapes::spawned_ahead("r-2", t0, None));
+        let mut clipped = ph.clone();
+        clip_to_window(&mut clipped, Some(t0 + 10_000_000));
+        assert_eq!(clipped, ph);
     }
 
     /// crate-split's `wsp-441`, leg `move`: three resets by hand, a park with a
