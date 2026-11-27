@@ -41,7 +41,7 @@ The hub hosts no agents and runs no builds (d5). Code moves between the people t
 
 wsp's side of it is the spoke (`crates/spoke`) and the wire they share (`crates/hub-protocol`). The hub's behaviour named below is the hub repository's; paths named here are wsp's.
 
-**Testing against it.** The tests that need a real hub (the spoke's and the root's `tests/{privacy,identity,login,hub_sync,hub_cache,publish,publish_sync}.rs`) run the hub's own program through `wsp_spoke::testhub`: `WSP_HUB_BIN=<path to wsp-hub>` runs the binary as a child process on loopback, `WSP_HUB_IMAGE=<image>` runs its container image over TLS with a throwaway CA. Without either they are skipped, with one notice per test binary; `WSP_HUB_REQUIRED=1` makes that a failure. A lease's TTL passes in real time there (`lease_secs`), and what a test reads of the hub it reads over the wire or from the hub's data files.
+**Testing against it.** The tests that need a real hub (the spoke's and the root's `tests/{privacy,identity,login,hub_sync,hub_cache,publish,publish_sync,multiplayer_v1}.rs`) run the hub's own program through `wsp_spoke::testhub`: `WSP_HUB_BIN=<path to wsp-hub>` runs the binary as a child process on loopback, `WSP_HUB_IMAGE=<image>` runs its container image over TLS with a throwaway CA. Without either they are skipped, with one notice per test binary; `WSP_HUB_REQUIRED=1` makes that a failure. A lease's TTL passes in real time there (`lease_secs`), and what a test reads of the hub it reads over the wire or from the hub's data files.
 
 **A spoke** is a person's ordinary wsp, once it is logged in (`wsp login`, below). Logging in adds one thing: the daemon starts the sync worker, a thread named `hub-sync` (`crates/spoke/src/hub_sync.rs:162`, started by `start` at `crates/spoke/src/hub_sync.rs:182`) that takes turns only while `~/.config/wsp/hubs.json` exists and the connection is switched on. `wsp hub disable` stops this wsp taking part in shared work and keeps the login: the switch is written first (no new lease, no shared list advanced from here, a row filed shared kept provisional on a local id until enabled, no message sent), the shared rows with agents in flight are parked with `wsp park`'s write, and the agent of each live seat on one is ended when its current turn is over with the engine's own despawn (`end_seat_when_idle`: a detached `wsp despawn --pane <seat> --keep-tree` that waits, up to twenty minutes, until the seat is not mid-turn; the worktree is kept and the row stays parked), the journal is flushed while the hub answers, the row and drive leases are given back (a row whose agent is still finishing keeps its lease until that agent's claim ends, so nobody else leases a row an agent is still writing to; `wsp hub status` says which agents are finishing and, afterwards, which rows had their agent ended; private rows and their agents are untouched), and the worker takes no further turn, the cache readable and marked not live (`link: off` in `sync.json`). A hub that does not answer leaves the journal kept and the leases to run out. `wsp hub enable` switches back on (the worker's next look replays the journal) and takes each parked row's lease again: granted, the row returns to its recorded status with no agent started (it is ready to be started again, and a member of a list this wsp drives is reseated by the run once it has been without a seat for `SILENT_AFTER`); held by another user, it stays parked and says who holds it; a row whose agent is still finishing stays parked until it has ended. The switch and the parked rows are `$WSP_STATE/hub/switch.json` (`crates/spoke/src/hub_switch.rs`). Logging out disables first, then removes the login file (`hubs.json`) (an agent still finishing its turn then ends with no login to give its row's lease back with, so that lease runs out, and logout says so); the switch stays off and keeps the rows the disconnect parked, so `wsp hub status` with no login says only that and the way back (`wsp login`, then `wsp hub enable`), and a later login says the connection is off. Without a login no hub code runs and nothing is written.
 
@@ -158,6 +158,46 @@ The hub (`wsp-hub serve --config <file>`) serves TLS when its config names a cer
 **Trust.** A `tls://` hub's certificate must be for the URL's host and chain to the platform's root certificates (`crates/spoke/src/hub_client/tls.rs:34`). A private CA (a test, a self-hosted hub) is *pinned* with a PEM file, named by `--ca <file>`, `$WSP_HUB_CA`, or `"ca"` in `~/.config/wsp/hubs.json`: the client then trusts that CA's certificates and no other root. A certificate it refuses ends the dial as `Silent::Tls`, naming the fault (`invalid peer certificate: UnknownIssuer`, `... not valid for name ...`); the user's token is not sent.
 
 **Deploying it.** The container image, the compose file and the step-by-step recipe (certificate, firewall port, backup, upgrade, first login) are the hub repository's (its `docs/hub-deploy.md` and `deploy/hub/`). Hosting and network are configuration, and no machine name or address is a literal anywhere in code, docs or plans (d5).
+
+### The v1 gate on two real machines (wsp-419)
+
+`tests/multiplayer_v1.rs` runs the v1 scenario in a sandbox: a real hub over TLS, two spokes, a bare repository as the shared remote. The same scenario, by two people on two real machines against a deployed hub, is the other half of the gate, and `scripts/mp-gate.sh` is what each of them runs. Nothing here or in the script names a machine or an address; the hub is whatever its URL says. The script has not been run end to end against a hub: expect to fix wording or output parsing on its first run.
+
+**Set up, once.**
+
+1. Deploy the hub from its own repository (its `docs/hub-deploy.md` and `deploy/hub/`: a container image, with compose, behind its own certificate, or on a tailnet). wsp builds no hub.
+2. Let the two people in, either way:
+   - **GitHub login.** The hub's config has a `github` object naming both logins in `users`, and the admin's in `admins`. No `admin init` and no tokens to hand over. The hub user is the GitHub login in lower case, and a login token lasts `token_days` (30 by default).
+   - **Issued tokens.** `wsp-hub admin init --config <file> --admin <name>` on the hub's host prints the first admin's token once; from that admin's spoke, `wsp hub user add <name>` prints each person's.
+3. On each machine, install the trunk's `wsp`, log in (`wsp login tls://<hub-host>:7489 --github`, or without `--github` and paste the token; a private CA adds `--ca <file>`) and run `wsp daemon`, which syncs with the hub every turn. `wsp hub status` should name the hub and the user.
+4. Both people are members of one shared workspace. A new user is in none: an admin runs `wsp hub member add <workspace> <user>` for each (`wsp hub workspace add <workspace>` first where it does not exist; `wsp hub workspace ls` shows what the hub has).
+5. On each machine the same project, its root a clone of one shared git remote that both can push to. The gate lands rows by pushing there.
+
+**The run.** One person is the *owner*, the other the *helper*; each runs, from inside the project's clone, with the same project slug, workspace and list name:
+
+```sh
+scripts/mp-gate.sh owner  --project <slug> --workspace <ws> --list <name>    # on the owner's machine
+scripts/mp-gate.sh helper --project <slug> --workspace <ws> --list <name>    # on the helper's machine
+```
+
+`--workspace` defaults to `core`. Start them in either order: each waits for what the other does. The hub URL and the user come from `hubs.json`, read through `wsp hub status`; the script never prints the token. It prints each step's result as `ok` or `FAIL`, and stops at the first `FAIL` with what it saw. The gate's rows and list are made in the real workspace and stay there.
+
+| Step | The owner's machine | The helper's machine |
+| --- | --- | --- |
+| 1 | makes three rows and a list in the private workspace, publishes the list to the shared one | |
+| 2 | | shows the list and its three rows |
+| 3 | | leases two rows and spawns them on its own seats |
+| 4 | shows those two held by the other user, does not start them, drives the list (`worklist go`) and starts the third | shows the list driven by the owner |
+| 5 | its run verifies the third row; the landing is pushed to the shared remote; the barrier opens | its run verifies its two, each landing pushed; both caches show all three landed |
+| 6 | the seat on the third row receives a `tell seat:<row>` from the helper's seat; its agent replies with the `--re` command in the footer | the helper's seat tells it, and waits for the reply |
+| 7 | sees the helper's work from the outage | adds a fourth row, is asked to cut the link, works offline, is asked to restore it; the journal fast-forwards |
+| 8 | | (not run here: `cargo test --test multiplayer_v1`, below, runs wsp-463's standalone test and wsp-180's privacy test) |
+
+Each seat's agent works its row from the row's note, which the owner's script writes. No verdict is given by hand: each spoke's run opens the verifier on the rows it holds (see *List driving*). A rerun uses a fresh `--list` name. `MP_GATE_WAIT` is the seconds a wait gives the other side or an agent (900 by default).
+
+The sandbox test needs a hub named, `WSP_HUB_BIN` or `WSP_HUB_IMAGE` (*Testing against it*, above): without one it is skipped with a notice, step 8 with it, so set `WSP_HUB_REQUIRED=1` where it must run. The hub must be a current build: one whose config lacks `lease_secs` or `max_connections_per_peer` is refused by the test harness at start.
+
+The gate passes when both scripts end with every step `ok`, and each person confirms the hub, the logins and the run.
 
 ## What a desktop app reads
 
