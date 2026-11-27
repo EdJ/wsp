@@ -691,8 +691,8 @@ pub fn cost(store: &Store, args: &Args, slug: &str) -> i32 {
 }
 
 /// The tasks' verifier passes as `attempts --json` rows, `role: "verifier"`.
-pub fn verifier_rows(tasks: &[crate::model::Task]) -> Vec<Value> {
-    let sessions = Sessions::of(&Store::open());
+pub fn verifier_rows(store: &Store, tasks: &[crate::model::Task]) -> Vec<Value> {
+    let sessions = Sessions::of(store);
     tasks
         .iter()
         .flat_map(|t| crate::verification::passes(t).into_iter().map(move |p| (t, p)))
@@ -1089,7 +1089,7 @@ mod tests {
         assert_eq!(read_as(&es, "worker"), [own("cpd-7", 100)]);
         assert_eq!(read_as(&es, "verifier"), [own("cpd-7", 900)]);
         assert_eq!(Sum::of(es.iter()).usd, 1_000);
-        let rows = verifier_rows(&[store.find_task("m-2").unwrap()]);
+        let rows = verifier_rows(&store, &[store.find_task("m-2").unwrap()]);
         assert_eq!(rows[0]["usd_micros"], 900);
     }
 
@@ -1107,7 +1107,7 @@ mod tests {
         let es = entries(&store, "run").unwrap();
         assert_eq!(read_as(&es, "worker"), [unread("cpd-7"), own("cpd-7", 900)]);
         assert_eq!(read_as(&es, "verifier"), [unread("cpd-8"), own("cpd-8", 800)]);
-        let rows = verifier_rows(&[store.find_task("m-1").unwrap()]);
+        let rows = verifier_rows(&store, &[store.find_task("m-1").unwrap()]);
         assert_eq!(rows[0]["usd_micros"], Value::Null);
     }
 
