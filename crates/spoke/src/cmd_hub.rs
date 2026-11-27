@@ -53,10 +53,10 @@ fn dial() -> Result<Client, String> {
 /// `forbidden`.
 fn say(e: Error) -> String {
     match e {
-        Error::Refused(Refusal::Forbidden { by }) => {
+        Error::Refused(Refusal::Forbidden { by }, _) => {
             format!("forbidden: {} is not an admin of this hub", wsp_hub_protocol::principal::text(&by))
         }
-        Error::Refused(r) => format!("the hub refused it: {r:?}"),
+        Error::Refused(r, _) => format!("the hub refused it: {r:?}"),
         Error::Failed(f) if f.code == Code::Forbidden => format!("forbidden: {}", f.text),
         other => other.to_string(),
     }

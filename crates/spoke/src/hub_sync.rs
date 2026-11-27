@@ -1170,7 +1170,7 @@ impl Worker {
                     continue;
                 }
                 Err(e) if unreachable(&e) => return Err(e.to_string()),
-                Err(hub_client::Error::Refused(_)) => {}
+                Err(hub_client::Error::Refused(..)) => {}
                 Err(e) => {
                     self.say_once(store, format!("hub-sync: the lease of {} was not read: {e}; it waits", row.0));
                     self.held_back.insert(subject.clone());
@@ -1195,10 +1195,10 @@ impl Worker {
                         &format!("hub-sync: {}'s lease ran out while the hub was away; taken again (token {}) and pushed", row.0, taken.0),
                     );
                 }
-                Err(hub_client::Error::Refused(wsp_store_contract::Refusal::Held { holder, .. })) => {
+                Err(hub_client::Error::Refused(wsp_store_contract::Refusal::Held { holder, .. }, _)) => {
                     aside.push((row.clone(), user_of(&holder), token));
                 }
-                Err(hub_client::Error::Refused(wsp_store_contract::Refusal::Forbidden { .. })) => {
+                Err(hub_client::Error::Refused(wsp_store_contract::Refusal::Forbidden { .. }, _)) => {
                     let holder = hub_cache::Cache::read(store).get(&row.0).and_then(|h| h.allocation.clone());
                     aside.push((row.clone(), holder.unwrap_or_else(|| "another user".into()), token));
                 }

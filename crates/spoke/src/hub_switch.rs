@@ -222,7 +222,7 @@ pub fn agent_gone(store: &Store, row: &str, claim: &Value) -> bool {
     }
     let given_back = match hub_client_home().and_then(|h| hub_sync::dial(&h).ok()) {
         Some(mut client) => tokens.iter().all(|t| {
-            matches!(client.lease_release(&RowId(row.to_string()), *t), Ok(()) | Err(crate::hub_client::Error::Refused(_)))
+            matches!(client.lease_release(&RowId(row.to_string()), *t), Ok(()) | Err(crate::hub_client::Error::Refused(..)))
         }),
         None => tokens.is_empty(),
     };
@@ -378,7 +378,7 @@ fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut 
         }
         let Some(token) = hub_lease::token_of(&claim) else { continue };
         match client.lease_release(&RowId(row.clone()), token) {
-            Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
+            Ok(()) | Err(crate::hub_client::Error::Refused(..)) => {
                 strip_token(store, &row, token);
                 hub_journal::Leased::forget(store, &row);
                 out.released.push(row);
@@ -395,7 +395,7 @@ fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut 
         // Already given back with its claim: the hub says it is not held
         // under this token any more, and that counts as given back.
         match client.lease_release(&RowId(row.clone()), d.token) {
-            Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
+            Ok(()) | Err(crate::hub_client::Error::Refused(..)) => {
                 hub_lease::forget_row(store, &row, d.token);
                 hub_journal::Leased::forget(store, &row);
                 if !out.released.contains(&row) {
@@ -413,7 +413,7 @@ fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut 
         // The hub's name: a list kept here under a name of its own (`hub_lists`).
         let row = hub_lease::drive_row(&crate::hub_lists::hub_id(store, &list));
         match client.lease_release(&RowId(row.clone()), d.token) {
-            Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
+            Ok(()) | Err(crate::hub_client::Error::Refused(..)) => {
                 hub_lease::Book::edit(store, |b| {
                     if b.drives.get(&list).is_some_and(|x| x.token == d.token) {
                         b.drives.remove(&list);

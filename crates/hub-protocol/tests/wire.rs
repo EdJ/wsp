@@ -231,15 +231,16 @@ fn frame_ordinal(f: &Frame) -> (usize, &'static str) {
 
 fn frames() -> Vec<Frame> {
     vec![
-        Frame::Hello(Hello { token: ApiToken("s3cret".into()), by: ann(), client: "wsp 0.1.0".into(), protocol: p::PROTOCOL }),
+        Frame::Hello(Hello { token: ApiToken("s3cret".into()), by: ann(), client: "wsp 0.1.0".into(), protocol: p::PROTOCOL, machine: None }),
         Frame::Hello(Hello {
             token: ApiToken("t".into()),
             by: Principal::Wsp("start-check".into()),
             client: "with \"quotes\" and a\nnewline".into(),
             protocol: 2,
+            machine: None,
         }),
-        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(411), by: Some(ann()) }),
-        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(0), by: None }),
+        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(411), by: Some(ann()), machine: None }),
+        Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(0), by: None, machine: None }),
         Frame::Refused(Refused { code: Code::Unauthorised, text: "the token is revoked".into() }),
         Frame::Refused(Refused { code: Code::Malformed, text: String::new() }),
         request(1, Call::Verb(Verb::Whoami(NoArgs {}))),
@@ -744,7 +745,7 @@ fn a_verb_without_arguments_decodes_either_way() {
 #[test]
 fn peers_of_other_versions_decode() {
     let welcome = decode(r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4}"#);
-    assert_eq!(welcome, Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: 1, head: EventId(4), by: None }));
+    assert_eq!(welcome, Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: 1, head: EventId(4), by: None, machine: None }));
     let refused = decode(r#"{"type":"refused","code":"unauthorised"}"#);
     assert_eq!(refused, Frame::Refused(Refused { code: Code::Unauthorised, text: String::new() }));
     let newer = decode(r#"{"type":"refused","code":"quota","text":"x"}"#);
@@ -753,6 +754,32 @@ fn peers_of_other_versions_decode() {
     assert_eq!(events, ok(2, Answer::Events { events: vec![], head: EventId(9), through: EventId(0) }, vec![]));
     let failure = decode(r#"{"type":"reply","id":2,"err":{"code":"fenced"}}"#);
     assert_eq!(failure, Frame::Reply(Reply { id: ReqId(2), outcome: Outcome::Err(Failure { code: Code::Fenced, text: String::new(), refusal: None }), events: vec![] }));
+}
+
+/// The machine a hello names and the welcome names back (the hub's
+/// `b5e529a`): additive fields, absent when there is none, so every frame
+/// above is the frozen bytes still. The lines are the hub repository's own
+/// test's, byte for byte, so the two ends agree on them.
+#[test]
+fn the_machine_is_an_additive_field_of_hello_and_welcome() {
+    let m = p::Machine { id: "m-7f3a".into(), name: "ann-laptop".into() };
+    let hello = |machine| Frame::Hello(Hello { token: ApiToken("t".into()), by: ann(), client: "wsp 0.1.0".into(), protocol: p::PROTOCOL, machine });
+    let line = r#"{"type":"hello","token":"t","by":"person:ann","client":"wsp 0.1.0","protocol":1,"machine":{"id":"m-7f3a","name":"ann-laptop"}}"#;
+    assert_eq!(serde_json::to_string(&hello(Some(m.clone()))).unwrap(), line);
+    assert_eq!(decode(line), hello(Some(m.clone())));
+    assert_eq!(serde_json::to_string(&hello(None)).unwrap(), r#"{"type":"hello","token":"t","by":"person:ann","client":"wsp 0.1.0","protocol":1}"#);
+
+    let welcome = |machine| Frame::Welcome(Welcome { server: "wsp-hub".into(), protocol: p::PROTOCOL, head: EventId(4), by: Some(ann()), machine });
+    let line = r#"{"type":"welcome","server":"wsp-hub","protocol":1,"head":4,"by":"person:ann","machine":{"id":"m-7f3a","name":"ann-laptop"}}"#;
+    assert_eq!(serde_json::to_string(&welcome(Some(m.clone()))).unwrap(), line);
+    assert_eq!(decode(line), welcome(Some(m)));
+
+    // A machine with no name is named by its id.
+    match decode(r#"{"type":"hello","token":"t","by":"person:ann","client":"c","protocol":1,"machine":{"id":"m-7f3a"}}"#) {
+        Frame::Hello(Hello { machine: Some(m), .. }) => assert_eq!((m.name.as_str(), m.label()), ("", "m-7f3a")),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p::MAX_MACHINE, 256);
 }
 
 #[test]

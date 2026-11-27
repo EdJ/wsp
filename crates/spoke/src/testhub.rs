@@ -591,7 +591,7 @@ impl TestHub {
     /// hub's refusal otherwise.
     pub fn raw(&self, token: &str, hello_by: Principal) -> Result<Wire, (Code, String)> {
         let mut line = self.dial();
-        let hello = Hello { token: ApiToken(token.into()), by: hello_by, client: "test".into(), protocol: PROTOCOL };
+        let hello = Hello { token: ApiToken(token.into()), by: hello_by, client: "test".into(), protocol: PROTOCOL, machine: None };
         line.send(&Frame::Hello(hello)).map_err(|e| (Code::Unknown, e))?;
         match line.recv(WAIT) {
             Ok(Some(Frame::Welcome(w))) => Ok(Wire { line, by: w.by.expect("welcome names who"), head: w.head, next: 1 }),

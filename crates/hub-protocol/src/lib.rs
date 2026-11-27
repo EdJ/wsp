@@ -9,8 +9,9 @@
 //! **On the wire** a connection carries one [`Frame`] per line of JSON
 //! ([`conn`]'s framing rule). A frame is tagged by `type`.
 //!
-//! - The client's first frame is [`Hello`], answered [`Welcome`] or
-//!   [`Refused`] (and then closed); or [`Login`], answered with
+//! - The client's first frame is [`Hello`] (naming the client's
+//!   [`Machine`], where it knows it), answered [`Welcome`] or [`Refused`]
+//!   (and then closed); or [`Login`], answered with
 //!   [`LoginPrompt`] and then [`LoginDone`] or [`Refused`], and closed.
 //! - After a welcome the client sends [`Request`]s, each answered by one
 //!   [`Reply`] with its `id`. After the reply to `subscribe`, the hub also sends
@@ -161,7 +162,7 @@ impl std::fmt::Debug for LoginDone {
 
 // ---------------------------------------------------------------- hello
 
-/// `hello { token, by, client, protocol }`.
+/// `hello { token, by, client, protocol, machine? }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     /// The user's token; the hub decides who the connection is from it alone.
@@ -173,9 +174,44 @@ pub struct Hello {
     pub client: String,
     /// [`PROTOCOL`] as the client was built.
     pub protocol: u32,
+    /// The machine the client runs on. A hub that keys leases by machine
+    /// holds a lease to its user on this machine, and refuses the user's
+    /// other machines. Absent from an older client (an additive field): its
+    /// leases are its user's, on whichever machine, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
 }
 
-/// `welcome { server, protocol, head, by }`.
+/// The machine a spoke runs on, as its [`Hello`] names it (not the state
+/// core's executor `Machine`): `machine { id, name }`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Machine {
+    /// Stable across the client's runs and logins on that machine, and no
+    /// other machine's: what a lease is held on. Opaque to the hub; at most
+    /// [`MAX_MACHINE`] bytes, no control character.
+    pub id: String,
+    /// What a person calls the machine (its host name): what a refusal names.
+    /// Empty reads as the id. At most [`MAX_MACHINE`] bytes, no control
+    /// character.
+    #[serde(default)]
+    pub name: String,
+}
+
+impl Machine {
+    /// What a person reads: the name, or the id where there is none.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// The longest [`Machine`] id or name, in bytes.
+pub const MAX_MACHINE: usize = 256;
+
+/// `welcome { server, protocol, head, by, machine? }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
     /// The instance's name.
@@ -188,6 +224,11 @@ pub struct Welcome {
     /// it. Absent from a server older than it (an additive field).
     #[serde(default, with = "principal::optional", skip_serializing_if = "Option::is_none")]
     pub by: Option<Principal>,
+    /// The machine the hub holds this connection's leases on: the hello's,
+    /// as the hub took it. Absent when the hello named none, and from a hub
+    /// that does not key leases by machine (an additive field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
 }
 
 /// `refused { code, text }`.

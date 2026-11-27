@@ -31,6 +31,7 @@ use wsp_hub_protocol::{
 
 mod dial;
 mod login;
+pub mod machine;
 mod subscribe;
 mod sync;
 mod tls;
@@ -68,7 +69,9 @@ pub enum Error {
     Silent(Silent),
     /// The hub refused a command, and said why; the same command under the
     /// same key would be refused the same, so it is not sent again.
-    Refused(Refusal),
+    /// The second field is the hub's text of it (empty where it gave none):
+    /// what only the words carry, as the machine a lease is held on.
+    Refused(Refusal, String),
     /// The hub answered `err` with a code and no refusal (a verb it does not
     /// run, a malformed request, a failed store).
     Failed(Failure),
@@ -82,7 +85,7 @@ impl std::fmt::Display for Error {
             Error::Timeout => f.write_str("no reply in time"),
             Error::Lost(e) => write!(f, "{e}"),
             Error::Silent(s) => write!(f, "{s}"),
-            Error::Refused(r) => write!(f, "the server refused it: {r:?}"),
+            Error::Refused(r, _) => write!(f, "the server refused it: {r:?}"),
             Error::Failed(x) => write!(f, "the server failed it: {:?}: {}", x.code, x.text),
             Error::Unexpected(what) => write!(f, "the server's answer was not the verb's: {what}"),
         }
@@ -95,7 +98,7 @@ impl std::error::Error for Error {}
 /// else the failure whole.
 pub(crate) fn refused(f: Failure) -> Error {
     match f.refusal {
-        Some(r) => Error::Refused(r),
+        Some(r) => Error::Refused(r, f.text),
         None => Error::Failed(f),
     }
 }
@@ -109,6 +112,9 @@ pub(crate) struct Dial {
     pub(crate) tls: Option<tls::Tls>,
     pub(crate) by: Principal,
     pub(crate) wait: Duration,
+    /// The machine every hello names ([`machine`]); none where its id could be
+    /// neither read nor made, and the hub then holds leases by user alone.
+    pub(crate) machine: Option<wsp_hub_protocol::Machine>,
 }
 
 /// A welcomed connection to the hub, for requests.
@@ -119,6 +125,9 @@ pub struct Client {
     timeout: Duration,
     server: String,
     head: EventId,
+    /// The machine the hub's first `welcome` said it holds this connection's
+    /// leases on (none from a hub that keys leases by user alone).
+    held_on: Option<wsp_hub_protocol::Machine>,
 }
 
 impl Client {
@@ -138,11 +147,26 @@ impl Client {
     /// [`Client::dial_hub`] trusting the CA in `ca` (a PEM file) and nothing
     /// else, for a hub whose certificate a private CA signed (a test, a
     /// self-hosted hub): `--ca <file>`, [`hub_ca`]. It applies to `tls://` only.
+    /// The hello names this machine ([`machine`]) as kept under the hub home
+    /// ([`hub_home`]), whatever home the credential was read from: in a
+    /// process the hub home is the one machine, so every dial of it (a test's
+    /// spokes too, unless each sets `$WSP_HUB_HOME`) holds leases alike.
     pub fn dial_hub_ca(url: &str, credential: Credential, ca: Option<&std::path::Path>, wait: Duration) -> Result<Client, Silent> {
+        let machine = login::hub_home().and_then(|home| machine::this(&home).ok());
+        Client::dial_hub_on(url, credential, ca, wait, machine)
+    }
+
+    fn dial_hub_on(
+        url: &str,
+        credential: Credential,
+        ca: Option<&std::path::Path>,
+        wait: Duration,
+        machine: Option<wsp_hub_protocol::Machine>,
+    ) -> Result<Client, Silent> {
         let Credential::User(token) = credential;
         let (addr, secure) = login::hub_addr(url)?;
         let tls = if secure { Some(tls::Tls::new(&addr, ca)?) } else { None };
-        let mut target = Dial { addr, token: ApiToken(token), tls, by: login::hint(), wait };
+        let mut target = Dial { addr, token: ApiToken(token), tls, by: login::hint(), wait, machine };
         let open = dial::open(&target)?;
         // Every request's `by` must be who the connection is: the hub names that from the token,
         // whatever `by` the hello sent.
@@ -156,7 +180,19 @@ impl Client {
             timeout: REQUEST_TIMEOUT.max(wait),
             server: open.welcome.server,
             head: open.welcome.head,
+            held_on: open.welcome.machine,
         })
+    }
+
+    /// The machine this client's hello named: what a lease it takes is held on.
+    pub fn machine(&self) -> Option<&wsp_hub_protocol::Machine> {
+        self.target.machine.as_ref()
+    }
+
+    /// The machine the hub's `welcome` said it holds this connection's leases
+    /// on: the hello's, where the hub keys leases by machine.
+    pub fn held_on(&self) -> Option<&wsp_hub_protocol::Machine> {
+        self.held_on.as_ref()
     }
 
     /// The instance the hub named in its `welcome` (the first one's).

@@ -94,22 +94,46 @@ fn who(p: &Principal) -> String {
     }
 }
 
-/// What a refused or failed lease verb says.
-fn say(row: &str, e: HubError) -> String {
+/// What a refused or failed lease verb says. `me` is who the connection is:
+/// a lease the hub says `me` holds is held by this user on another of their
+/// machines (the hub keys a lease by user and machine), which the hub's text
+/// names ([`other_machine`]).
+fn say(row: &str, e: HubError, me: &Principal) -> String {
     match e {
-        HubError::Refused(Refusal::Held { holder, .. }) => {
+        HubError::Refused(Refusal::Held { holder, .. }, text) if holder == *me => match other_machine(&text) {
+            Some(machine) => format!(
+                "{row} is leased by you on your other machine {machine}, not this one: release it there, or let its lease run out"
+            ),
+            None => format!("{row} is leased by you on another machine of yours, not this one: {text}"),
+        },
+        HubError::Refused(Refusal::Held { holder, .. }, _) => {
             format!("{row} is leased by {}: their spoke holds it until it lets go or the lease runs out", who(&holder))
         }
-        HubError::Refused(Refusal::Forbidden { .. }) => format!("{row} is forbidden to you: it is allocated to another user"),
+        HubError::Refused(Refusal::Forbidden { .. }, _) => format!("{row} is forbidden to you: it is allocated to another user"),
         other => format!("the hub would not lease {row}: {other}"),
     }
+}
+
+/// The machine a hub's `held` text names for a lease its own user holds
+/// elsewhere: the hub writes "… is held by <user> on the machine <name>, not
+/// this one: …" (`wsp-hub` `leases.rs` `held_elsewhere`). None for any other
+/// text (a hub that keys leases by user alone says no machine).
+pub fn other_machine(text: &str) -> Option<String> {
+    const ON: &str = " on the machine ";
+    const NOT: &str = ", not this one:";
+    let from = text.find(ON)? + ON.len();
+    let to = text[from..].rfind(NOT)? + from;
+    Some(text[from..to].to_string()).filter(|m| !m.is_empty())
 }
 
 /// `lease.take` for `row` in `workspace`, the refusals said in words.
 pub fn take(client: &mut Client, workspace: &str, row: &str) -> Result<Held, String> {
     match client.lease_take(&HubWorkspace(workspace.to_string()), &RowId(row.to_string())) {
         Ok((token, at)) => Ok(Held { token, expires: (at.0 / 1000) as i64 }),
-        Err(e) => Err(say(row, e)),
+        Err(e) => {
+            let me = client.by().clone();
+            Err(say(row, e, &me))
+        }
     }
 }
 
@@ -230,7 +254,7 @@ pub fn renew_due(store: &Store, client: &mut Client, now: i64, alive: &mut dyn F
                     out.renewed += 1;
                 }
             }
-            Err(HubError::Refused(r)) => {
+            Err(HubError::Refused(r, _)) => {
                 let why = format!("hub lease gone: renewing it was refused ({r:?})");
                 if drop_claim(store, &row, token, &why) {
                     out.lost.push(row);
@@ -659,8 +683,8 @@ pub fn drive(store: &Store, w: &wsp_engine::model::Worklist) -> Drives {
             });
             Drives::Here
         }
-        Err(HubError::Refused(Refusal::Held { holder, .. })) => Drives::Elsewhere(who(&holder)),
-        Err(HubError::Refused(Refusal::Forbidden { .. })) => Drives::Elsewhere(driver),
+        Err(HubError::Refused(Refusal::Held { holder, .. }, _)) => Drives::Elsewhere(who(&holder)),
+        Err(HubError::Refused(Refusal::Forbidden { .. }, _)) => Drives::Elsewhere(driver),
         Err(e) => Drives::NotYet(format!("the hub would not lease {row}: {e}")),
     }
 }
@@ -690,15 +714,18 @@ pub fn lease_member(store: &Store, row: &str) -> Member {
             Book::edit(store, |b| b.elsewhere.remove(row));
             Member::Leased(Held { token, expires: (at.0 / 1000) as i64 })
         }
-        Err(HubError::Refused(Refusal::Held { holder, .. })) => {
+        Err(HubError::Refused(Refusal::Held { holder, .. }, _)) => {
             let user = who(&holder);
             Book::edit(store, |b| b.elsewhere.insert(row.to_string(), user.clone()));
             Member::Elsewhere(user)
         }
-        Err(HubError::Refused(Refusal::Forbidden { .. })) => {
+        Err(HubError::Refused(Refusal::Forbidden { .. }, _)) => {
             Member::Elsewhere(crate::cmd_allocate::allocated_to(store, row).unwrap_or_else(|| "another user".into()))
         }
-        Err(e) => Member::NotYet(say(row, e)),
+        Err(e) => {
+            let me = client.by().clone();
+            Member::NotYet(say(row, e, &me))
+        }
     }
 }
 
@@ -767,7 +794,7 @@ pub fn renew_drives(store: &Store, client: &mut Client, now: i64) -> usize {
                 });
                 renewed += 1;
             }
-            Err(HubError::Refused(r)) => {
+            Err(HubError::Refused(r, _)) => {
                 drop_drive(store, &list, d.token, &format!("renewing it was refused ({r:?})"));
             }
             Err(_) => {}
@@ -832,7 +859,7 @@ pub fn release_finished(store: &Store, client: &mut Client) -> usize {
     let mut n = 0;
     for (row, token) in finished_unheld(store) {
         match client.lease_release(&RowId(row.clone()), token) {
-            Ok(()) | Err(HubError::Refused(_)) => {
+            Ok(()) | Err(HubError::Refused(..)) => {
                 forget_row(store, &row, token);
                 n += 1;
             }
@@ -848,7 +875,7 @@ pub fn release_if_finished(store: &Store, row: &str) {
     let Some((_, token)) = finished_unheld(store).into_iter().find(|(r, _)| r == row) else { return };
     let Some(home) = home().filter(|h| logged_in(h)) else { return };
     let Ok(mut client) = crate::cmd_publish::dial(&home) else { return };
-    if matches!(client.lease_release(&RowId(row.to_string()), token), Ok(()) | Err(HubError::Refused(_))) {
+    if matches!(client.lease_release(&RowId(row.to_string()), token), Ok(()) | Err(HubError::Refused(..))) {
         forget_row(store, row, token);
     }
 }
@@ -1480,6 +1507,84 @@ pub mod tests {
         assert_eq!(wsp_store::store::record_expires(&claim), Some(at));
         assert!(claim["ttl_s"].as_i64().unwrap() > 6 * 86_400);
     }
+    /// `$WSP_HUB_HOME` and the host name set for one spoke's dials: a spoke is
+    /// a machine by its hub home (its machine id) and is named by its host.
+    fn as_machine<T>(home: &std::path::Path, host: &str, f: impl FnOnce() -> T) -> T {
+        let was = (std::env::var_os(hub_client::HUB_HOME_ENV), std::env::var_os("HOSTNAME"));
+        std::env::set_var(hub_client::HUB_HOME_ENV, home);
+        std::env::set_var("HOSTNAME", host);
+        let out = f();
+        for (k, v) in [(hub_client::HUB_HOME_ENV, was.0), ("HOSTNAME", was.1)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    /// The hub keys a lease by user and machine (its `b5e529a`): two spokes
+    /// logged in as one user, on two machines. The first takes the row; the
+    /// second's take and renew are refused, the words saying it is held by
+    /// this user on their other machine and naming it. The first renews and
+    /// takes again from any connection, after logging out and in again too,
+    /// and its machine id is the one it had before.
+    #[test]
+    fn hub_machine_one_user_on_two_machines_the_second_is_refused_naming_the_first_and_the_first_renews_after_relogin() {
+        let env = wsp_engine::util::isolated("hub-machine-two");
+        let Some((running, tokens)) = serve_users(Setup::default(), &["ann"]) else { return };
+        let (a, b) = (env.path("machine-a"), env.path("machine-b"));
+        for h in [&a, &b] {
+            running.login(h, "ann", &tokens["ann"]);
+        }
+        let dial_on = |home: &std::path::Path, host: &str| as_machine(home, host, || crate::cmd_publish::dial(home).unwrap());
+
+        let mut on_a = dial_on(&a, "box-a");
+        assert_eq!(on_a.machine().map(|m| m.name.as_str()), Some("box-a"));
+        assert_eq!(on_a.held_on(), on_a.machine(), "the hub's welcome names the machine back");
+        let id_a = hub_client::machine::kept_id(&a).expect("the dial made a's id");
+        let held = take(&mut on_a, "shared:team", "wsp-1").unwrap();
+
+        let mut on_b = dial_on(&b, "box-b");
+        assert_ne!(hub_client::machine::kept_id(&b).as_deref(), Some(id_a.as_str()), "another hub home, another machine");
+        let why = take(&mut on_b, "shared:team", "wsp-1").unwrap_err();
+        assert_eq!(why, "wsp-1 is leased by you on your other machine box-a, not this one: release it there, or let its lease run out");
+        match on_b.lease_renew(&RowId("wsp-1".into()), held.token) {
+            Err(HubError::Refused(Refusal::Held { holder, .. }, text)) => {
+                assert_eq!(holder, Principal::Person("ann".into()));
+                assert_eq!(other_machine(&text).as_deref(), Some("box-a"), "{text}");
+            }
+            other => panic!("b's renew of a's lease: {other:?}"),
+        }
+        assert_eq!(running.lease_of("wsp-1").map(|l| l.1), Some(held.token), "b's refusals changed nothing");
+
+        // A logs out and in again: the same machine, so its lease is its own still.
+        assert!(crate::cmd_login::log_out(&a).unwrap().is_some());
+        assert_eq!(hub_client::machine::kept_id(&a).as_deref(), Some(id_a.as_str()), "a logout leaves the machine's id");
+        as_machine(&a, "box-a", || crate::cmd_login::log_in(&a, &running.url(), &tokens["ann"], running.ca()).unwrap());
+        assert_eq!(hub_client::machine::kept_id(&a).as_deref(), Some(id_a.as_str()), "a login keeps it too");
+        let mut again = dial_on(&a, "box-a");
+        let (token, _) = again.lease_renew(&RowId("wsp-1".into()), held.token).expect("a renews its lease after logging in again");
+        assert_eq!(token, held.token);
+        assert_eq!(take(&mut again, "shared:team", "wsp-1").unwrap().token, held.token, "a take by its holder renews it");
+        // Released on its machine, the other one takes it.
+        again.lease_release(&RowId("wsp-1".into()), held.token).unwrap();
+        assert!(take(&mut on_b, "shared:team", "wsp-1").unwrap().token.0 > held.token.0);
+    }
+
+    #[test]
+    fn hub_machine_the_machine_is_read_from_the_hubs_words_and_only_from_them() {
+        let text = "row:wsp-1 is held by person:ann on the machine box-a, not this one: release it there, or let it expire (2026-11-27T10:00:00Z)";
+        assert_eq!(other_machine(text).as_deref(), Some("box-a"));
+        assert_eq!(other_machine("row:wsp-1 is held by person:ann").as_deref(), None);
+        assert_eq!(other_machine("x on the machine , not this one: y"), None);
+        let me = Principal::Person("ann".into());
+        let held = |text: &str| HubError::Refused(Refusal::Held { lease: LeaseName("row:wsp-1".into()), holder: me.clone() }, text.into());
+        assert_eq!(say("wsp-1", held("held, no machine said"), &me), "wsp-1 is leased by you on another machine of yours, not this one: held, no machine said");
+        let bo = Principal::Person("bo".into());
+        assert_eq!(say("wsp-1", held(text), &bo), "wsp-1 is leased by ann: their spoke holds it until it lets go or the lease runs out");
+    }
+
     /// A hub that counts what dials it, and a home logged in to it as `who`.
     fn counted_login(env: &wsp_engine::util::Isolated, who: &str) -> (std::net::TcpListener, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;

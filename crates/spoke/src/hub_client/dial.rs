@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use wsp_hub_protocol::{
-    ApiToken, ConnError, Connection, Frame, Hello, Login, LoginDone, LoginPrompt, Principal, Refused, Welcome,
+    ApiToken, ConnError, Connection, Frame, Hello, Login, LoginDone, LoginPrompt, Machine, Principal, Refused, Welcome,
     LOGIN_GITHUB, MAX_LINE, PROTOCOL,
 };
 
@@ -72,7 +72,7 @@ pub(crate) struct Open {
 pub(crate) fn open(target: &Dial) -> Result<Open, Silent> {
     let deadline = Instant::now() + target.wait;
     let (conn, at) = connect(&target.addr, target.tls.as_ref(), deadline)?;
-    hello(conn, &at, target.token.clone(), &target.by, deadline)
+    hello(conn, &at, target.token.clone(), &target.by, target.machine.clone(), deadline)
 }
 
 /// Dial `addr` within `deadline`, inside TLS when `tls` is given. A name that
@@ -182,8 +182,8 @@ pub fn login_github_on(
     }
 }
 
-fn hello(mut conn: Tcp, at: &str, token: ApiToken, by: &Principal, deadline: Instant) -> Result<Open, Silent> {
-    let frame = Frame::Hello(Hello { token, by: by.clone(), client: client_name(), protocol: PROTOCOL });
+fn hello(mut conn: Tcp, at: &str, token: ApiToken, by: &Principal, machine: Option<Machine>, deadline: Instant) -> Result<Open, Silent> {
+    let frame = Frame::Hello(Hello { token, by: by.clone(), client: client_name(), protocol: PROTOCOL, machine });
     conn.send(&frame).map_err(|e| Silent::NoWelcome(format!("{at}: {e}")))?;
     let left = deadline.saturating_duration_since(Instant::now());
     match conn.recv(left) {
@@ -476,7 +476,7 @@ mod tests {
     fn a_github_login_that_hears_nothing_or_another_frame_or_a_closed_connection_fails_by_name() {
         let mut quiet = Scripted::new(vec![Ok(None)]);
         assert_eq!(login_github_on(&mut quiet, "hub", Duration::from_millis(1), |_| {}), Err(Silent::NoWelcome("hub".into())));
-        let welcome = Welcome { server: "old-hub".into(), protocol: PROTOCOL, head: wsp_hub_protocol::EventId(0), by: None };
+        let welcome = Welcome { server: "old-hub".into(), protocol: PROTOCOL, head: wsp_hub_protocol::EventId(0), by: None, machine: None };
         let mut old = Scripted::new(vec![Ok(Some(Frame::Welcome(welcome)))]);
         assert!(matches!(login_github_on(&mut old, "hub", Duration::from_secs(1), |_| {}), Err(Silent::NotAServer(_))));
         let mut gone = Scripted::new(vec![Ok(Some(Frame::LoginPrompt(prompt()))), Err(ConnError::Closed)]);

@@ -12,6 +12,10 @@
 //! - `ids.alloc { workspace, project, n, past? }` → [`Answer::Ids`].
 //! - `lease.take { workspace, row }` and `lease.renew { row, token }` →
 //!   [`Answer::Lease`]; `lease.release { row, token }` → [`Answer::Released`].
+//!   A lease is held by a user on the machine its hello named
+//!   ([`crate::Machine`]): the user's other machine is refused `held`, the
+//!   text naming the machine that holds it. A hello that named none holds
+//!   and matches by user alone.
 //! - `msg.send { to, from, seat?, text, re? }` → [`Answer::Queued`];
 //!   `msg.take {}` → [`Answer::Messages`]; `msg.ack { ids }` →
 //!   [`Answer::Acked`].

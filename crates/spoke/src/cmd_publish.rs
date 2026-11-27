@@ -194,7 +194,7 @@ pub fn allocate_or(store: &Store, client: &mut Client, ws: &HubWorkspace, code: 
 
 fn say(e: HubError) -> String {
     match &e {
-        HubError::Refused(r) if format!("{r:?}").contains("Forbidden") => format!("forbidden: you are not a member of that workspace ({r:?})"),
+        HubError::Refused(r, _) if format!("{r:?}").contains("Forbidden") => format!("forbidden: you are not a member of that workspace ({r:?})"),
         HubError::Failed(f) if format!("{:?}", f.code) == "Forbidden" => format!("forbidden: {}", f.text),
         _ => e.to_string(),
     }
