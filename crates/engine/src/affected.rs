@@ -459,13 +459,23 @@ const VALUED: &[&str] = &["--features", "-F", "--target", "--profile", "-j", "--
 /// or a bare name no `tests/` file mentions.
 fn in_bin(filter: &str, read: &dyn Fn(&str) -> Option<String>, in_tests: &dyn Fn(&str) -> bool) -> bool {
     match filter.split_once("::") {
-        Some((first, _)) => {
-            plain_path(first)
-                && (read(&format!("src/{first}.rs")).is_some() || read(&format!("src/{first}/mod.rs")).is_some())
-                && !in_tests(&format!("mod {first}"))
-        }
+        Some((first, _)) => plain_path(first) && has_module("src", first, read) && !in_tests(&format!("mod {first}")),
         None => !in_tests(filter),
     }
+}
+
+/// Whether the source directory `src` has the top-level module `name`.
+fn has_module(src: &str, name: &str, read: &dyn Fn(&str) -> Option<String>) -> bool {
+    read(&format!("{src}/{name}.rs")).is_some() || read(&format!("{src}/{name}/mod.rs")).is_some()
+}
+
+/// Whether a crate under `crates/` that `reach` reaches has the module a filter
+/// path starts with, so the filter matches its tests too (`wsp-899`). A
+/// workspace that cannot be read counts as having it.
+fn in_reached_crate(filter: &str, reach: &Reach, read: &dyn Fn(&str) -> Option<String>) -> bool {
+    let (Reach::Crates(c, d), Some((first, _))) = (reach, filter.split_once("::")) else { return false };
+    let Ok(ws) = members(read) else { return true };
+    ws.iter().any(|k| !k.dir.is_empty() && c.iter().chain(d).any(|n| *n == k.name) && has_module(&format!("{}/src", k.dir), first, read))
 }
 
 /// The narrower form of one step's command under `reach`, `None` where it stays
@@ -478,7 +488,8 @@ fn in_bin(filter: &str, read: &dyn Fn(&str) -> Option<String>, in_tests: &dyn Fn
 ///   crate's tests, not the other crates'.
 /// - Either way, a filtered step whose filters can match only the bin's own
 ///   tests runs that one binary (`-p <root> --bin <bin>`), not every `tests/`
-///   binary beside it.
+///   binary beside it. A `--workspace` one stays as declared where a changed
+///   crate or a reverse dependent has the filter's module too.
 pub fn narrow(command: &str, reach: &Reach, root: Option<&Root>, read: &dyn Fn(&str) -> Option<String>, in_tests: &dyn Fn(&str) -> bool) -> Option<Narrowed> {
     if matches!(reach, Reach::Whole(_)) || !plain_cargo(command) {
         return None;
@@ -534,7 +545,7 @@ pub fn narrow(command: &str, reach: &Reach, root: Option<&Root>, read: &dyn Fn(&
     if !filters.is_empty() {
         let root = root?;
         let bin = root.bin.as_ref()?;
-        if !filters.iter().all(|f| in_bin(f, read, in_tests)) {
+        if !filters.iter().all(|f| in_bin(f, read, in_tests)) || (workspace && filters.iter().any(|f| in_reached_crate(f, reach, read))) {
             return None;
         }
         let picks = ["-p".to_string(), root.package.clone(), "--bin".into(), bin.clone()];
@@ -1048,6 +1059,29 @@ mod tests {
         assert_eq!(said.len(), 3, "{said:?}");
         assert!(said[0].contains("the bin crate's tests, not the other crates'") && said[0].contains("(cycle)"), "{said:?}");
         assert!(said[1].contains("the filter matches no tests/ file"), "{said:?}");
+    }
+
+    #[test]
+    fn a_filtered_workspace_step_keeps_a_reached_crates_module_of_the_same_name() {
+        let files = |p: &str| match p {
+            "Cargo.toml" => Some("[package]\nname = \"wsp\"\n\n[workspace]\nmembers = [\"crates/base\", \"crates/view\"]\n\n[dependencies]\nwsp-view = { path = \"crates/view\" }\n".to_string()),
+            "crates/base/Cargo.toml" => Some("[package]\nname = \"wsp-base\"\n".into()),
+            "crates/view/Cargo.toml" => Some("[package]\nname = \"wsp-view\"\n\n[dependencies]\nwsp-base = { path = \"../base\" }\n".into()),
+            "src/main.rs" | "src/spend.rs" | "src/cycle.rs" | "crates/view/src/spend.rs" => Some(String::new()),
+            _ => None,
+        };
+        let none = |_: &str| false;
+        let run = |command: &str, changed: &[&str]| narrow_steps(vec![step("s", command, Of::Task)], &paths(changed), &files, &none).0.remove(0).command;
+        for command in ["cargo test --workspace spend::", "cargo nextest run --workspace spend::", "cargo test --workspace cycle:: spend::"] {
+            assert_eq!(run(command, &["crates/view/src/spend.rs"]), command);
+            assert_eq!(run(command, &["crates/view/src/spend.rs", "src/spend.rs"]), command);
+            // The module's crate is a reverse dependent of the changed one.
+            assert_eq!(run(command, &["crates/base/src/lib.rs"]), command);
+        }
+        // A module of src/ alone, a change to src/ alone, or a step that never ran the crates.
+        assert_eq!(run("cargo test --workspace cycle::", &["crates/view/src/spend.rs"]), "cargo test -p wsp --bin wsp cycle::");
+        assert_eq!(run("cargo test --workspace spend::", &["src/spend.rs"]), "cargo test -p wsp --bin wsp spend::");
+        assert_eq!(run("cargo test spend::", &["crates/view/src/spend.rs"]), "cargo test -p wsp --bin wsp spend::");
     }
 
     #[test]
