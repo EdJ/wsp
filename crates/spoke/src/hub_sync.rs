@@ -867,6 +867,10 @@ impl Worker {
                     if e.kind == EventKind::OrderQueued && me.is_some() && e.payload.get("user").and_then(|u| u.as_str()) == me.as_deref() {
                         woke = true;
                     }
+                    // A subject retired by another spoke: the turn reads the heads' `retired`.
+                    if e.kind == EventKind::RefRetired {
+                        woke = true;
+                    }
                     if e.kind == EventKind::RefMoved {
                         woke = true;
                         if let Some(w) = e.payload.get("workspace").and_then(|w| w.as_str()) {
@@ -964,7 +968,15 @@ impl Worker {
                 return Ok(());
             }
         };
-        let classified = match hub_cache::classify(store, client, ws, &hub, &me, by, &forced) {
+        // Retirements the hub lists, followed (stubs go, X -> Y recorded),
+        // and the rows this spoke moved away, which are not kept as heads.
+        for line in crate::hub_retire::follow_retired(store, &hub) {
+            wsp_engine::store::log_line(store, &line);
+        }
+        let moved_away = crate::hub_retire::skip(store, ws, &hub);
+        let retired = crate::hub_retire::retired(&hub);
+        let client = self.client()?;
+        let classified = match hub_cache::classify(store, client, ws, &hub, &me, by, &forced, &moved_away) {
             Ok(c) => c,
             Err(why) => {
                 self.refused.insert(ws.to_string(), format!("its heads were not read: {why}"));
@@ -979,12 +991,16 @@ impl Worker {
         self.settle(store, ws, &hub, by, turned)?;
         let heads = Heads::read(store);
         let promoting = classified.promoting.clone();
-        let (mut local, pushing, included) = self.pending(store, ws, tasks, by, &objects, &heads, classified.whole);
+        // A retired subject is never pushed: a whole one kept for its unsent edits stays here alone.
+        let tasks: Vec<wsp_engine::model::Task> = tasks.iter().filter(|t| !retired.contains(&Subject::Row(RowId(t.id.clone())))).cloned().collect();
+        let (mut local, pushing, included) = self.pending(store, ws, &tasks, by, &objects, &heads, classified.whole);
         for (subject, id) in Sides::read(store).notice_heads(ws) {
             local.set(subject, id);
         }
         let client = self.client()?;
-        let report = match client.sync_skipping(&wid, &local, &objects, &|s| matches!(s, Subject::Row(_)) && !included.contains(s)) {
+        let report = match client.sync_skipping(&wid, &local, &objects, &|s| {
+            (matches!(s, Subject::Row(_)) && !included.contains(s)) || retired.contains(s) || moved_away.contains(s)
+        }) {
             Ok(r) => r,
             Err(SyncError::Request(e)) if unreachable(&e) => return Err(e.to_string()),
             Err(e) => {
@@ -995,7 +1011,27 @@ impl Worker {
         };
         self.seam(store, "synced");
         self.keep(store, &objects, &heads, &pushing, &promoting, &report, by, turned);
-        self.after_push(store, &report)
+        self.after_push(store, &report)?;
+        // The rows moved away here, now that their new ids are pushed: retired
+        // on the hub, continuing as those ids (`hub_retire`).
+        if !moved_away.is_empty() {
+            let mut said = Vec::new();
+            let client = self.client()?;
+            let done = crate::hub_retire::retire_moved(store, client, ws, &hub, &mut |l| said.push(l));
+            for line in said {
+                self.say_once(store, line);
+            }
+            match done {
+                Ok(done) => {
+                    for (x, y) in done {
+                        wsp_engine::store::log_line(store, &format!("hub-sync: {x} retired on the hub, continuing as {y}"));
+                    }
+                }
+                Err(e) if unreachable(&e) => return Err(e.to_string()),
+                Err(e) => self.say_once(store, format!("hub-sync: rows moved here were not retired: {e}")),
+            }
+        }
+        Ok(())
     }
 
     /// The records of `ws`'s rows and lists that moved since their synced
@@ -1085,6 +1121,10 @@ impl Worker {
                     // records of an outage are one line, pushed in order.
                     if let Some(tip) = tips.get(&hub_s).filter(|t| objects.has(t)) {
                         set_parent(&mut obj, *tip);
+                    } else if let Some(h) = synced.is_none().then(|| row.as_deref().and_then(|r| crate::hub_retire::first_parent(store, r))).flatten().filter(|h| objects.has(h)) {
+                        // A row moved here from X: its first record follows X's head,
+                        // so X's history is reached through it once X is retired.
+                        set_parent(&mut obj, h);
                     }
                     let (id, bytes) = wsp_objects::encode(&obj);
                     let token = row.as_ref().and_then(|r| leased.get(r).copied());

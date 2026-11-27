@@ -238,6 +238,27 @@ impl Client {
         }
     }
 
+    /// `refs.retire` (the hub's 19317ac): `subject` leaves `workspace`'s heads
+    /// for good, from the head `from` the caller saw, continuing as
+    /// `successor`. `Ok(Ok(successor))` retired (a repeat answers the same);
+    /// `Ok(Err(head))` stale, the head the hub has (`None`: it has none, as a
+    /// subject retired already); refusals as any verb's (`held`, `forbidden`,
+    /// `invalid`: the successor has no head yet; `too_large`).
+    pub fn refs_retire(
+        &mut self,
+        workspace: &WorkspaceId,
+        subject: Subject,
+        from: ObjectId,
+        successor: Option<Subject>,
+    ) -> Result<Result<Option<Subject>, Option<ObjectId>>, Error> {
+        let ask = wsp_hub_protocol::RefRetire { workspace: workspace.clone(), subject, from, successor };
+        match self.sync_call(SyncCall::Retire(ask))? {
+            Answer::Retired { successor, .. } => Ok(Ok(successor)),
+            Answer::Move(Move::Stale { head }) => Ok(Err(head)),
+            other => Err(Error::Unexpected(format!("refs.retire was answered {other:?}"))),
+        }
+    }
+
     /// `ids.alloc`: `n` row ids under `project` from the hub's counter, each
     /// above `past`, for a publish into `workspace` (which the caller must be
     /// a member of). In increasing order; never one handed out before.

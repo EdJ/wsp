@@ -251,7 +251,8 @@ pub struct Classified {
 /// spoke has no file for, or holds only as a head at another id, is read from
 /// its one head object: own, it goes to the sync whole (and to `promoting` if
 /// it was a head, its stub left in place); otherwise its head is kept.
-/// `forced` is taken whole as asked (`wsp show --fetch`). Nothing here removes
+/// `forced` is taken whole as asked (`wsp show --fetch`); `passed` is passed
+/// over (rows moved away here, `hub_retire::skip`). Nothing here removes
 /// a file.
 pub fn classify(
     store: &Store,
@@ -261,12 +262,18 @@ pub fn classify(
     me: &str,
     by: &Principal,
     forced: &BTreeSet<Subject>,
+    passed: &BTreeSet<Subject>,
 ) -> Result<Classified, String> {
     let mut cache = Cache::read(store);
     let mut out = Classified::default();
     let mut want: Vec<(Subject, ObjectId)> = Vec::new();
     for (subject, to) in &hub.heads {
         let Subject::Row(id) = subject else { continue };
+        // A row this spoke moved to a new id (`hub_retire`): its old subject is
+        // being retired, and is never kept as a head here meanwhile.
+        if passed.contains(subject) {
+            continue;
+        }
         if forced.contains(subject) {
             if cache.is_head(&id.0) {
                 out.promoting.insert(subject.clone());

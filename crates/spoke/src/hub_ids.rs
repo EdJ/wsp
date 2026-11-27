@@ -602,6 +602,163 @@ mod tests {
         assert!(!is_provisional(&ann.store, &moved));
     }
 
+    /// The row `wsp show <id>` finds, if one.
+    fn resolved(store: &Store, id: &str) -> Option<String> {
+        match store.resolve_task(id) {
+            wsp_engine::store::Found::One(t) => Some(t.id),
+            _ => None,
+        }
+    }
+
+    /// A shared row already on the hub, moved (`wsp mv`, X to Y): the hub
+    /// ends with Y alone (X retired, continuing as Y), the mover's spoke keeps
+    /// no stub of X, and another member's spoke ends with Y alone, `wsp show
+    /// X` finding Y on both.
+    #[test]
+    fn hub_retire_a_pushed_shared_row_moved_leaves_no_ghost_on_either_spoke() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-mv");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"));
+        let x = ann.add_inbox("moved later");
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        assert!(on_hub(&hub, &tokens, "ann").contains(&x));
+        assert!(bo.store.task(&x).is_some(), "bo has x (as a head)");
+        let ws = wsp_objects::WorkspaceId("shared:team".into());
+        let x_head = *hub_lease::tests::dial(&hub, &tokens, "ann").sync_heads(&ws).unwrap().heads.get(&Subject::Row(RowId(x.clone()))).unwrap();
+        let y = ann.mv_to_pp(&x);
+        assert_ne!(y, x);
+        for _ in 0..2 {
+            ann.turn().unwrap();
+        }
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&y) && !heads.contains(&x), "the hub has y and not x: {heads:?}");
+        // Y's first record follows X's head, and the hub lists X retired as Y.
+        let mut c = hub_lease::tests::dial(&hub, &tokens, "bo");
+        let refs = c.sync_heads(&ws).unwrap();
+        assert_eq!(refs.retired.get(&Subject::Row(RowId(x.clone()))), Some(&Some(Subject::Row(RowId(y.clone())))));
+        let mut at = *refs.heads.get(&Subject::Row(RowId(y.clone()))).unwrap();
+        let mut first_parent = None;
+        for _ in 0..10 {
+            let blob = c.sync_get(vec![at]).unwrap().remove(0);
+            match wsp_objects::decode(&blob.bytes).unwrap() {
+                wsp_objects::Object::Record { subject, parent, .. } | wsp_objects::Object::Event { subject, parent, .. } => {
+                    if subject != Subject::Row(RowId(y.clone())) {
+                        break;
+                    }
+                    first_parent = parent;
+                    match parent {
+                        Some(p) => at = p,
+                        None => break,
+                    }
+                }
+            }
+        }
+        assert_eq!(first_parent, Some(x_head), "y's history reaches x's head");
+        assert!(ann.store.task_path(&x).exists() == false && !crate::hub_cache::is_head(&ann.store, &x), "no stub of x on ann's spoke");
+        assert_eq!(resolved(&ann.store, &x), Some(y.clone()), "show x finds y");
+        for _ in 0..2 {
+            bo.turn().unwrap();
+        }
+        assert!(!bo.store.task_path(&x).exists() && !crate::hub_cache::is_head(&bo.store, &x), "no x on bo's spoke");
+        assert_eq!(resolved(&bo.store, &x), Some(y.clone()), "show x finds y on bo's too");
+        assert_eq!(bo.title(&y), "moved later");
+    }
+
+    /// A member that had X whole (allocated to it), one that had it as a stub,
+    /// and one that connects only after the move all end with Y alone and
+    /// `wsp show X` finding Y; the mover's other turns change nothing.
+    #[test]
+    fn hub_retire_whole_stub_and_late_spokes_all_end_with_the_successor_alone() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo", "cy", "di"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-three");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo, cy) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"), Side::new(&env, &hub, &tokens, "cy"));
+        let x = ann.add_inbox("for bo");
+        let mut t = ann.store.task(&x).unwrap();
+        t.for_user = Some("bo".into());
+        ann.store.save_task(&t).unwrap();
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        cy.turn().unwrap();
+        assert!(!crate::hub_cache::is_head(&bo.store, &x) && bo.store.task(&x).is_some_and(|t| !t.body.is_empty() || t.title == "for bo"), "bo has x whole");
+        assert!(crate::hub_cache::is_head(&cy.store, &x), "cy has x as a head");
+        let y = ann.mv_to_pp(&x);
+        ann.turn().unwrap();
+        for side in [&bo, &cy] {
+            side.turn().unwrap();
+            side.turn().unwrap();
+            assert!(!side.store.task_path(&x).exists() && !crate::hub_cache::is_head(&side.store, &x), "{}: no x", side.who);
+            assert_eq!(resolved(&side.store, &x), Some(y.clone()), "{}: show x finds y", side.who);
+            assert_eq!(side.title(&y), "for bo", "{}", side.who);
+        }
+        // di connects after it all.
+        let di = Side::new(&env, &hub, &tokens, "di");
+        di.turn().unwrap();
+        di.turn().unwrap();
+        assert!(!di.store.task_path(&x).exists());
+        assert_eq!(resolved(&di.store, &x), Some(y.clone()), "di: show x finds y");
+        ann.turn().unwrap();
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&y) && !heads.contains(&x), "{heads:?}");
+    }
+
+    /// Moved while the hub does not answer: a provisional id, renamed to the
+    /// hub's at reconnect, and the old subject retired then, continuing as it.
+    #[test]
+    fn hub_retire_a_row_moved_offline_is_retired_at_reconnect() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-offline");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"));
+        let x = ann.add_inbox("moved offline");
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        ann.log_in_nowhere();
+        let local = ann.mv_to_pp(&x);
+        assert!(is_provisional(&ann.store, &local));
+        ann.log_in(&hub, &tokens);
+        ann.turn().unwrap();
+        ann.turn().unwrap();
+        let y = ann.store.renamed_ids().get(&x).cloned().expect("x renamed");
+        assert!(!is_provisional(&ann.store, &y), "{y}");
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&y) && !heads.contains(&x) && !heads.contains(&local), "{heads:?}");
+        assert!(!ann.store.task_path(&x).exists() && !crate::hub_cache::is_head(&ann.store, &x));
+        bo.turn().unwrap();
+        assert!(!bo.store.task_path(&x).exists());
+        assert_eq!(resolved(&bo.store, &x), Some(y.clone()));
+    }
+
+    /// X leased by another user: the retire is refused `held`, waits (said
+    /// once, X never stubbed meanwhile), and completes once they let go.
+    #[test]
+    fn hub_retire_a_held_row_waits_and_is_retired_once_released() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-held");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let x = ann.add_inbox("held by bo");
+        ann.turn().unwrap();
+        let mut bo = hub_lease::tests::dial(&hub, &tokens, "bo");
+        let held = hub_lease::take(&mut bo, "shared:team", &x).unwrap();
+        let y = ann.mv_to_pp(&x);
+        ann.turn().unwrap();
+        ann.turn().unwrap();
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&x) && heads.contains(&y), "x waits: {heads:?}");
+        assert!(!ann.store.task_path(&x).exists() && !crate::hub_cache::is_head(&ann.store, &x), "not stubbed meanwhile");
+        let log = std::fs::read_to_string(ann.store.state.join("cycle.log")).unwrap_or_default();
+        let said = format!("hub-sync: {x} is moved here to {y}, but {x} is leased by bo: it is retired on the hub once they let go, and is tried again each turn");
+        // Once a worker (each turn here is a new worker, as a daemon restart is).
+        assert_eq!(log.matches(&said).count(), 2, "said once a worker: {log}");
+        bo.lease_release(&RowId(x.clone()), held.token).unwrap();
+        ann.turn().unwrap();
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&y) && !heads.contains(&x), "{heads:?}");
+    }
+
     /// Offline, the move gives the row a provisional local id, as filing it
     /// would: never pushed under it, and renamed to a hub id at reconnect.
     #[test]

@@ -17,6 +17,7 @@ pub mod hub_journal;
 pub mod hub_lease;
 pub mod hub_lists;
 pub mod hub_members;
+pub mod hub_retire;
 pub mod hub_switch;
 pub mod hub_sync;
 #[allow(dead_code)]
