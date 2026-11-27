@@ -315,7 +315,20 @@ pub fn ls_entry(row: &Row, state: &State) -> Value {
     if let Some(legs) = row.fields.get(key::LEGS).and_then(|l| serde_json::from_str::<Value>(l).ok()) {
         v["legs"] = legs;
     }
+    shared_facts(row, &mut v);
     v
+}
+
+/// A shared row's facts (`mine`, `head_only`, and `held_by`, `held_on`,
+/// `held_until` where known), as the row's fields carry them and the feed
+/// sends them: strings, each key only where the row has it, so a private row
+/// carries none (`docs/multiplayer.md`, "What a desktop app reads").
+fn shared_facts(row: &Row, v: &mut Value) {
+    for k in key::SHARED_FACTS {
+        if let Some(f) = row.fields.get(k) {
+            v[k] = json!(f);
+        }
+    }
 }
 
 /// `ls --json` over [`State`]: each picked row as [`ls_entry`], in the order
@@ -360,7 +373,11 @@ pub fn ls_of_reading(heads: &[Row], reading: &crate::reading::Tasks) -> Option<S
     }
     let drawn: Vec<Value> = rows
         .iter()
-        .map(|r| ls_json_row(task_json(r), reading.stages.get(&r.id.0), reading.legs.get(&r.id.0).map(Vec::as_slice)))
+        .map(|r| {
+            let mut v = ls_json_row(task_json(r), reading.stages.get(&r.id.0), reading.legs.get(&r.id.0).map(Vec::as_slice));
+            shared_facts(r, &mut v);
+            v
+        })
         .collect();
     Some(ls(&drawn))
 }

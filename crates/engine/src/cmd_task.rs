@@ -4479,6 +4479,46 @@ pub mod tests {
         assert_ne!(stage["at"], stage["since"], "at stays the record's time");
     }
 
+    /// A shared-work add-on that knows who holds `s-1` (bo on box-b) and that
+    /// `s-2` is allocated to ann, who is the user here.
+    struct Holds;
+
+    impl crate::addon::SharedWork for Holds {
+        fn user(&self) -> Option<String> {
+            Some("ann".into())
+        }
+        fn row_facts(&self, _: &Store) -> std::collections::BTreeMap<String, crate::addon::RowFacts> {
+            let held = crate::addon::RowFacts { held_by: Some("bo".into()), held_on: Some("box-b".into()), held_until: Some(1_900_000_000), ..Default::default() };
+            [("s-1".to_string(), held)].into()
+        }
+    }
+
+    /// `ls --json`'s rows carry the shared-row facts the feed's rows do (both
+    /// are `mirror::row_half`'s, `docs/multiplayer.md` "What a desktop app
+    /// reads"): `mine` and `head_only` (`"true"`/`"false"`) on every shared row,
+    /// `held_by`, `held_on` and `held_until` where known, and a private row none.
+    #[test]
+    fn ls_json_rows_carry_the_shared_row_facts_the_feed_rows_do() {
+        let _iso = crate::util::isolated("ls-facts");
+        let store = scratch("ls-facts");
+        for (id, ws, for_user) in [("s-1", "shared:team", None), ("s-2", "shared:team", Some("ann")), ("s-3", "", None)] {
+            let mut t = Task::new(id, id);
+            if !ws.is_empty() {
+                t.workspace = ws.parse().unwrap();
+            }
+            t.for_user = for_user.map(str::to_string);
+            store.save_task(&t).unwrap();
+        }
+        let _a = crate::addon::scoped(std::sync::Arc::new(Holds));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&rows_json(&store, &store.tasks())).unwrap();
+        let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap().clone();
+        let facts = |id: &str| ["mine", "head_only", "held_by", "held_on", "held_until"].map(|k| row(id).get(k).cloned());
+        let s = |v: &str| Some(json!(v));
+        assert_eq!(facts("s-1"), [s("false"), s("false"), s("bo"), s("box-b"), s(&crate::util::iso_at(1_900_000_000))], "{}", row("s-1"));
+        assert_eq!(facts("s-2"), [s("true"), s("false"), None, None, None], "allocated to ann: {}", row("s-2"));
+        assert_eq!(facts("s-3"), [None, None, None, None, None], "a private row: {}", row("s-3"));
+    }
+
     /// `ls --json` gives a staged row the `legs` objects `show --json` has, and an
     /// unstaged row none at all.
     #[test]

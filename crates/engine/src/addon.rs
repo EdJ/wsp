@@ -136,15 +136,15 @@ pub fn json_of(facts: &RowFacts, mine: bool) -> Vec<(&'static str, Value)> {
 }
 
 /// The feed row's field and `show --json`'s key: see [`mine`].
-pub const FIELD_MINE: &str = "mine";
+pub const FIELD_MINE: &str = wsp_view::common::key::MINE;
 /// The feed row's field and `show --json`'s key: kept as a head only.
-pub const FIELD_HEAD_ONLY: &str = "head_only";
+pub const FIELD_HEAD_ONLY: &str = wsp_view::common::key::HEAD_ONLY;
 /// The feed row's field and `show --json`'s key: the user holding the lease.
-pub const FIELD_HELD_BY: &str = "held_by";
+pub const FIELD_HELD_BY: &str = wsp_view::common::key::HELD_BY;
 /// The feed row's field and `show --json`'s key: the holding machine's name.
-pub const FIELD_HELD_ON: &str = "held_on";
+pub const FIELD_HELD_ON: &str = wsp_view::common::key::HELD_ON;
 /// The feed row's field and `show --json`'s key: when the lease runs out.
-pub const FIELD_HELD_UNTIL: &str = "held_until";
+pub const FIELD_HELD_UNTIL: &str = wsp_view::common::key::HELD_UNTIL;
 
 /// A message leaving this machine for another user's: the address it is for
 /// (`to`), who sends it (`from`, an address or `wsp`), the sending seat's pane
