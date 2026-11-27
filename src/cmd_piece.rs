@@ -479,13 +479,15 @@ pub(crate) fn cmd_done(store: &Store, args: &Args, pane: Option<&str>) -> i32 {
     }
 }
 
-/// `wsp review` and `wsp block` typed in a piece's seat (`docs/pieces.md`, *A piece is a
-/// seat*), which `main` asks before it runs the verb. `None` for any other call, which
+/// `wsp review`, `wsp block` and `wsp submit` typed in a piece's seat (`docs/pieces.md`,
+/// *A piece is a seat*), which `main` asks before it runs the verb. `None` for any other call, which
 /// goes on as it always did.
 ///
 /// **`review` is `piece done` with the account as the note**, and the row does not move.
 /// **`block` blocks the piece, not the row**: its siblings carry on, and the row's
-/// governor is told once, with the piece's id. It is here and not in `cmd_task` because
+/// governor is told once, with the piece's id. **`submit` is refused**, naming `piece
+/// done`: the packet in a piece's brief ends with it, and the exit it reads is the whole
+/// row's, which is no piece's note (`wsp-954`). It is here and not in `cmd_task` because
 /// the words that read an account and the end line's clauses are above the engine.
 pub(crate) fn from_a_piece(store: &Store, args: &Args) -> Option<i32> {
     from_a_piece_in(store, args, crate::place::my_pane())
@@ -493,12 +495,20 @@ pub(crate) fn from_a_piece(store: &Store, args: &Args) -> Option<i32> {
 
 /// [`from_a_piece`] with the pane given, so a test is not asked where it is standing.
 fn from_a_piece_in(store: &Store, args: &Args, pane: Option<String>) -> Option<i32> {
-    if !matches!(args.cmd.as_str(), "review" | "block") || args.rest.len() < 2 {
+    let words = match args.cmd.as_str() {
+        "review" | "block" => 2,
+        "submit" => 1,
+        _ => return None,
+    };
+    let needle = args.rest.first()?;
+    if args.rest.len() < words || !crate::piece_seat::is_seat(store, needle, pane.as_deref()) {
         return None;
     }
-    let needle = args.rest.first()?;
-    if !crate::piece_seat::is_seat(store, needle, pane.as_deref()) {
-        return None;
+    if args.cmd == "submit" {
+        eprintln!(
+            "wsp: this is a piece's seat, and `wsp submit` is the whole row's — nothing moved. End your piece with `wsp piece done --note FILE --caption \"…\"`"
+        );
+        return Some(1);
     }
     let account = match crate::cmd_agent::prose(args, 1) {
         Ok(a) => a,
@@ -895,6 +905,29 @@ mod tests {
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "block did not block the row");
         let log = store.find_task("m-1").unwrap().section("Log").unwrap();
         assert!(log.contains("piece 3 blocked: which layout?"), "{log}");
+    }
+
+    /// `wsp-954`: the row's packet, in a piece's brief, ends with `wsp submit`. From the
+    /// piece's seat that is refused and nothing moves; the row's own seat goes on to the
+    /// verb.
+    #[test]
+    fn submit_from_a_pieces_pane_is_refused_and_leaves_the_row_where_it_is() {
+        let (env, store) = scratch("submit");
+        let overview = file(&env, "overview.md", "Do it.");
+        assert_eq!(run(&store, &parse(&["piece", "add", "m-1", "one", "--batch", "next", "--overview", &overview, "--done-when", "d"]), None), 0);
+        crate::piece_seat::open(&store, "m-1", 1).unwrap();
+        let cwd = env.home().display().to_string();
+        let stand = crate::piece_seat::Standing { room: None, cwd: Some(&cwd), kind: "claude", spawned: "" };
+        assert!(crate::piece_seat::attach(&store, "m-1", 1, "cpd-1", &stand));
+
+        for line in [&["submit", "m-1"][..], &["submit", "m-1", "--dry-run"], &["submit", "m-1", "-"]] {
+            let submit = parse(line);
+            assert_eq!(from_a_piece_in(&store, &submit, Some("cpd-1".into())), Some(1), "{line:?}");
+            assert_eq!(from_a_piece_in(&store, &submit, Some("cpd-9".into())), None, "the row's own seat goes on to the verb: {line:?}");
+            assert_eq!(from_a_piece_in(&store, &submit, None), None, "{line:?}");
+        }
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing, "submit did not move the row");
+        assert_eq!(record(&store.find_task("m-1").unwrap()).pieces[0].state, State::Running, "the piece is still open");
     }
 
     /// `docs/pieces.md`, *Ids* and *Seen and told* (wsp-508): a piece id works in

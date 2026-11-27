@@ -209,7 +209,8 @@ command from a piece's pane knows which piece it is.
   checks fail). On green it writes `checked: green at <sha>`, the note and
   caption, marks the piece `done`, writes the end line and pokes the run.
   `wsp review` from a piece's pane is `piece done`, with the account as the
-  note. A piece never moves the row's status.
+  note. `wsp submit` from a piece's pane is refused, naming `piece done`: its
+  exit is the whole row's. A piece never moves the row's status.
 - **`wsp block` from a piece blocks the piece, not the row.** The pieces are
   separable by definition, so its siblings carry on. The row's governor is
   told once, with the piece's id, and the batch cannot close until the piece
