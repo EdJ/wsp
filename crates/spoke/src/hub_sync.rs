@@ -1042,7 +1042,11 @@ impl Worker {
             subjects.push((Subject::List(ListId(w.id.clone())), wsp_engine::door::list_digest(store, &w.id)));
         }
         for (subject, digest) in subjects {
-            included.insert(subject.clone());
+            // The hub's name for it: a list kept here under a name of its own
+            // is its hub id on the wire and in the journal (`hub_lists`); the
+            // synced heads, the file and `minted` go by the local one.
+            let hub_s = crate::hub_lists::hub_subject(store, &subject);
+            included.insert(hub_s.clone());
             let synced = heads.head(&subject).copied();
             let row = match &subject {
                 Subject::Row(r) => Some(r.0.clone()),
@@ -1056,7 +1060,7 @@ impl Worker {
             let superseded = row.as_ref().and_then(|r| sides.rows.get(r)).is_some_and(|s| s.mine && claimed.is_none());
             if self.held_back.contains(&subject) || superseded || (synced.is_some() && heads.file(&subject) == digest) {
                 if let Some(h) = synced {
-                    local.set(subject, h);
+                    local.set(hub_s, h);
                 }
                 continue;
             }
@@ -1068,22 +1072,23 @@ impl Worker {
                         Some(_) => push_record(store, &subject, wid.clone(), by.clone(), at),
                         None => push_list_record(store, &subject, wid.clone(), by.clone(), at),
                     };
-                    let Some(mut obj) = made else { continue };
+                    let Some(obj) = made else { continue };
+                    let mut obj = crate::hub_lists::to_hub(store, obj);
                     // A journaled record of this very state (a restart lost
                     // `minted`) is the row's id still: no twin on top of it.
-                    if let Some((tip, bytes)) = journal.tip_of_entity(&subject, &obj) {
+                    if let Some((tip, bytes)) = journal.tip_of_entity(&hub_s, &obj) {
                         if let Err(e) = objects.put(&tip, &bytes) {
                             self.say_once(store, format!("hub-sync: cannot keep {subject:?}'s object: {e}"));
                             continue;
                         }
                         self.minted.insert(subject.clone(), (digest, tip));
-                        local.set(subject.clone(), tip);
-                        pushing.insert(subject, (tip, digest));
+                        local.set(hub_s.clone(), tip);
+                        pushing.insert(hub_s, (tip, digest));
                         continue;
                     }
                     // After what is journaled and not on the hub yet, so the
                     // records of an outage are one line, pushed in order.
-                    if let Some(tip) = tips.get(&subject).filter(|t| objects.has(t)) {
+                    if let Some(tip) = tips.get(&hub_s).filter(|t| objects.has(t)) {
                         set_parent(&mut obj, *tip);
                     }
                     let (id, bytes) = wsp_objects::encode(&obj);
@@ -1092,13 +1097,13 @@ impl Worker {
                         self.say_once(store, format!("hub-sync: cannot keep {subject:?}'s object: {e}"));
                         continue;
                     }
-                    tips.insert(subject.clone(), id);
+                    tips.insert(hub_s.clone(), id);
                     self.minted.insert(subject.clone(), (digest, id));
                     id
                 }
             };
-            local.set(subject.clone(), id);
-            pushing.insert(subject, (id, digest));
+            local.set(hub_s.clone(), id);
+            pushing.insert(hub_s, (id, digest));
         }
         if leased != leased_was {
             Leased::write(store, &leased);
@@ -1395,12 +1400,16 @@ impl Worker {
         turned: &mut Turned,
     ) {
         turned.sent += report.sent;
+        let ws = report.refs.workspace.0.clone();
+        // The local subject of one of the hub's (`hub_lists`: a list kept
+        // here under a name of its own; any other is itself).
+        let here = |s: &Subject| crate::hub_lists::local_subject(store, &ws, s);
         if !report.moved.is_empty() {
             let mut heads = Heads::read(store);
             for s in &report.moved {
                 if let Some((id, digest)) = pushing.get(s) {
-                    heads.set(s, *id, *digest);
-                    self.minted.remove(s);
+                    heads.set(&here(s), *id, *digest);
+                    self.minted.remove(&here(s));
                     turned.moved += 1;
                 }
             }
@@ -1424,6 +1433,13 @@ impl Worker {
                 self.take_notice(store, objects, &mut sides, &report.refs.workspace.0, row, head, by);
                 continue;
             }
+            // A list of a slug another list holds here comes in under a
+            // name of its own (`hub_lists`), and is walked by that name.
+            let named = match s {
+                Subject::List(l) => Some(crate::hub_lists::arriving(store, &ws, &l.0)).filter(|n| *n != l.0),
+                _ => None,
+            };
+            let local_s = here(s);
             // The hub's line from the head this spoke synced, oldest first, so
             // each import follows the one before it. A stub's synced head is
             // the head it was read from, not a file of the row: its whole line.
@@ -1431,7 +1447,7 @@ impl Worker {
             let mut line = Vec::new();
             let mut at = Some(head);
             while let Some(id) = at {
-                if !over && Some(&id) == before.head(s) {
+                if !over && Some(&id) == before.head(&local_s) {
                     break;
                 }
                 let Some(obj) = Objects::object(objects, &id) else { break };
@@ -1461,9 +1477,10 @@ impl Worker {
             }
             let mut whole = over;
             for (n, obj) in line.iter().rev().enumerate() {
-                let imported = match over && n == 0 {
-                    true => door.import_over(obj, by),
-                    false => door.import(obj, by),
+                let imported = match (&named, over && n == 0) {
+                    (Some(name), _) => import_named(store, &door, obj, name, by),
+                    (None, true) => door.import_over(obj, by),
+                    (None, false) => door.import(obj, by),
                 };
                 match imported {
                     Ok(_) => turned.adopted += 1,
@@ -1489,17 +1506,41 @@ impl Worker {
         let mut stale: Vec<hub_client::Stale> = report.stale.clone();
         for s in &report.diverged {
             if let Some(head) = hub_head_in(&report.received, s) {
-                stale.push(hub_client::Stale { subject: s.clone(), from: before.head(s).copied(), head: Some(head) });
+                stale.push(hub_client::Stale { subject: s.clone(), from: before.head(&here(s)).copied(), head: Some(head) });
             }
         }
         for st in &stale {
-            self.minted.remove(&st.subject);
+            self.minted.remove(&here(&st.subject));
+            // A list kept here under a name of its own meets the door by it.
+            if let (Subject::List(l), Subject::List(name)) = (&st.subject, here(&st.subject)) {
+                if name.0 != l.0 {
+                    let theirs = st.head.and_then(|h| Objects::object(objects, &h));
+                    let out = theirs.ok_or_else(|| Refusal::NotYet("the hub's head was not fetched".into())).and_then(|o| import_named(store, &door, &o, &name.0, by));
+                    match out {
+                        Ok(_) => turned.reconciled += 1,
+                        Err(r) => self.say_once(store, format!("hub-sync: {:?} is stale and was not reconciled: {r:?}", st.subject)),
+                    }
+                    continue;
+                }
+            }
             match after_stale(store, st, objects, &NoLease, by) {
                 Ok(_) => turned.reconciled += 1,
                 Err(r) => self.say_once(store, format!("hub-sync: {:?} is stale and was not reconciled: {r:?}", st.subject)),
             }
         }
     }
+}
+
+/// The hub's list record `obj` written here under the local name `name`
+/// (`hub_lists`): renamed for the door, then the synced head set back to the
+/// hub's object id, so the next record's parent is found as the local head.
+fn import_named(store: &Store, door: &Door, obj: &Object, name: &str, by: &Principal) -> Result<Applied, Refusal> {
+    let applied = door.import(&crate::hub_lists::to_local(obj, name), by)?;
+    let subject = Subject::List(ListId(name.to_string()));
+    let mut heads = Heads::read(store);
+    heads.set(&subject, wsp_objects::encode(obj).0, wsp_engine::door::list_digest(store, name));
+    heads.write(store).map_err(|e| Refusal::Write(e.to_string()))?;
+    Ok(applied)
 }
 
 /// What a sync pushes: per subject, the record's id and the file digest it was made of.

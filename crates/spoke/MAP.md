@@ -19,6 +19,8 @@ through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-
   cache and the merge after a stale)
 - `hub_ids`, `hub_members` — a shared row's id from the hub (or a provisional one), and the user's workspaces as the
   hub last said, so a filing into one the user is not a member of is refused when it is filed
+- `hub_lists` — a shared list whose slug another list here holds (another workspace's, or a private one), kept
+  under a local name of its own and renamed to its hub id at the sync's edge
 - `reconcile` — the merging reconcile the door calls
 - `hub_client` — the spoke's own client of the hub, speaking `wsp-hub-protocol` only: the TLS/TCP dial with a pinned
   CA, hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, the

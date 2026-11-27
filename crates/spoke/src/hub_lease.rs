@@ -648,7 +648,9 @@ pub fn drive(store: &Store, w: &wsp_engine::model::Worklist) -> Drives {
         Ok(c) => c,
         Err(e) => return Drives::NotYet(e),
     };
-    let row = drive_row(&w.id);
+    // The hub's name: a list kept here under a name of its own goes by its
+    // hub id there (`hub_lists`).
+    let row = drive_row(&crate::hub_lists::hub_id(store, &w.id));
     match client.lease_take(&HubWorkspace(w.workspace.to_string()), &RowId(row.clone())) {
         Ok((token, at)) => {
             let expires = (at.0 / 1000) as i64;
@@ -741,7 +743,7 @@ pub fn driven_by(store: &Store, w: &wsp_engine::model::Worklist) -> Option<Strin
 pub fn renew_drives(store: &Store, client: &mut Client, now: i64) -> usize {
     let mut renewed = 0;
     for (list, d) in Book::read(store).drives {
-        let row = RowId(drive_row(&list));
+        let row = RowId(drive_row(&crate::hub_lists::hub_id(store, &list)));
         let running = store
             .worklist(&list)
             .is_some_and(|w| !w.workspace.is_private() && w.status() != wsp_engine::model::WorklistStatus::Done);

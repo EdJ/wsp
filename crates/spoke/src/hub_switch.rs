@@ -410,7 +410,8 @@ fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut 
         }
     }
     for (list, d) in hub_lease::Book::read(store).drives {
-        let row = hub_lease::drive_row(&list);
+        // The hub's name: a list kept here under a name of its own (`hub_lists`).
+        let row = hub_lease::drive_row(&crate::hub_lists::hub_id(store, &list));
         match client.lease_release(&RowId(row.clone()), d.token) {
             Ok(()) | Err(crate::hub_client::Error::Refused(_)) => {
                 hub_lease::Book::edit(store, |b| {
