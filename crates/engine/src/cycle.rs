@@ -5046,7 +5046,8 @@ fn group_of(t: &Task, list: &str) -> Option<usize> {
 /// turn in which it reviews its own row — `wsp-158` did, and every held check
 /// was left at `doing` (`wsp-209`). A hold stops nothing in flight anyway, so
 /// the check is left to finish and [`last_barrier_left_behind`] ends it once it
-/// stands at `review`. A `done` ends the run outright, typed by whoever is
+/// stands at `review`. For the same reason it leaves a claimed row still at
+/// `doing` and a verifier pass with no verdict (`wsp-905`). A `done` ends the run outright, typed by whoever is
 /// over it, and a check still reading is one more thing it was opened for and
 /// will never be asked.
 ///
@@ -5150,33 +5151,80 @@ pub fn end_what_the_run_opened(store: &Store, seats: &dyn Seats, list: &str, at:
     ids.sort();
     ids.dedup();
     // The passes on those members, whose seats are not claims and so are not
-    // in `standing` below — ended here, each once, verdict or not.
+    // in `standing` below — ended here, each once. A `hold` leaves a pass with
+    // no verdict to give it (`wsp-905`); `done` ends it, verdict or not.
     let members: Vec<String> = match at {
         None => w.groups().iter().flat_map(|g| g.members.clone()).collect(),
         Some(at) => w.groups().get(at - 1).map(|g| g.members.clone()).unwrap_or_default(),
     };
+    let held = matches!(how, Closing::Held);
+    let unanswered = |p: &crate::verification::Pass| p.state == crate::verification::State::Running;
+    // What is at work, as it stood before anything here was ended.
+    let reading: Vec<String> = members
+        .iter()
+        .filter_map(|m| store.find_task(m))
+        .flat_map(|t| crate::verification::passes(&t))
+        .filter(|p| unanswered(p) && p.standing())
+        .filter_map(|p| p.pane)
+        .collect();
+    let working = |id: &String| tasks.iter().any(|t| &t.id == id && t.status() == Status::Doing);
     let mut passes_ended: Vec<String> = Vec::new();
     for m in &members {
-        passes_ended.extend(end_passes(store, seats, m, |_| true));
+        passes_ended.extend(end_passes(store, seats, m, |p| !(held && unanswered(p))));
     }
     let claims = store.claims();
-    let standing: Vec<String> = ids.iter().filter(|id| claims.contains_key(*id)).cloned().collect();
-    if !passes_ended.is_empty() {
-        log_line(store, &format!("{list} is closing — ended the verifier seat(s) {}", passes_ended.join(" ")));
+    // A `hold` stops nothing in flight: a claimed row still at `doing` is left.
+    let (mut left, standing): (Vec<String>, Vec<String>) =
+        ids.iter().filter(|id| claims.contains_key(*id)).cloned().partition(|id| held && working(id));
+    if held {
+        // The check in front, spared above, is named with the rest left working.
+        if let Some(at) = at {
+            left.extend(
+                tasks
+                    .iter()
+                    .filter(|t| is_barrier(t, list, at) && claims.contains_key(&t.id) && working(&t.id))
+                    .map(|t| t.id.clone()),
+            );
+        }
+        left.extend(reading.iter().cloned());
+        left.sort();
+        left.dedup();
     }
-    if standing.is_empty() {
+    let closing = if held { "held" } else { "closing" };
+    if !passes_ended.is_empty() {
+        log_line(store, &format!("{list} is {closing} — ended the verifier seat(s) {}", passes_ended.join(" ")));
+    }
+    if !left.is_empty() {
+        log_line(store, &format!("{list} is {closing} — left working: {}", left.join(" ")));
+    }
+    if !standing.is_empty() {
+        log_line(store, &format!(
+            "{list} is {closing} over {} that the run opened and left standing — ending {}",
+            standing.len(),
+            standing.join(" ")
+        ));
+    }
+    let (cut, finished): (Vec<String>, Vec<String>) = standing
+        .iter()
+        .chain(&passes_ended)
+        .cloned()
+        .partition(|x| reading.contains(x) || working(x));
+    let said: Vec<String> = [
+        ("wsp ended these agents it opened, which had nothing left to do", finished),
+        ("wsp ended these while they were still working", cut),
+        ("wsp left these working", left),
+    ]
+    .into_iter()
+    .filter(|(_, who)| !who.is_empty())
+    .map(|(what, who)| format!("{what}: {}.", who.join(" ")))
+    .collect();
+    if said.is_empty() {
         return;
     }
-    log_line(store, &format!(
-        "{list} is closing over {} that the run opened and left standing — ending {}",
-        standing.len(),
-        standing.join(" ")
-    ));
     if let Some(w) = store.worklist(list) {
         tell(store, &w, &format!(
-            "The {list} run is closing, and these agents it opened had nothing left to do: {}. \
-             `wsp wip` shows anything that stayed standing.",
-            standing.join(" ")
+            "The {list} run is {closing}. {} `wsp wip` shows anything that stayed standing.",
+            said.join(" ")
         ));
     }
     end_all(store, standing);
@@ -7469,6 +7517,59 @@ fn only_a_working_screen_is_ever_overruled() {
 
         end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Held);
         assert_eq!(drained(&ENDED), vec!["h-1".to_string()], "the helper, and not the check holding the barrier");
+    }
+
+    /// `wsp-905`. A hold stops nothing in flight: the member still working and
+    /// the verifier with no verdict yet are left, and the governor is told so.
+    #[test]
+    fn a_hold_leaves_a_working_member_and_a_reading_verifier_and_a_done_ends_them() {
+        use crate::verification::State as V;
+        let (_env, store) = scratch("holdworking");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Review);
+        task(&store, "m-3", Status::Doing);
+        let w = list(&store, &[(&["m-1", "m-2", "m-3"], "claude")]);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        crate::verification::name_seat(&store, "m-1", "cpd-9");
+        crate::verification::name_seat(&store, "m-2", "cpd-8");
+        crate::verification::record(&store, "m-2", V::Holds, "checked", Some("cpd-8"), None).unwrap();
+        let mut helper = Task::new("Install master", "h-1");
+        crate::log::note(&store, &mut helper, &format!("{} run group 1", OWNED)).unwrap();
+        for id in ["m-3", "h-1"] {
+            store.set_claim(id, serde_json::json!({ "workspace": "w" }));
+        }
+        let _ = drained(&ENDED);
+        let _ = drained(&TOLD);
+
+        end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Held);
+        let mut was = drained(&ENDED);
+        was.sort();
+        assert_eq!(was, ["cpd-8", "h-1"], "the verdict given and the idle helper, no one at work");
+        let told = drained(&TOLD).join("\n");
+        assert!(told.contains("had nothing left to do: h-1 cpd-8."), "{told}");
+        assert!(told.contains("left these working: cpd-9 m-3."), "{told}");
+
+        crate::verification::record(&store, "m-1", V::Holds, "checked", Some("cpd-9"), None).unwrap();
+        let pass = passes_on(&store, "m-1").remove(0);
+        assert_eq!((pass.state, pass.pane.as_deref()), (V::Holds, Some("cpd-9")), "on its own pass");
+
+        // A second reader, so `done` has a verifier with no verdict to end.
+        task(&store, "m-4", Status::Review);
+        let w = list(&store, &[(&["m-3", "m-4"], "claude")]);
+        step(&store, &w, &Blind);
+        let _ = spawned();
+        crate::verification::name_seat(&store, "m-4", "cpd-6");
+        let _ = drained(&ENDED);
+        let _ = drained(&TOLD);
+
+        end_what_the_run_opened(&store, &Exits, "run", Some(1), Closing::Done);
+        let was = drained(&ENDED);
+        for who in ["m-3", "cpd-6"] {
+            assert!(was.iter().any(|x| x == who), "{who}: {was:?}");
+        }
+        let told = drained(&TOLD).join("\n");
+        assert!(told.contains("still working: m-3 cpd-6."), "{told}");
     }
 
     /// A seat on `scope`, in the shape `wsp govern` writes one.
