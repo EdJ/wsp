@@ -174,9 +174,9 @@ pub fn allocate_or(store: &Store, client: &mut Client, ws: &HubWorkspace, code: 
     let ids = store.renamed_ids();
     let mut past = highest_local(store, code);
     let mut got: Vec<String> = Vec::new();
-    for _ in 0..ROUNDS {
-        let want = (n - got.len()) as u32;
-        let back = client.ids_alloc(ws, code, want, Some(past)).map_err(|e| Alloc::Hub(Box::new(e)))?;
+    for _ in 0..ROUNDS + n / wsp_hub_protocol::MAX_IDS as usize {
+        let want = (n - got.len()).min(wsp_hub_protocol::MAX_IDS as usize) as u32;
+        let back = alloc_stepped(client, ws, code, want, past).map_err(|e| Alloc::Hub(Box::new(e)))?;
         for id in back {
             if let Some(num) = id.rsplit_once('-').and_then(|(_, n)| n.parse::<u64>().ok()) {
                 past = past.max(num);
@@ -190,6 +190,39 @@ pub fn allocate_or(store: &Store, client: &mut Client, ws: &HubWorkspace, code: 
         }
     }
     Err(Alloc::Exhausted(format!("the hub kept handing out ids this store already has under {code}")))
+}
+
+/// How far one stepping `ids.alloc` moves a project's hub counter. A hub
+/// refuses (`too_large`) a request that would move the counter more than its
+/// `max_id_advance` quota ahead, and it does not tell a client that quota (no
+/// frame carries it); a hub's quota is never below [`wsp_hub_protocol::MAX_IDS`]
+/// (the hub's `Limits::check`), so a step of that size always fits.
+pub const ID_STEP: u64 = wsp_hub_protocol::MAX_IDS as u64;
+
+/// `ids.alloc` of `want` ids past `past`; where the hub refuses that as too
+/// far past its counter (a project whose local ids ran far ahead of a fresh
+/// hub), the counter is stepped up first, [`ID_STEP`] a request: one id past
+/// the counter tells where it is, then one id at most a step on, until the
+/// ask fits. The ids those steps hand out are gaps, never used.
+pub fn alloc_stepped(client: &mut Client, ws: &HubWorkspace, code: &str, want: u32, past: u64) -> Result<Vec<String>, HubError> {
+    match client.ids_alloc(ws, code, want, Some(past)) {
+        Err(HubError::Failed(f)) if f.code == wsp_hub_protocol::Code::TooLarge => {}
+        other => return other,
+    }
+    let number = |ids: Vec<String>| -> Result<u64, HubError> {
+        ids.first()
+            .and_then(|id| id.rsplit_once('-')?.1.parse::<u64>().ok())
+            .ok_or_else(|| HubError::Unexpected(format!("ids.alloc answered {ids:?}, not one id of {code}")))
+    };
+    // The ask fits once the counter is at `goal`; no step passes it, so every
+    // id a step hands out is at or below `past`, none the ones asked for.
+    let goal = past.saturating_add(u64::from(want)).saturating_sub(ID_STEP);
+    let mut at = number(client.ids_alloc(ws, code, 1, None)?)?;
+    while at < goal {
+        let to = goal.min(at + ID_STEP);
+        at = number(client.ids_alloc(ws, code, 1, Some(to - 1))?)?;
+    }
+    client.ids_alloc(ws, code, want, Some(past))
 }
 
 fn say(e: HubError) -> String {
@@ -350,3 +383,33 @@ pub const VERBS: &[wsp_engine::verbs::Verb] = &[wsp_engine::verbs::Verb {
                                     row takes the hub's lease first and is refused if it is held"##,
     }],
 }];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testhub::{Setup, TestHub};
+
+    /// A project whose local ids run far past a fresh hub's counter (the hub's
+    /// `max_id_advance`, 10,000 by default, refuses one request moving it so
+    /// far): the spoke steps the counter up in bounded requests and is handed
+    /// the ids past its own.
+    #[test]
+    fn ids_a_project_far_ahead_of_a_fresh_hub_steps_the_counter_up_in_bounded_requests() {
+        let _env = wsp_engine::util::isolated("ids-step");
+        let Some(hub) = TestHub::start(Setup::default()) else { return };
+        let tokens = hub.seed_members(&["team"], &["ann"]);
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        store.save_task(&Task::new("far ahead", "wsp-25000")).unwrap();
+        let ws = HubWorkspace("shared:team".into());
+        let mut c = hub.client(&tokens["ann"]);
+        match c.ids_alloc(&ws, "wsp", 1, Some(25_000)) {
+            Err(HubError::Failed(f)) if f.code == wsp_hub_protocol::Code::TooLarge => {}
+            other => panic!("one request 25,000 past a fresh counter: {other:?}"),
+        }
+        let got = allocate_or(&store, &mut c, &ws, "wsp", 3).unwrap();
+        assert_eq!(got, ["wsp-25001", "wsp-25002", "wsp-25003"]);
+        // Close behind the counter now, a plain ask fits at once.
+        assert_eq!(allocate_or(&store, &mut c, &ws, "wsp", 1).unwrap(), ["wsp-25004"]);
+    }
+}
