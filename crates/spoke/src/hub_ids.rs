@@ -629,6 +629,72 @@ mod tests {
         assert_eq!(hub_title(&hub, &tokens, "bo", &hub_id).as_deref(), Some("filed in the inbox online"));
     }
 
+    /// `wsp worklist new <slug> --workspace <ws>` on this spoke: the exit code.
+    fn list_new(side: &Side, slug: &str, ws: &str) -> i32 {
+        let _home = HubHome::at(&side.home);
+        wsp_engine::cmd_worklist::new(&side.store, &Args::synth("worklist", &["new", slug], &[("workspace", ws)]))
+    }
+
+    /// A hub with ann a member of `team` and not of `other`, which exists.
+    fn hub_with_other() -> Option<(crate::testhub::TestHub, BTreeMap<String, String>)> {
+        let (hub, tokens) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann"])?;
+        hub.apply(crate::testhub::protocol::IdentityCommand::HubWorkspaceAdd { name: crate::testhub::protocol::SharedName("other".into()) });
+        Some((hub, tokens))
+    }
+
+    /// Connected, a list filed into a workspace ann is not a member of is
+    /// refused when it is filed, with nothing written; before, only a login
+    /// was asked, the list was written, and the hub refused it at every sync.
+    #[test]
+    fn hub_ids_a_list_filed_into_a_workspace_the_user_is_not_a_member_of_is_refused_at_filing() {
+        let Some((hub, tokens)) = hub_with_other() else { return };
+        let env = wsp_engine::util::isolated("hub-ids-list-member");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        assert_eq!(list_new(&ann, "l-other", "shared:other"), 1, "not a member of other: refused");
+        assert!(ann.store.worklist("l-other").is_none(), "nothing written");
+        assert_eq!(list_new(&ann, "l-team", "shared:team"), 0, "a member of team: filed");
+        assert!(ann.store.worklist("l-team").is_some_and(|w| w.workspace.to_string() == "shared:team"));
+    }
+
+    /// Offline, with ann's membership known from her last connection: a row
+    /// filed into a workspace she is not a member of is refused when it is
+    /// filed; one into her own workspace is provisional as before. Before,
+    /// both were filed and the first waited for a hub id the hub never gave.
+    #[test]
+    fn hub_ids_offline_a_filing_into_a_workspace_known_not_to_be_the_users_is_refused() {
+        let Some((hub, tokens)) = hub_with_other() else { return };
+        let env = wsp_engine::util::isolated("hub-ids-offline-member");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        ann.turn().unwrap();
+        ann.log_in_nowhere();
+        let before = ann.store.tasks().len();
+        assert_eq!(ann.add_in("not ann's to file", "shared:other", None), Err(1), "known not a member: refused");
+        assert_eq!(ann.store.tasks().len(), before, "nothing written");
+        assert!(Book::read(&ann.store).rows.is_empty(), "nothing kept as provisional");
+        assert_eq!(list_new(&ann, "l-other", "shared:other"), 1, "a list too");
+        let row = ann.add("ann's own, offline").unwrap();
+        assert!(is_provisional(&ann.store, &row), "her own workspace: provisional, as before");
+        // Switched off is offline too, and dials nothing: the same answer.
+        crate::hub_switch::Switch::edit(&ann.store, |s| s.off = true).unwrap();
+        ann.log_in(&hub, &tokens);
+        assert_eq!(ann.add_in("still not ann's", "shared:other", None), Err(1));
+    }
+
+    /// Offline with nothing known of the user's workspaces (never connected
+    /// here): the filing is allowed, provisional, and the hub's refusal comes
+    /// at the first sync, as it did before. Nothing here can say otherwise.
+    #[test]
+    fn hub_ids_offline_with_membership_unknown_a_filing_is_provisional() {
+        let env = wsp_engine::util::isolated("hub-ids-unknown-member");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::bare(&env, "ann");
+        ann.log_in_nowhere();
+        let row = ann.add_in("filed blind", "shared:other", None).unwrap();
+        assert!(is_provisional(&ann.store, &row));
+    }
+
     /// A claimed provisional row keeps its claim and its seat across the
     /// rename, and is leased at its hub id then.
     #[test]

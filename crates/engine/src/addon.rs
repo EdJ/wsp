@@ -183,9 +183,20 @@ pub trait SharedWork: Send + Sync {
     }
 
     /// Whether a new record may be filed into a shared workspace, asked by
-    /// `record_workspace` once the flag or the environment named one.
+    /// `record_workspace` once the flag or the environment named one: a login
+    /// is what this asks, of any shared workspace.
     fn may_file_shared(&self, _store: &Store) -> Result<(), String> {
         Err("this wsp has no hub add-on, so it keeps everything private".into())
+    }
+
+    /// Whether this user may file into `workspace` in particular, asked by
+    /// `record_workspace` after [`SharedWork::may_file_shared`] said yes and
+    /// before anything is written: `Err` is a refusal in words (not a member
+    /// of it, as far as the add-on knows). Where the add-on cannot know, it
+    /// says yes and the shared side refuses later. Yes standalone, where
+    /// `may_file_shared` has refused already.
+    fn may_file_into(&self, _store: &Store, _workspace: &WorkspaceId) -> Result<(), String> {
+        Ok(())
     }
 
     /// The lease a claim (or `wsp start`) on `row` needs, taken before anything

@@ -129,20 +129,6 @@ pub fn publisher(store: &Store, list: &str) -> Option<String> {
     by
 }
 
-/// The shared workspaces the login's user is a member of, as the hub serves
-/// them: the first item of a scoped subscription is a snapshot that holds
-/// only the caller's workspaces (wsp-174), and its `workspaces` are the names.
-/// Empty where the hub does not answer in time.
-fn member_workspaces(client: &Client) -> Vec<WorkspaceId> {
-    let mut feed = client.subscribe(None);
-    match feed.next_within(DIAL_WAIT) {
-        Some(hub_client::Item::State { state, .. }) => {
-            state.workspaces.keys().map(|n| WorkspaceId(format!("shared:{}", n.0))).collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
 /// A push refused `stale`: the hub's head for the subject, read from
 /// `objects` (what the sync fetched), merged into the file by the door.
 pub fn after_stale(
@@ -944,10 +930,10 @@ impl Worker {
         // with nothing of its own there still takes what the others pushed.
         let by = {
             let c = self.client()?;
-            for w in member_workspaces(c) {
-                if w.0.starts_with("shared:") {
-                    workspaces.entry(w.0).or_default();
-                }
+            // Kept, too, for a filing made while the hub cannot be asked
+            // (`hub_members`).
+            for w in crate::hub_members::refresh(store, c).map(|m| m.workspaces).unwrap_or_default() {
+                workspaces.entry(w).or_default();
             }
             c.by().clone()
         };

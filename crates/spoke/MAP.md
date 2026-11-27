@@ -17,6 +17,8 @@ through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-
 - `hub_lease` — row and drive leases, their renewal, verdicts and landings sent between machines
 - `hub_journal`, `hub_cache` — what the spoke keeps of the hub between runs (the offline journal and side chains; the
   cache and the merge after a stale)
+- `hub_ids`, `hub_members` — a shared row's id from the hub (or a provisional one), and the user's workspaces as the
+  hub last said, so a filing into one the user is not a member of is refused when it is filed
 - `reconcile` — the merging reconcile the door calls
 - `hub_client` — the spoke's own client of the hub, speaking `wsp-hub-protocol` only: the TLS/TCP dial with a pinned
   CA, hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, the

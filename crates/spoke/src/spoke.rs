@@ -129,6 +129,21 @@ impl SharedWork for Spoke {
         crate::hub_client::Credential::for_hub().map(|_| ()).map_err(|e| e.to_string())
     }
 
+    /// A member of `workspace`, as far as this spoke knows ([`crate::hub_members`]):
+    /// what the hub last said, kept by the worker, or the hub asked now where
+    /// that does not say yes and the connection is on. Nothing known (never
+    /// connected here) and no hub to ask: yes, and the hub refuses at the sync.
+    fn may_file_into(&self, store: &Store, workspace: &wsp_engine::model::WorkspaceId) -> Result<(), String> {
+        let Some(user) = self.user() else { return Ok(()) };
+        let ask = || {
+            if hub_switch::off(store) {
+                return None;
+            }
+            crate::cmd_publish::dial(&home()?).ok()
+        };
+        crate::hub_members::check(store, workspace, &user, ask)
+    }
+
     fn new_row_id(&self, store: &Store, project: Option<&str>, workspace: &wsp_engine::model::WorkspaceId, parent: Option<&str>) -> Result<Option<String>, String> {
         crate::hub_ids::new_row_id(store, project, workspace, parent)
     }

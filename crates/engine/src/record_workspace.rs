@@ -13,7 +13,9 @@
 //! This is core, not the add-on's: the workspace is a field of every record,
 //! and it is core that stamps it on a new one and keeps a child where its
 //! parent is, so a private record stays private whether or not an add-on is
-//! there. The add-on is asked one thing, whether shared may be filed at all.
+//! there. The add-on is asked two things: whether shared may be filed at all
+//! (a login), then whether into this workspace (a member of it, as far as the
+//! add-on knows: [`crate::addon::SharedWork::may_file_into`]).
 
 use crate::model::WorkspaceId;
 use crate::store::Store;
@@ -28,12 +30,19 @@ pub fn of_new(store: &Store, flag: Option<&str>, parent: Option<&WorkspaceId>) -
         return Ok(p.clone());
     }
     let env = std::env::var(ENV).ok();
-    resolve(flag, env.as_deref(), || crate::addon::get().may_file_shared(store))
+    let addon = crate::addon::get();
+    resolve(flag, env.as_deref(), || addon.may_file_shared(store), |ws| addon.may_file_into(store, ws))
 }
 
-/// [`of_new`] without a parent, with the flag, the environment's value and the
-/// login check given, so a test sets no process-wide state.
-pub fn resolve(flag: Option<&str>, env: Option<&str>, logged_in: impl FnOnce() -> Result<(), String>) -> Result<WorkspaceId, String> {
+/// [`of_new`] without a parent, with the flag, the environment's value, the
+/// login check and the membership check given, so a test sets no
+/// process-wide state.
+pub fn resolve(
+    flag: Option<&str>,
+    env: Option<&str>,
+    logged_in: impl FnOnce() -> Result<(), String>,
+    member: impl FnOnce(&WorkspaceId) -> Result<(), String>,
+) -> Result<WorkspaceId, String> {
     let (said, from) = match flag {
         Some(f) => (f.trim(), "--workspace"),
         None => match env.map(str::trim).filter(|e| !e.is_empty()) {
@@ -52,6 +61,9 @@ pub fn resolve(flag: Option<&str>, env: Option<&str>, logged_in: impl FnOnce() -
             "cannot file into {ws}: {why}\n     `wsp login` first, or leave {from} off to file it private"
         ));
     }
+    if let Err(why) = member(&ws) {
+        return Err(format!("cannot file into {ws}: {why}\n     or leave {from} off to file it private"));
+    }
     Ok(ws)
 }
 
@@ -63,34 +75,50 @@ mod tests {
         Err("not logged in".into())
     }
 
+    fn member(_: &WorkspaceId) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[test]
+    fn a_workspace_the_user_is_not_a_member_of_is_refused_after_the_login() {
+        let not = |ws: &WorkspaceId| Err(format!("ann is not a member of {ws}"));
+        let why = resolve(Some("shared:core"), None, || Ok(()), not).unwrap_err();
+        assert!(why.starts_with("cannot file into shared:core: ann is not a member of shared:core"), "{why}");
+        assert!(why.contains("leave --workspace off") && !why.contains("wsp login"), "{why}");
+        // The login is asked first, and private asks neither.
+        let why = resolve(Some("shared:core"), None, out, not).unwrap_err();
+        assert!(why.contains("wsp login"), "{why}");
+        assert_eq!(resolve(Some("private"), None, out, not), Ok(WorkspaceId::Private));
+    }
+
     #[test]
     fn nothing_said_is_private_and_asks_no_login() {
-        assert_eq!(resolve(None, None, out), Ok(WorkspaceId::Private));
-        assert_eq!(resolve(None, Some("  "), out), Ok(WorkspaceId::Private));
-        assert_eq!(resolve(Some("private"), None, out), Ok(WorkspaceId::Private));
+        assert_eq!(resolve(None, None, out, member), Ok(WorkspaceId::Private));
+        assert_eq!(resolve(None, Some("  "), out, member), Ok(WorkspaceId::Private));
+        assert_eq!(resolve(Some("private"), None, out, member), Ok(WorkspaceId::Private));
     }
 
     #[test]
     fn shared_while_logged_out_is_refused_naming_login() {
-        let why = resolve(Some("shared:core"), None, out).unwrap_err();
+        let why = resolve(Some("shared:core"), None, out, member).unwrap_err();
         assert!(why.contains("wsp login") && why.contains("shared:core"), "{why}");
-        let why = resolve(None, Some("shared:core"), out).unwrap_err();
+        let why = resolve(None, Some("shared:core"), out, member).unwrap_err();
         assert!(why.contains("wsp login") && why.contains(ENV), "{why}");
     }
 
     #[test]
     fn shared_while_logged_in_is_shared_and_the_flag_beats_the_environment() {
-        let ws = resolve(Some("shared:core"), Some("shared:other"), || Ok(())).unwrap();
+        let ws = resolve(Some("shared:core"), Some("shared:other"), || Ok(()), member).unwrap();
         assert_eq!(ws.to_string(), "shared:core");
-        let ws = resolve(None, Some("shared:other"), || Ok(())).unwrap();
+        let ws = resolve(None, Some("shared:other"), || Ok(()), member).unwrap();
         assert_eq!(ws.to_string(), "shared:other");
-        assert_eq!(resolve(Some("private"), Some("shared:other"), out), Ok(WorkspaceId::Private));
+        assert_eq!(resolve(Some("private"), Some("shared:other"), out, member), Ok(WorkspaceId::Private));
     }
 
     #[test]
     fn a_word_that_is_no_workspace_is_refused() {
-        assert!(resolve(Some("core"), None, || Ok(())).is_err());
-        assert!(resolve(Some("true"), None, || Ok(())).is_err());
+        assert!(resolve(Some("core"), None, || Ok(()), member).is_err());
+        assert!(resolve(Some("true"), None, || Ok(()), member).is_err());
     }
 
     #[test]
