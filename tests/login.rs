@@ -379,3 +379,101 @@ fn hub_disable_and_logout_dry_run_print_the_preview_through_the_cli_and_change_n
     assert_eq!((v["logged_in"].as_bool(), v["user"].as_str()), (Some(true), Some("ann")), "{v}");
     assert_ne!(v["off"].as_bool(), Some(true), "the dry run switched the hub off: {v}");
 }
+
+/// The admin verbs as a person (or the app) runs them, against a real hub:
+/// what each prints with `--json`, its exit code, and its refusals as
+/// sentences with a stable `{"error": {"code", "message", …}}`. Run with
+/// `--nocapture` to see every command and its output (the examples in
+/// docs/multiplayer.md are these). A token a verb mints is printed once, as
+/// `token.token`, and is in no file the calls leave behind, `calls.jsonl`
+/// (which records each call's verb and flag names only) included.
+#[test]
+fn hub_admin_verbs_print_fields_refuse_in_words_and_keep_no_token() {
+    use wsp_spoke::testhub::protocol::IdentityCommand;
+    use wsp_spoke::testhub::user;
+    let Some(rig) = Rig::new("admin", &[]) else { return };
+    let run = |args: &[&str]| {
+        let out = rig.command(args).output().unwrap();
+        eprintln!("$ wsp {}\n[exit {}]\n{}{}", args.join(" "), out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let json = |o: &Output| -> serde_json::Value { serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {}", said(o))) };
+
+    // Not logged in: refused before anything is dialled, in words and as a code.
+    let out = run(&["hub", "user", "ls", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json(&out)["error"]["code"], "not_logged_in", "{}", said(&out));
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("wsp: hub: not logged in"), "{}", said(&out));
+
+    // ann, an admin, logs in.
+    rig._hub.apply(IdentityCommand::HubUserAdd { name: user("ann"), admin: true });
+    let ann = rig._hub.issue("ann");
+    let ca = rig.ca.display().to_string();
+    let (out, _) = rig.run(&["login", &rig.url, "--ca", &ca], &format!("{ann}\n"));
+    assert!(out.status.success(), "{}", said(&out));
+    let status = json(&run(&["hub", "status", "--json"]));
+    assert_eq!((status["admin"].clone(), status["server"].clone()), (serde_json::json!(true), serde_json::json!("wsp-hub")));
+
+    for args in [&["hub", "workspace", "add", "team"][..], &["hub", "member", "add", "team", "ann"], &["hub", "workspace", "add", "design"]] {
+        assert!(run(args).status.success());
+    }
+    let added = json(&run(&["hub", "user", "add", "bo", "--json"]));
+    let bo = added["token"]["token"].as_str().unwrap().to_string();
+    assert_eq!(added["lines"], serde_json::json!(["user bo added"]));
+    assert!(added["token"]["id"].as_str().unwrap().starts_with("t-bo-"));
+    assert!(run(&["hub", "member", "add", "team", "bo"]).status.success());
+    let cy_first = json(&run(&["hub", "user", "add", "cy", "--json"]))["token"]["token"].as_str().unwrap().to_string();
+    assert!(run(&["hub", "member", "add", "design", "cy"]).status.success());
+    let again = json(&run(&["hub", "token", "cy", "--json"]));
+    let cy = again["token"]["token"].as_str().unwrap().to_string();
+    assert_eq!(again["kept"], serde_json::json!([]));
+    assert_eq!(again["revoked"].as_array().unwrap().len(), 1);
+    let cy_id = again["token"]["id"].as_str().unwrap().to_string();
+
+    rig._hub.client(&bo).lease_take(&wsp_objects::WorkspaceId("shared:team".into()), &wsp_store_contract::RowId("wsp-1".into())).unwrap();
+    for args in [&["hub", "user", "ls", "--json"][..], &["hub", "user", "ls"], &["hub", "workspace", "ls", "--json"], &["hub", "workspace", "ls"], &["hub", "lease", "ls", "--json"], &["hub", "lease", "ls"], &["hub", "state", "--json"], &["hub", "state"], &["hub", "events", "--limit", "3", "--json"], &["hub", "events", "--kind", "lease", "--json"], &["hub", "events", "--person", "cy"]] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(0), "wsp {}: {}", args.join(" "), said(&out));
+    }
+    let leases = json(&run(&["hub", "lease", "ls", "--json"]));
+    assert_eq!((leases["leases"][0]["row"].clone(), leases["not_shown"].clone()), (serde_json::json!("wsp-1"), serde_json::json!(["design"])));
+
+    let revoked = json(&run(&["hub", "token", "revoke", &cy_id, "--json"]));
+    assert_eq!((revoked["revoked"].clone(), revoked["already"].clone()), (serde_json::json!(cy_id), serde_json::json!(false)));
+
+    // Refusals: a sentence on stderr, the code and the refusal's fields on stdout with --json, exit 1.
+    assert!(run(&["hub", "user", "revoke", "root"]).status.success());
+    let out = run(&["hub", "user", "revoke", "ann", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "wsp: hub: user ann is the last active admin, so the hub refuses hub.user.revoke");
+    assert_eq!(json(&out)["error"]["code"], "illegal");
+    for args in [&["hub", "user", "add", "bo", "--json"][..], &["hub", "member", "add", "nowhere", "bo", "--json"], &["hub", "token", "revoke", "t-nobody-1", "--json"]] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1), "{}", said(&out));
+        assert!(!said(&out).contains(" { ") && !said(&out).contains("UserName("), "debug form: {}", said(&out));
+    }
+    // As bo, no admin.
+    let bo_home = rig.dir.join("bo-home");
+    std::fs::create_dir_all(&bo_home).unwrap();
+    let out = rig.command(&["login", &rig.url, "--ca", &ca]).env("HOME", &bo_home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().and_then(|mut c| {
+        c.stdin.take().unwrap().write_all(format!("{bo}\n").as_bytes())?;
+        c.wait_with_output()
+    }).unwrap();
+    assert!(out.status.success(), "{}", said(&out));
+    let out = rig.command(&["hub", "state", "--json"]).env("HOME", &bo_home).output().unwrap();
+    eprintln!("$ wsp hub state --json   (as bo)\n[exit {}]\n{}{}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json(&out)["error"], serde_json::json!({ "code": "forbidden", "message": "forbidden: person:bo is not an admin of this hub", "by": "person:bo" }));
+    // Usage: exit 2, nothing dialled.
+    assert_eq!(run(&["hub", "events", "--since", "soon"]).status.code(), Some(2));
+    assert_eq!(run(&["hub", "token", "revoke"]).status.code(), Some(2));
+
+    // No token minted here is in any file the calls left, calls.jsonl included.
+    let left = rig.left_behind();
+    assert!(left.iter().any(|(p, text)| p.ends_with("calls.jsonl") && text.contains("\"hub\"")), "the calls were recorded: {:?}", left.iter().map(|(p, _)| p).collect::<Vec<_>>());
+    for (path, text) in left {
+        for t in [&bo, &cy_first, &cy] {
+            assert!(!text.contains(t.as_str()), "{} holds a minted token", path.display());
+        }
+    }
+}

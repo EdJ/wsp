@@ -400,7 +400,7 @@ impl Feed {
                     return match r.outcome {
                         Outcome::Ok(a) => Ok(a),
                         Outcome::Err(f) if f.code == Code::TooOld => Err(Refusal::TooOld),
-                        Outcome::Err(f) => Err(Refusal::Other(format!("subscribe was refused {:?}: {}", f.code, f.text))),
+                        Outcome::Err(f) => Err(Refusal::Other(format!("subscribe was refused: {}", super::words::failure(&f)))),
                     }
                 }
                 Ok(Some(Frame::Refused(r))) if r.code == Code::Unauthorised => return Err(Refusal::Revoked(r.text)),

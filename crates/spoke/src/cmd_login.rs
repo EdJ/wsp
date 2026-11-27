@@ -218,7 +218,7 @@ fn log_in_github_with(
     let ca = ca.map(absolute);
     let done = login(ca.as_deref()).map_err(|s| match s {
         Silent::Refused(r) if r.code == Code::Unsupported => format!("this hub does not log in with GitHub: {}", r.text),
-        Silent::Refused(r) => format!("the hub refused the login: {:?}: {}", r.code, r.text),
+        Silent::Refused(r) => format!("the hub refused the login: {}", hub_client::words::refused(&r)),
         other => other.to_string(),
     })?;
     let token = done.token.0;
@@ -463,6 +463,8 @@ pub fn status_text(login: &Option<HubLogin>) -> String {
 ///   the sync worker makes, dropped by a new login and by `wsp logout`);
 ///   `null` where nothing is kept for this login, or the hub is older than
 ///   the welcome's `admin` and did not say.
+/// - `server`: the hub's instance name, as the same last `welcome` said it
+///   (`welcome.server`); `null` where nothing is kept for this login.
 pub fn account_json(store: &Store, login: &HubLogin, home: Option<&Path>) -> serde_json::Map<String, serde_json::Value> {
     let kept = crate::hub_members::Members::read(store).filter(|m| m.user == login.user);
     let mut out = serde_json::Map::new();
@@ -477,6 +479,7 @@ pub fn account_json(store: &Store, login: &HubLogin, home: Option<&Path>) -> ser
         }),
     );
     out.insert("admin".into(), json!(home.and_then(|h| hub_client::kept_admin(h, login))));
+    out.insert("server".into(), json!(home.and_then(|h| hub_client::kept_server(h, login))));
     out
 }
 
@@ -485,10 +488,10 @@ pub fn hub(store: &Store, args: &Args) -> i32 {
         Some("status") if args.rest.len() == 1 => {}
         // This spoke's own switch.
         Some(word @ ("enable" | "disable")) if args.rest.len() == 1 => return crate::cmd_hub::switch(store, args, word),
-        // The admin verbs (wsp-163): user, token, workspace, member.
-        Some("user" | "token" | "workspace" | "member") => return crate::cmd_hub::run(store, args),
+        // The admin verbs (wsp-163): state, user, token, workspace, member, lease, events.
+        Some("state" | "user" | "token" | "workspace" | "member" | "lease" | "events") => return crate::cmd_hub::run(store, args),
         _ => {
-            eprintln!("usage: wsp hub status [--json] | enable | disable | user … | token … | workspace … | member … (wsp help)");
+            eprintln!("usage: wsp hub status [--json] | enable | disable | state | user … | token … | workspace … | member … | lease ls | events (wsp help)");
             return 2;
         }
     }
@@ -833,9 +836,9 @@ mod tests {
         let before = std::fs::read_to_string(h.join(HUBS_FILE)).unwrap();
         let refused = |code, text: &str| Frame::Refused(Refused { code, text: text.into() });
         let cases: Vec<(Vec<Frame>, &str)> = vec![
-            (vec![Frame::LoginPrompt(device()), refused(Code::Forbidden, "mallory is not on this hub's list of GitHub users")], "refused the login: Forbidden"),
+            (vec![Frame::LoginPrompt(device()), refused(Code::Forbidden, "mallory is not on this hub's list of GitHub users")], "refused the login: forbidden: mallory is not on this hub's list of GitHub users"),
             (vec![refused(Code::Unsupported, "no github")], "does not log in with GitHub"),
-            (vec![Frame::LoginPrompt(device()), refused(Code::Unauthorised, "the code ran out before it was entered")], "Unauthorised"),
+            (vec![Frame::LoginPrompt(device()), refused(Code::Unauthorised, "the code ran out before it was entered")], "the hub does not take this login: the code ran out before it was entered"),
             (vec![Frame::LoginPrompt(device())], "closed"),
             (vec![Frame::LoginDone(LoginDone { user: "ed".into(), token: ApiToken("two words".into()) })], "not a token"),
             (vec![Frame::LoginDone(LoginDone { user: " ".into(), token: ApiToken("tok".into()) })], "names no user"),
@@ -919,6 +922,8 @@ mod tests {
 
         log_in(&home, &hub.url, hub._hub.admin_token(), Some(&hub.ca)).unwrap();
         assert_eq!(admin(&home), json!(true), "the hub's admin");
+        let login = hub_login_in(&home).unwrap().unwrap();
+        assert_eq!(serde_json::Value::Object(account_json(&store, &login, Some(&home)))["server"], json!("wsp-hub"), "the welcome's instance name");
         log_in(&home, &hub.url, &hub.tokens["ann"], Some(&hub.ca)).unwrap();
         assert_eq!(admin(&home), json!(false), "an ordinary user: the second login's own welcome, not the first's");
 
@@ -960,5 +965,6 @@ mod tests {
         old.join().unwrap();
         let login = hub_login_in(&home).unwrap().unwrap();
         assert_eq!(serde_json::Value::Object(account_json(&store, &login, Some(&home)))["admin"], json!(null));
+        assert_eq!(serde_json::Value::Object(account_json(&store, &login, Some(&home)))["server"], json!("old-hub"));
     }
 }

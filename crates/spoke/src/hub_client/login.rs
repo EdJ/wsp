@@ -243,6 +243,7 @@ pub fn keep_welcome(home: &Path, url: &str, client: &super::Client) {
         "url": url.trim(),
         "user": user,
         "admin": client.admin(),
+        "server": client.server(),
         "at": wsp_base::util::iso_at(wsp_base::util::epoch_secs()),
     });
     let tmp = dir.join(format!(".welcome.json.{}.tmp", std::process::id()));
@@ -258,6 +259,14 @@ pub fn kept_admin(home: &Path, login: &HubLogin) -> Option<bool> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(WELCOME_FILE)).ok()?).ok()?;
     let same = v["url"].as_str() == Some(login.url.trim()) && v["user"].as_str() == Some(login.user.as_str());
     same.then(|| v["admin"].as_bool()).flatten()
+}
+
+/// The instance name (`welcome.server`) the hub's last welcome to `login`
+/// said; None where nothing is kept for this login.
+pub fn kept_server(home: &Path, login: &HubLogin) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(WELCOME_FILE)).ok()?).ok()?;
+    let same = v["url"].as_str() == Some(login.url.trim()) && v["user"].as_str() == Some(login.user.as_str());
+    same.then(|| v["server"].as_str().map(str::to_string)).flatten()
 }
 
 /// Drop what a welcome said (a new login, a logout).

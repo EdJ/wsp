@@ -281,6 +281,8 @@ pub const VALUED_ON: &[(&str, &str)] = &[
     // `verify --check` stands alone; on `spawn` it names the group a barrier
     // check reads (`wsp-230`).
     ("spawn", "check"),
+    // `wsp hub events --person <user>` names whose trail; elsewhere `person` stands alone.
+    ("hub", "person"),
 ];
 
 /// Whether this flag stands alone on this verb.

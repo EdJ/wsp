@@ -588,12 +588,22 @@ MACHINES
   wsp logout --dry-run [--json]     what the logout's disable would do; does nothing
   wsp hub status [--json]           the hub you are logged in to, and as whom; on or
                                     off, what the disconnect parked, what is unsent
+  wsp hub state [--json]               the admin's snapshot: the hub's name, who asks,
+                                       where its trail starts; people, workspaces, leases
   wsp hub user add <name> [--admin]    a hub user and its token, printed once (admin, logged in)
-  wsp hub user ls                      the hub's users and their live tokens
+  wsp hub user ls [--json]             the hub's people: role, state, token records
+                                       (id, method, issued, revoked), workspaces
   wsp hub user revoke <name>           revoke a user and every token of its
-  wsp hub token <name>                 a new token for a user, the old ones revoked
+  wsp hub token <name>                 a new token for a user; its admin-issued tokens
+                                       revoked, its GitHub logins' kept
+  wsp hub token revoke <id>            revoke one token record, by its id
   wsp hub workspace add <name>         a shared workspace
+  wsp hub workspace ls [--json]        the shared workspaces and their members
   wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
+  wsp hub lease ls [--json]            the leases the hub shows you (your workspaces')
+  wsp hub events [--from N] [--json]   the hub's trail, one page (at most 1000) after
+                                       event N; --limit N, --kind K, --workspace W,
+                                       --person U, --row R, --since T filter the page
   wsp hub disable                      stop taking shared work here, cleanly: shared
                                        rows in flight parked, the journal flushed,
                                        leases given back; the login is kept

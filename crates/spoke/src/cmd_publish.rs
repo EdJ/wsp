@@ -227,8 +227,10 @@ pub fn alloc_stepped(client: &mut Client, ws: &HubWorkspace, code: &str, want: u
 
 fn say(e: HubError) -> String {
     match &e {
-        HubError::Refused(r, _) if format!("{r:?}").contains("Forbidden") => format!("forbidden: you are not a member of that workspace ({r:?})"),
-        HubError::Failed(f) if format!("{:?}", f.code) == "Forbidden" => format!("forbidden: {}", f.text),
+        HubError::Refused(r @ wsp_store_contract::Refusal::Forbidden { .. }, text) => {
+            format!("forbidden: you are not a member of that workspace ({})", crate::hub_client::words::refusal(r, text))
+        }
+        HubError::Failed(f) if f.code == wsp_hub_protocol::Code::Forbidden => format!("forbidden: {}", f.text),
         _ => e.to_string(),
     }
 }

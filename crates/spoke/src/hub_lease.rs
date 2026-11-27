@@ -90,7 +90,7 @@ pub use wsp_engine::addon::Held;
 fn who(p: &Principal) -> String {
     match p {
         Principal::Person(u) => u.to_string(),
-        other => format!("{other:?}"),
+        other => wsp_hub_protocol::principal::text(other),
     }
 }
 
@@ -254,8 +254,8 @@ pub fn renew_due(store: &Store, client: &mut Client, now: i64, alive: &mut dyn F
                     out.renewed += 1;
                 }
             }
-            Err(HubError::Refused(r, _)) => {
-                let why = format!("hub lease gone: renewing it was refused ({r:?})");
+            Err(HubError::Refused(r, text)) => {
+                let why = format!("hub lease gone: renewing it was refused ({})", crate::hub_client::words::refusal(&r, &text));
                 if drop_claim(store, &row, token, &why) {
                     out.lost.push(row);
                 }
@@ -794,8 +794,8 @@ pub fn renew_drives(store: &Store, client: &mut Client, now: i64) -> usize {
                 });
                 renewed += 1;
             }
-            Err(HubError::Refused(r, _)) => {
-                drop_drive(store, &list, d.token, &format!("renewing it was refused ({r:?})"));
+            Err(HubError::Refused(r, text)) => {
+                drop_drive(store, &list, d.token, &format!("renewing it was refused ({})", crate::hub_client::words::refusal(&r, &text)));
             }
             Err(_) => {}
         }

@@ -21,6 +21,7 @@
 //!   hands back a user and a token.
 //! - [`hub_cert_expiry`] reads when the hub's certificate runs out.
 //! - [`token`] mints a hub token and its hash, for `wsp hub user add`.
+//! - [`words`] says a hub's refusal in a sentence, never Rust's debug form.
 
 use std::time::{Duration, Instant};
 
@@ -36,10 +37,11 @@ mod subscribe;
 mod sync;
 mod tls;
 pub mod token;
+pub mod words;
 
 pub use dial::{hub_cert_expiry, login_github, login_github_on, Silent};
 pub use login::{
-    forget_welcome, hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, keep_welcome, kept_admin, Credential, HubLogin,
+    forget_welcome, hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, keep_welcome, kept_admin, kept_server, Credential, HubLogin,
     HUBS_FILE, HUB_CA_ENV, HUB_HOME_ENV, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV, TOKEN_ENV, WELCOME_FILE,
 };
 pub use subscribe::{Feed, Item};
@@ -85,8 +87,8 @@ impl std::fmt::Display for Error {
             Error::Timeout => f.write_str("no reply in time"),
             Error::Lost(e) => write!(f, "{e}"),
             Error::Silent(s) => write!(f, "{s}"),
-            Error::Refused(r, _) => write!(f, "the server refused it: {r:?}"),
-            Error::Failed(x) => write!(f, "the server failed it: {:?}: {}", x.code, x.text),
+            Error::Refused(r, text) => write!(f, "the server refused it: {}", words::refusal(r, text)),
+            Error::Failed(x) => write!(f, "the server failed it: {}", words::failure(x)),
             Error::Unexpected(what) => write!(f, "the server's answer was not the verb's: {what}"),
         }
     }

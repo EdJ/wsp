@@ -28,9 +28,12 @@ through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-
 - `reconcile` — the merging reconcile the door calls
 - `hub_client` — the spoke's own client of the hub, speaking `wsp-hub-protocol` only: the TLS/TCP dial with a pinned
   CA, hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, the
-  login file and `WSP_HUB_*` (`hubs.json`), the machine every hello names (`machine`, `machine.json`), what the last welcome said of the user (whether a hub admin, `welcome.json`), certificate expiry, the GitHub login, and token mint/hash
+  login file and `WSP_HUB_*` (`hubs.json`), the machine every hello names (`machine`, `machine.json`), what the last welcome said of the user (whether a hub admin, `welcome.json`), certificate expiry, the GitHub login, token mint/hash, and a hub refusal in words (`words`)
 - `cmd_login`, `cmd_hub`, `cmd_publish`, `cmd_allocate` — the verbs of the shared side (`wsp login`, with a token or
   `--github`, `logout`, `hub`, `publish`, `allocate`)
+- `hub_admin` — what a hub admin reads, as fields: people with their token records (login method from the id's
+  prefix) and workspaces, workspaces and members, the leases the hub shows, the `events` trail a page at a time with
+  its filters and the `too_old` horizon as data (`wsp hub state`, `user ls`, `workspace ls`, `lease ls`, `events`)
 - `testhub` (behind `test-support`, and in this crate's tests) — a real hub for tests, run as an external program:
   `WSP_HUB_BIN` (the `wsp-hub` binary of the hub's repository) or `WSP_HUB_IMAGE` (its container image, over TLS with
   a throwaway CA, removed on drop). Seeded over the wire through `hub_client`; URL, CA, tokens, restart and stop, the
