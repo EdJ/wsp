@@ -1654,6 +1654,10 @@ fn say_capped(store: &Store, list: &str, at: usize, gate: &crate::room::Gate, al
 /// `todo` row that has been wedged long enough gets taken again a moment later
 /// and reads the group then. And only a member at `doing` or worse: one at
 /// `review` or `done` is settled and holds nothing.
+///
+/// **Told once** (`wsp-952`). [`CHECK_TOLD`] has what each check was last told
+/// holds it, and a step says it again only for a member, or a send-back, that
+/// is not in there. A tell that did not arrive is not recorded.
 fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
     let tasks = store.tasks_shared();
     // A row from before `wsp-230`, or the seat of the group's open check: the
@@ -1665,8 +1669,14 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
         .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))
         .map(|t| t.id.clone());
     let fresh = store.worklist(&w.id).and_then(|f| f.groups().into_iter().nth(at - 1));
-    let seated = fresh.as_ref().and_then(crate::barrier::running).and_then(|c| c.pane.clone());
-    let Some(check) = row.or(seated) else {
+    let entry = fresh.as_ref().and_then(crate::barrier::running);
+    // The check and when it started: a pane id alone is used again.
+    let seated = entry.and_then(|c| c.pane.clone().map(|p| (p, c.at.clone())));
+    let rowed = row.map(|id| {
+        let claimed = store.claims().get(&id).and_then(|c| c.get("claimed_at")?.as_str().map(str::to_string));
+        (id, claimed.unwrap_or_default())
+    });
+    let Some((check, since)) = rowed.or(seated) else {
         return;
     };
     // Rows this check attached itself (`wsp-210`, `followup --blocking`) are
@@ -1684,7 +1694,30 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
         .filter(|t| !matches!(t.status(), Status::Review | Status::Done))
         .cloned()
         .collect();
-    if holding.is_empty() {
+    let slot = format!("{}:{at}", w.id);
+    let who = format!("{check}@{since}");
+    // A member and the line that last sent it back, so a second send-back of
+    // one still holding is a change.
+    let now: Vec<String> = holding
+        .iter()
+        .map(|t| {
+            let log = t.section("Log").unwrap_or_default();
+            format!("{} {}", t.id, log.lines().rfind(|l| l.contains(SENT_BACK)).unwrap_or_default())
+        })
+        .collect();
+    let record = serde_json::json!({ "check": who, "holding": now });
+    let before = store.read_json_shared(CHECK_TOLD).get(&slot).cloned();
+    let told: Vec<&str> = before
+        .as_ref()
+        .filter(|b| b["check"] == who.as_str())
+        .and_then(|b| b["holding"].as_array())
+        .map(|h| h.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if now.iter().all(|h| told.contains(&h.as_str())) {
+        // One that settled is forgotten, to be told of if it comes back.
+        if before.as_ref().is_some_and(|b| *b != record) {
+            remember_told(store, &slot, record);
+        }
         return;
     }
     let names: Vec<String> = holding
@@ -1708,7 +1741,23 @@ fn sent_back_holding(store: &Store, w: &Worklist, at: usize, g: &Group) {
         check,
         names.join(", ")
     ));
-    tell_barrier(store, w, at, &check, &names);
+    let what = crate::artefact::hash_of(format!("{who}\n{}", now.join("\n")).as_bytes());
+    if tell_barrier(store, w, at, &check, &names, &what) {
+        remember_told(store, &slot, record);
+    }
+}
+
+/// `<list>:<group>` -> the check last told, and what it was told holds it.
+const CHECK_TOLD: &str = "check-told.json";
+
+fn remember_told(store: &Store, slot: &str, record: serde_json::Value) {
+    store.locked(|| {
+        let mut all = (*store.read_json_shared(CHECK_TOLD)).clone();
+        all[slot] = record;
+        if let Err(e) = crate::store::write_atomic(&store.state_file(CHECK_TOLD), &all.to_string()) {
+            log_line(store, &format!("{slot}: what the check was told is not recorded ({e})"));
+        }
+    });
 }
 
 /// The marker a reopened row carries, so the check can be told what changed
@@ -1720,7 +1769,10 @@ pub const SENT_BACK: &str = "sent back:";
 /// **`wsp tell` run as a process, for [`crate::cmd_task::reopen`]'s reason**:
 /// its refusals are the answer worth having, and a second implementation here
 /// would be a second answer that could disagree with the verb.
-fn tell_barrier(store: &Store, w: &Worklist, at: usize, check: &str, members: &[String]) {
+///
+/// `what` names this telling in the key, so a later one is not taken for it.
+/// Answers as [`tell_seat`] does.
+fn tell_barrier(store: &Store, w: &Worklist, at: usize, check: &str, members: &[String], what: &str) -> bool {
     let text = format!(
         "The {} run sent {} back after your barrier check {} opened, so the group is not the one you \
          were given. Read `wsp worklist next {}` again before deciding, and if it already holds, \
@@ -1731,8 +1783,8 @@ fn tell_barrier(store: &Store, w: &Worklist, at: usize, check: &str, members: &[
         w.id,
         w.id
     );
-    let key = format!("barrier:{}:{at}", w.id);
-    tell_seat(store, check, &text, "the group moved under it", &key);
+    let key = format!("barrier:{}:{at}:{what}", w.id);
+    tell_seat(store, check, &text, "the group moved under it", &key)
 }
 
 /// The seat a tell to `to` reaches: the pane of the row `to` names (its
@@ -1756,7 +1808,10 @@ fn seat_of(store: &Store, to: &str) -> String {
 ///
 /// Typed through [`crate::repair::type_to_seat`], so the text is cleaned and a
 /// sentence `wsp tell` refuses is reported once under the same key.
-fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) {
+///
+/// Answers false where it is worth saying again: it did not arrive, and was not
+/// refused as a sentence.
+fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) -> bool {
     if let Some(door) = crate::refusals::door(store) {
         let seat = seat_of(store, check);
         let text = util::said_plainly(text);
@@ -1764,18 +1819,28 @@ fn tell_seat(store: &Store, check: &str, text: &str, what: &str, key: &str) {
         match door.send(&seat, text, &format!("{key}:{seat}")) {
             Ok(sent) if sent.fresh => log_line(store, &format!("told {check}: {what} (order {})", sent.id.0)),
             Ok(_) => {}
-            Err(e) => log_line(store, &format!("told {check}: not delivered — {e}")),
+            Err(e) => {
+                log_line(store, &format!("told {check}: not delivered — {e}"));
+                return false;
+            }
         }
-        return;
+        return true;
     }
     use crate::repair::Typed;
     let once = format!("{key}:{}", seat_of(store, check));
     match crate::repair::type_to_seat(store, check, text, Some(&once)) {
         Typed::Yes => log_line(store, &format!("told {check}: {what}")),
-        Typed::NoRun(e) => log_line(store, &format!("tell {check}: could not run `wsp tell` ({e})")),
-        Typed::No(why) => log_line(store, &format!("told {check}: not delivered — {why}")),
+        Typed::NoRun(e) => {
+            log_line(store, &format!("tell {check}: could not run `wsp tell` ({e})"));
+            return false;
+        }
+        Typed::No(why) => {
+            log_line(store, &format!("told {check}: not delivered — {why}"));
+            return false;
+        }
         Typed::Unsayable | Typed::InTest => {}
     }
+    true
 }
 
 /// End every seat but the claim's that stands on a member of this group, and
@@ -7198,6 +7263,53 @@ fn only_a_working_screen_is_ever_overruled() {
             told[0].1
         );
 
+    }
+
+    /// `wsp-952`: one tell and one line for a member that stays sent back; one
+    /// sent back later is told, and so is a new check seat.
+    #[test]
+    fn a_check_is_told_once_until_what_holds_or_its_seat_changes() {
+        let (_env, store) = scratch("told-once");
+        task(&store, "m-1", Status::Review);
+        task(&store, "m-2", Status::Review);
+        let w = list(&store, &[(&["m-1", "m-2"], "claude")]);
+        step(&store, &w, &Blind);
+        hold_all(&store);
+        step(&store, &w, &Blind);
+        check_seated(&store, 1, "cpd-chk");
+        let _ = drained(&MEMBER_TOLD);
+        let _ = std::fs::write(store.state_file("cycle.log"), "");
+        let send_back = |id: &str| {
+            let mut t = store.find_task(id).unwrap();
+            t.set_status(Status::Doing);
+            crate::log::note(&store, &mut t, "sent back: install it").unwrap();
+        };
+        let lines = || {
+            let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+            log.lines().filter(|l| l.contains("the check is told")).count()
+        };
+        let told = || drained(&MEMBER_TOLD).into_iter().filter(|(to, _)| to.starts_with("cpd-chk")).collect::<Vec<_>>();
+
+        send_back("m-1");
+        step(&store, &w, &Blind);
+        step(&store, &w, &Blind);
+        assert_eq!((told().len(), lines()), (1, 1));
+
+        send_back("m-2");
+        step(&store, &w, &Blind);
+        step(&store, &w, &Blind);
+        let second = told();
+        assert_eq!((second.len(), lines()), (1, 2), "{second:?}");
+        assert!(second[0].1.contains("m-2"), "{}", second[0].1);
+
+        // The same pane id on a check opened later is another check.
+        let mut l = store.worklist("run").unwrap();
+        let mut groups = l.groups();
+        groups[0].checks.last_mut().unwrap().at = "2026-01-01T00:00:00Z".into();
+        l.set_groups(&groups);
+        store.save_worklist(&l).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!((told().len(), lines()), (1, 3));
     }
 
     /// The other side of that, and the reason the check is only told when it is
