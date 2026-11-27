@@ -244,7 +244,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             for (k, v) in &f.tools {
                 *tools.entry(k.clone()).or_insert(0) += v;
             }
-            if let Some(t) = store.task(m) {
+            if let Ok(t) = crate::timeline::read_row(store, m) {
                 for a in crate::cmd_attempts::attempts_of(&t) {
                     use crate::cmd_attempts::Outcome;
                     let counts = match a.outcome {
@@ -2116,6 +2116,80 @@ mod tests {
 
     /// `wsp-857`: effort.json says so where more than 1 % of the wall is in no
     /// bucket, and is silent at 1 % or less.
+    /// `wsp-901`: crate-split's report, rebuilt after members were archived,
+    /// read 0 legs and half the reopens. The member here ran two legs, was
+    /// reopened, and its rework took the pane id of an earlier barrier check,
+    /// whose banked line is the rework's and not the check's.
+    #[test]
+    fn a_finished_lists_effort_reads_the_same_once_its_members_are_archived() {
+        let (env, store, mut w) = list("arch", &["r-1"]);
+        let at = |hm: &str| format!("2026-10-18T{hm}:00Z");
+        let mut t = store.find_task("r-1").unwrap();
+        t.body = format!(
+            "## Legs\n- a · done\n- b · done\n\n## Log\n\
+- {} claimed by pane cpd-1 · spawned at sonnet/high\n\
+- {} review: first\n\
+- {} released after 30m · ran sonnet-5-5/high · 9 turns · 1M cache 1k in 1k out\n\
+- {} claimed by pane cpd-9 · spawned at sonnet/high\n\
+- {} leg a started by pane cpd-2 · spawned at sonnet/high\n\
+- {} leg a ended after 10m · ran sonnet-5-5/high · 3 turns · 1M cache 1k in 1k out\n\
+- {} leg b started by pane cpd-3 · spawned at sonnet/high\n\
+- {} leg b ended after 10m · ran sonnet-5-5/high · 3 turns · 1M cache 1k in 1k out\n\
+- {} review: again\n",
+            at("09:00"), at("09:30"), at("09:31"), at("10:00"), at("10:05"), at("10:15"), at("10:20"), at("10:30"), at("10:40")
+        );
+        t.status_raw = crate::model::Status::Done.as_str().into();
+        store.save_task(&t).unwrap();
+        let mut gs = w.groups();
+        let mut check = crate::barrier::Check::opened(None, None);
+        check.at = at("08:00");
+        check.pane = Some("cpd-9".into());
+        gs[0].checks.push(check);
+        w.set_groups(&gs);
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        let ev = |hm: &str, kind: &str, data: Value| json!({ "ts": at(hm), "kind": kind, "data": data }).to_string();
+        let events = [
+            ev("09:00", "task-claimed", json!({ "id": "r-1", "pane": "cpd-1" })),
+            ev("09:30", "task-review", json!({ "id": "r-1" })),
+            ev("09:31", "task-released", json!({ "id": "r-1" })),
+            ev("10:00", "task-claimed", json!({ "id": "r-1", "pane": "cpd-9" })),
+            ev("10:05", "leg-added", json!({ "id": "r-1", "leg": "a" })),
+            ev("10:15", "leg-done", json!({ "id": "r-1", "leg": "a" })),
+            ev("10:30", "leg-done", json!({ "id": "r-1", "leg": "b" })),
+            ev("10:40", "task-review", json!({ "id": "r-1" })),
+            ev("10:50", "task-verified", json!({ "id": "r-1", "verdict": "holds" })),
+            ev("10:51", "worklist-go", json!({ "id": "arch", "passed": 1, "started": false })),
+        ];
+        std::fs::write(store.state_file("events.jsonl"), format!("{}\n", events.join("\n"))).unwrap();
+        let ledger: String = ["cpd-1", "cpd-2", "cpd-3", "cpd-9"]
+            .iter()
+            .map(|p| format!("{}\n", json!({ "seat": p, "ended": at("10:45"), "session_id": p, "turns": 3, "input": 10, "output": 100, "cache_read": 5, "cache_write": 2, "cost": 1000 })))
+            .collect();
+        std::fs::write(env.state().join(crate::place_super::SPENT_FILE), ledger).unwrap();
+
+        let read = || {
+            let mut v = effort(&store, &store.worklist("arch").unwrap(), None);
+            v.as_object_mut().unwrap().remove("generated");
+            v
+        };
+        let legs = || crate::cmd_cost::entries(&store, "arch").unwrap().iter().filter(|e| e.role == "leg").count();
+        let before = read();
+        assert_eq!(before["rework"]["reopened"], 1, "{}", before["rework"]);
+        assert_eq!(legs(), 2);
+        assert!(before["totals"]["wall_seconds"].as_i64().unwrap() > 0);
+        let live = store.find_task("r-1").unwrap();
+        store.archive_task(&live).unwrap();
+        assert!(store.find_task("r-1").is_none(), "archived");
+        let after = read();
+        assert_eq!(legs(), 2);
+        // Key by key first, so a difference is named and not the whole report.
+        for (k, x) in before.as_object().unwrap() {
+            assert_eq!(&after[k], x, "{k}");
+        }
+        assert_eq!(after, before);
+    }
+
     #[test]
     fn an_unattributed_share_over_one_percent_of_the_wall_is_noted() {
         let note = unattributed_note(&json!({ "wall_seconds": 367_253, "unattributed_seconds": 333_032 })).unwrap();

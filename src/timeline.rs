@@ -14,7 +14,7 @@
 use serde_json::{json, Value};
 
 use crate::host::Host;
-use crate::store::Store;
+use crate::store::{Found, Store};
 use crate::util::{self, Paint};
 use crate::base::args::Args;
 
@@ -1568,6 +1568,16 @@ fn leg_seats_of(t: &crate::model::Task) -> Vec<LegSeat> {
         .collect()
 }
 
+/// A row to read, live or archived (`wsp-901`: a finished list's report lost
+/// the legs and rework of every member filed away since). For readers only: an
+/// archived row saved back would be filed twice ([`Found::Archived`]).
+pub(crate) fn read_row(store: &Store, needle: &str) -> Result<crate::model::Task, String> {
+    match store.resolve_task(needle) {
+        Found::One(t) | Found::Archived(t, _) => Ok(*t),
+        other => Err(other.why(needle).unwrap_or_default()),
+    }
+}
+
 pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
     let mut i = Inputs { id: id.to_string(), ..Default::default() };
     let group = store.worklists().into_iter().find_map(|w| {
@@ -1608,7 +1618,8 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             }
         }
     }
-    if let Some(t) = store.find_task(id) {
+    let row = read_row(store, id).ok();
+    if let Some(t) = &row {
         let all = crate::model::decisions_of(&t.body);
         let gone = crate::model::supersessions(&all);
         i.decisions = all
@@ -1617,10 +1628,10 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
             .filter(|(d, g)| g.is_none() && d.at.contains('T'))
             .map(|(d, _)| (util::epoch_of(&d.at), d.id, d.text))
             .collect();
-        i.leg_seats = leg_seats_of(&t);
-        i.leg_panes = crate::cmd_attempts::attempts_of(&t).into_iter().filter(|a| !a.pane.is_empty()).filter_map(|a| Some((util::epoch_of(&a.at), a.leg?, a.pane))).collect();
+        i.leg_seats = leg_seats_of(t);
+        i.leg_panes = crate::cmd_attempts::attempts_of(t).into_iter().filter(|a| !a.pane.is_empty()).filter_map(|a| Some((util::epoch_of(&a.at), a.leg?, a.pane))).collect();
         i.leg_marks = t.section("Log").map(|l| leg_marks(&l)).unwrap_or_default();
-        i.legs = crate::legs::legs(&t)
+        i.legs = crate::legs::legs(t)
             .into_iter()
             .map(|l| LegIn { skipped: l.skipped.is_some(), after: l.after.clone().unwrap_or_default(), name: l.name })
             .collect();
@@ -1707,8 +1718,8 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
     // The verifier seats' own first lines and test seconds, which wsp wrote on
     // each pass when it ended the seat (the binding that names the session is
     // gone after the despawn).
-    if let Some(t) = store.find_task(id) {
-        for p in crate::verification::passes(&t) {
+    if let Some(t) = &row {
+        for p in crate::verification::passes(t) {
             let Some(sp) = p.spent.as_ref() else { continue };
             let Some(first) = sp.first_line.as_deref().map(util::epoch_of).filter(|t| *t > 0) else { continue };
             i.verifiers.push(VerifierSeat { learned: util::epoch_of(&p.at), first, test_secs: sp.test_secs });
@@ -2660,7 +2671,7 @@ pub fn timeline(store: &Store, args: &Args) -> i32 {
         eprintln!("usage: {USAGE}");
         return 2;
     };
-    let t = match store.task_or_why(needle) {
+    let t = match read_row(store, needle) {
         Ok(t) => t,
         Err(why) => {
             eprintln!("{why}");
@@ -2772,6 +2783,26 @@ mod tests {
 
     fn ev(t: i64, kind: &str, d: Value) -> (i64, String, Value) {
         (t, kind.into(), d)
+    }
+
+    /// `wsp-901`: `wsp timeline` on an archived row printed where the file was
+    /// and no timeline.
+    #[test]
+    fn an_archived_row_has_a_timeline() {
+        let env = util::isolated("timeline-archived");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let t = crate::model::Task::new("r-1", "r-1");
+        store.save_task(&t).unwrap();
+        store.log_event("task-claimed", json!({ "id": "r-1", "pane": "cpd-1" }));
+        store.log_event("task-review", json!({ "id": "r-1" }));
+        let before = build(&gather(&store, "r-1")).len();
+        store.archive_task(&t).unwrap();
+        assert!(store.find_task("r-1").is_none(), "archived");
+        assert_eq!(timeline(&store, &Args::synth("timeline", &["r-1"], &[])), 0);
+        assert!(before > 0);
+        assert_eq!(build(&gather(&store, "r-1")).len(), before);
+        assert_eq!(timeline(&store, &Args::synth("timeline", &["r-2"], &[])), 1, "no such row is still refused");
     }
 
     fn row() -> Inputs {

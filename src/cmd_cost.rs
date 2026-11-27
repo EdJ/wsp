@@ -118,7 +118,9 @@ fn pane_uses(store: &Store) -> Vec<(i64, String)> {
             put(&c.at, pane);
         }
     }
-    for t in store.tasks() {
+    // Archived rows too: a pane id's next use bounds a check entry's session
+    // whether or not the row that used it has been filed since (`wsp-901`).
+    for t in store.tasks().into_iter().chain(store.archived_tasks()) {
         for a in attempts_of(&t) {
             put(&a.at, &a.pane);
         }
@@ -299,7 +301,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
     let tasks: Vec<(usize, crate::model::Task)> = groups
         .iter()
         .enumerate()
-        .flat_map(|(i, g)| g.members.iter().filter_map(|m| store.find_task(m)).map(move |t| (i + 1, t)))
+        .flat_map(|(i, g)| g.members.iter().filter_map(|m| crate::timeline::read_row(store, m).ok()).map(move |t| (i + 1, t)))
         .collect();
     for (gi, t) in &tasks {
         for p in crate::verification::passes(t) {
