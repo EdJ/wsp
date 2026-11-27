@@ -10,6 +10,10 @@
 //! seat has no cost (null, with `why`), and a group's or the list's total is
 //! what was read, marked a floor.
 //!
+//! Pane ids are handed out again, so a barrier check entry reads the session of
+//! its id that ran from the entry's opening (see `check_reading`), not the
+//! newest one.
+//!
 //! **A governor counts in full toward the group the run stood at when it was
 //! seated** (wsp-264): one plus the highest `passed` of the list's earlier
 //! `worklist-go` events. A pass short of the end rotates in a fresh seat, so
@@ -102,15 +106,71 @@ fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, 
     }
 }
 
+/// When each pane id is next heard of, as `(epoch, pane)`: every use of a seat
+/// the store records (a check entry, an attempt, a verifier pass, a governor's
+/// seating) and every `sweep: forgot` line, which says the seat before it is
+/// gone. Ids are handed out again, so these bound a check entry's session.
+fn pane_uses(store: &Store) -> Vec<(i64, String)> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    let mut put = |at: &str, pane: &str| out.push((util::epoch_of(at), pane.to_string()));
+    for c in store.worklists().iter().flat_map(|w| w.groups()).flat_map(|g| g.checks) {
+        if let Some(pane) = c.pane.as_deref() {
+            put(&c.at, pane);
+        }
+    }
+    for t in store.tasks() {
+        for a in attempts_of(&t) {
+            put(&a.at, &a.pane);
+        }
+        for p in crate::verification::passes(&t) {
+            if let Some(pane) = p.pane.as_deref() {
+                put(&p.at, pane);
+            }
+        }
+    }
+    let events = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
+    for v in events.lines().filter(|l| l.contains("governor-set")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        if v["kind"] == "governor-set" {
+            put(v["ts"].as_str().unwrap_or(""), v["data"]["workspace"].as_str().unwrap_or(""));
+        }
+    }
+    let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+    for (at, rest) in cycle.lines().filter_map(|l| l.split_once(" sweep: forgot ")) {
+        for pane in rest.split_once(": ").map_or("", |r| r.1).split_whitespace() {
+            put(at, pane);
+        }
+    }
+    out
+}
+
+/// A check entry's own reading: the session of its pane id that started at or
+/// after the entry opened and ended before the id's next use. The first such
+/// ledger line; else, while the id has not been used again, the live record.
+/// `None` is unmeasured: another session's figures are never read for it.
+fn check_reading(store: &Store, pane: &str, opened: i64, uses: &[(i64, String)]) -> Option<Value> {
+    let next = uses.iter().filter(|(t, p)| *t > opened && p == pane).map(|u| u.0).min();
+    let own = |r: &Value| session_start(r).is_none_or(|t| t >= opened);
+    let banked = crate::cmd_burn::ledger_lines(&store.state, pane).into_iter().find(|l| {
+        let ended = util::epoch_of(l["ended"].as_str().unwrap_or(""));
+        ended >= opened && next.is_none_or(|n| ended <= n) && own(l)
+    });
+    // A live record carries no `ended`; `reading_in` falls back to the ledger.
+    banked.or_else(|| crate::cmd_burn::reading_in(&store.state, pane).filter(|r| next.is_none() && r.get("ended").is_none() && own(r)))
+}
+
+/// The first stamp in the transcript a reading names, by path or session id.
+fn session_start(r: &Value) -> Option<i64> {
+    let s = |k: &str| r.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+    s("transcript").or(s("session_id")).and_then(crate::timeline::first_act)
+}
+
 /// A barrier check seat's seated seconds (`wsp-066`): from its first act (the
 /// first stamp in its transcript, else the check's opening) to its end (when the
-/// ledger says `stop()` banked it, else now while its seat still runs). `None`
-/// where the seat was never read: no live record and no ledger line.
-fn check_seconds(seat: &str, opened: &str) -> Option<i64> {
-    let r = crate::cmd_burn::reading(seat)?;
-    let s = |k: &str| r.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
-    let end = s("ended").map(util::epoch_of).filter(|t| *t > 0).unwrap_or_else(util::epoch_secs);
-    let start = s("transcript").or(s("session_id")).and_then(crate::timeline::first_act).unwrap_or_else(|| util::epoch_of(opened));
+/// ledger says `stop()` banked it, else now while its seat still runs).
+fn check_seconds(r: &Value, opened: i64) -> Option<i64> {
+    let ended = r.get("ended").and_then(Value::as_str).map(util::epoch_of).filter(|t| *t > 0);
+    let end = ended.unwrap_or_else(util::epoch_secs);
+    let start = session_start(r).unwrap_or(opened);
     (start > 0 && end >= start).then_some(end - start)
 }
 
@@ -221,14 +281,17 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
         e.fig = fig_of(&seat, None, Some(seconds));
         out.push(e);
     }
+    let checked = groups.iter().any(|g| g.checks.iter().any(|c| c.pane.is_some()));
+    let uses = if checked { pane_uses(store) } else { Vec::new() };
     for (i, g) in groups.iter().enumerate() {
         for c in &g.checks {
             let Some(pane) = c.pane.as_deref() else { continue };
             let mut e = entry(i + 1, None, "barrier", pane);
             e.tier = c.on.clone().unwrap_or_default();
             e.shared = !counted.insert(pane.to_string());
-            if !e.shared {
-                e.fig = fig_of(pane, None, check_seconds(pane, &c.at));
+            let opened = util::epoch_of(&c.at);
+            if let Some(r) = (!e.shared).then(|| check_reading(store, pane, opened, &uses)).flatten() {
+                e.fig = of_reading(&r, 0, check_seconds(&r, opened));
             }
             out.push(e);
         }
@@ -762,5 +825,122 @@ mod tests {
         let j = cost_json("run", &es, 2);
         assert_eq!(j["groups"][1]["barrier"][0]["measured"], true);
         assert_eq!(j["groups"][0]["barrier"][0]["measured"], false);
+    }
+
+    /// A check entry on group 1 for each `(opened, pane)`.
+    fn checked(store: &Store, entries: &[(&str, &str)]) {
+        let mut w = store.worklist("run").unwrap();
+        let mut gs = w.groups();
+        for (at, pane) in entries {
+            let mut c = crate::barrier::Check::opened(None, None);
+            c.at = at.to_string();
+            c.pane = Some(pane.to_string());
+            gs[0].checks.push(c);
+        }
+        w.set_groups(&gs);
+        store.save_worklist(&w).unwrap();
+    }
+
+    /// A ledger line as the manager's seats bank it: no session id, no transcript.
+    fn spent(seat: &str, ended: &str, turns: u64, cost: u64) -> String {
+        json!({ "seat": seat, "ended": ended, "session_id": "", "transcript": "", "turns": turns, "input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "cost": cost }).to_string()
+    }
+
+    fn ledger(state: &std::path::Path, lines: &[String]) {
+        std::fs::write(state.join(crate::place_super::SPENT_FILE), lines.join("\n") + "\n").unwrap();
+    }
+
+    /// `(seat, turns, seconds, usd)` of group 1's barrier entries.
+    fn barrier(store: &Store) -> Vec<(String, Option<u64>, Option<i64>, Option<u64>)> {
+        let j = cost_json("run", &entries(store, "run").unwrap(), 2);
+        j["groups"][0]["barrier"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["seat"].as_str().unwrap().to_string(), e["turns"].as_u64(), e["seconds"].as_i64(), e["usd_micros"].as_u64()))
+            .collect()
+    }
+
+    /// `wsp-847`, trunk-green's barrier 1: four check seats on pane ids that
+    /// wsp-075's seats had on 11-17, three killed by those seats' stale endings.
+    #[test]
+    fn each_check_entry_reads_the_session_that_ran_from_its_opening() {
+        let (env, store) = fixture("cost-reused");
+        let st = env.state();
+        checked(&store, &[
+            ("2026-11-23T08:01:25Z", "cpd-388"),
+            ("2026-11-23T08:03:12Z", "cpd-390"),
+            ("2026-11-23T08:06:19Z", "cpd-393"),
+            ("2026-11-23T08:07:21Z", "cpd-394"),
+        ]);
+        std::fs::write(st.join("cycle.log"), "\
+2026-11-23T08:01:25Z spawn trunk-green --agent --check 1 --kind claude --model opus --effort high
+2026-11-23T08:03:12Z ended cpd-388, which ran leg serve of wsp-075
+2026-11-23T08:03:33Z sweep: forgot 2 gone seat(s) with nothing to say: cpd-388 cpd-389
+2026-11-23T08:04:26Z spawn trunk-green --agent --check 1 --kind claude --model opus --effort high
+2026-11-23T08:06:17Z ended cpd-390, which ran leg finish of wsp-075
+2026-11-23T08:06:19Z spawn trunk-green --agent --check 1 --kind claude --model opus --effort high
+2026-11-23T08:06:40Z sweep: forgot 2 gone seat(s) with nothing to say: cpd-390 cpd-391
+2026-11-23T08:07:21Z ended cpd-393, which verified wsp-075 (holds), on a later try
+2026-11-23T08:07:21Z spawn trunk-green --agent --check 1 --kind claude --model opus --effort high
+2026-11-23T08:07:42Z sweep: forgot 1 gone seat(s) with nothing to say: cpd-393
+2026-11-23T08:13:17Z trunk-green: the check in cpd-394 settled its barrier and its turn is over — ending it
+2026-11-23T08:13:29Z sweep: forgot 1 gone seat(s) with nothing to say: cpd-394
+").unwrap();
+        let earlier = [
+            spent("cpd-390", "2026-11-17T22:52:10Z", 19, 226_596),
+            spent("cpd-388", "2026-11-17T22:58:22Z", 39, 665_767),
+            spent("cpd-393", "2026-11-17T23:07:14Z", 7, 312_401),
+            spent("cpd-394", "2026-11-17T23:07:14Z", 20, 431_346),
+        ];
+        let later = [
+            spent("cpd-390", "2026-11-23T08:06:17Z", 1, 375_888),
+            spent("cpd-393", "2026-11-23T08:07:21Z", 1, 263_584),
+            spent("cpd-394", "2026-11-23T08:13:17Z", 1, 587_521),
+        ];
+        let mut lines = earlier.to_vec();
+        lines.push(spent("cpd-388", "2026-11-23T08:03:12Z", 2, 461_679));
+        lines.extend(later.clone());
+        ledger(&st, &lines);
+        let others = [
+            ("cpd-390".to_string(), Some(1), Some(185), Some(375_888)),
+            ("cpd-393".to_string(), Some(1), Some(62), Some(263_584)),
+            ("cpd-394".to_string(), Some(1), Some(356), Some(587_521)),
+        ];
+        let got = barrier(&store);
+        assert_eq!(got[0], ("cpd-388".to_string(), Some(2), Some(107), Some(461_679)));
+        assert_eq!(got[1..], others);
+
+        // As the real ledger has it: two writers garbled cpd-388's 11-23 line,
+        // so its seat stays and is unmeasured, never the 11-17 reading.
+        let mut lines = earlier.to_vec();
+        lines.push(r#"{{""seatseat""::""cpd-388cpd-388"",,""turnsturns""::22}}"#.to_string());
+        lines.extend(later);
+        ledger(&st, &lines);
+        let got = barrier(&store);
+        assert_eq!(got[0], ("cpd-388".to_string(), None, None, None));
+        assert_eq!(got[1..], others);
+    }
+
+    #[test]
+    fn a_pane_id_reused_days_later_leaves_the_check_its_own_session() {
+        let (env, store) = fixture("cost-later");
+        let st = env.state();
+        checked(&store, &[("2026-11-17T19:45:22Z", "cpd-7")]);
+        claims_at(&store, "m-1", "2026-11-23T07:10:00Z", "cpd-7");
+        let own = spent("cpd-7", "2026-11-17T19:48:20Z", 12, 100);
+        let rows = spent("cpd-7", "2026-11-23T07:25:04Z", 4, 900);
+        ledger(&st, &[own, rows.clone()]);
+        assert_eq!(barrier(&store), [("cpd-7".to_string(), Some(12), Some(178), Some(100))]);
+        // Its own line lost: neither the row seat's line nor its live record.
+        ledger(&st, &[rows]);
+        seat(&st, "cpd-7", 30, 5);
+        assert_eq!(barrier(&store), [("cpd-7".to_string(), None, None, None)]);
+    }
+
+    fn claims_at(store: &Store, id: &str, at: &str, pane: &str) {
+        let mut t = store.find_task(id).unwrap();
+        t.body = format!("## Log\n- {at} claimed by pane {pane}\n");
+        store.save_task(&t).unwrap();
     }
 }
