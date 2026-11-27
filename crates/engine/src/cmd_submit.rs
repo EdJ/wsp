@@ -856,11 +856,14 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
     }
     said.extend(c.full_suite.iter().cloned());
     log_on(store, &id, &std::mem::take(&mut said));
-    // `checks:` is what writes `## Checks`.
+    // `checks:` is what writes `## Checks`. The review core reads the section it
+    // gates on, so it is written first and put back if the submit is refused.
+    let mut before: Option<String> = None;
     if !e.checks.is_empty() {
         let lines: String = e.checks.iter().map(|l| format!("- {} ({}): {}\n", l.label, member_limit(&l.time), l.command)).collect();
         let ok = store.locked(|| {
             let Some(mut t) = store.find_task(&id) else { return false };
+            before = Some(t.section(crate::check::SECTION).unwrap_or_default());
             crate::model::set_section_in(&mut t.body, crate::check::SECTION, lines.trim_end());
             store.save_task(&t).is_ok()
         });
@@ -869,6 +872,17 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
             return 1;
         }
     }
+    let put_back = || {
+        let Some(before) = &before else { return };
+        let ok = store.locked(|| {
+            let Some(mut t) = store.find_task(&id) else { return false };
+            crate::model::set_section_in(&mut t.body, crate::check::SECTION, before);
+            store.save_task(&t).is_ok()
+        });
+        if !ok {
+            eprintln!("wsp: {id}: could not put ## Checks back as it was");
+        }
+    };
     let outcome = e.outcome();
     match &outcome {
         Outcome::Blocked(asks) => {
@@ -878,6 +892,7 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
                     Ok(q) => raised.push(format!("asked ({}): {} · {q}", a.to.word(), fold(&a.text))),
                     Err(why) => {
                         eprintln!("wsp: {id}: could not raise the ask: {why}");
+                        put_back();
                         return 1;
                     }
                 }
@@ -896,6 +911,7 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
             });
             if !ok {
                 eprintln!("wsp: {id}: write failed");
+                put_back();
                 return 1;
             }
             store.git_commit(&format!("wsp: blocked {id} — {}", t.title));
@@ -908,6 +924,7 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
             let src = format!("{} characters from {from}, by wsp submit", text.len());
             let code = crate::cmd_task::accept(store, &core, &fold(text), Some(&src));
             if code != 0 {
+                put_back();
                 return code;
             }
         }

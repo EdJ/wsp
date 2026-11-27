@@ -5017,6 +5017,43 @@ pub mod tests {
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "review");
     }
 
+    /// `wsp-947`: a submit refused for its `checks:` leaves `## Checks` as it
+    /// was, declared before or not. The test runs itself as a child to read
+    /// what the refusal printed.
+    #[test]
+    fn a_refused_submit_leaves_the_rows_checks_as_they_were() {
+        const CHILD: &str = "WSP_TEST_REFUSED_SUBMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let out = wsp_base::calls::Command::new(std::env::current_exe().unwrap())
+                .args(["cmd_task::tests::a_refused_submit_leaves_the_rows_checks_as_they_were", "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{}{said}", String::from_utf8_lossy(&out.stdout));
+            assert_eq!(said.matches("its ## Checks has line(s) that call its own check:").count(), 2, "{said}");
+            return;
+        }
+        let (env, store, _tree) = a_member_with_a_commit("submit-refused-checks");
+        let file = env.path("exit.md");
+        std::fs::write(
+            &file,
+            "summary: the member did its work\n\nIt wrote work.txt and left nothing.\n\ndone-when:\n- held: the work — work.txt\n\nchecks:\n- own (1m): wsp check wsp-101\n\nasks:\n- note: nothing\n\nowed: nothing\n",
+        )
+        .unwrap();
+        let path = file.display().to_string();
+        let submit = parse(&["submit", "wsp-101", "--from", &path]);
+        let checks = || store.task("wsp-101").unwrap().section("Checks");
+        for declared in [None, Some("- closing (2m): true\n- legs (1m): true")] {
+            let mut t = store.task("wsp-101").unwrap();
+            crate::model::set_section_in(&mut t.body, "Checks", declared.unwrap_or_default());
+            store.save_task(&t).unwrap();
+            assert_eq!(crate::cmd_submit::submit_as(&store, &submit, Some("member")), 2);
+            assert_eq!(checks().as_deref(), declared);
+            assert_eq!(store.task("wsp-101").unwrap().status_raw, "doing");
+        }
+    }
+
     /// `wsp-529`: a commit a verifier blocked is not put up again unchanged —
     /// refused with the verdict's head, the row does not move; a new commit is
     /// allowed; `--anyway "why"` puts it up as it is and the log says so.
