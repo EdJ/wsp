@@ -1536,6 +1536,16 @@ pub fn ahead(repo: &Path, trunk_branch: &str, branch: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether a commit was ever made on `branch`, by its reflog. A branch cut and
+/// never committed on has only its creation there, and the fast-forwards and
+/// rebases that keep it level with the trunk add no commit of its own.
+pub fn committed_on(repo: &Path, branch: &str) -> bool {
+    const MADE: [&str; 4] = ["commit", "cherry-pick", "revert", "am"];
+    git(repo, &["reflog", "show", "--format=%gs", &format!("refs/heads/{branch}")]).is_some_and(|said| {
+        said.lines().any(|l| l.split([':', ' ']).next().is_some_and(|action| MADE.contains(&action)))
+    })
+}
+
 /// What each landed branch put on the trunk, read back off the trunk's reflog.
 ///
 /// The worklist barrier's one piece of feedback about how a group was composed:
@@ -2499,7 +2509,11 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
             w.branch
         ));
     }
-    if git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok() {
+    // Nothing of its own to rebase: a row whose work is in another repository
+    // is ready at that commit, and moving this tree would name the trunk's.
+    if git_ok(&w.dir, &["merge-base", "--is-ancestor", &w.branch, "HEAD"]).is_ok()
+        || ahead(&w.dir, &w.branch, "HEAD").is_empty()
+    {
         return Prepared::Unchanged;
     }
     if let Some(said) = merge_refusal(&w.dir, &w.branch, &[&w.task, &branch], "wsp submit") {

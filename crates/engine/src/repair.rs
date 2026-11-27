@@ -2127,11 +2127,11 @@ pub fn landed(t: &Task) -> Option<String> {
 /// Whether the member's newest submission said it lands no commit: its last
 /// [`NOTHING_TO_LAND`] line is newer than its last [`READY`] one (`wsp-777`).
 ///
-/// **A `wsp: landed` line does not undo it.** The sweep records a branch that
-/// reached the trunk without `wsp land` — and a branch cut at the tip and never
-/// committed on is exactly that — so wsp-771's row carried a landed line at the
-/// trunk's own commit after it had said it had nothing. A commit the member
-/// really landed is placed by the reflog, which is asked first.
+/// **A `wsp: landed` line does not undo it.** The sweep once recorded a branch
+/// cut at the tip and never committed on, so wsp-771's row carried a landed line
+/// at the trunk's own commit after it had said it had nothing, and rows written
+/// then still do. A commit the member really landed is placed by the reflog,
+/// which is asked first.
 pub(crate) fn landed_nothing(t: &Task) -> bool {
     let Some(log) = t.section("Log") else { return false };
     let newest = log.lines().filter(|l| l.contains(NOTHING_TO_LAND) || sha_after(l, READY).is_some()).last();
@@ -4790,6 +4790,92 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
             row_log(&store, "m-1").matches(LANDED).count() <= 1,
             "the record is the idempotence key, so a second tick finds it and writes nothing"
         );
+    }
+
+    /// A row with no commit of its own (a retro): its branch was cut at the
+    /// trunk tip and only kept level with it. No land is recorded, and its
+    /// verifier is handed no commit.
+    #[test]
+    fn a_member_that_committed_nothing_records_no_land_and_has_no_commit_to_verify() {
+        let (env, store) = scratch("nocommit");
+        let repo = repo(&env, &store);
+        crate::testkit::repo(&repo);
+        git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        git_in(&repo, &["checkout", "--quiet", "-b", "m-1"]);
+        git_in(&repo, &["checkout", "--quiet", "master"]);
+        git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "another row's work"]);
+        git_in(&repo, &["checkout", "--quiet", "m-1"]);
+        git_in(&repo, &["merge", "--quiet", "--ff-only", "master"]);
+        git_in(&repo, &["checkout", "--quiet", "master"]);
+        let mut t = Task::new("m-1", "m-1");
+        t.project = Some("p".into());
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        list(&store, &["m-1"], "claude");
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(commit_of(&t), None, "{}", row_log(&store, "m-1"));
+        assert!(crate::check::target(&store, &t, None).is_err(), "no diff to hand a verifier");
+        assert!(crate::verifier_packet::build(&store, &t).is_none());
+    }
+
+    /// Two roots: the row's branch in the first is level with its trunk, and its
+    /// work is a commit on the second's branch of the same name.
+    fn work_in_a_second_repo(env: &util::Isolated, store: &Store) -> (std::path::PathBuf, String) {
+        let first = env.path("repo");
+        let other = env.path("other");
+        for dir in [&first, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+            crate::testkit::repo(dir);
+            git_in(dir, &["commit", "--quiet", "--allow-empty", "-m", &format!("first of {}", dir.display())]);
+            git_in(dir, &["branch", "m-1"]);
+        }
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![first.display().to_string(), other.display().to_string()];
+        store.save_project(&p).unwrap();
+        git_in(&other, &["checkout", "--quiet", "m-1"]);
+        git_in(&other, &["commit", "--quiet", "--allow-empty", "-m", "the member's work"]);
+        git_in(&other, &["checkout", "--quiet", "master"]);
+        let sha = git_in(&other, &["rev-parse", "m-1"]);
+        let mut t = Task::new("m-1", "m-1");
+        t.project = Some("p".into());
+        t.set_status(Status::Review);
+        t.log(&format!("{READY} {sha} on m-1"));
+        store.save_task(&t).unwrap();
+        list(store, &["m-1"], "claude");
+        (other, sha)
+    }
+
+    #[test]
+    fn a_commit_on_another_repos_branch_is_not_recorded_at_the_first_trunk_and_is_what_is_verified() {
+        let (env, store) = scratch("otherrepo");
+        let (other, sha) = work_in_a_second_repo(&env, &store);
+        let w = store.worklists().remove(0);
+
+        let pos = worklist::position(&store, &w, Reading::Landed);
+        assert!(pos.members[0].ready && !pos.members[0].finished(), "{:?}", pos.members);
+        unrecorded_landing(&store, &w, 1, &pos);
+
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(landed(&t), None, "{}", row_log(&store, "m-1"));
+        let tg = crate::check::target(&store, &t, None).unwrap();
+        assert_eq!(tg.sha, sha);
+        assert_eq!(tg.repo.canonicalize().unwrap(), other.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_landing_in_a_second_repo_records_that_repos_commit() {
+        let (env, store) = scratch("otherlanded");
+        let (other, sha) = work_in_a_second_repo(&env, &store);
+        git_in(&other, &["merge", "--quiet", "--ff-only", "m-1"]);
+
+        tick(&store, &Fake::empty(), &mut Pass::new());
+
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(landed(&t), Some(sha.clone()), "{}", row_log(&store, "m-1"));
+        assert_eq!(crate::check::target(&store, &t, None).unwrap().sha, sha);
     }
 
     /// A member whose branch is still ahead has no landing to record, and

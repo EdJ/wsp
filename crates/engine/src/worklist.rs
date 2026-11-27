@@ -1434,10 +1434,16 @@ fn landing_and_tip(repos: &mut Repos, t: &Task) -> (Landing, Option<String>) {
     // not have: on a branch that does not exist it reports nothing outstanding,
     // which is indistinguishable from landed. The form is `ensure`'s, which is
     // what creates the branch in the first place.
-    let hit = trunks.iter().find_map(|trunk| {
-        let branch = repos.branches(&t.id).into_iter().find(|b| branch_tip(&trunk.dir, b).is_some())?;
-        Some((trunk.clone(), branch))
-    });
+    let hits: Vec<(Trunk, String)> = trunks
+        .iter()
+        .filter_map(|trunk| {
+            let branch = repos.branches(&t.id).into_iter().find(|b| branch_tip(&trunk.dir, b).is_some())?;
+            Some((trunk.clone(), branch))
+        })
+        .collect();
+    // The one holding work first: the row's tree in one repository stays level
+    // with its trunk while the work is on another repository's branch.
+    let hit = hits.iter().find(|(trunk, branch)| commits_ahead(trunk, branch) > 0).or(hits.first()).cloned();
     let Some((trunk, branch)) = hit else {
         return (Landing::NoBranch, None);
     };
@@ -1588,6 +1594,12 @@ pub fn verified_by_a_run(store: &Store, task: &str) -> bool {
 /// a member named by the worklist's own text — or `None` while any of it is
 /// still outstanding.
 ///
+/// **Only a branch something was committed on answers**
+/// ([`cmd_checkout::committed_on`]). One cut at the trunk tip and never
+/// committed on is level with the trunk too, and its tip is the trunk's: a row
+/// with no commit, or whose work is on another repository's branch, would be
+/// recorded as landed there. A branch ahead in any repository is outstanding.
+///
 /// **The branch's own tip, not the trunk's.** `wsp land` fast-forwards, so on
 /// every landing `wsp` performs the two are the same value; on a landing
 /// performed by anything else the branch's tip is still the right answer,
@@ -1608,6 +1620,7 @@ pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
     let mut repos = Repos::new(store);
     let task = store.task_now(&repos.renamed, id)?;
     let trunks = task.project.as_deref().map(|p| repos.of(p)).unwrap_or_default();
+    let mut landed = None;
     for trunk in trunks {
         for branch in repos.branches(&task.id) {
             let spec = format!("refs/heads/{branch}");
@@ -1615,13 +1628,15 @@ pub fn landed_at_of(store: &Store, id: &str) -> Option<(String, String)> {
                 continue;
             }
             if !cmd_checkout::ahead(&trunk.dir, &trunk.branch, &branch).is_empty() {
-                continue;
+                return None;
             }
-            let tip = git(&trunk.dir, &["rev-parse", &spec])?;
-            return Some((tip.trim().to_string(), trunk.branch.clone()));
+            if landed.is_none() && cmd_checkout::committed_on(&trunk.dir, &branch) {
+                let tip = git(&trunk.dir, &["rev-parse", &spec])?;
+                landed = Some((tip.trim().to_string(), trunk.branch.clone()));
+            }
         }
     }
-    None
+    landed
 }
 
 // ---- where a task sits in a run -----------------------------------------
