@@ -1484,6 +1484,35 @@ mod tests {
         let _ = w;
     }
 
+    /// `wsp-951`: a `go` from a held last barrier passed it with an output still
+    /// owed. A `go` on a hold taken mid-group passes nothing and owes nothing.
+    #[test]
+    fn a_held_last_barrier_holds_on_what_a_member_owes_when_go_passes_it() {
+        let (_e, store, _w) = list("heldlast", &["r-1"]);
+        assert_eq!(run(&store, &["output", "heldlast", "add", "notes"], &[("kind", "md"), ("from", "r-1")]), 0);
+        assert_eq!(run(&store, &["go", "heldlast", "start"], &[]), 0);
+        let caption = [("caption", "why")];
+        assert_eq!(run(&store, &["hold", "heldlast", "mid-group"], &caption), 0);
+        assert_eq!(run(&store, &["go", "heldlast", "carry on"], &caption), 0, "no barrier is crossed");
+
+        let mut t = store.task("r-1").unwrap();
+        t.status_raw = "done".into();
+        store.save_task(&t).unwrap();
+        assert_eq!(run(&store, &["hold", "heldlast", "not yet"], &caption), 0);
+
+        assert_eq!(run(&store, &["go", "heldlast", "fine"], &caption), 1);
+        let w = store.worklist("heldlast").unwrap();
+        assert_eq!(w.status(), WorklistStatus::Held);
+        assert!(w.groups()[0].verdict.is_empty(), "not passed");
+        assert_eq!(crate::outputs::missing(&w), ["notes.md"], "the two defaults were written");
+
+        write("heldlast", "notes.md", "x", "t").unwrap();
+        assert_eq!(run(&store, &["go", "heldlast", "fine"], &caption), 0);
+        let w = store.worklist("heldlast").unwrap();
+        assert_ne!(w.status(), WorklistStatus::Held);
+        assert!(!w.groups()[0].verdict.is_empty(), "passed");
+    }
+
     /// `wsp-862`: the report was written before the last pass was recorded, and
     /// read the finished list as running, its last check seat uncounted.
     #[test]

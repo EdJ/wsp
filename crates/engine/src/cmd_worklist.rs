@@ -5319,19 +5319,6 @@ fn go_with(
     let mut groups = w.groups();
     let resuming = matches!(shut, Some((Gate::Held, _)));
 
-    // wsp-375: **the last barrier is where the list's outputs are due.** wsp
-    // writes the effort report, the work report is composed if the check did
-    // not put its own, and a declared output still missing holds the barrier.
-    if let Some((Gate::After(at), _)) = &shut {
-        if *at == groups.len() && !groups.is_empty() {
-            if let Err(miss) = crate::outputs::at_last_barrier(store, &w, &said, args.has("dry-run")) {
-                eprintln!("wsp: the last barrier of `{}` holds — declared output(s) missing: {}", w.id, miss.join(", "));
-                eprintln!("     in {} · a member-sourced output is written by that member; `wsp worklist output {} rm <name>` takes one off", crate::outputs::dir(&w.id).display(), w.id);
-                return 1;
-            }
-        }
-    }
-
     // Which barrier was crossed, taken from the gate rather than from the
     // ordinal. Starting a list crosses none: the groups a freshly-started list
     // has already "passed" are work that was finished before it existed, and
@@ -5346,6 +5333,19 @@ fn go_with(
         (Some((Gate::Held, _)), _) => pos.at.filter(|_| pos.at_barrier()),
         _ => None,
     };
+
+    // wsp-375: **the last barrier is where the list's outputs are due.** wsp
+    // writes the effort report, the work report is composed if the check did
+    // not put its own, and a declared output still missing holds the barrier.
+    // Asked of the barrier crossed, so a `go` from a hold on it is held the
+    // same (`wsp-951`): the close wsp runs next does not ask again.
+    if crossed == Some(groups.len()) {
+        if let Err(miss) = crate::outputs::at_last_barrier(store, &w, &said, args.has("dry-run")) {
+            eprintln!("wsp: the last barrier of `{}` holds — declared output(s) missing: {}", w.id, miss.join(", "));
+            eprintln!("     in {} · a member-sourced output is written by that member; `wsp worklist output {} rm <name>` takes one off", crate::outputs::dir(&w.id).display(), w.id);
+            return 1;
+        }
+    }
 
     // How much of the list was already finished before anybody started it.
     // A draft has no barriers behind its groups, so its position is the first
