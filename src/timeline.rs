@@ -890,17 +890,32 @@ fn verifier_passes(i: &Inputs, reviews: &[i64], verdicts: &[i64]) -> Vec<(i64, i
     out
 }
 
-/// `t`, or the verdict of the pass `t` falls in: from a review to its verdict
-/// the row is the verifier's, so a wait that began at the review begins there
-/// (`wsp-587`: a blocked verifier's 515 s booked as the wait for the rework leg).
-fn past_pass(passes: &[(i64, i64)], t: i64) -> i64 {
-    passes.iter().find(|(r, v)| *r <= t && t < *v).map_or(t, |p| p.1)
+/// The stretches of `from..to` outside every pass. From a review to its verdict
+/// the row is the verifier's, so no wait covers it, wherever the wait began
+/// (`wsp-587`: a blocked verifier's 515 s booked as the wait for the rework leg;
+/// `compound-react-132`: 719 s under a wait begun two reviews earlier).
+fn outside_passes(passes: &[(i64, i64)], from: i64, to: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let mut at = from;
+    // In time order and apart: each review is after the verdict before.
+    for &(r, v) in passes.iter().filter(|(r, v)| *r < to && *v > from) {
+        if r > at {
+            out.push((at, r));
+        }
+        at = v;
+    }
+    if to > at {
+        out.push((at, to));
+    }
+    out
 }
 
 /// Review → verifier → verdict, for the review at `r`.
 fn verifier_phases(i: &Inputs, r: i64, verdict: Option<i64>, out: &mut Vec<Phase>) {
     let id = i.id.as_str();
     let Some(s) = i.first_line(r.saturating_sub(1), |l| l.starts_with(&format!("spawn {id} --agent --verify"))) else { return };
+    // The line may be stamped a second before the review that asked for it.
+    let s = s.max(r);
     // `wsp review` runs the row's own check before it spawns the verifier;
     // the last `task-checked` between the two ends it.
     let checked = i.kind("task-checked", id).into_iter().filter(|(t, _)| *t >= r && *t <= s).max_by_key(|(t, _)| *t);
@@ -972,7 +987,6 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     for (k, a) in seated.iter().enumerate().skip(1) {
         let prev = &seated[k - 1];
         let Some(from) = prev.review.or(prev.end) else { continue };
-        let from = past_pass(&passes, from).min(a.begin());
         let (label, why) = between_attempts(i, prev, a.claim);
         // A stretch after a review that held for the person is the person's step
         // (`wsp-311`): only what lies outside it stays rework.
@@ -1031,22 +1045,23 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
         // The leg that ends the row ends with the review, not a `leg done`.
         let done_event = i.events.iter().find(|(t, k, d)| k == "leg-done" && d["id"] == id && d["leg"] == leg.name.as_str() && *t >= s);
-        ready = past_pass(&passes, ready).min(s);
-        if ready > 0 && s > ready {
+        // Piece by piece around the verifiers' runs, each named for what it
+        // waited on itself; a pass's own check is its verifier's to place.
+        for (ready, to) in outside_passes(&passes, ready, s).into_iter().filter(|_| ready > 0) {
             // A review typed between two legs ran the row's own check, which
             // failed and sent the row back: that run is work, not a wait
             // (`compounding-506`: 299s and 650s booked as nothing the logs name).
             let mut from = ready;
-            for (r, c, event) in own_checks(i, &reviews, ready, s) {
+            for (r, c, event) in own_checks(i, &reviews, ready, to) {
                 if r > from {
                     out.push(Phase::gap(format!("gap before leg {}", leg.name), from, r, wait_name(i, from, r, id)));
                 }
                 out.push(Phase::work(format!("the row's own check (wsp check, run by review — sent the row back){}", check_start_note(event)), r, c));
                 from = c;
             }
-            if s > from {
+            if to > from {
                 let label = if from > ready { format!("row's check ended → leg {} started", leg.name) } else { format!("gap before leg {}", leg.name) };
-                out.push(Phase::gap(label, from, s, wait_name(i, from, s, id)));
+                out.push(Phase::gap(label, from, to, wait_name(i, from, to, id)));
             }
         }
         // Every start before the last is an attempt that ran to its own end;
@@ -1152,14 +1167,12 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
     let review = reviews.iter().copied().rev().find(|r| verdicts.iter().any(|v| v >= r)).or_else(|| reviews.last().copied());
     // The review its verifier was spawned by, where it was typed again since.
     let review = review.map(|r| {
-        let pass = match verdicts.iter().copied().filter(|v| *v >= r).min() {
-            Some(judged) => passes.iter().copied().find(|p| p.1 == judged),
-            // Still reading: no verdict stands between any review and this one.
-            None => verifier_passes(i, &reviews, &[i64::MAX]).first().copied(),
-        };
-        pass.map_or(r, |p| p.0)
+        // Still reading: a verdict later than any, after the ones there are.
+        let judged = verdicts.iter().copied().filter(|v| *v >= r).min().unwrap_or(i64::MAX);
+        let all = verifier_passes(i, &reviews, &[verdicts.as_slice(), &[i64::MAX]].concat());
+        all.iter().find(|p| p.1 == judged).map_or(r, |p| p.0)
     });
-    if let (Some(r), Some(e)) = (review, last_end.map(|e| past_pass(&passes, e))) {
+    if let (Some(r), Some(e)) = (review, last_end) {
         if r > e {
             let finishing = || "the row's own seat finishing (not wsp)".to_string();
             match capped_reopen(i, e, r).filter(|(at, end, _)| end > at) {
@@ -1179,6 +1192,14 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
         }
     }
     let verdict = verdicts.iter().copied().find(|t| review.is_none_or(|r| *t >= r));
+    // No wait so far covers a verifier's run: split around it.
+    out = out
+        .into_iter()
+        .flat_map(|p| match p.gap {
+            true => outside_passes(&passes, p.start, p.end).into_iter().map(|(start, end)| Phase { start, end, ..p.clone() }).collect(),
+            false => vec![p],
+        })
+        .collect();
     // Every earlier verifier too: one that blocked ran before the rework.
     for (r, v) in passes.iter().copied().filter(|(r, _)| review != Some(*r)) {
         verifier_phases(i, r, Some(v), &mut out);
@@ -3324,6 +3345,79 @@ mod tests {
         let ph = build(&i);
         assert!(!ph.iter().any(|p| p.gap && p.start < 820 && p.end > 306), "{ph:#?}");
         assert!(ph.iter().any(|p| p.label == "after the last leg → review typed" && (p.start, p.end) == (820, 900)), "{ph:#?}");
+    }
+
+    /// No wait covers any second of a verifier's phase.
+    fn no_wait_over_a_verifier(ph: &[Phase]) {
+        for v in ph.iter().filter(|p| !p.gap && p.label.starts_with("verifier")) {
+            assert!(!ph.iter().any(|p| p.gap && !p.shared && p.start < v.end && p.end > v.start), "a wait over {v:?}: {ph:#?}");
+        }
+    }
+
+    /// `compound-react-132`: reviewed, reopened and reviewed again before a
+    /// verifier was spawned, then released and claimed again. The wait begun at
+    /// the first review stops at the second and resumes at the verdict.
+    #[test]
+    fn a_wait_begun_before_the_spawning_review_is_split_around_the_verifier() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k == "task-claimed");
+        i.events.extend([
+            ev(305, "task-review", json!({"id": "r-1"})),
+            ev(340, "task-reopen", json!({"id": "r-1"})),
+            ev(380, "task-review", json!({"id": "r-1"})),
+            ev(900, "task-verified", json!({"id": "r-1", "verdict": "blocks"})),
+            ev(910, "task-released", json!({"id": "r-1"})),
+            ev(1500, "task-claimed", json!({"id": "r-1"})),
+            ev(1600, "task-review", json!({"id": "r-1"})),
+            ev(1700, "task-verified", json!({"id": "r-1", "verdict": "holds"})),
+        ]);
+        i.legs.clear();
+        i.cycle.retain(|(t, _)| *t < 300);
+        i.cycle.extend([
+            (379, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (385, "list group 1: started r-1 · verifying".to_string()),
+            (1601, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (1605, "list group 1: started r-1 · verifying".to_string()),
+        ]);
+        let ph = build(&i);
+        no_wait_over_a_verifier(&ph);
+        let waits: Vec<(i64, i64)> = ph.iter().filter(|p| p.label.contains("sent back → seat started again")).map(|p| (p.start, p.end)).collect();
+        assert_eq!(waits, vec![(305, 380), (900, 1500)], "{ph:#?}");
+    }
+
+    /// A leg row whose last `leg done` is earlier than the review: the wait for
+    /// the next leg began before the verifier, and the review's own check is
+    /// placed once.
+    #[test]
+    fn a_leg_wait_begun_before_the_review_is_split_around_the_verifier() {
+        let mut i = row();
+        i.events.retain(|(_, k, _)| k == "task-claimed");
+        i.events.extend([
+            ev(200, "leg-done", json!({"id": "r-1", "leg": "a"})),
+            ev(305, "task-review", json!({"id": "r-1"})),
+            ev(320, "task-checked", json!({"id": "r-1", "state": "passed"})),
+            ev(820, "task-verified", json!({"id": "r-1", "verdict": "blocks"})),
+            ev(900, "task-review", json!({"id": "r-1"})),
+            ev(980, "task-verified", json!({"id": "r-1", "verdict": "holds"})),
+        ]);
+        i.cycle.retain(|(t, _)| *t < 150);
+        i.cycle.extend([
+            (150, "list group 1: starting leg a of r-1".to_string()),
+            (321, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (325, "list group 1: started r-1 · verifying".to_string()),
+            (830, "list group 1: starting leg rework of r-1".to_string()),
+            (901, "spawn r-1 --agent --verify --kind claude".to_string()),
+            (905, "list group 1: started r-1 · verifying".to_string()),
+        ]);
+        i.legs = vec![
+            LegIn { name: "a".into(), ..Default::default() },
+            LegIn { name: "rework".into(), after: vec!["a".into()], ..Default::default() },
+        ];
+        let ph = build(&i);
+        no_wait_over_a_verifier(&ph);
+        let waits: Vec<(i64, i64)> = ph.iter().filter(|p| p.label == "gap before leg rework").map(|p| (p.start, p.end)).collect();
+        assert_eq!(waits, vec![(200, 305), (820, 830)], "{ph:#?}");
+        assert_eq!(ph.iter().filter(|p| p.label.starts_with("the row's own check")).count(), 1, "{ph:#?}");
     }
 
     /// compounding-114 and 117: reviewed, verified, then reviewed again (a fix
