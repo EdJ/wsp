@@ -18,6 +18,13 @@ pub fn wrong_project(project: &str, other: &str) -> String {
     format!("the files this row names are in none of {project}'s roots but are in {other}'s — its fix is {other}'s source; file it with `-p {other}` (or `wsp mv` it there)")
 }
 
+/// The sentence of a spawn refusal whose cause is the row's own project
+/// ([`NO_ROOT_HOLDS`], [`wrong_project`]), out of what `wsp spawn` wrote:
+/// starting it again cannot clear it.
+pub fn row_own_refusal(wrote: &str) -> Option<&str> {
+    wrote.lines().find_map(|l| l.find("the files this row names are in none of ").map(|at| &l[at..]))
+}
+
 pub struct Index {
     pub projects: Vec<Project>,
 }

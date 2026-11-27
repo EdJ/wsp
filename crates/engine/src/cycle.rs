@@ -1215,6 +1215,7 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
     let gate = crate::room::Gate::new(store, seats);
     if all {
         retry_after_hold(store, &w.id);
+        restart_the_moved(store, &w, at, &pos);
         // Before any start below, so a member the answer reopens with no seat
         // is seated in this very pass (`wsp-635`).
         reopen_the_answered(store, &w, at, &pos);
@@ -4458,6 +4459,11 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
     let failed = start(store, id, policy, owned, verify);
     let Some(why) = failed else { return true };
     log_line(store, &format!("FAILED spawn {}{id}: {why}", if verify { "a verifier on " } else { "" }));
+    // The row's own cause is not retried: it is blocked and asked about.
+    if let (Undo::Member, Some(sentence)) = (&undo, crate::resolve::row_own_refusal(&why)) {
+        row_refused(store, owned.0, id, sentence);
+        return false;
+    }
     let saved = store.locked(|| {
         let Some(mut t) = store.find_task(id) else { return false };
         match undo {
@@ -4487,6 +4493,78 @@ fn spawn(store: &Store, id: &str, policy: &Policy, undo: Undo, owned: (&str, &st
         }
     }
     false
+}
+
+/// How the `blocked:` line of a row no seat can be started on begins, before
+/// the project it was refused in. [`restart_the_moved`] reads it.
+const REFUSED_IN: &str = "blocked: no seat can be started in project ";
+
+/// A member's start was refused for a cause of its own (`compound-react-126`):
+/// it is the same on every try, and `wsp mv`, which clears it, is refused to
+/// agents. So on the first refusal the row is blocked with the refusal's
+/// sentence, the person is asked and the list's seat told. Blocked, it holds no
+/// place of the group's cap, and the other members start.
+fn row_refused(store: &Store, list: &str, id: &str, why: &str) {
+    use crate::message::{self, About, Kind, Message, Party, Waiting};
+    let to = why.split_once("file it with `-p ").and_then(|(_, r)| r.split_once('`')).map_or("<project>", |(p, _)| p);
+    let step = format!("wsp mv {id} -p {to}");
+    let blocked = store.locked(|| {
+        let mut t = store.find_task(id)?;
+        let project = t.project.clone().unwrap_or_default();
+        t.set_status(Status::Blocked);
+        t.log(&format!("{REFUSED_IN}{project}: {why}. A person runs `{step}`; agents are refused it"));
+        t.touch();
+        store.save_task(&t).ok()?;
+        Some(project)
+    });
+    let Some(project) = blocked else { return };
+    store.log_event("task-blocked", serde_json::json!({ "id": id, "project": project, "status": "blocked" }));
+    store.git_commit(&format!("wsp: block {id} — its start is refused"));
+    let text = format!(
+        "{id} cannot be started in {project}: run `{step}`\n\n{why}\n\n\
+         Agents are refused `wsp mv`. Once it is moved, the {list} run starts it at its next step."
+    );
+    let q = Message::question(Party::wsp(), Kind::Note, &text, Waiting::new("", id)).about(About::Task(id.to_string())).for_the_person();
+    match message::raise(store, &q) {
+        Ok(()) => crate::cmd_message::asked_of_the_person(store, &q, id),
+        Err(e) => log_line(store, &format!("{list}: {id}: could not ask the person to move it: {e}")),
+    }
+    if let Some(w) = store.worklist(list) {
+        tell(store, &w, &format!(
+            "wsp blocked {id} in the {list} run after one try and asked the person: {why}. \
+             It is not tried again until a person runs `{step}`; the group's other members go on."
+        ));
+    }
+}
+
+/// A member [`row_refused`] blocked that is now in another project goes back to
+/// `todo`, for this step to start, and the ask about it lapses.
+fn restart_the_moved(store: &Store, w: &Worklist, at: usize, pos: &worklist::Position) {
+    use crate::message::{self, Party, Shape};
+    for s in &pos.members {
+        let moved = store.locked(|| {
+            let mut t = store.find_task(&s.id).filter(|t| t.status() == Status::Blocked)?;
+            let line = t.section("Log")?.lines().rev().find(|l| l.contains(" blocked:"))?.to_string();
+            let was = line.split_once(REFUSED_IN)?.1.split_once(':')?.0.to_string();
+            let now = t.project.clone().unwrap_or_default();
+            if now == was {
+                return None;
+            }
+            t.set_status(Status::Todo);
+            t.log(&format!("wsp: moved from {was} to {now}, so the {} run starts it", w.id));
+            t.touch();
+            store.save_task(&t).ok()?;
+            Some(now)
+        });
+        let Some(now) = moved else { continue };
+        for q in message::about_task(store, &s.id) {
+            if q.is_open() && q.shape() == Some(Shape::Question) && q.from.is_wsp() {
+                let _ = message::lapse(store, &q.id, &Party::lapsed(), &format!("{} was moved to {now}", s.id));
+            }
+        }
+        store.git_commit(&format!("wsp: {} was moved to {now} — to be started", s.id));
+        log_line(store, &format!("{} group {at}: {} was moved to {now} — starting it", w.id, s.id));
+    }
 }
 
 /// What a refusal says when its cause is the same for every row of the list,
@@ -4538,8 +4616,9 @@ fn start(store: &Store, id: &str, policy: &Policy, owned: (&str, &str), verify: 
         #[cfg(test)]
         return tests::SPAWNED.with(|s| {
             let id = if verify { crate::verification::seat_label(id) } else { id.to_string() };
-            s.borrow_mut().push((id, policy.kind.clone()));
-            tests::FAIL.with(|f| f.borrow().clone())
+            s.borrow_mut().push((id.clone(), policy.kind.clone()));
+            let only = tests::FAIL_ON.with(|f| f.borrow().clone());
+            tests::FAIL.with(|f| f.borrow().clone()).filter(|_| only.is_none_or(|o| o == id))
         });
     }
     let exe = match wsp_base::util::self_exe() {
@@ -6388,6 +6467,8 @@ pub mod tests {
         pub static STALL: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
         /// Set, and every start in this thread fails with it.
         pub(super) static FAIL: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Set, and [`FAIL`] fails the starts of this one seat only.
+        pub(super) static FAIL_ON: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and the pack builder is missing for every start in this thread.
         pub(super) static PACK_MISSING: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Set, and every verifier seat this thread ends fails with it.
@@ -9449,6 +9530,45 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(spawned().len(), 1, "one try, and the second row is not tried");
         assert_eq!(store.worklist(&w.id).unwrap().status(), WorklistStatus::Parked);
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Todo);
+    }
+
+    /// `compound-react-126`: a refusal that is the row's own is tried once.
+    #[test]
+    fn a_row_filed_in_the_wrong_project_is_blocked_after_one_try_and_asked_about() {
+        let (_env, store) = scratch("wrongproject");
+        for m in ["m-1", "m-2"] {
+            task(&store, m, Status::Todo);
+        }
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("compound-react".into());
+        store.save_task(&t).unwrap();
+        let w = list(&store, &[(&["m-1", "m-2"], "claude x1")]);
+        let said = crate::resolve::wrong_project("compound-react", "wsp");
+        FAIL.with(|f| *f.borrow_mut() = Some(format!("wsp: not starting it: {said}")));
+        FAIL_ON.with(|f| *f.borrow_mut() = Some("m-1".into()));
+        step(&store, &w, &Blind);
+        assert_eq!(ids(spawned()), ["m-1", "m-2"], "one try of m-1, and it holds no place of the group's x1");
+        step(&store, &w, &Blind);
+        assert!(!ids(spawned()).contains(&"m-1".to_string()), "not tried again");
+
+        let t = store.find_task("m-1").unwrap();
+        assert_eq!(t.status(), Status::Blocked);
+        assert!(t.blocked_question().unwrap().contains("file it with `-p wsp`"), "{:?}", t.blocked_question());
+        let asks = crate::message::about_task(&store, "m-1");
+        let ask = asks.iter().find(|q| q.shape() == Some(crate::message::Shape::Question)).expect("an ask");
+        assert!(ask.is_open() && ask.for_person);
+        assert!(ask.text.contains("wsp mv m-1 -p wsp"), "{}", ask.text);
+
+        FAIL.with(|f| *f.borrow_mut() = None);
+        FAIL_ON.with(|f| *f.borrow_mut() = None);
+        set(&store, "m-2", Status::Done);
+        let mut t = store.find_task("m-1").unwrap();
+        t.project = Some("wsp".into());
+        store.save_task(&t).unwrap();
+        step(&store, &w, &Blind);
+        assert!(ids(spawned()).contains(&"m-1".to_string()), "the next start after the move");
+        assert_eq!(store.find_task("m-1").unwrap().status(), Status::Doing);
+        assert!(!crate::message::about_task(&store, "m-1").iter().any(|q| q.id == ask.id && q.is_open()));
     }
 
     #[test]
