@@ -166,7 +166,7 @@
 //! in the reassuring direction gets ignored, and one that is wrong in the
 //! alarming direction gets ignored too.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -1339,6 +1339,76 @@ pub fn discard(
     Tree::Removed { path, kept: remove(&w.repo, &w.dir).kept }
 }
 
+/// The file in a tree's git directory (so never in the tree) naming the
+/// untracked paths its check steps created, a `step<TAB>path` line each.
+const CHECK_WROTE: &str = "wsp-check-wrote";
+
+fn check_wrote_file(dir: &Path) -> Option<PathBuf> {
+    git(dir, &["rev-parse", "--absolute-git-dir"]).map(|d| PathBuf::from(d.trim()).join(CHECK_WROTE))
+}
+
+/// Path → the step that created it, as [`note_check_wrote`] left it.
+fn check_wrote(file: &Path) -> BTreeMap<String, String> {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    text.lines().filter_map(|l| l.split_once('\t')).map(|(step, path)| (path.to_string(), step.to_string())).collect()
+}
+
+/// The untracked paths of a tree, as `git status` spells them. It takes no
+/// index lock: it is asked around every check step, beside a seat's commits.
+pub fn untracked_paths(dir: &Path) -> BTreeSet<String> {
+    git(dir, &["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("?? "))
+        .map(|p| p.trim().to_string())
+        .collect()
+}
+
+/// Records what the check step `step` created in `dir`: untracked after it and
+/// not `before` it (`wsp-848`). An entry whose path was gone by then is dropped.
+pub fn note_check_wrote(dir: &Path, step: &str, before: &BTreeSet<String>) {
+    let after = untracked_paths(dir);
+    let Some(file) = check_wrote_file(dir) else { return };
+    let mut wrote = check_wrote(&file);
+    wrote.retain(|path, _| before.contains(path));
+    for path in after.difference(before) {
+        wrote.insert(path.clone(), step.replace(['\t', '\n'], " "));
+    }
+    if wrote.is_empty() {
+        let _ = std::fs::remove_file(file);
+        return;
+    }
+    let text: String = wrote.iter().map(|(path, step)| format!("{step}\t{path}\n")).collect();
+    let _ = std::fs::write(file, text);
+}
+
+/// What to say of a dirty tree some of whose paths a check step created: whose
+/// they are, that they are not to be committed, and what else is uncommitted.
+/// `None` where none of them is a check's.
+fn check_wrote_said(dir: &Path) -> Option<String> {
+    let wrote = check_wrote(&check_wrote_file(dir)?);
+    let mut by_step: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut own: Vec<String> = Vec::new();
+    for (code, path) in dirty_files(dir) {
+        match wrote.get_key_value(&path).filter(|_| code == "??") {
+            Some((path, step)) => by_step.entry(step).or_default().push(path),
+            None => own.push(path),
+        }
+    }
+    if by_step.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (step, paths) in by_step {
+        out.push_str(&format!("\n  written by check step `{step}`, not your work — do not commit these: {}", paths.join(", ")));
+    }
+    out.push_str("\n  delete them, and have the check write under $WSP_SCRATCH, outside the tree");
+    if !own.is_empty() {
+        out.push_str(&format!("\n  also uncommitted, and no check's — commit what is work (`wsp commit-help`): {}", own.join(", ")));
+    }
+    Some(out)
+}
+
 /// Whether a tree has anything uncommitted, tracked or not.
 fn dirty(dir: &Path) -> bool {
     uncommitted(dir) > 0
@@ -2330,6 +2400,9 @@ pub fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option<(Strin
         return Ok(None);
     }
     if dirty(&w.dir) {
+        if let Some(said) = check_wrote_said(&w.dir) {
+            return Err(format!("{} is not clean, so there is no commit to be ready at; then `wsp review` again{said}", util::contract(&w.dir)));
+        }
         return Err(format!(
             "{} has uncommitted work — commit it (`wsp commit-help`), then `wsp review` again: a verifier reads the tree at the commit you are ready at",
             util::contract(&w.dir)
@@ -2368,6 +2441,9 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     let Some(branch) = w.on() else { return Prepared::Unchanged };
     let tree = util::contract(&w.dir);
     if dirty(&w.dir) {
+        if let Some(said) = check_wrote_said(&w.dir) {
+            return Prepared::Refused(format!("wsp: {tree} is not clean, so the rebase onto {} could not be made; then `wsp review` again{said}", w.branch));
+        }
         return Prepared::Refused(format!(
             "wsp: {tree} has uncommitted work, so the rebase onto {} could not be made — commit it (`wsp commit-help`), then `wsp review` again",
             w.branch

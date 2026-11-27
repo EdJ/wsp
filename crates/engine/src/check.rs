@@ -2041,6 +2041,8 @@ pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, run
         }
     }
     let clean = reuse.is_some_and(|r| greens::clean_at(dir, r.sha));
+    // What the step creates in the tree is noted as the check's (`wsp-848`).
+    let before = crate::cmd_checkout::untracked_paths(dir);
     let mut first = run_step(dir, step, log, runner);
     // `wsp-067`: a missing tree is waited for, and the step run once more when
     // it is back; still gone, the step stays "tree missing".
@@ -2077,6 +2079,7 @@ pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, run
     } else {
         first
     };
+    crate::cmd_checkout::note_check_wrote(dir, &step.name, &before);
     if let (Some(r), true, Done::Passed) = (reuse, clean, &ran.done) {
         r.greens.record_by(r.sha, inputs.as_deref(), &step.command, r.env, secs(ran.took), r.who, ran.first.is_some());
     }
@@ -4309,6 +4312,65 @@ mod tests {
             assert_eq!(r.done, Done::Passed, "{how}: WSP_* reached the command");
         }
         std::env::remove_var("WSP_CHECK_PROBE");
+    }
+
+    // ---- what a row's step leaves in its tree (wsp-848) ----
+
+    /// A row's own tree, made by wsp, with one commit of the member's on it.
+    fn member_world(name: &str) -> (util::Isolated, Store, PathBuf) {
+        let (env, store, _) = world(name, "- x: true", "exit 0\n");
+        let tree = PathBuf::from(crate::cmd_checkout::tree_for(&env.path("repo").display().to_string(), "pj-001").unwrap());
+        std::fs::write(tree.join("mine"), "1\n").unwrap();
+        git_run(&tree, &["add", "mine"]);
+        git_run(&tree, &["commit", "--quiet", "-m", "pj-001: mine"]);
+        (env, store, tree)
+    }
+
+    fn sent_back(store: &Store) -> String {
+        match crate::cmd_checkout::rebase_ready(store, "pj-001") {
+            crate::cmd_checkout::Prepared::Refused(why) => why,
+            _ => panic!("a dirty tree was not sent back"),
+        }
+    }
+
+    #[test]
+    fn what_a_check_step_created_is_named_as_the_checks_and_not_to_be_committed() {
+        let (env, store, tree) = member_world("wrote");
+        let step = Step { name: "shots".into(), ..sh("echo a > out.txt && mkdir shots && echo b > shots/one", 10) };
+        assert!(passed(&run_all(&tree, &[step], &env.path("log"), None, &Runner::Inproc, |_| {})));
+        let said = sent_back(&store);
+        assert!(said.contains("written by check step `shots`, not your work — do not commit these: out.txt, shots/one"), "{said}");
+        assert!(!said.contains("commit it") && !said.contains("commit-help"), "{said}");
+        let review = crate::cmd_checkout::ready_from(&store, "pj-001", &tree).unwrap_err();
+        assert!(review.contains("do not commit these: out.txt, shots/one"), "{review}");
+        // The member's own edit beside them is still theirs to commit.
+        std::fs::write(tree.join("mine"), "2\n").unwrap();
+        let said = sent_back(&store);
+        assert!(said.contains("no check's — commit what is work (`wsp commit-help`): mine"), "{said}");
+    }
+
+    #[test]
+    fn a_members_own_uncommitted_edit_is_sent_back_to_be_committed() {
+        let (env, store, tree) = member_world("own-edit");
+        std::fs::write(tree.join("mine"), "2\n").unwrap();
+        std::fs::write(tree.join("new"), "new\n").unwrap();
+        // A step that ran over them claims neither.
+        assert!(passed(&run_all(&tree, &[sh("true", 10)], &env.path("log"), None, &Runner::Inproc, |_| {})));
+        let said = sent_back(&store);
+        assert!(said.contains("has uncommitted work, so the rebase onto") && said.contains("commit it (`wsp commit-help`)"), "{said}");
+        assert!(!said.contains("check step"), "{said}");
+    }
+
+    #[test]
+    fn a_row_step_sees_wsp_scratch_outside_its_tree() {
+        let (env, _store, tree) = member_world("scratch");
+        let log = env.path("log");
+        let ran = run_step(&tree, &sh(r#"printf %s "$WSP_SCRATCH""#, 10), &log, &Runner::Inproc);
+        assert_eq!(ran.done, Done::Passed);
+        let seen = PathBuf::from(std::fs::read_to_string(&log).unwrap().trim());
+        assert!(seen.is_absolute() && !seen.starts_with(&tree), "{}", seen.display());
+        // With none of a seat's own to hand down, as in a verifier's run.
+        assert!(!scratch_in(None, &tree).starts_with(&tree));
     }
 
     // ---- the row ----
