@@ -847,9 +847,12 @@ pub fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
     if let Some(u) = &t.for_user {
         v["for"] = Value::String(u.clone());
     }
-    // A shared row: what the shared-work add-on knows of it here (who holds
-    // it, whether it is a head only, whether it is mine), as the feed's row has it.
+    // A shared row: its workspace (`shared:<name>`, as `ls --json` and the
+    // feed's row name it), and what the shared-work add-on knows of it here
+    // (who holds it, whether it is a head only, whether it is mine), as the
+    // feed's row has it.
     if !t.workspace.is_private() {
+        v[wsp_view::common::key::WORKSPACE] = Value::String(t.workspace.to_string());
         let addon = crate::addon::get();
         let f = addon.row_facts(store).remove(&t.id).unwrap_or_default();
         let mine = crate::addon::mine(&f, t.for_user.as_deref(), addon.user().as_deref());
@@ -4495,7 +4498,8 @@ pub mod tests {
 
     /// `ls --json`'s rows carry the shared-row facts the feed's rows do (both
     /// are `mirror::row_half`'s, `docs/multiplayer.md` "What a desktop app
-    /// reads"): `mine` and `head_only` (`"true"`/`"false"`) on every shared row,
+    /// reads"): `workspace` on every shared row and `for` where allocated,
+    /// `mine` and `head_only` (`"true"`/`"false"`) on every shared row,
     /// `held_by`, `held_on` and `held_until` where known, and a private row none.
     #[test]
     fn ls_json_rows_carry_the_shared_row_facts_the_feed_rows_do() {
@@ -4517,6 +4521,14 @@ pub mod tests {
         assert_eq!(facts("s-1"), [s("false"), s("false"), s("bo"), s("box-b"), s(&crate::util::iso_at(1_900_000_000))], "{}", row("s-1"));
         assert_eq!(facts("s-2"), [s("true"), s("false"), None, None, None], "allocated to ann: {}", row("s-2"));
         assert_eq!(facts("s-3"), [None, None, None, None, None], "a private row: {}", row("s-3"));
+        // And the row's sharing itself, as the feed's row has it: its workspace and, where allocated, `for`.
+        let sharing = |id: &str| ["workspace", "for"].map(|k| row(id).get(k).cloned());
+        assert_eq!(sharing("s-1"), [s("shared:team"), None], "{}", row("s-1"));
+        assert_eq!(sharing("s-2"), [s("shared:team"), s("ann")], "{}", row("s-2"));
+        assert_eq!(sharing("s-3"), [None, None], "a private row: {}", row("s-3"));
+        // `show --json` names the same workspace; a private row none.
+        assert_eq!(show_json(&store, "s-2").unwrap()["workspace"], json!("shared:team"));
+        assert_eq!(show_json(&store, "s-3").unwrap().get("workspace"), None);
     }
 
     /// `show --json` of an id a row was moved from (`ids.json`, as `wsp mv` and

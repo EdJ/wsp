@@ -1781,6 +1781,20 @@ mod tests {
         assert_eq!((shown["held_by"].clone(), shown["held_on"].clone(), shown["mine"].clone(), shown["head_only"].clone()), (json!("bo"), json!("box-b"), json!(false), json!(false)));
         assert_eq!(shown["held_until"], json!(wsp_engine::util::iso_at(bo_holds.expires)));
         assert!(wsp_engine::cmd_task::show_json(&store, "wsp-3").unwrap().get("mine").is_none());
+        assert_eq!((shown["workspace"].clone(), wsp_engine::cmd_task::show_json(&store, "wsp-3").unwrap().get("workspace")), (json!("shared:team"), None));
+        // `wsp ls --json` (what an app reads that runs wsp over ssh, with no feed to fold) carries the same per row: the
+        // workspace, `for` where allocated, and the facts, as the strings the feed's fields hold.
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&wsp_engine::cmd_task::rows_json(&store, &store.tasks())).unwrap();
+        let ls = |id: &str| {
+            let r = listed.iter().find(|r| r["id"] == id).unwrap();
+            ["workspace", "for", "mine", "head_only", "held_by", "held_on"].map(|k| r.get(k).cloned())
+        };
+        let s = |v: &str| Some(json!(v));
+        assert_eq!(ls("wsp-1"), [s("shared:team"), None, s("false"), s("false"), s("bo"), s("box-b")]);
+        assert_eq!(ls("wsp-2"), [s("shared:team"), s("ann"), s("true"), s("false"), None, None]);
+        assert_eq!(ls("wsp-4"), [s("shared:team"), None, s("true"), s("false"), s("ann"), s("box-a")]);
+        assert_eq!(ls("wsp-5")[..4], [s("shared:team"), None, s("false"), s("true")]);
+        assert_eq!(ls("wsp-3"), [None, None, None, None, None, None], "a private row");
 
         // bo lets go: heard, and the row is free.
         bo.lease_release(&RowId("wsp-1".into()), bo_holds.token).unwrap();

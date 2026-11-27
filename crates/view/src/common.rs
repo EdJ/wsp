@@ -31,6 +31,7 @@
 //! | `stage`        | `stage::of_member`'s caption with no agent looked at, `Told::json` text | [`crate::stage::stage_of`] |
 //! | `stage_steps`  | `stage::history`'s steps before the live word settles them, JSON array | [`crate::stage::stage_of`] |
 //! | `legs`         | on a staged row, `legs::json`: the legs `show --json` gives, JSON text | [`crate::task::ls_entry`] |
+//! | `for`          | the user it is allocated to, where it is (`wsp allocate`) | [`crate::task::sharing`] |
 //! | `mine`, `head_only` | on a shared row, `"true"`/`"false"` (`addon::fields_of`) | [`crate::task::ls_entry`] |
 //! | `held_by`, `held_on`, `held_until` | on a shared row where known: user, machine name, ISO 8601 UTC | [`crate::task::ls_entry`] |
 //! | `stage_live`   | on a `doing` row whose word its seat decides: `{"said": …}`, what its agent last said | [`crate::stage::stage_of`] |
@@ -86,6 +87,12 @@ pub mod key {
     pub const HELD_BY: &str = "held_by";
     pub const HELD_ON: &str = "held_on";
     pub const HELD_UNTIL: &str = "held_until";
+    /// The user a row is allocated to (`wsp allocate`), where it is; also
+    /// `ls --json`'s and `show --json`'s key ([`crate::task::sharing`]).
+    pub const FOR: &str = "for";
+    /// Not a field: `ls --json`'s and `show --json`'s key for a shared row's
+    /// `Row::workspace` (`shared:<name>`), absent on a private row.
+    pub const WORKSPACE: &str = "workspace";
     /// Every key of the shared row's facts, in the order `ls --json` adds them.
     pub const SHARED_FACTS: [&str; 5] = [MINE, HEAD_ONLY, HELD_BY, HELD_ON, HELD_UNTIL];
     /// Seat keys.
