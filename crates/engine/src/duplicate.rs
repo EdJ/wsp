@@ -103,6 +103,14 @@ pub fn names(t: &Task) -> Names {
     n
 }
 
+/// The files both rows name in their own account of the work, read as
+/// [`names`] reads them. `wsp-859`: two members of one worklist group naming
+/// one file break `wsp-068`'s rule, and the second to land is sent back on a
+/// rebase conflict; `cmd_worklist` asks this when a row joins a group.
+pub fn shared_files(a: &Task, b: &Task) -> Vec<String> {
+    names(a).files.intersection(&names(b).files).cloned().collect()
+}
+
 /// Most of the significant words the same: three or more shared, and at least
 /// 60% of the smaller title.
 fn close_titles(a: &Names, b: &Names) -> bool {

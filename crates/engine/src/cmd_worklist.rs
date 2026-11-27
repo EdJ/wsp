@@ -620,7 +620,13 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     if let Some(code) = settle_other_lists(store, args, &mut w, &members, ordinal, why.as_deref()) {
         return code;
     }
+    // `wsp-859`: said, and logged where the barrier and the governor read.
+    let same_file = same_file_pairs(store, &groups[ordinal - 1].members, &members);
+    for line in same_file_lines(&same_file) {
+        w.log(&format!("same file in group {ordinal}: {line}"));
+    }
     save(store, &mut w, &groups, "add", &format!("add {}", members.join(" ")));
+    warn_same_file(&w.id, ordinal, &same_file);
 
     if args.json() {
         println!("{}", worklist_json(store, &w));
@@ -768,6 +774,51 @@ fn resolve_members(store: &Store, typed: &[String]) -> Result<Vec<String>, i32> 
         }
     }
     Ok(out)
+}
+
+/// `wsp-859`, the plan-side half of `wsp-068`'s rule: members of one group
+/// touch disjoint files. A pair in `group` with at least one of `incoming`,
+/// each with the files both rows name ([`crate::duplicate::shared_files`], the
+/// same reading of a row's prose as a follow-up's "covers <file>"). A pair
+/// that was in the group already is not said again.
+///
+/// A warning and not a refusal: a file named is a file the row expects to
+/// touch, not one it will, and two rows may name one file and edit far parts
+/// of it. The second to land is what pays, with a rebase.
+fn same_file_pairs(store: &Store, group: &[String], incoming: &[String]) -> Vec<(String, String, Vec<String>)> {
+    let tasks: Vec<crate::model::Task> = group.iter().filter_map(|m| store.task(m)).collect();
+    let mut out = Vec::new();
+    for (i, a) in tasks.iter().enumerate() {
+        for b in &tasks[i + 1..] {
+            if !incoming.contains(&a.id) && !incoming.contains(&b.id) {
+                continue;
+            }
+            let files = crate::duplicate::shared_files(a, b);
+            if !files.is_empty() {
+                out.push((a.id.clone(), b.id.clone(), files));
+            }
+        }
+    }
+    out
+}
+
+/// What [`same_file_pairs`] found, a line a pair: `a ~ b both name f`.
+fn same_file_lines(pairs: &[(String, String, Vec<String>)]) -> Vec<String> {
+    pairs.iter().map(|(a, b, files)| format!("{a} ~ {b} both name {}", files.join(", "))).collect()
+}
+
+/// The warning, on stderr, once the edit is saved: which pair and which file,
+/// and the move that keeps the rule.
+fn warn_same_file(list: &str, ordinal: usize, pairs: &[(String, String, Vec<String>)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    eprintln!("wsp: warning — group {ordinal} of `{list}` has rows naming one file; members of one group touch disjoint files (wsp-068):");
+    for line in same_file_lines(pairs) {
+        eprintln!("     {line}");
+    }
+    let (_, second, _) = &pairs[0];
+    eprintln!("     the second to land is sent back on a rebase conflict — `wsp worklist mv {list} {second} --after {ordinal}` runs it in the group after");
 }
 
 /// Refuse a member the list already holds, naming where it is.
@@ -1191,7 +1242,13 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
         return code;
     }
     w.log(&format!("{id} → group {at}{} · by {}", if fresh { " (new)" } else { "" }, crate::cmd_message::caller(store)));
+    // `wsp-859`: a fresh group holds only this row, so only a join can pair.
+    let same_file = if fresh { Vec::new() } else { same_file_pairs(store, &groups[at - 1].members, std::slice::from_ref(&id)) };
+    for line in same_file_lines(&same_file) {
+        w.log(&format!("same file in group {at}: {line}"));
+    }
     save(store, &mut w, &groups, "mv", &format!("mv {id} to group {at}"));
+    warn_same_file(&w.id, at, &same_file);
 
     if args.json() {
         println!("{}", worklist_json(store, &w));
@@ -8369,6 +8426,70 @@ mod tests {
 
     fn groups_of(store: &Store, id: &str) -> Vec<Group> {
         store.worklist(id).expect("the list").groups()
+    }
+
+    fn list_log(store: &Store, id: &str) -> String {
+        store.worklist(id).expect("the list").section("Log").unwrap_or_default()
+    }
+
+    const HOST_TCP: &str = "Likely files: crates/wire/src/host_tcp.rs (the accept loop).";
+
+    /// `wsp-859`: two rows naming one file put in one group, by `add --group`
+    /// or by `mv --group`, are warned and logged with the file and both rows.
+    /// A warning, not a refusal: the edit goes through.
+    #[test]
+    fn rows_naming_one_file_put_in_one_group_are_warned_with_the_file_and_both_rows() {
+        let (_env, store) = running("same-file");
+        row_with(&store, "o-1", HOST_TCP);
+        row_with(&store, "o-2", "Done when: crates/wire/src/host_tcp.rs reads the port from the config.");
+        row_with(&store, "o-3", HOST_TCP);
+        assert_eq!(run(&store, &["new", "sf", "Same file"]), 0);
+        no_outputs(&store, "sf");
+        assert_eq!(run(&store, &["add", "sf", "o-1"]), 0);
+        assert_eq!(flagged(&store, &["add", "sf", "o-2"], &[("group", "1")]), 0, "warned, not refused");
+        assert_eq!(groups_of(&store, "sf")[0].members, vec!["o-1", "o-2"]);
+        let log = list_log(&store, "sf");
+        assert!(log.contains("same file in group 1: o-1 ~ o-2 both name crates/wire/src/host_tcp.rs"), "{log}");
+
+        assert_eq!(run(&store, &["add", "sf", "o-3"]), 0);
+        assert_eq!(flagged(&store, &["mv", "sf", "o-3"], &[("group", "1")]), 0);
+        let log = list_log(&store, "sf");
+        assert!(log.contains("o-1 ~ o-3 both name crates/wire/src/host_tcp.rs"), "{log}");
+        assert!(log.contains("o-2 ~ o-3 both name crates/wire/src/host_tcp.rs"), "{log}");
+        assert_eq!(log.matches("o-1 ~ o-2").count(), 1, "a pair already in the group is not said again: {log}");
+
+        // Typed together into one new group is the same thing.
+        row_with(&store, "o-4", HOST_TCP);
+        row_with(&store, "o-5", HOST_TCP);
+        assert_eq!(run(&store, &["add", "sf", "o-4", "o-5"]), 0);
+        assert!(list_log(&store, "sf").contains("same file in group 2: o-4 ~ o-5"), "{}", list_log(&store, "sf"));
+    }
+
+    /// `wsp-859`: rows with disjoint files join one group as before, and the
+    /// same two rows naming one file in consecutive groups are accepted
+    /// without a word.
+    #[test]
+    fn disjoint_rows_share_a_group_and_one_file_in_consecutive_groups_is_said_nothing_of() {
+        let (_env, store) = running("same-file-not");
+        row_with(&store, "d-1", HOST_TCP);
+        row_with(&store, "d-2", "Likely files: crates/wire/src/host_unix.rs.");
+        assert_eq!(run(&store, &["new", "dj", "Disjoint"]), 0);
+        no_outputs(&store, "dj");
+        assert_eq!(run(&store, &["add", "dj", "d-1"]), 0);
+        assert_eq!(flagged(&store, &["add", "dj", "d-2"], &[("group", "1")]), 0);
+        assert_eq!(groups_of(&store, "dj")[0].members, vec!["d-1", "d-2"]);
+        assert!(!list_log(&store, "dj").contains("same file"), "{}", list_log(&store, "dj"));
+
+        row_with(&store, "c-1", HOST_TCP);
+        row_with(&store, "c-2", HOST_TCP);
+        assert_eq!(run(&store, &["new", "cg", "Consecutive"]), 0);
+        no_outputs(&store, "cg");
+        assert_eq!(run(&store, &["add", "cg", "c-1"]), 0);
+        assert_eq!(run(&store, &["add", "cg", "c-2"]), 0);
+        assert_eq!(groups_of(&store, "cg").len(), 2, "one group each");
+        assert!(!list_log(&store, "cg").contains("same file"), "{}", list_log(&store, "cg"));
+        let shared = crate::duplicate::shared_files(&store.task("c-1").unwrap(), &store.task("c-2").unwrap());
+        assert_eq!(shared, vec!["crates/wire/src/host_tcp.rs"], "the pair does overlap; it is the groups that keep them apart");
     }
 
     /// `wsp-560`: the start names the groups a kind would narrow: not the last
