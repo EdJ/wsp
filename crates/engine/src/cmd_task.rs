@@ -3395,6 +3395,13 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // A row the shared side holds for others too: what removing it does there
+    // is said first, and done only under `--force`.
+    let removal = crate::addon::get().removing(store, &t.id);
+    if let (Some(r), false) = (&removal, args.has("force")) {
+        eprintln!("wsp: {} — pass --force to remove it", r.warning);
+        return 1;
+    }
     let filed = match store.archive_task(&t) {
         Ok(name) => name,
         Err(e) => {
@@ -3412,13 +3419,22 @@ pub fn rm(store: &Store, args: &Args) -> i32 {
     store.log_event("task-removed", json!({ "id": t.id, "project": t.project, "title": t.title }));
     store.git_commit(&format!("wsp: rm {} — {}", t.id, t.title));
     if args.json() {
-        println!("{}", json!({ "removed": t.id, "archived": true, "filed_as": filed }));
-    } else if filed == t.id {
-        println!("removed {} (archived)", t.id);
+        let mut doc = json!({ "removed": t.id, "archived": true, "filed_as": filed });
+        if let Some(r) = &removal {
+            doc["shared"] = json!(r.done);
+        }
+        println!("{doc}");
     } else {
-        // Say it rather than let it pass: the archive already held that id,
-        // which means two tasks have worn it.
-        println!("removed {} (archived as {filed} — that id was already in the archive)", t.id);
+        if filed == t.id {
+            println!("removed {} (archived)", t.id);
+        } else {
+            // Say it rather than let it pass: the archive already held that id,
+            // which means two tasks have worn it.
+            println!("removed {} (archived as {filed} — that id was already in the archive)", t.id);
+        }
+        if let Some(r) = &removal {
+            println!("{}", r.done);
+        }
     }
     0
 }
@@ -4363,7 +4379,9 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Tasks,
                 order: 380,
-                text: r##"  wsp rm <id>                       retire it to the archive"##,
+                text: r##"  wsp rm <id> [--force]             retire it to the archive; a shared row is
+                                    retired on the hub for everyone too, for good,
+                                    which --force confirms"##,
             },
         ],
     },

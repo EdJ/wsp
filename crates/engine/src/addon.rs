@@ -195,6 +195,14 @@ pub struct Lent {
     pub spool: Spool,
 }
 
+/// What removing a row (`wsp rm`) does past this machine, in words: `warning`
+/// is said before it is done (and why `--force` is asked), `done` after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal {
+    pub warning: String,
+    pub done: String,
+}
+
 /// What the shared side says of who this process is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhoAmI {
@@ -345,6 +353,14 @@ pub trait SharedWork: Send + Sync {
     /// Bring `row` whole where only a stub of it is kept here (`wsp show
     /// --fetch`): `None` for a row there is nothing to fetch for.
     fn fetch(&self, _store: &Store, _row: &str) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// What removing `row` (`wsp rm`) does past this machine, which the person
+    /// is told before it is done; `None` for a row that is this machine's
+    /// alone (standalone, private, or never shared). The removal itself is the
+    /// archive `rm` makes; the add-on follows it from there.
+    fn removing(&self, _store: &Store, _row: &str) -> Option<Removal> {
         None
     }
 

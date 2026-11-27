@@ -977,7 +977,7 @@ impl Worker {
         match crate::hub_retire::follow_retired(store, client, &hub, by) {
             Ok(lines) => {
                 for line in lines {
-                    wsp_engine::store::log_line(store, &line);
+                    self.say_once(store, line);
                 }
             }
             Err(e) => return Err(e.to_string()),
@@ -1038,6 +1038,24 @@ impl Worker {
                 }
                 Err(e) if unreachable(&e) => return Err(e.to_string()),
                 Err(e) => self.say_once(store, format!("hub-sync: rows moved here were not retired: {e}")),
+            }
+        }
+        // The rows removed here (`wsp rm`): retired on the hub with no successor.
+        if !moved_away.is_empty() {
+            let mut said = Vec::new();
+            let client = self.client()?;
+            let done = crate::hub_retire::retire_removed(store, client, ws, &hub, &mut |l| said.push(l));
+            for line in said {
+                self.say_once(store, line);
+            }
+            match done {
+                Ok(done) => {
+                    for x in done {
+                        wsp_engine::store::log_line(store, &format!("hub-sync: {x} retired on the hub (removed here), for everyone in {ws}"));
+                    }
+                }
+                Err(e) if unreachable(&e) => return Err(e.to_string()),
+                Err(e) => self.say_once(store, format!("hub-sync: rows removed here were not retired: {e}")),
             }
         }
         Ok(())

@@ -376,6 +376,21 @@ mod tests {
             self.store.renamed_ids().get(id).cloned().unwrap_or_else(|| id.to_string())
         }
 
+        /// `wsp rm <id>` (with `--force` where asked) on this spoke: the exit code.
+        fn rm(&self, id: &str, force: bool) -> i32 {
+            let _home = HubHome::at(&self.home);
+            let flags: Vec<(&str, &str)> = if force { vec![("force", "true")] } else { vec![] };
+            wsp_engine::cmd_task::rm(&self.store, &Args::synth("rm", &[id], &flags))
+        }
+
+        fn archived(&self, id: &str) -> Option<wsp_engine::model::Task> {
+            self.store.archived_tasks().into_iter().find(|t| t.id == id)
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.store.state.join("cycle.log")).unwrap_or_default()
+        }
+
         fn turn(&self) -> Result<crate::hub_sync::Turned, String> {
             let _home = HubHome::at(&self.home);
             crate::hub_sync::Worker::new(self.home.clone()).turn(&self.store)
@@ -928,6 +943,159 @@ mod tests {
         let bos = bo.store.task(&y).unwrap();
         assert_eq!((bos.title.as_str(), bos.priority_raw.as_str(), bos.project.as_deref()), ("edited by bo unsent", "high", Some("pp")), "bo's edit in y, beside ann's move");
         assert_eq!(hub_task(&hub, &tokens, "bo", &y).map(|t| t.priority_raw), Some("high".to_string()), "and on the hub");
+    }
+
+    /// Whether `shared:team` lists `id` retired with no successor (removed).
+    fn removed_on_hub(hub: &crate::testhub::TestHub, tokens: &BTreeMap<String, String>, who: &str, id: &str) -> bool {
+        let refs = hub_lease::tests::dial(hub, tokens, who).sync_heads(&wsp_objects::WorkspaceId("shared:team".into())).unwrap();
+        refs.retired.get(&Subject::Row(RowId(id.to_string()))) == Some(&None) && !refs.heads.contains_key(&Subject::Row(RowId(id.to_string())))
+    }
+
+    /// `wsp rm` of a shared row on the hub refuses without `--force`, saying
+    /// the removal is for everyone and for good; with it, the row is archived
+    /// here and retired on the hub with no successor at the next turn. The
+    /// remover keeps no stub, a stub holder drops its stub, a whole holder
+    /// archives its copy, a late joiner never sees it; a copy recovered from
+    /// the archive is never pushed under the retired id, and `show` says so.
+    #[test]
+    fn hub_rm_a_shared_row_retires_it_for_everyone() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo", "cy", "di"]) else { return };
+        let env = wsp_engine::util::isolated("hub-rm-all");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo, cy) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"), Side::new(&env, &hub, &tokens, "cy"));
+        let x = ann.add_inbox("removed for all");
+        let mut t = ann.store.task(&x).unwrap();
+        t.for_user = Some("bo".into());
+        ann.store.save_task(&t).unwrap();
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        cy.turn().unwrap();
+        assert!(!crate::hub_cache::is_head(&bo.store, &x) && crate::hub_cache::is_head(&cy.store, &x), "bo whole, cy a stub");
+
+        assert_eq!(ann.rm(&x, false), 1, "refused without --force");
+        assert!(ann.store.task(&x).is_some() && ann.archived(&x).is_none(), "nothing done");
+        assert_eq!(ann.rm(&x, true), 0);
+        assert!(ann.store.task(&x).is_none() && ann.archived(&x).is_some(), "archived here");
+        for _ in 0..2 {
+            ann.turn().unwrap();
+        }
+        assert!(removed_on_hub(&hub, &tokens, "ann", &x), "retired on the hub with no successor");
+        assert!(!ann.store.task_path(&x).exists() && !crate::hub_cache::is_head(&ann.store, &x), "no stub of it back on ann's");
+        for side in [&bo, &cy] {
+            side.turn().unwrap();
+            side.turn().unwrap();
+            assert!(!side.store.task_path(&x).exists() && !crate::hub_cache::is_head(&side.store, &x), "{}: gone", side.who);
+        }
+        assert_eq!(bo.archived(&x).map(|t| t.title), Some("removed for all".to_string()), "bo's whole copy is archived");
+        assert!(cy.archived(&x).is_none(), "cy's stub is just removed");
+        let di = Side::new(&env, &hub, &tokens, "di");
+        di.turn().unwrap();
+        assert!(!di.store.task_path(&x).exists() && di.archived(&x).is_none(), "di never sees it");
+
+        // ann recovers her archived copy by hand: it is never pushed under x.
+        let (_, path) = ann.store.archived_tasks_filed().into_iter().find(|(t, _)| t.id == x).unwrap();
+        std::fs::rename(&path, ann.store.task_path(&x)).unwrap();
+        ann.turn().unwrap();
+        ann.turn().unwrap();
+        assert!(ann.store.task_path(&x).exists(), "the recovered copy stays");
+        assert!(removed_on_hub(&hub, &tokens, "bo", &x), "and the hub still has x retired");
+        let lines = {
+            let _home = HubHome::at(&ann.home);
+            wsp_engine::addon::get().show_lines(&ann.store, &x)
+        };
+        assert!(lines.iter().any(|l| l.contains("retired on the hub")), "{lines:?}");
+    }
+
+    /// Removed while the hub does not answer: retired at reconnect.
+    #[test]
+    fn hub_rm_offline_is_retired_at_reconnect() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann"]) else { return };
+        let env = wsp_engine::util::isolated("hub-rm-offline");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let x = ann.add_inbox("removed offline");
+        ann.turn().unwrap();
+        ann.log_in_nowhere();
+        assert_eq!(ann.rm(&x, true), 0);
+        assert!(ann.turn().is_err(), "the hub does not answer");
+        ann.log_in(&hub, &tokens);
+        ann.turn().unwrap();
+        assert!(removed_on_hub(&hub, &tokens, "ann", &x));
+        assert!(!ann.store.task_path(&x).exists());
+    }
+
+    /// X leased by another user: the retire is refused `held`, waits (said),
+    /// and completes once they let go.
+    #[test]
+    fn hub_rm_a_held_row_waits_and_is_retired_once_released() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-rm-held");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let x = ann.add_inbox("held by bo");
+        ann.turn().unwrap();
+        let mut bo = hub_lease::tests::dial(&hub, &tokens, "bo");
+        let held = hub_lease::take(&mut bo, "shared:team", &x).unwrap();
+        assert_eq!(ann.rm(&x, true), 0);
+        ann.turn().unwrap();
+        ann.turn().unwrap();
+        assert!(on_hub(&hub, &tokens, "ann").contains(&x), "waits");
+        assert!(!ann.store.task_path(&x).exists() && !crate::hub_cache::is_head(&ann.store, &x), "not stubbed meanwhile");
+        let said = format!("hub-sync: {x} is removed here, but {x} is leased by bo: it is retired on the hub once they let go, and is tried again each turn");
+        assert!(ann.log().contains(&said), "{}", ann.log());
+        bo.lease_release(&RowId(x.clone()), held.token).unwrap();
+        ann.turn().unwrap();
+        assert!(removed_on_hub(&hub, &tokens, "ann", &x));
+    }
+
+    /// bo has X whole with an edit not yet sent when ann's removal arrives:
+    /// the copy, edit and all, is archived on bo's, and one line says so.
+    #[test]
+    fn hub_rm_unsent_edits_on_another_spoke_are_archived_not_lost() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-rm-unsent");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"));
+        let x = ann.add_inbox("edited then removed");
+        let mut t = ann.store.task(&x).unwrap();
+        t.for_user = Some("bo".into());
+        ann.store.save_task(&t).unwrap();
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        let mut t = bo.store.task(&x).unwrap();
+        t.priority_raw = "high".into();
+        bo.store.save_task(&t).unwrap();
+        assert_eq!(ann.rm(&x, true), 0);
+        ann.turn().unwrap();
+        assert!(removed_on_hub(&hub, &tokens, "ann", &x));
+        bo.turn().unwrap();
+        bo.turn().unwrap();
+        assert!(!bo.store.task_path(&x).exists());
+        assert_eq!(bo.archived(&x).map(|t| t.priority_raw), Some("high".to_string()), "bo's edit is in the archive");
+        let said = format!("hub-sync: {x} was removed on the hub, for everyone in shared:team; this copy had edits never sent, and they are kept in the archive here (wsp show {x})");
+        assert!(bo.log().contains(&said), "{}", bo.log());
+    }
+
+    /// A private row is removed as ever: no `--force`, nothing on the hub.
+    #[test]
+    fn hub_rm_a_private_row_pushes_nothing() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann"]) else { return };
+        let env = wsp_engine::util::isolated("hub-rm-private");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let shared = ann.add_inbox("a shared one");
+        ann.turn().unwrap();
+        let before = hub_lease::tests::dial(&hub, &tokens, "ann").sync_heads(&wsp_objects::WorkspaceId("shared:team".into())).unwrap();
+        let private = {
+            let _home = HubHome::at(&ann.home);
+            assert_eq!(wsp_engine::cmd_task::add(&ann.store, &Args::synth("add", &["mine alone"], &[])), 0);
+            ann.store.tasks().into_iter().find(|t| t.title == "mine alone").unwrap().id
+        };
+        assert_eq!(ann.rm(&private, false), 0, "no --force for a private row");
+        ann.turn().unwrap();
+        let after = hub_lease::tests::dial(&hub, &tokens, "ann").sync_heads(&wsp_objects::WorkspaceId("shared:team".into())).unwrap();
+        assert_eq!((before.heads, before.retired), (after.heads, after.retired), "nothing changed on the hub");
+        assert!(ann.store.task(&shared).is_some());
     }
 
     /// Offline, the move gives the row a provisional local id, as filing it

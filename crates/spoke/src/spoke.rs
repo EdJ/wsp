@@ -277,6 +277,10 @@ impl SharedWork for Spoke {
         Some(hub_sync::fetch(store, row))
     }
 
+    fn removing(&self, store: &Store, row: &str) -> Option<wsp_engine::addon::Removal> {
+        crate::hub_retire::removing(store, row)
+    }
+
     fn show_lines(&self, store: &Store, row: &str) -> Vec<String> {
         let head = hub_cache::show_line(store, row);
         let stale = head.is_some() && switched_off(store);
@@ -284,6 +288,7 @@ impl SharedWork for Spoke {
         if stale {
             out.push("not live: the hub connection is disabled here, so this head is as it was last synced".into());
         }
+        out.extend(crate::hub_retire::show_line(store, row));
         if crate::hub_ids::is_provisional(store, row) {
             out.push("not yet published: a local id until the hub gives this row its own, at the next connection; nothing of it is sent before then".into());
         }

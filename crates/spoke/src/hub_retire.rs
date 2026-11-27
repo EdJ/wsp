@@ -51,6 +51,21 @@
 //! merge is pushed as Y's. Where Y has edits of its own not yet sent, or the
 //! merge cannot be made, X is kept, unpushed and said. A `ref.retired` event
 //! on the stream wakes a turn.
+//!
+//! **A shared row removed** (`wsp rm`, which asks `--force` for one the hub
+//! has, [`removing`]). The row is archived here as any; a row X is then
+//! *removed away* ([`removed_away`]) when the hub has a head for it, this
+//! spoke has synced it, it has no file here, no move records it and the
+//! archive holds it. Like a move, nothing else records it: read again every
+//! turn. It is never kept as a head meanwhile, and after the push it is
+//! retired with no successor ([`retire_removed`]): `retired` forgets it here;
+//! stale is tried again next turn; `held` waits, said; any other refusal is
+//! said once and not asked again. Every spoke follows a retirement with no
+//! successor: a stub goes, a synced copy is archived as `rm` archives (an
+//! edit never sent goes into the archive with it, said in one line), and a
+//! copy the hub never had from here (one recovered from the archive by hand)
+//! stays, this machine's alone, never pushed under its id, `show` saying so
+//! ([`show_line`], from `retire.json`'s `gone`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -79,12 +94,120 @@ fn refused(store: &Store) -> BTreeMap<String, String> {
     v["refused"].as_object().into_iter().flatten().filter_map(|(k, w)| Some((k.clone(), w.as_str()?.to_string()))).collect()
 }
 
-fn refuse(store: &Store, x: &str, why: &str) {
-    let mut r = refused(store);
-    r.insert(x.to_string(), why.to_string());
+fn read_doc(store: &Store) -> Value {
+    std::fs::read_to_string(path(store)).ok().and_then(|t| serde_json::from_str(&t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}))
+}
+
+fn write_doc(store: &Store, doc: &Value) {
     let p = path(store);
     let _ = std::fs::create_dir_all(p.parent().expect("under hub/"));
-    let _ = std::fs::write(&p, json!({ "refused": r }).to_string());
+    let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, doc.to_string()).and_then(|_| std::fs::rename(&tmp, &p)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn refuse(store: &Store, x: &str, why: &str) {
+    let mut doc = read_doc(store);
+    doc["refused"][x] = json!(why);
+    write_doc(store, &doc);
+}
+
+/// The rows retired on the hub with no successor (removed) that this spoke
+/// has followed: `retire.json`'s `gone`, for `show` to say a copy here is
+/// this machine's alone.
+pub fn gone(store: &Store) -> BTreeSet<String> {
+    read_doc(store)["gone"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect()
+}
+
+fn mark_gone(store: &Store, x: &str) {
+    let mut all = gone(store);
+    if all.insert(x.to_string()) {
+        let mut doc = read_doc(store);
+        doc["gone"] = json!(all);
+        write_doc(store, &doc);
+    }
+}
+
+/// What `wsp rm` of `row` does on the hub, said before it is done: `None`
+/// for a row the hub has never had (private, provisional, never synced).
+pub fn removing(store: &Store, row: &str) -> Option<wsp_engine::addon::Removal> {
+    let t = store.task(row)?;
+    if t.workspace.is_private() || crate::hub_ids::is_provisional(store, row) || Heads::read(store).head(&self::row(row)).is_none() {
+        return None;
+    }
+    let ws = t.workspace.to_string();
+    Some(wsp_engine::addon::Removal {
+        warning: format!("{row} is shared in {ws}: removing it retires it on the hub for everyone in {ws}, and it cannot be brought back there; your archived copy stays on this machine"),
+        done: format!("{row} is retired on the hub for everyone in {ws} at the next sync; it cannot be brought back there"),
+    })
+}
+
+/// The line `wsp show` prints for a row the hub retired with no successor.
+pub fn show_line(store: &Store, row: &str) -> Option<String> {
+    gone(store).contains(row).then(|| {
+        format!("retired on the hub (removed for everyone in the workspace): this copy is this machine's alone, and is never pushed under {row}")
+    })
+}
+
+/// The rows of `hub` this spoke removed (`wsp rm`, an archive): `(X, X's hub
+/// head)` where the hub has a head for X, this spoke has synced X, X has no
+/// file here, no move records it, and the archive holds X of this workspace.
+/// Read again at every turn, like a move, so it outlasts an outage and a crash.
+pub fn removed_away(store: &Store, ws: &str, hub: &Refs) -> Vec<(String, ObjectId)> {
+    let heads = Heads::read(store);
+    let renamed = store.renamed_ids();
+    let candidates: Vec<(String, ObjectId)> = hub
+        .heads
+        .iter()
+        .filter_map(|(s, h)| match s {
+            Subject::Row(RowId(x)) => Some((x.clone(), *h)),
+            _ => None,
+        })
+        .filter(|(x, _)| !store.task_path(x).exists() && heads.head(&row(x)).is_some() && !renamed.contains_key(x))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let archived: BTreeSet<String> = store.archived_tasks().into_iter().filter(|t| t.workspace.to_string() == ws).map(|t| t.id).collect();
+    candidates.into_iter().filter(|(x, _)| archived.contains(x)).collect()
+}
+
+/// After `ws`'s push: retire each row [`removed_away`] names in `hub`, with no
+/// successor, from the hub's head. `retired` (or stale with no head) forgets
+/// it here; stale with another head is tried again next turn; `held` waits,
+/// said; any other refusal is said once and not asked again. What was retired.
+pub fn retire_removed(store: &Store, client: &mut Client, ws: &str, hub: &Refs, say: &mut dyn FnMut(String)) -> Result<Vec<String>, HubError> {
+    let wid = WorkspaceId(ws.to_string());
+    let refused_before = refused(store);
+    let mut done = Vec::new();
+    for (x, head) in removed_away(store, ws, hub) {
+        if refused_before.contains_key(&x) {
+            continue;
+        }
+        match client.refs_retire(&wid, row(&x), head, None) {
+            Ok(Ok(_)) | Ok(Err(None)) => {
+                forget(store, &x);
+                mark_gone(store, &x);
+                done.push(x);
+            }
+            Ok(Err(Some(_))) => {}
+            Err(e) if crate::hub_sync::unreachable(&e) => return Err(e),
+            Err(HubError::Refused(wsp_store_contract::Refusal::Held { holder, .. }, text)) => {
+                let who = match crate::hub_lease::other_machine(&text) {
+                    Some(m) if Some(&holder) == Some(client.by()) => format!("you on your other machine {m}"),
+                    _ => wsp_engine::door::user_of(&holder),
+                };
+                say(format!("hub-sync: {x} is removed here, but {x} is leased by {who}: it is retired on the hub once they let go, and is tried again each turn"));
+            }
+            Err(e) => {
+                let why = e.to_string();
+                say(format!("hub-sync: {x} (removed here) was not retired on the hub, and is not asked again: {why}"));
+                refuse(store, &x, &why);
+            }
+        }
+    }
+    Ok(done)
 }
 
 fn row(id: &str) -> Subject {
@@ -113,9 +236,11 @@ pub fn moved_away(store: &Store, ws: &str, hub: &Refs) -> Vec<(String, ObjectId,
     out
 }
 
-/// The subjects [`moved_away`] names, for the classification to pass over.
+/// The subjects [`moved_away`] and [`removed_away`] name, for the
+/// classification to pass over.
 pub fn skip(store: &Store, ws: &str, hub: &Refs) -> BTreeSet<Subject> {
-    moved_away(store, ws, hub).into_iter().map(|(x, _, _)| row(&x)).collect()
+    let moved = moved_away(store, ws, hub).into_iter().map(|(x, _, _)| row(&x));
+    moved.chain(removed_away(store, ws, hub).into_iter().map(|(x, _)| row(&x))).collect()
 }
 
 /// The parent Y's first record takes: the head X had, where Y is a row this
@@ -327,6 +452,45 @@ pub fn follow_retired(store: &Store, client: &mut Client, hub: &Refs, by: &Princ
         };
         let file = store.task_path(x);
         let mut keep_x = false;
+        if y.is_none() {
+            // Removed on the hub, for everyone: a stub goes, a synced copy is
+            // archived as `wsp rm` archives (unsent edits and all), and a copy
+            // the hub never had from here (one recovered from the archive)
+            // stays, this machine's alone, never pushed under X.
+            if file.exists() {
+                let heads = Heads::read(store);
+                let digest = std::fs::read(&file).ok().map(|b| ObjectId::of(&b));
+                let ws = hub.workspace.0.clone();
+                if crate::hub_cache::is_head(store, x) {
+                    let _ = std::fs::remove_file(&file);
+                    store.wrote(file.clone());
+                } else if heads.head(subject).is_some() {
+                    let unsent = heads.file(subject) != digest;
+                    match store.task(x).map(|t| store.archive_task(&t)) {
+                        Some(Ok(_)) if unsent => said.push(format!(
+                            "hub-sync: {x} was removed on the hub, for everyone in {ws}; this copy had edits never sent, and they are kept in the archive here (wsp show {x})"
+                        )),
+                        Some(Ok(_)) => said.push(format!("hub-sync: {x} was removed on the hub, for everyone in {ws}; this copy is archived here (wsp show {x})")),
+                        _ => {
+                            keep_x = true;
+                            said.push(format!("hub-sync: {x} was removed on the hub, for everyone in {ws}, but this copy could not be archived: it is kept in {x}, which is no longer pushed"));
+                        }
+                    }
+                } else {
+                    keep_x = true;
+                    said.push(format!(
+                        "hub-sync: {x} is retired on the hub (removed for everyone in {ws}); the copy here is kept on this machine and never pushed under {x}"
+                    ));
+                }
+            }
+            if keep_x {
+                crate::hub_cache::drop_head(store, x);
+            } else {
+                forget(store, x);
+            }
+            mark_gone(store, x);
+            continue;
+        }
         if file.exists() {
             let heads = Heads::read(store);
             let digest = std::fs::read(&file).ok().map(|b| ObjectId::of(&b));
