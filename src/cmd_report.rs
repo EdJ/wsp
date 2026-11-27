@@ -773,24 +773,41 @@ fn governor_wall_with(
 fn standing_seats(store: &Store, w: &Worklist, cost: &Value) -> Value {
     let groups = w.groups();
     // The stretch each seat was seated, for its memory: a governor's tenure,
-    // a check's opening to its stop.
-    let mut held: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    // a check's opening to its own session's stop.
+    let mut tenures: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for g in crate::cmd_cost::governors(store, &w.id, groups.len()) {
         let from = g.spans.iter().map(|s| s.0).min().unwrap_or(0);
         let to = if g.spans.iter().any(|s| s.1 == 0) { 0 } else { g.spans.iter().map(|s| s.1).max().unwrap_or(0) };
-        held.insert(g.seat, (from, to));
+        tenures.insert(g.seat, (from, to));
     }
-    for c in groups.iter().flat_map(|g| g.checks.iter()) {
-        let Some(pane) = c.pane.as_deref() else { continue };
-        let ended = crate::cmd_burn::reading_in(&store.state, pane).and_then(|r| r["ended"].as_str().map(util::epoch_of)).unwrap_or(0);
-        held.entry(pane.to_string()).or_insert((util::epoch_of(&c.at), ended));
-    }
+    // Per group, in the order of the cost block's `barrier` entries: pane ids
+    // are handed out again, so each check has its own window. A session never
+    // read has none; a live one has no end yet (0).
+    let sessions = crate::cmd_cost::Sessions::of(store);
+    let checked: Vec<Vec<Option<(i64, i64)>>> = groups
+        .iter()
+        .map(|g| {
+            g.checks
+                .iter()
+                .filter_map(|c| {
+                    let opened = util::epoch_of(&c.at);
+                    let reading = sessions.reading(c.pane.as_deref()?, opened);
+                    Some(reading.map(|r| (opened, r["ended"].as_str().map(util::epoch_of).unwrap_or(0))))
+                })
+                .collect()
+        })
+        .collect();
     let mut seats: Vec<Value> = Vec::new();
     for g in cost["groups"].as_array().into_iter().flatten() {
         for (role, key) in [("governor", "governor"), ("check", "barrier")] {
-            for e in g[key].as_array().into_iter().flatten().filter(|e| e["shared"] != true) {
+            for (nth, e) in g[key].as_array().into_iter().flatten().enumerate().filter(|(_, e)| e["shared"] != true) {
                 let seat = e["seat"].as_str().unwrap_or("");
-                let memory = held.get(seat).and_then(|&(from, to)| crate::memory::seat_memory(&store.state, seat, from, to));
+                let window = if role == "check" {
+                    g["group"].as_u64().and_then(|n| checked.get((n as usize).checked_sub(1)?)?.get(nth).copied().flatten())
+                } else {
+                    tenures.get(seat).copied()
+                };
+                let memory = window.and_then(|(from, to)| crate::memory::seat_memory(&store.state, seat, from, to));
                 seats.push(json!({
                     "role": role, "group": g["group"], "seat": seat,
                     "seconds": e["seconds"], "turns": e["turns"], "usd_micros": e["usd_micros"], "measured": e["measured"],
@@ -1391,6 +1408,44 @@ mod tests {
         }
         assert_eq!(t["governor_wall_windows_unread"], 1);
         assert!(v["groups"][0]["governor_wall"]["governor_to_last_start"].is_null());
+    }
+
+    /// A check seat's memory window ends with its own session, though its pane
+    /// id is handed out again days later, here to the next group's check.
+    #[test]
+    fn a_check_seats_memory_window_ends_with_its_own_session_on_a_reused_pane_id() {
+        let (env, store, mut w) = list("reuse", &["r-1", "r-2"]);
+        let t0: i64 = util::epoch_secs() - 5 * 86_400;
+        let t1 = t0 + 3 * 86_400;
+        let check = |at: i64| {
+            let mut c = crate::barrier::Check::opened(None, None);
+            c.at = util::iso_at(at);
+            c.pane = Some("cpd-7".into());
+            c
+        };
+        let mut gs = w.groups();
+        gs.truncate(1);
+        gs[0].members = vec!["r-1".into()];
+        gs.push(crate::model::Group { members: vec!["r-2".into()], ..Default::default() });
+        gs[0].checks.push(check(t0));
+        gs[1].checks.push(check(t1));
+        w.set_groups(&gs);
+        store.save_worklist(&w).unwrap();
+        let banked = |sid: &str, ended: i64| {
+            let path = env.home().join(format!("{sid}.jsonl"));
+            json!({ "seat": "cpd-7", "session_id": sid, "transcript": path.to_string_lossy(), "turns": 2, "input": 1, "output": 10, "cache_read": 0, "cache_write": 0, "cost": 1000, "ended": util::iso_at(ended) }).to_string()
+        };
+        std::fs::write(store.state_file("spent.jsonl"), format!("{}\n{}\n", banked("first", t0 + 100), banked("later", t1 + 100))).unwrap();
+        let mut mem = Value::Null;
+        for (at, mb) in [(t0 + 10, 100), (t0 + 70, 200), (t1 + 10, 400), (t1 + 70, 400)] {
+            mem = crate::memory::fold(mem, &[("cpd-7".into(), mb * 1024)], at);
+        }
+        std::fs::write(store.state_file(crate::memory::SEAT_MEMORY_FILE), mem.to_string()).unwrap();
+
+        let v = effort_with(&store, &w, None, &|_| Default::default());
+        let seats = v["totals"]["standing_seats"]["seats"].as_array().unwrap();
+        let read: Vec<(Option<u64>, Option<f64>)> = seats.iter().filter(|s| s["role"] == "check").map(|s| (s["group"].as_u64(), s["memory"]["mb_minutes"].as_f64())).collect();
+        assert_eq!(read, [(Some(1), Some(150.0)), (Some(2), Some(400.0))], "each check's own minute, not the other's: {seats:?}");
     }
 
     #[test]
