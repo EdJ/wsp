@@ -129,6 +129,8 @@ fn fill_from_seat(f: &mut crate::timeline::RowFigures, total: Option<&Value>) ->
 /// transcript's calls without a time on them — has its idle named for that, not
 /// "none recorded" (`wsp-313`): a seat that wrote 13k tokens for 28 minutes
 /// read as idle with nothing said, and the figure saying so was the wrong one.
+/// A seat named as not found is counted in `transcripts_missing` (`wsp-900`),
+/// whether or not a session was recorded for it.
 fn name_untimed(f: &mut crate::timeline::RowFigures, seat_filled: bool) {
     let why = match (seat_filled, f.untimed > 0) {
         (true, _) => crate::wallbuckets::NO_TRANSCRIPT,
@@ -139,6 +141,9 @@ fn name_untimed(f: &mut crate::timeline::RowFigures, seat_filled: bool) {
         *m = why.to_string();
     }
     f.markers.insert(0, (i64::MIN, why.to_string()));
+    if seat_filled {
+        f.missing = f.missing.max(1);
+    }
 }
 
 /// [`effort`] with the timeline figures of a row handed in, so that a test can
@@ -213,7 +218,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             if shared.as_ref().is_none_or(|s| f.shared > s.shared) {
                 shared = Some(crate::timeline::RowFigures { shared: f.shared, shared_gap: f.shared_gap, shared_waits: f.shared_waits.clone(), ..Default::default() });
             }
-            let suites = crate::throttle::full_suite_runs(&store.state, m);
+            // A run is filed under the id the seat had (`wsp-900`).
+            let suites: u64 = store.ids_had(m).iter().map(|id| crate::throttle::full_suite_runs(&store.state, id)).sum();
             gsuites += suites;
             suites_total += suites;
             let tool: i64 = f.tools.values().sum();
@@ -1659,6 +1665,8 @@ mod tests {
         let v = effort_over(&store, &w, None, &|_| f.clone(), cost);
         assert_eq!(v["groups"][0]["members"][0]["record_empty_seat_measured"], true);
         assert_eq!(reasons(&v), vec![(NO_TRANSCRIPT.to_string(), 600), ("told: the seat has the sentence".to_string(), 400)]);
+        // `wsp-900`: named as not found, so counted as not found.
+        assert_eq!((v["groups"][0]["members"][0]["transcripts_missing"].as_u64(), v["totals"]["transcripts_missing"].as_u64()), (Some(1), Some(1)));
         let wb = &v["totals"]["wall_buckets"];
         assert_eq!(wb["attributed_seconds"], wb["wall_seconds"], "{wb}");
         // Read, but its calls carry no time.
@@ -1777,6 +1785,47 @@ mod tests {
         assert_eq!(g["wall_seconds"], 3900, "{g}");
         assert_eq!(g["wall_seconds"], g["wall_buckets"]["window_seconds"]);
         assert_eq!(g["wall_seconds"], v["totals"]["wall_seconds"]);
+    }
+
+    /// `wsp-900`: a row renamed after its seat ran has its transcript under the
+    /// old id's tree and its full-suite record under the old id's name.
+    #[test]
+    fn a_renamed_row_keeps_its_transcript_and_its_full_suite_runs() {
+        let (env, store, w) = list("renamed", &["r-1"]);
+        let at = |t: i64| util::iso_at(1_790_000_000 + t);
+        let events = [(100, "task-claimed"), (400, "task-review")].map(|(t, kind)| json!({"ts": at(t), "kind": kind, "data": {"id": "r-1", "pane": "cpd-1"}}).to_string());
+        std::fs::write(store.state_file("events.jsonl"), events.join("\n") + "\n").unwrap();
+        let lines = [
+            json!({"type": "user", "timestamp": at(110), "message": {"content": "go"}}),
+            json!({"type": "assistant", "timestamp": at(130), "requestId": "q1", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}], "usage": {"input_tokens": 10, "output_tokens": 100}}}),
+            json!({"type": "user", "timestamp": at(190), "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}}),
+        ]
+        .map(|l| l.to_string());
+        let user = env.home().join("user");
+        let project = user.join(".claude/projects/-src-p--worktrees-r-1");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("s.jsonl"), lines.join("\n")).unwrap();
+        std::fs::create_dir_all(store.state.join("full-suite")).unwrap();
+        std::fs::write(store.state.join("full-suite/r-1.json"), r#"{"task":"r-1","runs":2}"#).unwrap();
+        let was_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &user);
+
+        let read = |w: &Worklist| {
+            let v = effort_with(&store, w, None, &|id| crate::timeline::row_figures(&store, id));
+            let m = v["groups"][0]["members"][0].clone();
+            (m["task"].clone(), [m["calls"].clone(), m["model_seconds"].clone(), m["tool_seconds"].clone(), m["full_suite_runs"].clone()])
+        };
+        let before = read(&w);
+        store.rename_tasks(&[("r-1".to_string(), "n-1".to_string())].into()).unwrap();
+        let after = read(&store.worklist("renamed").unwrap());
+        match was_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!((before.0, after.0), (json!("r-1"), json!("n-1")));
+        assert_eq!((&before.1[0], &before.1[1], &before.1[2]["Bash"], &before.1[3]), (&json!(1), &json!(20), &json!(60), &json!(2)));
+        assert_eq!(after.1, before.1);
     }
 
     #[test]

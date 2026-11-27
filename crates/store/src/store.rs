@@ -1744,6 +1744,16 @@ impl Store {
         map
     }
 
+    /// Every id the row now called `id` has answered to: `id` first, then each
+    /// retired one that [`Store::renamed_ids`] points at it. For what is named
+    /// by an id and left behind by a rename: a tree's directory, a record filed
+    /// under the id's name. A retired id that a task is filed under again is
+    /// left out, since what is under that name may be the other task's.
+    pub fn ids_had(&self, id: &str) -> Vec<String> {
+        let retired = self.renamed_ids().into_iter().filter(|(old, now)| now == id && self.task(old).is_none()).map(|(old, _)| old);
+        std::iter::once(id.to_string()).chain(retired).collect()
+    }
+
     /// Rename tasks wholesale, rewriting every reference to them in one pass.
     ///
     /// One pass rather than one per task, because the alternative is

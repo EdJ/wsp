@@ -2002,7 +2002,8 @@ const FOUND_SLACK: i64 = 120;
 /// names one (`wsp-313`), each with its first stamp: the burn ledger's and live
 /// record's for every pane that claimed the row (a path, else a session id), and
 /// every transcript in Claude Code's directory for the row's tree, which keeps
-/// its name after the tree is gone. [`seat_sessions`] keeps those that began
+/// its name after the tree is gone, under each id the row has had (`wsp-900`: a
+/// renamed row's tree was named for the old one). [`seat_sessions`] keeps those that began
 /// inside the seat's own span; a verifier reading the same tree began after the
 /// review and is not kept.
 fn found_transcripts(store: &Store, i: &Inputs) -> Vec<(i64, String)> {
@@ -2024,9 +2025,11 @@ fn found_transcripts(store: &Store, i: &Inputs) -> Vec<(i64, String)> {
             }
         }
     }
-    let tree = format!("/{}/{}", crate::cmd_checkout::WORKTREES, i.id);
-    for f in crate::host::LOCAL.transcripts_of_tree(&tree) {
-        add(f.to_string_lossy().to_string());
+    for id in store.ids_had(&i.id) {
+        let tree = format!("/{}/{id}", crate::cmd_checkout::WORKTREES);
+        for f in crate::host::LOCAL.transcripts_of_tree(&tree) {
+            add(f.to_string_lossy().to_string());
+        }
     }
     refs.into_iter().filter_map(|r| first_act(&r).map(|t| (t, r))).collect()
 }
