@@ -10,16 +10,17 @@
 //! seat has no cost (null, with `why`), and a group's or the list's total is
 //! what was read, marked a floor.
 //!
-//! Pane ids are handed out again, so a barrier check entry reads the session of
-//! its id that ran from the entry's opening (see `check_reading`), not the
-//! newest one.
+//! Pane ids are handed out again, so every entry, whatever its role, reads the
+//! session of its id that ran from the entry's opening (see [`Sessions`]), not
+//! the newest one. An entry is *shared* only where its seat was still in a
+//! session already counted when it opened.
 //!
 //! **A governor counts in full toward the group the run stood at when it was
 //! seated** (wsp-264): one plus the highest `passed` of the list's earlier
 //! `worklist-go` events. A pass short of the end rotates in a fresh seat, so
 //! each seat governs one group; burn is whole-session and cannot be split.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -57,7 +58,7 @@ pub struct Entry {
     pub dropped: bool,
     /// A verifier pass whose seat is the list's governor, counted there.
     pub by_governor: bool,
-    /// A pane that served an earlier attempt too: counted at the first.
+    /// Its seat's session was already counted at an earlier entry.
     pub shared: bool,
     pub through: Option<usize>,
     pub fig: Fig,
@@ -96,8 +97,8 @@ fn of_clause(ran: &str, s: &crate::agent_kind::Spend, turns: usize, seconds: Opt
 }
 
 /// The figures for a seat: its reading, else the clause, else unmeasured.
-fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, seconds: Option<i64>) -> Fig {
-    if let Some(r) = crate::cmd_burn::reading(seat) {
+fn fig_of(reading: Option<Value>, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, seconds: Option<i64>) -> Fig {
+    if let Some(r) = reading {
         return of_reading(&r, clause.map_or(0, |c| c.2), seconds);
     }
     match clause {
@@ -106,58 +107,138 @@ fn fig_of(seat: &str, clause: Option<(&str, &crate::agent_kind::Spend, usize)>, 
     }
 }
 
-/// When each pane id is next heard of, as `(epoch, pane)`: every use of a seat
-/// the store records (a check entry, an attempt, a verifier pass, a governor's
-/// seating) and every `sweep: forgot` line, which says the seat before it is
-/// gone. Ids are handed out again, so these bound a check entry's session.
-fn pane_uses(store: &Store) -> Vec<(i64, String)> {
-    let mut out: Vec<(i64, String)> = Vec::new();
-    let mut put = |at: &str, pane: &str| out.push((util::epoch_of(at), pane.to_string()));
-    for c in store.worklists().iter().flat_map(|w| w.groups()).flat_map(|g| g.checks) {
-        if let Some(pane) = c.pane.as_deref() {
-            put(&c.at, pane);
-        }
-    }
-    // Archived rows too: a pane id's next use bounds a check entry's session
-    // whether or not the row that used it has been filed since (`wsp-901`).
-    for t in store.tasks().into_iter().chain(store.archived_tasks()) {
-        for a in attempts_of(&t) {
-            put(&a.at, &a.pane);
-        }
-        for p in crate::verification::passes(&t) {
-            if let Some(pane) = p.pane.as_deref() {
-                put(&p.at, pane);
-            }
-        }
-    }
-    let events = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
-    for v in events.lines().filter(|l| l.contains("governor-set")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
-        if v["kind"] == "governor-set" {
-            put(v["ts"].as_str().unwrap_or(""), v["data"]["workspace"].as_str().unwrap_or(""));
-        }
-    }
-    let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
-    for (at, rest) in cycle.lines().filter_map(|l| l.split_once(" sweep: forgot ")) {
-        for pane in rest.split_once(": ").map_or("", |r| r.1).split_whitespace() {
-            put(at, pane);
-        }
-    }
-    out
+/// One use of a pane id, as the store records it.
+struct Use {
+    at: i64,
+    pane: String,
+    /// Whose seat: `row:<id>`, `verify:<id>`, `check:<opened>` or
+    /// `gov:<project>`. `None` is a `sweep: forgot` line: the seat before it is
+    /// gone.
+    holder: Option<String>,
 }
 
-/// A check entry's own reading: the session of its pane id that started at or
-/// after the entry opened and ended before the id's next use. The first such
-/// ledger line; else, while the id has not been used again, the live record.
-/// `None` is unmeasured: another session's figures are never read for it.
-fn check_reading(store: &Store, pane: &str, opened: i64, uses: &[(i64, String)]) -> Option<Value> {
-    let next = uses.iter().filter(|(t, p)| *t > opened && p == pane).map(|u| u.0).min();
-    let own = |r: &Value| session_start(r).is_none_or(|t| t >= opened);
-    let banked = crate::cmd_burn::ledger_lines(&store.state, pane).into_iter().find(|l| {
-        let ended = util::epoch_of(l["ended"].as_str().unwrap_or(""));
-        ended >= opened && next.is_none_or(|n| ended <= n) && own(l)
-    });
-    // A live record carries no `ended`; `reading_in` falls back to the ledger.
-    banked.or_else(|| crate::cmd_burn::reading_in(&store.state, pane).filter(|r| next.is_none() && r.get("ended").is_none() && own(r)))
+/// **A seat entry's own session**, for every role and every reader. Pane ids
+/// are handed out again, so a reading by id alone is the newest seat's; this
+/// one is tied to when the entry opened.
+pub(crate) struct Sessions {
+    state: std::path::PathBuf,
+    /// Every use of a seat the store records: a check entry, an attempt, a
+    /// verifier pass, a governor's seating, a `sweep: forgot` line.
+    uses: Vec<Use>,
+    /// Each governor's seating, as `(epoch, pane, project)`.
+    seated: Vec<(i64, String, String)>,
+}
+
+impl Sessions {
+    pub(crate) fn of(store: &Store) -> Sessions {
+        let mut uses: Vec<Use> = Vec::new();
+        let mut seated = Vec::new();
+        let mut put = |at: &str, pane: &str, holder: Option<String>| uses.push(Use { at: util::epoch_of(at), pane: pane.to_string(), holder });
+        for c in store.worklists().iter().flat_map(|w| w.groups()).flat_map(|g| g.checks) {
+            if let Some(pane) = c.pane.as_deref() {
+                put(&c.at, pane, Some(format!("check:{}", c.at)));
+            }
+        }
+        // Archived rows too: a pane id's next use bounds an entry's session
+        // whether or not the row that used it has been filed since (`wsp-901`).
+        for t in store.tasks().into_iter().chain(store.archived_tasks()) {
+            for a in attempts_of(&t) {
+                put(&a.at, &a.pane, Some(format!("row:{}", t.id)));
+            }
+            for p in crate::verification::passes(&t) {
+                if let Some(pane) = p.pane.as_deref() {
+                    put(&p.at, pane, Some(format!("verify:{}", t.id)));
+                }
+            }
+        }
+        let events = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap_or_default();
+        for v in events.lines().filter(|l| l.contains("governor-set")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+            if v["kind"] == "governor-set" {
+                let (at, pane) = (v["ts"].as_str().unwrap_or(""), v["data"]["workspace"].as_str().unwrap_or(""));
+                let project = v["data"]["project"].as_str().unwrap_or("");
+                put(at, pane, Some(format!("gov:{project}")));
+                seated.push((util::epoch_of(at), pane.to_string(), project.to_string()));
+            }
+        }
+        let cycle = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
+        for (at, rest) in cycle.lines().filter_map(|l| l.split_once(" sweep: forgot ")) {
+            for pane in rest.split_once(": ").map_or("", |r| r.1).split_whitespace() {
+                put(at, pane, None);
+            }
+        }
+        let mut s = Sessions { state: store.state.clone(), uses, seated };
+        // What a governor's seat claims or verifies while it lives is the
+        // governor's own use of its id, not a reuse.
+        let theirs: Vec<(usize, String)> = s
+            .uses
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.holder.as_deref().is_some_and(|h| h.starts_with("row:") || h.starts_with("verify:")))
+            .filter_map(|(i, u)| s.governed(&u.pane, u.at).map(|p| (i, format!("gov:{p}"))))
+            .collect();
+        for (i, holder) in theirs {
+            s.uses[i].holder = Some(holder);
+        }
+        s
+    }
+
+    /// The project `pane`'s seat governed at `at`: its latest seating by then,
+    /// with nothing since saying that seat had gone.
+    fn governed(&self, pane: &str, at: i64) -> Option<&str> {
+        let (set, _, project) = self.seated.iter().filter(|s| s.1 == pane && s.0 <= at).max_by_key(|s| s.0)?;
+        let within = |t: i64| t > *set && t <= at;
+        let gone = self.uses.iter().any(|u| u.pane == pane && within(u.at) && u.holder.as_deref().is_none_or(|h| h.starts_with("check:")))
+            || crate::cmd_burn::ledger_lines(&self.state, pane).iter().any(|l| within(ended_of(l).unwrap_or(0)));
+        (!gone).then_some(project.as_str())
+    }
+
+    /// The reading of the entry that opened on `pane` at `opened` (epoch): the
+    /// session of that id that started at or after then and ended before the
+    /// id's next reuse, which is a use by another holder than the entry's. The
+    /// first such ledger line; else, while the id has not been reused, the live
+    /// record. `None` is unmeasured: another session's figures are never read
+    /// for it.
+    pub(crate) fn reading(&self, pane: &str, opened: i64) -> Option<Value> {
+        let own_uses: Vec<&Option<String>> = self.uses.iter().filter(|u| u.pane == pane && u.at == opened).map(|u| &u.holder).collect();
+        let next = self
+            .uses
+            .iter()
+            .filter(|u| u.pane == pane && u.at > opened && (u.holder.is_none() || !own_uses.contains(&&u.holder)))
+            .map(|u| u.at)
+            .min();
+        let own = |r: &Value| session_start(r).is_none_or(|t| t >= opened);
+        let banked = crate::cmd_burn::ledger_lines(&self.state, pane).into_iter().find(|l| {
+            let ended = ended_of(l).unwrap_or(0);
+            ended >= opened && next.is_none_or(|n| ended <= n) && own(l)
+        });
+        // A live record carries no `ended`; `reading_in` falls back to the ledger.
+        banked.or_else(|| crate::cmd_burn::reading_in(&self.state, pane).filter(|r| next.is_none() && r.get("ended").is_none() && own(r)))
+    }
+}
+
+/// When a ledger line's session ended; `None` on a live record.
+fn ended_of(r: &Value) -> Option<i64> {
+    r.get("ended").and_then(Value::as_str).map(util::epoch_of).filter(|t| *t > 0)
+}
+
+/// The sessions counted so far, by pane: each from the opening of the entry that
+/// read it to its end (a live one has none yet).
+#[derive(Default)]
+struct Counted(BTreeMap<String, Vec<(i64, i64)>>);
+
+impl Counted {
+    /// The reading for `e`, opened at `opened`; marks it shared, and reads
+    /// nothing, where its seat was still in a session already counted.
+    fn read(&mut self, sessions: &Sessions, e: &mut Entry, opened: i64) -> Option<Value> {
+        let seen = self.0.entry(e.seat.clone()).or_default();
+        if seen.iter().any(|&(from, to)| from <= opened && opened < to) {
+            e.shared = true;
+            return None;
+        }
+        let r = sessions.reading(&e.seat, opened)?;
+        seen.push((opened, ended_of(&r).unwrap_or(i64::MAX)));
+        Some(r)
+    }
 }
 
 /// The first stamp in the transcript a reading names, by path or session id.
@@ -170,8 +251,7 @@ fn session_start(r: &Value) -> Option<i64> {
 /// first stamp in its transcript, else the check's opening) to its end (when the
 /// ledger says `stop()` banked it, else now while its seat still runs).
 fn check_seconds(r: &Value, opened: i64) -> Option<i64> {
-    let ended = r.get("ended").and_then(Value::as_str).map(util::epoch_of).filter(|t| *t > 0);
-    let end = ended.unwrap_or_else(util::epoch_secs);
+    let end = ended_of(r).unwrap_or_else(util::epoch_secs);
     let start = session_start(r).unwrap_or(opened);
     (start > 0 && end >= start).then_some(end - start)
 }
@@ -260,7 +340,8 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
     let w = store.worklist(slug)?;
     let groups = w.groups();
     let mut out: Vec<Entry> = Vec::new();
-    let mut counted: BTreeSet<String> = BTreeSet::new();
+    let sessions = Sessions::of(store);
+    let mut counted = Counted::default();
     let entry = |group: usize, member: Option<&str>, role: &'static str, seat: &str| Entry {
         group,
         member: member.map(str::to_string),
@@ -274,25 +355,20 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
         through: None,
         fig: Fig::default(),
     };
-    let mut gov_seats: BTreeSet<String> = BTreeSet::new();
-    for GovSeat { seat, group: g, through, seconds, .. } in governors(store, slug, groups.len()) {
-        counted.insert(seat.clone());
-        gov_seats.insert(seat.clone());
+    for GovSeat { seat, group: g, through, seconds, spans } in governors(store, slug, groups.len()) {
         let mut e = entry(g, None, "governor", &seat);
         e.through = through;
-        e.fig = fig_of(&seat, None, Some(seconds));
+        let r = counted.read(&sessions, &mut e, spans.first().map_or(0, |s| s.0));
+        e.fig = fig_of(r, None, Some(seconds));
         out.push(e);
     }
-    let checked = groups.iter().any(|g| g.checks.iter().any(|c| c.pane.is_some()));
-    let uses = if checked { pane_uses(store) } else { Vec::new() };
     for (i, g) in groups.iter().enumerate() {
         for c in &g.checks {
             let Some(pane) = c.pane.as_deref() else { continue };
             let mut e = entry(i + 1, None, "barrier", pane);
             e.tier = c.on.clone().unwrap_or_default();
-            e.shared = !counted.insert(pane.to_string());
             let opened = util::epoch_of(&c.at);
-            if let Some(r) = (!e.shared).then(|| check_reading(store, pane, opened, &uses)).flatten() {
+            if let Some(r) = counted.read(&sessions, &mut e, opened) {
                 e.fig = of_reading(&r, 0, check_seconds(&r, opened));
             }
             out.push(e);
@@ -309,13 +385,15 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             let seconds = p.decided.as_deref().map_or(0, |d| (util::epoch_of(d) - util::epoch_of(&p.at)).max(0));
             let mut e = entry(*gi, Some(&t.id), "verifier", pane);
             e.tier = p.spent.as_ref().map_or_else(|| p.on.clone().unwrap_or_default(), |s| s.ran.clone());
-            if gov_seats.contains(pane) {
+            let opened = util::epoch_of(&p.at);
+            if sessions.governed(pane, opened) == Some(slug) {
                 e.by_governor = true;
-            } else if !counted.insert(pane.to_string()) {
-                e.shared = true;
             } else {
-                let clause = p.spent.as_ref().map(|s| (s.ran.as_str(), &s.spend, s.turns));
-                e.fig = fig_of(pane, clause, Some(seconds));
+                let r = counted.read(&sessions, &mut e, opened);
+                if !e.shared {
+                    let clause = p.spent.as_ref().map(|s| (s.ran.as_str(), &s.spend, s.turns));
+                    e.fig = fig_of(r, clause, Some(seconds));
+                }
             }
             out.push(e);
         }
@@ -336,10 +414,11 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             e.dropped = a.outcome.as_str() == "dropped";
             if a.pane.is_empty() {
                 e.fig = of_clause(&a.ran, &a.spend, a.turns, Some(a.seconds()));
-            } else if counted.insert(a.pane.clone()) {
-                e.fig = fig_of(&a.pane, Some((&a.ran, &a.spend, a.turns)), Some(a.seconds()));
             } else {
-                e.shared = true;
+                let r = counted.read(&sessions, &mut e, util::epoch_of(&a.at));
+                if !e.shared {
+                    e.fig = fig_of(r, Some((&a.ran, &a.spend, a.turns)), Some(a.seconds()));
+                }
             }
             out.push(e);
         }
@@ -578,15 +657,17 @@ pub fn cost(store: &Store, args: &Args, slug: &str) -> i32 {
     0
 }
 
-/// A task's verifier passes as `attempts --json` rows, `role: "verifier"`.
-pub fn verifier_rows(t: &crate::model::Task) -> Vec<Value> {
-    crate::verification::passes(t)
+/// The tasks' verifier passes as `attempts --json` rows, `role: "verifier"`.
+pub fn verifier_rows(tasks: &[crate::model::Task]) -> Vec<Value> {
+    let sessions = Sessions::of(&Store::open());
+    tasks
         .iter()
-        .filter_map(|p| {
+        .flat_map(|t| crate::verification::passes(t).into_iter().map(move |p| (t, p)))
+        .filter_map(|(t, p)| {
             let pane = p.pane.as_deref()?;
             let seconds = p.decided.as_deref().map_or(0, |d| (util::epoch_of(d) - util::epoch_of(&p.at)).max(0));
             let clause = p.spent.as_ref().map(|s| (s.ran.as_str(), &s.spend, s.turns));
-            let f = fig_of(pane, clause, Some(seconds));
+            let f = fig_of(sessions.reading(pane, util::epoch_of(&p.at)), clause, Some(seconds));
             Some(json!({
                 "task": t.id, "role": "verifier", "leg": null, "at": p.at, "pane": pane,
                 "ran_at": p.spent.as_ref().map(|s| s.ran.clone()).unwrap_or_default(),
@@ -649,8 +730,13 @@ mod tests {
     }
 
     fn verifier(store: &Store, id: &str, pane: &str) {
+        verifier_at(store, id, &util::now_iso(), pane);
+    }
+
+    fn verifier_at(store: &Store, id: &str, at: &str, pane: &str) {
         let mut t = store.find_task(id).unwrap();
         let mut p = crate::verification::Pass::opened(None, None);
+        p.at = at.into();
         p.pane = Some(pane.into());
         let mut all = crate::verification::passes(&t);
         all.push(p);
@@ -764,7 +850,7 @@ mod tests {
             banked(&env.state(), seat, output);
         }
         claims(&store, "m-1", &[("cpd-751", true), ("cpd-760", true)]);
-        verifier(&store, "m-1", "cpd-758");
+        verifier_at(&store, "m-1", "2026-10-18T02:40:00Z", "cpd-758");
         let j = cost_json("run", &entries(&store, "run").unwrap(), 2);
         let m = &j["groups"][0]["members"][0];
         let got: Vec<_> = m["seats"].as_array().unwrap().iter().map(|s| (s["role"].as_str().unwrap(), s["measured"] == true, s["input_tokens"].as_u64(), s["output_tokens"].as_u64(), s["usd_micros"].as_u64())).collect();
@@ -944,5 +1030,82 @@ mod tests {
         let mut t = store.find_task(id).unwrap();
         t.body = format!("## Log\n- {at} claimed by pane {pane}\n");
         store.save_task(&t).unwrap();
+    }
+
+    /// `(seat, shared, by_governor, measured, usd)` of every entry of `role`.
+    fn read_as(es: &[Entry], role: &str) -> Vec<(String, bool, bool, bool, Option<u64>)> {
+        es.iter().filter(|e| e.role == role).map(|e| (e.seat.clone(), e.shared, e.by_governor, e.fig.measured, e.fig.usd)).collect()
+    }
+
+    fn own(seat: &str, usd: u64) -> (String, bool, bool, bool, Option<u64>) {
+        (seat.to_string(), false, false, true, Some(usd))
+    }
+
+    fn unread(seat: &str) -> (String, bool, bool, bool, Option<u64>) {
+        (seat.to_string(), false, false, false, None)
+    }
+
+    /// `wsp-940`: a member's seat, then another row's verifier on its id.
+    #[test]
+    fn a_member_and_a_later_verifier_on_one_pane_id_each_read_their_own_session() {
+        let (env, store) = fixture("cost-two-roles");
+        claims_at(&store, "m-1", "2026-11-17T10:00:00Z", "cpd-7");
+        verifier_at(&store, "m-2", "2026-11-23T10:00:00Z", "cpd-7");
+        ledger(&env.state(), &[spent("cpd-7", "2026-11-17T10:30:00Z", 5, 100), spent("cpd-7", "2026-11-23T10:30:00Z", 6, 900)]);
+        let es = entries(&store, "run").unwrap();
+        assert_eq!(read_as(&es, "worker"), [own("cpd-7", 100)]);
+        assert_eq!(read_as(&es, "verifier"), [own("cpd-7", 900)]);
+        assert_eq!(Sum::of(es.iter()).usd, 1_000);
+        let rows = verifier_rows(&[store.find_task("m-2").unwrap()]);
+        assert_eq!(rows[0]["usd_micros"], 900);
+    }
+
+    /// Its own line lost: neither the later seat's line nor its live record.
+    #[test]
+    fn an_entry_on_a_reused_id_with_no_session_of_its_own_is_unmeasured() {
+        let (env, store) = fixture("cost-lost");
+        let st = env.state();
+        claims_at(&store, "m-1", "2026-11-17T10:00:00Z", "cpd-7");
+        verifier_at(&store, "m-1", "2026-11-17T11:00:00Z", "cpd-8");
+        claims_at(&store, "m-2", "2026-11-23T10:00:00Z", "cpd-7");
+        verifier_at(&store, "m-2", "2026-11-23T11:00:00Z", "cpd-8");
+        ledger(&st, &[spent("cpd-7", "2026-11-23T10:30:00Z", 6, 900), spent("cpd-8", "2026-11-23T11:30:00Z", 6, 800)]);
+        seat(&st, "cpd-7", 30, 5);
+        let es = entries(&store, "run").unwrap();
+        assert_eq!(read_as(&es, "worker"), [unread("cpd-7"), own("cpd-7", 900)]);
+        assert_eq!(read_as(&es, "verifier"), [unread("cpd-8"), own("cpd-8", 800)]);
+        let rows = verifier_rows(&[store.find_task("m-1").unwrap()]);
+        assert_eq!(rows[0]["usd_micros"], Value::Null);
+    }
+
+    /// A governor's id and a check's id handed out again once the seat had gone.
+    #[test]
+    fn a_governor_and_a_second_check_on_a_reused_id_are_not_shared() {
+        let (env, store) = fixture("cost-gov-reused");
+        let st = env.state();
+        std::fs::write(st.join("events.jsonl"), json!({ "kind": "governor-set", "ts": "2026-11-17T09:00:00Z", "data": { "project": "run", "workspace": "cpd-1" } }).to_string() + "\n").unwrap();
+        verifier_at(&store, "m-1", "2026-11-23T10:00:00Z", "cpd-1");
+        checked(&store, &[("2026-11-17T12:00:00Z", "cpd-2"), ("2026-11-23T12:00:00Z", "cpd-2")]);
+        ledger(&st, &[
+            spent("cpd-1", "2026-11-17T18:00:00Z", 9, 100),
+            spent("cpd-1", "2026-11-23T10:30:00Z", 6, 200),
+            spent("cpd-2", "2026-11-17T12:30:00Z", 3, 300),
+            spent("cpd-2", "2026-11-23T12:30:00Z", 4, 400),
+        ]);
+        let es = entries(&store, "run").unwrap();
+        assert_eq!(read_as(&es, "governor"), [own("cpd-1", 100)]);
+        assert_eq!(read_as(&es, "verifier"), [own("cpd-1", 200)]);
+        assert_eq!(read_as(&es, "barrier"), [own("cpd-2", 300), own("cpd-2", 400)]);
+    }
+
+    /// One session that took its row twice is counted once.
+    #[test]
+    fn a_second_claim_inside_one_session_is_shared() {
+        let (env, store) = fixture("cost-reclaim");
+        claims(&store, "m-1", &[("cpd-7", true), ("cpd-7", false)]);
+        ledger(&env.state(), &[spent("cpd-7", "2026-10-18T05:00:00Z", 5, 100)]);
+        let es = entries(&store, "run").unwrap();
+        assert_eq!(read_as(&es, "worker"), [own("cpd-7", 100)]);
+        assert!(es.iter().any(|e| e.role == "rework" && e.shared), "{es:?}");
     }
 }

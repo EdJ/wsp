@@ -337,9 +337,7 @@ fn attempt_rows(store: &Store, tasks: &[Task]) -> Vec<Attempt> {
 /// The objects `--json` prints: the attempts, then each task's verifier passes.
 fn attempts_objects(rows: &[Attempt], tasks: &[Task]) -> Vec<serde_json::Value> {
     let mut out = attempts_json(rows);
-    for t in tasks {
-        out.extend(crate::cmd_cost::verifier_rows(t));
-    }
+    out.extend(crate::cmd_cost::verifier_rows(tasks));
     out
 }
 
