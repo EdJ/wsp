@@ -282,7 +282,7 @@ impl SharedWork for Spoke {
     }
 
     fn show_lines(&self, store: &Store, row: &str) -> Vec<String> {
-        let head = hub_cache::show_line(store, row);
+        let head = hub_cache::show_line(store, row, self.row_facts(store).get(row));
         let stale = head.is_some() && switched_off(store);
         let mut out: Vec<String> = head.into_iter().chain(hub_journal::show_line(store, row)).collect();
         if stale {

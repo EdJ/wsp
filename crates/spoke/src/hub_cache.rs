@@ -326,10 +326,17 @@ pub fn classify(
 }
 
 /// The line `show` prints for a row kept as a head, `None` for any other.
-pub fn show_line(store: &Store, row: &str) -> Option<String> {
+/// Who holds it is the row's facts' (`facts`: `held_by`, `held_on`, the
+/// lease as last heard, [`crate::spoke::Spoke::row_facts`]), as `show --json`
+/// and the feed say it, not the seat the hub's record names (`Head::holder`).
+pub fn show_line(store: &Store, row: &str, facts: Option<&wsp_engine::addon::RowFacts>) -> Option<String> {
     let cache = Cache::read(store);
     let h = cache.get(row)?;
-    let holder = h.holder.as_deref().unwrap_or("nobody");
+    let holder = match facts.and_then(|f| f.held_by.as_deref().map(|u| (u, f.held_on.as_deref()))) {
+        Some((user, Some(machine))) => format!("{user} on {machine}"),
+        Some((user, None)) => user.to_string(),
+        None => "nobody".to_string(),
+    };
     let alloc = h.allocation.as_deref().unwrap_or("nobody");
     Some(format!(
         "head only: {} · {} · held by {holder} · allocated to {alloc} — the hub holds the rest; `wsp show {row} --fetch` brings it whole",
@@ -396,9 +403,35 @@ mod tests {
         let h = Cache::read(&store);
         assert_eq!(h.get("wsp-7").map(|h| (h.title.as_str(), h.allocation.as_deref())), Some(("Someone else's work", Some("bob"))));
         assert!(wsp_engine::door::pending(&store).is_empty(), "a head is not pushed back");
-        assert!(show_line(&store, "wsp-7").unwrap().contains("--fetch"));
+        assert!(show_line(&store, "wsp-7", None).unwrap().contains("--fetch"));
         assert!(!is_own(&store, &h, "ann", "wsp-7", Some("bob")), "bob's, not ann's");
         assert!(is_own(&store, &h, "bob", "wsp-7", Some("bob")), "allocated to bob: his");
+    }
+
+    /// `wsp show` of a head-only row names its holder as the row's facts do
+    /// (`held_by`, `held_on`: the lease the stream last said), not the seat
+    /// the record names: a row bo leases on box-b is "held by bo on box-b",
+    /// and one nobody is known to hold is "held by nobody", as `held_by` null.
+    #[test]
+    fn a_head_only_rows_show_line_names_the_holder_its_facts_name() {
+        use wsp_engine::addon::SharedWork;
+        let (_env, store) = scratch("hc-held");
+        let mut cache = Cache::default();
+        keep_head(&store, &mut cache, &record("wsp-7", "Bo's work", None), "shared:mp", ObjectId::of(b"h7"), &ann()).unwrap();
+        keep_head(&store, &mut cache, &record("wsp-9", "Nobody's", None), "shared:mp", ObjectId::of(b"h9"), &ann()).unwrap();
+        crate::hub_holders::follow(
+            &store,
+            wsp_store_contract::EventKind::LeaseTaken,
+            &serde_json::json!({ "workspace": "shared:mp", "row": "wsp-7", "holder": { "person": "bo" }, "token": 3, "expires": 4_000_000_000_000i64, "cause": "take", "machine": { "id": "m-b", "name": "box-b" } }),
+        );
+        let spoke = crate::spoke::Spoke::new();
+        let facts = spoke.row_facts(&store);
+        assert_eq!((facts["wsp-7"].held_by.as_deref(), facts["wsp-7"].held_on.as_deref(), facts["wsp-7"].head_only), (Some("bo"), Some("box-b"), true));
+        let said = spoke.show_lines(&store, "wsp-7").join("\n");
+        assert!(said.contains("head only: shared:mp · todo · held by bo on box-b · allocated to nobody"), "{said}");
+        assert_eq!(facts["wsp-9"].held_by, None);
+        let said = spoke.show_lines(&store, "wsp-9").join("\n");
+        assert!(said.contains("· held by nobody ·"), "{said}");
     }
 
     /// The whole row is written over the stub by the door, then the cache
@@ -427,7 +460,7 @@ mod tests {
         drop_head(&store, "wsp-8");
         assert!(!Cache::read(&store).is_head("wsp-8"));
         assert_eq!(Heads::read(&store).head(&Subject::Row(RowId("wsp-8".into()))), Some(&wsp_objects::encode(&obj).0));
-        assert!(show_line(&store, "wsp-8").is_none());
+        assert!(show_line(&store, "wsp-8", None).is_none());
         assert!(wsp_engine::door::pending(&store).is_empty(), "the import is nothing to push back");
     }
 

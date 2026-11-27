@@ -1939,7 +1939,7 @@ mod tests {
         assert!(worker.fetch(&ann, "wsp-1").is_err(), "the hub went away mid-fetch");
         assert!(ann.task("wsp-1").is_some(), "the row is still there");
         assert!(hub_cache::is_head(&ann, "wsp-1"), "still a head, as `show` says");
-        assert!(hub_cache::show_line(&ann, "wsp-1").is_some());
+        assert!(hub_cache::show_line(&ann, "wsp-1", None).is_some());
     }
 
     // ---- messages through the hub (wsp-470) ----
