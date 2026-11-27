@@ -759,6 +759,177 @@ mod tests {
         assert!(heads.contains(&y) && !heads.contains(&x), "{heads:?}");
     }
 
+    /// The task the hub's head of row `id` in `shared:team` carries, if it has one.
+    fn hub_task(hub: &crate::testhub::TestHub, tokens: &BTreeMap<String, String>, who: &str, id: &str) -> Option<wsp_engine::model::Task> {
+        let mut c = hub_lease::tests::dial(hub, tokens, who);
+        let refs = c.sync_heads(&wsp_objects::WorkspaceId("shared:team".into())).unwrap();
+        let head = *refs.heads.get(&Subject::Row(RowId(id.to_string())))?;
+        let blob = c.sync_get(vec![head]).unwrap().into_iter().next()?;
+        match wsp_objects::decode(&blob.bytes).ok()? {
+            wsp_objects::Object::Record { entity: wsp_store_contract::Entity::Row(r), .. } => wsp_engine::door::task_of_record(&r),
+            _ => None,
+        }
+    }
+
+    /// ann files X for bo, and both take it (bo whole); ann moves X to Y and
+    /// renames it, while bo raises X's priority and pushes first. The move
+    /// must not lose bo's change: Y ends with ann's title and bo's priority,
+    /// on the hub and on both spokes, and X is retired. The move's own status
+    /// change is merged as a divergence merges one made without the lease.
+    #[test]
+    fn hub_retire_a_change_pushed_to_the_moved_row_before_the_movers_turn_reaches_its_new_id() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-theirs");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"));
+        let x = ann.add_inbox("moved while bo edits");
+        let mut t = ann.store.task(&x).unwrap();
+        t.for_user = Some("bo".into());
+        ann.store.save_task(&t).unwrap();
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        assert!(!crate::hub_cache::is_head(&bo.store, &x) && bo.store.task(&x).is_some(), "bo has x whole");
+
+        let y = ann.mv_to_pp(&x);
+        let mut t = ann.store.task(&y).unwrap();
+        t.title = "renamed by ann".into();
+        ann.store.save_task(&t).unwrap();
+        let mut t = bo.store.task(&x).unwrap();
+        t.priority_raw = "high".into();
+        bo.store.save_task(&t).unwrap();
+        bo.turn().unwrap();
+        assert_eq!(hub_task(&hub, &tokens, "bo", &x).map(|t| t.priority_raw), Some("high".to_string()), "bo's change is on the hub");
+
+        for _ in 0..3 {
+            ann.turn().unwrap();
+        }
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&y) && !heads.contains(&x), "x retired: {heads:?}");
+        let mine = ann.store.task(&y).unwrap();
+        assert_eq!((mine.title.as_str(), mine.priority_raw.as_str(), mine.project.as_deref()), ("renamed by ann", "high", Some("pp")), "both sides' changes in y on ann's");
+        // Filing out of the inbox moved the status (inbox to todo) without the
+        // row's lease: as in any divergence, the hub's status is kept and the
+        // spoke's is noted, the row flagged for the person.
+        assert_eq!(mine.status_raw, "inbox", "the hub's status kept");
+        assert!(mine.tags.iter().any(|g| g == crate::reconcile::FLAG), "{:?}", mine.tags);
+        let log = mine.section("Log").unwrap_or_default();
+        assert!(log.contains("conflict: status moved here without the hub's lease; kept the hub's (\"inbox\"); this spoke had \"todo\""), "{log}");
+        assert!(!log.contains("conflict: title") && !log.contains("conflict: priority"), "the disjoint fields merged clean: {log}");
+        let on = hub_task(&hub, &tokens, "ann", &y).unwrap();
+        assert_eq!((on.title.as_str(), on.priority_raw.as_str()), ("renamed by ann", "high"), "and on the hub");
+        for _ in 0..2 {
+            bo.turn().unwrap();
+        }
+        assert!(!bo.store.task_path(&x).exists(), "no x on bo's");
+        let bos = bo.store.task(&y).unwrap();
+        assert_eq!((bos.title.as_str(), bos.priority_raw.as_str()), ("renamed by ann", "high"), "and on bo's");
+    }
+
+    /// As above, but bo pushes between ann's sync and her retire, so the hub
+    /// answers the retire `stale` with bo's head; and both changed the title.
+    /// bo's change reaches Y as a divergence's does: the hub's title kept, ann's
+    /// written into Y's log as a conflict note, Y tagged `conflict`.
+    #[test]
+    fn hub_retire_a_change_pushed_to_the_moved_row_during_the_movers_turn_is_merged_as_a_divergence() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-stale");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let bo = std::rc::Rc::new(Side::new(&env, &hub, &tokens, "bo"));
+        let x = ann.add_inbox("moved while bo edits");
+        let mut t = ann.store.task(&x).unwrap();
+        t.for_user = Some("bo".into());
+        ann.store.save_task(&t).unwrap();
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        assert!(!crate::hub_cache::is_head(&bo.store, &x), "bo has x whole");
+
+        let y = ann.mv_to_pp(&x);
+        let mut t = ann.store.task(&y).unwrap();
+        t.title = "ann's title".into();
+        ann.store.save_task(&t).unwrap();
+        // bo's edit reaches the hub after ann's sync read the heads, before her retire.
+        let (bo_in, x_in) = (bo.clone(), x.clone());
+        let mut fired = false;
+        let mut worker = crate::hub_sync::Worker::new(ann.home.clone());
+        worker.seam = Some(Box::new(move |_: &Store, step: &str| {
+            if step != "synced" || fired {
+                return;
+            }
+            fired = true;
+            let mut t = bo_in.store.task(&x_in).unwrap();
+            t.title = "bo's title".into();
+            t.priority_raw = "high".into();
+            bo_in.store.save_task(&t).unwrap();
+            bo_in.turn().unwrap();
+        }));
+        {
+            let _home = HubHome::at(&ann.home);
+            worker.turn(&ann.store).unwrap();
+        }
+        assert_eq!(hub_task(&hub, &tokens, "ann", &x).map(|t| t.title), Some("bo's title".to_string()), "bo pushed during ann's turn");
+        for _ in 0..3 {
+            ann.turn().unwrap();
+        }
+        let heads = on_hub(&hub, &tokens, "ann");
+        assert!(heads.contains(&y) && !heads.contains(&x), "x retired: {heads:?}");
+        let mine = ann.store.task(&y).unwrap();
+        assert_eq!((mine.title.as_str(), mine.priority_raw.as_str(), mine.project.as_deref()), ("bo's title", "high", Some("pp")), "the hub's title kept, bo's priority taken");
+        assert!(mine.tags.iter().any(|g| g == crate::reconcile::FLAG), "flagged: {:?}", mine.tags);
+        let log = mine.section("Log").unwrap_or_default();
+        assert!(log.contains("conflict: title changed here and on the hub; kept the hub's") && log.contains("ann's title"), "ann's title kept in the log: {log}");
+        let on = hub_task(&hub, &tokens, "ann", &y).unwrap();
+        assert_eq!((on.title.as_str(), on.priority_raw.as_str()), ("bo's title", "high"), "and on the hub");
+        assert!(on.section("Log").unwrap_or_default().contains("ann's title"), "the note reaches the hub");
+    }
+
+    /// bo has X whole and Y too (the retire waited on a lease bo held from a
+    /// client of its own), then
+    /// raises X's priority and has not synced it when the retirement arrives.
+    /// The edit is not left behind in X: it reaches Y, on bo's and the hub.
+    #[test]
+    fn hub_retire_unsent_edits_to_the_old_id_reach_the_new_id_already_here() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-retire-unsent");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let (ann, bo) = (Side::new(&env, &hub, &tokens, "ann"), Side::new(&env, &hub, &tokens, "bo"));
+        let x = ann.add_inbox("edited by bo unsent");
+        let mut t = ann.store.task(&x).unwrap();
+        t.for_user = Some("bo".into());
+        ann.store.save_task(&t).unwrap();
+        ann.turn().unwrap();
+        bo.turn().unwrap();
+        let mut holder = hub_lease::tests::dial(&hub, &tokens, "bo");
+        let held = hub_lease::take(&mut holder, "shared:team", &x).unwrap();
+        let y = ann.mv_to_pp(&x);
+        ann.turn().unwrap();
+        ann.turn().unwrap();
+        assert!(on_hub(&hub, &tokens, "ann").contains(&x), "the retire waits on the lease");
+        bo.turn().unwrap();
+        bo.turn().unwrap();
+        assert!(bo.store.task(&y).is_some() && !crate::hub_cache::is_head(&bo.store, &y), "bo has y whole");
+        assert!(bo.store.task(&x).is_some(), "and x");
+
+        let mut t = bo.store.task(&x).unwrap();
+        t.priority_raw = "high".into();
+        bo.store.save_task(&t).unwrap();
+        holder.lease_release(&RowId(x.clone()), held.token).unwrap();
+        // bo's spoke wrote X on the hub meanwhile: ann takes that into Y, then retires X.
+        ann.turn().unwrap();
+        ann.turn().unwrap();
+        assert!(!on_hub(&hub, &tokens, "ann").contains(&x), "x retired: {}", std::fs::read_to_string(ann.store.state.join("cycle.log")).unwrap_or_default());
+
+        for _ in 0..3 {
+            bo.turn().unwrap();
+        }
+        let log = std::fs::read_to_string(bo.store.state.join("cycle.log")).unwrap_or_default();
+        assert!(!log.contains("bring them over by hand"), "{log}");
+        assert!(!bo.store.task_path(&x).exists(), "no x left on bo's");
+        let bos = bo.store.task(&y).unwrap();
+        assert_eq!((bos.title.as_str(), bos.priority_raw.as_str(), bos.project.as_deref()), ("edited by bo unsent", "high", Some("pp")), "bo's edit in y, beside ann's move");
+        assert_eq!(hub_task(&hub, &tokens, "bo", &y).map(|t| t.priority_raw), Some("high".to_string()), "and on the hub");
+    }
+
     /// Offline, the move gives the row a provisional local id, as filing it
     /// would: never pushed under it, and renamed to a hub id at reconnect.
     #[test]

@@ -557,7 +557,7 @@ pub struct Worker {
     /// A test's look at the store between the steps of one workspace's sync,
     /// by the step's name: what a reader of the files sees there.
     #[cfg(test)]
-    seam: Option<Box<dyn FnMut(&Store, &str)>>,
+    pub(crate) seam: Option<Box<dyn FnMut(&Store, &str)>>,
 }
 
 impl Worker {
@@ -973,8 +973,14 @@ impl Worker {
         };
         // Retirements the hub lists, followed (stubs go, X -> Y recorded),
         // and the rows this spoke moved away, which are not kept as heads.
-        for line in crate::hub_retire::follow_retired(store, &hub) {
-            wsp_engine::store::log_line(store, &line);
+        let client = self.client()?;
+        match crate::hub_retire::follow_retired(store, client, &hub, by) {
+            Ok(lines) => {
+                for line in lines {
+                    wsp_engine::store::log_line(store, &line);
+                }
+            }
+            Err(e) => return Err(e.to_string()),
         }
         let moved_away = crate::hub_retire::skip(store, ws, &hub);
         let retired = crate::hub_retire::retired(&hub);
