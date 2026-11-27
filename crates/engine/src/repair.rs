@@ -4823,6 +4823,7 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
 
     /// Two roots: the row's branch in the first is level with its trunk, and its
     /// work is a commit on the second's branch of the same name.
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
     fn work_in_a_second_repo(env: &util::Isolated, store: &Store) -> (std::path::PathBuf, String) {
         let first = env.path("repo");
         let other = env.path("other");
