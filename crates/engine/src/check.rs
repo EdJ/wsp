@@ -2373,7 +2373,8 @@ pub enum Settled {
     Passed,
     /// Failed, and the row was at review: it is back at `doing`.
     SentBack,
-    /// Failed, and the row was not at review: recorded, nobody moved.
+    /// Failed, and the row was not at review, or the verifier's hold had
+    /// already weighed the red ([`weighed_by_hold`]): recorded, nobody moved.
     Failed,
     /// A step could not start: the line is wrong, not the work, so the row is
     /// recorded and left where it is, and its owner is asked to fix the line.
@@ -2388,9 +2389,34 @@ pub enum Settled {
     Lost,
 }
 
+/// Whether a red at `read` is one the verifier's hold already weighed
+/// (`compound-react-121`): the newest pass holds that commit, as read or as
+/// landed, and every red step's command had failed in the last run at the commit
+/// the pass read, before it decided. `this` is the running entry's stamp. A red
+/// the hold did not see, one the rebase brought in, is not weighed.
+fn weighed_by_hold(t: &Task, runs: &[Run], this: &str, read: &str, ran: &[Ran]) -> bool {
+    let Some(pass) = v::passes(t).pop().filter(|p| p.state == v::State::Holds) else { return false };
+    if !pass.landed.as_deref().or(pass.own()).is_some_and(|c| v::same_commit(c, read)) {
+        return false;
+    }
+    let decided = pass.decided.as_deref().map(util::epoch_of);
+    let seen = |r: &&Run| {
+        r.at != this
+            && decided.is_none_or(|d| util::epoch_of(&r.at) <= d)
+            && r.read.as_deref().is_some_and(|x| [pass.read.as_deref(), pass.own()].into_iter().flatten().any(|c| v::same_commit(x, c)))
+    };
+    let Some(before) = runs.iter().rev().find(seen).filter(|r| r.state == RunState::Failed) else { return false };
+    // By command, not name: a label is often rewritten to name the red.
+    ran.iter().filter(|r| r.done.is_red()).all(|r| {
+        let command = format!(" · {} · ", r.step.command.lines().next().unwrap_or_default());
+        before.text.lines().any(|l| l.starts_with("✗ ") && l.contains(&command))
+    })
+}
+
 /// Write the outcome over its `running` entry — and, when it failed on a row at
 /// review, send the row back in the same write, so no reader ever sees a failed
-/// landing as finished.
+/// landing as finished. A red the verifier's hold already weighed sends nothing
+/// back ([`weighed_by_hold`]).
 pub fn settle(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration) -> Settled {
     settle_started(store, id, at, ran, took, None)
 }
@@ -2455,6 +2481,12 @@ fn settle_loaded(store: &Store, id: &str, at: &str, ran: &[Ran], took: Duration,
         } else if state == RunState::Waiting {
             t.updated = util::now_iso();
             t.log(&format!("wsp: check {WAITING}{} — the row stays where it is", busy.as_deref().unwrap_or_default()));
+        } else if state == RunState::Failed && t.status() == Status::Review && weighed_by_hold(&t, &runs, at, read.as_deref().unwrap_or_default(), ran) {
+            t.updated = util::now_iso();
+            t.log(&format!(
+                "wsp: check red at {}, as the verifier's hold had already weighed — the row stays at review",
+                read.as_deref().unwrap_or_default()
+            ));
         } else if state == RunState::Failed && t.status() == Status::Review {
             let mut owes = owed(ran, read.as_deref().unwrap_or_default());
             if !earlier.is_empty() && ran.iter().any(|r| matches!(r.done, Done::Failed { timed_out: true, .. })) {
@@ -4733,6 +4765,38 @@ mod tests {
         let run = &v::runs(&t)[0];
         assert_eq!(run.state, RunState::Failed);
         assert!(run.text.contains("✗ tests · sh check.sh · 2s · exit 7") && run.text.contains("  | boom"), "{}", run.text);
+    }
+
+    #[test]
+    fn a_hold_weighs_only_the_reds_that_had_failed_at_the_commit_it_read() {
+        let (_env, store, sha) = world("weighed", "- tests: sh check.sh", "exit 7\n");
+        let red = |command: &str| {
+            vec![Ran {
+                step: Step { name: "tests, red from one".into(), command: command.into(), limit: DEFAULT_LIMIT, of: Of::Project, on: Vec::new(), barrier: false, end: false },
+                done: Done::Failed { exit: Some(7), timed_out: false },
+                took: Duration::from_secs(2),
+                tail: String::new(),
+                first: None,
+                reused: None,
+                build: None,
+                via: None,
+            }]
+        };
+        let read: String = sha.chars().take(12).collect();
+        let landed = "ddde618483b4";
+        let mut t = store.find_task("pj-001").unwrap();
+        let before = Run { at: "2026-01-01T00:00:00Z".into(), state: RunState::Failed, read: Some(read.clone()), took: Some(2), text: "✗ tests · sh check.sh · 2s · exit 7".into() };
+        v::save_runs(&store, &mut t, &[before]).unwrap();
+        let mut pass = v::Pass::opened(Some(read), None);
+        (pass.state, pass.decided, pass.landed) = (v::State::Holds, Some("2026-01-01T00:05:00Z".into()), Some(landed.into()));
+        v::write(&mut t, &[pass]);
+        store.save_task(&t).unwrap();
+
+        let at = begin(&store, "pj-001", landed, 3600, false).unwrap();
+        assert_eq!(settle(&store, "pj-001", &at, &red("sh check.sh"), Duration::ZERO), Settled::Failed);
+        assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Review);
+        let at = begin(&store, "pj-001", landed, 3600, true).unwrap();
+        assert_eq!(settle(&store, "pj-001", &at, &red("sh other.sh"), Duration::ZERO), Settled::SentBack, "a red the hold did not see");
     }
 
     fn timed_out() -> Vec<Ran> {

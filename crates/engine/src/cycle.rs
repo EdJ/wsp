@@ -8259,6 +8259,48 @@ fn only_a_working_screen_is_ever_overruled() {
         let _ = spawned();
     }
 
+    /// `compound-react-121`: a hold over a red row check lands the row rebased,
+    /// so the gate checks a commit with no run of its own. The same red there
+    /// sends nothing back and starts no seat.
+    #[test]
+    fn a_hold_over_a_red_check_is_not_sent_back_by_the_check_of_what_it_landed() {
+        let r = run_ready("e2e-override", "", "g", "h");
+        let mut m = r.store.find_task("m-1").unwrap();
+        m.body.push_str("\n## Checks\n- web: test ! -f g\n");
+        r.store.save_task(&m).unwrap();
+        let run_check = || {
+            let run = crate::verification::runs(&r.store.find_task("m-1").unwrap()).pop().unwrap();
+            let args = crate::base::args::Args::synth("check", &["m-1"], &[("auto", "true"), ("run", &run.at)]);
+            assert_eq!(crate::check::check(&r.store, &args), 1, "red");
+        };
+        step(&r.store, &r.w, &Blind);
+        run_check();
+        // Sent back once, and back at review with the red answered.
+        let mut m = r.store.find_task("m-1").unwrap();
+        assert_eq!(m.status(), Status::Doing);
+        m.set_status(Status::Review);
+        r.store.save_task(&m).unwrap();
+        step(&r.store, &r.w, &Blind);
+        r.commit_on_trunk("other", "theirs\n");
+        r.verdict("holds");
+        let landed = crate::repair::landed(&r.store.find_task("m-1").unwrap()).unwrap();
+        assert_eq!(r.trunk(), landed);
+        assert!(r.latest().landed.is_some(), "landed at a commit the pass did not read");
+        let _ = spawned();
+
+        step(&r.store, &r.w, &Blind);
+        run_check();
+        step(&r.store, &r.w, &Blind);
+        let m = r.store.find_task("m-1").unwrap();
+        assert_eq!(m.status(), Status::Review, "{}", m.body);
+        let run = crate::verification::runs(&m).pop().unwrap();
+        assert_eq!(run.state, crate::verification::RunState::Failed, "the red is still recorded");
+        assert!(landed.starts_with(run.read.as_deref().unwrap()), "of the landed commit");
+        assert_eq!(m.section("Log").unwrap().matches(SENT_BACK).count(), 1, "only the one before the hold: {}", m.body);
+        let seats = spawned();
+        assert!(!seats.iter().any(|(id, _)| id == "m-1"), "no seat for nothing to land: {seats:?}");
+    }
+
     /// Blocks: the verdict sends the row back and nothing reaches the trunk.
     #[test]
     fn a_block_on_a_ready_member_leaves_the_trunk_as_it_was() {
