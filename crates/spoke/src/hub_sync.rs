@@ -63,9 +63,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::hub_client::{self, Client, Credential, Feed, Item, ObjectSource, SyncError, SyncReport, HUBS_FILE};
-use wsp_hub_protocol::{Answer, Blob, Call, HubMessage, Move, MsgSend, NoArgs, Outcome, RefMove, Verb};
+use wsp_hub_protocol::{Blob, HubMessage, Move, MsgSend, RefMove};
 use wsp_objects::{Object, ObjectId, Refs, WorkspaceId};
-use wsp_store_contract::{At, Entity, EventId, EventKind, ListId, Principal, RowId, Subject, Token, UserName};
+use wsp_store_contract::{At, Entity, EventId, EventKind, ListId, Principal, RowId, Subject, Token};
 
 use wsp_engine::door::{user_of, Applied, Door, Heads, Refusal};
 use crate::hub_cache::{self, Cache, Stream};
@@ -800,23 +800,16 @@ impl Worker {
         Ok(told)
     }
 
-    /// The user this connection is, the hub's event head now, and the shared
-    /// workspaces the user is a member of (`state`'s identity domain). A hub
+    /// The hub's event head now, and the shared workspaces the user is a
+    /// member of: the state the hub's stream opens with, which the hub scopes
+    /// to the user ([`crate::hub_members`], kept in `members.json`). Not the
+    /// `state` verb, which is an admin's and refused to anyone else. A hub
     /// that will not say leaves the workspaces to the stream's.
-    fn members(&mut self) -> Result<(Vec<String>, u64), String> {
+    fn members(&mut self, store: &Store) -> Result<(Vec<String>, u64), String> {
         let client = self.client()?;
         let head = client.head().0;
-        let me = user_of(client.by());
-        let reply = client.request(Call::Verb(Verb::State(NoArgs {}))).map_err(|e| e.to_string())?;
-        let Outcome::Ok(Answer::State { state, at }) = reply.outcome else { return Ok((Vec::new(), head)) };
-        let user = UserName(me);
-        let names = state
-            .members
-            .iter()
-            .filter(|(w, users)| users.contains(&user) && state.workspaces.contains_key(*w))
-            .map(|(w, _)| format!("shared:{}", w.0))
-            .collect();
-        Ok((names, at.0))
+        let names = crate::hub_members::refresh(store, client).map(|m| m.workspaces.into_iter().collect()).unwrap_or_default();
+        Ok((names, head))
     }
 
     /// Subscribe to the hub's stream where there is no feed: from the position
@@ -827,7 +820,7 @@ impl Worker {
         if self.feed.is_some() {
             return Ok(());
         }
-        let (names, head) = self.members()?;
+        let (names, head) = self.members(store)?;
         let mut stream = Stream::read(store);
         stream.workspaces.extend(names);
         let (from, gap) = hub_cache::resume(stream.position, head);
@@ -1578,6 +1571,26 @@ fn hub_head_in(received: &[Blob], subject: &Subject) -> Option<ObjectId> {
 mod tests {
     use super::*;
     use crate::testhub::{Setup, TestHub};
+
+    /// The workspaces a worker opens its stream for are the user's, read as an
+    /// ordinary user reads them: the hub's `state` verb is an admin's and is
+    /// refused `forbidden` to anyone else, so an ordinary user must not be
+    /// told it is a member of nothing.
+    #[test]
+    fn hub_members_an_ordinary_user_s_worker_knows_its_workspaces() {
+        let Some(hub) = TestHub::start(Setup::default()) else { return };
+        let tokens = hub.seed(&["team", "other"], &[("ann", &["team"])]);
+        let env = wsp_engine::util::isolated("hub-sync-members");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let home = env.path("ann-home");
+        hub.login(&home, "ann", &tokens["ann"]);
+        let mut worker = Worker::new(home);
+        let (names, head) = worker.members(&store).unwrap();
+        assert_eq!(names, vec!["shared:team".to_string()], "ann's workspaces, not none and not the other");
+        assert!(head > 0, "the hub's head");
+        assert_eq!(crate::hub_members::Members::read(&store).map(|m| m.workspaces.into_iter().collect::<Vec<_>>()), Some(names), "and kept");
+    }
 
     /// wsp-484: a worker that lost `minted` (the daemon restarted with the
     /// journal not yet pushed) takes the journaled record for the unchanged
