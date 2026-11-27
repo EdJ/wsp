@@ -861,6 +861,8 @@ impl Worker {
                     if e.kind == EventKind::LeaseExpired {
                         crate::hub_lease::follow_expired(store, &e.payload);
                     }
+                    // Who holds what, for the rows' facts (`hub_holders`).
+                    crate::hub_holders::follow(store, e.kind, &e.payload);
                     // A message queued for this user (wsp-470): take it now.
                     if e.kind == EventKind::OrderQueued && me.is_some() && e.payload.get("user").and_then(|u| u.as_str()) == me.as_deref() {
                         woke = true;
@@ -1571,6 +1573,86 @@ fn hub_head_in(received: &[Blob], subject: &Subject) -> Option<ObjectId> {
 mod tests {
     use super::*;
     use crate::testhub::{Setup, TestHub};
+    use serde_json::json;
+
+    /// The rows' facts the desktop reads, from what this spoke heard and keeps:
+    /// a row bo leases on his machine reads `held_by` bo, `held_on` his
+    /// machine and `held_until`, heard on ann's stream with no dial of its own;
+    /// a row ann leases here is `mine` and held here; a row allocated to ann
+    /// is `mine`; a head-only row says so; a private row carries none of it.
+    /// `wsp show --json` says the same of one row.
+    #[test]
+    fn hub_facts_the_feed_rows_say_who_holds_a_row_where_and_until_when_head_only_and_mine() {
+        use wsp_engine::model::{Status, Task};
+        let Some(hub) = TestHub::start(Setup::default()) else { return };
+        let tokens = hub.seed_members(&["team"], &["ann", "bo"]);
+        let env = wsp_engine::util::isolated("hub-facts");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let (ann_home, bo_home) = (env.path("ann-home"), env.path("bo-home"));
+        hub.login(&ann_home, "ann", &tokens["ann"]);
+        let was = (std::env::var_os(hub_client::HUB_HOME_ENV), std::env::var_os("HOSTNAME"));
+        let set = |home: &std::path::Path, host: &str| {
+            std::env::set_var(hub_client::HUB_HOME_ENV, home);
+            std::env::set_var("HOSTNAME", host);
+        };
+        for (id, ws, for_user) in [("wsp-1", "shared:team", None), ("wsp-2", "shared:team", Some("ann")), ("wsp-3", "", None), ("wsp-4", "shared:team", None), ("wsp-5", "shared:team", None)] {
+            let mut t = Task::new(id, id);
+            t.set_status(Status::Todo);
+            if !ws.is_empty() {
+                t.workspace = ws.parse().unwrap();
+            }
+            t.for_user = for_user.map(str::to_string);
+            store.save_task(&t).unwrap();
+        }
+        // wsp-5 is kept as the hub's head only.
+        std::fs::create_dir_all(store.state.join("hub")).unwrap();
+        std::fs::write(
+            store.state.join("hub").join("heads.json"),
+            serde_json::json!({ "wsp-5": { "workspace": "shared:team", "head": "sha256:00", "title": "wsp-5", "status": "todo" } }).to_string(),
+        )
+        .unwrap();
+
+        set(&ann_home, "box-a");
+        let mut worker = Worker::new(ann_home.clone());
+        worker.open_feed(&store).unwrap();
+        // ann leases wsp-4 here, as `wsp start` does.
+        let held = crate::hub_lease::before_claim(&store, "wsp-4").unwrap().expect("a lease");
+        set(&bo_home, "box-b");
+        let mut bo = hub.client(&tokens["bo"]);
+        let bo_holds = crate::hub_lease::take(&mut bo, "shared:team", "wsp-1").unwrap();
+        set(&ann_home, "box-a");
+        worker.listen(&store, Duration::from_secs(3));
+
+        let _addon = wsp_engine::addon::scoped(std::sync::Arc::new(crate::spoke::Spoke::new()));
+        let rows = wsp_engine::mirror::rows_state(&store, "here").rows;
+        let f = |id: &str, k: &str| rows[&RowId(id.into())].fields.get(k).cloned();
+        assert_eq!((f("wsp-1", "held_by"), f("wsp-1", "held_on"), f("wsp-1", "mine")), (Some("bo".into()), Some("box-b".into()), Some("false".into())));
+        assert_eq!(f("wsp-1", "held_until"), Some(wsp_engine::util::iso_at(bo_holds.expires)));
+        assert_eq!((f("wsp-4", "held_by"), f("wsp-4", "held_on"), f("wsp-4", "mine")), (Some("ann".into()), Some("box-a".into()), Some("true".into())));
+        assert_eq!(f("wsp-4", "held_until"), Some(wsp_engine::util::iso_at(held.expires)));
+        assert_eq!((f("wsp-2", "mine"), f("wsp-2", "held_by")), (Some("true".into()), None), "allocated to ann");
+        assert_eq!((f("wsp-5", "head_only"), f("wsp-1", "head_only")), (Some("true".into()), Some("false".into())));
+        for k in ["mine", "head_only", "held_by", "held_on", "held_until"] {
+            assert_eq!(f("wsp-3", k), None, "a private row: {k}");
+        }
+        let shown = wsp_engine::cmd_task::show_json(&store, "wsp-1").unwrap();
+        assert_eq!((shown["held_by"].clone(), shown["held_on"].clone(), shown["mine"].clone(), shown["head_only"].clone()), (json!("bo"), json!("box-b"), json!(false), json!(false)));
+        assert_eq!(shown["held_until"], json!(wsp_engine::util::iso_at(bo_holds.expires)));
+        assert!(wsp_engine::cmd_task::show_json(&store, "wsp-3").unwrap().get("mine").is_none());
+
+        // bo lets go: heard, and the row is free.
+        bo.lease_release(&RowId("wsp-1".into()), bo_holds.token).unwrap();
+        worker.listen(&store, Duration::from_secs(3));
+        let rows = wsp_engine::mirror::rows_state(&store, "here").rows;
+        assert_eq!(rows[&RowId("wsp-1".into())].fields.get("held_by"), None);
+        for (k, v) in [(hub_client::HUB_HOME_ENV, was.0), ("HOSTNAME", was.1)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 
     /// The workspaces a worker opens its stream for are the user's, read as an
     /// ordinary user reads them: the hub's `state` verb is an admin's and is

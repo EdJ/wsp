@@ -847,6 +847,16 @@ pub fn show_json(store: &Store, needle: &str) -> Result<Value, String> {
     if let Some(u) = &t.for_user {
         v["for"] = Value::String(u.clone());
     }
+    // A shared row: what the shared-work add-on knows of it here (who holds
+    // it, whether it is a head only, whether it is mine), as the feed's row has it.
+    if !t.workspace.is_private() {
+        let addon = crate::addon::get();
+        let f = addon.row_facts(store).remove(&t.id).unwrap_or_default();
+        let mine = crate::addon::mine(&f, t.for_user.as_deref(), addon.user().as_deref());
+        for (k, val) in crate::addon::json_of(&f, mine) {
+            v[k] = val;
+        }
+    }
     // Both ends of a follow-up (`wsp-345`), each only where there is one, so a
     // row that has neither prints what it did.
     if let Some(f) = &t.found_by {

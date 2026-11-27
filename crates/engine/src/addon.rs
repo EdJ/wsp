@@ -80,6 +80,72 @@ pub struct Elsewhere {
     pub lists: BTreeMap<String, String>,
 }
 
+/// What the add-on knows of one shared row here without dialling: who holds
+/// its lease (a user, the machine where known, until when), whether that is
+/// this user on this machine, and whether the row is kept here only as the
+/// shared side's head (a stub `wsp show --fetch` brings whole). Plain data,
+/// engine-agnostic: the feed's row fields and `show --json` are made from it
+/// ([`fields_of`], [`json_of`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RowFacts {
+    /// The user whose lease holds the row, as last heard.
+    pub held_by: Option<String>,
+    /// The name of the machine that holds it, where the shared side said.
+    pub held_on: Option<String>,
+    /// When that lease runs out, epoch seconds, where known.
+    pub held_until: Option<i64>,
+    /// Leased by this user on this machine.
+    pub held_here: bool,
+    /// Kept here as the shared side's head only, not whole.
+    pub head_only: bool,
+}
+
+/// "Mine", defined once: a shared row leased by this user on this machine, or
+/// allocated (`for`) to this user (`user`, the add-on's [`SharedWork::user`]).
+pub fn mine(facts: &RowFacts, for_user: Option<&str>, user: Option<&str>) -> bool {
+    facts.held_here || (for_user.is_some_and(|f| !f.is_empty()) && for_user == user)
+}
+
+/// A shared row's facts as the feed row's string fields: `mine` and
+/// `head_only` (`"true"`/`"false"`) always, `held_by`, `held_on` and
+/// `held_until` (ISO 8601 UTC) where known.
+pub fn fields_of(facts: &RowFacts, mine: bool) -> Vec<(&'static str, String)> {
+    let mut out = vec![(FIELD_MINE, mine.to_string()), (FIELD_HEAD_ONLY, facts.head_only.to_string())];
+    if let Some(u) = &facts.held_by {
+        out.push((FIELD_HELD_BY, u.clone()));
+    }
+    if let Some(m) = &facts.held_on {
+        out.push((FIELD_HELD_ON, m.clone()));
+    }
+    if let Some(t) = facts.held_until {
+        out.push((FIELD_HELD_UNTIL, crate::util::iso_at(t)));
+    }
+    out
+}
+
+/// The same facts as `show --json`'s keys: `mine` and `head_only` booleans,
+/// `held_by`, `held_on`, `held_until` strings or `null`.
+pub fn json_of(facts: &RowFacts, mine: bool) -> Vec<(&'static str, Value)> {
+    vec![
+        (FIELD_MINE, Value::Bool(mine)),
+        (FIELD_HEAD_ONLY, Value::Bool(facts.head_only)),
+        (FIELD_HELD_BY, facts.held_by.clone().map(Value::String).unwrap_or(Value::Null)),
+        (FIELD_HELD_ON, facts.held_on.clone().map(Value::String).unwrap_or(Value::Null)),
+        (FIELD_HELD_UNTIL, facts.held_until.map(|t| Value::String(crate::util::iso_at(t))).unwrap_or(Value::Null)),
+    ]
+}
+
+/// The feed row's field and `show --json`'s key: see [`mine`].
+pub const FIELD_MINE: &str = "mine";
+/// The feed row's field and `show --json`'s key: kept as a head only.
+pub const FIELD_HEAD_ONLY: &str = "head_only";
+/// The feed row's field and `show --json`'s key: the user holding the lease.
+pub const FIELD_HELD_BY: &str = "held_by";
+/// The feed row's field and `show --json`'s key: the holding machine's name.
+pub const FIELD_HELD_ON: &str = "held_on";
+/// The feed row's field and `show --json`'s key: when the lease runs out.
+pub const FIELD_HELD_UNTIL: &str = "held_until";
+
 /// A message leaving this machine for another user's: the address it is for
 /// (`to`), who sends it (`from`, an address or `wsp`), the sending seat's pane
 /// when a seat sends it, the words, and the id of the message it replies to.
@@ -173,6 +239,19 @@ pub trait SharedWork: Send + Sync {
     /// `parent` is the row's parent, when it has one.
     fn new_row_id(&self, _store: &Store, _project: Option<&str>, _workspace: &WorkspaceId, _parent: Option<&str>) -> Result<Option<String>, String> {
         Ok(None)
+    }
+
+    /// What is known here, without dialling, of each shared row the add-on
+    /// knows something of, by row ([`RowFacts`]). Empty standalone.
+    fn row_facts(&self, _store: &Store) -> BTreeMap<String, RowFacts> {
+        BTreeMap::new()
+    }
+
+    /// A number that changes whenever [`SharedWork::row_facts`] may answer
+    /// otherwise (its files' times, say): the feed re-reads its rows when it
+    /// moves, as it does when a row's file does. 0 standalone.
+    fn facts_stamp(&self, _store: &Store) -> u64 {
+        0
     }
 
     /// A short word `wsp ls` puts after a row's title, by row: what the add-on

@@ -948,8 +948,31 @@ fn row_half(store: &Store, tasks: &[Task], worklists: &[Worklist]) -> Vec<Entity
             }
         }
     }
+    shared_facts(store, tasks, &mut out);
     out.extend(claims(&claims_file));
     out
+}
+
+/// The shared-work add-on's facts on each shared row ([`crate::addon::RowFacts`]):
+/// `mine`, `head_only`, and `held_by`/`held_on`/`held_until` where known, as
+/// row fields. A private row carries none of them. Only the feed's rows: the
+/// row a hub is sent ([`shared_row`]) is the file and nothing of this spoke's.
+fn shared_facts(store: &Store, tasks: &[Task], out: &mut [Entity]) {
+    let addon = crate::addon::get();
+    let facts = addon.row_facts(store);
+    let user = addon.user();
+    let for_user: BTreeMap<&str, Option<&str>> = tasks.iter().map(|t| (t.id.as_str(), t.for_user.as_deref())).collect();
+    for e in out.iter_mut() {
+        let Entity::Row(r) = e else { continue };
+        if r.workspace.is_private() {
+            continue;
+        }
+        let f = facts.get(&r.id.0).cloned().unwrap_or_default();
+        let mine = crate::addon::mine(&f, for_user.get(r.id.0.as_str()).copied().flatten(), user.as_deref());
+        for (k, v) in crate::addon::fields_of(&f, mine) {
+            r.fields.insert(k.to_string(), v);
+        }
+    }
 }
 
 /// [`read_rows_etc`]'s lists, with [`list_facts`] and `shown`'s show facts.
@@ -1315,7 +1338,8 @@ fn stamp_of(store: &Store, half: Half) -> Stamp {
         Half::Attention => (store.attention_stamp(), [None, None, None]),
         Half::RowsEtc => {
             let m = |n: &str| std::fs::metadata(store.state_file(n)).ok().and_then(|m| m.modified().ok());
-            (store.fingerprint(), [m("claims.json"), m("machines.json"), m("governors.json")])
+            // The add-on's facts on shared rows ride on the rows: a change to them re-reads the rows.
+            (store.fingerprint() ^ crate::addon::get().facts_stamp(store), [m("claims.json"), m("machines.json"), m("governors.json")])
         }
     }
 }

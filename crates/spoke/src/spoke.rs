@@ -9,7 +9,7 @@
 //! takes a provisional local id ([`crate::hub_ids`]) and nothing is dialled, while what is kept here (the cache, the
 //! journal, who holds what) stays readable.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -288,6 +288,50 @@ impl SharedWork for Spoke {
             out.push("not yet published: a local id until the hub gives this row its own, at the next connection; nothing of it is sent before then".into());
         }
         out
+    }
+
+    /// What is known here of each shared row, with no dial: its lease's
+    /// holder as the stream last said (`hub_holders`: user, machine, expiry),
+    /// else the user a refused take named (`drive.json`'s `elsewhere`: the
+    /// user alone); this spoke's own leases (its book's rows and its claims'
+    /// tokens: held here, on this machine, until their expiry) over either;
+    /// and whether the row is kept as a head only (`heads.json`).
+    fn row_facts(&self, store: &Store) -> BTreeMap<String, wsp_engine::addon::RowFacts> {
+        let me = self.user();
+        let my_machine = home().and_then(|h| crate::hub_client::machine::kept_id(&h));
+        let now = wsp_engine::util::epoch_secs();
+        let mut out = crate::hub_holders::facts(store, me.as_deref(), my_machine.as_deref(), now);
+        let book = hub_lease::Book::read(store);
+        for (row, user) in &book.elsewhere {
+            out.entry(row.clone()).or_insert_with(|| wsp_engine::addon::RowFacts { held_by: Some(user.clone()), ..Default::default() });
+        }
+        let name = crate::hub_client::machine::name_of(&wsp_engine::util::hostname());
+        let mut own: BTreeMap<String, i64> = book.rows.iter().map(|(r, d)| (r.clone(), d.expires)).collect();
+        for (row, claim) in store.claims() {
+            if hub_lease::token_of(&claim).is_some() {
+                own.insert(row, wsp_engine::store::record_expires(&claim).unwrap_or(0));
+            }
+        }
+        for (row, expires) in own {
+            let f = out.entry(row).or_default();
+            f.held_by = me.clone();
+            f.held_on = Some(name.clone());
+            f.held_until = Some(expires).filter(|t| *t > 0);
+            f.held_here = true;
+        }
+        for (row, _) in hub_cache::Cache::read(store).rows() {
+            out.entry(row.clone()).or_default().head_only = true;
+        }
+        out
+    }
+
+    fn facts_stamp(&self, store: &Store) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for f in [crate::hub_holders::path(store), store.state.join("hub").join("drive.json"), store.state.join("hub").join("heads.json")] {
+            std::fs::metadata(&f).and_then(|m| m.modified()).ok().hash(&mut h);
+        }
+        h.finish()
     }
 
     fn elsewhere(&self, store: &Store) -> Elsewhere {
