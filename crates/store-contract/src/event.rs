@@ -176,6 +176,14 @@ pub enum EventKind {
     // `{"workspace", "subject", "to"}`.
     #[serde(rename = "ref.moved")]
     RefMoved,
+    // The hub's refs: a subject was retired in a workspace (`refs.retire`), so
+    // it has no head there any more and never will. The subject is the one
+    // retired, the workspace the event's, the payload `{"workspace",
+    // "subject", "from", "successor"?}`: `from` the head it had, `successor`
+    // the subject it continues as, where there is one. A reader that does not
+    // know the kind reads it as `Unknown`.
+    #[serde(rename = "ref.retired")]
+    RefRetired,
     // The hub's leases (wsp-466): a shared row's lease ran past its TTL and the
     // hub released it. The subject is the lease, the workspace the row's, the
     // payload `{"workspace", "row", "holder", "token"}`.

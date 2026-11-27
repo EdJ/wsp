@@ -20,7 +20,7 @@ use wsp_api as api;
 use wsp_hub_protocol as p;
 use wsp_hub_protocol::{
     Answer, ApiToken, Blob, Call, Code, Failure, Frame, Hello, HubMessage, IdentityCommand, IdsAlloc, LeaseHold,
-    LeaseTake, Login, LoginDone, LoginPrompt, Move, MsgSend, NoArgs, Outcome, RefMove, Refused, Reply, ReqId,
+    LeaseTake, Login, LoginDone, LoginPrompt, Move, MsgSend, NoArgs, Outcome, RefMove, RefRetire, Refused, Reply, ReqId,
     Request, SyncCall, Verb, Welcome,
 };
 use wsp_objects::{ObjectId, Refs, WorkspaceId};
@@ -125,6 +125,14 @@ fn refs() -> Refs {
     let mut refs = Refs::new(ws());
     refs.set(Subject::Row(row()), an_id(1));
     refs.set(Subject::Lease(LeaseName("row:wsp-071".into())), an_id(2));
+    refs
+}
+
+/// Refs with a retired subject beside a head.
+fn retired_refs() -> Refs {
+    let mut refs = refs();
+    refs.retired.insert(Subject::Row(RowId("inbox-001".into())), Some(Subject::Row(row())));
+    refs.retired.insert(Subject::Row(RowId("inbox-002".into())), None);
     refs
 }
 
@@ -261,7 +269,7 @@ fn every_frame_type_is_todays_bytes() {
 
 const VERBS: usize = 4;
 const COMMANDS: usize = 6;
-const SYNCS: usize = 12;
+const SYNCS: usize = 13;
 const CALLS: usize = VERBS + COMMANDS + SYNCS + 1;
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
@@ -298,6 +306,7 @@ fn sync_ordinal(c: &SyncCall) -> (usize, &'static str) {
         SyncCall::MsgSend(_) => (9, "msg.send"),
         SyncCall::MsgTake(_) => (10, "msg.take"),
         SyncCall::MsgAck { .. } => (11, "msg.ack"),
+        SyncCall::Retire(_) => (12, "refs.retire"),
     }
 }
 
@@ -378,6 +387,14 @@ fn requests() -> Vec<Frame> {
     out.extend(commands.into_iter().map(Call::Command));
     out.extend(syncs.into_iter().map(Call::Sync));
     out.push(Call::Unknown { verb: "seat.teleport".into(), args: json!({ "seat": "cpd-1", "to": "moon" }) });
+    // `refs.retire` (the hub's 19317ac), after the frames frozen before it, so their ids and bytes stay.
+    out.push(Call::Sync(SyncCall::Retire(RefRetire {
+        workspace: ws(),
+        subject: Subject::Row(RowId("inbox-001".into())),
+        from: an_id(1),
+        successor: Some(Subject::Row(row())),
+    })));
+    out.push(Call::Sync(SyncCall::Retire(RefRetire { workspace: ws(), subject: Subject::Row(row()), from: an_id(2), successor: None })));
     out.into_iter().enumerate().map(|(i, c)| request(i as u64 + 1, c)).collect()
 }
 
@@ -423,13 +440,13 @@ fn the_verb_tables_are_the_variants_and_todays() {
     assert!(p::SYNC_VERBS.iter().all(|v| !api::READ_VERBS.contains(v) && !api::COMMAND_VERBS.contains(v)));
     assert_eq!(
         p::SYNC_VERBS,
-        ["sync.heads", "sync.have", "sync.put", "sync.get", "refs.move", "ids.alloc", "lease.take", "lease.renew", "lease.release", "msg.send", "msg.take", "msg.ack"]
+        ["sync.heads", "sync.have", "sync.put", "sync.get", "refs.move", "ids.alloc", "lease.take", "lease.renew", "lease.release", "msg.send", "msg.take", "msg.ack", "refs.retire"]
     );
 }
 
 // ---------------------------------------------------------------- replies
 
-const ANSWERS: usize = 16;
+const ANSWERS: usize = 17;
 
 fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
     let Frame::Reply(Reply { outcome: Outcome::Ok(a), .. }) = f else { panic!("not an ok reply: {f:?}") };
@@ -450,6 +467,7 @@ fn answer_ordinal(f: &Frame) -> (usize, &'static str) {
         Answer::Queued { .. } => (13, "queued"),
         Answer::Messages(_) => (14, "messages"),
         Answer::Acked { .. } => (15, "acked"),
+        Answer::Retired { .. } => (16, "retired"),
     }
 }
 
@@ -503,6 +521,9 @@ fn answers() -> Vec<Frame> {
         ok(22, Answer::Messages(vec![a_message(Some("%3"), Some("hm-0")), a_message(None, None)]), vec![]),
         ok(23, Answer::Messages(vec![]), vec![]),
         ok(24, Answer::Acked { acked: 1 }, vec![]),
+        ok(25, Answer::Heads(retired_refs()), vec![]),
+        ok(26, Answer::Retired { subject: Subject::Row(RowId("inbox-001".into())), successor: Some(Subject::Row(row())) }, vec![]),
+        ok(27, Answer::Retired { subject: Subject::Row(row()), successor: None }, vec![]),
     ]
 }
 
@@ -754,6 +775,36 @@ fn peers_of_other_versions_decode() {
     assert_eq!(events, ok(2, Answer::Events { events: vec![], head: EventId(9), through: EventId(0) }, vec![]));
     let failure = decode(r#"{"type":"reply","id":2,"err":{"code":"fenced"}}"#);
     assert_eq!(failure, Frame::Reply(Reply { id: ReqId(2), outcome: Outcome::Err(Failure { code: Code::Fenced, text: String::new(), refusal: None }), events: vec![] }));
+}
+
+/// `refs.retire`, its answer and `sync.heads`' `retired`, spelled as the hub
+/// repository's own test pins them (its 19317ac), byte for byte.
+#[test]
+fn the_retire_spelling_is_the_hubs() {
+    let retire = request(
+        12,
+        Call::Sync(SyncCall::Retire(RefRetire {
+            workspace: ws(),
+            subject: Subject::Row(RowId("inbox-001".into())),
+            from: an_id(1),
+            successor: Some(Subject::Row(RowId("pp-007".into()))),
+        })),
+    );
+    assert_eq!(
+        serde_json::to_string(&retire).unwrap(),
+        format!(
+            r#"{{"type":"request","v":1,"id":12,"by":"person:ann","verb":"refs.retire","args":{{"workspace":"shared:team","subject":{{"row":"inbox-001"}},"from":"{}","successor":{{"row":"pp-007"}}}}}}"#,
+            an_id(1)
+        )
+    );
+    let gone = ok(12, Answer::Retired { subject: Subject::Row(RowId("inbox-001".into())), successor: None }, vec![413]);
+    assert_eq!(serde_json::to_string(&gone).unwrap(), r#"{"type":"reply","id":12,"ok":{"retired":{"subject":{"row":"inbox-001"}}},"events":[413]}"#);
+    let mut heads = Refs::new(ws());
+    heads.retired.insert(Subject::Row(RowId("inbox-001".into())), Some(Subject::Row(RowId("pp-007".into()))));
+    assert_eq!(
+        serde_json::to_string(&ok(13, Answer::Heads(heads), vec![])).unwrap(),
+        r#"{"type":"reply","id":13,"ok":{"heads":{"workspace":"shared:team","heads":[],"retired":[{"subject":{"row":"inbox-001"},"successor":{"row":"pp-007"}}]}},"events":[]}"#
+    );
 }
 
 /// The machine a hello names and the welcome names back (the hub's

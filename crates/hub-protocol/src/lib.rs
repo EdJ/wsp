@@ -45,7 +45,7 @@ pub mod sync;
 pub use conn::{ConnError, Connection, MAX_LINE};
 pub use identity::{IdentityCommand, COMMAND_VERBS};
 pub use sync::{
-    Blob, HubMessage, IdsAlloc, LeaseHold, LeaseTake, Move, MsgSend, RefMove, SyncCall, FENCE_TOKEN, MAX_IDS,
+    Blob, HubMessage, IdsAlloc, LeaseHold, LeaseTake, Move, MsgSend, RefMove, RefRetire, SyncCall, FENCE_TOKEN, MAX_IDS,
     MAX_PAST, SYNC_VERBS,
 };
 
@@ -402,6 +402,15 @@ pub enum Answer {
     Messages(Vec<HubMessage>),
     /// `msg.ack`: how many of the ids left the caller's queue.
     Acked { acked: u32 },
+    /// `refs.retire`: `subject` is retired, continuing as `successor` (none:
+    /// gone). A repeat, or a retire of a subject retired before, answers the
+    /// successor it was retired with. Only `refs.retire` answers it, which an
+    /// older client never sends.
+    Retired {
+        subject: Subject,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successor: Option<Subject>,
+    },
 }
 
 /// What `err` carries: `{ code, text }`, and the contract's refusal whole

@@ -9,6 +9,12 @@
 //! - `refs.move { workspace, subject, from, to }` → [`Answer::Move`]:
 //!   [`Move::Moved`], or [`Move::Stale`] with the head there is (an answer,
 //!   not an `err`).
+//! - `refs.retire { workspace, subject, from, successor? }` →
+//!   [`Answer::Retired`], or [`Answer::Move`] with [`Move::Stale`] when the
+//!   head is not `from`: the subject is taken out of the workspace's heads for
+//!   good and listed in its `retired` ([`Refs::retired`]) with the subject it
+//!   continues as; `ref.retired` announces it. A `refs.move` of a retired
+//!   subject is answered `stale` with no head, whatever its `from`.
 //! - `ids.alloc { workspace, project, n, past? }` → [`Answer::Ids`].
 //! - `lease.take { workspace, row }` and `lease.renew { row, token }` →
 //!   [`Answer::Lease`]; `lease.release { row, token }` → [`Answer::Released`].
@@ -20,7 +26,9 @@
 //!   `msg.take {}` → [`Answer::Messages`]; `msg.ack { ids }` →
 //!   [`Answer::Acked`].
 //!
-//! None carries an idempotency key.
+//! None carries an idempotency key: a put is idempotent by hash, a move by
+//! its `from`, and a retire by what it leaves (a repeat finds the subject
+//! retired and is answered the same `retired`, writing nothing).
 
 use serde::{Deserialize, Serialize};
 use wsp_objects::{ObjectId, WorkspaceId};
@@ -45,6 +53,7 @@ pub const SYNC_VERBS: &[&str] = &[
     "msg.send",
     "msg.take",
     "msg.ack",
+    "refs.retire",
 ];
 
 /// The most ids one `ids.alloc` hands out; more is refused `invalid`.
@@ -84,6 +93,8 @@ pub enum SyncCall {
     MsgTake(#[serde(default)] crate::NoArgs),
     #[serde(rename = "msg.ack")]
     MsgAck { ids: Vec<String> },
+    #[serde(rename = "refs.retire")]
+    Retire(RefRetire),
 }
 
 impl SyncCall {
@@ -102,6 +113,7 @@ impl SyncCall {
             SyncCall::MsgSend(_) => "msg.send",
             SyncCall::MsgTake(_) => "msg.take",
             SyncCall::MsgAck { .. } => "msg.ack",
+            SyncCall::Retire(_) => "refs.retire",
         }
     }
 }
@@ -123,6 +135,20 @@ pub struct RefMove {
     /// The head the writer saw: none for a subject it saw no head for.
     pub from: Option<ObjectId>,
     pub to: ObjectId,
+}
+
+/// `refs.retire`'s `args`: `subject` is gone from `workspace`, and continues
+/// as `successor` where there is one (a row moved to a new id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefRetire {
+    pub workspace: WorkspaceId,
+    pub subject: Subject,
+    /// The head the writer saw: a subject is retired only from its head.
+    pub from: ObjectId,
+    /// The subject it continues as: one of the same kind with a head in the
+    /// same workspace. None: it is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<Subject>,
 }
 
 /// `ids.alloc`'s `args`.

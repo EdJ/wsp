@@ -22,3 +22,6 @@
 {"type":"reply","id":22,"ok":{"messages":[{"id":"hm-1","to":"seat:wsp-071","user":"bo","from_user":"ann","from":"seat:wsp-470","seat":"%3","text":"is it landed?","re":"hm-0","at":1800000000000},{"id":"hm-1","to":"seat:wsp-071","user":"bo","from_user":"ann","from":"seat:wsp-470","text":"is it landed?","at":1800000000000}]},"events":[]}
 {"type":"reply","id":23,"ok":{"messages":[]},"events":[]}
 {"type":"reply","id":24,"ok":{"acked":{"acked":1}},"events":[]}
+{"type":"reply","id":25,"ok":{"heads":{"workspace":"shared:team","heads":[{"subject":{"row":"wsp-071"},"head":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"},{"subject":{"lease":"row:wsp-071"},"head":"sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"}],"retired":[{"subject":{"row":"inbox-001"},"successor":{"row":"wsp-071"}},{"subject":{"row":"inbox-002"}}]}},"events":[]}
+{"type":"reply","id":26,"ok":{"retired":{"subject":{"row":"inbox-001"},"successor":{"row":"wsp-071"}}},"events":[]}
+{"type":"reply","id":27,"ok":{"retired":{"subject":{"row":"wsp-071"}}},"events":[]}

@@ -30,3 +30,5 @@
 {"type":"request","v":1,"id":30,"by":"person:ann","verb":"msg.take","args":{}}
 {"type":"request","v":1,"id":31,"by":"person:ann","verb":"msg.ack","args":{"ids":["hm-1","hm-2"]}}
 {"type":"request","v":1,"id":32,"by":"person:ann","verb":"seat.teleport","args":{"seat":"cpd-1","to":"moon"}}
+{"type":"request","v":1,"id":33,"by":"person:ann","verb":"refs.retire","args":{"workspace":"shared:team","subject":{"row":"inbox-001"},"from":"sha256:4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a","successor":{"row":"wsp-071"}}}
+{"type":"request","v":1,"id":34,"by":"person:ann","verb":"refs.retire","args":{"workspace":"shared:team","subject":{"row":"wsp-071"},"from":"sha256:dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"}}
