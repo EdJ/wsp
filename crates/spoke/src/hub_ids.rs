@@ -360,6 +360,22 @@ mod tests {
             self.add_in(title, "shared:team", None)
         }
 
+        /// `wsp add <title> --workspace shared:team` with no project: a shared row in the inbox.
+        fn add_inbox(&self, title: &str) -> String {
+            let _home = HubHome::at(&self.home);
+            let before: Vec<String> = self.store.tasks().into_iter().map(|t| t.id).collect();
+            let code = wsp_engine::cmd_task::add(&self.store, &Args::synth("add", &[title], &[("workspace", "shared:team")]));
+            assert_eq!(code, 0, "add to the inbox");
+            self.store.tasks().into_iter().map(|t| t.id).find(|id| !before.contains(id)).expect("a new row")
+        }
+
+        /// `wsp mv <id> -p pp` on this spoke: the row's id after it.
+        fn mv_to_pp(&self, id: &str) -> String {
+            let _home = HubHome::at(&self.home);
+            assert_eq!(wsp_engine::cmd_task::mv(&self.store, &Args::synth("mv", &[id], &[("project", "pp")])), 0, "mv {id} -p pp");
+            self.store.renamed_ids().get(id).cloned().unwrap_or_else(|| id.to_string())
+        }
+
         fn turn(&self) -> Result<crate::hub_sync::Turned, String> {
             let _home = HubHome::at(&self.home);
             crate::hub_sync::Worker::new(self.home.clone()).turn(&self.store)
@@ -543,6 +559,74 @@ mod tests {
         let book = Book::read(&ann.store);
         assert!(book.rows.is_empty() && book.pending.is_empty(), "{book:?}");
         assert!(on_hub(&hub, &tokens, "ann").contains(&map[&two]));
+    }
+
+    /// The id the hub's counter hands `who` next under `code` in `shared:team`:
+    /// what a row filed there through the hub takes (the test's `add` cannot
+    /// name a project: no seats are installed to resolve `-p`, so it files to
+    /// the inbox).
+    fn hub_hands(hub: &crate::testhub::TestHub, tokens: &BTreeMap<String, String>, who: &str, code: &str) -> String {
+        let mut c = hub_lease::tests::dial(hub, tokens, who);
+        c.ids_alloc(&wsp_objects::WorkspaceId("shared:team".into()), code, 1, None).unwrap().remove(0)
+    }
+
+    /// `wsp mv` filing a shared row out of the inbox into a project gives it
+    /// the hub's id, as filing it there would have. bo has taken `pp-001` from
+    /// the hub, and ann's local counter for `pp` has never moved, so the local
+    /// counter hands ann's row `pp-001` too: two rows, one subject on the hub.
+    #[test]
+    fn hub_ids_moving_a_shared_inbox_row_into_a_project_takes_a_hub_id() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-ids-mv");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let row = ann.add_inbox("ann's inbox row");
+        assert!(!is_provisional(&ann.store, &row));
+        let bos = hub_hands(&hub, &tokens, "bo", "pp");
+        let new = ann.mv_to_pp(&row);
+        assert!(new.starts_with("pp-"), "filed out of the inbox into pp: {new}");
+        assert_ne!(new, bos, "the hub gave {bos} to bo; ann's row took it from the local counter");
+        assert!(!is_provisional(&ann.store, &new), "connected: a hub id, not provisional");
+        assert_eq!(ann.title(&new), "ann's inbox row");
+        let after = hub_hands(&hub, &tokens, "bo", "pp");
+        assert!(after > new, "the hub's counter moved past ann's id ({new}), now at {after}");
+        ann.turn().unwrap();
+        assert_eq!(hub_title(&hub, &tokens, "bo", &new).as_deref(), Some("ann's inbox row"));
+        // A private inbox row still takes the local counter.
+        let home = HubHome::at(&ann.home);
+        assert_eq!(wsp_engine::cmd_task::add(&ann.store, &Args::synth("add", &["private"], &[])), 0);
+        drop(home);
+        let private = ann.store.tasks().into_iter().find(|t| t.title == "private").unwrap().id;
+        let moved = ann.mv_to_pp(&private);
+        assert!(moved.starts_with("pp-") && ann.store.task(&moved).unwrap().workspace.is_private());
+        assert!(!is_provisional(&ann.store, &moved));
+    }
+
+    /// Offline, the move gives the row a provisional local id, as filing it
+    /// would: never pushed under it, and renamed to a hub id at reconnect.
+    #[test]
+    fn hub_ids_moving_a_shared_inbox_row_offline_is_provisional_until_reconnect() {
+        let Some((hub, tokens)) = hub_lease::tests::serve_users(crate::testhub::Setup::default(), &["ann", "bo"]) else { return };
+        let env = wsp_engine::util::isolated("hub-ids-mv-off");
+        let _addon = wsp_engine::addon::scoped(Arc::new(Spoke::new()));
+        let ann = Side::new(&env, &hub, &tokens, "ann");
+        let row = ann.add_inbox("filed in the inbox online");
+        ann.log_in_nowhere();
+        let new = ann.mv_to_pp(&row);
+        assert!(new.starts_with("pp-"), "filed out of the inbox into pp: {new}");
+        assert!(is_provisional(&ann.store, &new), "offline: a provisional local id");
+        let subject = Subject::Row(RowId(new.clone()));
+        let by = wsp_store_contract::Principal::Person("ann".into());
+        assert!(crate::hub_sync::push_record(&ann.store, &subject, wsp_objects::WorkspaceId("shared:team".into()), by, wsp_store_contract::At(0)).is_none(), "never pushed under it");
+        // bo takes pp's next id meanwhile, through the hub.
+        let bos = hub_hands(&hub, &tokens, "bo", "pp");
+        ann.log_in(&hub, &tokens);
+        ann.turn().unwrap();
+        let hub_id = ann.store.renamed_ids().get(&new).cloned().expect("renamed at reconnect");
+        assert_ne!(hub_id, bos);
+        assert!(!is_provisional(&ann.store, &hub_id) && !is_provisional(&ann.store, &new));
+        assert_eq!(ann.title(&hub_id), "filed in the inbox online");
+        assert_eq!(hub_title(&hub, &tokens, "bo", &hub_id).as_deref(), Some("filed in the inbox online"));
     }
 
     /// A claimed provisional row keeps its claim and its seat across the

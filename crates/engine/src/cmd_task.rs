@@ -2757,23 +2757,41 @@ pub fn mv(store: &Store, args: &Args) -> i32 {
     // written, so that the log each task keeps can name the id it is about to
     // take — a rename recorded only in the file it renamed is a rename nobody
     // reading the old id can follow.
+    //
+    // A shared row's new id is the shared side's to give, as it is when one is
+    // filed straight into the project (`new_row_id`, the hub's counter, or a
+    // provisional local id when the hub cannot be asked); a private row's is
+    // the local counter's. Taken from the local counter, a shared row's id is
+    // one another person filing into the same project may be given too.
     let mut renumber: std::collections::BTreeMap<String, String> = Default::default();
     if let Some(into) = &target {
-        let mut filing: Vec<String> = Vec::new();
+        let mut filing: Vec<&Task> = Vec::new();
         if is_inbox_id(&subject.id) {
-            filing.push(subject.id.clone());
+            filing.push(&subject);
         }
         for id in crate::resolve::descendants_of(&tasks, &subject.id) {
-            if is_inbox_id(&id) {
-                filing.push(id);
+            if let Some(kid) = tasks.iter().find(|t| t.id == id).filter(|t| is_inbox_id(&t.id)) {
+                filing.push(kid);
             }
         }
         for old in filing {
-            match store.alloc_task_id(Some(into)) {
+            // The parent it will have: a provisional parent makes it provisional.
+            let parent = match (&new_parent, old.id == subject.id) {
+                (Some(p), true) => p.as_ref().map(|p| p.id.clone()),
+                _ => old.parent.clone(),
+            };
+            match new_row_id(store, Some(into), &old.workspace, parent.as_deref()) {
                 Ok(new) => {
-                    renumber.insert(old, new);
+                    renumber.insert(old.id.clone(), new);
                 }
                 Err(e) => {
+                    // The ids already reserved go back: nothing was written yet.
+                    for new in renumber.values() {
+                        let path = store.task_path(new);
+                        if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                     eprintln!("wsp: cannot allocate an id in {into}: {e}");
                     return 1;
                 }
