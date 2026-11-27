@@ -61,6 +61,11 @@ pub struct Entry {
     /// Its seat's session was already counted at an earlier entry.
     pub shared: bool,
     pub through: Option<usize>,
+    /// When the entry opened (epoch); 0 where it is not recorded.
+    pub opened: i64,
+    /// Why `fig` is unmeasured; `None` where it was read or is counted
+    /// elsewhere.
+    pub why: Option<&'static str>,
     pub fig: Fig,
 }
 
@@ -192,6 +197,29 @@ impl Sessions {
         (!gone).then_some(project.as_str())
     }
 
+    /// The id's next reuse after the entry that opened on it at `opened`.
+    fn next_use(&self, pane: &str, opened: i64) -> Option<i64> {
+        let own_uses: Vec<&Option<String>> = self.uses.iter().filter(|u| u.pane == pane && u.at == opened).map(|u| &u.holder).collect();
+        self.uses
+            .iter()
+            .filter(|u| u.pane == pane && u.at > opened && (u.holder.is_none() || !own_uses.contains(&&u.holder)))
+            .map(|u| u.at)
+            .min()
+    }
+
+    /// Why [`reading`](Self::reading) found nothing for this entry.
+    fn unread_why(&self, pane: &str, opened: i64) -> &'static str {
+        if pane.is_empty() {
+            return "no seat is recorded for it";
+        }
+        let next = self.next_use(pane, opened);
+        if crate::cmd_burn::garbled_stamps(&self.state, pane).iter().any(|&t| t >= opened && next.is_none_or(|n| t <= n)) {
+            "its ledger line is unreadable: two stops wrote it at once (fixed by wsp-864; the line is left as it is)"
+        } else {
+            "no ledger line or live record of its session"
+        }
+    }
+
     /// The reading of the entry that opened on `pane` at `opened` (epoch): the
     /// session of that id that started at or after then and ended before the
     /// id's next reuse, which is a use by another holder than the entry's. The
@@ -199,13 +227,7 @@ impl Sessions {
     /// record. `None` is unmeasured: another session's figures are never read
     /// for it.
     pub(crate) fn reading(&self, pane: &str, opened: i64) -> Option<Value> {
-        let own_uses: Vec<&Option<String>> = self.uses.iter().filter(|u| u.pane == pane && u.at == opened).map(|u| &u.holder).collect();
-        let next = self
-            .uses
-            .iter()
-            .filter(|u| u.pane == pane && u.at > opened && (u.holder.is_none() || !own_uses.contains(&&u.holder)))
-            .map(|u| u.at)
-            .min();
+        let next = self.next_use(pane, opened);
         let own = |r: &Value| session_start(r).is_none_or(|t| t >= opened);
         let banked = crate::cmd_burn::ledger_lines(&self.state, pane).into_iter().find(|l| {
             let ended = ended_of(l).unwrap_or(0);
@@ -353,12 +375,16 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
         by_governor: false,
         shared: false,
         through: None,
+        opened: 0,
+        why: None,
         fig: Fig::default(),
     };
     for GovSeat { seat, group: g, through, seconds, spans } in governors(store, slug, groups.len()) {
         let mut e = entry(g, None, "governor", &seat);
         e.through = through;
-        let r = counted.read(&sessions, &mut e, spans.first().map_or(0, |s| s.0));
+        e.opened = spans.first().map_or(0, |s| s.0);
+        let opened = e.opened;
+        let r = counted.read(&sessions, &mut e, opened);
         e.fig = fig_of(r, None, Some(seconds));
         out.push(e);
     }
@@ -368,6 +394,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             let mut e = entry(i + 1, None, "barrier", pane);
             e.tier = c.on.clone().unwrap_or_default();
             let opened = util::epoch_of(&c.at);
+            e.opened = opened;
             if let Some(r) = counted.read(&sessions, &mut e, opened) {
                 e.fig = of_reading(&r, 0, check_seconds(&r, opened));
             }
@@ -386,6 +413,7 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             let mut e = entry(*gi, Some(&t.id), "verifier", pane);
             e.tier = p.spent.as_ref().map_or_else(|| p.on.clone().unwrap_or_default(), |s| s.ran.clone());
             let opened = util::epoch_of(&p.at);
+            e.opened = opened;
             if sessions.governed(pane, opened) == Some(slug) {
                 e.by_governor = true;
             } else {
@@ -412,16 +440,21 @@ pub fn entries(store: &Store, slug: &str) -> Option<Vec<Entry>> {
             e.label = a.leg.clone().unwrap_or_default();
             e.tier = Row(a.clone()).tier();
             e.dropped = a.outcome.as_str() == "dropped";
+            e.opened = util::epoch_of(&a.at);
             if a.pane.is_empty() {
                 e.fig = of_clause(&a.ran, &a.spend, a.turns, Some(a.seconds()));
             } else {
-                let r = counted.read(&sessions, &mut e, util::epoch_of(&a.at));
+                let opened = e.opened;
+                let r = counted.read(&sessions, &mut e, opened);
                 if !e.shared {
                     e.fig = fig_of(r, Some((&a.ran, &a.spend, a.turns)), Some(a.seconds()));
                 }
             }
             out.push(e);
         }
+    }
+    for e in out.iter_mut().filter(|e| !e.fig.measured && !e.shared && !e.by_governor) {
+        e.why = Some(sessions.unread_why(&e.seat, e.opened));
     }
     out.sort_by_key(|e| e.group);
     Some(out)
@@ -508,7 +541,7 @@ fn entry_json(e: &Entry) -> Value {
         "role": e.role, "member": e.member, "leg": (!e.label.is_empty()).then(|| e.label.clone()),
         "seat": e.seat, "tier": e.tier, "dropped": e.dropped, "by_governor": e.by_governor,
         "shared": e.shared, "through": e.through,
-        "measured": f.measured, "exact": f.exact,
+        "measured": f.measured, "why": e.why, "exact": f.exact,
         "input_tokens": f.input, "output_tokens": f.output,
         "cache_tokens": f.cache_read, "cache_write_tokens": f.cache_write,
         "usd_micros": f.usd, "turns": if f.measured || f.turns > 0 { json!(f.turns) } else { Value::Null }, "seconds": f.seconds,
@@ -612,7 +645,7 @@ fn render(slug: &str, es: &[Entry], groups: usize) -> String {
             if e.by_governor { n.push("by the governor".to_string()); }
             if e.shared { n.push(format!("{} counted above", e.seat)); }
             if let Some(t) = e.through { n.push(format!("through group {t}")); }
-            if !e.fig.measured && !e.by_governor && !e.shared { n.push("no reading".to_string()); }
+            if !e.fig.measured && !e.by_governor && !e.shared { n.push(e.why.map_or("no reading".to_string(), |w| format!("no reading: {w}"))); }
             if e.fig.measured && !e.fig.exact { n.push("rounded".to_string()); }
             n.join(" · ")
         };
@@ -1076,6 +1109,21 @@ mod tests {
         assert_eq!(read_as(&es, "verifier"), [unread("cpd-8"), own("cpd-8", 800)]);
         let rows = verifier_rows(&[store.find_task("m-1").unwrap()]);
         assert_eq!(rows[0]["usd_micros"], Value::Null);
+    }
+
+    /// cr-sync (`compound-react-124`): both of a row's seats banked into one
+    /// line at once, so neither parses; each says that is why.
+    #[test]
+    fn a_seat_whose_ledger_line_is_garbled_says_so() {
+        let (env, store) = fixture("cost-garbled");
+        claims_at(&store, "m-1", "2026-11-24T05:10:34Z", "cpd-71");
+        verifier_at(&store, "m-1", "2026-11-24T05:11:09Z", "cpd-712");
+        let line = r#"{{""cache_read"cache_read:"284398:,284398,""ended""ended:"":2026-11-24T05:12:07Z""2026-11-24T05:12:07Z,"",seat""seat:"":cpd-712""cpd-712,""turns""turns:1}1}"#;
+        std::fs::write(env.state().join(crate::place_super::SPENT_FILE), format!("{line}\n")).unwrap();
+        let es = entries(&store, "run").unwrap();
+        let why = |role: &str| es.iter().find(|e| e.role == role).map(|e| entry_json(e)["why"].as_str().unwrap_or("").to_string()).unwrap();
+        assert!(why("verifier").starts_with("its ledger line is unreadable"), "{}", why("verifier"));
+        assert_eq!(why("worker"), "no ledger line or live record of its session", "cpd-71 is not cpd-712");
     }
 
     /// A governor's id and a check's id handed out again once the seat had gone.

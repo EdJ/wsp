@@ -209,6 +209,20 @@ pub(crate) fn ledger_lines(state: &std::path::Path, seat: &str) -> Vec<serde_jso
     read_ledger(state, Some(seat)).0
 }
 
+/// When each unreadable ledger line naming `seat` was written: one stamp a
+/// line, the first it holds. A line two banked into at once (before `wsp-864`)
+/// is no JSON, but its seat and its stamps are each written whole.
+pub(crate) fn garbled_stamps(state: &std::path::Path, seat: &str) -> Vec<i64> {
+    let bytes = std::fs::read(state.join(crate::place_super::SPENT_FILE)).unwrap_or_default();
+    let names = |l: &str| l.match_indices(seat).any(|(i, _)| !l[i + seat.len()..].starts_with(|c: char| c.is_ascii_digit()));
+    let stamp = |l: &str| l.as_bytes().windows(20).find(|w| w[4] == b'-' && w[10] == b'T' && w[19] == b'Z').map(|w| crate::util::epoch_of(&String::from_utf8_lossy(w))).filter(|t| *t > 0);
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|l| names(l) && serde_json::from_str::<serde_json::Value>(l).map_or(true, |v| !v["seat"].is_string()))
+        .filter_map(stamp)
+        .collect()
+}
+
 /// The ledger's lines (one seat's, or all), and how many of the lines read are
 /// unreadable: not a JSON object naming its `seat`.
 ///

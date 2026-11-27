@@ -394,7 +394,16 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let gsum = |f: &dyn Fn(&crate::timeline::GovernorWindow) -> i64| if govs.is_empty() { Value::Null } else { json!(govs.iter().map(|g| f(g)).sum::<i64>()) };
     let seats = standing_seats(store, w, &cost);
     let held: i64 = gov.iter().flatten().map(|x| x.last - x.pass).sum();
-    let followups: Vec<Value> = crate::cmd_worklist::followups(w).into_iter().map(|(row, ids)| json!({ "by": row, "rows": ids })).collect();
+    let followups: Vec<Value> = crate::cmd_worklist::follow_up_records(w)
+        .into_iter()
+        .map(|f| {
+            let mut v = json!({ "by": f.by, "rows": f.rows });
+            if !f.named.is_empty() {
+                v["named"] = json!(f.named);
+            }
+            v
+        })
+        .collect();
     let mut wait_list: Vec<(String, i64)> = waits.into_iter().collect();
     wait_list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let tool_total: i64 = tools.values().sum();
@@ -407,7 +416,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         "generated": util::now_iso(),
         "status": w.status().as_str(),
         "scope": {
-            "cost": "whole row: every seat — members, verifiers, barrier checks, governors. A member whose row has a seat unmeasured or unpriced has no cost (cost.groups[].members[].total.usd_micros null, with why); a group's or the list's total is then a floor (floor, why; totals.usd_floor, totals.usd_why), null where nothing was read",
+            "cost": "whole row: every seat — members, verifiers, barrier checks, governors. A member whose row has a seat unmeasured or unpriced has no cost (cost.groups[].members[].total.usd_micros null, with why); a group's or the list's total is then a floor (floor, why; totals.usd_floor, totals.usd_why), null where nothing was read. A seat not measured says why (cost.groups[] …seats[], governor[] and barrier[]: why)",
             "full_suite": "full_suite_runs: full-suite `cargo test` runs started in a member's or verifier's seat (the shim's note, wsp-389), by row and group. The barrier's own run is one per group and is not counted here; the aim is zero in seats.",
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
             "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start: governor_wall_windows is how many there were and governor_wall_windows_unread how many had no governor transcript read; the governor_* sums are over the windows read, and null (not measured, never 0) where none was. A window is null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, and then the session ids the ledger (spent.jsonl) banked at each stop are read, so the figures are a floor",
@@ -1054,7 +1063,9 @@ pub fn effort_html(v: &Value) -> String {
     }
     for f in r["followups"].as_array().into_iter().flatten() {
         let ids: Vec<&str> = f["rows"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        b.push_str(&format!("<p>follow-up by {}: {}</p>", esc(f["by"].as_str().unwrap_or("")), esc(&ids.join(" "))));
+        let named: Vec<&str> = f["named"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let named = if named.is_empty() { String::new() } else { format!(" (went ahead of {}, which covered it already)", named.join(" ")) };
+        b.push_str(&format!("<p>follow-up by {}: {}</p>", esc(f["by"].as_str().unwrap_or("")), esc(&(ids.join(" ") + &named))));
     }
     b.push_str("<h2>5 · Against a baseline</h2>");
     let bl = &v["baseline"];
@@ -1446,6 +1457,23 @@ mod tests {
         let seats = v["totals"]["standing_seats"]["seats"].as_array().unwrap();
         let read: Vec<(Option<u64>, Option<f64>)> = seats.iter().filter(|s| s["role"] == "check").map(|s| (s["group"].as_u64(), s["memory"]["mb_minutes"].as_f64())).collect();
         assert_eq!(read, [(Some(1), Some(150.0)), (Some(2), Some(400.0))], "each check's own minute, not the other's: {seats:?}");
+    }
+
+    /// cr-sync (`compound-react-124`): the barrier check's `--anyway` line is
+    /// prose after the ids, and was read as forty rows.
+    #[test]
+    fn an_anyway_line_gives_the_followups_its_row_and_names_the_one_it_covers() {
+        let (_e, store, mut w) = list("fup", &["r-1"]);
+        let line = "follow-up by cpd-718: anyway: compound-react-117 ~ compound-react-080 (doing): names the same test";
+        let read = |w: &Worklist| effort_with(&store, w, None, &|_| Default::default())["rework"]["followups"].clone();
+        let want = json!([{ "by": "cpd-718", "rows": ["compound-react-117"], "named": ["compound-react-080"] }]);
+        crate::log::note_to_list(&store, &mut w, line).unwrap();
+        assert_eq!(read(&w), want, "the line alone");
+
+        let mut w = store.worklist("fup").unwrap();
+        w.body = w.body.replace(line, "follow-up by cpd-718 passes: compound-react-117 · group 2 (new), ahead of 0 planned");
+        crate::log::note_to_list(&store, &mut w, &format!("{line}, sets_the_real_wsp_accepts_the_answer_set_line, covers feed.rs · a ~ b is the same")).unwrap();
+        assert_eq!(read(&w), want, "after the line that attached it: one follow-up, not two");
     }
 
     #[test]

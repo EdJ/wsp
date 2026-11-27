@@ -6785,26 +6785,81 @@ fn refuse_round(store: &Store, w: Worklist, at: usize, row: &str, prior: &str, m
     1
 }
 
-/// Every follow-up the list's log records: the check row that added it, and
-/// the rows it attached.
+/// One follow-up as the list's log records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUp {
+    /// The check row that added it.
+    pub by: String,
+    /// The rows it attached.
+    pub rows: Vec<String>,
+    /// The rows an `--anyway` went ahead of: each covers one of `rows`
+    /// already, and none was attached.
+    pub named: Vec<String>,
+}
+
+/// A row id as a log line spells one: a slug, a dash and a number.
+fn id_shaped(word: &str) -> bool {
+    word.rsplit_once('-').is_some_and(|(slug, n)| {
+        !slug.is_empty()
+            && slug.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
+/// Every follow-up the list's log records. Two lines are read:
+/// `<row> holds|passes: <ids> · …`, which attached them, and
+/// `<row>: anyway: <id> ~ <other> (<status>): <why>; … · <reason>`
+/// ([`log_anyway`]), whose words after the ids are prose.
 ///
 /// **The log and not a field on the group**, because the log is where the
 /// verb's record has to be anyway (naming the row that added it), and a
 /// second copy is a copy that can disagree. Read by member id rather than by
 /// ordinal, so a group renumbered by an edit ahead of it is still found.
-pub fn followups(w: &Worklist) -> Vec<(String, Vec<String>)> {
+pub fn follow_up_records(w: &Worklist) -> Vec<FollowUp> {
     let log = w.section("Log").unwrap_or_default();
-    log.lines()
+    let mut out: Vec<FollowUp> = Vec::new();
+    let lines = log
+        .lines()
         .filter_map(|l| l.trim().strip_prefix("- "))
         .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest.trim()))
-        .filter_map(|rest| rest.strip_prefix(FOLLOWUP))
-        .filter_map(|rest| {
-            let (head, tail) = rest.split_once(':')?;
-            let row = head.split_whitespace().next()?.to_string();
-            let ids = tail.split(" · ").next()?.split_whitespace().map(str::to_string).collect();
-            Some((row, ids))
-        })
-        .collect()
+        .filter_map(|rest| rest.strip_prefix(FOLLOWUP));
+    for rest in lines {
+        let Some((head, tail)) = rest.split_once(':') else { continue };
+        let Some(by) = head.split_whitespace().next() else { continue };
+        let add = |into: &mut Vec<String>, id: &str| {
+            if !into.iter().any(|x| x == id) {
+                into.push(id.to_string());
+            }
+        };
+        let (mut rows, mut named) = (Vec::new(), Vec::new());
+        match tail.trim_start().strip_prefix("anyway:") {
+            Some(found) => {
+                let words: Vec<&str> = found.split_whitespace().collect();
+                for pair in words.windows(3).filter(|p| p[1] == "~" && id_shaped(p[0]) && id_shaped(p[2])) {
+                    add(&mut rows, pair[0]);
+                    add(&mut named, pair[2]);
+                }
+                // The line that attached these rows is ahead of this one: what
+                // was gone ahead of is said there, not as a second follow-up.
+                if let Some(f) = out.iter_mut().rev().find(|f| f.by == by && rows.iter().all(|r| f.rows.contains(r))) {
+                    named.iter().for_each(|n| add(&mut f.named, n));
+                    continue;
+                }
+            }
+            None => tail.split_whitespace().take_while(|w| id_shaped(w)).for_each(|w| add(&mut rows, w)),
+        }
+        if !rows.is_empty() {
+            out.push(FollowUp { by: by.to_string(), rows, named });
+        }
+    }
+    out
+}
+
+/// [`follow_up_records`] as the check row that added each and the rows it
+/// attached.
+pub fn followups(w: &Worklist) -> Vec<(String, Vec<String>)> {
+    follow_up_records(w).into_iter().map(|f| (f.by, f.rows)).collect()
 }
 
 /// The check row whose follow-ups a group already holds, if any: the group's
