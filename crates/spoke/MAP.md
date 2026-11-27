@@ -21,10 +21,14 @@ through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-
   hub last said, so a filing into one the user is not a member of is refused when it is filed
 - `hub_lists` — a shared list whose slug another list here holds (another workspace's, or a private one), kept
   under a local name of its own and renamed to its hub id at the sync's edge
+- `hub_holders` — who holds each shared row's lease (user, machine, expiry), as the stream's lease events last said
+  (`holders.json`): the rows' `held_by`/`held_on`/`held_until` facts
+- `hub_retire` — a shared row moved to a new id: its old subject retired on the hub (`refs.retire`), and the hub's
+  `retired` list followed on every spoke (stubs gone, old id resolving to the new one)
 - `reconcile` — the merging reconcile the door calls
 - `hub_client` — the spoke's own client of the hub, speaking `wsp-hub-protocol` only: the TLS/TCP dial with a pinned
   CA, hello, requests and identity commands, subscribe, the sync helper and the id, lease and message verbs, the
-  login file and `WSP_HUB_*` (`hubs.json`), certificate expiry, the GitHub login, and token mint/hash
+  login file and `WSP_HUB_*` (`hubs.json`), the machine every hello names (`machine`, `machine.json`), certificate expiry, the GitHub login, and token mint/hash
 - `cmd_login`, `cmd_hub`, `cmd_publish`, `cmd_allocate` — the verbs of the shared side (`wsp login`, with a token or
   `--github`, `logout`, `hub`, `publish`, `allocate`)
 - `testhub` (behind `test-support`, and in this crate's tests) — a real hub for tests, run as an external program:
