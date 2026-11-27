@@ -1231,25 +1231,40 @@ pub fn last_written(dir: &Path) -> Option<i64> {
 /// its `burn.json` with it; this is the one copy that outlives it (wsp-264).
 pub const SPENT_FILE: &str = "spent.jsonl";
 
+/// What [`bank_burn`] locks while it reads and writes the ledger.
+const SPENT_LOCK: &str = "spent.lock";
+
 /// Append the seat's burn record to the ledger before its directory goes.
 /// Best effort and silent: a stop that cannot write a receipt still stops.
 /// Same field names as `wsp burn --json`, so one reader serves both.
+///
+/// **One line per seat and session, whoever reports the stop.** `stop()` and
+/// the manager's `seat.stopped` both bank, in two processes at once: the
+/// ledger is read and written under `spent.lock`, a second banking of the
+/// same figures writes nothing, and one of newer figures replaces the line.
 pub fn bank_burn(dir: &Path) {
-    let rec = read_json(&dir.join(BURN_FILE));
-    if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
-        return;
-    }
     let (Some(seat), Some(state)) = (
         dir.file_name().map(|n| n.to_string_lossy().to_string()),
         dir.parent().and_then(|r| r.parent()),
     ) else {
         return;
     };
+    // Held until it drops. A filesystem that cannot lock still gets its line.
+    let lock = fs::OpenOptions::new().create(true).append(true).open(state.join(SPENT_LOCK));
+    if let Ok(f) = &lock {
+        let _ = f.lock();
+    }
+    // Read under the lock, so the last to write has the newest reading.
+    let rec = read_json(&dir.join(BURN_FILE));
+    if rec.get("turns").and_then(|v| v.as_u64()).unwrap_or(0) == 0 {
+        return;
+    }
     let n = |k: &str| rec.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-    let line = serde_json::json!({
+    let session = str_of(&rec, "session_id");
+    let mut line = serde_json::json!({
         "seat": seat,
         "ended": util::now_iso(),
-        "session_id": str_of(&rec, "session_id"),
+        "session_id": session,
         // The transcript's path, so a reader after the seat is gone finds it
         // without searching for the session id (`wsp-066`).
         "transcript": str_of(&rec, "transcript"),
@@ -1261,10 +1276,38 @@ pub fn bank_burn(dir: &Path) {
         "cache_write": n("cache_write"),
         "cost": cost_of(&rec),
     });
-    if let Ok(mut f) =
-        fs::OpenOptions::new().create(true).append(true).open(state.join(SPENT_FILE))
-    {
-        let _ = writeln!(f, "{line}");
+    let path = state.join(SPENT_FILE);
+    let held = fs::read(&path).unwrap_or_default();
+    let banked = |raw: &[u8]| {
+        serde_json::from_slice::<Value>(raw)
+            .ok()
+            .filter(|v| str_of(v, "seat") == seat && str_of(v, "session_id") == session)
+    };
+    if let Some(prev) = held.split(|b| *b == b'\n').filter_map(banked).last() {
+        line["ended"] = prev["ended"].clone();
+        if line == prev {
+            return;
+        }
+        line["ended"] = json!(util::now_iso());
+        // Every other line stands as it is, an unreadable one included.
+        let mut out: Vec<u8> = Vec::with_capacity(held.len());
+        for raw in held.split(|b| *b == b'\n').filter(|r| !r.is_empty() && banked(r).is_none()) {
+            out.extend_from_slice(raw);
+            out.push(b'\n');
+        }
+        out.extend_from_slice(format!("{line}\n").as_bytes());
+        let tmp = state.join(".spent.jsonl.tmp");
+        if fs::write(&tmp, out).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+        return;
+    }
+    // The whole line in one `write_all`: `writeln!` on the file wrote it in
+    // pieces, and two banking at once garbled both. A line a crash cut short
+    // is ended first, so it does not take this one with it.
+    let start = if held.last().is_some_and(|b| *b != b'\n') { "\n" } else { "" };
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(format!("{start}{line}\n").as_bytes());
     }
 }
 
@@ -1990,4 +2033,48 @@ pub fn read_json(path: &PathBuf) -> Value {
 
 pub fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+#[cfg(test)]
+mod bank_tests {
+    use super::*;
+
+    /// wsp-864: two threads banking at once, many times, leave only lines that
+    /// parse; and where both banked the same seat, one of them.
+    #[test]
+    fn two_banking_at_once_leave_whole_lines_one_a_seat() {
+        let state = std::env::temp_dir().join(format!("wsp-bank-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&state);
+        const SEATS: usize = 200;
+        let dir = |seat: String| state.join("seats").join(seat);
+        let burnt = |seat: String| {
+            let d = dir(seat);
+            fs::create_dir_all(&d).unwrap();
+            let rec = json!({ "turns": 3, "session_id": "s", "model": "claude-opus-5-5", "cost": 7, "transcript": "/t".repeat(200) });
+            fs::write(d.join(BURN_FILE), rec.to_string()).unwrap();
+        };
+        for i in 0..SEATS {
+            for who in ["both", "a", "b"] {
+                burnt(format!("{who}-{i}"));
+            }
+        }
+        let go = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            for who in ["a", "b"] {
+                let (go, dir) = (&go, &dir);
+                s.spawn(move || {
+                    go.wait();
+                    for i in 0..SEATS {
+                        bank_burn(&dir(format!("{who}-{i}")));
+                        bank_burn(&dir(format!("both-{i}")));
+                    }
+                });
+            }
+        });
+        let text = fs::read_to_string(state.join(SPENT_FILE)).unwrap();
+        let seats: Vec<String> = text.lines().map(|l| str_of(&serde_json::from_str(l).expect(l), "seat")).collect();
+        let distinct: BTreeSet<&String> = seats.iter().collect();
+        assert_eq!((seats.len(), distinct.len()), (3 * SEATS, 3 * SEATS));
+        let _ = fs::remove_dir_all(&state);
+    }
 }

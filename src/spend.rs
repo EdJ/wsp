@@ -33,9 +33,9 @@ const DAY: i64 = 86_400;
 const WINDOW: i64 = 30;
 
 pub fn ledger(state: &Path) -> Vec<Line> {
-    let text = std::fs::read_to_string(state.join(crate::place_super::SPENT_FILE)).unwrap_or_default();
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    let (lines, _) = crate::cmd_burn::read_ledger(state, None);
+    lines
+        .into_iter()
         .filter_map(|v| {
             let n = |k: &str| v[k].as_u64().unwrap_or(0);
             Some(Line {
@@ -133,7 +133,17 @@ pub fn reading(store: &Store, now: i64) -> wsp_view::reading::Spend {
     wsp_view::reading::Spend { lines, places: places.into_iter().collect(), landed }
 }
 
+/// What `wsp spend` says of the ledger lines it could not read, if any.
+fn unreadable_note(state: &Path) -> Option<String> {
+    let n = crate::cmd_burn::read_ledger(state, None).1;
+    (n > 0).then(|| format!("{n} unreadable ledger lines in {} are not counted (left as they are)", crate::place_super::SPENT_FILE))
+}
+
 pub fn spend(store: &Store, args: &Args) -> i32 {
+    // On stderr, so `--json` stays the document compound reads.
+    if let Some(note) = unreadable_note(&store.state) {
+        eprintln!("{note}");
+    }
     let r = report(store, util::epoch_secs());
     if args.json() {
         println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
@@ -276,6 +286,25 @@ mod tests {
         assert_eq!(r["projects"][1]["id"], "unplaced");
         assert_eq!(r["lists"][0], json!({ "slug": "pass-9", "project": "compounding", "cost": 6.5, "today": 0.0, "output": 650, "sessions": 4 }));
         assert_eq!(r["rows"], json!({ "landed_30d": 1, "cost_per_landed_row": 6.75 }));
+    }
+
+    #[test]
+    fn a_line_held_twice_counts_once_and_the_unreadable_lines_are_counted() {
+        let env = util::isolated("spend-twice");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let st = env.state();
+        assert_eq!(unreadable_note(&st), None);
+        line(&st, "cpd-1", "2026-11-17T09:00:00Z", "claude-opus-5-5", 3_000_000, 100);
+        line(&st, "cpd-1", "2026-11-17T09:00:00Z", "claude-opus-5-5", 3_000_000, 100);
+        // The other banking path's copy, a second later.
+        line(&st, "cpd-1", "2026-11-17T09:00:01Z", "claude-opus-5-5", 3_000_000, 100);
+        let mut held = std::fs::read(st.join("spent.jsonl")).unwrap();
+        held.extend_from_slice(b"{\"seat\":\"cpd-2{\"seat\":\n\xff\n\n\"cost\"\n");
+        std::fs::write(st.join("spent.jsonl"), held).unwrap();
+        let t = report(&store, util::epoch_of(NOW))["totals"]["30d"].clone();
+        assert_eq!((t["sessions"].as_u64(), t["cost"].as_f64()), (Some(1), Some(3.0)), "{t}");
+        assert!(unreadable_note(&st).unwrap().starts_with("3 unreadable ledger lines"), "{:?}", unreadable_note(&st));
     }
 
     #[test]

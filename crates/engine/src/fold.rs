@@ -1049,6 +1049,35 @@ pub mod tests {
         m.stop();
     }
 
+    /// wsp-864: `stop()` and the manager's `seat.stopped` both bank a seat, in
+    /// either order, and the ledger holds one line for its session; a reading
+    /// that grew between them replaces that line.
+    #[test]
+    fn one_seat_stopped_on_both_paths_is_one_ledger_line() {
+        let env = util::isolated("fold-bank-once");
+        let store = Store::open();
+        let exec = env.state().join("exec");
+        let m = manager(&exec, 0);
+        let mut sub = Subscription::new(m.addrs()[0], token(&exec), HOST, &store.state, "test");
+        let dir = seat_dir(&store, "cpd-f1").unwrap();
+        let burnt = |cost: u64| write(&dir.join(crate::host::BURN_FILE), &json!({ "turns": 2, "session_id": "s-1", "cost": cost }));
+        let ledger = || std::fs::read_to_string(store.state.join(crate::host::SPENT_FILE)).unwrap();
+
+        burnt(10);
+        LOCAL.bank(&dir);
+        let stopped = Message::SeatStopped(SeatStopped { seat: seat(), epoch: Epoch(1), exit: Some(0), ended: vec![], renderer_left: false });
+        fold_to(&store, &mut sub, m.emit(stopped).unwrap().0);
+        LOCAL.bank(&dir);
+        assert_eq!(ledger().lines().count(), 1, "{}", ledger());
+
+        burnt(30);
+        LOCAL.bank(&dir);
+        assert_eq!(ledger().lines().count(), 1, "{}", ledger());
+        assert!(ledger().contains("\"cost\":30"), "{}", ledger());
+        sub.close();
+        m.stop();
+    }
+
     /// wsp-029: a seat the manager adopts from the in-process host goes out
     /// with an empty row, and a spawn without a key is keyed by its own seat:
     /// folding either writes no claim and no binding for a row named after
