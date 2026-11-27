@@ -21,13 +21,19 @@
 //! host's `admin init`), which the hub keeps out of the GitHub rules.
 //!
 //! A lease in `state` carries its holder, token and expiry, not the machine it
-//! is held on (the contract's `Lease`): `machine` is left out, never guessed.
+//! is held on (the contract's `Lease`); the hub's reply carries the machine
+//! beside it, by lease name (`lease_machines`, the hub's b5c19f9), for those
+//! held on one. `machine` is that, or `null` where the reply names none (a
+//! holder that named no machine, or a hub older than it), never guessed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use wsp_hub_protocol::{principal, Answer, Call, Outcome, Verb, MAX_EVENTS};
-use wsp_store_contract::{At, Credential, Event, EventId, IdentityState, Principal, Refusal, State, Subject, WorkspaceId};
+use wsp_store_contract::{At, Credential, Event, EventId, IdentityState, LeaseName, Principal, Refusal, State, Subject, WorkspaceId};
+
+/// The machine each lease is held on, by its name in `state.leases`, as the hub's `state` reply names it.
+pub type Machines = BTreeMap<LeaseName, wsp_hub_protocol::Machine>;
 
 use crate::hub_client::{self, words, Client, Error};
 use wsp_engine::util;
@@ -190,9 +196,9 @@ pub fn workspaces_lines(state: &State, me: Option<&str>) -> Vec<String> {
 }
 
 /// The leases `state` shows (only those of workspaces the caller is a member
-/// of): workspace, row, holder, fencing token, expiry. No `machine`: the hub's
-/// `state` does not carry it.
-pub fn leases(state: &State) -> Vec<Value> {
+/// of): workspace, row, holder, fencing token, expiry, and the machine
+/// `{id, name}` it is held on where the reply names one (`null` where not).
+pub fn leases(state: &State, machines: &Machines) -> Vec<Value> {
     state
         .leases
         .values()
@@ -205,6 +211,7 @@ pub fn leases(state: &State) -> Vec<Value> {
                 "holder": principal::text(&l.holder),
                 "token": l.token.0,
                 "expires": iso(l.expires),
+                "machine": machines.get(&l.name).map(|m| json!({ "id": m.id, "name": m.name })),
             })
         })
         .collect()
@@ -216,12 +223,13 @@ pub fn not_shown(state: &State, me: Option<&str>) -> Vec<String> {
     state.workspaces.keys().filter(|w| !is_member(state, &w.0, me)).map(|w| w.0.clone()).collect()
 }
 
-pub fn leases_lines(state: &State, me: Option<&str>) -> Vec<String> {
-    let mut lines: Vec<String> = leases(state)
+pub fn leases_lines(state: &State, machines: &Machines, me: Option<&str>) -> Vec<String> {
+    let mut lines: Vec<String> = leases(state, machines)
         .iter()
         .map(|l| {
+            let on = l["machine"]["name"].as_str().map(|m| format!(" on {m}")).unwrap_or_default();
             format!(
-                "{:<14} {:<12} held by {}  token {}  until {}",
+                "{:<14} {:<12} held by {}{on}  token {}  until {}",
                 l["row"].as_str().unwrap_or("?"),
                 l["workspace"].as_str().unwrap_or("?"),
                 l["holder"].as_str().unwrap_or_default(),
@@ -423,6 +431,51 @@ pub fn parse_since(s: &str, now_secs: i64) -> Option<u64> {
 /// Token record id → user, for [`Filter::keeps`].
 pub fn owners(state: &State) -> BTreeMap<String, String> {
     state.credentials.values().map(|c| (c.id.0.clone(), c.user.0.clone())).collect()
+}
+
+/// The keys of [`info_json`], each `null` where the hub does not say.
+const INFO_KEYS: &[&str] = &["version", "protocol", "server", "quotas", "event_days", "lease_secs", "sweep_secs", "max_connections", "max_connections_per_peer", "login", "usage"];
+
+/// What `hub.info` said, as the hub spells it (a usage's workspace by its
+/// name, `team`); every key `null` where the hub did not say (`None`: a hub
+/// older than `hub.info`, which answers `unsupported`). `login` is `null` too
+/// on a hub with no login (an admin issues every token).
+pub fn info_json(info: Option<&wsp_hub_protocol::HubInfo>) -> Value {
+    let mut out = serde_json::Map::new();
+    let said = info.and_then(|i| serde_json::to_value(i).ok());
+    for k in INFO_KEYS {
+        out.insert((*k).into(), said.as_ref().and_then(|v| v.get(*k)).cloned().unwrap_or(Value::Null));
+    }
+    if let Some(Value::Array(usage)) = out.get_mut("usage") {
+        for u in usage {
+            if let Some(w) = u.get("workspace").and_then(Value::as_str).map(|w| w.strip_prefix("shared:").unwrap_or(w).to_string()) {
+                u["workspace"] = json!(w);
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+pub fn info_lines(info: Option<&wsp_hub_protocol::HubInfo>) -> Vec<String> {
+    let Some(i) = info else { return vec!["facts       the hub does not say (a hub older than hub.info)".into()] };
+    let q = &i.quotas;
+    let mut lines = vec![
+        format!("build       {} (protocol {})", i.version, i.protocol),
+        format!("kept        events {} day(s); a lease runs {}s; swept every {}s", i.event_days, i.lease_secs, i.sweep_secs),
+        format!("connections {} at most, {} per peer", i.max_connections, i.max_connections_per_peer),
+        format!(
+            "quotas      object {} B, {} objects a put, workspace {} B, {} refs a workspace, message {} B, queue {}, {} login tokens a person, ids {} ahead",
+            q.max_object_bytes, q.max_objects_per_put, q.max_workspace_bytes, q.max_refs_per_workspace, q.max_message_bytes, q.max_queue, q.max_login_tokens, q.max_id_advance
+        ),
+        match &i.login {
+            Some(l) => format!("login       {} (its tokens last {} day(s)); a token an admin issues does not expire", l.method, l.token_days),
+            None => "login       none: an admin issues every token".into(),
+        },
+    ];
+    for u in &i.usage {
+        lines.push(format!("usage       {}: {} B of {}, {} ref(s) of {}", u.workspace.0.strip_prefix("shared:").unwrap_or(&u.workspace.0), u.bytes, q.max_workspace_bytes, u.refs, q.max_refs_per_workspace));
+    }
+    lines
 }
 
 #[cfg(test)]

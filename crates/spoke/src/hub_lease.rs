@@ -532,12 +532,54 @@ fn drop_claim(store: &Store, row: &str, token: Token, why: &str) -> bool {
 /// where the claim here holds that token it is released. Whether it was. The
 /// book forgets the row lease either way.
 pub fn follow_expired(store: &Store, payload: &Value) -> bool {
+    follow_expired_by(store, payload, None)
+}
+
+/// What the holder's spoke does with a lease event of the stream: a
+/// `lease.released` by an admin (cause `admin`, `released_by`) is noted in
+/// `admin_released` by row and token, and the `lease.expired` that follows
+/// it (cause `admin_released`), as any `lease.expired`, lets the claim go
+/// ([`follow_expired_by`]), naming the admin. Whether a claim was let go.
+pub fn follow_lease_event(store: &Store, kind: EventKind, payload: &Value, admin_released: &mut std::collections::BTreeMap<(String, u64), String>) -> bool {
+    let key = || (payload["row"].as_str().unwrap_or_default().to_string(), payload["token"].as_u64().unwrap_or_default());
+    match kind {
+        EventKind::LeaseReleased if payload["cause"] == "admin" => {
+            if let Some(by) = payload["released_by"].as_str() {
+                admin_released.insert(key(), by.to_string());
+            }
+            false
+        }
+        EventKind::LeaseExpired => {
+            let by = admin_released.remove(&key());
+            follow_expired_by(store, payload, by.as_deref())
+        }
+        _ => false,
+    }
+}
+
+/// [`follow_expired`], for a `lease.expired` that may follow an admin's
+/// release (cause `admin_released`): `released_by` is the admin the
+/// `lease.released` before it named (`person:ann`). The claim is let go
+/// exactly as on an expiry; the line it leaves names the admin instead.
+pub fn follow_expired_by(store: &Store, payload: &Value, released_by: Option<&str>) -> bool {
     let (Some(row), Some(token)) = (payload["row"].as_str(), payload["token"].as_u64()) else { return false };
+    let admin = (payload["cause"] == "admin_released").then(|| {
+        let by = released_by.unwrap_or("an admin");
+        by.strip_prefix("person:").map(|u| format!("the hub admin {u}")).unwrap_or_else(|| by.to_string())
+    });
     if let Some(list) = row.strip_prefix(DRIVE) {
-        return drop_drive(store, list, Token(token), &format!("it expired on the hub (token {token})"));
+        let why = match &admin {
+            Some(by) => format!("{by} released it on the hub (token {token})"),
+            None => format!("it expired on the hub (token {token})"),
+        };
+        return drop_drive(store, list, Token(token), &why);
     }
     forget_row(store, row, Token(token));
-    drop_claim(store, row, Token(token), &format!("lease expired on the hub: {row}, token {token}"))
+    let why = match &admin {
+        Some(by) => format!("lease released on the hub by {by}: {row}, token {token}"),
+        None => format!("lease expired on the hub: {row}, token {token}"),
+    };
+    drop_claim(store, row, Token(token), &why)
 }
 
 // ---- the drive lease (wsp-467) ----------------------------------------------------
@@ -929,6 +971,57 @@ pub mod tests {
         t.status_raw = "doing".into();
         t.workspace = "shared:team".parse().unwrap();
         store.save_task(&t).unwrap();
+    }
+
+    /// An admin's release (the hub's b5c19f9) reaches the holder's spoke as
+    /// `lease.released` (cause `admin`, `released_by`) then `lease.expired`
+    /// (cause `admin_released`): the spoke lets its claim go exactly as on an
+    /// expiry, and the line it leaves names the admin, not an expiry.
+    #[test]
+    fn hub_lease_an_admins_release_lets_the_holders_claim_go_as_an_expiry_naming_the_admin() {
+        install(lose, |_, _, _| false);
+        let _env = wsp_engine::util::isolated("hub-lease-admin-release");
+        std::env::remove_var("WSP_CLAIM_TTL");
+        let Some((running, tokens)) = serve(Setup::default()) else { return };
+        // The hub's admin `root` is a member of team (`seed`), so it may release there.
+        let mut ann = dial(&running, &tokens, "ann");
+        let mut feed = dial(&running, &tokens, "ann").subscribe(None);
+        assert!(matches!(feed.next_within(WAIT), Some(Item::State { .. })));
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        shared_row(&store, "wsp-1");
+        let held = take(&mut ann, "shared:team", "wsp-1").unwrap();
+        let mut claim = json!({ "workspace_id": "cpd-a", "claimed_at": util::now_iso() });
+        stamp(&mut claim, &held);
+        store.set_claim("wsp-1", claim);
+        store.set_binding("cpd-a", json!({ "task_id": "wsp-1", "pane_id": "cpd-a" }));
+
+        running.admin().lease_release_admin(&wsp_objects::WorkspaceId("shared:team".into()), &RowId("wsp-1".into()), held.token).unwrap();
+        let mut noted = BTreeMap::new();
+        let mut heard = Vec::new();
+        let dropped = loop {
+            match feed.next_within(WAIT) {
+                Some(Item::Event(e)) if matches!(e.kind, EventKind::LeaseReleased | EventKind::LeaseExpired) => {
+                    heard.push((e.kind, e.payload["cause"].clone()));
+                    let let_go = follow_lease_event(&store, e.kind, &e.payload, &mut noted);
+                    if e.kind == EventKind::LeaseExpired {
+                        break let_go;
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("no lease.expired on the stream after the admin's release: {heard:?}"),
+            }
+        };
+        assert_eq!(heard, vec![(EventKind::LeaseReleased, json!("admin")), (EventKind::LeaseExpired, json!("admin_released"))]);
+        assert!(dropped, "the claim was let go");
+        assert!(!store.claims().contains_key("wsp-1"), "the claim is released, as on an expiry");
+        assert!(store.bindings().get("cpd-a").is_none());
+        let row = store.task("wsp-1").unwrap();
+        assert_eq!(row.status(), wsp_engine::model::Status::Todo);
+        let log = row.section("Log").unwrap_or_default();
+        assert!(log.contains(&format!("lease released on the hub by the hub admin root: wsp-1, token {}", held.token.0)), "{log}");
+        assert!(!log.contains("lease expired on the hub"), "not called an expiry: {log}");
+        assert!(noted.is_empty(), "what the release noted is used up");
     }
 
     /// Done-when 1 (wsp-466): A leases a row; B's claim on it is refused naming

@@ -594,13 +594,19 @@ MACHINES
   wsp hub user ls [--json]             the hub's people: role, state, token records
                                        (id, method, issued, revoked), workspaces
   wsp hub user revoke <name>           revoke a user and every token of its
+  wsp hub user admin <name> [--remove] make an active user a hub admin, or not
+                                       (--remove); never the last active admin
   wsp hub token <name>                 a new token for a user; its admin-issued tokens
                                        revoked, its GitHub logins' kept
   wsp hub token revoke <id>            revoke one token record, by its id
   wsp hub workspace add <name>         a shared workspace
   wsp hub workspace ls [--json]        the shared workspaces and their members
   wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
-  wsp hub lease ls [--json]            the leases the hub shows you (your workspaces')
+  wsp hub lease ls [--json]            the leases the hub shows you (your workspaces'),
+                                       with the machine each is held on
+  wsp hub lease release <row>          release another's lease on a row, as an admin
+                [--workspace W]        and a member of its workspace: the holder's work
+                                       on the row is cut off as on an expiry
   wsp hub events [--from N] [--json]   the hub's trail, one page (at most 1000) after
                                        event N; --limit N, --kind K, --workspace W,
                                        --person U, --row R, --since T filter the page

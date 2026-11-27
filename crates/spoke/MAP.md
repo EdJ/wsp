@@ -33,7 +33,8 @@ through the engine's installed `cycle::seats()`). Neither `wsp-engine` nor `wsp-
   `--github`, `logout`, `hub`, `publish`, `allocate`)
 - `hub_admin` — what a hub admin reads, as fields: people with their token records (login method from the id's
   prefix) and workspaces, workspaces and members, the leases the hub shows, the `events` trail a page at a time with
-  its filters and the `too_old` horizon as data (`wsp hub state`, `user ls`, `workspace ls`, `lease ls`, `events`)
+  its filters and the `too_old` horizon as data, the lease's machine (`lease_machines`) and the hub's own facts
+  (`hub.info`) (`wsp hub state`, `user ls`, `workspace ls`, `lease ls`, `events`)
 - `testhub` (behind `test-support`, and in this crate's tests) — a real hub for tests, run as an external program:
   `WSP_HUB_BIN` (the `wsp-hub` binary of the hub's repository) or `WSP_HUB_IMAGE` (its container image, over TLS with
   a throwaway CA, removed on drop). Seeded over the wire through `hub_client`; URL, CA, tokens, restart and stop, the
@@ -48,7 +49,7 @@ never name it.
 
 ## Tests
 
-`cargo test -p wsp-spoke` (81). The tests that need a hub run the hub's own program (`testhub`):
+`cargo test -p wsp-spoke` (150, with `--features test-support` and a hub named). The tests that need a hub run the hub's own program (`testhub`):
 
 ```text
 WSP_HUB_BIN=<path to wsp-hub> cargo test -p wsp-spoke        # the binary, a child process on loopback

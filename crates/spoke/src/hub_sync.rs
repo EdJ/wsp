@@ -157,6 +157,10 @@ pub const TURN_ENV: &str = "WSP_HUB_SYNC_MS";
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// How often the worker asks the hub, on its open connection, whether the
+/// user is an admin now ([`Worker::refresh_admin`]).
+pub const ADMIN_REFRESH: Duration = Duration::from_secs(60);
+
 /// How often the task files are looked at for a change between turns.
 const POLL: Duration = Duration::from_millis(250);
 
@@ -554,6 +558,11 @@ pub struct Worker {
     release_after: Vec<(RowId, Token)>,
     /// Rows whose lease the hub would not say this turn: nothing of them pushed.
     held_back: BTreeSet<Subject>,
+    /// When `whoami` was last asked whether the user is a hub admin ([`Worker::refresh_admin`]).
+    admin_read: Option<Instant>,
+    /// Who released a lease as an admin, by row and token, from its
+    /// `lease.released` (cause `admin`), for the `lease.expired` that follows.
+    admin_released: BTreeMap<(String, u64), String>,
     /// A test's look at the store between the steps of one workspace's sync,
     /// by the step's name: what a reader of the files sees there.
     #[cfg(test)]
@@ -577,6 +586,8 @@ impl Worker {
             by: None,
             release_after: Vec::new(),
             held_back: BTreeSet::new(),
+            admin_read: None,
+            admin_released: BTreeMap::new(),
             #[cfg(test)]
             seam: None,
         }
@@ -665,6 +676,7 @@ impl Worker {
                     self.link = Link::Up;
                 }
                 self.renew_leases(store);
+                self.refresh_admin();
                 let hand = hand_to_orders(store);
                 if let Err(why) = self.take_messages(store, &hand) {
                     self.say_once(store, format!("hub-sync: the messages queued for this spoke were not taken: {why}"));
@@ -704,6 +716,26 @@ impl Worker {
         }
         self.write_status(store, out.as_ref().ok());
         out
+    }
+
+    /// Whether the user is a hub admin now, asked of the open connection
+    /// (`whoami`'s `admin`, read at the request) at most every
+    /// [`ADMIN_REFRESH`], and kept for `wsp hub status`: a flag set or cleared
+    /// while the worker's connection stays open shows without a new login. A
+    /// hub older than `whoami`'s `admin` says nothing, and nothing is kept.
+    fn refresh_admin(&mut self) {
+        if self.admin_read.is_some_and(|at| at.elapsed() < ADMIN_REFRESH) {
+            return;
+        }
+        let Some(client) = self.client.as_mut() else { return };
+        self.admin_read = Some(Instant::now());
+        if let Ok((by, _, Some(admin))) = client.whoami() {
+            // The url as the dial read it (the environment's before the login's), as `keep_welcome` keeps it.
+            let env = std::env::var(hub_client::HUB_URL_ENV).ok().filter(|v| !v.is_empty());
+            if let Ok(url) = hub_client::hub_url_in(env, &self.home) {
+                hub_client::keep_admin(&self.home, &url, &by, admin);
+            }
+        }
     }
 
     /// The hub leases of the claims here whose seats are alive, renewed at most
@@ -861,9 +893,10 @@ impl Worker {
             let left = end.saturating_duration_since(Instant::now());
             match feed.next_within(left) {
                 Some(Item::Event(e)) => {
-                    if e.kind == EventKind::LeaseExpired {
-                        crate::hub_lease::follow_expired(store, &e.payload);
-                    }
+                    // An admin's release (the hub's b5c19f9): `lease.released` (cause `admin`,
+                    // `released_by`), then `lease.expired` (cause `admin_released`), which the
+                    // holder follows as an expiry, naming the admin.
+                    crate::hub_lease::follow_lease_event(store, e.kind, &e.payload, &mut self.admin_released);
                     // Who holds what, for the rows' facts (`hub_holders`).
                     crate::hub_holders::follow(store, e.kind, &e.payload);
                     // A message queued for this user (wsp-470): take it now.

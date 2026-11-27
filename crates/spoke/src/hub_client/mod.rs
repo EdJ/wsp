@@ -41,7 +41,7 @@ pub mod words;
 
 pub use dial::{hub_cert_expiry, login_github, login_github_on, Silent};
 pub use login::{
-    forget_welcome, hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, keep_welcome, kept_admin, kept_server, Credential, HubLogin,
+    forget_welcome, hub_ca, hub_ca_in, hub_home, hub_login_in, hub_url, hub_url_in, keep_admin, keep_welcome, kept_admin, kept_server, Credential, HubLogin,
     HUBS_FILE, HUB_CA_ENV, HUB_HOME_ENV, HUB_TOKEN_ENV, HUB_URL_ENV, HUB_USER_ENV, TOKEN_ENV, WELCOME_FILE,
 };
 pub use subscribe::{Feed, Item};
@@ -244,10 +244,12 @@ impl Client {
 
     /// The `whoami` verb: who the hub holds this connection as (what the
     /// token names), and the instance it is on.
-    pub fn whoami(&mut self) -> Result<(Principal, String), Error> {
+    /// The third is whether its user is an active admin now, read at this
+    /// request; none from a hub older than it.
+    pub fn whoami(&mut self) -> Result<(Principal, String, Option<bool>), Error> {
         let reply = self.send_call(Call::Verb(Verb::Whoami(NoArgs {})), None)?;
         match reply.outcome {
-            Outcome::Ok(Answer::Whoami { by, server }) => Ok((by, server)),
+            Outcome::Ok(Answer::Whoami { by, server, admin }) => Ok((by, server, admin)),
             Outcome::Ok(other) => Err(Error::Unexpected(format!("whoami was answered {other:?}"))),
             Outcome::Err(f) => Err(refused(f)),
         }
@@ -258,8 +260,20 @@ impl Client {
     pub fn state(&mut self) -> Result<(State, EventId), Error> {
         let reply = self.send_call(Call::Verb(Verb::State(NoArgs {})), None)?;
         match reply.outcome {
-            Outcome::Ok(Answer::State { state, at }) => Ok((state, at)),
+            Outcome::Ok(Answer::State { state, at, .. }) => Ok((state, at)),
             Outcome::Ok(other) => Err(Error::Unexpected(format!("state was answered {other:?}"))),
+            Outcome::Err(f) => Err(refused(f)),
+        }
+    }
+
+    /// The `hub.info` verb (an admin's): the hub's build, protocol, quotas,
+    /// retention, lease TTL, sweep, connection limits, login and the usage of
+    /// the caller's workspaces. A hub older than it answers `unsupported`.
+    pub fn hub_info(&mut self) -> Result<wsp_hub_protocol::HubInfo, Error> {
+        let reply = self.send_call(Call::Verb(Verb::HubInfo(NoArgs {})), None)?;
+        match reply.outcome {
+            Outcome::Ok(Answer::Info(info)) => Ok(info),
+            Outcome::Ok(other) => Err(Error::Unexpected(format!("hub.info was answered {other:?}"))),
             Outcome::Err(f) => Err(refused(f)),
         }
     }

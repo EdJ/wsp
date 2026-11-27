@@ -5,12 +5,14 @@
 //! wsp hub user add <name> [--admin]     add a user, issue its token, print it once
 //! wsp hub user ls                       the hub's people, their token records and workspaces
 //! wsp hub user revoke <name>            revoke the user and every token of its
+//! wsp hub user admin <name> [--remove]  make an active user a hub admin, or not
 //! wsp hub token <name>                  issue a new token, revoking the old admin-issued ones
 //! wsp hub token revoke <id>             revoke one token record
 //! wsp hub workspace add <name>          a shared workspace
 //! wsp hub workspace ls                  the shared workspaces and their members
 //! wsp hub member add|rm <ws> <user>     a user in a shared workspace, or out of it
 //! wsp hub lease ls                      the leases the hub shows the caller
+//! wsp hub lease release <row>           an admin's release of another's lease
 //! wsp hub events [--from N] [filters]   the hub's trail, a page at a time
 //! wsp hub disable                       stop taking part in shared work, the login kept
 //! wsp hub enable                        take part again, taking back what the disable parked
@@ -123,7 +125,12 @@ fn dial() -> Result<Client, Said> {
     let url = hub_client::hub_url().map_err(silent)?;
     let credential = Credential::for_hub().map_err(silent)?;
     let ca = hub_client::hub_ca().map_err(silent)?;
-    Client::dial_hub_ca(&url, credential, ca.as_deref(), WAIT).map_err(silent)
+    let client = Client::dial_hub_ca(&url, credential, ca.as_deref(), WAIT).map_err(silent)?;
+    // What this welcome said of the user (read at this hello: whether an admin now), for `wsp hub status`.
+    if let Some(home) = hub_client::hub_home() {
+        hub_client::keep_welcome(&home, &url, &client);
+    }
+    Ok(client)
 }
 
 /// A failed call in words: a refusal for want of being an admin says
@@ -138,7 +145,13 @@ fn say(e: Error) -> Said {
             fields.insert("by".into(), json!(wsp_hub_protocol::principal::text(by)));
             Said { code: "forbidden".into(), message, fields }
         }
-        Error::Refused(r, text) => Said { code: words::refusal_code(&r), message: words::refusal(&r, &text), fields: words::refusal_fields(&r) },
+        Error::Refused(r, text) => {
+            let mut message = words::refusal(&r, &text);
+            if matches!(&r, Refusal::Illegal { state, .. } if state == LAST_ADMIN) {
+                message.push_str(": make another user an admin first (`wsp hub user admin <name>`)");
+            }
+            Said { code: words::refusal_code(&r), message, fields: words::refusal_fields(&r) }
+        }
         Error::Failed(f) => {
             let mut said = Said::new(&words::code(f.code), words::failure(&f));
             said.fields.insert("text".into(), json!(f.text));
@@ -154,15 +167,20 @@ fn say(e: Error) -> Said {
     }
 }
 
+/// The state the hub names its last active admin by, refusing to revoke it or
+/// clear its admin flag (`wsp-hub crates/ledger/src/identity.rs`).
+const LAST_ADMIN: &str = "the last active admin";
+
 /// Sends `cmd`; the ids of the events it wrote (none: it changed nothing).
 fn send(client: &mut Client, cmd: Command) -> Result<Vec<EventId>, Said> {
     client.apply(&cmd).map_err(say)
 }
 
-/// The hub's state as the admin reads it, and the event id it is consistent at.
-fn state(client: &mut Client) -> Result<(State, EventId), Said> {
+/// The hub's state as the admin reads it, the event id it is consistent at,
+/// and the machine each lease is held on (where the hub names one).
+fn state(client: &mut Client) -> Result<(State, EventId, hub_admin::Machines), Said> {
     match client.request(Call::Verb(Verb::State(NoArgs {}))).map_err(say)?.outcome {
-        Outcome::Ok(Answer::State { state, at }) => Ok((state, at)),
+        Outcome::Ok(Answer::State { state, at, lease_machines }) => Ok((state, at, lease_machines)),
         Outcome::Ok(_) => Err(Said::new("unexpected", "the hub answered state with something other than its state")),
         Outcome::Err(f) => Err(say(hub_client::refused(f))),
     }
@@ -189,7 +207,7 @@ fn user_add(client: &mut Client, name: &str, admin: bool) -> Result<Done, Said> 
 }
 
 fn user_ls(client: &mut Client) -> Result<Done, Said> {
-    let (state, at) = state(client)?;
+    let (state, at, _) = state(client)?;
     Ok(read(hub_admin::people_lines(&state), json!({ "users": hub_admin::people(&state), "at": at.0 })))
 }
 
@@ -201,12 +219,110 @@ fn user_revoke(client: &mut Client, name: &str) -> Result<Done, Said> {
     Ok(done)
 }
 
+/// `hub.user.admin {name, admin}`: makes an active user a hub admin, or not.
+/// Setting what is changes nothing, and says so.
+fn user_admin(client: &mut Client, name: &str, admin: bool) -> Result<Done, Said> {
+    let wrote = send(client, Command::HubUserAdmin { name: UserName(name.to_string()), admin })?;
+    let line = match (admin, wrote.is_empty()) {
+        (true, false) => format!("{name} is a hub admin now"),
+        (true, true) => format!("{name} was a hub admin already"),
+        (false, false) => format!("{name} is no hub admin now"),
+        (false, true) => format!("{name} was no hub admin already"),
+    };
+    let mut done = Done { lines: vec![line], ..Done::default() };
+    done.fields.insert("user".into(), json!(name));
+    done.fields.insert("admin".into(), json!(admin));
+    done.fields.insert("changed".into(), json!(!wrote.is_empty()));
+    Ok(done)
+}
+
+/// An admin's release of the lease on `row` (`lease.release {row, token,
+/// workspace, admin: true}`): the token and workspace are read from the
+/// admin's `state` (a lease the hub shows it, so of a workspace it is a
+/// member of), `workspace` narrowing it where the row is leased in more than
+/// one. The holder's work on the row is cut off as on an expiry.
+fn lease_release(client: &mut Client, row: &str, workspace: Option<&str>) -> Result<Done, Said> {
+    let (state, _, machines) = state(client)?;
+    let found: Vec<Value> = hub_admin::leases(&state, &machines)
+        .into_iter()
+        .filter(|l| l["row"] == json!(row) && workspace.is_none_or(|w| l["workspace"] == json!(w)))
+        .collect();
+    let lease = match found.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            let mut said = Said::new(
+                "not_found",
+                format!("the hub shows you no lease on {row}{}: it is not held, or it is in a workspace you are not a member of (`wsp hub lease ls`)", workspace.map(|w| format!(" in {w}")).unwrap_or_default()),
+            );
+            said.fields.insert("row".into(), json!(row));
+            return Err(said);
+        }
+        many => {
+            let wss: Vec<&str> = many.iter().filter_map(|l| l["workspace"].as_str()).collect();
+            let mut said = Said::new("ambiguous", format!("{row} is leased in {}: say which with --workspace", wss.join(" and ")));
+            said.fields.insert("workspaces".into(), json!(wss));
+            return Err(said);
+        }
+    };
+    let ws = lease["workspace"].as_str().unwrap_or_default().to_string();
+    let token = lease["token"].as_u64().unwrap_or_default();
+    let holder = lease["holder"].as_str().unwrap_or_default().to_string();
+    let on = lease["machine"]["name"].as_str().map(|m| format!(" on {m}")).unwrap_or_default();
+    let who = holder.strip_prefix("person:").unwrap_or(&holder).to_string();
+    if let Err(e) = client.lease_release_admin(&wsp_objects::WorkspaceId(format!("shared:{ws}")), &wsp_store_contract::RowId(row.to_string()), wsp_store_contract::Token(token)) {
+        return Err(release_refused(e, row, &ws, token, &holder));
+    }
+    let mut done = Done {
+        lines: vec![format!(
+            "the lease on {row} in {ws} (held by {holder}{on}, token {token}) is released: {who}'s work on {row} is cut off as on an expiry, and anyone in {ws} may take the row"
+        )],
+        ..Done::default()
+    };
+    done.fields.extend([
+        ("released".into(), json!(row)),
+        ("workspace".into(), json!(ws)),
+        ("holder".into(), json!(holder)),
+        ("lease_token".into(), json!(token)),
+        ("machine".into(), lease["machine"].clone()),
+    ]);
+    Ok(done)
+}
+
+/// An admin's release refused, in words: `stale` is the lease changed hands
+/// since it was read; `forbidden` is a caller no admin, or a hub older than
+/// an admin's release (it answers as to a holder's own release).
+fn release_refused(e: Error, row: &str, ws: &str, token: u64, holder: &str) -> Said {
+    let mut said = match e {
+        Error::Refused(Refusal::Stale { current, .. }, _) => {
+            let mut said = Said::new(
+                "stale",
+                format!("the lease on {row} in {ws} changed hands since it was read (its token is {} now, not {token}): read again (`wsp hub lease ls`) and release that one if you still mean to", current.0),
+            );
+            said.fields.insert("current".into(), json!(current.0));
+            said
+        }
+        Error::Refused(Refusal::Forbidden { by }, _) => Said::new(
+            "forbidden",
+            format!(
+                "forbidden: the hub would not let {} release {holder}'s lease on {row}: only a hub admin may, and a hub older than an admin's release refuses it to anyone but the holder",
+                wsp_hub_protocol::principal::text(&by)
+            ),
+        ),
+        Error::Refused(Refusal::NotFound { .. }, _) => {
+            Said::new("not_found", format!("the hub holds no lease on {row} in {ws} any more (it ran out, or its holder let it go): read again (`wsp hub lease ls`)"))
+        }
+        other => say(other),
+    };
+    said.fields.extend([("row".into(), json!(row)), ("workspace".into(), json!(ws)), ("lease_token".into(), json!(token))]);
+    said
+}
+
 /// A new token for `name`, then its live admin-issued tokens revoked after it
 /// (issued first, so a failure never leaves a user with none). Its GitHub
 /// logins' tokens (`gh-`) are kept: they are the GitHub login's, which
 /// limits and expires them itself.
 fn token_reissue(client: &mut Client, name: &str) -> Result<Done, Said> {
-    let (st, _) = state(client)?;
+    let (st, _, _) = state(client)?;
     let live: Vec<&wsp_store_contract::Credential> = st.credentials.values().filter(|c| c.user.0 == name && c.state == IdentityState::Active).collect();
     let (github, issued): (Vec<_>, Vec<_>) = live.into_iter().partition(|c| hub_admin::method_of(&c.id.0) == "github");
     let token = issue(client, name)?;
@@ -245,7 +361,7 @@ fn workspace_add(client: &mut Client, name: &str) -> Result<Done, Said> {
 }
 
 fn workspace_ls(client: &mut Client) -> Result<Done, Said> {
-    let (state, at) = state(client)?;
+    let (state, at, _) = state(client)?;
     let me = hub_admin::person(client.by()).map(str::to_string);
     Ok(read(hub_admin::workspaces_lines(&state, me.as_deref()), json!({ "workspaces": hub_admin::workspaces(&state, me.as_deref()), "at": at.0 })))
 }
@@ -257,17 +373,23 @@ fn member_set(client: &mut Client, workspace: &str, user: &str, member: bool) ->
 }
 
 fn lease_ls(client: &mut Client) -> Result<Done, Said> {
-    let (state, at) = state(client)?;
+    let (state, at, machines) = state(client)?;
     let me = hub_admin::person(client.by()).map(str::to_string);
-    let doc = json!({ "leases": hub_admin::leases(&state), "not_shown": hub_admin::not_shown(&state, me.as_deref()), "at": at.0 });
-    Ok(read(hub_admin::leases_lines(&state, me.as_deref()), doc))
+    let doc = json!({ "leases": hub_admin::leases(&state, &machines), "not_shown": hub_admin::not_shown(&state, me.as_deref()), "at": at.0 });
+    Ok(read(hub_admin::leases_lines(&state, &machines, me.as_deref()), doc))
 }
 
 /// The admin's snapshot: the hub (its instance name, who is asking, where its
 /// trail starts), its people, workspaces and the leases it shows.
 fn hub_state(client: &mut Client, url: &str) -> Result<Done, Said> {
-    let (state, at) = state(client)?;
+    let (state, at, machines) = state(client)?;
     let horizon = hub_admin::horizon(client).map_err(say)?;
+    // `hub.info`: a hub older than it answers `unsupported`, which is "the hub does not say", not a failure.
+    let info = match client.hub_info() {
+        Ok(info) => Some(info),
+        Err(Error::Failed(f)) if f.code == Code::Unsupported => None,
+        Err(e) => return Err(say(e)),
+    };
     let me = hub_admin::person(client.by()).map(str::to_string);
     let mut hub = json!({
         "url": url,
@@ -279,9 +401,10 @@ fn hub_state(client: &mut Client, url: &str) -> Result<Done, Said> {
     if let (Some(h), Value::Object(more)) = (hub.as_object_mut(), hub_admin::horizon_json(&horizon)) {
         h.extend(more);
     }
+    hub["info"] = hub_admin::info_json(info.as_ref());
     let users = hub_admin::people(&state);
     let workspaces = hub_admin::workspaces(&state, me.as_deref());
-    let leases = hub_admin::leases(&state);
+    let leases = hub_admin::leases(&state, &machines);
     let not_shown = hub_admin::not_shown(&state, me.as_deref());
     let admins = state.users.values().filter(|u| u.admin && u.state == IdentityState::Active).count();
     let revoked = state.users.values().filter(|u| u.state == IdentityState::Revoked).count();
@@ -304,6 +427,7 @@ fn hub_state(client: &mut Client, url: &str) -> Result<Done, Said> {
         )),
         (None, _) => lines.push("trail       no event you can read".into()),
     }
+    lines.extend(hub_admin::info_lines(info.as_ref()));
     if !not_shown.is_empty() {
         lines.push(format!("not shown to you (you are not a member): {}", not_shown.join(", ")));
     }
@@ -372,12 +496,16 @@ fn read(lines: Vec<String>, doc: Value) -> Done {
     Done { lines, fields, read: true, ..Done::default() }
 }
 
-const USAGE: &str = "usage: wsp hub state | user add <name> [--admin] | user ls | user revoke <name> | token <name> | token revoke <id> | workspace add <name> | workspace ls | member add|rm <workspace> <user> | lease ls | events [--from N] [--limit N] [--kind K] [--workspace W] [--person U] [--row R] [--since T]";
+const USAGE: &str = "usage: wsp hub state | user add <name> [--admin] | user ls | user revoke <name> | user admin <name> [--remove] | token <name> | token revoke <id> | workspace add <name> | workspace ls | member add|rm <workspace> <user> | lease ls | lease release <row> [--workspace W] | events [--from N] [--limit N] [--kind K] [--workspace W] [--person U] [--row R] [--since T]";
 
 /// The flags a verb reads beside its words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Opts {
     pub admin: bool,
+    /// `user admin <name> --remove`: clear the flag.
+    pub remove: bool,
+    /// `lease release <row> --workspace W`.
+    pub workspace: Option<String>,
     pub events: EventsAsk,
     /// The hub's URL, as the login names it, for `state`.
     pub url: String,
@@ -390,6 +518,7 @@ pub fn run_words(client: &mut Client, words: &[&str], opts: &Opts) -> Result<Don
         ["user", "add", name] => user_add(client, name, opts.admin),
         ["user", "ls"] => user_ls(client),
         ["user", "revoke", name] => user_revoke(client, name),
+        ["user", "admin", name] => user_admin(client, name, !opts.remove),
         ["token", "revoke", id] => token_revoke(client, id),
         ["token", name] => token_reissue(client, name),
         ["workspace", "add", name] => workspace_add(client, name),
@@ -397,6 +526,7 @@ pub fn run_words(client: &mut Client, words: &[&str], opts: &Opts) -> Result<Don
         ["member", "add", ws, user] => member_set(client, ws, user, true),
         ["member", "rm", ws, user] => member_set(client, ws, user, false),
         ["lease", "ls"] => lease_ls(client),
+        ["lease", "release", row] => lease_release(client, row, opts.workspace.as_deref()),
         ["events"] => events(client, &opts.events),
         _ => Err(Said::new("usage", USAGE)),
     }
@@ -407,8 +537,8 @@ fn known(words: &[&str]) -> bool {
     match words {
         // `wsp hub token revoke` with no id is a slip, not a new token for a user named `revoke`.
         ["token", "revoke"] => false,
-        ["state"] | ["user", "add", _] | ["user", "ls"] | ["user", "revoke", _] | ["token", _] | ["token", "revoke", _] => true,
-        ["workspace", "add", _] | ["workspace", "ls"] | ["member", "add" | "rm", _, _] | ["lease", "ls"] | ["events"] => true,
+        ["state"] | ["user", "add", _] | ["user", "ls"] | ["user", "revoke", _] | ["user", "admin", _] | ["token", _] | ["token", "revoke", _] => true,
+        ["workspace", "add", _] | ["workspace", "ls"] | ["member", "add" | "rm", _, _] | ["lease", "ls"] | ["lease", "release", _] | ["events"] => true,
         _ => false,
     }
 }
@@ -470,6 +600,12 @@ pub fn run(_store: &Store, args: &Args) -> i32 {
     }
     let json = args.json();
     let mut opts = Opts { admin: words.starts_with(&["user", "add"]) && args.has("admin"), ..Opts::default() };
+    if words.starts_with(&["user", "admin"]) {
+        opts.remove = args.has("remove");
+    }
+    if words.starts_with(&["lease", "release"]) {
+        opts.workspace = args.get("workspace");
+    }
     if words == ["events"] {
         match events_ask(args) {
             Ok(ask) => opts.events = ask,
@@ -633,13 +769,19 @@ pub const HELP: &str = r##"  wsp hub state [--json]               the admin's sn
   wsp hub user ls [--json]             the hub's people: role, state, token records
                                        (id, method, issued, revoked), workspaces
   wsp hub user revoke <name>           revoke a user and every token of its
+  wsp hub user admin <name> [--remove] make an active user a hub admin, or not
+                                       (--remove); never the last active admin
   wsp hub token <name>                 a new token for a user; its admin-issued tokens
                                        revoked, its GitHub logins' kept
   wsp hub token revoke <id>            revoke one token record, by its id
   wsp hub workspace add <name>         a shared workspace
   wsp hub workspace ls [--json]        the shared workspaces and their members
   wsp hub member add|rm <ws> <user>    a user in a shared workspace, or out of it
-  wsp hub lease ls [--json]            the leases the hub shows you (your workspaces')
+  wsp hub lease ls [--json]            the leases the hub shows you (your workspaces'),
+                                       with the machine each is held on
+  wsp hub lease release <row>          release another's lease on a row, as an admin
+                [--workspace W]        and a member of its workspace: the holder's work
+                                       on the row is cut off as on an expiry
   wsp hub events [--from N] [--json]   the hub's trail, one page (at most 1000) after
                                        event N; --limit N, --kind K, --workspace W,
                                        --person U, --row R, --since T filter the page
@@ -656,7 +798,7 @@ mod tests {
     use super::*;
     use crate::testhub::{Backend, Setup, TestHub};
     use wsp_objects::WorkspaceId;
-    use wsp_store_contract::RowId;
+    use wsp_store_contract::{Principal, RowId};
 
     /// A real hub with its first admin `root` (`testhub`); `None` when no hub is named.
     struct Hub {
@@ -754,7 +896,7 @@ mod tests {
         assert_eq!(done.lines[2], format!("kept (GitHub logins): {gh}"));
         assert!(hub.dial(&old).is_err(), "the old token is revoked");
         assert!(hub.dial(&new).is_ok(), "the new one logs in");
-        let (st, _) = state(&mut root).unwrap();
+        let (st, _, _) = state(&mut root).unwrap();
         assert_eq!(st.credentials[&TokenId(gh.clone())].state, IdentityState::Active, "the GitHub login's token is kept");
 
         w(&mut root, &["user", "revoke", "ed"]).unwrap();
@@ -792,7 +934,7 @@ mod tests {
         let Some(hub) = Hub::start("refusals") else { return };
         let mut root = hub.dial(&hub.root).unwrap();
         let why = w(&mut root, &["user", "revoke", "root"]).unwrap_err();
-        assert_eq!(why.message, "user root is the last active admin, so the hub refuses hub.user.revoke");
+        assert_eq!(why.message, "user root is the last active admin, so the hub refuses hub.user.revoke: make another user an admin first (`wsp hub user admin <name>`)");
         assert_eq!(why.json()["error"], json!({ "code": "illegal", "message": why.message, "subject": { "user": "root" }, "state": "the last active admin", "verb": "hub.user.revoke" }));
         let why = w(&mut root, &["user", "add", "root"]).unwrap_err();
         assert_eq!((why.code.as_str(), why.message.as_str()), ("invalid", "root is a name the hub has had; a name is never reused"));
@@ -851,7 +993,8 @@ mod tests {
         let l = &leases["leases"][0];
         assert_eq!(leases["leases"].as_array().unwrap().len(), 1, "design's lease is not shown to ann: {leases}");
         assert_eq!((l["workspace"].clone(), l["row"].clone(), l["holder"].clone(), l["token"].clone()), (json!("team"), json!("wsp-1"), json!("person:bo"), json!(tok.0)));
-        assert!(l.get("machine").is_none(), "state carries no machine: {l}");
+        // The machine the lease is held on, from the reply's `lease_machines` (the hub's b5c19f9).
+        assert!(l["machine"]["id"].as_str().is_some_and(|id| id.starts_with("m-")) && l["machine"]["name"].is_string(), "{l}");
         assert_eq!(leases["not_shown"], json!(["design"]));
         let text = w(&mut a, &["lease", "ls"]).unwrap().lines.join("\n");
         assert!(text.contains("wsp-1") && text.contains("held by person:bo") && text.contains("not shown to you (you are not a member): design"), "{text}");
@@ -861,6 +1004,104 @@ mod tests {
         assert_eq!((st["hub"]["pruned"].clone(), st["hub"]["oldest_event"]["id"].clone()), (json!(false), json!(1)));
         assert_eq!(st["users"].as_array().unwrap().len(), 4);
         assert_eq!(st["not_shown"], json!(["design"]));
+        // `hub.info`, as fields: the instance, its retention, its login (none here), the usage of ann's workspaces only.
+        let info = &st["hub"]["info"];
+        assert_eq!((info["server"].clone(), info["protocol"].clone(), info["login"].clone()), (json!("wsp-hub"), json!(1), Value::Null));
+        assert!(info["version"].is_string() && info["event_days"].is_u64() && info["lease_secs"].is_u64() && info["quotas"]["max_workspace_bytes"].is_u64(), "{info}");
+        assert_eq!(info["usage"].as_array().unwrap().iter().map(|u| u["workspace"].clone()).collect::<Vec<_>>(), vec![json!("team")], "{info}");
+        // A hub that does not say: every key null, not a failure.
+        let none = hub_admin::info_json(None);
+        assert!(none.as_object().unwrap().values().all(Value::is_null) && none.as_object().unwrap().contains_key("event_days"), "{none}");
+    }
+
+    /// `wsp hub user admin <name> [--remove]` (`hub.user.admin`): set, repeat,
+    /// clear, and every refusal in words; the last admin's tells the person to
+    /// make another first. `whoami` says the flag now, on a connection that
+    /// was open before it changed, and that is what `wsp hub status` keeps.
+    #[test]
+    fn an_admin_makes_and_unmakes_admins_and_the_last_one_stays() {
+        let Some(hub) = Hub::start("admin-flag-verb") else { return };
+        let mut root = hub.dial(&hub.root).unwrap();
+        let bo = token_of(&w(&mut root, &["user", "add", "bo"]).unwrap());
+        let mut as_bo = hub.dial(&bo).unwrap();
+        assert_eq!(as_bo.admin(), Some(false));
+        assert_eq!(w(&mut as_bo, &["state"]).unwrap_err().code, "forbidden");
+
+        let made = w(&mut root, &["user", "admin", "bo"]).unwrap();
+        assert_eq!(made.lines, vec!["bo is a hub admin now".to_string()]);
+        assert_eq!(doc(&made), json!({ "lines": ["bo is a hub admin now"], "token": null, "user": "bo", "admin": true, "changed": true }));
+        // The open connection: its welcome said no; `whoami` says yes now, and so do its reads.
+        assert_eq!(as_bo.whoami().unwrap().2, Some(true));
+        assert!(w(&mut as_bo, &["user", "ls"]).is_ok());
+        let home = hub.hub.dir().join("bo-home");
+        hub.hub.login(&home, "bo", &bo);
+        let login = hub_client::hub_login_in(&home).unwrap().unwrap();
+        hub_client::keep_admin(&home, &login.url, &Principal::Person("bo".into()), true);
+        assert_eq!(hub_client::kept_admin(&home, &login), Some(true), "what `wsp hub status --json` says");
+        assert_eq!(w(&mut root, &["user", "admin", "bo"]).unwrap().lines, vec!["bo was a hub admin already".to_string()]);
+
+        let off = Opts { remove: true, ..Opts::default() };
+        assert_eq!(run_words(&mut as_bo, &["user", "admin", "root"], &off).unwrap().lines, vec!["root is no hub admin now".to_string()]);
+        assert_eq!(run_words(&mut as_bo, &["user", "admin", "root"], &off).unwrap().lines, vec!["root was no hub admin already".to_string()]);
+        let why = run_words(&mut as_bo, &["user", "admin", "bo"], &off).unwrap_err();
+        assert_eq!(why.code, "illegal");
+        assert_eq!(why.message, "user bo is the last active admin, so the hub refuses hub.user.admin: make another user an admin first (`wsp hub user admin <name>`)");
+        assert_eq!(why.json()["error"]["state"], json!("the last active admin"));
+        // root is no admin now: forbidden at its next request, on the same connection.
+        let why = w(&mut root, &["user", "admin", "root"]).unwrap_err();
+        assert_eq!(why.message, "forbidden: person:root is not an admin of this hub");
+        let why = w(&mut as_bo, &["user", "admin", "nobody"]).unwrap_err();
+        assert_eq!((why.code.as_str(), why.message.as_str()), ("not_found", "the hub has no user nobody"));
+        w(&mut as_bo, &["user", "add", "cy"]).unwrap();
+        w(&mut as_bo, &["user", "revoke", "cy"]).unwrap();
+        let why = w(&mut as_bo, &["user", "admin", "cy"]).unwrap_err();
+        assert_eq!(why.message, "user cy is revoked, so the hub refuses hub.user.admin");
+        // The trail names it.
+        let ev = doc(&run_words(&mut as_bo, &["events"], &Opts { events: EventsAsk { filter: Filter { kinds: vec!["hub.user.admin_set".into()], ..Filter::default() }, ..EventsAsk::default() }, ..Opts::default() }).unwrap());
+        assert_eq!(ev["events"].as_array().unwrap().iter().map(|e| (e["subject"]["user"].clone(), e["payload"]["admin"].clone())).collect::<Vec<_>>(), vec![(json!("bo"), json!(true)), (json!("root"), json!(false))]);
+    }
+
+    /// `wsp hub lease release <row>`: the token and workspace from the admin's
+    /// read; released, then nothing to release; a workspace the admin is no
+    /// member of shows it no lease; a token that changed hands is `stale`.
+    #[test]
+    fn an_admin_releases_anothers_lease_by_row() {
+        let Some(hub) = Hub::start("admin-release") else { return };
+        let mut root = hub.dial(&hub.root).unwrap();
+        let tokens = hub.hub.seed(&["team"], &[("bo", &["team"]), ("cy", &[])]);
+        w(&mut root, &["workspace", "add", "design"]).unwrap();
+        w(&mut root, &["member", "add", "design", "cy"]).unwrap();
+        let team = WorkspaceId("shared:team".into());
+        let (tok, _) = hub.hub.client(&tokens["bo"]).lease_take(&team, &RowId("wsp-1".into())).unwrap();
+        hub.hub.client(&tokens["cy"]).lease_take(&WorkspaceId("shared:design".into()), &RowId("wsp-2".into())).unwrap();
+
+        let done = w(&mut root, &["lease", "release", "wsp-1"]).unwrap();
+        let line = &done.lines[0];
+        assert!(line.starts_with(&format!("the lease on wsp-1 in team (held by person:bo on ")), "{line}");
+        assert!(line.ends_with(&format!(", token {}) is released: bo's work on wsp-1 is cut off as on an expiry, and anyone in team may take the row", tok.0)), "{line}");
+        let v = doc(&done);
+        assert_eq!((v["released"].clone(), v["workspace"].clone(), v["holder"].clone(), v["lease_token"].clone()), (json!("wsp-1"), json!("team"), json!("person:bo"), json!(tok.0)));
+        assert!(v["machine"]["id"].is_string(), "{v}");
+        assert!(hub.hub.lease_of("wsp-1").is_none(), "released on the hub");
+
+        let why = w(&mut root, &["lease", "release", "wsp-1"]).unwrap_err();
+        assert_eq!(why.code, "not_found");
+        assert_eq!(why.message, "the hub shows you no lease on wsp-1: it is not held, or it is in a workspace you are not a member of (`wsp hub lease ls`)");
+        let why = w(&mut root, &["lease", "release", "wsp-2"]).unwrap_err();
+        assert_eq!(why.code, "not_found", "design is not root's: {why:?}");
+
+        // Stale: the lease changed hands after it was read (the hub's answer, then wsp's words for it).
+        let (again, _) = hub.hub.client(&tokens["bo"]).lease_take(&team, &RowId("wsp-1".into())).unwrap();
+        let e = root.lease_release_admin(&team, &RowId("wsp-1".into()), tok).unwrap_err();
+        assert!(matches!(&e, Error::Refused(Refusal::Stale { current, .. }, _) if *current == again), "{e:?}");
+        let said = release_refused(e, "wsp-1", "team", tok.0, "person:bo");
+        assert_eq!(said.code, "stale");
+        assert_eq!(said.message, format!("the lease on wsp-1 in team changed hands since it was read (its token is {} now, not {}): read again (`wsp hub lease ls`) and release that one if you still mean to", again.0, tok.0));
+        // A non-admin's admin release is forbidden, in words.
+        let e = hub.hub.client(&tokens["cy"]).lease_release_admin(&team, &RowId("wsp-1".into()), again).unwrap_err();
+        let said = release_refused(e, "wsp-1", "team", again.0, "person:bo");
+        assert_eq!(said.code, "forbidden");
+        assert!(said.message.starts_with("forbidden: the hub would not let person:cy release person:bo's lease on wsp-1"), "{}", said.message);
     }
 
     /// `wsp hub events` pages as the hub does, filters a page, and reads a
@@ -942,7 +1183,7 @@ mod tests {
         let cases = [
             (
                 Refusal::Illegal { subject: Subject::User(UserName("bo".into())), state: "the last active admin".into(), verb: "hub.user.revoke".into() },
-                "user bo is the last active admin, so the hub refuses hub.user.revoke",
+                "user bo is the last active admin, so the hub refuses hub.user.revoke: make another user an admin first (`wsp hub user admin <name>`)",
             ),
             (Refusal::Invalid { reason: "cy is a name the hub has had; a name is never reused".into() }, "cy is a name the hub has had; a name is never reused"),
             (Refusal::NotFound { subject: Subject::Workspace(SharedName("design".into())) }, "the hub has no shared workspace design"),

@@ -445,7 +445,7 @@ fn hub_admin_verbs_print_fields_refuse_in_words_and_keep_no_token() {
     assert!(run(&["hub", "user", "revoke", "root"]).status.success());
     let out = run(&["hub", "user", "revoke", "ann", "--json"]);
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "wsp: hub: user ann is the last active admin, so the hub refuses hub.user.revoke");
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "wsp: hub: user ann is the last active admin, so the hub refuses hub.user.revoke: make another user an admin first (`wsp hub user admin <name>`)");
     assert_eq!(json(&out)["error"]["code"], "illegal");
     for args in [&["hub", "user", "add", "bo", "--json"][..], &["hub", "member", "add", "nowhere", "bo", "--json"], &["hub", "token", "revoke", "t-nobody-1", "--json"]] {
         let out = run(args);
@@ -476,4 +476,57 @@ fn hub_admin_verbs_print_fields_refuse_in_words_and_keep_no_token() {
             assert!(!text.contains(t.as_str()), "{} holds a minted token", path.display());
         }
     }
+}
+
+/// The verbs the hub's b5c19f9 made possible, as processes: `user admin`,
+/// `lease release`, `hub.info` in `state`, the machine in `lease ls`, and
+/// `hub status --json`'s `admin` kept from what the last dial was told.
+/// `--nocapture` prints each command and its output.
+#[test]
+fn hub_admin_flag_release_and_info_through_the_cli() {
+    use wsp_spoke::testhub::protocol::IdentityCommand;
+    use wsp_spoke::testhub::user;
+    let Some(rig) = Rig::new("admin2", &[]) else { return };
+    let run = |args: &[&str]| {
+        let out = rig.command(args).output().unwrap();
+        eprintln!("$ wsp {}\n[exit {}]\n{}{}", args.join(" "), out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        out
+    };
+    let json = |o: &Output| -> serde_json::Value { serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {}", said(o))) };
+    rig._hub.apply(IdentityCommand::HubUserAdd { name: user("ann"), admin: true });
+    let ann = rig._hub.issue("ann");
+    let ca = rig.ca.display().to_string();
+    assert!(rig.run(&["login", &rig.url, "--ca", &ca], &format!("{ann}\n")).0.status.success());
+    for args in [&["hub", "workspace", "add", "team"][..], &["hub", "member", "add", "team", "ann"]] {
+        assert!(run(args).status.success());
+    }
+    let bo = json(&run(&["hub", "user", "add", "bo", "--json"]))["token"]["token"].as_str().unwrap().to_string();
+    assert!(run(&["hub", "member", "add", "team", "bo"]).status.success());
+
+    // Make bo an admin, and not; root gives its flag up; ann, the last, cannot.
+    let v = json(&run(&["hub", "user", "admin", "bo", "--json"]));
+    assert_eq!(v, serde_json::json!({ "lines": ["bo is a hub admin now"], "token": null, "user": "bo", "admin": true, "changed": true }));
+    assert!(run(&["hub", "user", "admin", "bo"]).status.success());
+    assert!(run(&["hub", "user", "admin", "bo", "--remove", "--json"]).status.success());
+    assert!(run(&["hub", "user", "admin", "root", "--remove"]).status.success());
+    let out = run(&["hub", "user", "admin", "ann", "--remove", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json(&out)["error"]["code"], "illegal");
+
+    // A lease bo holds, released by ann.
+    rig._hub.client(&bo).lease_take(&wsp_objects::WorkspaceId("shared:team".into()), &wsp_store_contract::RowId("wsp-7".into())).unwrap();
+    let leases = json(&run(&["hub", "lease", "ls", "--json"]));
+    assert!(leases["leases"][0]["machine"]["id"].is_string(), "{leases}");
+    assert!(run(&["hub", "lease", "ls"]).status.success());
+    let v = json(&run(&["hub", "lease", "release", "wsp-7", "--json"]));
+    assert_eq!((v["released"].clone(), v["holder"].clone()), (serde_json::json!("wsp-7"), serde_json::json!("person:bo")));
+    let out = run(&["hub", "lease", "release", "wsp-7", "--json"]);
+    assert_eq!((out.status.code(), json(&out)["error"]["code"].clone()), (Some(1), serde_json::json!("not_found")));
+    assert!(run(&["hub", "events", "--kind", "lease", "--json"]).status.success());
+
+    let st = json(&run(&["hub", "state", "--json"]));
+    assert_eq!(st["hub"]["info"]["server"], "wsp-hub");
+    assert!(run(&["hub", "state"]).status.success());
+    let status = json(&run(&["hub", "status", "--json"]));
+    assert_eq!(status["admin"], serde_json::json!(true));
 }

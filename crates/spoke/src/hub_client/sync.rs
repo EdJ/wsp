@@ -293,7 +293,18 @@ impl Client {
 
     /// `lease.release`: lets the caller's lease on `row` under `token` go.
     pub fn lease_release(&mut self, row: &RowId, token: Token) -> Result<(), Error> {
-        match self.sync_call(SyncCall::LeaseRelease(LeaseHold { row: row.clone(), token }))? {
+        match self.sync_call(SyncCall::LeaseRelease(wsp_hub_protocol::LeaseRelease::own(row.clone(), token)))? {
+            Answer::Released => Ok(()),
+            other => Err(Error::Unexpected(format!("lease.release was answered {other:?}"))),
+        }
+    }
+
+    /// `lease.release {row, token, workspace, admin: true}`: a hub admin lets
+    /// another's lease on `row` in `workspace` go (the hub's b5c19f9). A hub
+    /// older than it answers as to a holder's own release: `forbidden`.
+    pub fn lease_release_admin(&mut self, workspace: &WorkspaceId, row: &RowId, token: Token) -> Result<(), Error> {
+        let ask = wsp_hub_protocol::LeaseRelease { row: row.clone(), token, workspace: Some(workspace.clone()), admin: true };
+        match self.sync_call(SyncCall::LeaseRelease(ask))? {
             Answer::Released => Ok(()),
             other => Err(Error::Unexpected(format!("lease.release was answered {other:?}"))),
         }
