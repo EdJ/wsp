@@ -214,6 +214,10 @@ pub fn switch(store: &Store, args: &Args, word: &str) -> i32 {
         return 1;
     };
     match word {
+        "disable" if args.has("dry-run") => {
+            println!("{}", preview_text(&crate::hub_switch::preview(store), true, args.json()));
+            0
+        }
         "disable" => {
             let done = crate::hub_switch::disable(store, &home);
             println!("{}", disabled_text(&done, args.json()));
@@ -225,6 +229,44 @@ pub fn switch(store: &Store, args: &Args, word: &str) -> i32 {
             if done.still_parked.is_empty() { 0 } else { 1 }
         }
     }
+}
+
+/// What `wsp hub disable --dry-run` and `wsp logout --dry-run` print: what the
+/// disable would do now (`logged_in` false: a logout with no login disables
+/// nothing). JSON: `{"dry_run":true,"logged_in","off","park":[{"row","status"}],
+/// "ending":[{"row","seat"}],"leases":[…],"unsent"}`.
+pub fn preview_text(p: &crate::hub_switch::Preview, logged_in: bool, json: bool) -> String {
+    if json {
+        return json!({
+            "dry_run": true, "logged_in": logged_in, "off": p.off,
+            "park": p.park.iter().map(|(r, s)| json!({ "row": r, "status": s })).collect::<Vec<_>>(),
+            "ending": p.ending.iter().map(|(r, s)| json!({ "row": r, "seat": s })).collect::<Vec<_>>(),
+            "leases": p.leases, "unsent": p.unsent,
+        })
+        .to_string();
+    }
+    if !logged_in {
+        return "dry run: not logged in, so nothing would be disabled".into();
+    }
+    let mut out = vec!["dry run: nothing is done".to_string()];
+    if p.off {
+        out.push("the hub connection is off already; what is left would be done again".into());
+    }
+    match p.park.is_empty() {
+        true => out.push("would park: nothing".into()),
+        false => out.push(format!("would park: {}", p.park.iter().map(|(r, s)| format!("{r} ({s})")).collect::<Vec<_>>().join(" "))),
+    }
+    for (row, seat) in &p.ending {
+        out.push(format!("{row}: its agent on {seat} would end when its turn is over; its lease would go back then"));
+    }
+    if p.unsent > 0 {
+        out.push(format!("would send first: {} journal entries", p.unsent));
+    }
+    match p.leases.is_empty() {
+        true => out.push("would give back: no lease".into()),
+        false => out.push(format!("would give back (if the hub answers): {}", p.leases.join(" "))),
+    }
+    out.join("\n")
 }
 
 /// What `wsp hub disable` (and `wsp logout`, which disables first) prints.
@@ -300,6 +342,8 @@ pub const HELP: &str = r##"  wsp hub user add <name> [--admin]    a hub user and
   wsp hub disable                      stop taking shared work here, cleanly: shared
                                        rows in flight parked, the journal flushed,
                                        leases given back; the login is kept
+  wsp hub disable --dry-run [--json]   what disable would park, end and give back,
+                                       and the journal it would send; does nothing
   wsp hub enable                       take part again: parked rows resumed where
                                        their lease can be taken"##;
 

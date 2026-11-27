@@ -313,7 +313,7 @@ pub fn disable(store: &Store, home: &Path) -> Disabled {
         let _ = Switch::edit(store, |s| {
             s.parked.insert(row.clone(), status.as_str().to_string());
         });
-        for seat in wsp_engine::attention::seats_of_row(store, &row).into_iter().filter(|s| (ops.live)(s)) {
+        for seat in agents_to_end(store, &row, ops) {
             match (ops.end)(store, &seat) {
                 Ok(()) => {
                     let _ = Switch::edit(store, |s| {
@@ -367,63 +367,136 @@ pub fn held_leases(store: &Store) -> Vec<String> {
     out
 }
 
-/// Releases every row lease a claim here holds (the claim keeps its binding and
-/// loses its token) and every drive lease. A lease the hub says is gone already
-/// counts as given back.
-fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut Disabled) {
-    let ending = Switch::read(store).ending;
+/// One lease a disable gives back, as [`leases_to_give_back`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Back {
+    /// A claim's row lease: the claim keeps its binding and loses its token.
+    Claim { row: String, token: Token },
+    /// A row lease no claim holds (`wsp start`'s), or one the book has under
+    /// another token than its claim's.
+    Row { row: String, token: Token },
+    /// A list's drive lease: `list` as kept here, `row` the hub's name of it.
+    Drive { list: String, row: String, token: Token },
+}
+
+impl Back {
+    /// The name `released` and `not_released` say it by.
+    fn name(&self) -> &str {
+        match self {
+            Back::Claim { row, .. } | Back::Row { row, .. } | Back::Drive { row, .. } => row,
+        }
+    }
+}
+
+/// Every lease a disable gives back, in the order it gives them, leaving out
+/// the rows in `ending` (an agent still finishing its turn holds its lease
+/// until it is gone): what [`release_all`] releases and what [`preview`]
+/// says it would.
+fn leases_to_give_back(store: &Store, ending: &std::collections::BTreeSet<String>) -> Vec<Back> {
+    let mut out = Vec::new();
     for (row, claim) in store.claims() {
-        if ending.contains_key(&row) {
+        if ending.contains(&row) {
             continue;
         }
-        let Some(token) = hub_lease::token_of(&claim) else { continue };
-        match client.lease_release(&RowId(row.clone()), token) {
-            Ok(()) | Err(crate::hub_client::Error::Refused(..)) => {
-                strip_token(store, &row, token);
-                hub_journal::Leased::forget(store, &row);
-                out.released.push(row);
-            }
-            Err(_) => out.not_released.push(row),
+        if let Some(token) = hub_lease::token_of(&claim) {
+            out.push(Back::Claim { row, token });
         }
     }
-    // The row leases no claim holds (`wsp start` made none), and any the book
-    // has under another token than its claim's.
-    for (row, d) in hub_lease::Book::read(store).rows {
-        if ending.contains_key(&row) {
-            continue;
-        }
-        // Already given back with its claim: the hub says it is not held
-        // under this token any more, and that counts as given back.
-        match client.lease_release(&RowId(row.clone()), d.token) {
-            Ok(()) | Err(crate::hub_client::Error::Refused(..)) => {
-                hub_lease::forget_row(store, &row, d.token);
-                hub_journal::Leased::forget(store, &row);
-                if !out.released.contains(&row) {
-                    out.released.push(row);
-                }
-            }
-            Err(_) => {
-                if !out.not_released.contains(&row) {
-                    out.not_released.push(row)
-                }
-            }
+    let book = hub_lease::Book::read(store);
+    for (row, d) in book.rows {
+        if !ending.contains(&row) {
+            out.push(Back::Row { row, token: d.token });
         }
     }
-    for (list, d) in hub_lease::Book::read(store).drives {
+    for (list, d) in book.drives {
         // The hub's name: a list kept here under a name of its own (`hub_lists`).
         let row = hub_lease::drive_row(&crate::hub_lists::hub_id(store, &list));
-        match client.lease_release(&RowId(row.clone()), d.token) {
-            Ok(()) | Err(crate::hub_client::Error::Refused(..)) => {
-                hub_lease::Book::edit(store, |b| {
-                    if b.drives.get(&list).is_some_and(|x| x.token == d.token) {
-                        b.drives.remove(&list);
-                    }
-                });
-                out.released.push(row);
+        out.push(Back::Drive { list, row, token: d.token });
+    }
+    out
+}
+
+/// Releases every lease [`leases_to_give_back`] lists. A lease the hub says
+/// is gone already (a refusal) counts as given back.
+fn release_all(store: &Store, client: &mut crate::hub_client::Client, out: &mut Disabled) {
+    let ending: std::collections::BTreeSet<String> = Switch::read(store).ending.into_keys().collect();
+    for back in leases_to_give_back(store, &ending) {
+        let token = match &back {
+            Back::Claim { token, .. } | Back::Row { token, .. } | Back::Drive { token, .. } => *token,
+        };
+        let given = matches!(client.lease_release(&RowId(back.name().to_string()), token), Ok(()) | Err(crate::hub_client::Error::Refused(..)));
+        let name = back.name().to_string();
+        if !given {
+            if !out.not_released.contains(&name) {
+                out.not_released.push(name);
             }
-            Err(_) => out.not_released.push(row),
+            continue;
+        }
+        match &back {
+            Back::Claim { row, token } => {
+                strip_token(store, row, *token);
+                hub_journal::Leased::forget(store, row);
+            }
+            Back::Row { row, token } => {
+                hub_lease::forget_row(store, row, *token);
+                hub_journal::Leased::forget(store, row);
+            }
+            Back::Drive { list, token, .. } => hub_lease::Book::edit(store, |b| {
+                if b.drives.get(list).is_some_and(|x| x.token == *token) {
+                    b.drives.remove(list);
+                }
+            }),
+        }
+        if !out.released.contains(&name) {
+            out.released.push(name);
         }
     }
+}
+
+/// The live seats on `row` whose agents a disable asks to end at the end of
+/// their turn: the one decision [`disable`] acts on and [`preview`] reports.
+fn agents_to_end(store: &Store, row: &str, ops: SeatOps) -> Vec<String> {
+    wsp_engine::attention::seats_of_row(store, row).into_iter().filter(|s| (ops.live)(s)).collect()
+}
+
+/// What `wsp hub disable` (and `wsp logout`, which disables first) would do
+/// now, done by nothing: the rows it would park (with the status each has),
+/// the agents it would ask to end when their turn is over, the leases it
+/// would give back if the hub answers, and how many journal entries it would
+/// send first. Every list comes from the function the real disable acts on
+/// ([`in_flight`], [`agents_to_end`], [`leases_to_give_back`]), so the two
+/// cannot disagree.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Preview {
+    /// It is off already.
+    pub off: bool,
+    /// `(row, status)`: parked, each kept to be put back by `wsp hub enable`.
+    pub park: Vec<(String, String)>,
+    /// `(row, seat)`: an agent asked to end at the end of its turn; its row's
+    /// lease is held until it is gone.
+    pub ending: Vec<(String, String)>,
+    /// Leases given back (a row id, or `drive:<list>`), when the hub answers.
+    pub leases: Vec<String>,
+    /// Journal entries sent before the leases go back.
+    pub unsent: usize,
+}
+
+/// [`Preview`] of a disable now. Writes nothing and dials nothing.
+pub fn preview(store: &Store) -> Preview {
+    let ops = seat_ops();
+    let switch = Switch::read(store);
+    let mut out = Preview { off: switch.off, unsent: hub_journal::Journal::of(store).len(), ..Preview::default() };
+    let mut ending: std::collections::BTreeSet<String> = switch.ending.into_keys().collect();
+    for (row, status) in in_flight(store) {
+        for seat in agents_to_end(store, &row, ops) {
+            ending.insert(row.clone());
+            out.ending.push((row.clone(), seat));
+        }
+        out.park.push((row, status.as_str().to_string()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    out.leases = leases_to_give_back(store, &ending).iter().map(|b| b.name().to_string()).filter(|n| seen.insert(n.clone())).collect();
+    out
 }
 
 /// The claim on `row` without its hub token, where it still holds `token`.
@@ -772,6 +845,60 @@ mod tests {
         assert!(lines.contains("disabled") && lines.contains("s-1 (was doing)"), "{lines}");
         // The login is kept.
         assert!(r.home.join(crate::hub_client::HUBS_FILE).exists());
+    }
+
+    /// The preview of a disable says what the disable then does, from the same
+    /// decisions: the rows parked, the leases given back, the journal sent
+    /// first; and it does none of it.
+    #[test]
+    fn hub_switch_the_preview_of_a_disable_is_what_the_disable_then_does() {
+        let Some(r) = rig("preview") else { return };
+        // A lease `wsp start` took with no claim, too.
+        let mut ann = hub_lease::tests::dial(&r.running, &r.tokens, "ann");
+        let held = hub_lease::take(&mut ann, "shared:team", "s-2").unwrap();
+        hub_lease::Book::edit(&r.store, |b| {
+            b.rows.insert("s-2".into(), hub_lease::Drive { token: held.token, expires: held.expires, ttl: 60 });
+        });
+        let p = preview(&r.store);
+        assert_eq!(p.park, vec![("s-1".to_string(), "doing".to_string()), ("s-2".to_string(), "todo".to_string())], "{p:?}");
+        assert!(p.ending.is_empty(), "no live seat: {p:?}");
+        assert_eq!(p.leases, vec!["s-1".to_string(), "s-2".to_string()]);
+        assert!(!p.off);
+        // Nothing was done.
+        assert!(!off(&r.store));
+        assert_eq!(status(&r.store, "s-1"), Status::Doing);
+        assert!(hub_lease::token_of(&r.store.claims()["s-1"]).is_some());
+        assert_eq!(preview(&r.store), p, "asking twice changes nothing");
+
+        let unsent_before = hub_journal::Journal::of(&r.store).len();
+        assert_eq!(p.unsent, unsent_before);
+        let done = disable(&r.store, &r.home);
+        assert_eq!(done.parked, p.park.iter().map(|(row, _)| row.clone()).collect::<Vec<_>>());
+        assert_eq!(Switch::read(&r.store).parked, p.park.iter().cloned().collect::<BTreeMap<_, _>>());
+        assert_eq!(done.released, p.leases);
+        assert!(done.ending.is_empty());
+    }
+
+    /// With a live seat on a shared row, the preview names the agent the
+    /// disable asks to end and leaves that row's lease out of those given back,
+    /// as the disable then does.
+    #[test]
+    fn hub_switch_the_preview_names_the_agent_that_would_end_and_holds_its_lease_as_the_disable_does() {
+        let Some(mut r) = rig("preview-agent") else { return };
+        let _ops = Ops::on();
+        let p = preview(&r.store);
+        assert_eq!(p.ending, vec![("s-1".to_string(), "cpd-s1".to_string())]);
+        assert!(p.leases.is_empty(), "{p:?}");
+        assert!(ends().is_empty(), "the preview ends no agent");
+        let done = disable(&r.store, &r.home);
+        assert_eq!(done.ending, p.ending);
+        assert_eq!(done.released, p.leases);
+        assert_eq!(done.parked, p.park.iter().map(|(row, _)| row.clone()).collect::<Vec<_>>());
+        let json: serde_json::Value = serde_json::from_str(&crate::cmd_hub::preview_text(&p, true, true)).unwrap();
+        assert_eq!(json["ending"], json!([{ "row": "s-1", "seat": "cpd-s1" }]));
+        assert_eq!(json["park"], json!([{ "row": "s-1", "status": "doing" }]));
+        assert_eq!((json["dry_run"].clone(), json["logged_in"].clone(), json["unsent"].clone()), (json!(true), json!(true), json!(p.unsent)));
+        r.running.stop();
     }
 
     /// Done-when: a disable the hub does not answer still switches off and

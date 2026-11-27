@@ -383,6 +383,13 @@ pub fn logout(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
+    // `--dry-run`: what the disconnect below would do, done by nothing.
+    if args.has("dry-run") {
+        let logged_in = hub_login_in(&home).ok().flatten().is_some();
+        let p = if logged_in { crate::hub_switch::preview(store) } else { crate::hub_switch::Preview::default() };
+        println!("{}", crate::cmd_hub::preview_text(&p, logged_in, args.json()));
+        return 0;
+    }
     // A clean disconnect first, while the login is there to dial with: shared
     // rows in flight parked, the journal flushed, the leases given back.
     if hub_login_in(&home).ok().flatten().is_some() {
@@ -531,7 +538,8 @@ pub const VERBS: &[wsp_engine::verbs::Verb] = &[
                                     replaces the first. --ca pins a private CA
   wsp login <hub-url> --github      log in with GitHub instead: open the address
                                     shown, enter the code; the hub's token for
-                                    you is stored, never shown"##,
+                                    you is stored, never shown; --json also
+                                    prints the address and code as a JSON line"##,
         }],
     },
     wsp_engine::verbs::Verb {
@@ -541,7 +549,8 @@ pub const VERBS: &[wsp_engine::verbs::Verb] = &[
             section: wsp_engine::verbs::Section::Machines,
             order: 110,
             text: r##"  wsp logout                        disable the hub connection (wsp hub disable),
-                                    then forget the hub's token"##,
+                                    then forget the hub's token
+  wsp logout --dry-run [--json]     what the logout's disable would do; does nothing"##,
         }],
     },
     wsp_engine::verbs::Verb {
