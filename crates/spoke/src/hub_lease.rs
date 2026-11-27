@@ -1177,9 +1177,26 @@ pub mod tests {
         git_t(&seed, &["push", "--quiet", &at.display().to_string(), "master"]);
     }
 
-    /// A clone of `remote` at `at`, its remote named `origin`.
+    /// A clone of `remote` at `at`, its remote named `origin`, with a git
+    /// identity of its own in its config: the landing's rebase and commits are
+    /// the engine's git calls, which take no identity from the test.
     fn clone_of(remote: &Path, at: &Path) {
         git_t(remote.parent().unwrap(), &["clone", "--quiet", &remote.display().to_string(), &at.display().to_string()]);
+        git_t(at, &["config", "user.name", "t"]);
+        git_t(at, &["config", "user.email", "t@t"]);
+    }
+
+    /// The landing commits in the clones through the engine's own git calls,
+    /// which get no identity from [`git_t`]: a clone carries its own, so the
+    /// tests do not depend on the developer's global `user.email`.
+    #[test]
+    fn hub_push_fixture_clones_carry_their_own_git_identity() {
+        let env = wsp_engine::util::isolated("hub-push-identity");
+        let (remote, mine) = (env.path("remote.git"), env.path("mine"));
+        bare_remote(&remote);
+        clone_of(&remote, &mine);
+        assert_eq!(git_t(&mine, &["config", "--local", "user.email"]), "t@t");
+        assert_eq!(git_t(&mine, &["config", "--local", "user.name"]), "t");
     }
 
     /// Puts `file` in a commit on the clone `at` and pushes it: the remote moves.
