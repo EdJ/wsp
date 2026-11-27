@@ -184,6 +184,12 @@ pub enum EventKind {
     // know the kind reads it as `Unknown`.
     #[serde(rename = "ref.retired")]
     RefRetired,
+    // The hub's identity: an admin set or cleared an active user's admin flag
+    // (`hub.user.admin`). The subject is the user, the workspace private, the
+    // principal the admin who set it, the payload `{"admin"}`: what the flag
+    // is now. A reader that does not know the kind reads it as `Unknown`.
+    #[serde(rename = "hub.user.admin_set")]
+    HubUserAdminSet,
     // The hub's leases (wsp-466): a shared row's lease ran past its TTL and the
     // hub released it. The subject is the lease, the workspace the row's, the
     // payload `{"workspace", "row", "holder", "token"}`.

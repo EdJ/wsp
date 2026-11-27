@@ -17,7 +17,9 @@
 //!   subject is answered `stale` with no head, whatever its `from`.
 //! - `ids.alloc { workspace, project, n, past? }` → [`Answer::Ids`].
 //! - `lease.take { workspace, row }` and `lease.renew { row, token }` →
-//!   [`Answer::Lease`]; `lease.release { row, token }` → [`Answer::Released`].
+//!   [`Answer::Lease`]; `lease.release { row, token, workspace?, admin? }` →
+//!   [`Answer::Released`]: `admin: true` is a hub admin's release of
+//!   another's lease ([`LeaseRelease`]).
 //!   A lease is held by a user on the machine its hello named
 //!   ([`crate::Machine`]): the user's other machine is refused `held`, the
 //!   text naming the machine that holds it. A hello that named none holds
@@ -86,7 +88,7 @@ pub enum SyncCall {
     #[serde(rename = "lease.renew")]
     LeaseRenew(LeaseHold),
     #[serde(rename = "lease.release")]
-    LeaseRelease(LeaseHold),
+    LeaseRelease(LeaseRelease),
     #[serde(rename = "msg.send")]
     MsgSend(MsgSend),
     #[serde(rename = "msg.take")]
@@ -174,12 +176,40 @@ pub struct LeaseTake {
     pub row: RowId,
 }
 
-/// `lease.renew`'s and `lease.release`'s `args`: the row and the token its
-/// `lease.take` answered.
+/// `lease.renew`'s `args`, and those `lease.release` had before
+/// [`LeaseRelease`]: the row and the token its `lease.take` answered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseHold {
     pub row: RowId,
     pub token: Token,
+}
+
+/// `lease.release`'s `args`: the row and the token its `lease.take`
+/// answered, and two fields added after them, each left out when not said
+/// (so a holder's release is the bytes it was):
+///
+/// - `admin: true`: a hub admin releases the lease whoever holds it, in a
+///   workspace it is a member of. Without it a release is the holder's own,
+///   and another's current token is `forbidden`, as ever. A hub older than
+///   the field passes it over and answers as to a holder's release.
+/// - `workspace`: the shared workspace the lease is in; absent, the caller's
+///   workspaces are searched, as before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRelease {
+    pub row: RowId,
+    pub token: Token,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
+}
+
+impl LeaseRelease {
+    /// The holder's own release of `row` under `token`: what `lease.release`
+    /// was before its additive fields, the same bytes.
+    pub fn own(row: RowId, token: Token) -> LeaseRelease {
+        LeaseRelease { row, token, workspace: None, admin: false }
+    }
 }
 
 /// `msg.send`'s `args`: a tell to an address the sending spoke does not hold.

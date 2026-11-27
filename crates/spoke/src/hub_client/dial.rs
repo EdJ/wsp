@@ -51,7 +51,7 @@ impl fmt::Display for Silent {
             Silent::BadUrl(why) => write!(f, "{why}"),
             Silent::Unreachable(tried) => write!(f, "nothing answered: {}", tried.join("; ")),
             Silent::NoWelcome(at) => write!(f, "{at} accepted the connection but sent no welcome in time"),
-            Silent::Refused(r) => write!(f, "the server refused the hello: {:?}: {}", r.code, r.text),
+            Silent::Refused(r) => write!(f, "the server refused the hello: {}", super::words::refused(r)),
             Silent::NotAServer(what) => write!(f, "not a wsp server: {what}"),
             Silent::NotLoggedIn(why) => write!(f, "not logged in: {why}"),
             Silent::BadHubsFile(why) => write!(f, "hubs.json is not usable: {why}"),

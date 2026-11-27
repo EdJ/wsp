@@ -139,6 +139,7 @@ pub const COMMAND_VERBS: &[&str] = &[
     "hub.token.revoke",
     "hub.workspace.add",
     "hub.member.set",
+    "hub.user.admin",
 ];
 
 // ---------------------------------------------------------------- identities

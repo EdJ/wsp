@@ -90,7 +90,13 @@ pub fn whoami_at(url: &str, credential: crate::hub_client::Credential, ca: Optio
         }
     };
     match client.whoami() {
-        Ok((by, server)) => WhoAmI::Known(by, server),
+        Ok((by, server, admin)) => {
+            // Whether the user is an admin now, as the hub read it at this request: for `wsp hub status`.
+            if let (Some(admin), Some(home)) = (admin, crate::hub_client::hub_home()) {
+                crate::hub_client::keep_admin(&home, url, &by, admin);
+            }
+            WhoAmI::Known(by, server)
+        }
         Err(e) => WhoAmI::Unanswered(e.to_string()),
     }
 }

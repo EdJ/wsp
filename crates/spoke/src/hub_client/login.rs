@@ -243,6 +243,7 @@ pub fn keep_welcome(home: &Path, url: &str, client: &super::Client) {
         "url": url.trim(),
         "user": user,
         "admin": client.admin(),
+        "server": client.server(),
         "at": wsp_base::util::iso_at(wsp_base::util::epoch_secs()),
     });
     let tmp = dir.join(format!(".welcome.json.{}.tmp", std::process::id()));
@@ -258,6 +259,44 @@ pub fn kept_admin(home: &Path, login: &HubLogin) -> Option<bool> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(WELCOME_FILE)).ok()?).ok()?;
     let same = v["url"].as_str() == Some(login.url.trim()) && v["user"].as_str() == Some(login.user.as_str());
     same.then(|| v["admin"].as_bool()).flatten()
+}
+
+/// Keep `admin` as what the hub now says of the user `by` of the login to
+/// `url` under `home`: `whoami`'s `admin`, read at its request (the hub's
+/// b5c19f9), so a flag set or cleared while a connection is open shows in
+/// `wsp hub status` without a new login. The rest of what the last welcome
+/// said is kept where it was of the same login. Best effort.
+pub fn keep_admin(home: &Path, url: &str, by: &Principal, admin: bool) {
+    let Principal::Person(user) = by else { return };
+    let path = home.join(WELCOME_FILE);
+    let Some(dir) = path.parent() else { return };
+    let old: serde_json::Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let same = old["url"].as_str() == Some(url.trim()) && old["user"].as_str() == Some(user.as_str());
+    if old["admin"].as_bool() == Some(admin) && same {
+        return;
+    }
+    let body = serde_json::json!({
+        "url": url.trim(),
+        "user": user,
+        "admin": admin,
+        "server": if same { old["server"].clone() } else { serde_json::Value::Null },
+        "at": wsp_base::util::iso_at(wsp_base::util::epoch_secs()),
+    });
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!(".welcome.json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, body.to_string()).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The instance name (`welcome.server`) the hub's last welcome to `login`
+/// said; None where nothing is kept for this login.
+pub fn kept_server(home: &Path, login: &HubLogin) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(WELCOME_FILE)).ok()?).ok()?;
+    let same = v["url"].as_str() == Some(login.url.trim()) && v["user"].as_str() == Some(login.user.as_str());
+    same.then(|| v["server"].as_str().map(str::to_string)).flatten()
 }
 
 /// Drop what a welcome said (a new login, a logout).

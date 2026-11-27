@@ -1,8 +1,10 @@
 //! The identity commands: the hub's users, token records, shared workspaces
 //! and members. On the wire each is a command of the state core's envelope
 //! (`verb`, `args`, and the request's `key`), spelled exactly as the
-//! contract's `Command` spells the same six verbs; the hub's identity machine
-//! decides them, and they are the only commands a hub runs.
+//! contract's `Command` spells the same seven verbs; the hub's identity machine
+//! decides them, and they are the only commands a hub runs. `hub.user.admin`
+//! came after the first six: a hub older than it decodes it as an unknown
+//! verb and answers it `unsupported`.
 
 use serde::{Deserialize, Serialize};
 use wsp_store_contract::{SharedName, TokenId, UserName};
@@ -15,6 +17,7 @@ pub const COMMAND_VERBS: &[&str] = &[
     "hub.token.revoke",
     "hub.workspace.add",
     "hub.member.set",
+    "hub.user.admin",
 ];
 
 /// One identity command, tagged by `verb`, with its `args`.
@@ -47,6 +50,11 @@ pub enum IdentityCommand {
         user: UserName,
         member: bool,
     },
+    /// Make an active user a hub admin (`admin: true`) or not. Setting what
+    /// is, is an empty decision; clearing the last active admin (oneself
+    /// included) is `illegal`.
+    #[serde(rename = "hub.user.admin")]
+    HubUserAdmin { name: UserName, admin: bool },
 }
 
 impl IdentityCommand {
@@ -59,6 +67,7 @@ impl IdentityCommand {
             IdentityCommand::HubTokenRevoke { .. } => "hub.token.revoke",
             IdentityCommand::HubWorkspaceAdd { .. } => "hub.workspace.add",
             IdentityCommand::HubMemberSet { .. } => "hub.member.set",
+            IdentityCommand::HubUserAdmin { .. } => "hub.user.admin",
         }
     }
 }

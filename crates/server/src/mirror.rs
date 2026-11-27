@@ -224,7 +224,7 @@ fn about(cmd: &Command) -> Subject {
         Command::AskAnswer { ask, .. } | Command::AskAck { ask } => Subject::Ask(ask.clone()),
         Command::AskRaise { about: Some(s), .. } => s.clone(),
         Command::MachineSet { name, .. } => Subject::Machine(name.clone()),
-        Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } => Subject::User(name.clone()),
+        Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } | Command::HubUserAdmin { name, .. } => Subject::User(name.clone()),
         Command::HubTokenIssue { id, .. } | Command::HubTokenRevoke { id } => Subject::Credential(id.clone()),
         Command::HubWorkspaceAdd { name } => Subject::Workspace(name.clone()),
         Command::HubMemberSet { workspace, user, .. } => {

@@ -40,13 +40,15 @@ use serde_json::Value;
 
 pub mod conn;
 mod identity;
+mod info;
 pub mod principal;
 pub mod sync;
 
 pub use conn::{ConnError, Connection, MAX_LINE};
 pub use identity::{IdentityCommand, COMMAND_VERBS};
+pub use info::{HubInfo, HubLogin, HubQuotas, WorkspaceUsage};
 pub use sync::{
-    Blob, HubMessage, IdsAlloc, LeaseHold, LeaseTake, Move, MsgSend, RefMove, RefRetire, SyncCall, FENCE_TOKEN, MAX_IDS,
+    Blob, HubMessage, IdsAlloc, LeaseHold, LeaseRelease, LeaseTake, Move, MsgSend, RefMove, RefRetire, SyncCall, FENCE_TOKEN, MAX_IDS,
     MAX_PAST, SYNC_VERBS,
 };
 
@@ -73,7 +75,7 @@ pub const MAX_EVENTS: u32 = 1000;
 pub const MAX_EVENTS_BYTES: usize = MAX_LINE / 2;
 
 /// The read verbs a hub answers, as [`Verb`] names them on the wire.
-pub const READ_VERBS: &[&str] = &["state", "events", "subscribe", "whoami"];
+pub const READ_VERBS: &[&str] = &["state", "events", "subscribe", "whoami", "hub.info"];
 
 // ---------------------------------------------------------------- identities
 
@@ -232,7 +234,7 @@ pub struct Welcome {
     pub machine: Option<Machine>,
     /// Whether the user the connection is from is an active admin of the hub,
     /// as the hub read it at the hello (a change while the connection is open
-    /// shows at the next one). `false` for any principal that is not such a
+    /// shows in `whoami`'s `admin`, and at the next hello). `false` for any principal that is not such a
     /// user. Absent from a hub older than it (an additive field), which reads
     /// as not said, never as `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +307,12 @@ pub enum Verb {
     Subscribe(#[serde(default)] Subscribe),
     /// Who this connection is. Answered [`Answer::Whoami`].
     Whoami(#[serde(default)] NoArgs),
+    /// What the hub tells an admin of itself: its build, quotas, retention,
+    /// lease TTL, sweep, login, and the usage of the admin's workspaces.
+    /// Answered [`Answer::Info`]. An admin's; added after the first four, so
+    /// a hub older than it answers `unsupported`.
+    #[serde(rename = "hub.info")]
+    HubInfo(#[serde(default)] NoArgs),
 }
 
 /// The `args` of a verb that takes none: written `{}`, and read from `{}`,
@@ -367,8 +375,16 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Answer {
-    /// `state`: the snapshot and the id it is consistent at.
-    State { state: State, at: EventId },
+    /// `state`: the snapshot and the id it is consistent at; and the machine
+    /// each lease is held on, by the lease's name in `state.leases`, for
+    /// those held on one (the contract's `Lease` has no machine). Left out
+    /// when there is none, and by a hub older than it (an additive field).
+    State {
+        state: State,
+        at: EventId,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        lease_machines: std::collections::BTreeMap<wsp_store_contract::LeaseName, Machine>,
+    },
     /// `events`: the events, the head when they were read, and where the page
     /// stopped (absent from an older server: 0).
     Events {
@@ -381,11 +397,17 @@ pub enum Answer {
     Subscribed,
     /// An identity command: it was applied, and its events are the reply's `events`.
     Applied,
-    /// `whoami`: who the connection is, in the text form, and the instance.
+    /// `whoami`: who the connection is, in the text form, and the instance;
+    /// and whether its user is an active admin of the hub now, read at this
+    /// request (the welcome's `admin` was read at the hello), so a client
+    /// learns of an admin flag set or cleared while it is connected. Absent
+    /// from a hub older than it (an additive field): not said, never `false`.
     Whoami {
         #[serde(with = "principal")]
         by: Principal,
         server: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin: Option<bool>,
     },
     /// `sync.heads`: the workspace's refs, each subject's head.
     Heads(Refs),
@@ -419,6 +441,9 @@ pub enum Answer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         successor: Option<Subject>,
     },
+    /// `hub.info`: what the hub tells an admin of itself. Only `hub.info`
+    /// answers it, which an older client never sends.
+    Info(HubInfo),
 }
 
 /// What `err` carries: `{ code, text }`, and the contract's refusal whole

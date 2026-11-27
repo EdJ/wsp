@@ -56,6 +56,8 @@ pub const BOOL_FLAGS: &[&str] = &[
     // the `--ending` a rotation starts behind itself, and `--take`, which
     // `wsp govern core --take` puts after the scope it takes.
     "govern", "remove", "rotate", "ending", "take",
+    // `wsp hub user add --no-token <name>` must not read the name as its value.
+    "no-token",
     // `wsp spawn --primary` takes no positional, and `--primary --kind x`
     // must not read `--kind` as its value.
     "primary",
@@ -281,6 +283,8 @@ pub const VALUED_ON: &[(&str, &str)] = &[
     // `verify --check` stands alone; on `spawn` it names the group a barrier
     // check reads (`wsp-230`).
     ("spawn", "check"),
+    // `wsp hub events --person <user>` names whose trail; elsewhere `person` stands alone.
+    ("hub", "person"),
 ];
 
 /// Whether this flag stands alone on this verb.
