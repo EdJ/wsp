@@ -307,6 +307,28 @@ mod tests {
         assert!(unreadable_note(&st).unwrap().starts_with("3 unreadable ledger lines"), "{:?}", unreadable_note(&st));
     }
 
+    /// wsp-864: a seat's name comes round again and its burn record has no
+    /// session id, so a later seat of the name erases and hides nothing.
+    #[test]
+    fn two_seats_of_one_name_and_no_session_id_are_two_lines_and_both_count() {
+        let env = util::isolated("spend-name-again");
+        let store = Store::at(env.home(), env.state());
+        store.ensure_dirs().unwrap();
+        let st = env.state();
+        let dir = st.join("seats").join("cpd-243");
+        for cost in [2_000_000, 5_000_000] {
+            std::fs::create_dir_all(&dir).unwrap();
+            let rec = json!({ "turns": 2, "input": 10, "output": 100, "cost": cost, "epoch": 1 });
+            std::fs::write(dir.join(crate::host::BURN_FILE), rec.to_string()).unwrap();
+            crate::host::bank_burn(&dir);
+            // As `stop()` leaves it: the next seat of the name has a new one.
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(st.join("spent.jsonl")).unwrap().lines().count(), 2);
+        let t = report(&store, util::epoch_secs())["totals"]["30d"].clone();
+        assert_eq!((t["sessions"].as_u64(), t["cost"].as_f64()), (Some(2), Some(7.0)), "{t}");
+    }
+
     #[test]
     fn nothing_landed_is_a_null_cost_per_row_and_an_empty_ledger_is_zeros() {
         let env = util::isolated("spend-empty");

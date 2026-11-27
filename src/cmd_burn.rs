@@ -203,8 +203,8 @@ pub(crate) fn reading_in(state: &std::path::Path, seat: &str) -> Option<serde_js
     ledger_lines(state, seat).pop()
 }
 
-/// Every line the ledger holds for a seat, oldest first: one per session the
-/// seat banked at its `stop()`, each with its `session_id` and when it `ended`.
+/// Every line the ledger holds for a seat, oldest first: one per stop banked
+/// under its name, each with its `session_id` and when it `ended`.
 pub(crate) fn ledger_lines(state: &std::path::Path, seat: &str) -> Vec<serde_json::Value> {
     read_ledger(state, Some(seat)).0
 }
@@ -212,15 +212,16 @@ pub(crate) fn ledger_lines(state: &std::path::Path, seat: &str) -> Vec<serde_jso
 /// The ledger's lines (one seat's, or all), and how many of the lines read are
 /// unreadable: not a JSON object naming its `seat`.
 ///
-/// **A seat's session counts once.** Ledgers written before banking was
-/// guarded hold the same stop twice; of those the line that spent the most
-/// stands, the first of equals.
+/// **A line held twice counts once.** Ledgers written before banking was
+/// guarded hold the same stop twice: lines alike in everything but `ended`,
+/// the first of which stands. Lines whose figures differ all count, since a
+/// seat's name comes round again and most lines carry no session id.
 pub(crate) fn read_ledger(state: &std::path::Path, seat: Option<&str>) -> (Vec<serde_json::Value>, usize) {
     let bytes = std::fs::read(state.join(crate::place_super::SPENT_FILE)).unwrap_or_default();
     // Lossy: one garbled byte must not lose the whole ledger.
     let text = String::from_utf8_lossy(&bytes);
     let mut out: Vec<serde_json::Value> = Vec::new();
-    let mut at = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     let mut unreadable = 0;
     for l in text.lines().filter(|l| !l.trim().is_empty() && seat.is_none_or(|s| l.contains(s))) {
         let v = serde_json::from_str::<serde_json::Value>(l).unwrap_or_default();
@@ -231,18 +232,12 @@ pub(crate) fn read_ledger(state: &std::path::Path, seat: Option<&str>) -> (Vec<s
         if seat.is_some_and(|s| s != of) {
             continue;
         }
-        let key = (of.to_string(), v["session_id"].as_str().unwrap_or("").to_string());
-        match at.get(&key) {
-            Some(&i) => {
-                let spent = |v: &serde_json::Value| (n(v, "cost"), n(v, "turns"));
-                if spent(&v) > spent(&out[i]) {
-                    out[i] = v;
-                }
-            }
-            None => {
-                at.insert(key, out.len());
-                out.push(v);
-            }
+        let mut figures = v.clone();
+        if let Some(m) = figures.as_object_mut() {
+            m.remove("ended");
+        }
+        if seen.insert(figures.to_string()) {
+            out.push(v);
         }
     }
     (out, unreadable)

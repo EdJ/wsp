@@ -1050,8 +1050,9 @@ pub mod tests {
     }
 
     /// wsp-864: `stop()` and the manager's `seat.stopped` both bank a seat, in
-    /// either order, and the ledger holds one line for its session; a reading
-    /// that grew between them replaces that line.
+    /// either order, and the ledger holds one line for its stop; a reading
+    /// that grew between them replaces that line. The burn record is the one
+    /// the fold writes, which carries no session id.
     #[test]
     fn one_seat_stopped_on_both_paths_is_one_ledger_line() {
         let env = util::isolated("fold-bank-once");
@@ -1060,17 +1061,21 @@ pub mod tests {
         let m = manager(&exec, 0);
         let mut sub = Subscription::new(m.addrs()[0], token(&exec), HOST, &store.state, "test");
         let dir = seat_dir(&store, "cpd-f1").unwrap();
-        let burnt = |cost: u64| write(&dir.join(crate::host::BURN_FILE), &json!({ "turns": 2, "session_id": "s-1", "cost": cost }));
+        let mut send = |msg: Message| fold_to(&store, &mut sub, m.emit(msg).unwrap().0);
+        let spent = |cost_micros: u64| {
+            Message::SeatSpent(SeatSpent { seat: seat(), epoch: Epoch(1), tokens: Tokens { input: 100, output: 20, cache_read: 5, cache_write: 2 }, cost_micros })
+        };
         let ledger = || std::fs::read_to_string(store.state.join(crate::host::SPENT_FILE)).unwrap();
 
-        burnt(10);
+        send(Message::Turn(Turn { seat: seat(), epoch: Epoch(1), edge: TurnEdge::Began, at: At(1_700_000_000_000), order: None }));
+        send(spent(10));
+        assert_eq!(read(&dir.join(crate::host::BURN_FILE)).get("session_id"), None);
         LOCAL.bank(&dir);
-        let stopped = Message::SeatStopped(SeatStopped { seat: seat(), epoch: Epoch(1), exit: Some(0), ended: vec![], renderer_left: false });
-        fold_to(&store, &mut sub, m.emit(stopped).unwrap().0);
+        send(Message::SeatStopped(SeatStopped { seat: seat(), epoch: Epoch(1), exit: Some(0), ended: vec![], renderer_left: false }));
         LOCAL.bank(&dir);
         assert_eq!(ledger().lines().count(), 1, "{}", ledger());
 
-        burnt(30);
+        send(spent(30));
         LOCAL.bank(&dir);
         assert_eq!(ledger().lines().count(), 1, "{}", ledger());
         assert!(ledger().contains("\"cost\":30"), "{}", ledger());
