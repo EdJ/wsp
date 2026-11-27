@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 use wsp_store_contract::{Row, State};
 
-use crate::common::{key, priority, priority_rank, status, status_rank, task_json};
+use crate::common::{key, opt, priority, priority_rank, status, status_rank, task_json};
 
 /// A stage's caption (`wsp-242`): the word wsp derives and the tail, as the
 /// `stage` key prints them. A pass's `caption` is the same shape.
@@ -315,15 +315,26 @@ pub fn ls_entry(row: &Row, state: &State) -> Value {
     if let Some(legs) = row.fields.get(key::LEGS).and_then(|l| serde_json::from_str::<Value>(l).ok()) {
         v["legs"] = legs;
     }
-    shared_facts(row, &mut v);
+    sharing(row, &mut v);
     v
 }
 
-/// A shared row's facts (`mine`, `head_only`, and `held_by`, `held_on`,
-/// `held_until` where known), as the row's fields carry them and the feed
-/// sends them: strings, each key only where the row has it, so a private row
-/// carries none (`docs/multiplayer.md`, "What a desktop app reads").
-fn shared_facts(row: &Row, v: &mut Value) {
+/// A row's sharing, as the feed's row carries it, onto an `ls --json` row:
+/// `workspace` (`shared:<name>`, the row's own `Row::workspace`) on a shared
+/// row, `for` (the user it is allocated to) where it is allocated, and the
+/// shared row's facts (`mine`, `head_only`, and `held_by`, `held_on`,
+/// `held_until` where known) as the row's fields carry them: strings, each
+/// key only where the row has it, so a private row that is allocated to
+/// nobody carries none (`docs/multiplayer.md`, "What a desktop app reads").
+/// So a reader of `ls --json` (an app running `wsp` over ssh, with no feed to
+/// fold) has what a reader of the feed's rows has.
+pub fn sharing(row: &Row, v: &mut Value) {
+    if !row.workspace.is_private() {
+        v[key::WORKSPACE] = json!(row.workspace.to_string());
+    }
+    if let Some(u) = opt(row, key::FOR) {
+        v[key::FOR] = json!(u);
+    }
     for k in key::SHARED_FACTS {
         if let Some(f) = row.fields.get(k) {
             v[k] = json!(f);
@@ -375,7 +386,7 @@ pub fn ls_of_reading(heads: &[Row], reading: &crate::reading::Tasks) -> Option<S
         .iter()
         .map(|r| {
             let mut v = ls_json_row(task_json(r), reading.stages.get(&r.id.0), reading.legs.get(&r.id.0).map(Vec::as_slice));
-            shared_facts(r, &mut v);
+            sharing(r, &mut v);
             v
         })
         .collect();
@@ -457,5 +468,29 @@ mod tests {
         assert_eq!(ls_of_reading(&heads, &reading(&["p-2", "p-1"])), None, "a row moved since");
         assert_eq!(ls_of_reading(&heads, &reading(&["p-1"])), None, "a row added since");
         assert_eq!(ls_of_reading(&heads, &reading(&["p-1", "p-2", "p-3"])), None, "a row filed away since");
+    }
+
+    /// Off the API as off the files, an `ls --json` row carries the row's
+    /// sharing as the feed's row has it: `workspace` on a shared row, `for`
+    /// where allocated, the shared facts as the strings the fields hold; a
+    /// private row none of it.
+    #[test]
+    fn an_ls_row_carries_its_workspace_for_and_facts_and_a_private_row_none() {
+        let mut shared = head("p-1", "todo");
+        shared.workspace = "shared:team".parse().unwrap();
+        for (k, v) in [(key::FOR, "ann"), (key::MINE, "true"), (key::HEAD_ONLY, "false"), (key::HELD_BY, "ann"), (key::HELD_ON, "box-a"), (key::HELD_UNTIL, "2026-12-04T10:58:57Z")] {
+            shared.fields.insert(k.to_string(), v.to_string());
+        }
+        let private = head("p-2", "todo");
+        let reading = crate::reading::Tasks { order: vec!["p-1".into(), "p-2".into()], ..Default::default() };
+        let drawn: Vec<Value> = serde_json::from_str(&ls_of_reading(&[shared.clone(), private.clone()], &reading).unwrap()).unwrap();
+        let keys = ["workspace", "for", "mine", "head_only", "held_by", "held_on", "held_until"];
+        let got = |v: &Value| keys.map(|k| v.get(k).cloned());
+        let want = ["shared:team", "ann", "true", "false", "ann", "box-a", "2026-12-04T10:58:57Z"].map(|v| Some(json!(v)));
+        assert_eq!(got(&drawn[0]), want, "{}", drawn[0]);
+        assert_eq!(got(&drawn[1]), [None, None, None, None, None, None, None], "{}", drawn[1]);
+        let state = State::default();
+        assert_eq!(got(&ls_entry(&shared, &state)), want, "off the files");
+        assert_eq!(got(&ls_entry(&private, &state)), [None, None, None, None, None, None, None]);
     }
 }
