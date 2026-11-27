@@ -18,7 +18,10 @@
 //!   line is still `running` (a leg is working only while its seat is alive);
 //! - **serialised** — nobody is started but a member is yet to start: it waits
 //!   behind the group's cap or an `after`;
-//! - **barrier run** — the group's barrier, from the last verdict to the check;
+//! - **barrier run** — the group's barrier, from the last verdict to the check:
+//!   its runs, and the hand-off or daemon tick before one. A longer stretch
+//!   with no run and no seat in it is **waiting**, under what the log says held
+//!   it, or `nothing the logs name` (`wsp-852`);
 //! - **check seat** — the barrier's check seat;
 //! - **between groups** — the previous group's pass to this group's first start.
 //!
@@ -48,9 +51,11 @@ pub(crate) enum Class {
     Barrier,
     /// The barrier's check seat, and the wait before it.
     Check,
-    /// The barrier held before it started, by a line of the cycle log naming
-    /// what it waits on (an open question, a verifier, a member): the group is
-    /// waiting on that, and no barrier is running (`compounding-468`).
+    /// The barrier waiting with no run and no seat in it: held, by a line of
+    /// the cycle log naming what it waits on (an open question, a verifier, a
+    /// member, `compounding-468`) or by a person's step; or longer than a tick
+    /// and a hand-off, for what the log names or for nothing it does
+    /// (`wsp-852`). The group is waiting on that.
     BarrierWait(String),
     /// Overlaps the barrier (clean-up, the seat released late): not counted.
     Alongside,
@@ -68,7 +73,7 @@ impl Span {
         let l = p.label.as_str();
         let class = if p.shared {
             match p.waiting_for.as_deref() {
-                Some(w) if p.gap && w.starts_with(BARRIER_HOLD) => Class::BarrierWait(w.to_string()),
+                Some(w) if p.gap && !crate::timeline::is_step_latency(w) => Class::BarrierWait(w.to_string()),
                 _ if l.contains("check seat") => Class::Check,
                 _ => Class::Barrier,
             }

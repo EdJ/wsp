@@ -31,7 +31,7 @@ wsp retro start <list> [--replaces ROW]";
 
 /// The bucket names of the wall, as `effort.json` spells them under
 /// `totals.wall_buckets` (`<name>_seconds`).
-pub const BUCKETS: &[&str] = &["working", "waiting", "serialised", "barrier_run", "check_seat", "between_groups", "parked"];
+pub const BUCKETS: &[&str] = &crate::wallbuckets::BUCKETS;
 
 /// A cleared list's wall figures: what the baseline is made of.
 #[derive(Debug, Clone, PartialEq)]
@@ -432,6 +432,18 @@ mod tests {
         let mut w = list(&store, "l");
         w.project = Some("proj".into());
         assert!(eligible_with(&store, &w, 9, 9999).unwrap_err().contains("retro = off"));
+    }
+
+    #[test]
+    fn the_packets_bucket_list_reads_each_of_wall_buckets_by_its_name() {
+        let mut e = json!({ "totals": { "wall_buckets": {} } });
+        for (n, b) in crate::wallbuckets::BUCKETS.iter().enumerate() {
+            e["totals"]["wall_buckets"][format!("{b}_seconds")] = json!(60 * (n + 1));
+        }
+        let got = Figures::of(&e).buckets;
+        let of = |name: &str| got.iter().find(|(b, _)| b == name).map(|(_, s)| *s);
+        assert_eq!((of("waiting"), of("check_seat")), (Some(120), Some(300)), "{got:?}");
+        assert_eq!(got.len(), crate::wallbuckets::BUCKETS.len(), "{got:?}");
     }
 
     #[test]

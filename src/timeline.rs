@@ -322,13 +322,24 @@ fn wait_name(i: &Inputs, from: i64, to: i64, who: &str) -> String {
         // The log has the reopen and the cap: that is what the step waited on.
         why
     } else if span <= HAND_OFF {
-        "the hand-off (a poke and a spawn)".into()
+        HAND_OFF_CAUSE.into()
     } else if span <= TICK + HAND_OFF {
-        format!("a daemon tick (every {TICK}s) — nothing poked the step")
+        format!("{TICK_CAUSE} (every {TICK}s) — nothing poked the step")
     } else {
         // Named for its row, so the bucket in a list's report says whose.
         format!("nothing the logs name — the step of {who} did not run for longer than a tick")
     }
+}
+
+/// The causes [`wait_name`] gives a stretch no longer than the run's own
+/// latency in taking a step.
+const HAND_OFF_CAUSE: &str = "the hand-off (a poke and a spawn)";
+const TICK_CAUSE: &str = "a daemon tick";
+
+/// Whether a gap's cause is only that latency: before a barrier's step it is
+/// the barrier's own time, and any other cause there is a wait (`wsp-852`).
+pub(crate) fn is_step_latency(why: &str) -> bool {
+    why == HAND_OFF_CAUSE || why.starts_with(TICK_CAUSE)
 }
 
 /// The cause of a stretch a person's park of the whole list covered.
@@ -1226,8 +1237,10 @@ pub(crate) fn build(i: &Inputs) -> Vec<Phase> {
             }
         } else if let Some(b) = req.or(seat_up) {
             out.push(Phase::gap(format!("last verdict → barrier {at} started{others}"), from, b, wait_name(i, from, b, &who)).shared());
+            // A hold inside it is the hold here too, with no run line to
+            // read (`wsp-852`: cr-linux-panes' group 1).
             if let Some(p) = pass.filter(|p| *p >= b) {
-                out.push(Phase::work(format!("barrier {at} runs → passed"), b, p).shared());
+                out.extend(check_seat(i, format!("barrier {at} runs → passed"), b, p, &list, *at));
             }
         }
     }
@@ -3456,6 +3469,73 @@ mod tests {
         assert_eq!(cut_at_word("unbrokenword", 4), "…");
     }
 
+    /// The wall of one member's phases, up to `pass`.
+    fn wall_of(ph: &[Phase], pass: i64) -> crate::wallbuckets::GroupWall {
+        let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
+        crate::wallbuckets::group_wall(&[r1], None, Some(pass)).unwrap()
+    }
+
+    /// cr-events-3's group 1 (`cycle.log`, 2026-11-23): the last verdict at
+    /// 14:01:59, nothing until a barrier of no steps at 15:57:49, and
+    /// effort.json booked the 116 min as the barrier's run (`wsp-852`). The
+    /// first verdict (14:01:59) is at 380 here.
+    #[test]
+    fn a_long_unnamed_stretch_before_the_barriers_run_is_waiting_not_the_run() {
+        let mut i = row();
+        i.group = Some(("cr-events-3".into(), 1, vec!["r-1".into(), "r-2".into()]));
+        let at = |h: i64, m: i64, sec: i64| 380 + (h * 3600 + m * 60 + sec) - (14 * 3600 + 60 + 59);
+        let none = "cr-events-3 group 1: barrier run — 0 step(s), 0 reused, 0 ran, 0 failed, 0s · scope: full";
+        let spawn = "spawn cr-events-3 --agent --check 1 --kind claude --model opus --effort high";
+        i.events.push(ev(at(16, 9, 30), "task-verified", json!({"id": "r-2"})));
+        for (t, l) in [
+            (at(15, 57, 49), "cr-events-3 group 1: started cr-events-3 · barrier 1"),
+            (at(15, 57, 49), none),
+            (at(15, 57, 49), spawn),
+            (at(16, 6, 49), "tell cr-events-3: Group 1's barrier in the cr-events-3 run holds, pending follow-ups: r-2"),
+            (at(16, 7, 59), "cr-events-3: the check in cpd-512 settled its barrier and its turn is over — ending it"),
+            (at(16, 9, 42), none),
+            (at(16, 9, 42), spawn),
+            (at(16, 17, 37), "tell cr-events-3: Barrier 1 of cr-events-3 passed"),
+        ] {
+            i.cycle.push((t, l.into()));
+        }
+        let g = wall_of(&build(&i), at(16, 17, 37));
+        let unnamed: i64 = g.waits.iter().filter(|((_, c), _)| c.starts_with("nothing the logs name")).map(|(_, s)| s).sum();
+        assert_eq!(unnamed, at(15, 57, 49) - at(14, 1, 59), "the 116 min: {g:?}");
+        assert_eq!(g.seconds("barrier_run"), 12, "only the hand-off to the second run: {g:?}");
+        assert_eq!(g.seconds("check_seat"), 10 * 60 + 10 + 7 * 60 + 55, "the two check seats: {g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+
+        // Where the log names what held it, that is the cause.
+        i.cycle.insert(0, (at(15, 0, 0), "cr-events-3 group 1: barrier waits: r-1's verifier is still seated".into()));
+        let g = wall_of(&build(&i), at(16, 17, 37));
+        assert!(g.waits.iter().any(|((_, c), s)| c.contains("r-1's verifier is still seated") && *s >= 6900), "{g:?}");
+    }
+
+    /// cr-linux-panes' group 1 (2026-11-23): no barrier run line, the check
+    /// seat up at 08:56:54, the hold at 08:59:11, the pass at 09:25:45
+    /// (`wsp-852`). The verdict (08:56:54) is at 380 here.
+    #[test]
+    fn a_hold_in_a_barrier_with_no_run_line_is_the_persons_step_not_the_barriers_run() {
+        let mut i = row();
+        i.group = Some(("cr-linux-panes".into(), 1, vec!["r-1".into()]));
+        let at = |h: i64, m: i64, sec: i64| 380 + (h * 3600 + m * 60 + sec) - (8 * 3600 + 56 * 60 + 54);
+        let (held, pass) = (at(8, 59, 11), at(9, 25, 45));
+        i.cycle.push((at(8, 56, 54), "spawn cr-linux-panes --agent --check 1 --kind claude --model opus --effort high".into()));
+        i.cycle.push((at(8, 56, 56), "cr-linux-panes group 1: started cr-linux-panes · barrier 1".into()));
+        i.cycle.push((pass, "tell cr-linux-panes: Barrier 1 of cr-linux-panes passed".into()));
+        let evs = vec![
+            (held, "worklist-held".to_string(), json!({"id": "cr-linux-panes", "why": "group 2 rests on rows on no worklist"})),
+            (pass, "worklist-go".to_string(), json!({"id": "cr-linux-panes", "passed": 1})),
+        ];
+        i.holds = holds_of(&evs, "cr-linux-panes", 99_999_999);
+        let g = wall_of(&build(&i), pass);
+        let waited: i64 = g.waits.iter().filter(|((_, c), _)| c.contains(HELD_FOR_STEP)).map(|(_, s)| s).sum();
+        assert_eq!(waited, pass - held, "the 26 min: {g:?}");
+        assert_eq!(g.seconds("barrier_run"), held - at(8, 56, 54), "{g:?}");
+        assert_eq!(g.by.values().sum::<i64>(), g.close - g.open, "the buckets tile the window");
+    }
+
     #[test]
     fn a_hold_with_no_go_after_it_runs_to_now_and_a_second_hold_while_held_is_the_same() {
         let evs = vec![
@@ -3515,7 +3595,8 @@ mod tests {
         };
         let r1 = crate::wallbuckets::MemberIn { id: "r-1".into(), spans: ph.iter().map(crate::wallbuckets::Span::of).collect(), ..Default::default() };
         let g = crate::wallbuckets::group_wall(&[r1, r2], None, Some(at(20, 25, 20))).unwrap();
-        assert_eq!(g.seconds("barrier_run"), 30 + 1242 + 6 + 9, "wait to the run, the failed run, the wait to the run again, the run again: {g:?}");
+        assert_eq!(g.seconds("barrier_run"), 1242 + 6 + 9, "the failed run, the hand-off to the run again, the run again: {g:?}");
+        assert!(g.waits.iter().any(|((_, c), s)| c.starts_with("nothing the logs name") && *s == 30), "30s to the first run is past a tick and a hand-off: {g:?}");
         assert_eq!(g.seconds("check_seat"), 1 + 120 + 125, "the failed run's seat (and the second before it was up), the last run's seat: {g:?}");
         assert_eq!(g.seconds("serialised"), 0, "wsp-531 had started inside the failed run's check seat; nothing was held: {g:?}");
         assert!(g.seconds("working") >= v2 - (s2 + 120) - 10, "the follow-up's stretch is the members': {g:?}");
