@@ -1,0 +1,27 @@
+#!/bin/sh
+# wsp-548: cargo's and nextest's runner (`.cargo/config.toml`). Each test process gets a TMPDIR of
+# its own, `<base>/wsp-test-<pid>`, removed when it ends, passed or failed: under nextest that is
+# one per test, statics that are never dropped included. Anything that is not a test binary (those
+# sit in `deps/`) is exec'd untouched.
+case "$1" in
+  */deps/*) ;;
+  *) exec "$@" ;;
+esac
+# A unix socket path may be 104 bytes: a long $TMPDIR (a Mac's /var/folders/..) is not used.
+base=${TMPDIR:-/tmp}
+base=${base%/}
+[ ${#base} -le 20 ] || base=/tmp
+# A runner killed outright removed nothing: its directory goes with the next run.
+for old in "$base"/wsp-test-*; do
+  pid=${old##*-}
+  case "$pid" in '' | *[!0-9]*) continue ;; esac
+  [ -O "$old" ] && ! kill -0 "$pid" 2>/dev/null && rm -rf "$old" 2>/dev/null
+done
+run=$base/wsp-test-$$
+mkdir -m 700 "$run" || exit 1
+trap 'rm -rf "$run" 2>/dev/null || { chmod -R u+rwx "$run"; rm -rf "$run"; }' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+TMPDIR=$run "$@"
+exit $?

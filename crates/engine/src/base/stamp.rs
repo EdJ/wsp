@@ -20,7 +20,7 @@ pub fn build_stamp() -> String {
 fn unset() -> String {
     // This crate's own tests ran inside the root package until wsp-440 and
     // read its stamp, never an empty one: a stamp they can tell from none.
-    if cfg!(test) {
+    if crate::base::under_test() {
         return stamp_word("0000000", true);
     }
     String::new()

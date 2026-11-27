@@ -144,7 +144,7 @@ fn wait(what: &str, within: Duration, mut done: impl FnMut() -> bool, why: impl 
 
 #[test]
 fn a_published_list_and_its_three_rows_reach_the_other_member_under_hub_ids() {
-    let root = PathBuf::from("/tmp").join(format!("ps-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("ps-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 

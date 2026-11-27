@@ -67,7 +67,6 @@
 use crate::model::{Status, Task, Worklist, WorklistStatus};
 use crate::cycle::Seats;
 use crate::place::State;
-use crate::cmd_govern;
 use crate::cmd_checkout::Flow;
 use crate::store::Store;
 use crate::util;
@@ -159,7 +158,7 @@ const EVERY: i64 = 60;
 /// [`Pass`], because the daemon `exec`s itself when an install lands underneath
 /// it — which is exactly when a person is most likely to be installing, mid-run,
 /// with a governor dead.
-const EMPTY_TICKS: u64 = 2;
+pub const EMPTY_TICKS: u64 = 2;
 
 /// The pass's own clock, held between ticks.
 ///
@@ -476,7 +475,7 @@ fn step_running(store: &Store, seats: &dyn Seats) {
 /// seat a running list governs is examined as that list's own and the backlog
 /// contributes nothing new for it.
 fn seat_scopes(store: &Store) -> Vec<(String, String)> {
-    seat_scopes_owing(store, crate::wake::scopes_owed(store))
+    seat_scopes_owing(store, Seats::scopes_owed(crate::cycle::seats(), store))
 }
 
 /// [`seat_scopes`], with the backlog half asked only of the scopes in `owed`.
@@ -571,7 +570,7 @@ fn seat_scopes_owing(store: &Store, owed: Vec<(String, usize)>) -> Vec<(String, 
 /// lines none of which is owed, read `unseated · 8 held · counting` on
 /// 2026-10-06 while this walk never counted it.
 pub fn will_seat(store: &Store, scope: &str) -> bool {
-    let owed = crate::wake::owed_to(store, scope);
+    let owed = Seats::owed_to(crate::cycle::seats(), store, scope);
     let owed = if owed > 0 { vec![(scope.to_string(), owed)] } else { Vec::new() };
     seat_scopes_owing(store, owed).iter().any(|(s, _)| s == scope)
 }
@@ -605,7 +604,7 @@ pub fn stamp(store: &Store, line: &str) {
 
 /// Every seat whose screen this pass overruled, said once each.
 ///
-/// **Said here rather than inside the reading that overrules it.** [`Fleet`] is
+/// **Said here rather than inside the reading that overrules it.** [`crate::cmd_spawn::Fleet`] is
 /// what turns a frozen opencode screen into `Idle`, and it is deliberately a
 /// cheap function on a port that a panel calls four times a second — it has no
 /// store, no file and no place to put a sentence. This has all three, and a
@@ -630,7 +629,7 @@ fn say_frozen_screens(store: &Store, seats: &dyn Seats) {
             }
             let session = compound.session_of(&crate::place::Seat::new(&seat));
             let Some(finished) = (!session.is_empty())
-                .then(|| crate::agent_commands::opencode_finished_at(&session))
+                .then(|| seats.opencode_finished_at(&session))
                 .flatten()
             else {
                 continue;
@@ -664,7 +663,7 @@ pub fn refusal_tick(store: &Store, seats: &dyn Seats) {
         if n < crate::refusals::REFUSED_TICKS {
             continue;
         }
-        let Some(seat) = cmd_govern::seat_held(&scope, &governors) else {
+        let Some(seat) = crate::governors::seat_held(&scope, &governors) else {
             // Nobody is in the seat any more: the count belongs to one that is gone.
             crate::refusals::accepted(store, &scope);
             continue;
@@ -702,7 +701,7 @@ pub fn refusal_tick(store: &Store, seats: &dyn Seats) {
 fn deaf_tick(store: &Store, seats: &dyn Seats, door: &crate::refusals::Door) {
     let governors = store.governors();
     for scope in governors.keys() {
-        let Some(seat) = cmd_govern::seat_held(scope, &governors) else { continue };
+        let Some(seat) = crate::governors::seat_held(scope, &governors) else { continue };
         let Some(why) = door.deaf(&seat.pane) else { continue };
         if seats.state(&seat.pane) == Some(State::Working) {
             continue;
@@ -777,7 +776,7 @@ pub fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::
             .bindings()
             .keys()
             .filter_map(|seat| {
-                let s = crate::cmd_agent::stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
+                let s = crate::stuck::stuck_of_seat(store, seat, now, None).into_iter().find(|s| s.open)?;
                 Some((seat.clone(), (s.kind, s.secs)))
             })
             .collect();
@@ -799,7 +798,7 @@ pub fn stuck_seats(store: &Store) -> std::collections::BTreeMap<String, (crate::
 pub fn stuck_tick(store: &Store, seats: &dyn Seats) {
     if let Some(door) = crate::refusals::door(store) {
         return stuck_ordered(store, seats, &door, &|seat| {
-            crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), None)
+            crate::stuck::stuck_of_seat(store, seat, util::epoch_secs(), None)
         }, &|_| Vec::new());
     }
     let before = held_all(store);
@@ -808,7 +807,7 @@ pub fn stuck_tick(store: &Store, seats: &dyn Seats) {
         seats,
         &|seat| {
             let recorded = before.get(seat).map(|h| (h.command.as_str(), h.at));
-            crate::cmd_agent::stuck_of_seat(store, seat, util::epoch_secs(), recorded)
+            crate::stuck::stuck_of_seat(store, seat, util::epoch_secs(), recorded)
         },
         &|_| Vec::new(),
     );
@@ -973,7 +972,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
         return;
     }
     // Somebody else's machine is somebody else's seat. Absent record is ours.
-    if governors.contains_key(&scope) && cmd_govern::host_of(&governors, &scope) != util::hostname() {
+    if governors.contains_key(&scope) && crate::governors::host_of(&governors, &scope) != util::hostname() {
         return;
     }
     let never_filled = !governors.contains_key(&scope);
@@ -981,7 +980,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // means nobody can be asked; see `how_it_reads`.
     let Some(word) = how_it_reads(store, seats, &scope) else { return };
     // This pass's own count, and the record's reading of it, from one write.
-    let here = cmd_govern::count_unseated(store, &scope);
+    let here = crate::governors::count_unseated(store, &scope);
     // **A seat that reads `gone` is not waited on** (`wsp-386`). `Empty` is the
     // reading of a pane between two agents, and that is what the two ticks are
     // for; `Gone` is a pane closed or an agent released, and nobody is coming
@@ -989,7 +988,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // hours between two groups, with the only repair a person's `advance`.
     let gone = word == "gone";
     if gone && !never_filled {
-        if let Some(seat) = cmd_govern::seat_held(&scope, &governors) {
+        if let Some(seat) = crate::governors::seat_held(&scope, &governors) {
             note_gone(store, seats, &seat.pane, &format!("the {scope} governor"));
         }
     }
@@ -1006,7 +1005,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // confirmed — `tokenhub-spec-sync` paid for exactly that every twenty
     // minutes. Said on the pass that crosses the threshold; `wake::unseated`
     // says it on the seat for as long as it stays true.
-    let kind = crate::cmd_spawn::seat_kind(&governors, &scope);
+    let kind = crate::governors::seat_kind(&governors, &scope);
     if !crate::place_compound::reads_kind(&kind) {
         if here.unseated == if gone { 1 } else { EMPTY_TICKS } {
             stamp(store, &format!("{scope}: the seat reads {word} and {trigger}, but it was a {kind} governor and compound cannot run one — nothing seated"));
@@ -1016,12 +1015,12 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // The claim is the duplicate guard and it is taken *before* the process
     // starts, because the process is where the seat is written and a tick that
     // arrives in between would find an empty post and start a second one.
-    if !cmd_govern::claim_seat(store, &scope) {
+    if !crate::governors::claim_seat(store, &scope) {
         return;
     }
     stamp(store, &format!("{scope}: the seat reads {word} and {trigger} — seating a successor"));
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         crate::cycle::tests::RESEATED.with(|s| s.borrow_mut().push(scope.clone()));
     }
     // A successor that never started is a failed reseat, said with its reason
@@ -1029,7 +1028,7 @@ fn seat_vacant(store: &Store, seats: &dyn Seats, scope: &str, trigger: &str) {
     // silence and was taken again, and a done list's held sentences read
     // "nobody coming" only once the list closed.
     if let Err(why) = crate::cycle::try_launch(store, &["govern", &scope, "--reseat"]) {
-        cmd_govern::reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` could not be started: {why}"));
+        crate::governors::reseat_failed(store, &scope, &format!("`wsp govern {scope} --reseat` could not be started: {why}"));
     }
 }
 
@@ -1078,7 +1077,7 @@ pub fn reading(store: &Store, seats: &dyn Seats, scope: &str) -> Occupancy {
     // `seat_held` rather than `seat_of_scope(..).or(last_seat(..))`: a record
     // with a workspace and an empty `pane` is a slot nobody is in, and it was
     // `tooling`'s live shape on 2026-10-05.
-    let Some(seat) = cmd_govern::seat_held(scope, &store.governors()) else {
+    let Some(seat) = crate::governors::seat_held(scope, &store.governors()) else {
         return Occupancy::Vacant("unseated");
     };
     match seats.state(&seat.pane) {
@@ -1117,7 +1116,7 @@ fn how_it_reads(store: &Store, seats: &dyn Seats, scope: &str) -> Option<&'stati
     match reading(store, seats, scope) {
         Occupancy::Vacant(word) => Some(word),
         Occupancy::Occupied => {
-            cmd_govern::forget_unseated(store, scope);
+            crate::governors::forget_unseated(store, scope);
             None
         }
         Occupancy::Unreadable => None,
@@ -1590,7 +1589,7 @@ const GONE_KEEP: i64 = 30 * 60;
 /// The host's side of a seat's death, as far as the host keeps it: the load
 /// and the free memory now, which is the nearest reading to the moment.
 fn host_words() -> String {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return "host readings not taken".to_string();
     }
     let load = crate::throttle::load_avgs()
@@ -2565,7 +2564,8 @@ fn undated(line: &str) -> &str {
 /// well as written, so a test can read what was said from either.
 
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
     use crate::cycle::tests::{ENDED, MEMBER_TOLD, RESEATED, SPAWNED, TOLD};
@@ -2582,14 +2582,14 @@ pub mod tests {
 
     /// The seats a fake answers for. `None` in the map is a seat nobody can say
     /// anything about, which is deliberately not the same as one reading `Gone`.
-    struct Fake(std::collections::BTreeMap<String, Option<State>>);
+    pub struct Fake(std::collections::BTreeMap<String, Option<State>>);
 
     impl Fake {
-        fn new(pairs: &[(&str, Option<State>)]) -> Fake {
+        pub fn new(pairs: &[(&str, Option<State>)]) -> Fake {
             Fake(pairs.iter().map(|(s, v)| (s.to_string(), *v)).collect())
         }
 
-        fn empty() -> Fake {
+        pub fn empty() -> Fake {
             Fake(Default::default())
         }
     }
@@ -2621,7 +2621,7 @@ pub mod tests {
     }
 
     /// A seat that records what it is sent and pressed (`wsp-420`).
-    struct Orders {
+    pub struct Orders {
         state: Option<State>,
         typed: bool,
         sent: std::cell::RefCell<Vec<String>>,
@@ -2645,7 +2645,7 @@ pub mod tests {
         }
     }
 
-    fn stall(open: bool, secs: i64) -> crate::stuck::Stall {
+    pub fn stall(open: bool, secs: i64) -> crate::stuck::Stall {
         crate::stuck::Stall { kind: crate::stuck::Kind::SelfWait, command: "until ! pgrep -f x; do sleep 1; done".into(), at: 1000, secs, open }
     }
 
@@ -2793,7 +2793,7 @@ pub mod tests {
     /// The seat a fake can answer about *and* report gone: `state` is `None` and
 /// `absent` is true, which is what a closed pane is.
 #[derive(Default)]
-struct Absent(Vec<String>);
+pub struct Absent(pub Vec<String>);
 
 impl Seats for Absent {
     fn state(&self, _seat: &str) -> Option<State> {
@@ -2802,8 +2802,17 @@ impl Seats for Absent {
     fn absent(&self, seat: &str) -> bool {
         self.0.iter().any(|s| s == seat)
     }
+    /// What the engine can see of a release: binding, claim and the log line.
+    /// The act itself is the seats': `cmd_spawn::from_repair`'s
+    /// `a_gone_seats_claim_is_released_on_the_next_tick_with_a_line_on_the_row`
+    /// runs the real one under the same tick.
     fn release_gone(&self, store: &Store, row: &str, seat: &str, why: &str) -> bool {
-        crate::cmd_spawn::release_gone(store, row, seat, why);
+        store.clear_binding(seat);
+        store.clear_claim(row);
+        if let Some(mut t) = store.task(row) {
+            t.log(&format!("released · {why}"));
+            store.save_task(&t).unwrap();
+        }
         true
     }
 }
@@ -2814,33 +2823,33 @@ impl Seats for Absent {
     /// reconciler logs through it rather than opening the file itself — so a
     /// repair's lines and the run steps' lines come out of one list in one
     /// order, and a test reading "what did the run say" reads both.
-    fn stamped() -> Vec<String> {
+    pub fn stamped() -> Vec<String> {
         crate::cycle::tests::SAID.with(|s| s.borrow_mut().drain(..).collect())
     }
 
-    fn member_told() -> Vec<(String, String)> {
+    pub fn member_told() -> Vec<(String, String)> {
         MEMBER_TOLD.with(|t| t.borrow_mut().drain(..).collect())
     }
 
-    fn governed() -> Vec<String> {
+    pub fn governed() -> Vec<String> {
         TOLD.with(|t| t.borrow_mut().drain(..).collect())
     }
 
-    fn ended() -> Vec<String> {
+    pub fn ended() -> Vec<String> {
         ENDED.with(|e| e.borrow_mut().drain(..).collect())
     }
 
-    fn spawned() -> Vec<(String, String)> {
+    pub fn spawned() -> Vec<(String, String)> {
         SPAWNED.with(|s| s.borrow_mut().drain(..).collect())
     }
 
-    fn scratch(tag: &str) -> (util::Isolated, Store) {
+    pub fn scratch(tag: &str) -> (util::Isolated, Store) {
         crate::testkit::isolated_store(&format!("repair-{tag}"))
     }
 
     /// A running list of one group, and the only kind of group the reconciler
     /// touches: one carrying a policy.
-    fn list(store: &Store, members: &[&str], agent: &str) -> Worklist {
+    pub fn list(store: &Store, members: &[&str], agent: &str) -> Worklist {
         let mut w = Worklist::new("run", "run");
         w.set_status(WorklistStatus::Running);
         w.set_groups(&[Group {
@@ -2852,7 +2861,7 @@ impl Seats for Absent {
         w
     }
 
-    fn member(store: &Store, id: &str, status: Status) {
+    pub fn member(store: &Store, id: &str, status: Status) {
         let mut t = Task::new(id, id);
         t.set_status(status);
         store.save_task(&t).unwrap();
@@ -2860,7 +2869,7 @@ impl Seats for Absent {
 
     /// A running list of one member at `doing`, its claim held and `cpd-1`
     /// bound to it: a run in flight, with something that could be lost.
-    fn in_flight(tag: &str) -> (util::Isolated, Store) {
+    pub fn in_flight(tag: &str) -> (util::Isolated, Store) {
         let (env, store) = scratch(tag);
         member(&store, "m-1", Status::Doing);
         list(&store, &["m-1"], "claude");
@@ -2868,42 +2877,12 @@ impl Seats for Absent {
         (env, store)
     }
 
-    /// `wsp-344`: a claim whose seat the manager reports absent is released on
-    /// the next tick, with the reason on the row; a seat that is there, a far
-    /// seat (a machine that is gone is `--lost`'s), a claim younger than a
-    /// minute and a seat nobody can read keep theirs.
-    #[test]
-    fn a_gone_seats_claim_is_released_on_the_next_tick_with_a_line_on_the_row() {
-        let (_env, store) = in_flight("gone-seat-claim");
-        for (id, seat) in [("m-far", "cpd-8@mb"), ("m-young", "cpd-3"), ("m-here", "cpd-4")] {
-            member(&store, id, Status::Doing);
-            claim(&store, id, seat);
-        }
-        let rec = store.state.join(crate::place_compound::SEATS).join("cpd-8@mb");
-        std::fs::create_dir_all(&rec).unwrap();
-        std::fs::write(rec.join("seat.json"), r#"{"machine":"mb"}"#).unwrap();
-        store.set_claim("m-young", serde_json::json!({ "workspace": "cpd-3", "claimed_at": util::now_iso() }));
-
-        tick(&store, &Absent(vec!["cpd-1".into(), "cpd-8@mb".into(), "cpd-3".into()]), &mut Pass::new());
-
-        let claims = store.claims();
-        assert!(!claims.contains_key("m-1"), "the gone seat's claim is released");
-        assert!(!store.bindings().contains_key("cpd-1"), "and its binding");
-        let log = store.task("m-1").unwrap().section("Log").unwrap_or_default();
-        assert!(log.contains("released") && log.contains("its seat cpd-1 is gone"), "{log}");
-        assert_eq!(store.task("m-1").unwrap().status(), Status::Doing, "the row's status is not this pass's");
-        assert!(claims.contains_key("m-far"), "a far seat keeps --lost's path");
-        assert!(claims.contains_key("m-young"), "a claim made a moment ago is not judged on the seat table yet");
-        assert!(claims.contains_key("m-here"), "a seat no backend calls absent keeps its claim");
-        assert!(stamped().iter().any(|l| l.contains("claim(s) whose seat is gone, released: m-1 (cpd-1)")));
-    }
-
-    fn claim(store: &Store, id: &str, seat: &str) {
+    pub fn claim(store: &Store, id: &str, seat: &str) {
         store.set_claim(id, serde_json::json!({ "workspace": seat }));
         store.set_binding(seat, serde_json::json!({ "task_id": id }));
     }
 
-    fn git_in(repo: &Path, args: &[&str]) -> String {
+    pub fn git_in(repo: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -2919,7 +2898,7 @@ impl Seats for Absent {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    fn repo(env: &util::Isolated, store: &Store) -> PathBuf {
+    pub fn repo(env: &util::Isolated, store: &Store) -> PathBuf {
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let mut p = crate::model::Project::new("p");
@@ -2930,7 +2909,8 @@ impl Seats for Absent {
 
     /// A member at `review` in a project whose `m-1` branch is level with the
     /// trunk — its work has landed and its row says nothing about how.
-    fn landed_member(env: &util::Isolated, store: &Store, ahead: bool) -> String {
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
+    pub fn landed_member(env: &util::Isolated, store: &Store, ahead: bool) -> String {
         let repo = repo(env, store);
         crate::testkit::repo(&repo);
         git_in(&repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
@@ -2962,7 +2942,7 @@ impl Seats for Absent {
     /// durable across a daemon restart — so a test that aged `updated` instead
     /// would pass against a repair keyed on the wrong thing, which is the
     /// defect `wsp-136` item 1 is about.
-    fn age_the_notice(store: &Store, id: &str) {
+    pub fn age_the_notice(store: &Store, id: &str) {
         let mut t = store.find_task(id).unwrap();
         let log = t.section("Log").unwrap_or_default();
         let aged: Vec<String> = log
@@ -2980,49 +2960,34 @@ impl Seats for Absent {
         store.save_task(&t).unwrap();
     }
 
-    fn row_log(store: &Store, id: &str) -> String {
+    pub fn row_log(store: &Store, id: &str) -> String {
         store.find_task(id).and_then(|t| t.section("Log")).unwrap_or_default()
     }
 
-    fn key(store: &Store, id: &str) -> Option<String> {
+    pub fn key(store: &Store, id: &str) -> Option<String> {
         landed(&store.find_task(id)?)
     }
 
     // ---- a governor seat nobody is in ---------------------------------------
 
     /// One pass of the reconciler, which is the shape every test here takes.
-    fn a_pass(store: &Store, seats: &dyn Seats) {
+    pub fn a_pass(store: &Store, seats: &dyn Seats) {
         tick(store, seats, &mut Pass::new());
     }
 
     /// What `wsp-148`'s repair filled a seat on, in order.
-    fn reseated() -> Vec<String> {
+    pub fn reseated() -> Vec<String> {
         RESEATED.with(|s| s.borrow_mut().drain(..).collect())
     }
 
-    /// `n` lines sitting in `scope`'s wake spool — somebody has written to it and
-    /// nobody has taken it, which is the fact the second trigger reads.
-    fn held_for(store: &Store, scope: &str, n: usize) {
-        store.update_watch(&crate::wake::key_for(scope), |rec| {
-            crate::cmd_watch::Spool::append(
-                rec,
-                (0..n)
-                    .map(|i| {
-                        crate::cmd_watch::Spooled::of(
-                            0,
-                            crate::cmd_watch::Line::Note(
-                                crate::cmd_watch::Class::Message,
-                                format!("owed {i}"),
-                            ),
-                        )
-                    })
-                    .collect(),
-            );
-        });
+    /// `scope`'s seat is owed `n` lines — somebody has written to it and nobody
+    /// has taken it, which is the fact the second trigger reads.
+    pub fn held_for(_store: &Store, scope: &str, n: usize) {
+        crate::cycle::install_tests::OWED.with(|o| o.borrow_mut().insert(scope.to_string(), n));
     }
 
     /// A governor seat on `scope`, occupying `room` as `pane`, at a tier.
-    fn seated(store: &Store, scope: &str, room: &str, pane: &str, model: &str, effort: &str) {
+    pub fn seated(store: &Store, scope: &str, room: &str, pane: &str, model: &str, effort: &str) {
         store.set_governor(
             scope,
             serde_json::json!({
@@ -3104,7 +3069,7 @@ impl Seats for Absent {
     /// `Seats::state` answers `None` on a machine with no backend answering, and
     /// this is the repair that starts agents: reading an absence as a death would
     /// seat a successor for every running list at the moment the terminal server
-    /// is restarting, which is the same failure [`Fleet`]'s docs warn about and
+    /// is restarting, which is the same failure [`crate::cmd_spawn::Fleet`]'s docs warn about and
     /// it is the one place the warning applies.
     #[test]
     fn a_seat_nobody_can_be_asked_about_is_never_reseated() {
@@ -3190,112 +3155,6 @@ esac
         fn drop(&mut self) {
             std::env::set_var(wsp_wire::host_tcp::ENV, "inproc");
         }
-    }
-
-    /// **`wsp-036`: a governor reseat goes through the Host `wsp spawn` does.**
-    /// retro-2's governor was reseated in cpd-241 by the daemon under
-    /// `WSP_HOST=manager`, and the manager neither journalled it nor listed it
-    /// to `wip`: `cmd_spawn::reseat` started the successor on the in-process
-    /// host whatever `WSP_HOST` said. Here the reconciler's pass finds a
-    /// running list with nobody in its seat and claims it, then the verb it
-    /// launches (`wsp govern run --reseat`) runs under a loopback manager: the
-    /// manager forks the seat (its `seat.spawn`, under the row's key), runs it,
-    /// and `wip`'s census reads it from the manager.
-    #[test]
-    fn a_governor_reseat_under_the_manager_is_its_seat_spawn_and_reads_in_wips_census() {
-        let (env, store) = in_flight("reseat-mgr");
-        let _inproc = Inproc;
-        // The member's project gives the list's governor a root to stand in.
-        repo(&env, &store);
-        let mut t = store.find_task("m-1").unwrap();
-        t.project = Some("p".into());
-        store.save_task(&t).unwrap();
-
-        let exec = env.path("x");
-        std::fs::create_dir_all(&exec).unwrap();
-        let sup = env.path("sup");
-        wsp_testkit::script(&sup, &FAKE_SUP.replace("__OWNER__", &std::process::id().to_string()));
-        let mut cfg = wsp_manager::Config::new(&exec, "test-host");
-        cfg.port = 0;
-        cfg.sup = Some(sup);
-        let m = wsp_manager::Manager::start(cfg).expect("the manager starts on loopback");
-        let token = std::fs::read_to_string(exec.join(wsp_manager::TOKEN_FILE)).unwrap();
-        let local = crate::manager::Local {
-            host: "test-host".into(),
-            addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port: m.addrs()[0].port(),
-            exec_dir: exec.clone(),
-        };
-        crate::manager::write_record(&store.state, &local, token.trim()).unwrap();
-        std::env::set_var(wsp_wire::host_tcp::ENV, "manager");
-
-        // The daemon's pass: claimed, and the reseat launched.
-        a_pass(&store, &Fake::empty());
-        assert_eq!(reseated(), vec!["run".to_string()]);
-        // Claude Code's hook, played: claude takes its order in argv and is
-        // ready when a turn runs, which under the manager its hook posts as
-        // the seat's turn begun, at the epoch the manager started it under
-        // (wsp-038; `wait_ready` hears it as an event, wsp-037). Posted once
-        // the agent is on the seat's record: its epoch then is the agent's,
-        // not that of the shell `open` put there first.
-        let done = std::sync::atomic::AtomicBool::new(false);
-        let dial = wsp_host::hooks::Dial::Manager { addr: m.addrs()[0], token_file: exec.join(wsp_manager::TOKEN_FILE) };
-        let code = std::thread::scope(|s| {
-            s.spawn(|| {
-                let seats = store.state.join(crate::place_compound::SEATS);
-                let mut posted = std::collections::BTreeSet::new();
-                while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                    for dir in std::fs::read_dir(&seats).into_iter().flatten().flatten().map(|e| e.path()) {
-                        let rec: serde_json::Value = std::fs::read_to_string(dir.join("seat.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-                        let seat = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        let Some(epoch) = m.seats().into_iter().find(|r| r.seat.0 == seat).map(|r| r.epoch) else { continue };
-                        if rec.get("agent").is_some() && !posted.contains(&(seat.clone(), epoch.0)) {
-                            let payload = serde_json::json!({ "session_id": format!("sess-{seat}") });
-                            // Posted again on the next round until the manager takes it.
-                            if let wsp_host::hooks::Sent::Taken(_) = wsp_host::hooks::report(&dial, &seat, epoch, "UserPromptSubmit", &payload) {
-                                posted.insert((seat, epoch.0));
-                            }
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            });
-            // What it launched, run here (a test's `launch` starts nothing).
-            let code = crate::cmd_govern::govern(&store, &crate::base::args::Args::synth("govern", &["run"], &[("reseat", "true")]));
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            code
-        });
-        let said = || {
-            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
-            format!("cycle.log:\n{}\nmanager.log:\n{}", read(store.state_file("cycle.log")), read(m.log_path()))
-        };
-        assert_eq!(code, 0, "the reseat seated a successor: {}", said());
-        let seat = store.governors()["run"]["pane"].as_str().unwrap_or_default().to_string();
-        assert!(!seat.is_empty(), "the seat is on the record: {:?}", store.governors()["run"]);
-
-        // The manager took the seat.spawn and forked it: it runs the seat.
-        let spawns = std::fs::read_to_string(exec.join(wsp_manager::seats::RUN_DIR).join("spawns")).unwrap_or_default();
-        assert!(spawns.lines().any(|l| l.starts_with(&format!("{seat} "))), "the manager forked {seat}: {spawns:?}");
-        assert!(m.seats().iter().any(|s| s.seat.0 == seat), "the manager runs {seat}: {:?}", m.seats());
-        // And `wip`'s census, which asks the manager, reads it. The census
-        // gives a manager `SILENT` (1 s) to answer and reads it silent past
-        // that, which a loaded machine overruns: asked again until the
-        // manager is heard (bounded generously, as wsp-114's waits are), and
-        // only a heard census is held to having the seat.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        let reading = loop {
-            let reading = wsp_wire::host_tcp::census(&store.state, env!("CARGO_PKG_VERSION"));
-            if reading.heard() {
-                break reading;
-            }
-            assert!(std::time::Instant::now() < deadline, "wip's census never heard the manager within 120s");
-        };
-        assert!(reading.rows.contains_key(&seat), "wip's census reads {seat}: {:?}", reading.rows.keys().collect::<Vec<_>>());
-
-        // The seat ended through the manager, as `wsp despawn` would.
-        let place = crate::place_compound::Compound::chosen(env!("CARGO_PKG_VERSION")).unwrap();
-        let _ = crate::place::Place::stop(&place, &crate::place::Seat::new(&seat));
-        m.stop();
     }
 
     /// **A person's pause leaves the post empty, and nothing reaches it to
@@ -3625,28 +3484,6 @@ esac
         let _ = std::fs::remove_dir_all(&store.root);
     }
 
-    /// **A seat on a backend pane, read by the real fleet** (`wsp-148`, live on
-    /// 2026-10-06). backend is out of the picture, and while the fleet still asked
-    /// it, its `Unreachable` made every such seat `Unreadable` — so compound,
-    /// jolt-app and wsp sat dead with nothing coming to fill them. Compound has
-    /// no record of the pane, which is a fact, and the seat reads `gone`.
-    #[test]
-    fn a_seat_on_a_backend_pane_reads_gone_to_the_real_fleet() {
-        let (_env, store) = in_flight("seat-backend-pane");
-        store.set_governor(
-            "run",
-            serde_json::json!({
-                "last": {
-                    "pane": "w8K:p1", "workspace": "w8K", "kind": "claude",
-                    "host": util::hostname(), "since": "2026-08-25T22:31:09Z",
-                },
-                "vacated": "2026-08-29T11:51:45Z",
-            }),
-        );
-        assert_eq!(reading(&store, &crate::cycle::Fleet, "run"), Occupancy::Vacant("gone"));
-        let _ = std::fs::remove_dir_all(&store.root);
-    }
-
     /// **A kind compound cannot run is never reseated, and said once.** The
     /// successor would start, read `Unknown` for ever and never be confirmed;
     /// a line per pass would bury `cycle.log` in a decision only a person can
@@ -3772,7 +3609,7 @@ esac
         // is asserted is the guard's answer on that same record: the verb refuses
         // a scope only when this returns `Some`, and it returns `None`.
         assert!(
-            cmd_govern::seat_held("run", &store.governors()).is_none(),
+            crate::governors::seat_held("run", &store.governors()).is_none(),
             "which is what stops the verb refusing the process this pass just launched: {:?}",
             store.governors()["run"]
         );
@@ -3787,7 +3624,7 @@ esac
     fn a_record_naming_a_pane_is_a_seat_and_neither_reader_disagrees() {
         let (_env, store) = in_flight("seat-pane");
         seated(&store, "run", "compound", "cpd-9", "", "");
-        assert!(cmd_govern::seat_held("run", &store.governors()).is_some());
+        assert!(crate::governors::seat_held("run", &store.governors()).is_some());
 
         a_pass(&store, &Fake::empty());
         assert!(
@@ -3815,8 +3652,8 @@ fn a_seat_a_person_stood_down_is_never_reseated_however_much_is_held_for_it() {
     held_for(&store, "run", 7);
     // What `--clear` leaves: the occupancy dropped, the way back kept, and now the
     // sentence that says a person meant it.
-    cmd_govern::vacate(&store, "run");
-    cmd_govern::mark_stood_down(&store, "run");
+    crate::governors::vacate(&store, "run");
+    crate::governors::mark_stood_down(&store, "run");
 
     let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
     for _ in 0..(EMPTY_TICKS + 2) {
@@ -3850,7 +3687,7 @@ fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it(
     let (_env, store) = scratch("seat-primary");
     seated(&store, crate::governors::PRIMARY, "cpd-1", "cpd-1", "", "");
     held_for(&store, crate::governors::PRIMARY, 3);
-    cmd_govern::vacate(&store, crate::governors::PRIMARY);
+    crate::governors::vacate(&store, crate::governors::PRIMARY);
 
     let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
     for _ in 0..(EMPTY_TICKS + 2) {
@@ -3872,9 +3709,9 @@ fn the_primary_seat_is_never_reseated_by_the_daemon_however_much_is_held_for_it(
 fn a_seat_stays_stood_down_through_a_reconcile_that_vacates_it_again() {
     let (_env, store) = in_flight("seat-stood-reap");
     seated(&store, "run", "w1", "cpd-1", "", "");
-    cmd_govern::mark_stood_down(&store, "run");
+    crate::governors::mark_stood_down(&store, "run");
     // The reconciler's own empty-the-occupancy, on a record somebody closed.
-    cmd_govern::vacate(&store, "run");
+    crate::governors::vacate(&store, "run");
     assert!(
         crate::governors::stood_at(&store.governors(), "run").is_some(),
         "a vacating that did not fill the seat did not lift the decision: {:?}",
@@ -3890,33 +3727,6 @@ fn a_seat_stays_stood_down_through_a_reconcile_that_vacates_it_again() {
         a_pass(&store, &gone);
     }
     assert!(reseated().is_empty(), "{:?}", reseated());
-    let _ = std::fs::remove_dir_all(&store.root);
-}
-
-/// **And filling the seat is what lifts it**, which is the only undo there is and
-/// the reason the marker lives on the record rather than in a file of decisions:
-/// a seat somebody is *in* has already answered the question, so `take` replacing
-/// the record drops the sentence, and the next death is an ordinary vacancy.
-#[test]
-fn taking_a_stood_down_seat_lifts_the_decision_so_the_next_death_is_ordinary() {
-    let (_env, store) = in_flight("seat-stood-retake");
-    seated(&store, "run", "w1", "cpd-1", "", "");
-    cmd_govern::mark_stood_down(&store, "run");
-    assert!(crate::governors::stood_at(&store.governors(), "run").is_some());
-
-    // A person filling it by hand, which is `wsp govern` in the seat's own pane.
-    cmd_govern::take(&store, "run", "w1", "cpd-1").unwrap();
-    assert!(
-        crate::governors::stood_at(&store.governors(), "run").is_none(),
-        "a seat somebody is in is not a stood-down seat: {:?}",
-        store.governors()["run"]
-    );
-
-    cmd_govern::vacate(&store, "run");
-    let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
-    a_pass(&store, &gone);
-    a_pass(&store, &gone);
-    assert_eq!(reseated(), vec!["run".to_string()], "so a dead governor is repaired again");
     let _ = std::fs::remove_dir_all(&store.root);
 }
 
@@ -3986,104 +3796,6 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
     let silent = Fake::new(&[("cpd-1", None)]);
 
     assert_eq!(reading(&store, &silent, "run"), Occupancy::Unreadable);
-    let _ = std::fs::remove_dir_all(&store.root);
-}
-
-/// **A scope that holds three lines and owes a seat none of them.**
-///
-/// `wsp-178`'s live case: `tokenhub-spec-sync` is a `done` list, all three of its
-/// spool entries are `edge: left`, and `wsp-166` withholds those from a governor
-/// seat — so it owes nothing, while the spool's depth says it is holding three.
-/// `wsp-148`'s second trigger asked about depth and read that as a scope owing an
-/// answer, and reseated it every twenty minutes for hours on a compound agent
-/// that never comes up (`unseated: 250`).
-///
-/// **Built with `edge: left` and not with `held_for`.** The helper appends a
-/// `Class::Message`, and a message always counts as owed — so a fixture written
-/// with it passes against the bug, which is the fourth time on this row that a
-/// fixture's own convenience was the thing hiding the defect. This is
-/// `tokenhub-spec-sync`'s shape exactly: a level that moved on, whose lines stay
-/// in the record and are not typed.
-#[test]
-fn a_scope_holding_only_withheld_lines_owes_nothing_and_is_never_reseated() {
-    let (_env, store) = in_flight("seat-withheld");
-    seated(&store, "run", "w1", "cpd-1", "", "");
-    // The other half of `tokenhub-spec-sync`: a `done` list, so nothing in this
-    // scope can arrive by the running-list trigger either.
-    let mut w = store.worklist("run").unwrap();
-    w.set_status(crate::model::WorklistStatus::Done);
-    store.save_worklist(&w).unwrap();
-
-    store.update_watch(&crate::wake::key_for("run"), |rec| {
-        crate::cmd_watch::Spool::append(
-            rec,
-            (0..3)
-                .map(|i| {
-                    let mut e = crate::cmd_watch::Emit {
-                        edge: crate::cmd_watch::Edge::Left,
-                        signal: crate::cmd_watch::Signal::new(
-                            crate::cmd_watch::Kind::Review,
-                            "m-1",
-                            "the level moved on",
-                        )
-                        .to("run"),
-                        held: 0,
-                        to: "run".into(),
-                    };
-                    e.held = i;
-                    crate::cmd_watch::Spooled::of(0, crate::cmd_watch::Line::News(e))
-                })
-                .collect(),
-        );
-    });
-
-    let held = store
-        .watches()
-        .get(&crate::wake::key_for("run"))
-        .and_then(|v| v.get("spool"))
-        .and_then(|s| s.as_array())
-        .map(Vec::len)
-        .unwrap_or(0);
-    assert_eq!(held, 3, "the spool really is holding three: the fixture has to be this shape");
-    assert!(
-        !crate::wake::scopes_owed(&store).iter().any(|(s, _)| s == "run"),
-        "and it owes a seat none of them: {:?}",
-        crate::wake::scopes_owed(&store)
-    );
-
-    let gone = Absent(vec!["cpd-1".to_string()]);
-    for _ in 0..(EMPTY_TICKS + 3) {
-        a_pass(&store, &gone);
-    }
-
-    assert!(
-        reseated().is_empty(),
-        "a scope nobody is owed anything to is not a vacancy: {:?}",
-        reseated()
-    );
-    let _ = std::fs::remove_dir_all(&store.root);
-}
-
-/// **And the other side of the same line, so the fixture cannot be satisfied by a
-/// trigger that never fires.** One `edge: up` on a running list is owed, and a
-/// scope owing something with an empty seat is exactly what the second trigger is
-/// for — asserted here because the test above passes against a trigger that
-/// returns nothing at all, which is the same way the withholding fix could have
-/// been shipped broken.
-#[test]
-fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
-    let (_env, store) = in_flight("seat-owed");
-    seated(&store, "run", "w1", "cpd-1", "", "");
-    held_for(&store, "run", 1);
-    assert!(
-        crate::wake::scopes_owed(&store).iter().any(|(s, _)| s == "run"),
-        "a message counts as owed, which is the half the other test cannot see"
-    );
-
-    let gone = Fake::new(&[("cpd-1", Some(State::Gone))]);
-    a_pass(&store, &gone);
-    a_pass(&store, &gone);
-    assert_eq!(reseated(), vec!["run".to_string()], "so the trigger is still live");
     let _ = std::fs::remove_dir_all(&store.root);
 }
 
@@ -4183,7 +3895,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
     /// A [`Fake`] whose seats' last turn ended at `stop` seconds ago with
     /// `words` on it, `denied` or not.
-    struct Stopped(Fake, i64, &'static str, bool);
+    pub struct Stopped(Fake, i64, &'static str, bool);
 
     impl Seats for Stopped {
         fn state(&self, seat: &str) -> Option<State> {
@@ -4199,7 +3911,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     }
 
     /// The row's start, `ago` seconds back, as the run writes it.
-    fn started(store: &Store, id: &str, ago: i64) {
+    pub fn started(store: &Store, id: &str, ago: i64) {
         let mut t = store.find_task(id).unwrap();
         let log = t.section("Log").unwrap_or_default();
         let line = format!("- {} {} spawned cpd-1", util::iso_at(util::epoch_secs() - ago), crate::cycle::STARTED_BY);
@@ -4208,7 +3920,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         store.save_task(&t).unwrap();
     }
 
-    fn raised_texts(store: &Store) -> Vec<String> {
+    pub fn raised_texts(store: &Store) -> Vec<String> {
         crate::message::raised(store).into_iter().map(|m| m.text).collect()
     }
 
@@ -4255,7 +3967,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
     /// A [`Fake`] whose seats' last turn ended at the epoch `at`, on quiet
     /// words: a stop that stays one stop however many ticks read it.
-    struct StopAt(Fake, i64);
+    pub struct StopAt(Fake, i64);
 
     impl Seats for StopAt {
         fn state(&self, seat: &str) -> Option<State> {
@@ -4266,7 +3978,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         }
     }
 
-    fn told_m1() -> Vec<String> {
+    pub fn told_m1() -> Vec<String> {
         member_told().into_iter().filter(|(id, _)| id == "m-1").map(|(_, t)| t).collect()
     }
 
@@ -4336,7 +4048,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     // ---- a seat waiting on somebody: wsp-172 -------------------------------
 
     /// An open question from `pane` about `task`, as `wsp ask` writes one.
-    fn ask(store: &Store, pane: &str, task: &str) -> String {
+    pub fn ask(store: &Store, pane: &str, task: &str) -> String {
         let q = crate::message::Message::question(
             crate::message::Party::pane(pane, ""),
             crate::message::Kind::Note,
@@ -4403,7 +4115,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     }
 
     /// A [`Fake`] whose agent at `.1` has a shell of its own running.
-    struct Shelled(Fake, &'static str, &'static str);
+    pub struct Shelled(Fake, &'static str, &'static str);
 
     impl Seats for Shelled {
         fn state(&self, seat: &str) -> Option<State> {
@@ -4454,7 +4166,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
     /// Every stamp in a member's `## Log` set to long ago: the fake clock that
     /// puts every window the repair reads behind it.
-    fn age_the_log(store: &Store, id: &str) {
+    pub fn age_the_log(store: &Store, id: &str) {
         let mut t = store.find_task(id).unwrap();
         let log = t.section("Log").unwrap_or_default();
         let aged: Vec<String> =
@@ -4976,8 +4688,9 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         assert!(refused.contains("resolve deps") && refused.contains("`wsp land m-1`") && refused.contains("`wsp reopen m-1"), "the verbs: {refused}");
     }
 
+    #[cfg(test)] // calls `landed_member`
     /// A member told to land, its notice an hour old and its seat `cpd-1`.
-    fn told_an_hour_ago(tag: &str) -> (util::Isolated, Store) {
+    pub fn told_an_hour_ago(tag: &str) -> (util::Isolated, Store) {
         let (env, store) = scratch(tag);
         landed_member(&env, &store, true);
         claim(&store, "m-1", "cpd-1");
@@ -4996,7 +4709,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
         (env, store)
     }
 
-    fn landed_for() -> Vec<String> {
+    pub fn landed_for() -> Vec<String> {
         LANDED_FOR.with(|l| l.borrow_mut().drain(..).collect())
     }
 
@@ -5582,7 +5295,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
     }
 
     /// The members with a pass still reading (`wsp-188`).
-    fn verifiers(store: &Store) -> Vec<String> {
+    pub fn verifiers(store: &Store) -> Vec<String> {
         store
             .tasks()
             .into_iter()
@@ -5593,7 +5306,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
 
     /// Every barrier check the run has opened, on any group of any list —
     /// entries since `wsp-230`, never rows.
-    fn barriers(store: &Store) -> Vec<String> {
+    pub fn barriers(store: &Store) -> Vec<String> {
         store
             .worklists()
             .iter()
@@ -5601,7 +5314,7 @@ fn a_scope_owing_one_line_is_still_reseated_when_its_seat_is_empty() {
             .collect()
     }
 
-    fn set_status(store: &Store, id: &str, status: Status) {
+    pub fn set_status(store: &Store, id: &str, status: Status) {
         let mut t = store.find_task(id).unwrap();
         t.set_status(status);
         t.touch();

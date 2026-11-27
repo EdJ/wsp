@@ -2,7 +2,7 @@
 name = "wsp-engine"
 version = "0.1.0"
 edition = "2021"
-description = "wsp's engine and seats: the run (worklist, cycle, repair, verification, legs, the barrier), the row and list verbs, and the seat commands"
+description = "wsp's engine: the run (worklist, cycle, repair, verification, legs, the barrier), the row and list verbs, orders, the fold and the mirror"
 
 [lib]
 path = "src/lib.rs"
@@ -42,4 +42,17 @@ wsp-hub = { path = "../hub" }
 wsp-store-sqlite = { path = "../store-sqlite" }
 
 [features]
-test-support = []
+# What a dependent's tests need of engine's: the fixtures, the recorders and `base::under_test` (wsp-544).
+test-support = [
+    "wsp-base/test-support",
+    "wsp-client/test-support",
+    "wsp-store/test-support",
+    "wsp-wire/test-support",
+    "wsp-trees/test-support",
+    "wsp-server/test-support",
+]
+
+# A dependent's view of engine; the root's dev-dependency turns the feature on in a workspace run.
+[[test]]
+name = "dependent"
+required-features = ["test-support"]

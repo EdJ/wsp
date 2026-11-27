@@ -1979,7 +1979,7 @@ mod tests {
     #[test]
     fn the_real_beat_reads_an_answer_off_the_socket_and_fails_without_one() {
         use std::io::{BufRead, BufReader, Write};
-        let dir = PathBuf::from("/tmp").join(format!("wl-{}-{}", std::process::id(), crate::util::epoch_nanos() % 100_000));
+        let dir = std::env::temp_dir().join(format!("wl-{}-{}", std::process::id(), crate::util::epoch_nanos() % 100_000));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("s.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
@@ -2011,7 +2011,7 @@ mod tests {
     /// beat that goes through a forward made minutes later (wsp-562).
     #[test]
     fn the_first_lease_is_written_at_spawn_before_any_beat() {
-        let root = std::path::PathBuf::from("/tmp").join(format!("wf-firstlease-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("wf-firstlease-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut m = Machine::new("mb2", "mb2");
         m.exec_dir = format!("{}/it's exec/", root.display());
@@ -2062,7 +2062,7 @@ mod tests {
             eprintln!("skipped: no compound-remote built (set COMPOUND_REMOTE_BIN)");
             return;
         };
-        let root = std::path::PathBuf::from("/tmp").join(format!("wf-gate-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("wf-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut m = Machine::new("mb2", "mb2");
         m.exec_dir = root.display().to_string();

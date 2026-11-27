@@ -36,6 +36,8 @@ use crate::cmd_agent;
 use crate::cmd_checkout::{self, Tree};
 use crate::cmd_govern;
 pub use crate::place::local_backends;
+pub use crate::agent_kind::{kind_or_default, DEFAULT_KIND};
+pub use crate::governors::seat_kind;
 use crate::leg_seat;
 use crate::place::{Agent, Order, Place, Refusal, Seat, State};
 use crate::resolve::Index;
@@ -1298,42 +1300,6 @@ fn governed(args: &Args, kind: &str, agent: bool, scope: &Scope) -> (Option<Stri
     (Some(GOVERNED_MODEL.to_string()), Some(GOVERNED_EFFORT.to_string()))
 }
 
-/// backend's default when nobody says which agent. Every other kind it knows is
-/// spelt the way its own CLI spells it and passed straight through — an
-/// unknown one is refused by backend with the whole catalogue in the message,
-/// which is a better list than one kept here and left to go stale.
-pub const DEFAULT_KIND: &str = "claude";
-
-/// The kind a record names, or [`DEFAULT_KIND`] for one that names none.
-///
-/// **`core-031`'s second decision, and it is a decision rather than a
-/// convenience.** A record with no kind can be read two ways — as `claude`,
-/// which is compatible and wrong for exactly the agents `core-020` is adding,
-/// or as *unknown*, which is honest and costs more than it sounds.
-///
-/// Unknown resolves to [`crate::agent_commands::Plain`], and `Plain` has no
-/// resume flag: `wsp resume` on every record written before this existed would
-/// stop working, and the ones written before this existed are all `claude`
-/// because `--kind` was read and thrown away. So honesty about the absence buys
-/// nothing true and loses the whole back catalogue.
-///
-/// What makes the default safe rather than merely convenient is that an absence
-/// no longer lasts: [`crate::cmd_agent::learn_sessions`] and
-/// [`crate::cmd_govern::learn_seats`] take the kind off backend's own reading on
-/// every `sync` tick, so a live record is corrected within a tick of anything
-/// looking at it and only a record whose agent is already gone can still be
-/// reading its default. For those, the default is what they were.
-///
-/// One function because there are three call sites and `cmd_resume`'s census
-/// path already had this line written out; the store path now reads the same
-/// fact the same way.
-pub fn kind_or_default(recorded: &str) -> String {
-    match recorded.trim() {
-        "" => DEFAULT_KIND.to_string(),
-        k => k.to_string(),
-    }
-}
-
 /// How long the caller is prepared to wait, in three numbers and a clock.
 ///
 /// A struct rather than three constants for the reason `place_backend::Backend`
@@ -2474,7 +2440,7 @@ pub fn spawn(store: &Store, args: &Args) -> i32 {
         }
     };
     if args.has("primary") {
-        return seat_primary(place.as_ref(), &crate::cycle::Fleet, store, args);
+        return seat_primary(place.as_ref(), crate::cycle::seats(), store, args);
     }
     place_work(place.as_ref(), store, args)
 }
@@ -2909,7 +2875,7 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
         && !verifying
         && checking.is_none();
     if by_hand && args.has("agent") && !args.has("govern") && args.get("on").is_none() {
-        if let Some((cap, now)) = crate::room::full(store, &crate::cycle::Fleet) {
+        if let Some((cap, now)) = crate::room::full(store, crate::cycle::seats()) {
             eprintln!(
                 "wsp: the seat is at its cap of {cap} ({}) — starting this anyway: a hand spawn is not the run",
                 crate::room::names(&now)
@@ -4122,18 +4088,6 @@ pub fn reseat(store: &Store, scope: &str) -> i32 {
         }
     };
     reseat_on(place.as_ref(), store, &args, &Patience::default())
-}
-
-/// The kind a reseat of this scope starts — the seat's own, read live or from
-/// under `last`, or [`DEFAULT_KIND`].
-///
-/// **Under `last` as well, through [`cmd_govern::last_seat`]**, for
-/// [`cmd_govern::tier_of`]'s reason: a governor whose pane died is vacated
-/// before the reconciler looks, so the kind is nearly always there and a reader
-/// of the top level alone defaulted it — right by luck for `claude`, and an
-/// opencode run moved onto claude for everyone else.
-pub fn seat_kind(governors: &BTreeMap<String, Value>, scope: &str) -> String {
-    kind_or_default(&cmd_govern::last_seat(governors, scope).map(|s| s.kind).unwrap_or_default())
 }
 
 /// What the reseat is asked for, read off the seat's own record.
@@ -5926,7 +5880,35 @@ pub const VERBS: &[crate::verbs::Verb] = &[
 ];
 
 // The real `Seats` — the port's implementation lives with the seats it reads and acts on (`wsp-406`).
-impl crate::cycle::Seats for crate::cycle::Fleet {
+/// The real reading, over the backends on this machine — with opencode's own
+/// database overruling a screen that has stopped repainting. `wsp-160`.
+///
+/// **A backend that is not running here is not asked** (`wsp-148`, live on
+/// 2026-10-06). backend is out of the picture (Ed, 2026-10-06), and while the
+/// fleet still asked it, its `Unreachable` with no server was read as "cannot
+/// say" — so every dead governor seat was `Unreadable` for as long as backend
+/// stayed down, which is always now, and the reconciler refilled none of them:
+/// compound, jolt-app and wsp. backend owns its panes, so no server here means no
+/// backend pane here to be in, and a seat recorded on one is a seat compound has
+/// no record of: nobody is in it, and a reseat fills it on compound. Only a
+/// bare id — one qualified `@machine` is that machine's backend's to answer.
+///
+/// [`crate::backend::available_now`] rather than the cached answer, because the
+/// daemon lives for days: a cache latched `false` would go on skipping backend
+/// after it came back, and skipping is the direction that seats a successor
+/// beside a live pane. One connect, once a minute, per seat asked about.
+///
+/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
+/// and the argument is the cost: that function is called from `survey`, from
+/// `wsp wip`, and from a panel four times a second, and the overrule shells to
+/// `opencode db`. A reader that fires it on every call would run a process per
+/// opencode seat per panel frame. The reconciler runs it once a minute, on the
+/// seats it is already asking about, and can say in `cycle.log` that it did —
+/// which is what `wsp-160` asks for ("log the repair beside it") and what a
+/// function returning a [`State`] has nowhere to put.
+pub struct Fleet;
+
+impl crate::cycle::Seats for Fleet {
     /// **The store is not a parameter**, and that is the one thing here worth
     /// stating: this overrule logs, and logging means naming the store whose
     /// `cycle.log` the line goes in. [`Seats::state`] carries only the seat, so
@@ -5935,7 +5917,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     fn state(&self, seat: &str) -> Option<State> {
         let seat_id = Seat::new(seat);
         let compound = crate::place_compound::Compound::new();
-        let raw = crate::cycle::Fleet::here(seat).find_map(|b| b.state(&seat_id).ok())?;
+        let raw = Fleet::here(seat).find_map(|b| b.state(&seat_id).ok())?;
         Some(self.overrule_frozen_opencode(&compound, seat, raw))
     }
 
@@ -5955,7 +5937,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
         // `wsp-344`: no backend asked is nobody saying anything, not every
         // backend saying "not mine" — and a claim is released on this answer.
         let mut asked = false;
-        let none_has_it = crate::cycle::Fleet::here(seat).all(|b| {
+        let none_has_it = Fleet::here(seat).all(|b| {
             asked = true;
             matches!(b.state(&seat_id), Err(crate::place::Refusal::NoSeat(_)))
         });
@@ -5964,7 +5946,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn pids(&self, seat: &str) -> Option<Vec<u32>> {
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find_map(|b| b.pids(&seat_id))
+        Fleet::here(seat).find_map(|b| b.pids(&seat_id))
     }
 
     fn release_gone(&self, store: &Store, row: &str, seat: &str, why: &str) -> bool {
@@ -5974,7 +5956,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn typed(&self, seat: &str) -> Option<bool> {
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find_map(|b| b.typed(&seat_id))
+        Fleet::here(seat).find_map(|b| b.typed(&seat_id))
     }
 
     fn shells(&self, seats: &[&str]) -> crate::waiting::Shells {
@@ -5993,7 +5975,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn turn_end(&self, seat: &str) -> Option<crate::waiting::TurnEnd> {
         let seat_id = Seat::new(seat);
-        let stop = crate::cycle::Fleet::here(seat).find_map(|b| b.stopped(&seat_id))?;
+        let stop = Fleet::here(seat).find_map(|b| b.stopped(&seat_id))?;
         let (words, denied) = stop
             .transcript
             .as_deref()
@@ -6012,7 +5994,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
             return false;
         }
         let seat_id = Seat::new(seat);
-        crate::cycle::Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
+        Fleet::here(seat).find(|b| b.state(&seat_id).is_ok()).is_some_and(|b| b.nudge(&seat_id).is_ok())
     }
 
     /// Not under `WSP_ORDERS=store`, for [`Self::press`]'s reason: nothing
@@ -6030,6 +6012,73 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
 
     fn fold_typed(&self, store: &Store, scope: &str) -> usize {
         crate::wake::fold_what_was_typed(store, scope)
+    }
+
+    fn opencode_finished_at(&self, session: &str) -> Option<i64> {
+        crate::agent_commands::opencode_finished_at(session)
+    }
+
+    fn occupant(&self, store: &Store, seat: &crate::governors::Seat) -> Option<String> {
+        let backends = crate::place::local_backends();
+        cmd_govern::occupant(store, &backends, seat).map(|(_, found)| found.seat.as_str().to_string())
+    }
+
+    fn answering_scope(&self, store: &Store, task: &crate::model::Task) -> Option<String> {
+        cmd_govern::answering_seat(store, task).map(|s| s.scope)
+    }
+
+    fn notice(&self, store: &Store, task: &str, text: &str) -> bool {
+        cmd_agent::notice(store, task, text).is_some()
+    }
+
+    fn say(&self, store: &Store, scope: &str, text: &str, record: Option<&str>) -> crate::cycle::Report {
+        crate::wake::say(store, scope, text, record)
+    }
+
+    fn messages_held(&self, store: &Store, scope: &str) -> Vec<(u64, i64, String)> {
+        crate::wake::messages_held(store, scope)
+    }
+
+    fn settle_held(&self, store: &Store, scope: &str, seqs: &[u64]) {
+        crate::wake::settle_held(store, scope, seqs)
+    }
+
+    fn owed_to(&self, store: &Store, scope: &str) -> usize {
+        crate::wake::owed_to(store, scope)
+    }
+
+    fn scopes_owed(&self, store: &Store) -> Vec<(String, usize)> {
+        crate::wake::scopes_owed(store)
+    }
+
+    fn answering_seat(&self, store: &Store, task: &crate::model::Task) -> Option<crate::governors::Seat> {
+        cmd_govern::answering_seat(store, task)
+    }
+
+    fn current_project(&self, store: &Store, args: &Args, index: &crate::resolve::Index) -> Result<Option<String>, i32> {
+        cmd_agent::current_project(store, args, index)
+    }
+
+    fn hand_off(&self, store: &Store, task: &str, to: Option<&str>, reason: &str) {
+        cmd_agent::hand_off(store, task, to, reason)
+    }
+
+    fn thread_kind(&self, store: &Store, task: &str) -> Option<String> {
+        crate::cmd_resume::thread_for_task(store, task).map(|th| th.kind)
+    }
+
+    fn ran_in_seat(&self, store: &Store, seat: &str, since: &str) -> String {
+        cmd_agent::ran_in_seat(store, seat, since)
+    }
+
+    fn tell_as(
+        &self,
+        kind: &str,
+        place: &dyn crate::place::Place,
+        seat: &crate::place::Seat,
+        text: &str,
+    ) -> crate::place::Result<crate::place::Delivery> {
+        crate::agent_commands::of(kind).tell(place, seat, text)
     }
 
     fn end_when_idle(&self, store: &Store, seat: &str) -> Result<(), String> {
@@ -6057,7 +6106,7 @@ impl crate::cycle::Seats for crate::cycle::Fleet {
     }
 }
 
-impl crate::cycle::Fleet {
+impl Fleet {
     /// The backends that could hold this seat: every local one, less backend when
     /// no backend is running here to hold it. See [`Fleet`].
     pub fn here(_seat: &str) -> impl Iterator<Item = Box<dyn crate::place::Place>> {
@@ -7181,6 +7230,7 @@ mod tests {
     /// before any seat is opened.
     #[test]
     fn a_row_whose_files_are_another_projects_is_refused_at_spawn_before_a_seat() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -8224,6 +8274,7 @@ mod tests {
     /// acknowledged. Nothing is owed in a file.
     #[test]
     fn under_store_an_acked_first_order_is_one_acknowledged_order_under_the_id_the_seat_was_asked() {
+        crate::install_db();
         use wsp_store_contract::{OrderState, SeatId, SeatState};
         let env = util::isolated("spawn-first-stored");
         let store = Store::open();
@@ -8267,6 +8318,7 @@ mod tests {
     /// as `order not received` (wsp-126).
     #[test]
     fn under_store_a_refused_first_order_is_delivered_at_idle_and_one_refused_to_the_cap_is_failed() {
+        crate::install_db();
         use crate::place::Refusal as Said;
         use wsp_store_contract::{OrderState, SeatId, SeatState};
         let env = util::isolated("spawn-first-refused");
@@ -8859,6 +8911,7 @@ mod tests {
     /// leave it failed, and the spawn never sends a third.
     #[test]
     fn a_spawn_whose_first_order_is_dropped_sends_it_again_once() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let _quick = quick();
         let place = Dropping::new(1, true, Some(false));
@@ -8964,6 +9017,7 @@ mod tests {
     /// path `$WSP_VERDICT` names, beside `$WSP_SEAT_KIND`.
     #[test]
     fn a_spawned_members_seat_has_its_exit_path_beside_its_verdict_and_kind() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -8988,6 +9042,7 @@ mod tests {
 
     #[test]
     fn a_spawn_composes_the_brief_for_the_seat_it_opened_and_not_for_itself() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         // The seat this process is in, unset — because `Briefing::live` reads
         // exactly these, and a test that inherited a real pane from the session
@@ -9068,6 +9123,7 @@ mod tests {
     /// them; this process standing somewhere else is the case that failed.
     #[test]
     fn a_spawns_claim_records_the_seat_the_tree_and_the_kind_it_opened_and_not_where_the_caller_stood() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -9189,6 +9245,7 @@ mod tests {
     /// which is Sonnet when the entry names none. Its order is one line.
     #[test]
     fn a_leg_spawn_claims_nothing_seats_the_entry_binds_the_row_and_runs_on_sonnet() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -9263,6 +9320,7 @@ mod tests {
     /// the batch before is open, and `block` from a piece's pane leaves the row `doing`.
     #[test]
     fn a_piece_spawn_claims_nothing_seats_the_entry_binds_the_row_and_refuses_a_later_batch() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         std::env::remove_var("WSP_BACKEND_PANE_ID");
         std::env::remove_var("WSP_BACKEND_WORKSPACE_ID");
@@ -11134,6 +11192,7 @@ mod tests {
     /// person had claimed.
     #[test]
     fn a_seat_a_governor_spawns_onto_a_row_is_its_helper_at_that_row() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-row");
         standing_in(Some("cpd-7"));
@@ -11162,6 +11221,7 @@ mod tests {
     /// `wip`. With that seat gone the row goes back to its project's walk.
     #[test]
     fn a_rows_review_reaches_the_seat_whose_work_order_started_it() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("ordered-by");
         let mut run = crate::model::Worklist::new("proc", "a process list");
@@ -11199,6 +11259,7 @@ mod tests {
     /// governor's helper with no task, drawn under that governor.
     #[test]
     fn a_seat_a_governor_spawns_with_no_row_is_its_helper_all_the_same() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-no-row");
         standing_in(Some("cpd-7"));
@@ -11221,6 +11282,7 @@ mod tests {
     /// the seat is an `agent`, not anybody's helper.
     #[test]
     fn a_seat_a_member_spawns_is_recorded_and_stays_an_agent() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-by-member");
         standing_in(Some("cpd-12"));
@@ -11242,6 +11304,7 @@ mod tests {
     /// seat and on the claim alike.
     #[test]
     fn a_persons_spawn_records_nobody_and_inherits_no_helpers_record() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("spawned-by-person");
         store.set_spawned("w9:p1", Some(&json!({ "seat": "cpd-7", "scope": "core" })));
@@ -11417,6 +11480,7 @@ mod tests {
     /// helper: the seat is said and the scope is null, as for a member's.
     #[test]
     fn a_seat_the_primary_interface_spawns_is_not_its_helper() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
         let _guard = no_backend();
         let store = governed_core("primary-spawns");
         store.set_governor(crate::governors::PRIMARY, json!({ "workspace": "cpd-1", "pane": "cpd-1", "host": util::hostname() }));
@@ -11721,5 +11785,89 @@ mod tests {
         let (_, said) = take_tree(&w.dir, &|| Tree::Kept { path: util::contract(&w.dir), why: "cpd-9 is standing in it".into() }, &w, false);
         assert!(w.signalled.borrow().is_empty() && said.is_empty(), "{said:?}");
         let _ = std::fs::remove_dir_all(&w.dir);
+    }
+}
+
+/// Moved from `repair`'s tests (wsp-543): they call seats code, above the engine.
+#[cfg(test)]
+mod from_repair {
+    use crate::repair::*;
+    use crate::repair::tests::*;
+    use crate::util;
+    use crate::model::Status;
+
+    /// **A seat on a backend pane, read by the real fleet** (`wsp-148`, live on
+    /// 2026-10-06). backend is out of the picture, and while the fleet still asked
+    /// it, its `Unreachable` made every such seat `Unreadable` — so compound,
+    /// jolt-app and wsp sat dead with nothing coming to fill them. Compound has
+    /// no record of the pane, which is a fact, and the seat reads `gone`.
+    #[test]
+    fn a_seat_on_a_backend_pane_reads_gone_to_the_real_fleet() {
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = in_flight("seat-backend-pane");
+        store.set_governor(
+            "run",
+            serde_json::json!({
+                "last": {
+                    "pane": "w8K:p1", "workspace": "w8K", "kind": "claude",
+                    "host": util::hostname(), "since": "2026-08-25T22:31:09Z",
+                },
+                "vacated": "2026-08-29T11:51:45Z",
+            }),
+        );
+        assert_eq!(reading(&store, crate::cycle::seats(), "run"), Occupancy::Vacant("gone"));
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-344`: a claim whose seat the manager reports absent is released on
+    /// the next tick, with the reason on the row; a seat that is there, a far
+    /// seat (a machine that is gone is `--lost`'s), a claim younger than a
+    /// minute and a seat nobody can read keep theirs.
+    #[test]
+    fn a_gone_seats_claim_is_released_on_the_next_tick_with_a_line_on_the_row() {
+        /// Absence is scripted; the release is the real fleet's.
+        struct GoneThenReal(Absent);
+        impl crate::cycle::Seats for GoneThenReal {
+            fn state(&self, seat: &str) -> Option<crate::place::State> {
+                self.0.state(seat)
+            }
+            fn absent(&self, seat: &str) -> bool {
+                self.0.absent(seat)
+            }
+            fn release_gone(&self, store: &crate::store::Store, row: &str, seat: &str, why: &str) -> bool {
+                crate::cycle::Seats::release_gone(&super::Fleet, store, row, seat, why)
+            }
+        }
+        crate::cycle::install_seats(&crate::cmd_spawn::Fleet);
+        let (_env, store) = in_flight("gone-seat-claim");
+        for (id, seat) in [("m-far", "cpd-8@mb"), ("m-young", "cpd-3"), ("m-here", "cpd-4")] {
+            member(&store, id, Status::Doing);
+            claim(&store, id, seat);
+        }
+        let rec = store.state.join(crate::place_compound::SEATS).join("cpd-8@mb");
+        std::fs::create_dir_all(&rec).unwrap();
+        std::fs::write(rec.join("seat.json"), r#"{"machine":"mb"}"#).unwrap();
+        store.set_claim("m-young", serde_json::json!({ "workspace": "cpd-3", "claimed_at": util::now_iso() }));
+        // A claim no binding stands for is still a claim.
+        member(&store, "m-bare", Status::Doing);
+        store.set_claim("m-bare", serde_json::json!({ "agent_id": "a-bare" }));
+        store.set_agent("a-bare", serde_json::json!({ "seat": "cpd-2" }));
+
+        let gone = Absent(["cpd-1", "cpd-2", "cpd-8@mb", "cpd-3"].map(String::from).to_vec());
+        tick(&store, &GoneThenReal(gone), &mut Pass::new());
+
+        let claims = store.claims();
+        assert!(!claims.contains_key("m-1"), "the gone seat's claim is released");
+        assert!(!store.bindings().contains_key("cpd-1"), "and its binding");
+        let log = store.task("m-1").unwrap().section("Log").unwrap_or_default();
+        assert!(log.contains("released") && log.contains("its seat cpd-1 is gone"), "{log}");
+        assert_eq!(store.task("m-1").unwrap().status(), Status::Doing, "the row's status is not this pass's");
+        assert!(!claims.contains_key("m-bare"), "the claim with no binding is released too");
+        let bare = store.task("m-bare").unwrap().section("Log").unwrap_or_default();
+        assert!(bare.contains("its seat cpd-2 is gone"), "{bare}");
+        assert!(claims.contains_key("m-far"), "a far seat keeps --lost's path");
+        assert!(claims.contains_key("m-young"), "a claim made a moment ago is not judged on the seat table yet");
+        assert!(claims.contains_key("m-here"), "a seat no backend calls absent keeps its claim");
+        assert!(stamped().iter().any(|l| l.contains("claim(s) whose seat is gone, released:") && l.contains("m-1 (cpd-1)")));
     }
 }

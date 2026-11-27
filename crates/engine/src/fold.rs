@@ -166,7 +166,7 @@ fn seat_dir(store: &Store, seat: &str) -> Option<PathBuf> {
 }
 
 /// `said.json` with `f` applied, through the host's own writer.
-fn say(store: &Store, seat: &str, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+pub fn say(store: &Store, seat: &str, f: impl FnOnce(&mut serde_json::Map<String, Value>)) {
     let Some(dir) = seat_dir(store, seat) else { return };
     let mut m = match LOCAL.said(&dir) {
         Value::Object(m) => m,
@@ -527,7 +527,7 @@ pub fn sweep_mute(store: &Store, db: &SharedStore, pick: impl FnOnce(&[crate::pl
     mute
 }
 
-fn put_cmd(put: Vec<Entity>) -> Command {
+pub fn put_cmd(put: Vec<Entity>) -> Command {
     Command::Mirror { put, gone: Vec::new() }
 }
 
@@ -867,7 +867,7 @@ pub fn start(store: &Store, db: Option<SharedStore>) -> Option<(std::thread::Joi
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::time::Instant;
     use wsp_host_api::{
@@ -876,9 +876,9 @@ mod tests {
     };
     use wsp_manager::{Config, Manager, TOKEN_FILE};
 
-    const HOST: &str = "test-host";
+    pub const HOST: &str = "test-host";
 
-    fn manager(exec: &Path, port: u16) -> Manager {
+    pub fn manager(exec: &Path, port: u16) -> Manager {
         let mut cfg = Config::new(exec, HOST);
         cfg.port = port;
         // No beat in the window: the facts a beat carries are the manager's,
@@ -887,16 +887,16 @@ mod tests {
         Manager::start(cfg).expect("the manager starts on loopback")
     }
 
-    fn token(exec: &Path) -> Token {
+    pub fn token(exec: &Path) -> Token {
         Token(std::fs::read_to_string(exec.join(TOKEN_FILE)).unwrap().trim().to_string())
     }
 
-    fn seat() -> SeatId {
+    pub fn seat() -> SeatId {
         SeatId("cpd-f1".into())
     }
 
     /// The stream a seat's life makes: started, a turn, a word, its spend, its stop.
-    fn script(m: &Manager) -> Vec<u64> {
+    pub fn script(m: &Manager) -> Vec<u64> {
         let s = seat();
         let e = Epoch(1);
         let msgs = vec![
@@ -932,13 +932,13 @@ mod tests {
     /// The upper bound on every wait here for a frame to come and be folded:
     /// generous, so a machine under load is slow and not failed. Each wait
     /// ends as soon as what it waits for is seen (as wsp-114's do).
-    const WAIT: Duration = Duration::from_secs(120);
+    pub const WAIT: Duration = Duration::from_secs(120);
 
     /// Ask until the fold has reached event `id`, and fail if `WAIT` runs out.
     /// What it waits on is the folded id, not a count of frames: a manager
     /// that comes back beats first, and under load that beat can be the frame
     /// a count would stop at, before the event the test emitted.
-    fn fold_to(store: &Store, sub: &mut Subscription, id: u64) {
+    pub fn fold_to(store: &Store, sub: &mut Subscription, id: u64) {
         let deadline = Instant::now() + WAIT;
         while read_folded(&store.state, HOST).is_none_or(|EventId(n)| n < id) {
             assert!(Instant::now() < deadline, "event {id} not folded within {WAIT:?}: at {:?}", read_folded(&store.state, HOST));
@@ -946,7 +946,7 @@ mod tests {
         }
     }
 
-    fn lines(path: &Path) -> usize {
+    pub fn lines(path: &Path) -> usize {
         std::fs::read_to_string(path).map(|t| t.lines().count()).unwrap_or(0)
     }
 
@@ -1318,21 +1318,22 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod mirror_tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
+pub mod mirror_tests {
     use super::*;
     use wsp_host_api::{Epoch, Key, RowId, SeatId, SeatStarted, SeatStopped};
     use wsp_store_contract::{EventKind, Events};
 
-    fn open(state: &Path) -> SharedStore {
-        Arc::new(wsp_store_sqlite::SqliteStore::open(state.join("state.db"), Arc::new(wsp_server::Mirror)).unwrap())
+    pub fn open(state: &Path) -> SharedStore {
+        crate::orders::tests::open_db(&state.join("state.db"), Arc::new(wsp_server::Mirror))
     }
 
-    fn frame(id: u64, msg: Message) -> Frame {
+    pub fn frame(id: u64, msg: Message) -> Frame {
         Frame { id: Some(EventId(id)), req: None, msg }
     }
 
-    fn puts(db: &SharedStore) -> Vec<(String, String)> {
+    pub fn puts(db: &SharedStore) -> Vec<(String, String)> {
         db.events_after(wsp_store_contract::EventId(0), 1000)
             .unwrap()
             .into_iter()
@@ -1384,80 +1385,6 @@ mod mirror_tests {
         assert_eq!(db.head().unwrap(), head, "the same keys write nothing");
     }
 
-    /// wsp-094: after a machine restart the manager journalled every seat
-    /// stopped and the fold put each gone; nothing ever forgot them. The tick's
-    /// sweep forgets a gone seat with nothing to say — in the state core and in
-    /// `spawned.json` — keeps one that said something,
-    /// forgets a seat mirrored before the census word was carried, and a
-    /// second sweep finds nothing.
-    #[test]
-    fn the_sweep_forgets_seats_a_restart_left_gone_with_nothing_to_say() {
-        let env = util::isolated("fold-sweep-mute");
-        let store = Store::open();
-        let db = open(&env.state());
-        let mut id = 0;
-        for seat in ["cpd-r1", "cpd-r2"] {
-            let s = SeatId(seat.into());
-            id += 1;
-            let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 19479, sockets: vec![] };
-            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStarted(started))));
-            id += 1;
-            let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
-            assert!(fold_into(&store, Some(&db), "h", &frame(id, Message::SeatStopped(stopped))));
-        }
-        store.set_sentence("cpd-r2", "stopped at the barrier", None);
-        // As a build before the census word mirrored it: gone, and nothing else.
-        let old = c::Seat {
-            id: c::SeatId("cpd-r3".into()),
-            machine: MachineName("h".into()),
-            kind: "claude".into(),
-            model: None,
-            state: SeatState::Gone,
-            before_lost: None,
-            row: None,
-            attempt: 0,
-            pid: Some(1),
-            fields: BTreeMap::from([("epoch".to_string(), "1".to_string())]),
-        };
-        db.apply(put_cmd(vec![Entity::Seat(old)]), IdempotencyKey("old".into()), Principal::Wsp("test".into())).unwrap();
-        assert!(store.spawned().contains_key("cpd-r1"), "the fold recorded the start");
-        assert!(state_since(&store, ["cpd-r1"]).contains_key("cpd-r1"), "and dated the gone");
-
-        let mut forgot = sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s));
-        forgot.sort();
-        assert_eq!(forgot, ["cpd-r1", "cpd-r3"]);
-        let seats = db.snapshot().unwrap().0.seats;
-        assert!(!seats.contains_key(&c::SeatId("cpd-r1".into())) && !seats.contains_key(&c::SeatId("cpd-r3".into())), "{seats:?}");
-        assert!(seats.contains_key(&c::SeatId("cpd-r2".into())), "it said something");
-        assert!(!store.spawned().contains_key("cpd-r1"));
-        assert!(store.spawned().contains_key("cpd-r2"));
-        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "nothing left to forget");
-
-        // A day after it was first seen gone, the one that said something goes too.
-        let day_ago = util::epoch_secs() - crate::cmd_agent::GONE_FOR - 60;
-        say(&store, "cpd-r2", |m| {
-            m.insert("at".into(), json!(util::iso_at(day_ago)));
-        });
-        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-r2"]);
-    }
-
-    /// A despawn of a gone seat that said something ends its record, and the
-    /// next sweep forgets it at once.
-    #[test]
-    fn the_sweep_forgets_a_despawned_seat_at_once() {
-        let env = util::isolated("fold-sweep-despawned");
-        let store = Store::open();
-        let db = open(&env.state());
-        let s = SeatId("cpd-d1".into());
-        let started = SeatStarted { key: Key { row: RowId(String::new()), attempt: 0 }, seat: s.clone(), epoch: Epoch(1), pid: 1, sockets: vec![] };
-        fold_into(&store, Some(&db), "h", &frame(1, Message::SeatStarted(started)));
-        let stopped = SeatStopped { seat: s, epoch: Epoch(1), exit: None, ended: vec![], renderer_left: false };
-        fold_into(&store, Some(&db), "h", &frame(2, Message::SeatStopped(stopped)));
-        store.set_sentence("cpd-d1", "stopped at the barrier", None);
-        assert!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)).is_empty(), "it said something");
-        store.end_spawned("cpd-d1", util::epoch_secs());
-        assert_eq!(sweep_mute(&store, &db, |s| crate::cmd_agent::mute_seats(&store, s)), ["cpd-d1"]);
-    }
 }
 
 #[cfg(test)]

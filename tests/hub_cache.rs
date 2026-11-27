@@ -228,6 +228,14 @@ impl Spoke {
         }
     }
 
+    /// `show` finds the row and it is no head. It finds none for a moment while
+    /// the head's stub is gone and the sync has not yet adopted the row, so a
+    /// wait asks this and not [`Spoke::ok`].
+    fn whole(&self, row: &str) -> bool {
+        let (ok, out) = self.run(&["show", row]);
+        ok && !out.contains("head only")
+    }
+
     fn ls(&self) -> String {
         self.run(&["ls"]).1
     }
@@ -280,7 +288,7 @@ struct Rig {
 
 impl Rig {
     fn up(tag: &str) -> Rig {
-        let dir = PathBuf::from("/tmp").join(format!("hc{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hc{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let data = dir.join("hub");
@@ -390,7 +398,7 @@ fn a_row_spoke_a_adds_is_a_head_in_spoke_bs_ls_within_two_turns_and_whole_once_i
 
     // A allocates it to bob: it is B's own, whole.
     rig.a.ok(&["allocate", &id, "bob"]);
-    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| s.whole(&id));
     let whole = rig.b.ok(&["show", &id]);
     assert!(whole.contains("Written on A"), "{whole}");
     assert!(!std::fs::read_to_string(rig.b.state().join("hub/heads.json")).unwrap_or_default().contains(&id));
@@ -425,7 +433,7 @@ fn a_head_only_row_bob_claims_is_whole_on_bobs_next_turn() {
     rig.b.ok(&["claim", &id, "--pane", "w1:p1"]);
     let now = rig.b.turns();
     rig.b.wait("B's next turn", Duration::from_secs(30), |s| s.turns() > now);
-    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    rig.b.wait("the row whole on B", Duration::from_secs(30), |s| s.whole(&id));
     let whole = rig.b.ok(&["show", &id]);
     assert!(whole.contains("Written on A"), "{whole}");
     let cache = std::fs::read_to_string(rig.b.state().join("hub/heads.json")).unwrap_or_default();
@@ -622,7 +630,7 @@ fn ann_offline_past_the_ttl_with_the_row_re_leased_by_bob_lands_her_journal_as_a
     rig.b.wait("the row in Bob's ls", Duration::from_secs(30), |s| s.ls().contains(&id));
     rig.b.ok(&["claim", &id, "--pane", "w1:p1"]);
     rig.b.wait("Bob's lease", Duration::from_secs(30), |_| rig.holder(&id).is_some_and(|(h, _)| h.contains("bob")));
-    rig.b.wait("the row whole on Bob", Duration::from_secs(30), |s| !s.ok(&["show", &id]).contains("head only"));
+    rig.b.wait("the row whole on Bob", Duration::from_secs(30), |s| s.whole(&id));
     // Let Bob's claim settle, both turns of it, before he edits: a rename that
     // lands while the turn is still adopting the claim is written over by it.
     let now = rig.b.turns();

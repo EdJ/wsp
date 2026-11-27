@@ -941,6 +941,8 @@ pub fn weight(tool: &str, args: &[String]) -> Weight {
         return Weight::Heavy;
     }
     match subcommand(args) {
+        // A probe for nextest builds nothing, and a check step makes one (wsp-527).
+        Some("nextest") if args.iter().any(|a| a == "--version" || a == "-V") => Weight::Light,
         Some(s) if HEAVY.contains(&s) => Weight::Heavy,
         Some("run" | "r") => Weight::Runs,
         _ => Weight::Light,
@@ -1352,7 +1354,7 @@ fn note_full_suite(ctx: &Ctx) {
     });
     let _ = crate::store::write_atomic(&path, &rec.to_string());
     (ctx.say)(
-        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo test <module>::`); the full suite runs once per group, at the barrier.",
+        "wsp: that is the full suite, and in a member's or verifier's seat it is noted (`wsp wip` says so). Run the tests for what you changed (`cargo nextest run -p <crate> <module>::`, one process per test, or `cargo test -p <crate> <module>::` where cargo-nextest is not installed); the full suite runs once per group, at the barrier.",
     );
 }
 
@@ -2742,6 +2744,8 @@ mod tests {
         assert_eq!(weight("cargo", &s(&["-q", "check"])), Weight::Heavy);
         assert_eq!(weight("cargo", &s(&["run"])), Weight::Runs, "a run may stay up for hours and would hold the tree");
         assert_eq!(weight("cargo", &s(&["metadata"])), Weight::Light);
+        assert_eq!(weight("cargo", &s(&["nextest", "--version"])), Weight::Light);
+        assert_eq!(weight("cargo", &s(&["nextest", "run", "x::"])), Weight::Heavy);
         assert_eq!(weight("cargo", &s(&["--version"])), Weight::Light);
         assert_eq!(weight("make", &s(&["all"])), Weight::Heavy, "a declared tool is heavy whatever it is asked");
     }

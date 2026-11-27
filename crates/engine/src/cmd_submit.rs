@@ -97,6 +97,20 @@ const FULL_SUITE: &[&str] = &["cargo nextest run --workspace", "npm run check"];
 /// The longest a member's check may be given.
 const MEMBER_MAX_SECS: u64 = 30 * 60;
 
+/// The shortest limit a member's check is written with. A member writes the
+/// time its command took as `(<time>)`, and that was then its limit: `(1s)` on
+/// `cargo test --test layering` cut the barrier's warm run off, 0.82s of it
+/// cargo's build (`wsp-540`). `wsp check --set` still writes what it is given.
+const MEMBER_MIN_SECS: u64 = 60;
+
+/// `time` as a member's check is written: no shorter than [`MEMBER_MIN_SECS`].
+fn member_limit(time: &str) -> String {
+    match crate::check::limit_of(time) {
+        Some(d) if d.as_secs() < MEMBER_MIN_SECS => format!("{MEMBER_MIN_SECS}s"),
+        _ => time.to_string(),
+    }
+}
+
 pub fn submit(store: &Store, args: &Args) -> i32 {
     // The helper an accepted exit leaves behind: its seat, ended at its `Stop`.
     if let Some(seat) = args.get("end-seat") {
@@ -752,7 +766,7 @@ fn end_my_seat(store: &Store, row: &str, kind: &str, me: Option<&str>) -> Option
     }
     let arranged = match cfg!(test) {
         true => Ok(()),
-        false => crate::cycle::Seats::end_exit_when_idle(&crate::cycle::Fleet, store, &seat),
+        false => crate::cycle::Seats::end_exit_when_idle(crate::cycle::seats(), store, &seat),
     };
     Some(match arranged {
         Ok(()) => format!("submit: the {kind} seat {seat} is closing — no place under the cap now, ended at its Stop"),
@@ -781,9 +795,9 @@ fn refused(store: &Store, seat: Option<&str>) {
 /// the seat's turn to end, then end it by [`crate::ending::end_exit`]. Through
 /// the [`crate::cycle::Seats`] port, so this module reaches no seat verb.
 fn end_at_stop(store: &Store, seat: &str) -> i32 {
-    let fleet = crate::cycle::Fleet;
-    crate::cycle::Seats::wait_idle(&fleet, seat);
-    match crate::ending::end_exit(store, &fleet, seat) {
+    let fleet = crate::cycle::seats();
+    crate::cycle::Seats::wait_idle(fleet, seat);
+    match crate::ending::end_exit(store, fleet, seat) {
         Some(line) => println!("{line}"),
         None => println!("wsp: {seat} is still in a turn or unreadable — the next tick ends it"),
     }
@@ -844,7 +858,7 @@ fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str,
     log_on(store, &id, &std::mem::take(&mut said));
     // `checks:` is what writes `## Checks`.
     if !e.checks.is_empty() {
-        let lines: String = e.checks.iter().map(|l| format!("- {} ({}): {}\n", l.label, l.time, l.command)).collect();
+        let lines: String = e.checks.iter().map(|l| format!("- {} ({}): {}\n", l.label, member_limit(&l.time), l.command)).collect();
         let ok = store.locked(|| {
             let Some(mut t) = store.find_task(&id) else { return false };
             crate::model::set_section_in(&mut t.body, crate::check::SECTION, lines.trim_end());
@@ -1742,6 +1756,17 @@ mod tests {
         assert!(checks.contains("- everything (20m): npm run check"), "`checks:` writes ## Checks: {checks}");
     }
 
+    /// `wsp-540`: a member's measured `(1s)` is not the limit a barrier then
+    /// cuts its check off at; a longer time is written as given.
+    #[test]
+    fn a_members_measured_second_is_not_written_as_its_checks_limit() {
+        let (env, store, _tree) = member("submit-floor", "");
+        let e = exit_with("- layering (1s): true\n- long (5m): true\n", "- note: fine\n");
+        assert_eq!(run(&env, &store, &e, &[]), 0);
+        let checks = store.task("wsp-101").unwrap().section("Checks").unwrap_or_default();
+        assert!(checks.contains("- layering (60s): true") && checks.contains("- long (5m): true"), "{checks}");
+    }
+
     #[test]
     fn a_barrier_step_is_refused_as_a_members_check() {
         let (_env, store, _tree) = member("submit-barrier", "## Checks\n- whole (20m) at barrier: cargo test --workspace\n");
@@ -1795,7 +1820,7 @@ mod tests {
         };
         hold("seat-a");
         let why = "claim expired: held by seat-a on this machine, last renewed 2026-11-10T10:00:00Z";
-        crate::cmd_spawn::release_lost(&store, "wsp-101", why).unwrap();
+        crate::hub_lease::tests::lose(&store, "wsp-101", why).unwrap();
         assert_eq!(store.task("wsp-101").unwrap().status_raw, "todo");
         hold("seat-b");
         let mut t = store.task("wsp-101").unwrap();

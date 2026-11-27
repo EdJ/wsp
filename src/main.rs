@@ -8,7 +8,8 @@
 use std::collections::{HashMap, HashSet};
 
 pub(crate) use wsp_trees::{at_stop, check_tree, cmd_checkout, cmd_verify, gc, greens, guard, overlap, throttle, treecopy, warm};
-pub(crate) use wsp_engine::{address, affected, after, agent_commands, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, classify, closing, cmd_agent, cmd_allocate, cmd_attend, cmd_brief, cmd_govern, cmd_hub, cmd_initiative, cmd_install, cmd_login, cmd_machine, cmd_mandate, cmd_message, cmd_migrate, cmd_project, cmd_publish, cmd_resume, cmd_role, cmd_sandbox, cmd_spawn, cmd_stamp, cmd_submit, cmd_task, cmd_watch, cmd_whoami, cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close, hub_cache, hub_journal, hub_lease, hub_sync, inner, kind_attention, kind_data, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, memory, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close, piece_seat, pieces, reconcile, record_workspace, refusals, repair, retro_yours, room, scope, scratch, size_check, split, stage, stand_down, starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, wake, worklist};
+pub(crate) use wsp_engine::{address, affected, after, artefact, attempt, attention, auto_close, barrier, barrier_replay, barrier_run, build_output, by_merge, check, classify, closing, cmd_allocate, cmd_hub, cmd_initiative, cmd_login, cmd_mandate, cmd_message, cmd_migrate, cmd_publish, cmd_submit, cmd_task, cmd_whoami, cmd_worklist, cold, cycle, deliver, did, disk, door, duplicate, ending, exit, fold, follow_up, history, hold, hold_close, hub_cache, hub_journal, hub_lease, hub_sync, inner, leg_seat, leg_tree, legs, list_sweep, liveness, local_trust, mirror, orders, outputs, owed, packet, packet_gen, pickup, piece_close, piece_seat, pieces, reconcile, record_workspace, refusals, repair, retro_yours, room, scope, scratch, size_check, split, stage, stand_down, starts, stepping, stuck, tell_log, untaken, verification, verifier_packet, waiting, waits, worklist};
+pub(crate) use wsp_seats::{agent_commands, cmd_agent, cmd_attend, cmd_brief, cmd_govern, cmd_install, cmd_machine, cmd_project, cmd_resume, cmd_role, cmd_sandbox, cmd_spawn, cmd_stamp, cmd_watch, kind_attention, kind_data, memory, wake};
 mod base;
 pub(crate) use wsp_base::{choices, input, risk, util};
 pub(crate) use wsp_store::{agent_kind, caption, checks, decisions, governors, lands, lapse, lease, log, message, model, resolve, sharing, store, tags, verbs};
@@ -453,6 +454,8 @@ fn needs_store(args: &Args) -> bool {
 }
 
 fn main() {
+    // Before the daemon or any verb: the engine reaches seats only through this (wsp-542).
+    cycle::install_seats(&cmd_spawn::Fleet);
     die_on_broken_pipe();
     let _ = store::BUILD_STAMP.set(base::stamp::build_stamp);
     let _ = wsp_engine::base::stamp::BUILD_STAMP.set(base::stamp::build_stamp);
@@ -460,7 +463,7 @@ fn main() {
     outputs::install(cmd_report::REPORTS);
     let _ = mirror::LIST_SHOW.set(cmd_worklist::show_facts);
     let _ = mirror::SEAT_WORKING.set(cmd_machine::seat_working);
-    let _ = mirror::ROW_HOLDER.set(|store, id| cmd_task::holder_with(store, id, &cmd_spawn::seat_is_live, &cycle::Fleet));
+    let _ = mirror::ROW_HOLDER.set(|store, id| cmd_task::holder_with(store, id, &cmd_spawn::seat_is_live, cycle::seats()));
     cmd_checkout::install_engine(cmd_checkout::Engine {
         passed: worklist::passed_by_running,
         poke_task: cycle::poke_task,

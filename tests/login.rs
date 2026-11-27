@@ -28,9 +28,9 @@ struct Rig {
 
 impl Rig {
     fn new(name: &str, users: &[&str]) -> Rig {
-        // Short on purpose: a sandbox's fake listens on a unix socket under here, and macOS
-        // refuses a path past 104 bytes, which `$TMPDIR` (/var/folders/..) alone nearly fills.
-        let dir = PathBuf::from("/tmp").join(format!("wsp-li-{name}-{}", std::process::id()));
+        // A sandbox's fake listens on a unix socket under here, and macOS refuses a path past
+        // 104 bytes: `.cargo/test-run` keeps `$TMPDIR` short.
+        let dir = std::env::temp_dir().join(format!("wsp-li-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("home")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();

@@ -2,12 +2,16 @@
 //! a piece of work, whether a seat is vacant or stood down, whether a caller
 //! governs. Moved out of `cmd_govern` (wsp-403) so the store and the engine can ask
 //! these without reaching up into the seat commands; `cmd_govern` re-exports each.
+//! The record's own writes (vacate, stand down, the reseat's count, claim and
+//! failure) and the reads of the last seat moved here too (wsp-437), so the run's
+//! repair and stand-down keep a seat's record without the seat commands.
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::resolve::Index;
+use crate::store::Store;
 use crate::util;
 
 /// A seat, resolved: which scope it governs and where it is sitting.
@@ -487,6 +491,368 @@ impl Vacancy {
     pub fn overdue(&self, n: u64) -> bool {
         self.unseated >= n
     }
+}
+
+/// The last agent to hold this slot, filled or not — the reader `wsp resume`
+/// asks and the only one entitled to look in `last`.
+///
+/// A live occupant is preferred over a remembered one, and both are answered
+/// as a [`Seat`] because they are the same fact at different ages: this is who
+/// was sitting here, where, and under which session. `elsewhere` is not
+/// filtered out here the way [`seat_of`] filters it — a resume names the host
+/// it is going to, and refusing to *read* a seat on another machine would make
+/// `wsp resume` unable to say "that seat is on mb2" at all.
+pub fn last_seat(governors: &BTreeMap<String, Value>, scope: &str) -> Option<Seat> {
+    let rec = governors.get(scope)?;
+    let of = |r: &Value| {
+        let workspace = str_at(r, "workspace");
+        (!workspace.is_empty()).then(|| Seat {
+            scope: scope.to_string(),
+            pane: str_at(r, "pane"),
+            since: str_at(r, "since"),
+            session: str_at(r, "session"),
+            cwd: str_at(r, "cwd"),
+            kind: str_at(r, "kind"),
+            vacant: false,
+        })
+    };
+    of(rec).or_else(|| rec.get("last").and_then(of))
+}
+
+/// The seat this scope's slot is for — filled, or remembered by a vacated
+/// record — and `None` where **nobody is in it**.
+///
+/// **One definition of that question, and `wsp-148` is why there is one.**
+/// Two readers disagreed about it: this verb's `--reseat` guard asked
+/// [`seat_of_scope`] and read a record with a workspace and an *empty* `pane`
+/// as occupied, while the reconciler asked the same record and read it as
+/// unseated. So the daemon would count a vacancy twice, claim the record, launch
+/// this verb — and be told *"the seat has somebody in it - nothing to reseat"*,
+/// leaving the claim on a post nobody was ever going to fill for the next
+/// twenty minutes. Found live on 2026-10-05, on `tooling`, whose record reads
+/// `workspace: compound, pane: ""`.
+///
+/// **The empty pane is the whole of it.** [`seat_of`] stops at the workspace,
+/// because a workspace names a seat and a pane names an *occupant*; two records
+/// in this store write the first and not the second, and this is the reader that
+/// has to notice. Live first, the way back second — [`last_seat`] is not an
+/// alternative here, it is the same seat at a different age.
+pub fn seat_held(scope: &str, governors: &BTreeMap<String, Value>) -> Option<Seat> {
+    let seat = seat_of_scope(scope, governors).or_else(|| last_seat(governors, scope))?;
+    (!seat.pane.is_empty()).then_some(seat)
+}
+
+/// The host a slot was last held from — a live occupancy's, or a vacated
+/// record's memory of one. Empty where nothing has ever sat here.
+pub fn host_of(governors: &BTreeMap<String, Value>, project: &str) -> String {
+    let Some(rec) = governors.get(project) else { return String::new() };
+    match str_at(rec, "host") {
+        h if !h.is_empty() => h,
+        _ => rec.get("last").map(|l| str_at(l, "host")).unwrap_or_default(),
+    }
+}
+
+/// Why the last reseat of this seat failed, as [`reseat_failed`] recorded it.
+pub fn reseat_why(governors: &BTreeMap<String, Value>, scope: &str) -> Option<String> {
+    governors
+        .get(scope)
+        .and_then(|r| r.get("reseat_why"))
+        .and_then(Value::as_str)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+}
+
+/// The occupancy a vacated record keeps, out of the record it is replacing.
+///
+/// Everything a resume is keyed on and nothing a live reader looks at. A
+/// record that was already vacated hands its own `last` back rather than
+/// wrapping it again — standing an empty slot down twice must not bury the
+/// thread one level deeper each time, and `reconcile --reap` runs on every
+/// daemon start.
+fn stood_down(rec: &Value) -> Value {
+    if let Some(last) = rec.get("last") {
+        return last.clone();
+    }
+    json!({
+        "workspace": str_at(rec, "workspace"),
+        "pane": str_at(rec, "pane"),
+        "host": str_at(rec, "host"),
+        "session": str_at(rec, "session"),
+        "cwd": str_at(rec, "cwd"),
+        "kind": str_at(rec, "kind"),
+        // The tier, and **this is the field that made the omission matter.**
+        // `wsp-148` reads it back off `last` to seat a successor, because a
+        // governor whose pane died is vacated before the reconciler looks — so
+        // without these two the one record a reseat has to read is the one that
+        // did not carry them, and a run's most expensive seat was replaced at the
+        // runtime default every time it was replaced.
+        "model": str_at(rec, "model"),
+        "effort": str_at(rec, "effort"),
+        "since": str_at(rec, "since"),
+    })
+}
+
+/// Empty a slot without taking it off the project.
+///
+/// The half of "it outlives its occupant" that a person can see. Every earlier
+/// version of standing down deleted the record, so a night that ended took the
+/// position down with the agent and the project woke up with no governor and no
+/// sign there had ever been one. What is dropped is the occupancy — workspace,
+/// pane, host — and what is kept is the post, which is the thing another agent
+/// can be put into tomorrow.
+///
+/// Also what `reconcile --reap` does to a slot whose workspace has
+/// closed: the agent is gone, the position is not.
+///
+/// **What it drops is the occupancy and what it keeps is the way back.** The
+/// record it leaves carries `last`: the workspace, host, session and cwd of
+/// whoever was just in it, which is exactly what `wsp resume` needs and exactly
+/// what nothing else must read. Under its own key rather than left in place,
+/// because every reader of a governor record asks *who is in this seat now* —
+/// [`seat_of`], [`governs`], [`Slot::elsewhere`] — and a vacated record that
+/// still answered `workspace` or `host` at the top level would tell all three
+/// that somebody is sitting here. The nesting is the whole of the guarantee:
+/// one key nobody had reason to look in before, so a slot cannot be brought
+/// back to life by a field left behind.
+/// kept and what is dropped, and then the `stood_down` sentence rides along if it
+/// was there — because this function is `reconcile`'s as well as `--clear`'s, and
+/// a reconciler that dropped the sentence would undo a person's decision on its
+/// next visit. **The one thing that clears a stand-down is filling the seat**
+/// ([`take`]), which is the point: the decision is about an empty seat, so an
+/// empty seat cannot revoke it and an occupied one has already answered it.
+pub fn vacate(store: &Store, project: &str) -> bool {
+    let governors = store.governors();
+    let Some(rec) = governors.get(project) else { return false };
+    // Already empty. Said as false so a caller can report what it actually
+    // changed rather than what it looked at.
+    if seat_of(project, rec).is_none() && rec.get("workspace").is_none() {
+        return false;
+    }
+    let mut left = json!({ "vacated": util::now_iso(), "last": stood_down(rec) });
+    if let Some(at) = str_at(rec, STOOD_DOWN).into() {
+        if let Some(o) = left.as_object_mut() {
+            o.insert(STOOD_DOWN.into(), json!(at));
+        }
+    }
+    store.set_governor(project, left);
+    store.log_event("governor-vacated", json!({ "project": project }));
+    true
+}
+
+/// Record that a person stood this seat down, and that it is to stay down.
+///
+/// **Written after the vacate rather than inside it, because `vacate` is also
+/// what `reconcile` calls** and the two must not converge again. `vacate`'s own
+/// record is what a dead governor leaves; this is the extra sentence on it that
+/// says somebody meant it.
+pub fn mark_stood_down(store: &Store, scope: &str) -> bool {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert(STOOD_DOWN.into(), json!(util::now_iso()));
+        true
+    })
+}
+
+/// One more pass has found this seat empty, and how this seat now reads.
+///
+/// **The whole record and not just the count, and the reason is that the caller
+/// decides on one and writes the other.** The reconciler asks "is this seat
+/// overdue?" — [`Vacancy::overdue`] — and this is the only reading that can
+/// answer it, so returning the pair rather than the number means the predicate
+/// that fires and the marker that recorded it are the same read of the same
+/// value. Returning the count alone would put `EMPTY_TICKS` and the record's own
+/// `unseated` field on either side of a write that a concurrent `learn_seats`
+/// can interleave with.
+///
+/// Under the lock and re-read inside it, so two passes racing cannot both decide
+/// they are the first.
+pub fn count_unseated(store: &Store, scope: &str) -> Vacancy {
+    let mut now = Vacancy::default();
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert(
+            "unseated".into(),
+            json!(o.get("unseated").and_then(Value::as_u64).unwrap_or(0) + 1),
+        );
+        now = Vacancy::of(rec);
+        true
+    });
+    now
+}
+
+/// Forget that this seat was ever empty — a pass that found somebody in it.
+///
+/// **Clears the count and never the claim.** A live seat is the one reading that
+/// proves the reseat worked, and it is the only evidence there will ever be that
+/// it did; clearing a claim on it would be clearing the receipt.
+pub fn forget_unseated(store: &Store, scope: &str) {
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        if o.remove("unseated").is_none() {
+            return false;
+        }
+        true
+    });
+}
+
+/// Take the claim that stops a second pass seating a second successor.
+///
+/// **The record before the spawn, which is the whole of the ordering.** It is
+/// written by whoever is about to open a seat and started, so a pass that finds
+/// it does nothing at all — not a second seat, and not a second sentence to the
+/// spool. The alternative, deciding on a field that is only written once the
+/// successor is up, leaves the window that `wsp-114` was filed about open for the
+/// whole length of a spawn.
+///
+/// A stale claim is taken back rather than refused, and refusing it is the
+/// obvious thing to write: an abandoned claim would then hold a dead governor's
+/// post empty until a person noticed it, which is the failure this row exists to
+/// end.
+pub fn claim_seat(store: &Store, scope: &str) -> bool {
+    let at = util::epoch_secs();
+    store.edit_governor(scope, |rec| {
+        if !Vacancy::of(rec).claim_free(at) {
+            return false;
+        }
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert("reseating".into(), json!(util::now_iso()));
+        true
+    })
+}
+
+/// A reseat was attempted under a claim and did not produce a seat.
+///
+/// **The claim is kept and the failure is recorded against it, and both halves
+/// are load-bearing.** The claim is what stops the next pass trying again
+/// immediately, which is the whole difference between a momentary failure being
+/// retried in a minute and a structural one being retried every minute for
+/// ever — `tokenhub-spec-sync` on 2026-10-05, each attempt opening a compound
+/// agent whose renderer never came up. The record of the failure is what lets
+/// [`crate::wake`] say `retrying` rather than `reseating` for the twenty minutes
+/// in between.
+///
+/// **Kept for a refusal as well as a broken agent**, and for the same reason: a
+/// refusal the reconciler keeps making is a refusal it will keep making, and a
+/// verb that released the claim on its way out turned one into a spawn a minute.
+///
+/// **With the reason, on the seat and in `cycle.log`, from this one call**
+/// (`wsp-177`). Before, the seat said `retrying` and the reason was only in the
+/// verb's undated stderr, which ended "cpd-313 has the order in its composer"
+/// about a pane `put_back` had already ended. A reader of `--status` could not
+/// tell a renderer that never came up from a refusal, and `cycle.log` had no
+/// dated line saying the attempt was over. One function writes both so neither
+/// can be forgotten by the next way out somebody adds.
+pub fn reseat_failed(store: &Store, scope: &str, why: &str) {
+    let mut claimed = None;
+    store.edit_governor(scope, |rec| {
+        let Some(o) = rec.as_object_mut() else { return false };
+        o.insert("reseating_failed".into(), json!(util::now_iso()));
+        o.insert("reseat_why".into(), json!(why));
+        // A claim that was never taken is not invented here: this records that
+        // an attempt happened, and the reconciler is what decides whether a
+        // *next* one may.
+        claimed = Vacancy::of(rec).reseating;
+        true
+    });
+    let next = claimed
+        .map(|at| format!("; the next attempt is after {}", util::local_hm(at + SEAT_CLAIMED_FOR)))
+        .unwrap_or_default();
+    crate::store::log_line(store, &format!("{scope}: the reseat failed — {why}{next}"));
+}
+
+/// The kind a reseat of this scope starts — the seat's own, read live or from
+/// under `last`, or [`DEFAULT_KIND`].
+///
+/// **Under `last` as well, through [`cmd_govern::last_seat`]**, for
+/// [`cmd_govern::tier_of`]'s reason: a governor whose pane died is vacated
+/// before the reconciler looks, so the kind is nearly always there and a reader
+/// of the top level alone defaulted it — right by luck for `claude`, and an
+/// opencode run moved onto claude for everyone else.
+pub fn seat_kind(governors: &BTreeMap<String, Value>, scope: &str) -> String {
+    crate::agent_kind::kind_or_default(&last_seat(governors, scope).map(|s| s.kind).unwrap_or_default())
+}
+
+/// The room a scope's seat is filed under, read off the governor record
+/// itself rather than off a parsed [`Seat`] — the field that carried it,
+/// `Seat::workspace`, is gone (`compound-096`); the record's own `workspace`
+/// key is not and is what every caller here reads instead, the way
+/// [`governs`] already did. Mirrors [`host_of`]: a live record answers first,
+/// a vacated one's `last` second, and a scope with neither answers empty.
+pub fn room_of(governors: &BTreeMap<String, Value>, scope: &str) -> String {
+    let Some(rec) = governors.get(scope) else { return String::new() };
+    match str_at(rec, "workspace") {
+        w if !w.is_empty() => w,
+        _ => rec.get("last").map(|l| str_at(l, "workspace")).unwrap_or_default(),
+    }
+}
+
+/// Where a seat [`seat_for`] reached is, for a receipt: its room, or that wsp
+/// is filling it and what is said to it waits there ([`Seat::vacant`]).
+pub fn whereabouts(governors: &BTreeMap<String, Value>, seat: &Seat) -> String {
+    match seat.vacant {
+        true => "nobody in it yet — wsp is seating one, and it waits there".to_string(),
+        false => room_of(governors, &seat.scope),
+    }
+}
+
+/// A slot on a project or a worklist: the position, and whoever is in it now.
+///
+/// [`Seat`] is the occupancy and this is the post. The difference is the whole
+/// of "it outlives its occupant": a slot whose agent has gone is a slot with
+/// `occupant: None`, which still has a project, a place in the tree and a row
+/// you can stand on — where before, the record was deleted and the position
+/// went with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    /// The scope the post is on — see [`Seat::scope`].
+    pub scope: String,
+    /// Filled, on this machine. `None` covers both an empty slot and one held
+    /// from another host, which are the same thing from here: nobody you can
+    /// reach. `host` below says which.
+    pub occupant: Option<Seat>,
+    /// The machine the slot was last filled from, or empty for a vacant one.
+    /// Carried so a slot held on the laptop does not draw here as empty, which
+    /// would invite two agents into one position.
+    pub host: String,
+    /// When the slot was last filled, or vacated. One field, because what a
+    /// reader wants is "and how long has *that* been true".
+    pub since: String,
+}
+
+impl Slot {
+    /// Somebody is in it, here.
+    pub fn filled(&self) -> bool {
+        self.occupant.is_some()
+    }
+
+    /// Held from another machine — not ours to draw as empty and not ours to
+    /// speak to.
+    pub fn elsewhere(&self) -> bool {
+        self.occupant.is_none() && !self.host.is_empty() && self.host != util::hostname()
+    }
+}
+
+/// Every slot that exists, in project order — vacant ones included.
+///
+/// The display read, where [`seat_for`] is the routing one. Routing wants the
+/// nearest seat that can actually answer; a tree wants every position there is,
+/// because a post nobody is standing in is exactly the thing a person has to be
+/// able to see in order to fill it.
+pub fn slots(governors: &BTreeMap<String, Value>) -> Vec<Slot> {
+    governors
+        .iter()
+        .map(|(scope, rec)| Slot {
+            occupant: seat_of(scope, rec),
+            host: rec.get("host").and_then(Value::as_str).unwrap_or_default().to_string(),
+            since: rec
+                .get("since")
+                .or_else(|| rec.get("vacated"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            scope: scope.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

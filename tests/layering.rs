@@ -383,6 +383,7 @@ fn no_new_upward_edge_and_the_allowlist_only_shrinks() {
         root.join("crates/wire/src"),
         root.join("crates/trees/src"),
         root.join("crates/engine/src"),
+        root.join("crates/seats/src"),
     ]);
 
     let unmapped: Vec<&String> = mods.iter().filter(|m| !comp.contains_key(*m)).collect();
@@ -603,21 +604,28 @@ fn reached_normally(dir: &Path) -> BTreeMap<String, Vec<String>> {
     reached
 }
 
-/// `wsp-engine`, the engine and the seats (the phase 2 cut, wsp-440), is linked by the root
-/// and links the crates below it in `docs/components.md`: never the sqlite backend (D2: only
-/// the binaries link it; the engine's tests do, as a dev-dependency), the hub, the root or a
-/// test kit, through any normal path dependency. (The in-process manager comes in through
-/// `wsp-wire`, as it does for the root.)
+/// `wsp-engine`, the engine (the phase 2 cut, wsp-440), and `wsp-seats`, the seats on it (wsp-441), are linked
+/// by the root and link the crates below them in `docs/components.md`: never the sqlite backend (D2: only the
+/// binaries link it; their tests do, as a dev-dependency), the hub, the root or a test kit, through any normal path
+/// dependency. (The in-process manager comes in through `wsp-wire`, as it does for the root.) The engine never
+/// links the seats, not even in its tests: it reaches them only through the `Seats` impl the root installs.
 #[test]
 fn the_engine_links_neither_the_sqlite_crate_nor_a_binary() {
     const NEVER: &[&str] = &["wsp-store-sqlite", "wsp-hub", "wsp-testkit", "wsp-store-conformance", "wsp"];
-    let dir = root().join("crates/engine");
-    assert!(fs::read_to_string(dir.join("Cargo.toml")).unwrap().lines().any(|l| l.trim() == "name = \"wsp-engine\""));
-    let reached = reached_normally(&dir);
-    println!("wsp-engine reaches: {:?}", reached.keys().collect::<Vec<_>>());
-    let bad: String =
-        reached.iter().filter(|(n, _)| NEVER.contains(&n.as_str())).map(|(_, chain)| format!("  {}\n", chain.join(" -> "))).collect();
-    assert!(bad.is_empty(), "wsp-engine's normal dependencies must reach none of {NEVER:?}:\n{bad}");
+    for (dir, name) in [("crates/engine", "wsp-engine"), ("crates/seats", "wsp-seats")] {
+        let dir = root().join(dir);
+        assert!(fs::read_to_string(dir.join("Cargo.toml")).unwrap().lines().any(|l| l.trim() == format!("name = \"{name}\"")));
+        let reached = reached_normally(&dir);
+        println!("{name} reaches: {:?}", reached.keys().collect::<Vec<_>>());
+        let bad: String =
+            reached.iter().filter(|(n, _)| NEVER.contains(&n.as_str())).map(|(_, chain)| format!("  {}\n", chain.join(" -> "))).collect();
+        assert!(bad.is_empty(), "{name}'s normal dependencies must reach none of {NEVER:?}:\n{bad}");
+    }
+    assert!(reached_normally(&root().join("crates/seats")).contains_key("wsp-engine"), "wsp-seats is built on wsp-engine");
+    let engine = root().join("crates/engine/Cargo.toml");
+    for dev in [false, true] {
+        assert!(!path_deps(&engine, dev).contains_key("wsp-seats"), "wsp-engine names wsp-seats; the engine never links the seats");
+    }
 }
 
 /// `wsp-manager`, the agent manager, depends on `wsp-host-api`, `wsp-base` and
@@ -743,21 +751,22 @@ fn rusqlite_is_the_sqlite_crates_alone_and_that_crate_links_no_store_wire_host_o
 
 /// No manifest of the workspace but the root's and the hub's names `wsp-store-sqlite`: nothing
 /// but the two binaries links the backend (wsp-460: the hub keeps its refs and leases in it).
-/// One exception, for tests alone: `wsp-engine` (wsp-440) names it as a dev-dependency, because
-/// the engine's orders, fold and mirror tests open a real `state.db` as the daemon does; its
-/// normal dependencies never reach it (`the_engine_links_neither_the_sqlite_crate_nor_a_binary`).
+/// One exception, for tests alone: `wsp-engine` (wsp-440) and `wsp-seats` (wsp-441, d1) name it as a
+/// dev-dependency, because their orders, fold, mirror and seat tests open a real `state.db` as the daemon
+/// does; their normal dependencies never reach it (`the_engine_links_neither_the_sqlite_crate_nor_a_binary`).
 #[test]
 fn no_manifest_but_the_roots_names_the_sqlite_crate() {
     let binaries = [root().join("Cargo.toml"), root().join("crates/hub/Cargo.toml")];
-    let engine = root().join("crates/engine/Cargo.toml");
+    let tested = [root().join("crates/engine/Cargo.toml"), root().join("crates/seats/Cargo.toml")];
     for m in manifests() {
         if binaries.contains(&m) {
             continue;
         }
-        if m == engine {
+        if tested.contains(&m) {
             assert!(
                 !path_deps(&m, false).contains_key("wsp-store-sqlite"),
-                "wsp-engine names wsp-store-sqlite as a dependency; only its tests may (docs/state-core.md section 6)"
+                "{} names wsp-store-sqlite as a dependency; only its tests may (docs/state-core.md section 6)",
+                m.display()
             );
             continue;
         }

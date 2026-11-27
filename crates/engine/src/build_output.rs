@@ -146,7 +146,7 @@ static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 ///
 /// Not under test, for `check_tree::tidy`'s reason; the tests drive [`sweep`].
 pub fn tidy(store: &Store) {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return;
     }
     let occupied = std::cell::OnceCell::new();

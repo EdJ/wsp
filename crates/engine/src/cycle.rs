@@ -330,38 +330,233 @@ pub trait Seats {
     fn fold_typed(&self, _store: &Store, _scope: &str) -> usize {
         0
     }
+
+    /// When opencode's own database says `session` last finished a turn, in
+    /// seconds — `agent_commands::opencode_finished_at`, the reading
+    /// [`overrule`] is handed. `None` is "we do not know", and the default, for
+    /// [`Seats::absent`]'s reason: a fake runs no opencode.
+    fn opencode_finished_at(&self, _session: &str) -> Option<i64> {
+        None
+    }
+
+    /// The pane `seat`'s agent is in now, looked for on the backends here the
+    /// way `cmd_govern::occupant` looks: the recorded pane, then the room, then
+    /// a claim. `None` by default, for [`Seats::absent`]'s reason.
+    fn occupant(&self, _store: &Store, _seat: &crate::governors::Seat) -> Option<String> {
+        None
+    }
+
+    /// The scope of the seat that answers for `task` —
+    /// `cmd_govern::answering_seat`. `None` by default: a fake answers for
+    /// nothing.
+    fn answering_scope(&self, _store: &Store, _task: &crate::model::Task) -> Option<String> {
+        None
+    }
+
+    /// wsp's notice on row `task`, for the seat that answers for it —
+    /// `cmd_agent::notice`. Whether it was raised. **Does nothing by default**,
+    /// for [`Seats::rotate`]'s reason: a fake that raised notices would be
+    /// telling seats out of a fixture.
+    fn notice(&self, _store: &Store, _task: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Say `text` to `scope`'s seat, through its spool — `wake::say`: held
+    /// until the seat can hear it, and `record` the message it carries. What the
+    /// spool says of it. Says nothing by default, for [`Seats::rotate`]'s reason.
+    fn say(&self, _store: &Store, _scope: &str, _text: &str, _record: Option<&str>) -> Report {
+        Report::default()
+    }
+
+    /// The messages `scope`'s spool still holds, as `(seq, at, text)` —
+    /// `wake::messages_held`. None by default: a fake has no spool.
+    fn messages_held(&self, _store: &Store, _scope: &str) -> Vec<(u64, i64, String)> {
+        Vec::new()
+    }
+
+    /// Take these entries off `scope`'s spool — `wake::settle_held`. Does
+    /// nothing by default: a fake has no spool.
+    fn settle_held(&self, _store: &Store, _scope: &str, _seqs: &[u64]) {}
+
+    /// How many lines `scope`'s seat is owed, the withheld ones left out —
+    /// `wake::owed_to`. Nothing by default: a fake has no spool.
+    fn owed_to(&self, _store: &Store, _scope: &str) -> usize {
+        0
+    }
+
+    /// Every scope owed a line, with how many — `wake::scopes_owed`. None by
+    /// default: a fake has no spool.
+    fn scopes_owed(&self, _store: &Store) -> Vec<(String, usize)> {
+        Vec::new()
+    }
+
+    // The row, list and message verbs' side (wsp-438): what `cmd_task`,
+    // `cmd_worklist`, `cmd_message` and `leg_seat` asked of the seats directly.
+    // Each default is "a fake has no seats": nothing read, nothing done.
+
+    /// The seat that answers for `task` — `cmd_govern::answering_seat`, the
+    /// whole [`crate::governors::Seat`] where [`Seats::answering_scope`] gives
+    /// its scope. `None` by default.
+    fn answering_seat(&self, _store: &Store, _task: &crate::model::Task) -> Option<crate::governors::Seat> {
+        None
+    }
+
+    /// The project the caller is standing in — `cmd_agent::current_project`:
+    /// `-p`, else the standing-in chain, which reads the seat the caller is in.
+    /// `Err` is the exit code of a `-p` that names nothing, already said.
+    /// Nowhere by default: a fake has no seat to stand in.
+    fn current_project(&self, _store: &Store, _args: &Args, _index: &crate::resolve::Index) -> Result<Option<String>, i32> {
+        Ok(None)
+    }
+
+    /// End the claim on `task` and leave its trace — `cmd_agent::hand_off`,
+    /// which reads what served the attempt off the seat's session. Does nothing
+    /// by default, for [`Seats::rotate`]'s reason.
+    fn hand_off(&self, _store: &Store, _task: &str, _to: Option<&str>, _reason: &str) {}
+
+    /// The agent kind of the session wsp last learned for `task` —
+    /// `cmd_resume::thread_for_task`'s kind. `None` by default.
+    fn thread_kind(&self, _store: &Store, _task: &str) -> Option<String> {
+        None
+    }
+
+    /// What served a leg's seat since `since`, as the clause its end line
+    /// carries — `cmd_agent::ran_in_seat`. Empty by default.
+    fn ran_in_seat(&self, _store: &Store, _seat: &str, _since: &str) -> String {
+        String::new()
+    }
+
+    /// Type `text` at `seat` on `place` the way an agent of `kind` takes it —
+    /// `agent_commands::of(kind).tell`. Refused by default, for
+    /// [`Seats::rotate`]'s reason.
+    fn tell_as(
+        &self,
+        _kind: &str,
+        _place: &dyn crate::place::Place,
+        _seat: &crate::place::Seat,
+        _text: &str,
+    ) -> crate::place::Result<crate::place::Delivery> {
+        Err(crate::place::Refusal::Failed("no seats here to type at".into()))
+    }
 }
 
-/// The real reading, over the backends on this machine — with opencode's own
-/// database overruling a screen that has stopped repainting. `wsp-160`.
+/// What happened to a seat's spool, in the words a receipt prints.
 ///
-/// **A backend that is not running here is not asked** (`wsp-148`, live on
-/// 2026-10-06). backend is out of the picture (Ed, 2026-10-06), and while the
-/// fleet still asked it, its `Unreachable` with no server was read as "cannot
-/// say" — so every dead governor seat was `Unreadable` for as long as backend
-/// stayed down, which is always now, and the reconciler refilled none of them:
-/// compound, jolt-app and wsp. backend owns its panes, so no server here means no
-/// backend pane here to be in, and a seat recorded on one is a seat compound has
-/// no record of: nobody is in it, and a reseat fills it on compound. Only a
-/// bare id — one qualified `@machine` is that machine's backend's to answer.
-///
-/// [`crate::backend::available_now`] rather than the cached answer, because the
-/// daemon lives for days: a cache latched `false` would go on skipping backend
-/// after it came back, and skipping is the direction that seats a successor
-/// beside a live pane. One connect, once a minute, per seat asked about.
-///
-/// **The overrule is here and not in [`place_compound::Compound::detected_state`]**,
-/// and the argument is the cost: that function is called from `survey`, from
-/// `wsp wip`, and from a panel four times a second, and the overrule shells to
-/// `opencode db`. A reader that fires it on every call would run a process per
-/// opencode seat per panel frame. The reconciler runs it once a minute, on the
-/// seats it is already asking about, and can say in `cycle.log` that it did —
-/// which is what `wsp-160` asks for ("log the repair beside it") and what a
-/// function returning a [`State`] has nowhere to put.
-pub struct Fleet;
+/// **`wsp-146`'s answer to "where did my sentence go"**, and the reason a verb
+/// can hand a sentence over and still say something true about it. A caller
+/// that used to type at a pane and print `delivered, no turn seen` has one of
+/// three things to report and this is the type that says which.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    /// The scope whose seat this was.
+    pub scope: String,
+    /// How many entries cleared, which is zero on every tick that merely held.
+    pub settled: usize,
+    /// How many this seat is still owed.
+    pub held: usize,
+    /// When its text last went to the seat and no turn came of it, or `None`
+    /// if it never has been.
+    pub typed_at: Option<i64>,
+    /// Why it is still holding, in the words `--status` prints.
+    pub why: String,
+    /// Set when the sentence went to another user's primary through the hub
+    /// rather than to a seat here (`wsp-418`): whose.
+    pub routed_to: Option<String>,
+}
+
+impl Report {
+    /// Whether the seat has it now — a turn, not a send. See [`Delivery`].
+    ///
+    /// [`Delivery`]: crate::place::Delivery
+    pub fn arrived(&self) -> bool {
+        self.settled > 0
+    }
+
+    /// One line, for a caller that has to say where a sentence went.
+    ///
+    /// **Both halves are load-bearing and the second one is the brief's.** A
+    /// receipt that only says *delivered* leaves the sender unable to tell a
+    /// governor that is busy from a governor that has stopped answering, and a
+    /// receipt that only says *held* teaches an agent to stop trusting the
+    /// channel. So it names the post, says whether the seat has it or is owed
+    /// it, says why in the same words `doctor` would, and points at the drain.
+    pub fn said(&self, what: &str, p: &util::Paint) -> String {
+        if let Some(user) = &self.routed_to {
+            return match self.settled {
+                0 => format!("{} {} · {}", p.dim("→"), p.bold(&format!("{user}'s primary")), self.why),
+                _ => format!("{} sent to {} · through the hub, queued until it is told", p.dim("→"), p.bold(&format!("{user}'s primary"))),
+            };
+        }
+        if self.arrived() {
+            return format!("{} {} · the seat has it", p.dim("→"), p.bold(&self.scope));
+        }
+        let held = match self.held {
+            0 => String::new(),
+            n => format!(" · {n} still owed"),
+        };
+        let typed = match self.typed_at {
+            Some(at) => format!(" · typed {}s ago", (util::epoch_secs() - at).max(0)),
+            None => String::new(),
+        };
+        format!(
+            "{} {}{held}{typed} · {} · `wsp watch --drain` shows what is held",
+            p.dim("→"),
+            p.bold(what),
+            self.why
+        )
+    }
+}
+
+/// The real [`Seats`] is seats' (`cmd_spawn::Fleet`), above the engine, so it is
+/// installed (wsp-542): by `main` first thing, and by a test in its setup.
+static SEATS: std::sync::OnceLock<&'static (dyn Seats + Sync)> = std::sync::OnceLock::new();
+
+pub fn install_seats(seats: &'static (dyn Seats + Sync)) {
+    // A test's install is its own thread's: the tests share one process.
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
+        install_tests::install(seats);
+    }
+    let _ = SEATS.set(seats);
+}
+
+/// The installed [`Seats`]. Panics before [`install_seats`]: an answer made up
+/// here would read as "nobody can say" and the run would act on it.
+pub fn seats() -> &'static dyn Seats {
+    // The engine's own tests have no `main`, and nothing real to install: they
+    // read the double unless the test installed another.
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
+        return install_tests::installed();
+    }
+    required(SEATS.get().copied())
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn required(seats: Option<&'static (dyn Seats + Sync)>) -> &'static dyn Seats {
+    seats.expect("no Seats installed: call cycle::install_seats(&cmd_spawn::Fleet) before this")
+}
 
 
-/// The half of [`Fleet::overrule_frozen_opencode`] that decides, split out so a
+/// How long a completed turn has to have been over before a screen still
+/// reading `Working` is overruled, in seconds.
+///
+/// **The threshold is not arbitrary.** A turn that has just ended leaves the
+/// screen reading `Working` for as long as the TUI takes to repaint, which is
+/// normally under a second; a session that finished longer ago than that and is
+/// *still* reading `Working` is a seat whose screen has stopped telling us
+/// anything. Without a threshold the reader contradicts the screen on every turn
+/// boundary, and one that overrides its most direct witness on every tick is a
+/// reader nobody would believe.
+///
+/// **It lives beside [`overrule`], which makes the comparison, and that is
+/// what makes both testable** (moved here from `agent_commands`, wsp-437): a
+/// test can cross the threshold in microseconds against a supplied clock and
+/// no opencode, a database or a frozen TUI, which is the same bargain
+/// [`crate::repair::Pass::due`] makes.
+pub const SETTLED_AFTER: i64 = 60;
+
+/// The half of [`crate::cmd_spawn::Fleet::overrule_frozen_opencode`] that decides, split out so a
 /// test can drive it without an opencode, a database and a frozen TUI.
 ///
 /// **`finished` is the session's last completed turn in seconds, and `None` is
@@ -373,7 +568,7 @@ pub struct Fleet;
 /// one direction only.
 pub fn overrule(raw: State, finished: Option<i64>, at: i64) -> State {
     match (raw, finished) {
-        (State::Working, Some(f)) if f + crate::agent_commands::SETTLED_AFTER <= at => State::Idle,
+        (State::Working, Some(f)) if f + SETTLED_AFTER <= at => State::Idle,
         _ => raw,
     }
 }
@@ -480,8 +675,9 @@ fn launch(store: &Store, argv: &[&str]) {
 /// that cause; this is so the next one is said.
 fn start_detached(store: &Store, argv: &[&str]) -> Result<(), String> {
     // A test's `current_exe` is the test harness, and handing it `worklist
-    // advance` would run the suite again from inside itself.
-    if cfg!(test) || std::env::var_os(OFF).is_some() {
+    // advance` would run the suite again from inside itself. A dependent's
+    // tests too, so `under_test` and not `cfg!(test)` (wsp-544).
+    if crate::base::under_test() || std::env::var_os(OFF).is_some() {
         return Ok(());
     }
     let exe = util::self_exe().map_err(|e| format!("no path to this binary: {e}"))?;
@@ -607,7 +803,7 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
         // is owed start here, through the gate (`start_inside` leaves a list's
         // member to the list).
         if store.find_task(&id).is_some_and(|t| crate::inner::run_inside(&t)) {
-            let _ = start_inside(store, &id, &Fleet);
+            let _ = start_inside(store, &id, seats());
         }
     }
     if let (Some(list), Some(event)) = (named.as_deref(), args.get("event")) {
@@ -644,13 +840,13 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
                     // step is still taken: a hand-run group may be followed
                     // by one wsp runs.
                     if !ran_by_wsp(&w, passed) {
-                        let _ = step(store, &w, &Fleet);
+                        let _ = step(store, &w, seats());
                         return 0;
                     }
                     if let Some(n) = passed {
-                        after_pass(store, &Fleet, &w, n);
+                        after_pass(store, seats(), &w, n);
                     }
-                    let _ = step(store, &w, &Fleet);
+                    let _ = step(store, &w, seats());
                     tell(store, &w, &passed_sentence(store, &w, passed));
                     return 0;
                 }
@@ -671,7 +867,7 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
         }
     }
     for w in stepped(store, named.as_deref(), args.get("task").as_deref()) {
-        let _ = step(store, &w, &Fleet);
+        let _ = step(store, &w, seats());
     }
     0
 }
@@ -712,7 +908,7 @@ fn stepped(store: &Store, named: Option<&str>, task: Option<&str>) -> Vec<Workli
 /// The last group passed is the whole test, because the position is read from
 /// the last verdict on: anything still open behind it is slipped, which `done`
 /// writes down, and not a barrier the run stands at.
-fn after_pass(store: &Store, seats: &dyn Seats, w: &Worklist, n: usize) {
+pub fn after_pass(store: &Store, seats: &dyn Seats, w: &Worklist, n: usize) {
     end_behind(store, seats, w, n);
     if n < w.groups().len() {
         rotate(store, seats, w);
@@ -4202,19 +4398,15 @@ fn is_list_wide(why: &str) -> bool {
 /// `None`. Checked before any seat is opened: a start that fails this fails for
 /// every row, five times over, with a seat's minute each (wsp-017).
 fn list_wide_blocker(store: &Store, rows: &[String]) -> Option<String> {
-    #[cfg(test)]
-    {
-        let _ = (store, rows);
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
         return tests::PACK_MISSING.with(|p| p.borrow().clone());
     }
-    #[cfg(not(test))]
-    {
-        let needs = rows.iter().any(|id| store.find_task(id).is_some_and(|t| t.status() == Status::Todo && crate::packet_gen::eligible(&t).is_ok()));
-        if !needs {
-            return None;
-        }
-        crate::packet_gen::pack_bin().err()
+    let needs = rows.iter().any(|id| store.find_task(id).is_some_and(|t| t.status() == Status::Todo && crate::packet_gen::eligible(&t).is_ok()));
+    if !needs {
+        return None;
     }
+    crate::packet_gen::pack_bin().err()
 }
 
 /// Park the list for a cause shared by every row, after one try. The row is
@@ -4426,7 +4618,7 @@ fn forgive_spent_starts(store: &Store, list: &str) -> usize {
 /// The starts that gave up under a throttle or memory hold are tried again once
 /// the hold lets go, without a hand `advance` (`wsp-600`). Says which, once.
 fn retry_after_hold(store: &Store, list: &str) {
-    let spent = crate::starts::forgive_after_hold(store, &start_labels(store, list), !cfg!(test) && crate::throttle::holding_back(store).is_some());
+    let spent = crate::starts::forgive_after_hold(store, &start_labels(store, list), !crate::base::under_test() && crate::throttle::holding_back(store).is_some());
     if !spent.is_empty() {
         log_line(store, &format!("{list}: the hold has let go — {} tried again, its start having given up under it", spent.join(", ")));
     }
@@ -4729,7 +4921,7 @@ pub fn end_checks_when_idle(store: &Store, list: &str, at: usize) -> Vec<String>
 fn end_check(store: &Store, list: &str, id: &str) {
     let pane = store.panes_for_task(id).into_iter().next();
     if let Some(pane) = pane.as_deref().filter(|_| !cfg!(test)) {
-        Seats::wait_idle(&Fleet, pane);
+        Seats::wait_idle(seats(), pane);
     }
     if !store.claims().contains_key(id) {
         log_line(store, &format!("{list}: {id} settled its barrier and has already gone — nothing to end"));
@@ -4743,7 +4935,7 @@ fn end_check(store: &Store, list: &str, id: &str) {
 /// with no row, which holds no claim — its standing entry is the test.
 fn end_check_seat(store: &Store, list: &str, seat: &str) {
     if !cfg!(test) {
-        Seats::wait_idle(&Fleet, seat);
+        Seats::wait_idle(seats(), seat);
     }
     if crate::barrier::seat_of(store, seat).is_none() {
         log_line(store, &format!("{list}: the check in {seat} settled its barrier and has already gone — nothing to end"));
@@ -5043,7 +5235,7 @@ pub fn stand_down_own_seat(store: &Store, list: &str) {
             .get(list)
             .is_some_and(|rec| rec.get("workspace").and_then(serde_json::Value::as_str).unwrap_or_default().is_empty());
         if empty && crate::governors::stood_at(&governors, list).is_none() {
-            crate::cmd_govern::mark_stood_down(store, list);
+            crate::governors::mark_stood_down(store, list);
             log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
         }
         return;
@@ -5051,8 +5243,8 @@ pub fn stand_down_own_seat(store: &Store, list: &str) {
     // Read before the vacate: the room a compound seat is found by is on the
     // record the vacate empties.
     let sitting = occupied(store, &seat);
-    crate::cmd_govern::vacate(store, list);
-    crate::cmd_govern::mark_stood_down(store, list);
+    crate::governors::vacate(store, list);
+    crate::governors::mark_stood_down(store, list);
     let Some(seat) = sitting else {
         log_line(store, &format!("{list} is closing — stood its own seat down; nobody was sitting in it"));
         return;
@@ -5070,21 +5262,20 @@ pub fn stand_down_own_seat(store: &Store, list: &str) {
 /// [`rotate_on_behalf`](crate::cmd_spawn::rotate_on_behalf) finds the one it
 /// replaces; under test, the recorded one.
 pub fn occupied(store: &Store, seat: &crate::governors::Seat) -> Option<String> {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return (!seat.pane.is_empty()).then(|| seat.pane.clone());
     }
-    let backends = crate::place::local_backends();
-    crate::cmd_govern::occupant(store, &backends, seat).map(|(_, found)| found.seat.as_str().to_string())
+    Seats::occupant(seats(), store, seat)
 }
 
 /// [`crate::cmd_spawn::end_seat_when_idle`], recorded instead under test.
 pub fn end_seat_when_idle(store: &Store, seat: &str) -> Result<(), String> {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::ENDED.with(|s| s.borrow_mut().push(seat.to_string()));
         return Ok(());
     }
-    Seats::end_when_idle(&Fleet, store, seat)
+    Seats::end_when_idle(seats(), store, seat)
 }
 
 /// Every agent this run opened that has nothing left to do, and holds a claim.
@@ -5216,7 +5407,7 @@ pub fn end_passes_keeping(
         // folded `seat.spent`'s, and what it did the `seat.did` digests'.
         let spent = crate::verification::Spent::ending(p.spent.as_ref(), None, None);
         let spent = crate::verification::Spent::with_session(spent, None);
-        let did = crate::cmd_agent::did_of_seat(store, &seat, &p.at);
+        let did = crate::fold::did_since(store, &seat, util::epoch_of(&p.at));
         let outcome = despawn_seat_keeping(&seat, keep).and_then(|()| crate::ending::confirm_gone(seats, &pids));
         let ending = match &outcome {
             Ok(()) => Ending::Ended,
@@ -5374,10 +5565,10 @@ fn despawn_argv(target: &[&str], keep: bool) -> Vec<String> {
 /// [`despawn_seat`], leaving the tree when `keep`: a member handed to its
 /// verifier, which reads in it (`wsp-430`).
 pub fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String> {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::ON_END.with(|h| h.borrow().as_ref().map(|f| f(seat)));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         return tests::ENDED.with(|s| {
             s.borrow_mut().push(seat.to_string());
             if keep {
@@ -5403,7 +5594,7 @@ pub fn despawn_seat_keeping(seat: &str, keep: bool) -> Result<(), String> {
 /// may stand in the primary seat, whose despawn gives a why (`wsp-344`'s
 /// `wsp done` on a verified row whose seat sits idle). Its gate is despawn's.
 pub fn despawn_seat_because(seat: &str, why: &str) -> Result<(), String> {
-    if cfg!(test) {
+    if crate::base::under_test() {
         return despawn_seat_keeping(seat, true);
     }
     let exe = wsp_base::util::self_exe().map_err(|e| e.to_string())?;
@@ -5433,14 +5624,14 @@ pub fn despawned(store: &Store, id: &str) -> Result<(), String> {
 /// [`despawned`], with `--keep-tree` when `keep`.
 pub fn despawned_keeping(store: &Store, id: &str, keep: bool) -> Result<(), String> {
     say_uncommitted(store, id);
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(why) = tests::DESPAWN_FAILS.with(|f| f.borrow().clone()) {
             return Err(why);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         tests::ENDED.with(|s| s.borrow_mut().push(id.to_string()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if keep {
             tests::KEPT.with(|s| s.borrow_mut().push(id.to_string()));
         }
@@ -5544,7 +5735,7 @@ pub fn governing_post(store: &Store, w: &Worklist) -> Option<String> {
     let governors = store.governors();
     the_chain(store, w)
         .into_iter()
-        .find(|s| governors.contains_key(s) || crate::cmd_govern::last_seat(&governors, s).is_some())
+        .find(|s| governors.contains_key(s) || crate::governors::last_seat(&governors, s).is_some())
 }
 
 /// `list, then the project of its first member that has one, then that project's
@@ -5602,6 +5793,7 @@ pub fn tell(store: &Store, w: &Worklist, text: &str) {
         tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
+    told_in_a_dependents_test(text);
     log_line(store, &format!("tell {}: {}", w.id, util::truncate(text, 120)));
     tell_now(store, w, text);
 }
@@ -5616,7 +5808,17 @@ pub fn tell_logged(store: &Store, w: &Worklist, text: &str) {
         tests::TOLD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
+    told_in_a_dependents_test(text);
     tell_now(store, w, text);
+}
+
+/// [`tell`] in a dependent's test (`wsp-seats`'), which takes the real path: recorded in `tests::TOLD` as well,
+/// so a seats test's "nobody was told" can fail (wsp-441). Nothing outside a test harness built with `test-support`.
+fn told_in_a_dependents_test(_text: &str) {
+    #[cfg(all(not(test), feature = "test-support"))]
+    if crate::base::under_test() {
+        tests::TOLD.with(|s| s.borrow_mut().push(_text.to_string()));
+    }
 }
 
 /// [`tell`]'s delivery, which [`hand_on_what_done_lists_held`] takes too:
@@ -5626,7 +5828,7 @@ pub fn tell_logged(store: &Store, w: &Worklist, text: &str) {
 /// The notice on a member reaches the nearest filled seat above, which is not
 /// the seat the sentence was written for — so it is told whose it was, and
 /// why it has it.
-fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
+pub fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     if hand_it_to_the_governor(store, w, text) {
         return true;
     }
@@ -5639,7 +5841,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
     // wsp's own notice, for the seat that answers for the member — not a
     // `wsp flag` with no pane behind it, which recorded the run as a person
     // and put every barrier pass on the person's panel (`wsp-272`).
-    crate::cmd_agent::notice(store, &first, &text).is_some()
+    Seats::notice(seats(), store, &first, &text)
 }
 
 /// wsp's notice on a row on no list, for the seat that answers for it (its
@@ -5647,7 +5849,7 @@ fn tell_now(store: &Store, w: &Worklist, text: &str) -> bool {
 /// the engine modules that tell a row's stall reach it through the run and not
 /// up into the seats (`wsp-690`). Returns whether it was raised.
 pub fn notice_on_row(store: &Store, member: &str, text: &str) -> bool {
-    crate::cmd_agent::notice(store, member, text).is_some()
+    Seats::notice(seats(), store, member, text)
 }
 
 /// The member [`tell_now`] puts a run's notice on: the first of the group the
@@ -5702,7 +5904,7 @@ pub fn nobody_coming(store: &Store, list: &str) -> Option<String> {
         return Some(format!("its seat was stood down at {}", util::local_hm(at)));
     }
     if crate::governors::vacancy(&governors, list).backed_off() {
-        let why = crate::cmd_govern::reseat_why(&governors, list).map(|w| format!(" — {}", util::truncate(&w, 120)));
+        let why = crate::governors::reseat_why(&governors, list).map(|w| format!(" — {}", util::truncate(&w, 120)));
         return Some(format!("its reseat failed{}", why.unwrap_or_default()));
     }
     None
@@ -5724,7 +5926,7 @@ pub fn nobody_coming(store: &Store, list: &str) -> Option<String> {
 pub fn hand_on_what_done_lists_held(store: &Store) {
     for key in store.watches().keys() {
         let Some(scope) = key.strip_prefix("wake:") else { continue };
-        let held = crate::wake::messages_held(store, scope);
+        let held = Seats::messages_held(seats(), store, scope);
         if held.is_empty() {
             continue;
         }
@@ -5754,7 +5956,7 @@ pub fn hand_on_what_done_lists_held(store: &Store) {
                 handed.push(*seq);
             }
         }
-        crate::wake::settle_held(store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
+        Seats::settle_held(seats(), store, scope, &[handed.as_slice(), let_go.as_slice()].concat());
         // Said when something moved, not every tick something could not: a
         // done list with no member to put a notice on would otherwise write
         // this line a minute for ever. What stays is still on `--status`.
@@ -5813,8 +6015,8 @@ fn heard(w: &Worklist, event: &str, passed: Option<usize>) -> Option<String> {
 /// than said under `cfg(test)`, as [`tell`] is; [`hand_it_up`] is the half that
 /// decides, and is driven on its own.
 pub fn tell_above(store: &Store, w: &Worklist, text: &str) {
-    if cfg!(test) {
-        #[cfg(test)]
+    if crate::base::under_test() {
+        #[cfg(any(test, feature = "test-support"))]
         tests::HEARD.with(|s| s.borrow_mut().push(text.to_string()));
         return;
     }
@@ -5839,7 +6041,7 @@ pub fn hand_it_up(store: &Store, w: &Worklist, text: &str) -> Option<String> {
     if crate::cmd_message::caller(store) == above.scope {
         return None;
     }
-    crate::wake::say(store, &above.scope, text, None);
+    Seats::say(seats(), store, &above.scope, text, None);
     Some(above.scope)
 }
 
@@ -5870,7 +6072,7 @@ pub fn hand_it_to_the_governor(store: &Store, w: &Worklist, text: &str) -> bool 
     // nowhere, and the caller's hand on a member reaches the seat above.
     let own = || (w.runs_itself() && nobody_coming(store, &w.id).is_none()).then(|| w.id.clone());
     let Some(scope) = governing_scope(store, w).or_else(own) else { return false };
-    let report = crate::wake::say(store, &scope, text, None);
+    let report = Seats::say(seats(), store, &scope, text, None);
     // Said as well as returned, because `cycle.log` is how a governor reads what
     // the run has been doing, and *the seat is mid-turn* is the answer to "why
     // has nobody started my next group" that used to be missing from it. The
@@ -5895,7 +6097,69 @@ fn rotate(store: &Store, seats: &dyn Seats, w: &Worklist) {
 
 pub use crate::store::log_line;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+pub mod install_tests {
+    use super::{Report, Seats};
+    use crate::store::Store;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+
+    thread_local! {
+        static HERE: Cell<Option<&'static (dyn Seats + Sync)>> = const { Cell::new(None) };
+        /// How many lines the [`Double`] says each scope is owed.
+        pub static OWED: RefCell<BTreeMap<String, usize>> = const { RefCell::new(BTreeMap::new()) };
+        /// The scope whose seat the [`Double`] says answers for every task.
+        pub static ANSWERS: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// What was said to a seat through the [`Double`], as `(scope, text)`.
+        pub static SAID_TO: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The engine tests' [`Seats`]: no backend, no spool, and only what a test
+    /// scripted above.
+    pub struct Double;
+
+    impl Seats for Double {
+        fn state(&self, _seat: &str) -> Option<crate::place::State> {
+            None
+        }
+        fn owed_to(&self, _store: &Store, scope: &str) -> usize {
+            OWED.with(|o| o.borrow().get(scope).copied().unwrap_or(0))
+        }
+        fn scopes_owed(&self, _store: &Store) -> Vec<(String, usize)> {
+            OWED.with(|o| o.borrow().iter().map(|(s, n)| (s.clone(), *n)).collect())
+        }
+        fn answering_scope(&self, _store: &Store, _task: &crate::model::Task) -> Option<String> {
+            ANSWERS.with(|a| a.borrow().clone())
+        }
+        fn answering_seat(&self, store: &Store, _task: &crate::model::Task) -> Option<crate::governors::Seat> {
+            ANSWERS.with(|a| a.borrow().as_deref().and_then(|s| crate::governors::seat_held(s, &store.governors())))
+        }
+        fn say(&self, _store: &Store, scope: &str, text: &str, _record: Option<&str>) -> Report {
+            SAID_TO.with(|s| s.borrow_mut().push((scope.to_string(), text.to_string())));
+            Report::default()
+        }
+    }
+
+    pub fn install(seats: &'static (dyn Seats + Sync)) {
+        HERE.with(|h| h.set(Some(seats)));
+    }
+
+    pub fn installed() -> &'static dyn Seats {
+        match HERE.with(Cell::get) {
+            Some(seats) => seats,
+            None => &Double,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "no Seats installed: call cycle::install_seats")]
+    fn a_seats_call_before_the_install_panics_naming_it() {
+        super::required(None);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     /// `wsp-538`: the reason a member gave for a full suite is in its verifier's
     /// order, so an unneeded run can be challenged.
@@ -6018,28 +6282,28 @@ pub mod tests {
         pub static WAKES: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn spawned() -> Vec<(String, String)> {
+    pub fn spawned() -> Vec<(String, String)> {
         SPAWNED.with(|s| s.borrow_mut().drain(..).collect())
     }
 
-    fn scratch(tag: &str) -> (util::Isolated, Store) {
+    pub fn scratch(tag: &str) -> (util::Isolated, Store) {
         crate::testkit::isolated_store(&format!("cycle-{tag}"))
     }
 
-    fn task(store: &Store, id: &str, status: Status) {
+    pub fn task(store: &Store, id: &str, status: Status) {
         let mut t = Task::new(id, id);
         t.status_raw = status.as_str().into();
         store.save_task(&t).unwrap();
     }
 
-    fn set(store: &Store, id: &str, status: Status) {
+    pub fn set(store: &Store, id: &str, status: Status) {
         let mut t = store.find_task(id).unwrap();
         t.set_status(status);
         t.touch();
         store.save_task(&t).unwrap();
     }
 
-    fn list(store: &Store, groups: &[(&[&str], &str)]) -> Worklist {
+    pub fn list(store: &Store, groups: &[(&[&str], &str)]) -> Worklist {
         let mut w = Worklist::new("run", "run");
         w.set_status(WorklistStatus::Running);
         w.set_groups(
@@ -6125,22 +6389,22 @@ pub mod tests {
     }
 
     /// The checks on group `at` of the `run` list.
-    fn checks(store: &Store, at: usize) -> Vec<crate::barrier::Check> {
+    pub fn checks(store: &Store, at: usize) -> Vec<crate::barrier::Check> {
         store.worklist("run").unwrap().groups()[at - 1].checks.clone()
     }
 
     /// The open check on group `at` seated, as `wsp spawn --check` does.
-    fn check_seated(store: &Store, at: usize, seat: &str) {
+    pub fn check_seated(store: &Store, at: usize, seat: &str) {
         assert!(crate::barrier::name_seat(store, "run", at, seat), "no open check on group {at} to seat");
     }
 
-    fn tagged(store: &Store, tag: &str) -> Vec<Task> {
+    pub fn tagged(store: &Store, tag: &str) -> Vec<Task> {
         store.tasks().into_iter().filter(|t| t.tags.iter().any(|g| g == tag)).collect()
     }
 
     /// The members with a pass still reading: what a Verify row in `todo` used
     /// to be (`wsp-188`).
-    fn reading(store: &Store) -> Vec<String> {
+    pub fn reading(store: &Store) -> Vec<String> {
         store
             .tasks()
             .iter()
@@ -6149,20 +6413,20 @@ pub mod tests {
             .collect()
     }
 
-    fn passes_on(store: &Store, id: &str) -> Vec<crate::verification::Pass> {
+    pub fn passes_on(store: &Store, id: &str) -> Vec<crate::verification::Pass> {
         crate::verification::passes(&store.find_task(id).unwrap())
     }
 
     /// Every pass still reading gets its verdict, the way `wsp verified` writes
     /// it from the verifier's own seat.
-    fn verdict_all(store: &Store, state: crate::verification::State) {
+    pub fn verdict_all(store: &Store, state: crate::verification::State) {
         for m in reading(store) {
             let pane = passes_on(store, &m).last().and_then(|p| p.pane.clone());
             crate::verification::record(store, &m, state, "checked it on the trunk", pane.as_deref(), None).unwrap();
         }
     }
 
-    fn hold_all(store: &Store) {
+    pub fn hold_all(store: &Store) {
         verdict_all(store, crate::verification::State::Holds)
     }
 
@@ -6480,7 +6744,7 @@ pub mod tests {
 #[test]
 fn a_frozen_opencode_screen_is_overruled_by_the_database() {
     let now = 1_800_000_000;
-    let ago = now - crate::agent_commands::SETTLED_AFTER - 1;
+    let ago = now - SETTLED_AFTER - 1;
     assert_eq!(
         overrule(State::Working, Some(ago), now),
         State::Idle,
@@ -6507,7 +6771,7 @@ fn a_frozen_opencode_screen_is_overruled_by_the_database() {
 #[test]
 fn only_a_working_screen_is_ever_overruled() {
     let now = 1_800_000_000;
-    let long = now - crate::agent_commands::SETTLED_AFTER - 1;
+    let long = now - SETTLED_AFTER - 1;
     for read in [State::Idle, State::Starting, State::Blocked, State::Empty, State::Gone, State::Unknown] {
         assert_eq!(overrule(read, Some(long), now), read, "{read:?} is not this repair's to overrule");
     }
@@ -6712,7 +6976,7 @@ fn only_a_working_screen_is_ever_overruled() {
         struct Frozen;
         impl Seats for Frozen {
             fn state(&self, _seat: &str) -> Option<State> {
-                Some(overrule(State::Working, Some(util::epoch_secs() - crate::agent_commands::SETTLED_AFTER - 1), util::epoch_secs()))
+                Some(overrule(State::Working, Some(util::epoch_secs() - SETTLED_AFTER - 1), util::epoch_secs()))
             }
         }
         step(&store, &w, &Frozen);
@@ -6773,7 +7037,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// Backdate the note that starts the barrier's wait on a pane.
-    fn age_the_wait(store: &Store, id: &str) {
+    pub fn age_the_wait(store: &Store, id: &str) {
         let mut t = store.find_task(id).unwrap();
         let log = t.section("Log").unwrap_or_default();
         let aged: Vec<String> = log
@@ -7223,7 +7487,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// A seat on `scope`, in the shape `wsp govern` writes one.
-    fn seated(store: &Store, scope: &str, pane: &str) {
+    pub fn seated(store: &Store, scope: &str, pane: &str) {
         store.set_governor(
             scope,
             serde_json::json!({ "workspace": pane, "pane": pane, "host": util::hostname(), "kind": "claude" }),
@@ -7233,7 +7497,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// A run of one group under project `p`, its barrier passed, with the check
     /// whose `go` it was still holding its claim at `doing`, and a seat on the
     /// list and another on the project.
-    fn passed_with_seats(tag: &str) -> (util::Isolated, Store, Worklist) {
+    pub fn passed_with_seats(tag: &str) -> (util::Isolated, Store, Worklist) {
         let (env, store) = scratch(tag);
         let mut m = Task::new("m-1", "m-1");
         m.status_raw = Status::Review.as_str().into();
@@ -7288,7 +7552,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// The record a failed reseat leaves on a list's post: its markers and no
     /// workspace — `wsp-acceptance-fixes`' own on 2026-10-06, down to the count.
-    fn a_failed_reseat(store: &Store, scope: &str) {
+    pub fn a_failed_reseat(store: &Store, scope: &str) {
         store.set_governor(
             scope,
             serde_json::json!({
@@ -7298,171 +7562,6 @@ fn only_a_working_screen_is_ever_overruled() {
                 "unseated": 1,
             }),
         );
-    }
-
-    /// `wsp-216`. `wsp-acceptance-fixes` closed past its last barrier with its
-    /// post holding a failed reseat's record and nobody in it. The close
-    /// returned at the seat lookup, so the post was never stood down; the
-    /// closing verdict was then held on the list's own scope, with nobody coming
-    /// to it, and reached nobody.
-    ///
-    /// Now the empty post is stood down at the close, and the verdict goes on a
-    /// member, whose notice reaches the project's seat — saying which list's it
-    /// was and why the project has it.
-    #[test]
-    fn a_close_over_a_post_nobody_is_in_stands_it_down_and_the_verdict_reaches_the_seat_above() {
-        let (_env, store, w) = passed_with_seats("emptypost");
-        a_failed_reseat(&store, "run");
-        let _ = drained(&SAID);
-
-        after_pass(&store, &Exits, &w, 1);
-
-        let governors = store.governors();
-        assert!(crate::governors::stood_at(&governors, "run").is_some(), "the empty post is stood down: {governors:?}");
-        let said = drained(&SAID);
-        assert!(
-            said.iter().any(|l| l == "run is closing — stood its own seat down; nobody was sitting in it"),
-            "and says so: {said:?}"
-        );
-        assert!(drained(&ENDED).iter().all(|s| s != "cpd-7"), "there was nobody in it to end");
-
-        let now = store.worklist("run").unwrap();
-        assert_eq!(nobody_coming(&store, "run").as_deref(), Some("the list is done"));
-        assert!(!hand_it_to_the_governor(&store, &now, "Barrier 1 of run passed."), "not held on its own scope");
-        assert!(tell_now(&store, &now, "Barrier 1 of run passed."), "somebody has it");
-        assert!(crate::wake::messages_held(&store, "run").is_empty(), "nothing waits on the list's post");
-        let to_p = crate::wake::messages_held(&store, "p");
-        assert!(
-            to_p.iter().any(|(_, _, t)| t.starts_with("Meant for the run list's own seat, and nobody is coming to it: the list is done.")
-                && t.contains("Barrier 1 of run passed.")),
-            "the project's seat has it, and is told whose it was: {to_p:?}"
-        );
-    }
-
-    /// `wsp-216`, the governor's rule: a member's ask waits on its list's post
-    /// while a successor is on the way, and goes to the project's seat once
-    /// nobody is coming.
-    #[test]
-    fn a_members_ask_waits_on_a_post_being_reseated_and_goes_up_once_nobody_is_coming() {
-        let (_env, store) = scratch("ask-route");
-        let mut m = Task::new("m-1", "m-1");
-        m.project = Some("p".into());
-        m.set_status(Status::Doing);
-        store.save_task(&m).unwrap();
-        list(&store, &[(&["m-1"], "claude")]);
-        seated(&store, "p", "cpd-340");
-        let ask = |store: &Store| crate::cmd_govern::answering_seat(store, &store.find_task("m-1").unwrap());
-
-        // Its governor died and the reconciler has claimed the reseat.
-        store.set_governor(
-            "run",
-            serde_json::json!({ "vacated": util::now_iso(), "last": { "workspace": "cpd-7" }, "reseating": util::now_iso() }),
-        );
-        let s = ask(&store).expect("a seat answers");
-        assert_eq!((s.scope.as_str(), s.vacant), ("run", true), "it waits on the list's post, empty and being filled");
-
-        // Not yet claimed: the reconciler has counted the vacancy, and is coming.
-        store.set_governor("run", serde_json::json!({ "unseated": 1 }));
-        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("run"));
-
-        // The reseat failed and backed off: nobody is coming.
-        a_failed_reseat(&store, "run");
-        let s = ask(&store).expect("a seat answers");
-        assert_eq!((s.scope.as_str(), s.vacant), ("p", false), "the project's seat, which is somebody");
-        let now = store.worklist("run").unwrap();
-        assert!(nobody_coming(&store, "run").is_some_and(|why| why.starts_with("its reseat failed")));
-        assert!(!hand_it_to_the_governor(&store, &now, "a verdict"), "nor does the run's own tell wait there");
-
-        // Retried: a claim after the failure is a successor on the way again.
-        store.edit_governor("run", |rec| {
-            rec["reseating"] = serde_json::json!("2026-10-06T13:40:00Z");
-            true
-        });
-        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("run"));
-
-        // Stood down, and done: nobody, and the list is not a running one.
-        crate::cmd_govern::mark_stood_down(&store, "run");
-        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"));
-        let mut w = store.worklist("run").unwrap();
-        w.set_status(WorklistStatus::Done);
-        store.save_worklist(&w).unwrap();
-        store.edit_governor("run", |rec| rec.as_object_mut().is_some_and(|o| o.remove(crate::governors::STOOD_DOWN).is_some()));
-        assert_eq!(ask(&store).map(|s| s.scope).as_deref(), Some("p"), "a done list answers for nothing");
-    }
-
-    /// `wsp-216`'s live repair: what was already held on a done list's post
-    /// when it closed — `wsp-acceptance-fixes`' two, the barrier-3 verdict among
-    /// them — is handed on by a tick, and taken off the post. A running list's
-    /// held sentences are its own, and stay.
-    #[test]
-    fn a_tick_hands_on_what_a_done_lists_post_was_holding() {
-        let (_env, store, _w) = passed_with_seats("handon");
-        a_failed_reseat(&store, "run");
-        crate::wake::say(&store, "run", "m-1 is at doing with nothing working on it", None);
-        crate::wake::say(&store, "run", "Barrier 1 of run passed.", None);
-        let mut w = store.worklist("run").unwrap();
-        w.set_status(WorklistStatus::Done);
-        store.save_worklist(&w).unwrap();
-        let mut other = Worklist::new("other", "other");
-        other.set_status(WorklistStatus::Running);
-        other.set_groups(&[Group { members: vec!["m-2".into()], agent: "claude".into(), ..Group::default() }]);
-        store.save_worklist(&other).unwrap();
-        crate::wake::say(&store, "other", "for a list still running", None);
-        let _ = drained(&SAID);
-
-        hand_on_what_done_lists_held(&store);
-
-        assert!(crate::wake::messages_held(&store, "run").is_empty(), "taken off the done list's post");
-        assert_eq!(crate::wake::messages_held(&store, "other").len(), 1, "a running list keeps its own");
-        let to_p: Vec<String> = crate::wake::messages_held(&store, "p").into_iter().map(|(_, _, t)| t).collect();
-        assert_eq!(to_p.len(), 2, "{to_p:?}");
-        let today = util::local_ymd(&util::now_iso());
-        assert!(
-            to_p.iter().all(|t| t.contains("Meant for the run list's own seat") && t.contains(&format!("(Held on its scope since {today} "))),
-            "dated, since a done list's backlog is days old as often as not: {to_p:?}"
-        );
-        assert!(to_p[1].contains("Barrier 1 of run passed."), "{to_p:?}");
-        let said = drained(&SAID);
-        assert!(said.iter().any(|l| l.contains("handed on 2 of the 2")), "{said:?}");
-
-        hand_on_what_done_lists_held(&store);
-        assert_eq!(crate::wake::messages_held(&store, "p").len(), 2, "once");
-    }
-
-    /// `wsp-151`. cr-linux closed on a machine whose project had no seat, and
-    /// all 26 sentences held on its post went to the person as flags —
-    /// started, parked, resumed, verified, none asking anything. With nobody
-    /// above to keep current, a sentence that asks nothing is let go; one that
-    /// asks still reaches the person.
-    #[test]
-    fn a_done_list_with_no_seat_above_lets_go_what_asks_nothing() {
-        let (_env, store, _w) = passed_with_seats("letgo");
-        a_failed_reseat(&store, "run");
-        assert!(store.clear_governor("p"), "nobody above the list");
-        crate::wake::say(&store, "run", "The run list was parked: nothing starts until it is resumed · wsp worklist show run", None);
-        crate::wake::say(&store, "run", "The run list was resumed where it was parked · wsp worklist show run", None);
-        crate::wake::say(&store, "run", "m-1 has been blocked for 40 min and waits on: does the schema keep its old column?", None);
-        let mut w = store.worklist("run").unwrap();
-        w.set_status(WorklistStatus::Done);
-        store.save_worklist(&w).unwrap();
-        let before: Vec<String> = crate::message::all(&store).into_iter().map(|m| m.id).collect();
-        let _ = drained(&SAID);
-
-        hand_on_what_done_lists_held(&store);
-
-        assert!(crate::wake::messages_held(&store, "run").is_empty(), "nothing is left on the done list's post");
-        let raised: Vec<String> =
-            crate::message::all(&store).into_iter().filter(|m| !before.contains(&m.id)).map(|m| m.text).collect();
-        assert_eq!(raised.len(), 1, "only the one that asks: {raised:?}");
-        assert!(raised[0].contains("does the schema keep its old column?"), "{raised:?}");
-        let said = drained(&SAID);
-        assert!(
-            said.iter().any(|l| l.contains("handed on 1 of the 3") && l.contains("let go 2 that asked nothing")),
-            "{said:?}"
-        );
-
-        hand_on_what_done_lists_held(&store);
-        assert_eq!(crate::message::all(&store).len(), before.len() + 1, "once");
     }
 
     /// `wsp-216`: `go` on the last barrier of a group wsp ran is the close, and
@@ -7631,7 +7730,8 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// A project over a repository with member `m-1` in its own tree, one commit
     /// ahead of a trunk that has since gained `trunk_file` (`wsp-341`).
-    fn ready_tree(tag: &str, member_file: &str, trunk_file: &str) -> (util::Isolated, Store, std::path::PathBuf, crate::model::Worklist) {
+    #[cfg(test)] // `testkit::repo` is engine's dev-dependency
+    pub fn ready_tree(tag: &str, member_file: &str, trunk_file: &str) -> (util::Isolated, Store, std::path::PathBuf, crate::model::Worklist) {
         let (env, store) = scratch(tag);
         let repo = env.path("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -7726,7 +7826,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// `wsp-341`, end to end: a project whose `## Checks` are `checks` (`RAN` is a
     /// file the test reads back), a member ready in its own tree, the step that
     /// rebases it and opens the pass, then `wsp verified`.
-    struct Run {
+    pub struct Run {
         _env: util::Isolated,
         store: Store,
         repo: std::path::PathBuf,
@@ -7735,7 +7835,8 @@ fn only_a_working_screen_is_ever_overruled() {
         ran: std::path::PathBuf,
     }
 
-    fn run_ready(tag: &str, checks: &str, member_file: &str, trunk_file: &str) -> Run {
+    #[cfg(test)] // calls `ready_tree`
+    pub fn run_ready(tag: &str, checks: &str, member_file: &str, trunk_file: &str) -> Run {
         // The land a hold performs reruns checks through the engine's answers, which `main` installs.
         crate::cmd_checkout::install_engine(crate::cmd_checkout::Engine {
             passed: |_| Default::default(),
@@ -8236,7 +8337,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// The barrier of a one-member run, open and with its first start taken.
-    fn barrier_open(tag: &str) -> (util::Isolated, Store, Worklist) {
+    pub fn barrier_open(tag: &str) -> (util::Isolated, Store, Worklist) {
         let (env, store) = scratch(tag);
         task(&store, "m-1", Status::Review);
         let w = list(&store, &[(&["m-1"], "claude")]);
@@ -8249,7 +8350,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// Make the open check on group 1 as old as it would be `secs` after its
     /// last start or failure.
-    fn age_check(store: &Store, secs: i64) {
+    pub fn age_check(store: &Store, secs: i64) {
         let mut l = store.worklist("run").unwrap();
         let mut g = l.groups();
         g[0].checks.last_mut().unwrap().at = util::iso_at(util::epoch_secs() - secs);
@@ -8288,7 +8389,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// The wake a failed start on `run` scheduled, as [`wake_after`] launches it.
-    fn woken_after(secs: &str) -> Vec<String> {
+    pub fn woken_after(secs: &str) -> Vec<String> {
         ["worklist", "advance", "run", "--event", RETRY_EVENT, "--after", secs].iter().map(|a| a.to_string()).collect()
     }
 
@@ -8650,7 +8751,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// A seat that is idle, has taken no turn, and answers what its prompt holds.
-    struct Untaken {
+    pub struct Untaken {
         typed: Option<bool>,
         pressed: RefCell<Vec<String>>,
         resent: RefCell<Vec<(String, String)>>,
@@ -8688,7 +8789,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// A member under review with its verifier seated in `seat`, the pass
     /// opened five minutes ago.
-    fn verifier_waiting(store: &Store, seat: &str) -> Worklist {
+    pub fn verifier_waiting(store: &Store, seat: &str) -> Worklist {
         task(store, "m-1", Status::Review);
         let w = list(store, &[(&["m-1"], "claude")]);
         step(store, &w, &Blind);
@@ -8704,7 +8805,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// Every `cycle.log` line dated five minutes back, which is what the
     /// next step waits out.
-    fn age_the_log(store: &Store) {
+    pub fn age_the_log(store: &Store) {
         let path = store.state_file("cycle.log");
         let then = util::iso_at(util::epoch_secs() - 300);
         let aged: String = std::fs::read_to_string(&path)
@@ -8908,7 +9009,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// Panes the backends hold, all idle, each with its label.
-    struct Panes(Vec<(&'static str, &'static str)>);
+    pub struct Panes(Vec<(&'static str, &'static str)>);
 
     impl Seats for Panes {
         fn state(&self, seat: &str) -> Option<State> {
@@ -9114,17 +9215,17 @@ fn only_a_working_screen_is_ever_overruled() {
 
     // ---- the seat's cap (`wsp-231`) --------------------------------------
 
-    fn ids(started: Vec<(String, String)>) -> Vec<String> {
+    pub fn ids(started: Vec<(String, String)>) -> Vec<String> {
         started.into_iter().map(|(id, _)| id).collect()
     }
 
-    fn said_capped() -> Vec<String> {
+    pub fn said_capped() -> Vec<String> {
         drained(&SAID).into_iter().filter(|l| l.contains("the seat is at its cap")).collect()
     }
 
     /// A second running list beside `run`, for the cases where two share the
     /// machine.
-    fn list_named(store: &Store, id: &str, members: &[&str], agent: &str) -> Worklist {
+    pub fn list_named(store: &Store, id: &str, members: &[&str], agent: &str) -> Worklist {
         let mut w = Worklist::new(id, id);
         w.set_status(WorklistStatus::Running);
         w.set_groups(&[Group { members: members.iter().map(|x| x.to_string()).collect(), agent: agent.into(), ..Group::default() }]);
@@ -9169,7 +9270,7 @@ fn only_a_working_screen_is_ever_overruled() {
     // ---- light rows count half a place (`wsp-601`) ------------------------
 
     /// A row of project `docs`, carrying `tag`.
-    fn docs_row(store: &Store, id: &str, tag: &str) {
+    pub fn docs_row(store: &Store, id: &str, tag: &str) {
         let mut t = Task::new(id, id);
         t.status_raw = Status::Todo.as_str().into();
         t.project = Some("docs".into());
@@ -9178,14 +9279,14 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// Project `docs`, declaring `light` as its light tags.
-    fn declare_light(store: &Store, light: &str) {
+    pub fn declare_light(store: &Store, light: &str) {
         let mut p = crate::model::Project::new("docs");
         p.light = light.into();
         store.save_project(&p).unwrap();
     }
 
     /// One group of `members` run on claude, carrying `weight` and `own` (member, word).
-    fn weighed_list(store: &Store, members: &[&str], weight: &str, own: &[(&str, &str)]) -> Worklist {
+    pub fn weighed_list(store: &Store, members: &[&str], weight: &str, own: &[(&str, &str)]) -> Worklist {
         let w = list(store, &[(members, "claude")]);
         let mut g = w.groups();
         g[0].weight = weight.into();
@@ -9508,7 +9609,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(ids, ["m-1", "m-3"]);
     }
 
-    fn capped_group(store: &Store, kind: &str, n: usize, cap: usize) -> Worklist {
+    pub fn capped_group(store: &Store, kind: &str, n: usize, cap: usize) -> Worklist {
         let ids: Vec<String> = (1..=n).map(|i| format!("m-{i}")).collect();
         for m in &ids {
             task(store, m, Status::Todo);
@@ -9554,7 +9655,7 @@ fn only_a_working_screen_is_ever_overruled() {
     // ---- a member is started once, however many picks race (wsp-607) ----------
 
     /// The ids the passes in `run` started, from every thread they ran on.
-    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    pub fn sorted(mut ids: Vec<String>) -> Vec<String> {
         ids.sort();
         ids
     }
@@ -9605,7 +9706,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// Since `wsp-663` a step does not carry on without the lock: it waits for
     /// the holder, and the second step finds its list held and marks it rather
     /// than stepping beside it.
-    fn race(tag: &str, kind: &str, n: usize, cap: usize, seat_cap: Option<usize>) -> (Vec<String>, usize) {
+    pub fn race(tag: &str, kind: &str, n: usize, cap: usize, seat_cap: Option<usize>) -> (Vec<String>, usize) {
         let (_env, store) = scratch(tag);
         store.set_seat_cap(seat_cap).unwrap();
         let w = capped_group(&store, kind, n, cap);
@@ -9906,7 +10007,7 @@ fn only_a_working_screen_is_ever_overruled() {
         k.with(|s| s.borrow_mut().drain(..).collect())
     }
 
-    fn go(store: &Store, passed: usize) {
+    pub fn go(store: &Store, passed: usize) {
         let args = Args::synth("worklist", &["advance", "run"], &[("event", "go"), ("passed", &passed.to_string())]);
         assert_eq!(advance(store, &args), 0);
     }
@@ -10321,7 +10422,7 @@ fn only_a_working_screen_is_ever_overruled() {
     // ---- legs (wsp-293) ---------------------------------------------------------
 
     /// `legs::*` applied to the row's record, as the verb that does it would.
-    fn edit_legs(store: &Store, id: &str, f: impl FnOnce(&[crate::legs::Leg]) -> Result<Vec<crate::legs::Leg>, String>) {
+    pub fn edit_legs(store: &Store, id: &str, f: impl FnOnce(&[crate::legs::Leg]) -> Result<Vec<crate::legs::Leg>, String>) {
         let mut t = store.find_task(id).unwrap();
         let new = f(&crate::legs::legs(&t)).unwrap();
         crate::legs::write(&mut t, &new);
@@ -10329,12 +10430,12 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// A row staged with `plan` alone, as `wsp leg add` writes it.
-    fn staged(store: &Store, id: &str, status: Status) {
+    pub fn staged(store: &Store, id: &str, status: Status) {
         task(store, id, status);
         edit_legs(store, id, |_| Ok(vec![crate::legs::Leg::pending("plan", "decide how it splits")]));
     }
 
-    fn add_leg(store: &Store, id: &str, name: &str, after: &[&str], before: Option<&str>, actor: Option<&str>) {
+    pub fn add_leg(store: &Store, id: &str, name: &str, after: &[&str], before: Option<&str>, actor: Option<&str>) {
         edit_legs(store, id, |old| {
             crate::legs::add(
                 old,
@@ -10351,17 +10452,17 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// The seat a spawn gives a leg that opened, as `wsp spawn --leg` writes it.
-    fn seat_leg(store: &Store, id: &str, name: &str, seat: &str) {
+    pub fn seat_leg(store: &Store, id: &str, name: &str, seat: &str) {
         let stand = crate::leg_seat::Standing { room: None, cwd: None, kind: "claude" };
         assert!(crate::leg_seat::attach(store, id, name, seat, &stand), "{name} was not open to seat");
     }
 
     /// `wsp leg done` from the leg's seat.
-    fn leg_done(store: &Store, id: &str, name: &str) {
+    pub fn leg_done(store: &Store, id: &str, name: &str) {
         edit_legs(store, id, |old| crate::legs::finish(old, name, "handed on", "did it", "2026-10-18T10:00:00Z"));
     }
 
-    fn leg_state(store: &Store, id: &str, name: &str) -> crate::legs::State {
+    pub fn leg_state(store: &Store, id: &str, name: &str) -> crate::legs::State {
         crate::legs::legs(&store.find_task(id).unwrap()).into_iter().find(|l| l.name == name).unwrap().state
     }
 
@@ -10506,7 +10607,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// The manager host's fold of a seat's start for `row` (`wsp-028`), as
     /// event `id`: the record that wrote a claim for every leg's seat until
     /// `wsp-334`.
-    fn fold_start(store: &Store, row: &str, seat: &str, id: u64) {
+    pub fn fold_start(store: &Store, row: &str, seat: &str, id: u64) {
         use wsp_host_api::{Epoch, EventId, Frame, Key, Message, RowId, SeatId, SeatStarted};
         let started = SeatStarted { key: Key { row: RowId(row.into()), attempt: 1 }, seat: SeatId(seat.into()), epoch: Epoch(1), pid: 4242, sockets: vec![] };
         assert!(crate::fold::fold(store, "manager", &Frame { id: Some(EventId(id)), req: None, msg: Message::SeatStarted(started) }));
@@ -10514,7 +10615,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// [`seat_leg`] in `cwd`, a directory no repository holds, so the leg's own
     /// `wsp leg done` ([`crate::leg_seat::finish`]) reads no tree as unclean.
-    fn seat_leg_in(store: &Store, id: &str, name: &str, seat: &str, cwd: &std::path::Path) {
+    pub fn seat_leg_in(store: &Store, id: &str, name: &str, seat: &str, cwd: &std::path::Path) {
         let cwd = cwd.display().to_string();
         let stand = crate::leg_seat::Standing { room: None, cwd: Some(&cwd), kind: "claude" };
         assert!(crate::leg_seat::attach(store, id, name, seat, &stand), "{name} was not open to seat");
@@ -10524,7 +10625,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// an hour ago, so far past the member's idle window (`repair::STALLED_AFTER`).
     /// Every process is gone once looked for. This is a leg's seat after its
     /// `wsp leg done`, as wsp-030's read when they were told to finish.
-    struct IdleAnHour;
+    pub struct IdleAnHour;
 
     impl Seats for IdleAnHour {
         fn state(&self, _seat: &str) -> Option<State> {
@@ -10544,7 +10645,7 @@ fn only_a_working_screen_is_ever_overruled() {
     /// What a leg's seat must never be told or flagged as, read off `cycle.log`
     /// and the row's log: the member's idle tell, its end-and-restart and the
     /// close that flags the person (`wsp-334`).
-    fn no_member_word(store: &Store, id: &str) {
+    pub fn no_member_word(store: &Store, id: &str) {
         let log = std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default();
         for word in ["told to finish", "needs a person", "with nothing working on it", "open and not closing"] {
             assert!(!log.contains(word), "{word:?} in cycle.log: {log}");
@@ -10629,7 +10730,7 @@ fn only_a_working_screen_is_ever_overruled() {
     }
 
     /// A row at `doing`: the plan done, two siblings and their join.
-    fn fanned_out(store: &Store, id: &str) {
+    pub fn fanned_out(store: &Store, id: &str) {
         staged(store, id, Status::Doing);
         edit_legs(store, id, |old| {
             let after = |on: &[&str], l: crate::legs::Leg| crate::legs::Leg { after: Some(on.iter().map(|s| s.to_string()).collect()), ..l };
@@ -10645,7 +10746,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// `plan` opened and seated by hand, which is how a row staged in a test
     /// has its first leg run.
-    fn seat_leg_open(store: &Store, id: &str, name: &str, seat: &str) {
+    pub fn seat_leg_open(store: &Store, id: &str, name: &str, seat: &str) {
         crate::leg_seat::open(store, id, name).unwrap();
         seat_leg(store, id, name, seat);
     }
@@ -10705,7 +10806,7 @@ fn only_a_working_screen_is_ever_overruled() {
     // ---- pieces (wsp-506) ------------------------------------------------------------
 
     /// A row with pieces: `(n, batch)` each, pending, under `cap:`.
-    fn pieced(store: &Store, id: &str, status: Status, spec: &[(usize, usize)], cap: usize) {
+    pub fn pieced(store: &Store, id: &str, status: Status, spec: &[(usize, usize)], cap: usize) {
         task(store, id, status);
         let mut t = store.find_task(id).unwrap();
         let mut rec = crate::pieces::Record { cap, ..Default::default() };
@@ -10719,22 +10820,22 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&t).unwrap();
     }
 
-    fn piece_rec(store: &Store, id: &str) -> crate::pieces::Record {
+    pub fn piece_rec(store: &Store, id: &str) -> crate::pieces::Record {
         crate::pieces::record(&store.find_task(id).unwrap())
     }
 
-    fn piece_of(store: &Store, id: &str, n: usize) -> crate::pieces::Piece {
+    pub fn piece_of(store: &Store, id: &str, n: usize) -> crate::pieces::Piece {
         piece_rec(store, id).pieces.into_iter().find(|p| p.n == n).unwrap()
     }
 
     /// The seat a spawn gives a piece that opened, as `wsp spawn --piece` writes it.
-    fn seat_piece(store: &Store, id: &str, n: usize, seat: &str) {
+    pub fn seat_piece(store: &Store, id: &str, n: usize, seat: &str) {
         let stand = crate::piece_seat::Standing { room: None, cwd: None, kind: "claude", spawned: "" };
         assert!(crate::piece_seat::attach(store, id, n, seat, &stand), "piece {n} was not open to seat");
     }
 
     /// `wsp piece done` from the piece's seat, as the record has it after.
-    fn piece_done(store: &Store, id: &str, n: usize) {
+    pub fn piece_done(store: &Store, id: &str, n: usize) {
         let mut t = store.find_task(id).unwrap();
         let mut rec = crate::pieces::record(&t);
         let p = rec.pieces.iter_mut().find(|p| p.n == n).unwrap();
@@ -10745,7 +10846,7 @@ fn only_a_working_screen_is_ever_overruled() {
         store.save_task(&t).unwrap();
     }
 
-    fn closes() -> Vec<String> {
+    pub fn closes() -> Vec<String> {
         drained(&CLOSED)
     }
 
@@ -10845,7 +10946,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// What a batch that did not merge does: files `merge batch N` in a batch of
     /// its own right after, as `piece_close::close` would.
-    fn conflicted(store: &Store, row: &str, batch: usize) -> crate::piece_close::Closed {
+    pub fn conflicted(store: &Store, row: &str, batch: usize) -> crate::piece_close::Closed {
         let added = store.locked(|| {
             let mut t = store.find_task(row).unwrap();
             let rec = crate::pieces::record(&t);
@@ -10987,17 +11088,17 @@ fn only_a_working_screen_is_ever_overruled() {
     // ---- starts that did not take (wsp-335) --------------------------------------
 
     /// Make the misses of `label` as old as they would be `secs` after the last.
-    fn age_start(store: &Store, label: &str, secs: i64) {
+    pub fn age_start(store: &Store, label: &str, secs: i64) {
         store.update_starts(|m| {
             m.get_mut(label).unwrap()["at"] = serde_json::json!(util::epoch_secs() - secs);
         });
     }
 
-    fn flags_on(store: &Store, row: &str) -> Vec<crate::message::Message> {
+    pub fn flags_on(store: &Store, row: &str) -> Vec<crate::message::Message> {
         crate::message::raised(store).into_iter().filter(|m| m.about.task() == Some(row)).collect()
     }
 
-    fn leg_of(store: &Store, id: &str, name: &str) -> crate::legs::Leg {
+    pub fn leg_of(store: &Store, id: &str, name: &str) -> crate::legs::Leg {
         crate::legs::legs(&store.find_task(id).unwrap()).into_iter().find(|l| l.name == name).unwrap()
     }
 
@@ -11216,7 +11317,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// A `doing` row with no seat, left quiet for `secs`, with `lines` on its log
     /// and nothing said of it in `cycle.log`.
-    fn left_unseated(store: &Store, id: &str, lines: &[&str], secs: i64) {
+    pub fn left_unseated(store: &Store, id: &str, lines: &[&str], secs: i64) {
         let mut t = store.find_task(id).unwrap();
         for l in lines {
             t.log(l);
@@ -11226,7 +11327,7 @@ fn only_a_working_screen_is_ever_overruled() {
         std::fs::write(store.state_file("cycle.log"), "").unwrap();
     }
 
-    fn said(store: &Store) -> String {
+    pub fn said(store: &Store) -> String {
         std::fs::read_to_string(store.state_file("cycle.log")).unwrap_or_default()
     }
 
@@ -11746,7 +11847,7 @@ fn only_a_working_screen_is_ever_overruled() {
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review);
     }
 
-    fn leg_done_by_hand(store: &Store) {
+    pub fn leg_done_by_hand(store: &Store) {
         edit_legs(store, "m-1", |old| {
             let mut v = old.to_vec();
             v[0].state = crate::legs::State::Done;
@@ -11847,7 +11948,7 @@ fn only_a_working_screen_is_ever_overruled() {
 
     /// `m-1` of a group run at `x1` is going when it files a row and rests on it
     /// (`wsp after`), and then releases its seat to wait.
-    fn waiting_on_its_prerequisite(tag: &str) -> (util::Isolated, Store, Worklist) {
+    pub fn waiting_on_its_prerequisite(tag: &str) -> (util::Isolated, Store, Worklist) {
         let (env, store) = scratch(tag);
         task(&store, "m-1", Status::Todo);
         let mut w = list(&store, &[(&["m-1"], "claude")]);
@@ -11964,7 +12065,7 @@ fn only_a_working_screen_is_ever_overruled() {
     // ---- the drive lease (wsp-467) ------------------------------------------------
 
     /// `HOME` pointed at a spoke's login for the test, put back however it ends.
-    struct Home(Option<std::ffi::OsString>);
+    pub struct Home(Option<std::ffi::OsString>);
 
     impl Home {
         fn at(home: &std::path::Path) -> Home {
@@ -11983,10 +12084,11 @@ fn only_a_working_screen_is_ever_overruled() {
         }
     }
 
+    #[cfg(test)] // the hub is a dev-dependency, and only engine's own tests serve one
     /// A served hub with `ed` and `jesper` in `shared:team`; this store a spoke
     /// logged in as `me`; three shared rows in `todo` and the `run` list over
     /// them, shared.
-    fn two_spokes(env: &util::Isolated, store: &Store, me: &str) -> (wsp_hub::serve::Running, std::collections::BTreeMap<String, String>, Home) {
+    pub fn two_spokes(env: &util::Isolated, store: &Store, me: &str) -> (wsp_hub::serve::Running, std::collections::BTreeMap<String, String>, Home) {
         let dir = env.path("hub");
         std::fs::create_dir_all(&dir).unwrap();
         let (running, tokens) = crate::hub_lease::tests::serve_users(&dir, &["ed", "jesper"]);

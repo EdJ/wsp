@@ -813,6 +813,19 @@ pub mod tests {
         Client::dial_at(vec![running.addrs()[0].to_string()], ApiToken(tokens[who].clone()), person(who), WAIT).expect("the hub answers")
     }
 
+    /// A double for the root's [`Release`]: what a spoke is left with once a
+    /// seat is lost. Seats' own release is above the engine.
+    pub fn lose(store: &Store, row: &str, why: &str) -> Result<(), String> {
+        for seat in store.panes_for_task(row) {
+            store.clear_binding(&seat);
+        }
+        store.clear_claim(row);
+        let mut t = store.task(row).ok_or_else(|| format!("no row {row}"))?;
+        t.set_status(crate::model::Status::Todo);
+        t.log(why);
+        store.save_task(&t).map_err(|e| e.to_string())
+    }
+
     fn shared_row(store: &Store, id: &str) {
         let mut t = wsp_store::model::Task::new(id, id);
         t.status_raw = "doing".into();
@@ -826,7 +839,7 @@ pub mod tests {
     /// `despawn --lost` does, and B takes it with a higher token.
     #[test]
     fn hub_lease_two_spokes_a_held_row_is_refused_renewed_while_alive_and_follows_the_hub_on_expiry() {
-        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        install(lose, |_, _, _| false);
         let _env = crate::util::isolated("hub-lease-two");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-466-two-{}", std::process::id()));
@@ -904,7 +917,7 @@ pub mod tests {
     /// hub's head for the row is what B left.
     #[test]
     fn hub_fence_a_verdict_and_a_landing_go_under_the_token_and_a_stale_one_is_refused_fenced() {
-        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        install(lose, |_, _, _| false);
         let _env = crate::util::isolated("hub-fence");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-468-fence-{}", std::process::id()));
@@ -973,7 +986,7 @@ pub mod tests {
     /// held elsewhere at that commit, and false for one that is not held elsewhere.
     #[test]
     fn hub_verdict_a_held_verdict_is_pushed_once_and_pulled_into_the_book() {
-        install(|s, r, w| crate::cmd_spawn::release_lost(s, r, w).map(|_| ()), |_, _, _| false);
+        install(lose, |_, _, _| false);
         let _env = crate::util::isolated("hub-verdict-held");
         std::env::remove_var("WSP_CLAIM_TTL");
         let dir = std::env::temp_dir().join(format!("wsp-486-verdict-{}", std::process::id()));
@@ -1437,7 +1450,9 @@ pub mod tests {
             t.for_user = owner.map(str::to_string);
             store.save_task(&t).unwrap();
         }
-        let dialled = || listener.accept().is_ok();
+        // Takes every connection waiting: one dial can leave two, and the second must not count
+        // against a later row.
+        let dialled = || std::iter::from_fn(|| listener.accept().ok()).count() > 0;
 
         let why = before_claim(&store, "wsp-1").unwrap_err();
         assert_eq!(why, "wsp-1 is allocated to ed; it runs on their wsp");

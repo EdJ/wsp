@@ -184,7 +184,7 @@ pub const FINISHED_GRACE_SECS: i64 = 5 * 60;
 /// How long a despawned agent's processes are given to exit before the ending
 /// is called failed. `compound`'s own `stop` already waits out `TERM` and sends
 /// `KILL`, so this is the margin after that, not the whole grace.
-const GONE_WITHIN_MS: u64 = if cfg!(test) { 0 } else { 5_000 };
+const GONE_WITHIN_MS: u64 = 5_000;
 
 /// A verification that holds and still stands — the trigger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,9 +427,10 @@ pub fn tick(store: &Store, seats: &dyn Seats) {
 /// Whether the tick scans finished trees: always, but in a test only where it
 /// asked to on its thread.
 fn scans_finished() -> bool {
-    #[cfg(test)]
-    return tests::SCANS.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::base::under_test() {
+        return tests::SCANS.with(std::cell::Cell::get);
+    }
     true
 }
 
@@ -886,7 +887,7 @@ pub fn handed_to_legs(store: &Store, row: &str, seat: &str, binding: &serde_json
 /// `Ok` once none of `pids` is running, waiting [`GONE_WITHIN_MS`] at most.
 /// The member's check, and the verifier's in [`crate::cycle::end_passes`].
 pub fn confirm_gone(seats: &dyn Seats, pids: &[u32]) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(GONE_WITHIN_MS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(if crate::base::under_test() { 0 } else { GONE_WITHIN_MS });
     loop {
         let running = seats.running(pids);
         if running.is_empty() {
@@ -1360,8 +1361,9 @@ fn said_exit(store: &Store, seat: &str, row: &str, kind: &str, line: &str) -> St
     line.to_string()
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
+pub mod tests {
     use super::*;
 
     #[test]
@@ -1381,7 +1383,7 @@ mod tests {
     /// Seats scripted per seat: what each reads, whether a turn began since the
     /// verdict, its pids — and which pids are still running after an ending.
     #[derive(Default)]
-    struct Fake {
+    pub struct Fake {
         state: BTreeMap<String, State>,
         typed: BTreeMap<String, bool>,
         pids: BTreeMap<String, Vec<u32>>,
@@ -1394,7 +1396,7 @@ mod tests {
     impl Fake {
         /// `cpd-1` the member and `cpd-2` the verifier, both idle, nobody has
         /// typed to either, each with a pid that exits when it is ended.
-        fn at_rest() -> Fake {
+        pub fn at_rest() -> Fake {
             let mut f = Fake::default();
             for (seat, pid) in [("cpd-1", 101), ("cpd-2", 202)] {
                 f.state.insert(seat.into(), State::Idle);
@@ -1437,7 +1439,7 @@ mod tests {
         pub(super) static SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
+    pub fn drain<T>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>) -> Vec<T> {
         cell.with(|c| c.borrow_mut().drain(..).collect())
     }
 
@@ -1445,7 +1447,7 @@ mod tests {
     /// `review`, claimed on `cpd-1`, with one pass in its `## Verification`
     /// that read that commit and holds — its verifier still standing in
     /// `cpd-2`, as `wsp-188` leaves it until the next tick.
-    fn verified(tag: &str) -> (util::Isolated, Store) {
+    pub fn verified(tag: &str) -> (util::Isolated, Store) {
         drain(&DESPAWNED);
         drain(&SAID);
         drain(&TOLD);
@@ -1467,7 +1469,7 @@ mod tests {
     }
 
     /// `m-1`'s one pass, at `state`.
-    fn set_pass(store: &Store, state: crate::verification::State) {
+    pub fn set_pass(store: &Store, state: crate::verification::State) {
         let mut m = store.find_task("m-1").unwrap();
         let mut p = crate::verification::Pass::opened(Some("abc1234".into()), None);
         p.at = "2026-10-06T09:00:00Z".into();
@@ -1480,81 +1482,17 @@ mod tests {
 
     /// One repair pass, in its order: `wsp-188` ends the verifier seats whose
     /// verdict is in, and then this module ends the members.
-    fn pass(store: &Store, seats: &Fake) {
+    pub fn pass(store: &Store, seats: &Fake) {
         crate::cycle::passes_finished(store, seats);
         tick(store, seats);
     }
 
-    fn log_of(store: &Store, id: &str) -> String {
+    pub fn log_of(store: &Store, id: &str) -> String {
         store.find_task(id).unwrap().section("Log").unwrap_or_default().to_string()
     }
 
-    fn member_ended() -> bool {
+    pub fn member_ended() -> bool {
         drain(&DESPAWNED).contains(&"m-1".to_string())
-    }
-
-    /// `wsp-433`: `wsp doctor` found 26 task files with release lines and 43
-    /// worklist files with attempts marked `ended` on disk and in no commit.
-    /// The release (`release_pane`'s claim and log line) and both endings (the
-    /// row's, and the check's on its worklist) leave the store clean.
-    #[test]
-    fn a_release_and_an_attempts_end_leave_the_store_committed() {
-        let (_env, store) = verified("committed");
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "wsp@test"],
-            &["config", "user.name", "wsp test"],
-            &["config", "commit.gpgsign", "false"],
-            &["add", "-A"],
-            &["commit", "-q", "-m", "store"],
-        ] {
-            let ok = wsp_base::calls::Command::new("git").arg("-C").arg(&store.root).args(args).env_remove("GIT_INDEX_FILE").status().unwrap();
-            assert!(ok.success(), "git {args:?}");
-        }
-        let loose = || {
-            let out = wsp_base::calls::Command::new("git")
-                .arg("-C")
-                .arg(&store.root)
-                .args(["status", "--porcelain"])
-                .env_remove("GIT_INDEX_FILE")
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        assert_eq!(loose(), "", "the baseline is clean");
-
-        // The member's ending, then the release line a seat's ending writes.
-        pass(&store, &Fake::at_rest());
-        assert!(log_of(&store, "m-1").contains("ended: verification holds"), "{}", log_of(&store, "m-1"));
-        assert_eq!(loose(), "", "the row's ending is committed");
-        let (removed, task) = crate::cmd_agent::release_pane(&store, "cpd-1");
-        assert!(removed && task.as_deref() == Some("m-1"));
-        assert!(log_of(&store, "m-1").contains("released"), "{}", log_of(&store, "m-1"));
-        assert_eq!(loose(), "", "the release line is committed");
-
-        // And a check marked ended on its worklist.
-        let mut w = store.worklist("run").unwrap();
-        let mut g = w.groups();
-        g[0].checks.push(crate::barrier::Check {
-            at: "2026-10-06T09:00:00Z".into(),
-            state: crate::barrier::State::Running,
-            read: None,
-            pane: Some("cpd-9".into()),
-            on: Some("claude sonnet/high".into()),
-            ending: crate::barrier::Ending::Standing,
-            was: None,
-            tries: 1,
-            gave_up: false,
-            suite: None,
-            run: None,
-            by: None,
-        });
-        w.set_groups(&g);
-        store.save_worklist(&w).unwrap();
-        store.git_commit("test: a check");
-        assert_eq!(loose(), "");
-        assert!(crate::barrier::mark_ended(&store, "cpd-9", true));
-        assert!(loose().is_empty(), "the attempt's end is committed: {}", loose());
     }
 
     #[test]
@@ -1761,7 +1699,7 @@ mod tests {
     }
 
     /// `m-1` made a retro row, its pass decided `ago` seconds before now.
-    fn retro(store: &Store, ago: i64) {
+    pub fn retro(store: &Store, ago: i64) {
         let mut m = store.find_task("m-1").unwrap();
         m.tags.push(RETRO_TAG.into());
         store.save_task(&m).unwrap();
@@ -1965,7 +1903,7 @@ mod tests {
     }
 
     /// `m-1`'s pass decided `ago` seconds before now, its tags left alone.
-    fn retro_decided(store: &Store, ago: i64) {
+    pub fn retro_decided(store: &Store, ago: i64) {
         let mut m = store.find_task("m-1").unwrap();
         let mut ps = crate::verification::passes(&m);
         ps[0].decided = Some(util::iso_at(util::epoch_secs() - ago));
@@ -2011,7 +1949,7 @@ mod tests {
 
     /// `m-1` as `wsp-340` found five: landed, at review, its verdict holding, and
     /// its claim and binding let go — the pane still open at `cpd-1`.
-    fn released(tag: &str) -> (util::Isolated, Store, Fake) {
+    pub fn released(tag: &str) -> (util::Isolated, Store, Fake) {
         let (env, store) = verified(tag);
         let mut m = store.find_task("m-1").unwrap();
         m.log("claimed by pane cpd-1 · spawned at sonnet/high");
@@ -2068,7 +2006,7 @@ mod tests {
         assert!(drain(&DESPAWNED).is_empty(), "nobody answered, so there is nothing to sweep");
     }
 
-    fn verifier_ending(store: &Store) -> Ending {
+    pub fn verifier_ending(store: &Store) -> Ending {
         crate::verification::passes(&store.find_task("m-1").unwrap())[0].ending.clone()
     }
 
@@ -2131,7 +2069,7 @@ mod tests {
         assert!(log_of(&store, "m-1").contains("ended: verification holds at abc1234"));
     }
 
-    fn set_list(store: &Store, status: WorklistStatus, agent: &str) {
+    pub fn set_list(store: &Store, status: WorklistStatus, agent: &str) {
         let mut w = Worklist::new("run", "run");
         w.set_status(status);
         w.set_groups(&[Group { members: vec!["m-1".into()], agent: agent.into(), ..Group::default() }]);
@@ -2211,7 +2149,7 @@ mod tests {
 
     /// A staged row `s-1` at `review`, landed, every leg done, handed over by
     /// `cpd-7`, which is bound to nothing now.
-    fn staged_row(tag: &str) -> (util::Isolated, Store) {
+    pub fn staged_row(tag: &str) -> (util::Isolated, Store) {
         drain(&DESPAWNED);
         drain(&SAID);
         DESPAWN_FAILS.with(|f| *f.borrow_mut() = None);
@@ -2230,7 +2168,7 @@ mod tests {
         (env, store)
     }
 
-    fn finish_row(store: &Store) {
+    pub fn finish_row(store: &Store) {
         let mut t = store.find_task("s-1").unwrap();
         let mut legs = crate::legs::legs(&t);
         legs[0].state = crate::legs::State::Done;
@@ -2239,11 +2177,11 @@ mod tests {
         crate::log::note(store, &mut t, &format!("{} abc1234", crate::repair::LANDED)).unwrap();
     }
 
-    fn seat_ended() -> bool {
+    pub fn seat_ended() -> bool {
         drain(&DESPAWNED).contains(&"cpd-7".to_string())
     }
 
-    fn lone() -> Fake {
+    pub fn lone() -> Fake {
         let mut f = Fake::default();
         f.state.insert("cpd-7".into(), State::Idle);
         f.typed.insert("cpd-7".into(), false);
@@ -2374,13 +2312,13 @@ mod tests {
         root.kill().unwrap();
         root.wait().unwrap();
         let after = crate::place_super::tree_of(root.id());
-        let running = crate::cycle::Fleet.running(&tree);
+        let running = crate::cycle::seats().running(&tree);
         // By pid, never by pattern — this test's own sleep and nothing else.
         crate::host::Host::signal(&crate::host::LOCAL, &[child], "TERM");
         assert!(after.contains(&child), "still in the group with its parent gone: {after:?}");
         assert_eq!(running, vec![child], "the seat's root is gone and its agent is not");
     }
-    struct Quiet(Vec<(String, String)>);
+    pub struct Quiet(Vec<(String, String)>);
     impl Seats for Quiet {
         fn state(&self, _seat: &str) -> Option<crate::place::State> {
             None
@@ -2505,7 +2443,7 @@ mod tests {
     // ---- `wsp-615`: an accepted exit ends its seat ----------------------------
 
     /// The run's places, with every seat seen working: what the cap counts.
-    fn counted_now(store: &Store) -> Vec<String> {
+    pub fn counted_now(store: &Store) -> Vec<String> {
         let r = crate::room::Records::read(store);
         crate::room::working(&r, &|_| crate::room::Look::Working).into_iter().map(|c| c.what).collect()
     }
@@ -2514,7 +2452,7 @@ mod tests {
     /// its verifier on `cpd-2` with its verdict (holds) on the pass, and a check
     /// on `cpd-3` standing on the barrier entry of `run`'s group 1, which it
     /// passed. Each idle with a pid, nobody having typed since.
-    fn three_exits(tag: &str) -> (util::Isolated, Store, Fake) {
+    pub fn three_exits(tag: &str) -> (util::Isolated, Store, Fake) {
         let (env, store) = verified(tag);
         drain(&crate::cycle::tests::KEPT);
         // What the pass's start wrote: the load, kept at its end, and a reading
@@ -2540,11 +2478,11 @@ mod tests {
     }
 
     /// The check entry's ending on group 1.
-    fn check_ending(store: &Store) -> crate::barrier::Ending {
+    pub fn check_ending(store: &Store) -> crate::barrier::Ending {
         store.worklist("run").unwrap().groups()[0].checks[0].ending
     }
 
-    fn the_pass(store: &Store) -> crate::verification::Pass {
+    pub fn the_pass(store: &Store) -> crate::verification::Pass {
         crate::verification::passes(&store.find_task("m-1").unwrap()).remove(0)
     }
 
@@ -2634,7 +2572,7 @@ mod tests {
 
     /// How many times the check's seat `cpd-3` was ended since last asked —
     /// the fixture's member is the tick's to end too, and not what is asked.
-    fn checks_ended() -> usize {
+    pub fn checks_ended() -> usize {
         drain(&DESPAWNED).iter().filter(|e| *e == "cpd-3").count()
     }
 
@@ -2788,7 +2726,7 @@ mod tests {
     /// A `yes` started in `tree` in the background by a shell that then exits:
     /// orphaned, its parent pid 1 as wsp-693's eight burners were (or, on
     /// Linux, the subreaper that adopted it: `check_tree::orphaned`).
-    fn orphaned_yes(tree: &std::path::Path) -> u32 {
+    pub fn orphaned_yes(tree: &std::path::Path) -> u32 {
         let out = wsp_base::calls::Command::new("sh")
             .args(["-c", "yes >/dev/null 2>&1 </dev/null & echo $!"])
             .current_dir(tree)
@@ -2809,7 +2747,7 @@ mod tests {
 
     /// The seat's agent: a shell standing in `tree` with a `sleep` under it,
     /// its one direct child.
-    fn agent_in(tree: &std::path::Path) -> wsp_base::calls::Child {
+    pub fn agent_in(tree: &std::path::Path) -> wsp_base::calls::Child {
         wsp_base::calls::Command::new("sh")
             .args(["-c", "sleep 60; true"])
             .current_dir(tree)
@@ -2818,7 +2756,6 @@ mod tests {
             .unwrap()
     }
 
-    /// The pids under `parent`, read now.
     /// Copy a system binary to run under another name. macOS kills a copied
     /// system binary at once (its signature names the old path), so on macOS
     /// the copy is signed ad hoc.
@@ -2830,18 +2767,19 @@ mod tests {
         }
     }
 
-    fn children_of(parent: u32) -> Vec<u32> {
+    /// The pids under `parent`, read now.
+    pub fn children_of(parent: u32) -> Vec<u32> {
         crate::check_tree::exes().into_iter().filter(|(_, pp, _)| *pp == parent).map(|r| r.0).collect()
     }
 
-    fn alive(pids: &[u32]) -> Vec<u32> {
+    pub fn alive(pids: &[u32]) -> Vec<u32> {
         let mut a: Vec<u32> = crate::host::Host::alive(&crate::host::LOCAL, pids).into_iter().collect();
         a.sort();
         a
     }
 
     /// A tree of the test's own, `.worktrees/<row>` under a fresh root.
-    fn own_tree(row: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    pub fn own_tree(row: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("wsp-691-{}-{}", std::process::id(), util::epoch_nanos()));
         let tree = root.join(crate::cmd_checkout::WORKTREES).join(row);
         std::fs::create_dir_all(&tree).unwrap();

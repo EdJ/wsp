@@ -96,7 +96,7 @@ pub struct Sent {
     pub fresh: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// A test's store: [`door`] answers through it as though under `store`.
     pub static TEST_DOOR: std::cell::RefCell<Option<wsp_server::SharedStore>> =
@@ -105,7 +105,7 @@ thread_local! {
 
 /// The door, when the orders machine owns orders; `None` under `files`.
 pub fn door(store: &Store) -> Option<Door<'_>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(db) = TEST_DOOR.with(|d| d.borrow().clone()) {
         return Some(Door { store, db: Some(db) });
     }
@@ -171,7 +171,8 @@ pub fn first_ending(store: &Store, seat: &str) -> bool {
     ENDED.lock().map(|mut e| e.insert(key)).unwrap_or(true)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
     use std::time::Duration;

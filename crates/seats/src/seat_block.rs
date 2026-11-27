@@ -113,7 +113,6 @@ pub fn sync_now(store: &Store) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hold::tests::{at, scratch};
 
     fn read(state: State) -> Vec<Reading> {
         let screen = "Which database?\n 1. Postgres\n 2. SQLite\nenter to select".to_string();
@@ -123,8 +122,7 @@ mod tests {
     #[test]
     fn a_seat_blocked_at_a_question_raises_one_item_with_its_text_and_clears_when_it_moves_on() {
         for next in [State::Idle, State::Working] {
-            let root = scratch(&format!("seat-block-{}", next.as_str()));
-            let store = at(&root);
+            let store = crate::testkit::store(&format!("seat-block-{}", next.as_str()));
             assert_eq!(sync(&store, &read(State::Blocked)), (1, 0));
             assert_eq!(sync(&store, &read(State::Blocked)), (0, 0), "once per spell, not once per pass");
             let items = crate::cmd_message::yours_in(&store, None);

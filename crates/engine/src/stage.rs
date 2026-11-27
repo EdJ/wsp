@@ -477,7 +477,7 @@ pub fn sayings(store: &Store) -> BTreeMap<String, String> {
     }
     for (seat, b) in store.bindings() {
         if let Some(task) = b.get("task_id").and_then(|v| v.as_str()) {
-            if let Some(s) = crate::cmd_agent::sentence(&said, &seat, Some(task)) {
+            if let Some(s) = sentence(&said, &seat, Some(task)) {
                 out.insert(task.to_string(), s);
             }
         }
@@ -510,7 +510,7 @@ pub fn census(store: &Store, doing: &[&Task]) -> BTreeMap<String, Agent> {
             }
             let workspace = seat.split(':').next().unwrap_or(seat);
             let governs = crate::place::governs(&governors, &crate::place::seat_query(workspace, Some(seat))).is_some();
-            let agent = match crate::cmd_govern::needs_a_person(s.state.stopped(), true, governs) {
+            let agent = match wsp_view::stage::needs_a_person(s.state.stopped(), true, governs) {
                 true => Agent::WantsYou,
                 false => Agent::Working,
             };
@@ -661,6 +661,88 @@ pub fn filed(
             (t.id.clone(), Filed { told, steps, live })
         })
         .collect()
+}
+
+/// The sentence a seat's agent last said about itself, while it is still
+/// about the work the seat holds.
+///
+/// Not [`full_name`], which answers *what is the whole of this label* and is
+/// invalidated by a rename. This answers *what did the agent say it is doing*,
+/// for a surface drawing no label of ours — a compound pane header, `wsp wip`
+/// — and what makes it stale is the seat's work changing under it: a sentence
+/// said on one task is not a statement about the next one, or about none. The
+/// task is compared rather than trusted to have been cleared, for the reason
+/// `full_name` compares the label: every claim, release and handoff would
+/// otherwise have to remember this record, and the one that forgot would put
+/// a sentence about old work over new work.
+pub fn sentence(said: &BTreeMap<String, serde_json::Value>, pane: &str, held: Option<&str>) -> Option<String> {
+    let entry = said.get(pane)?;
+    let task = entry.get("task").and_then(|t| t.as_str());
+    let said = entry.get("said").and_then(|s| s.as_str()).filter(|s| !s.is_empty())?;
+    (task == held).then(|| said.to_string())
+}
+
+/// What a pane wears while its agent is looking for a task.
+///
+/// State first, project second, because the ellipsis falls on the right: a
+/// sidebar draws 26 columns, and `looking for work in stra…` still says
+/// the thing a person scanning a column of panes is scanning for. The project
+/// is the half they can usually read off the workspace row anyway.
+pub fn looking_label(project: Option<&str>, found: bool) -> String {
+    match (found, project) {
+        (true, Some(p)) => format!("looking for work in {p}"),
+        (true, None) => "looking for work".into(),
+        (false, Some(p)) => format!("nothing actionable in {p}"),
+        (false, None) => "nothing actionable".into(),
+    }
+}
+
+/// Say, on the pane, that this agent has nothing in hand and is looking.
+///
+/// The gap this fills is the one between being sent to find work and having
+/// found it. `claim` names the pane after the task, so everything from the
+/// claim onwards is visible from outside — but the minute or two before it, in
+/// which an agent reads a backlog, writes an overview and decides, showed
+/// whatever the pane was called last. From outside that is indistinguishable
+/// from an agent that read its instruction and did nothing.
+///
+/// Two conditions, and both are about the caller rather than the answer:
+///
+/// *An agent.* A person running `wsp next` in a shell is asking a question,
+/// not reporting a state, and their pane is not ours to rename.
+///
+/// *Holding nothing.* A bound pane running `next` is peeking at what comes
+/// after the thing it is in the middle of — and `next` deliberately keeps that
+/// pane's own `doing` task in the running, so the answer is often the task it
+/// already has. Renaming there would replace a true name with a false one. It
+/// is also why this needs no separate hook for the panel's `f`: `find_work`
+/// refuses on an agent that still holds a task, so an agent sent looking is
+/// unbound by the time it asks.
+///
+/// Nothing here is worth failing a command over, so every failure is silent —
+/// the same bargain `claim`'s rename makes.
+///
+/// Said the way [`say`] says things, since wsp-115: into the record first, so
+/// a seat no host draws still says it is looking. *An agent* is asked of the
+/// backend that seated it — a supervisor sets its seat variable only on a
+/// process it spawned as one, so a seat that arrived by that name is driven by
+/// construction.
+pub fn say_looking(store: &Store, project: Option<&str>, found: bool) {
+    let Some(pane) = crate::place::my_pane() else { return };
+    if crate::place::seat_from_env().is_none() {
+        return;
+    }
+    let holds = store
+        .bindings()
+        .get(&pane)
+        .and_then(|b| b.get("task_id"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|id| store.task(id).is_some());
+    if holds {
+        return;
+    }
+    let label = looking_label(project, found);
+    store.set_sentence(&pane, &label, None);
 }
 
 #[cfg(test)]

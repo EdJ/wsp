@@ -273,7 +273,7 @@ fn entry_of(store: &Store, l: &Listed, seat_cap: Option<usize>) -> Entry {
 
 /// Places free under the seat's cap, counted as the run counts them.
 fn free_places(store: &Store) -> Option<usize> {
-    let gate = crate::room::Gate::new(store, &crate::cycle::Fleet);
+    let gate = crate::room::Gate::new(store, crate::cycle::seats());
     gate.free_places()
 }
 
@@ -346,7 +346,7 @@ pub fn read_on(store: &Store, listed: &[Listed], machine: Option<Machine>) -> Ve
     // One count of the working agents, taken when first asked, for the
     // room and for the lists waiting on a person.
     let counted: std::cell::OnceCell<Vec<crate::room::Counted>> = std::cell::OnceCell::new();
-    let working = || counted.get_or_init(|| crate::room::working_now(store, &crate::cycle::Fleet)).clone();
+    let working = || counted.get_or_init(|| crate::room::working_now(store, crate::cycle::seats())).clone();
     let machine = machine.unwrap_or_else(|| Machine::counted(store, &working));
     let mut world = World { free: machine.free, throttled: machine.throttled, ..World::default() };
     for l in listed {

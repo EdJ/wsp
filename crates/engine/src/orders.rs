@@ -581,19 +581,40 @@ pub fn principal(from: &str) -> Principal {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports, dead_code))]
 pub mod tests {
     use super::*;
     use std::sync::Arc;
     use wsp_store_contract::{Entity, Fence, LeaseName, Leases, MachineName, Seat, SeatState};
 
+    /// How a `state.db` is opened. Layering lets engine name the sqlite crate in its dev-dependencies only,
+    /// so a dependent's tests hand the open in from theirs ([`install_db`]), as `main` installs `Seats`.
+    pub type Opener = fn(&std::path::Path, Arc<dyn wsp_store_contract::Domain + Send + Sync>) -> SharedStore;
+
+    #[cfg(not(test))]
+    static OPENER: std::sync::OnceLock<Opener> = std::sync::OnceLock::new();
+
+    #[cfg(not(test))]
+    pub fn install_db(open: Opener) {
+        let _ = OPENER.set(open);
+    }
+
+    #[cfg(not(test))]
+    pub fn open_db(path: &std::path::Path, domain: Arc<dyn wsp_store_contract::Domain + Send + Sync>) -> SharedStore {
+        (OPENER.get().expect("no opener installed: call orders::tests::install_db first"))(path, domain)
+    }
+
+    #[cfg(test)]
+    pub fn open_db(path: &std::path::Path, domain: Arc<dyn wsp_store_contract::Domain + Send + Sync>) -> SharedStore {
+        Arc::new(wsp_store_sqlite::SqliteStore::open(path, domain).unwrap())
+    }
+
     /// A fresh `state.db` under `dir`, its domain the composed one under `mode`.
     pub fn db(dir: &std::path::Path, mode: wsp_server::Mode) -> SharedStore {
         std::fs::create_dir_all(dir).unwrap();
         let _ = std::fs::remove_file(dir.join("state.db"));
-        Arc::new(
-            wsp_store_sqlite::SqliteStore::open(dir.join("state.db"), Arc::new(wsp_server::Composed::new(mode))).unwrap(),
-        )
+        open_db(&dir.join("state.db"), Arc::new(wsp_server::Composed::new(mode)))
     }
 
     /// `seat` mirrored into `db` in `state`, as the fold puts it.

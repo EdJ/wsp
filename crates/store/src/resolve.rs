@@ -632,6 +632,20 @@ pub fn list_root(store: &crate::store::Store, index: &Index, list: &str) -> Opti
     tally.into_iter().rev().max_by_key(|(_, n)| *n).map(|(r, _)| r)
 }
 
+/// What `-p` names, or why it cannot: `None` when it was not given. Split from
+/// [`current_project`] so the refusal is a string a test can read — the verbs
+/// that print it are all `eprintln!` and an exit code.
+pub fn named_project(args: &crate::base::args::Args, index: &Index) -> Option<Result<Option<String>, String>> {
+    let p = args.get("project")?;
+    if p == "none" || p == "inbox" {
+        return Some(Ok(None));
+    }
+    Some(match index.find(&p) {
+        Some(found) => Ok(Some(found.id.clone())),
+        None => Err(util::no_such("project", &p)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

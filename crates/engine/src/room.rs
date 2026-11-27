@@ -354,7 +354,7 @@ pub fn working(r: &Records, look: &dyn Fn(&str) -> Look) -> Vec<Counted> {
     let fresh = |at: &str| now - util::epoch_of(at) <= WEDGED_AFTER;
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    let governor = |seat: &str| crate::cmd_agent::governs_seat(&r.governors, seat);
+    let governor = |seat: &str| governs_seat(&r.governors, seat);
     // `since` is when the record opened, where one says: a seat still reading
     // `starting` that long after is not an agent that is coming up.
     // **`settled`: a verdict is recorded** (`wsp-385`) — a verifier's, or a check's
@@ -660,6 +660,13 @@ pub fn names(counted: &[Counted]) -> String {
         out.push(format!("{} more", counted.len() - SHOWN));
     }
     out.join(", ")
+}
+
+/// Whether `seat` is a project's governor seat, through the same query `wip`
+/// draws its `▣` from.
+pub fn governs_seat(governors: &BTreeMap<String, Value>, seat: &str) -> bool {
+    let workspace = seat.split(':').next().unwrap_or(seat);
+    crate::place::governs(governors, &crate::place::seat_query(workspace, Some(seat))).is_some()
 }
 
 #[cfg(test)]

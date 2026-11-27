@@ -489,7 +489,7 @@ When a custodian is talked to directly about work that is not its project's,
 it does not take the work on. It names the primary interface, or with Ed's yes
 it passes the request on itself with `wsp govern primary --tell`, and then it
 goes back to its own project. That is one sentence added to the custodial work
-order (`Handover::Custodian` in `crates/engine/src/cmd_spawn.rs`), and it is there now. What it removes is what
+order (`Handover::Custodian` in `crates/seats/src/cmd_spawn.rs`), and it is there now. What it removes is what
 happened on gpui-migration: exceptions made on Ed's say-so that then rode in
 one custodian's thread for the rest of the run.
 

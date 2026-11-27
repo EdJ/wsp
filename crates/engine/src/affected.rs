@@ -1004,7 +1004,15 @@ mod tests {
         match reach(&paths(&["crates/engine/src/affected.rs"]), &read) {
             Reach::Crates(c, d) => {
                 assert_eq!(c, ["wsp-engine"]);
-                assert!(d.iter().any(|n| n == "wsp"), "{d:?}");
+                assert!(d.iter().any(|n| n == "wsp") && d.iter().any(|n| n == "wsp-seats"), "{d:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A seats-only edit (wsp-441) runs the seats' tests and the root package's, never the engine's.
+        match reach(&paths(&["crates/seats/src/wake.rs"]), &read) {
+            Reach::Crates(c, d) => {
+                assert_eq!(c, ["wsp-seats"]);
+                assert_eq!(d, ["wsp"]);
             }
             other => panic!("{other:?}"),
         }

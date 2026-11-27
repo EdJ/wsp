@@ -533,8 +533,8 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let words: &[(&str, &[&str])] = &[
             ("crates/engine/src/ending.rs", &["wsp: the seat of an accepted exit had already gone —"]),
-            ("crates/engine/src/cmd_spawn.rs", &["started but never became ready for input"]),
-            ("crates/engine/src/wake.rs", &["typed at the seat — no turn seen yet"]),
+            ("crates/seats/src/cmd_spawn.rs", &["started but never became ready for input"]),
+            ("crates/seats/src/wake.rs", &["typed at the seat — no turn seen yet"]),
             ("crates/engine/src/cmd_task.rs", &["but its pane did not get it"]),
             ("crates/engine/src/repair.rs", &[
                 "the screen says working and opencode finished",
