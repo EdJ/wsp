@@ -225,7 +225,7 @@ impl Holds {
 /// The member's newest verification, if it holds and nothing has moved past it.
 ///
 /// **The one place this module reads a verdict.** A pass at `holds` whose
-/// `read` is not the member's latest landing was overtaken by one: that landing
+/// `read` (or the commit its hold landed) is not the member's latest landing was overtaken by one: that landing
 /// has not been read, and it is a new verdict that ends the agent, if any does.
 /// The time is the pass's `decided`; a pass written before `decided` existed
 /// falls back to when it was opened, which only widens what counts as typed.
@@ -236,8 +236,10 @@ fn holds(tasks: &[Task], member: &Task) -> Option<Holds> {
         return None;
     }
     let now = crate::repair::landed(member);
+    // A hold that rebased onto a moved trunk landed the work it read under a
+    // new commit, which the pass names (`wsp-853`): not a later landing.
     if let (Some(read), Some(now)) = (p.own(), now.as_deref()) {
-        if !same_commit(read, now) {
+        if !same_commit(read, now) && !p.landed.as_deref().is_some_and(|l| same_commit(l, now)) {
             return None;
         }
     }
@@ -1580,6 +1582,32 @@ pub mod tests {
         assert_eq!(store.find_task("m-1").unwrap().status(), Status::Review);
         pass(&store, &seats);
         assert!(drain(&DESPAWNED).is_empty(), "once");
+    }
+
+    /// `wsp-853`: wsp-490's cpd-726 was still in a turn when its verifier
+    /// started, so it was not handed over; the trunk had moved, so the hold
+    /// landed the work rebased. That commit is the verdict's own, and the next
+    /// tick ends the seat. A landing past it is still unread.
+    #[test]
+    fn a_member_in_a_turn_when_its_verifier_started_is_ended_after_a_hold_that_landed_it_rebased() {
+        let (_env, store) = verified("rebased-hold");
+        set_pass(&store, crate::verification::State::Running);
+        pass(&store, &Fake::at_rest().with("cpd-1", State::Working));
+        assert!(!member_ended(), "mid-turn as the verifier starts");
+
+        set_pass(&store, crate::verification::State::Holds);
+        let mut m = store.find_task("m-1").unwrap();
+        let mut ps = crate::verification::passes(&m);
+        ps[0].landed = Some("def5678".into());
+        crate::verification::write(&mut m, &ps);
+        crate::log::note(&store, &mut m, &format!("{} def5678", crate::repair::LANDED)).unwrap();
+        drain(&SAID);
+        pass(&store, &Fake::at_rest());
+        assert!(member_ended(), "the commit the hold landed is the work it read");
+        let log = log_of(&store, "m-1");
+        assert_eq!(log.matches("ended: verification holds at abc1234").count(), 1, "{log}");
+        let said = drain(&SAID);
+        assert!(said.iter().any(|l| l.contains("m-1 (cpd-1) ended — verification holds at abc1234")), "{said:?}");
     }
 
     /// `wsp-430`: a block after the seat has gone starts a rework seat, whose
