@@ -2329,15 +2329,16 @@ fn skipped(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     }
 }
 
-// ---- a parked member the barrier waits on --------------------------------
+// ---- a member the barrier waits on and this run will not start -----------
 
-/// The marker on a parked member's `## Log` for what `cycle.log` and the
+/// The marker on such a member's `## Log` for what `cycle.log` and the
 /// person were last told about the run waiting on it. The list and group follow
 /// it: a row cut or moved to another place is a new wait there.
 const PARKED_WAIT: &str = "wsp: the run waits on this parked row:";
 
-/// The headline of the person's item about a parked member of `list`, or one
-/// unparked and still claimed, and what finds it again once the wait is over.
+/// The headline of the person's item about a member of `list` that is parked,
+/// unparked and still claimed, or claimed by another list's run, and what finds
+/// it again once the wait is over.
 fn parked_headline(row: &str, list: &str) -> String {
     format!("the {list} run waits on {row} and will not start it")
 }
@@ -2354,7 +2355,20 @@ fn unparked_but_claimed(store: &Store, id: &str, claims: &std::collections::BTre
     last.is_some_and(|l| l.starts_with("parked: "))
 }
 
-/// Close the open items about this run's parked members that `over` names.
+/// The other list whose run started `id` and whose claim stands on it at
+/// `doing` (`wsp-946`: `wsp worklist add --also` keeps a row in two lists).
+/// A claim made by hand since that start is not the other list's. At `review`
+/// the run reads the row as its own member and says what it is owed.
+fn claimed_elsewhere(store: &Store, id: &str, list: &str, claims: &std::collections::BTreeMap<String, serde_json::Value>) -> Option<String> {
+    let t = store.find_task(id).filter(|t| t.status() == Status::Doing && claims.contains_key(&t.id))?;
+    let log = t.section("Log").unwrap_or_default();
+    let owned = crate::cycle::OWNED;
+    let last = log.lines().map(|l| undated(l.trim())).filter(|l| l.starts_with(owned) || fresh_start(l)).last()?;
+    let by = last.strip_prefix(owned)?.split_whitespace().next()?;
+    (by != list).then(|| by.to_string())
+}
+
+/// Close the open items about this run's waiting members that `over` names.
 fn lapse_parked(store: &Store, list: &str, why: &str, over: impl Fn(&str) -> bool) {
     use crate::message::{self, Party};
     for m in store.messages().into_values().filter(|m| m.is_open() && m.from == Party::wsp()) {
@@ -2365,9 +2379,10 @@ fn lapse_parked(store: &Store, list: &str, why: &str, over: impl Fn(&str) -> boo
     }
 }
 
-/// Say, and ask the person about, a member of the current group that is parked
-/// and so will never be started (`wsp-851`: cr-events-3 waited 116 min on one
-/// whose prerequisite had landed, and `cycle.log` said nothing).
+/// Say, and ask the person about, a member of the current group that this run
+/// will not start: parked (`wsp-851`: cr-events-3 waited 116 min on one whose
+/// prerequisite had landed, and `cycle.log` said nothing), or at work for
+/// another list.
 ///
 /// A member whose `after:` rows have all landed is said at once. One with no
 /// landed prerequisite is said once nothing else holds the group: every other
@@ -2378,6 +2393,9 @@ fn lapse_parked(store: &Store, list: &str, why: &str, over: impl Fn(&str) -> boo
 /// at once with the verb that ends the claim ([`unparked_but_claimed`]): nothing
 /// here ends a seat, so none is started beside one.
 ///
+/// A member another list's run claimed ([`claimed_elsewhere`]) is said once
+/// nothing else holds the group, naming that list and the cut.
+///
 /// Once per reason and group, in `cycle.log` and to the person alike; a changed
 /// reason replaces the item, and a member the run no longer waits on this way
 /// has its item closed. The item is a question for the person, so it is in `wsp yours` and
@@ -2387,20 +2405,22 @@ fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
     let parked = |s: &worklist::Standing| s.settlement == worklist::Settlement::Open(Status::Parked);
     let claims = store.claims();
     let stranded = |s: &worklist::Standing| unparked_but_claimed(store, &s.id, &claims);
-    let waits = |s: &worklist::Standing| parked(s) || stranded(s);
-    lapse_parked(store, &w.id, "the run no longer waits on it as a parked row", |row| {
+    let elsewhere = |s: &worklist::Standing| claimed_elsewhere(store, &s.id, &w.id, &claims);
+    let waits = |s: &worklist::Standing| parked(s) || stranded(s) || elsewhere(s).is_some();
+    lapse_parked(store, &w.id, "the run no longer waits on it this way", |row| {
         !pos.members.iter().any(|s| s.id == row && waits(s))
     });
     let tasks = store.tasks_shared();
-    let only_parked = pos.members.iter().all(|s| waits(s) || (s.finished() && crate::cycle::verified(&tasks, &s.id)));
+    let only_waiting = pos.members.iter().all(|s| waits(s) || (s.finished() && crate::cycle::verified(&tasks, &s.id)));
     let mut repos = None;
     for s in pos.members.iter().filter(|s| waits(s)) {
         let stranded = stranded(s);
+        let elsewhere = elsewhere(s);
         let Some(t) = store.find_task(&s.id) else { continue };
         let (done, owed): (Vec<&str>, Vec<&str>) =
             t.after.iter().map(String::as_str).partition(|o| crate::after::landed(store, &mut repos, o));
-        let due = !done.is_empty() && owed.is_empty();
-        if !stranded && !due && !only_parked {
+        let due = parked(s) && !done.is_empty() && owed.is_empty();
+        if !stranded && !due && !only_waiting {
             continue;
         }
         let prerequisite = if due {
@@ -2416,9 +2436,10 @@ fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
             Some(r) => format!("{prerequisite}; parked: \"{}\"", util::truncate(r, 200)),
             None => prerequisite,
         };
-        let (state, why) = match stranded {
-            true => ("unparked but still claimed", "the run starts a todo row only when nobody claims it".to_string()),
-            false => ("parked", why),
+        let (state, why) = match &elsewhere {
+            Some(by) => ("claimed by another list", format!("the {by} run started it and holds the claim")),
+            None if stranded => ("unparked but still claimed", "the run starts a todo row only when nobody claims it".to_string()),
+            None => ("parked", why),
         };
         let place = format!("{PARKED_WAIT} {} group {at}:", w.id);
         if !said_once_per_reason(store, &s.id, &place, &format!("{place} {state}, {why}")) {
@@ -2426,6 +2447,7 @@ fn parked_members(store: &Store, w: &Worklist, at: usize, pos: &Position) {
         }
         let cut = format!("`wsp worklist cut {} {} --why \"…\"` takes it out of the group.", w.id, s.id);
         let verbs = match stranded {
+            _ if elsewhere.is_some() => cut,
             true => format!(
                 "`wsp despawn {row}` ends the seat that holds it and the run then starts it (`wsp release {row}` where \
                  no seat is left to end); {cut}",
@@ -5451,6 +5473,76 @@ fn a_seat_nobody_can_be_asked_about_is_not_something_the_guard_will_open() {
         assert!(said.len() == 1 && said[0].starts_with("run group 2:"), "{said:?}");
         let asked = items(&store);
         assert!(asked.len() == 1 && asked[0].contains("Group 2:"), "{asked:?}");
+    }
+
+    /// `wsp-946`: the third member is in `other` too, and that run started it.
+    /// Said and asked once, naming the list and the cut; the item closes when
+    /// the cut takes the member out of the group.
+    #[test]
+    fn a_group_held_by_a_member_claimed_by_another_list_is_said_once_until_cut() {
+        let (_env, store) = scratch("claimedelsewhere");
+        for id in ["m-1", "m-2"] {
+            member(&store, id, Status::Review);
+            crate::verification::record(&store, id, crate::verification::State::Holds, "it holds", None, None).unwrap();
+        }
+        let mut t = Task::new("m-3", "m-3");
+        t.set_status(Status::Doing);
+        t.log(&format!("{} other group 1", crate::cycle::OWNED));
+        store.save_task(&t).unwrap();
+        let mut other = list(&store, &["m-3"], "claude");
+        other.id = "other".into();
+        store.save_worklist(&other).unwrap();
+        list(&store, &["m-1", "m-2", "m-3"], "claude");
+        claim(&store, "m-3", "cpd-1");
+        let seats = Fake::new(&[("cpd-1", Some(State::Working))]);
+        stamped();
+
+        for _ in 0..3 {
+            tick(&store, &seats, &mut Pass::new());
+        }
+        let said: Vec<String> = stamped().into_iter().filter(|l| l.contains("waits on m-3")).collect();
+        assert!(
+            said.len() == 1 && said[0].starts_with("run group 1:") && said[0].contains("the other run")
+                && said[0].contains("wsp worklist cut run m-3"),
+            "{said:?}"
+        );
+        let asked = items(&store);
+        assert!(
+            asked.len() == 1 && asked[0].contains("the other run") && asked[0].contains("wsp worklist cut run m-3"),
+            "{asked:?}"
+        );
+
+        let args = crate::base::args::Args::synth("worklist", &["cut", "run", "m-3"], &[("why", "other has it")]);
+        assert_eq!(crate::cmd_worklist::cut_by(&store, &args, &[], None), 0);
+        tick(&store, &seats, &mut Pass::new());
+        assert!(items(&store).is_empty(), "{:?}", items(&store));
+    }
+
+    /// `wsp-946`: while another member is still going the group does not wait on
+    /// the claimed one alone, and a claim that ends closes the item.
+    #[test]
+    fn a_member_claimed_by_another_list_is_asked_about_only_when_it_alone_holds_the_group() {
+        let (_env, store) = scratch("claimedalone");
+        member(&store, "m-1", Status::Doing);
+        let mut t = Task::new("m-3", "m-3");
+        t.set_status(Status::Doing);
+        t.log(&format!("{} other group 1", crate::cycle::OWNED));
+        store.save_task(&t).unwrap();
+        list(&store, &["m-1", "m-3"], "claude");
+        claim(&store, "m-1", "cpd-2");
+        claim(&store, "m-3", "cpd-1");
+        let seats = Fake::new(&[("cpd-1", Some(State::Working)), ("cpd-2", Some(State::Working))]);
+        tick(&store, &seats, &mut Pass::new());
+        assert!(items(&store).is_empty(), "{:?}", items(&store));
+
+        set_status(&store, "m-1", Status::Review);
+        crate::verification::record(&store, "m-1", crate::verification::State::Holds, "it holds", None, None).unwrap();
+        tick(&store, &seats, &mut Pass::new());
+        assert_eq!(items(&store).len(), 1);
+
+        assert!(store.clear_claim("m-3"));
+        tick(&store, &seats, &mut Pass::new());
+        assert!(items(&store).is_empty(), "{:?}", items(&store));
     }
 
     /// **A verifier that blocked is named as the block, not as a missing
