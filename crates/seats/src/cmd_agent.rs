@@ -11296,6 +11296,40 @@ mod from_cmd_task {
         assert!(log.contains("`wsp done` ended it and released the claim"), "{log}");
     }
 
+    /// `wsp-929`: cpd-1053 as `wsp done` met it, idle at review for 12 minutes —
+    /// the hook's `idle` long past its two minutes, so the screen alone answers.
+    /// Through the real reader it is Idle, and a refused `wsp done --json` offers
+    /// Release and mark done.
+    #[test]
+    fn done_refused_for_a_seat_idle_past_its_hooks_word_offers_release_and_mark_done() {
+        let env = util::isolated("done-idle-at-review");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let mut t = Task::new("a row", "p-001");
+        t.set_status(Status::Review);
+        store.save_task(&t).unwrap();
+        store.set_binding("cpd-9", json!({ "task_id": "p-001", "pane_id": "cpd-9", "workspace_id": "cpd-9" }));
+        store.set_claim("p-001", json!({ "workspace_id": "cpd-9", "workspace_label": "p-001", "cwd": "/tmp" }));
+
+        let seat = store.state.join(crate::place_compound::SEATS).join("cpd-9");
+        std::fs::create_dir_all(&seat).unwrap();
+        let ago = |secs: i64| util::iso_at(util::epoch_secs() - secs);
+        let record = json!({ "pid": std::process::id(), "started_at": ago(900), "render_socket": env.path("rsock"),
+            "agent": { "kind": "claude", "name": "a", "args": [] } });
+        std::fs::write(seat.join("seat.json"), record.to_string()).unwrap();
+        std::fs::write(seat.join("said.json"), json!({ "state": "idle", "at": ago(720) }).to_string()).unwrap();
+        let render = env.path("compound-render");
+        wsp_testkit::script(&render, "#!/bin/sh\necho idle\n");
+        wsp_host::inproc::RENDER.with(|r| *r.borrow_mut() = Some(render.clone()));
+
+        let fleet = crate::cmd_spawn::Fleet;
+        assert_eq!(standing_as(&fleet, "cpd-9"), Standing::Idle);
+        let code = done_with(&store, &parse(&["done", "p-001", "--json"]), &crate::cmd_spawn::seat_is_live, &fleet);
+        wsp_host::inproc::RENDER.with(|r| *r.borrow_mut() = None);
+        assert_eq!(code, 1);
+        assert_eq!(labels(&refused(), "buttons"), ["Release and mark done", "Release"]);
+    }
+
     /// `wsp-582`: `done` on a row whose seat is up refuses, names the seat and the
     /// verb, and leaves the claim and binding exactly as they were; a seat that
     /// is gone, or a leg's, does not stop it.
