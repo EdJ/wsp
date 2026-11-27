@@ -104,7 +104,7 @@ fn die_on_broken_pipe() {
 /// need. It is short because the property it describes is rare, and it going
 /// stale is the one failure here that costs nothing but a wrong signpost.
 const LOOKS_FIRST: &str =
-    "archive, checkout, initiative plan, install, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
+    "archive, checkout, hub disable, initiative plan, install, logout, migrate, project rm, sandbox rm, scratch, verify --rm, worklist cut, worklist go, worklist group --drop, worklist rm";
 
 /// Whether this invocation reads `-n`, and what to call it if it does not.
 ///
@@ -217,6 +217,12 @@ fn dry_run(args: &Args) -> (bool, String) {
         "initiative" => named(sub == "plan" && args.rest.get(1).map(String::as_str) != Some("show")),
         "machine" | "machines" => named(false),
         "agent" => named(true),
+        // The shared-work add-on's disconnect: `hub disable` parks rows, ends
+        // agents and gives leases back, and `logout` does that disable before
+        // it removes the login, a set computed from the rows in flight that no
+        // other verb prints. Both print it under `-n` (`cmd_hub::preview_text`).
+        "hub" => named(sub == "disable"),
+        "logout" => (true, args.cmd.clone()),
         _ => (false, args.cmd.clone()),
     }
 }

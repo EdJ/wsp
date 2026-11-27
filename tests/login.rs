@@ -321,3 +321,61 @@ fn two_sandboxes_hold_two_logins_and_the_developers_is_untouched() {
         let _ = rig.command(&["sandbox", "rm", name]).output();
     }
 }
+
+/// `wsp hub disable --dry-run` and `wsp logout --dry-run` (and `-n`) reach the
+/// verbs through the binary's dry-run gate (`dry_run` in `src/main.rs`), print
+/// the preview `docs/multiplayer.md` documents ("Park preview"), and change
+/// nothing: the login, the switch, the state directory and the home are as
+/// they were. Not logged in, `logout -n` says so in the same shape, and
+/// `hub disable -n` is the verb's own refusal, not the gate's.
+#[test]
+fn hub_disable_and_logout_dry_run_print_the_preview_through_the_cli_and_change_nothing() {
+    let Some(rig) = Rig::new("dryrun", &["ann"]) else { return };
+    let run = |args: &[&str]| rig.command(args).output().unwrap();
+    let json = |o: &Output| -> serde_json::Value {
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {}", said(o)))
+    };
+    let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    let documented = ["dry_run", "ending", "leases", "logged_in", "off", "park", "unsent"];
+
+    // Not logged in.
+    for flag in ["--dry-run", "-n"] {
+        let out = run(&["logout", flag, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+        let v = json(&out);
+        assert_eq!(keys(&v), documented, "{v}");
+        assert_eq!(v, serde_json::json!({"dry_run": true, "logged_in": false, "off": false, "park": [], "ending": [], "leases": [], "unsent": 0}));
+        let out = run(&["logout", flag]);
+        assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stdout).trim()), (Some(0), "dry run: not logged in, so nothing would be disabled"), "{}", said(&out));
+        let out = run(&["hub", "disable", flag, "--json"]);
+        assert!(!said(&out).contains("does not look first"), "the gate refused it: {}", said(&out));
+        assert_eq!(out.status.code(), Some(1), "{}", said(&out));
+        assert!(said(&out).contains("not logged in to a hub"), "{}", said(&out));
+    }
+    assert!(!rig.hubs().exists());
+
+    // Logged in.
+    assert!(rig.login("ann").status.success());
+    let login = std::fs::read(rig.hubs()).unwrap();
+    // Every call appends its own line to `calls.jsonl` (the call tally, `wsp calls`); nothing else may change.
+    let left = || rig.left_behind().into_iter().filter(|(p, _)| !p.ends_with("calls.jsonl")).collect::<Vec<_>>();
+    let before = left();
+    for args in [&["hub", "disable", "--dry-run", "--json"][..], &["hub", "disable", "-n", "--json"], &["logout", "--dry-run", "--json"], &["logout", "-n", "--json"]] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(0), "wsp {}: {}", args.join(" "), said(&out));
+        let v = json(&out);
+        assert_eq!(keys(&v), documented, "{v}");
+        assert_eq!(v, serde_json::json!({"dry_run": true, "logged_in": true, "off": false, "park": [], "ending": [], "leases": [], "unsent": 0}), "wsp {}", args.join(" "));
+    }
+    for args in [&["hub", "disable", "--dry-run"][..], &["logout", "-n"]] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.starts_with("dry run: nothing is done\nwould park: nothing"), "wsp {}: {text}", args.join(" "));
+    }
+    assert_eq!(std::fs::read(rig.hubs()).unwrap(), login, "the login is as it was");
+    assert_eq!(left(), before, "a dry run left something behind");
+    let v = json(&run(&["hub", "status", "--json"]));
+    assert_eq!((v["logged_in"].as_bool(), v["user"].as_str()), (Some(true), Some("ann")), "{v}");
+    assert_ne!(v["off"].as_bool(), Some(true), "the dry run switched the hub off: {v}");
+}
