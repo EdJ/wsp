@@ -39,6 +39,11 @@
 //! rehearses that script here: owner on Ed's spoke, helper on Jesper's, side by
 //! side on a sandbox of its own, with the agents' work and the cut link played
 //! as this test plays them.
+//!
+//! [`a_row_run_as_legs_on_one_spoke_is_refused_to_the_other_while_a_leg_runs`]
+//! (wsp-896): a shared row run as legs on Ed's spoke is his on the hub while
+//! its leg runs, Jesper's spawn of it is refused, and the lease goes back at
+//! the last leg's review.
 
 // Step 8's tests, compiled into this binary so the gate can run them in order.
 #[allow(dead_code, unused_imports)]
@@ -910,6 +915,78 @@ fn the_v1_gate_runs_end_to_end_on_two_spokes_and_one_hub() {
     step_7_jesper_offline_mid_row_and_his_journal_fast_forwards(&rig, &ed, &jesper);
     drop((ed, jesper));
     step_8_the_standalone_and_privacy_tests_still_pass();
+}
+
+// ──────────────────────── a row run as legs holds its lease ────────────────────────
+
+const LEGS: &str = "legs (wsp-896: a shared row run as legs on Ed's spoke holds his hub lease while a leg runs)";
+
+/// wsp-896, beside the gate: a shared row run as legs on Ed's spoke is leased
+/// to him on the hub while its leg runs, though a leg's seat claims nothing;
+/// his `ls --json` reads it held by him and his; Jesper's spoke sees the row
+/// and is refused it, naming Ed; once the last leg ends by review the lease
+/// is gone from the hub and from Ed's `ls --json`.
+#[test]
+fn a_row_run_as_legs_on_one_spoke_is_refused_to_the_other_while_a_leg_runs() {
+    let Some(rig) = HubRig::up("l") else { return };
+    let mut ed = Spoke::up(&rig, "ed");
+    let mut jesper = Spoke::up(&rig, "jesper");
+    ed.start_daemon();
+    jesper.start_daemon();
+    for s in [&ed, &jesper] {
+        s.wait("setup", "a first sync turn", WAIT, |s| s.turns() >= 1);
+    }
+
+    // Ed's row, published to shared:core, with one leg staged on it.
+    let out = ed.ok(&["add", "Legged row", "-p", "alpha"]);
+    let private = out.split_whitespace().find(|w| w.starts_with("alpha-")).unwrap_or_else(|| panic!("{LEGS}: add printed no id: {out}")).to_string();
+    ed.ok(&["caption", &private, "Legged row"]);
+    let out = ed.ok(&["publish", &private, "--to", SHARED]);
+    let row = out
+        .lines()
+        .find_map(|l| l.split_once(" -> ").filter(|(a, _)| a.trim() == private).map(|(_, b)| b.trim().to_string()))
+        .unwrap_or_else(|| panic!("{LEGS}: {private} not renumbered: {out}"));
+    ed.wait(LEGS, "the row on the hub", WAIT, |_| rig.row_head(&row).is_some());
+    let order = ed.dir.join("build.order");
+    std::fs::write(&order, "Write legs.txt in the row's tree and review it.\n").unwrap();
+    ed.ok(&["leg", "add", &row, "build", "--order", order.to_str().unwrap()]);
+    assert_eq!(rig.holder(&row), None, "{LEGS}: nobody holds {row} before its leg starts");
+
+    // The leg starts: its seat claims nothing, and the row is Ed's on the hub.
+    let out = ed.ok(&["spawn", &row, "-p", "alpha", "--agent", "--leg", "build"]);
+    assert!(!ed.claimed(&row), "{LEGS}: a leg's seat claims no row: {}", ed.show(&row));
+    let legs: Value = serde_json::from_str(&ed.ok(&["leg", "show", &row, "--json"])).unwrap_or_else(|e| panic!("{LEGS}: leg show --json: {e}: {out}"));
+    let seat = legs[0]["pane"].as_str().filter(|_| legs[0]["state"] == "running").unwrap_or_else(|| panic!("{LEGS}: leg build is not running on a seat: {legs}\n{out}")).to_string();
+    assert_eq!(
+        rig.holder(&row).map(|h| h.0).as_deref(),
+        Some("ed"),
+        "{LEGS}: the hub records Ed's lease on {row} while its leg runs\nspawn: {out}\ndrive.json: {}\ncycle.log (tail):\n{}\nhub leases: {:?}",
+        ed.json("drive.json"),
+        tail(&ed.cycle_log(), 20),
+        rig.hub.state().leases
+    );
+    let mine = |s: &Spoke| s.rows().into_iter().find(|r| r["id"].as_str() == Some(row.as_str())).unwrap_or(Value::Null);
+    let shown = mine(&ed);
+    // `ls --json` writes the add-on's row facts as strings (`"mine": "true"`).
+    assert_eq!((shown["held_by"].as_str(), shown["mine"].as_str()), (Some("ed"), Some("true")), "{LEGS}: Ed's ls --json reads {row} held by him: {shown}");
+
+    // Jesper's spoke sees the row, and its spawn is refused while the leg runs.
+    jesper.wait(LEGS, &format!("{row} on Jesper's spoke"), WAIT, |s| s.ids().contains(&row));
+    let (ok, said) = jesper.run(&["spawn", &row, "-p", "alpha", "--agent"]);
+    assert!(!ok && said.contains("leased by ed"), "{LEGS}: Jesper's spawn of {row} is refused naming Ed: {said}");
+    assert!(!jesper.claimed(&row), "{LEGS}: Jesper holds no claim on {row}: {}", jesper.show(&row));
+    assert_eq!(rig.holder(&row).map(|h| h.0).as_deref(), Some("ed"), "{LEGS}: {row} is still Ed's on the hub");
+
+    // The last leg ends by review: the lease goes back to the hub.
+    let tree = ed.repo.join(".worktrees").join(&row);
+    if tree.is_dir() {
+        ed.commit_in_tree(&row, "legs.txt");
+    }
+    let (ok, said) = ed.as_seat(&seat, &["review", &row, "Wrote legs.txt; nothing left."], "");
+    assert!(ok, "{LEGS}: the leg's seat reviews {row}: {said}");
+    ed.wait(LEGS, &format!("{row}'s lease gone from the hub"), WAIT, |_| rig.holder(&row).is_none());
+    let shown = mine(&ed);
+    assert!(shown["held_by"].is_null() || shown["held_by"].as_str().is_none(), "{LEGS}: Ed's ls --json reads {row} unheld once its last leg ended: {shown}");
 }
 
 // ──────────────────────── the two-machine script, rehearsed ────────────────────────

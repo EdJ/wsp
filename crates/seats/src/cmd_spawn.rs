@@ -2773,6 +2773,18 @@ fn place_work(place: &dyn Place, store: &Store, args: &Args) -> i32 {
             }
         }
     };
+    // A leg's seat claims nothing, but its row is a shared row's all the same,
+    // and the hub's to lease (wsp-896): taken before anything is written, as a
+    // claim's is, so a row another user's spoke holds is refused here and one
+    // run as legs reads held while any leg runs. Each leg's start takes it
+    // again, which the hub answers for its own holder as a renewal; the lease
+    // goes back once the row leaves `doing` (`hub_lease::finished`).
+    if let (Some(name), Some(task)) = (&leg_name, work.task.as_deref().filter(|_| leg_rec.is_some())) {
+        if let Err(why) = crate::addon::get().before_claim(store, task) {
+            eprintln!("wsp: not starting leg {name} of {task}: {why}");
+            return 1;
+        }
+    }
     let entry_tier = leg_rec.as_ref().map(leg_seat::tier_of).or_else(|| piece_rec.as_ref().map(crate::piece_seat::tier_of));
     let kind = match &entry_tier {
         Some(t) => t.0.clone(),

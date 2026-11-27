@@ -873,11 +873,60 @@ pub fn forget_row(store: &Store, row: &str, token: Token) {
 }
 
 /// Whether `row`'s work here is over as far as its lease goes: done, parked,
-/// put back (`todo`, `inbox`) or gone.
+/// put back (`todo`, `inbox`) or gone. A row run as legs (wsp-896) is over
+/// too once its last leg has ended, by review or a block: its legs' starts
+/// took the lease, and a rework's leg takes it again.
 fn finished(store: &Store, row: &str) -> bool {
+    use wsp_engine::model::Status;
     store.find_task(row).is_none_or(|t| {
-        matches!(t.status(), wsp_engine::model::Status::Done | wsp_engine::model::Status::Parked | wsp_engine::model::Status::Todo | wsp_engine::model::Status::Inbox)
+        matches!(t.status(), Status::Done | Status::Parked | Status::Todo | Status::Inbox)
+            || (wsp_engine::legs::staged(&t) && matches!(t.status(), Status::Review | Status::Blocked))
     })
+}
+
+/// Whether a leg of `row` is running here: its row lease, which no claim
+/// holds, is renewed while one is ([`renew_legs`]).
+fn leg_running(store: &Store, row: &str) -> bool {
+    store
+        .find_task(row)
+        .is_some_and(|t| wsp_engine::legs::legs(&t).iter().any(|l| l.state == wsp_engine::legs::State::Running))
+}
+
+/// The row leases in the book that no claim holds and that a running leg
+/// works under (wsp-896), renewed on [`renew_due`]'s margin; how many. One
+/// the hub refuses is forgotten, said once in `cycle.log`, and the next leg's
+/// start takes it again or is refused naming who has it.
+pub fn renew_legs(store: &Store, client: &mut Client, now: i64) -> usize {
+    let claims = store.claims();
+    let mut renewed = 0;
+    for (row, d) in Book::read(store).rows {
+        if claims.get(&row).and_then(token_of) == Some(d.token) || !leg_running(store, &row) {
+            continue;
+        }
+        let margin = d.ttl.min(3600).min(d.ttl / 2).max(0);
+        if d.ttl <= 0 || d.expires - now >= d.ttl - margin {
+            continue;
+        }
+        match client.lease_renew(&RowId(row.clone()), d.token) {
+            Ok((_, at)) => {
+                let expires = (at.0 / 1000) as i64;
+                Book::edit(store, |b| {
+                    if let Some(x) = b.rows.get_mut(&row).filter(|x| x.token == d.token) {
+                        x.expires = expires;
+                        x.ttl = (expires - now).max(0);
+                    }
+                });
+                renewed += 1;
+            }
+            Err(HubError::Refused(r, text)) => {
+                forget_row(store, &row, d.token);
+                let why = crate::hub_client::words::refusal(&r, &text);
+                wsp_store::store::log_line(store, &format!("{row}: the hub lease its legs run under is gone: renewing it was refused ({why})"));
+            }
+            Err(_) => {}
+        }
+    }
+    renewed
 }
 
 /// The row leases in the book that no claim holds and whose work is over
@@ -1756,5 +1805,75 @@ pub mod tests {
             Some(h) => std::env::set_var(crate::hub_client::HUB_HOME_ENV, h),
             None => std::env::remove_var(crate::hub_client::HUB_HOME_ENV),
         }
+    }
+
+    /// A shared row run as legs, at `status`, with one leg in `leg`.
+    fn legged_row(store: &Store, id: &str, status: &str, leg: wsp_engine::legs::State) {
+        let mut t = wsp_store::model::Task::new(id, id);
+        t.status_raw = status.into();
+        t.workspace = "shared:team".parse().unwrap();
+        let mut l = wsp_engine::legs::Leg::pending("build", "do it");
+        l.state = leg;
+        wsp_engine::legs::write(&mut t, &[l]);
+        store.save_task(&t).unwrap();
+    }
+
+    /// wsp-896: the lease a leg's start took, which no claim holds, stands
+    /// while the row is `doing` (a leg running, or between two legs) and goes
+    /// back once its last leg has ended by review or a block; a row with no
+    /// legs keeps `wsp start`'s rule (only done, parked or put back).
+    #[test]
+    fn hub_lease_a_legged_rows_lease_stands_while_doing_and_goes_back_at_review_or_a_block() {
+        use wsp_engine::legs::State;
+        let _env = wsp_engine::util::isolated("hub-lease-legs-finished");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        let book = |rows: &[(&str, u64)]| {
+            Book::edit(&store, |b| {
+                for (row, token) in rows {
+                    b.rows.insert(row.to_string(), Drive { token: Token(*token), expires: util::epoch_secs() + 600, ttl: 600 });
+                }
+            })
+        };
+        legged_row(&store, "wsp-1", "doing", State::Running);
+        legged_row(&store, "wsp-2", "doing", State::Done);
+        legged_row(&store, "wsp-3", "review", State::Done);
+        legged_row(&store, "wsp-4", "blocked", State::Running);
+        let mut plain = wsp_store::model::Task::new("wsp-5", "wsp-5");
+        plain.status_raw = "review".into();
+        plain.workspace = "shared:team".parse().unwrap();
+        store.save_task(&plain).unwrap();
+        book(&[("wsp-1", 1), ("wsp-2", 2), ("wsp-3", 3), ("wsp-4", 4), ("wsp-5", 5)]);
+
+        let names: Vec<String> = finished_unheld(&store).into_iter().map(|(r, _)| r).collect();
+        assert_eq!(names, ["wsp-3", "wsp-4"], "a leg running or between legs keeps it; review and a block give it back; `wsp start`'s rule stands");
+        assert!(leg_running(&store, "wsp-1") && !leg_running(&store, "wsp-2"));
+    }
+
+    /// wsp-896: [`renew_legs`] renews a book lease while a leg of its row runs,
+    /// on the margin, and leaves one whose row runs no leg to its expiry.
+    #[test]
+    fn hub_lease_a_running_legs_row_lease_is_renewed_and_an_idle_ones_is_not() {
+        use wsp_engine::legs::State;
+        let _env = wsp_engine::util::isolated("hub-lease-legs-renew");
+        let Some((running, tokens)) = serve(Setup::default()) else { return };
+        let mut ann = dial(&running, &tokens, "ann");
+        let store = Store::open();
+        store.ensure_dirs().unwrap();
+        legged_row(&store, "wsp-1", "doing", State::Running);
+        legged_row(&store, "wsp-2", "doing", State::Done);
+        let now = util::epoch_secs();
+        for row in ["wsp-1", "wsp-2"] {
+            let h = take(&mut ann, "shared:team", row).unwrap();
+            Book::edit(&store, |b| drop(b.rows.insert(row.to_string(), Drive { token: h.token, expires: h.expires, ttl: (h.expires - now).max(0) })));
+        }
+        assert_eq!(renew_legs(&store, &mut ann, now), 0, "not due yet");
+        // Past the margin by the clock passed in; the hub's own TTL, so its new
+        // expiry is a second or two on from the first.
+        let (before, ttl) = { let d = &Book::read(&store).rows["wsp-1"]; (d.expires, d.ttl) };
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(renew_legs(&store, &mut ann, now + ttl), 1, "only the row a leg runs on");
+        assert!(Book::read(&store).rows["wsp-1"].expires > before, "its expiry moved to the hub's");
+        drop(running);
     }
 }

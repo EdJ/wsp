@@ -747,6 +747,8 @@ impl Worker {
         crate::hub_lease::renew_all(store, client, now);
         // And the drive leases of the shared lists this spoke drives (wsp-467).
         crate::hub_lease::renew_drives(store, client, now);
+        // And the row leases a running leg works under, which no claim holds (wsp-896).
+        crate::hub_lease::renew_legs(store, client, now);
         crate::hub_lease::push_all(store, client);
         // A lease no claim holds (`wsp start`'s) goes back once its work is
         // over, by whatever write ended it (a landing, `done`, `park`). Not
