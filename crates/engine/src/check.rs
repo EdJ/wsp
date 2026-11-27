@@ -1012,13 +1012,34 @@ pub fn target(store: &Store, t: &Task, at: Option<&str>) -> Result<Target, Strin
     if roots.is_empty() {
         return Err(format!("project {project} has no roots to find {sha} in"));
     }
+    let row_tree = at.and_then(|_| crate::cmd_checkout::member_tree(store, &t.id));
     for root in &roots {
         let Some(repo) = crate::cmd_verify::toplevel(&util::expand(root)) else { continue };
-        if let Some(full) = git(&repo, &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")]) {
-            return Ok(Target { sha: full.trim().to_string(), repo, project, since: None });
+        let full = match at {
+            Some(_) => commit_named(&repo, row_tree.as_deref(), &sha),
+            None => commit_in(&repo, &sha),
+        };
+        if let Some(sha) = full {
+            return Ok(Target { sha, repo, project, since: None });
         }
     }
     Err(format!("{sha} is in none of {project}'s roots ({})", roots.join(", ")))
+}
+
+fn commit_in(dir: &Path, rev: &str) -> Option<String> {
+    git(dir, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]).map(|s| s.trim().to_string())
+}
+
+/// The commit the caller means by `rev`, in the repository at `repo`. `HEAD`
+/// and its like are each tree's own, and the root's is the trunk, so `rev` is
+/// read in the tree the verb is run from when that is a tree of `repo`, else in
+/// the row's own tree, else in `repo`.
+fn commit_named(repo: &Path, row_tree: Option<&Path>, rev: &str) -> Option<String> {
+    let common = |dir: &Path| git(dir, &["rev-parse", "--git-common-dir"]).and_then(|c| dir.join(c.trim()).canonicalize().ok());
+    let ours = common(repo)?;
+    let here = std::env::current_dir().ok();
+    let tree = here.as_deref().into_iter().chain(row_tree).find(|d| common(d).as_ref() == Some(&ours));
+    commit_in(tree.unwrap_or(repo), rev)
 }
 
 /// The member's own tree, when the commit to check is the ready commit it
@@ -2522,7 +2543,11 @@ pub fn check(store: &Store, args: &Args) -> i32 {
     };
     let at = args.get("at");
     let tg = match target(store, &t, at.as_deref()) {
-        Ok(tg) => Target { since: args.get("since"), ..tg },
+        Ok(tg) => {
+            let row_tree = args.get("since").and_then(|_| crate::cmd_checkout::member_tree(store, &t.id));
+            let since = args.get("since").map(|s| commit_named(&tg.repo, row_tree.as_deref(), &s).unwrap_or(s));
+            Target { since, ..tg }
+        }
         Err(why) => {
             if auto {
                 crate::store::log_line(store, &format!("check {}: not run — {why}", t.id));
@@ -2652,7 +2677,10 @@ pub fn check(store: &Store, args: &Args) -> i32 {
                 Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
             };
-            println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
+            // A named commit may have been named by a symbol, so each step says
+            // which commit it was.
+            let of = at.as_ref().map(|_| format!(" · at {}", &tg.sha[..12])).unwrap_or_default();
+            println!("  {mark} {} · {}s{of}{tail}", r.step.name, secs(r.took));
         }
     });
     drop(lock);
@@ -3057,7 +3085,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
         eprintln!("wsp: {} has no root to run in", found.id);
         return 1;
     };
-    let Some(sha) = args.get("at").map(|a| git(&repo, &["rev-parse", "--verify", "--quiet", &format!("{a}^{{commit}}")])).unwrap_or_else(|| {
+    let Some(sha) = args.get("at").map(|a| commit_named(&repo, None, &a)).unwrap_or_else(|| {
         let trunk = crate::cmd_checkout::trunk(&repo)?;
         let branch = crate::cmd_checkout::trunk_branch(&trunk)?;
         git(&trunk, &["rev-parse", &branch])
@@ -5590,6 +5618,46 @@ mod tests {
         let t = store.find_task("pj-001").unwrap();
         assert_eq!(t.body, before);
         assert_eq!(t.status(), Status::Review, "a replay moves nobody");
+    }
+
+    /// `wsp-948`: `--at HEAD` from a row's tree one commit ahead of the trunk
+    /// is that tree's HEAD, not the root's. The verb prints to stdout, so the
+    /// test runs itself again as a child and reads what the child printed.
+    #[test]
+    fn at_head_from_a_rows_tree_checks_that_trees_head_and_prints_it() {
+        const CHILD: &str = "WSP_TEST_AT_HEAD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let me = "check::tests::at_head_from_a_rows_tree_checks_that_trees_head_and_prints_it";
+            let out = wsp_base::calls::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", me, "--nocapture", "--test-threads", "1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+            let head = said.split("tree-head=").nth(1).and_then(|s| s.get(..40)).expect("the child ran");
+            let step = said.lines().find(|l| l.contains("script")).unwrap_or_default();
+            assert!(step.contains(&format!("at {}", &head[..12])), "{said}");
+            return;
+        }
+        let (env, store, base) = world("at-head", "- script: sh check.sh", "exit 1\n");
+        let own = env.path("repo").join(crate::cmd_checkout::WORKTREES).join("pj-001");
+        git_run(&env.path("repo"), &["worktree", "add", "--quiet", "-b", "pj-001", &own.display().to_string()]);
+        std::fs::write(own.join("check.sh"), "exit 0\n").unwrap();
+        git_run(&own, &["commit", "--quiet", "-am", "pj-001: one ahead"]);
+        let head = git(&own, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert_ne!(head, base);
+        let t = store.find_task("pj-001").unwrap();
+        let named = |rev: &str| target(&store, &t, Some(rev)).unwrap().sha;
+        assert_eq!(named("HEAD"), head, "from elsewhere, the row's tree");
+        std::env::set_current_dir(env.path("repo")).unwrap();
+        assert_eq!(named("HEAD"), base, "from a tree of the repository, that tree");
+        std::env::set_current_dir(&own).unwrap();
+        assert_eq!(named("HEAD"), head);
+        assert_eq!(named("HEAD~1"), base);
+        println!("tree-head={head}");
+        // The step is red at the base and green at the tree's HEAD.
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[("at", "HEAD")])), 0);
     }
 
     #[test]
