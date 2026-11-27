@@ -176,6 +176,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     let mut fixed_tests = 0i64;
     let mut group_starts: Vec<(i64, i64)> = Vec::new();
     let passes = passes_of(store, &w.id);
+    // Group 1 has no pass before it: its window opens at the list's start.
+    let started = crate::timeline::start_in(&crate::timeline::list_events(store, &["worklist-go"]), &w.id);
     // The stretches a person parked the whole list: every second in one is
     // `parked` in the wall buckets and in no other (`compounding-464`).
     let parks: Vec<(i64, i64, String)> = crate::timeline::list_parks(store, &w.id).into_iter().map(|p| (p.start, p.end, p.words())).collect();
@@ -196,7 +198,7 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
         // it out of the members and put it back once per group (`wsp-390`).
         let mut shared: Option<crate::timeline::RowFigures> = None;
         let (mut gstart, mut glast, mut gend) = (0i64, 0i64, 0i64);
-        let open = if gi == 0 { None } else { passes.get(&(gi as u64)).copied() };
+        let open = if gi == 0 { started } else { passes.get(&(gi as u64)).copied() };
         for m in &g.members {
             let mut f = figures(m);
             // A member that started before its window opened is read from the
@@ -238,7 +240,9 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             idle += (f.wall - f.shared - f.model_secs - tool - legs_only - f.between_attempts).max(0);
             missing_sessions += f.missing;
             if f.end > 0 {
-                start = start.min(f.start);
+                // A member over before its window opened adds nothing ahead of
+                // it to the list's wall.
+                start = start.min(open.map_or(f.start, |o| f.start.max(o)));
                 end = end.max(f.end);
             }
             for (k, v) in &f.waits {
@@ -361,8 +365,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
     // The buckets tile the windows from the first group's open to the last
     // pass, which runs past the last member's verdict where a pass is given
     // late (a manual group's, by a person). The list's wall is that stretch:
-    // `wall_seconds` here and in the buckets is one figure, first spawn to the
-    // last pass; `last_verdict_wall_seconds` is the stretch to the last verdict.
+    // `wall_seconds` here and in the buckets is one figure, first spawn (the
+    // list's start, where one is recorded) to the last pass; `last_verdict_wall_seconds` is the stretch to the last verdict.
     let reach = {
         let (lo, hi) = walls.iter().flatten().fold((i64::MAX, 0i64), |(lo, hi), g| (lo.min(g.open), hi.max(g.close)));
         if hi > lo { hi - lo } else { 0 }
@@ -408,8 +412,8 @@ pub(crate) fn effort_over(store: &Store, w: &Worklist, baseline: Option<&str>, f
             "barrier_scope": "groups[].barrier_scope: the barrier's run scoped to what the group touched (wsp-431) — scoped or full and why, the targets it ran, shared paths that widened it, its seconds against the last full run's, and net_red: scoped barriers a red full run stood behind, which is what scoping let through",
             "governor_wall": "groups[].governor_wall: between a group's barrier pass and the next group's first and last member start (wsp-398) — the seconds to each, the cycle-log line saying why a member waited (held_by), and the governor's turns, model and tool seconds and idle in each window, with the turns that only looked (a watch, a listing) and the model seconds they held, which is what a governor that skips a turn when nothing needs judgement would give back. Totals are over the windows to the last start: governor_wall_windows is how many there were and governor_wall_windows_unread how many had no governor transcript read; the governor_* sums are over the windows read, and null (not measured, never 0) where none was. A window is null where no group follows or no pass is found; the governor figures are null where its transcript is not found; its transcript is the one the seat's burn.json names, for each pane `governor-set` seated, clipped to the stretch it held the slot; burn.json holds only a seat's latest session and goes when the seat stops, and then the session ids the ledger (spent.jsonl) banked at each stop are read, so the figures are a floor",
             "standing_seats": "totals.standing_seats (wsp-066): each governor and barrier check seat — what a seat costs while it waits on the run — with its group, seated seconds (a governor's: the stretches it held the slot; a check's: its transcript's first stamp, else the check's opening, to its stop), turns and cost as the cost block reads them, and memory: its resident memory over its seated time from the daemon's samples (seat-memory.json, one per minute): MB-minutes, mean and peak MB, the seconds and number of samples; a check seat opened with no check to go on and ended (wsp-089) is one too, with \"orphaned\": true, its seconds from its opening to its ending and no turns. Any figure not read is null and not 0 — seconds or turns where the seat was never read (counted in unmeasured_seats), memory where the seat was never sampled (it ran before the daemon sampled, or on a machine it does not). governor_seconds, check_seconds and their mb_minutes are the sums over the seats read, null where none was",
-            "wall_buckets": "totals.wall_buckets and groups[].wall_buckets (wsp-470): every second of the list's wall in one bucket, by what the run as a whole was doing at that second — working (some member's seat in a model call or a tool, or one of its legs running, or a check or a verifier running; legs_running_seconds is the part of working where only legs were — a member whose legs run has no call of its own then, and wsp-218 stopped calling that its seat idle), waiting (nobody working, some member started and not moving: blocked from the moment it blocks, an unclaimed or slow start, a named gap, a seat idle), serialised (nobody started, a member behind the cap or an `after`), barrier_run (the barrier's runs and the hand-off or daemon tick before a step; a longer stretch with no run and no seat in it is waiting, under what the log says held it or 'nothing the logs name', wsp-852), check_seat (less any stretch the list stood held inside it, from worklist-held, or from the check seat's stop where the seat that wrote the hold stayed open past it, to the go or resume that took it back: that is a person's step, waiting, named 'the barrier waits: held for a person's step — barrier <n> of <list> …' with the hold's reason, wsp-090), between_groups (a pass to the group's first start, where the run starts the group; a manual group's is a person's wait for a hand to start it, so it is waiting, named 'waiting for a hand to start'), parked (a person parked the whole list, worklist-parked to worklist-resumed: every second inside it is parked and in no other bucket, the barrier's wait and its run included, so barrier_run is the run and its own waits and never a park; parked_by names who, when and why; wall_without_parked_seconds is the wall less it, the working wall a retro attributes). A group's window runs from the previous group's pass to its own, so they tile the wall: a member that started before its window opened (a row cut from the previous group and started again) is read from the pass on, and attributed_seconds equals wall_seconds. between_attempts_seconds (totals, and per member) is the stretch between a row's attempts (compounding-217): a row released and started again is two seats, each with its own spawn → release or review span, and what lay between them is named for what it was — the row parked or waiting to be restarted (with the row it waited on when its `after` names one), or reviewed, sent back and reopened (rework; the row's attempt is booked in rework.attempts), or, from where a decision in force on the row says it holds for the person (to the next seat) or a question its seat put to the person stood unanswered (to the answer), a person's step and not rework, named 'the row waits for a person's step — <the decision or the question>' (wsp-311) — and is neither the seat finishing nor the seat idle, nor in idle_seconds. gap_seconds and idle_seconds above are member-seconds read per row, kept beside it: a stall inside a seat is not a gap there. seat_idle_seconds and seat_idle_by_reason (wsp-559), beside waiting_by in each group's wall_buckets and in the totals: the waiting that was a seat idle, split by what the row's log says it waited on from the moment it was written — sent back (the verdict given, the tell not delivered or delivered, the verdict with the governor), reopened, a rebase refused, a hand-off to another row, owed to another (an after), a block, waiting on the governor's or a person's answer to a question it asked (named with the question's id, from the question to its answer), the seat's own shells, the check and the verifier's hand-off, the verdict read — and 'none recorded' where no line precedes the second; where the seat's calls were not timed, 'no call timing: …' says why in its place (no transcript found for the seat, its tokens the cost table's, or a transcript with no timestamps on its calls, wsp-313)",
-            "notes": "notes: what the figures say of themselves (wsp-857) — where more than 1 % of the list's wall is in no bucket (totals.wall_buckets.unattributed_seconds), a line saying how much and that the buckets and waits do not add up to the wall. A member's phases are read from its group window's start (the previous group's pass), as the buckets read it, so a row spawned or given legs days before its window books those days to no gap of this one",
+            "wall_buckets": "totals.wall_buckets and groups[].wall_buckets (wsp-470): every second of the list's wall in one bucket, by what the run as a whole was doing at that second — working (some member's seat in a model call or a tool, or one of its legs running, or a check or a verifier running; legs_running_seconds is the part of working where only legs were — a member whose legs run has no call of its own then, and wsp-218 stopped calling that its seat idle), waiting (nobody working, some member started and not moving: blocked from the moment it blocks, an unclaimed or slow start, a named gap, a seat idle), serialised (nobody started, a member behind the cap or an `after`), barrier_run (the barrier's runs and the hand-off or daemon tick before a step; a longer stretch with no run and no seat in it is waiting, under what the log says held it or 'nothing the logs name', wsp-852), check_seat (less any stretch the list stood held inside it, from worklist-held, or from the check seat's stop where the seat that wrote the hold stayed open past it, to the go or resume that took it back: that is a person's step, waiting, named 'the barrier waits: held for a person's step — barrier <n> of <list> …' with the hold's reason, wsp-090), between_groups (a pass to the group's first start, where the run starts the group; a manual group's is a person's wait for a hand to start it, so it is waiting, named 'waiting for a hand to start'), parked (a person parked the whole list, worklist-parked to worklist-resumed: every second inside it is parked and in no other bucket, the barrier's wait and its run included, so barrier_run is the run and its own waits and never a park; parked_by names who, when and why; wall_without_parked_seconds is the wall less it, the working wall a retro attributes). A group's window runs from the previous group's pass to its own (the first group's from the list's start, the worklist-go that says started, or from its first member's start where none is recorded), so they tile the wall: a member that started before its window opened (a row cut from the previous group and started again) is read from the pass on, and attributed_seconds equals wall_seconds. between_attempts_seconds (totals, and per member) is the stretch between a row's attempts (compounding-217): a row released and started again is two seats, each with its own spawn → release or review span, and what lay between them is named for what it was — the row parked or waiting to be restarted (with the row it waited on when its `after` names one), or reviewed, sent back and reopened (rework; the row's attempt is booked in rework.attempts), or, from where a decision in force on the row says it holds for the person (to the next seat) or a question its seat put to the person stood unanswered (to the answer), a person's step and not rework, named 'the row waits for a person's step — <the decision or the question>' (wsp-311) — and is neither the seat finishing nor the seat idle, nor in idle_seconds. gap_seconds and idle_seconds above are member-seconds read per row, kept beside it: a stall inside a seat is not a gap there. seat_idle_seconds and seat_idle_by_reason (wsp-559), beside waiting_by in each group's wall_buckets and in the totals: the waiting that was a seat idle, split by what the row's log says it waited on from the moment it was written — sent back (the verdict given, the tell not delivered or delivered, the verdict with the governor), reopened, a rebase refused, a hand-off to another row, owed to another (an after), a block, waiting on the governor's or a person's answer to a question it asked (named with the question's id, from the question to its answer), the seat's own shells, the check and the verifier's hand-off, the verdict read — and 'none recorded' where no line precedes the second; where the seat's calls were not timed, 'no call timing: …' says why in its place (no transcript found for the seat, its tokens the cost table's, or a transcript with no timestamps on its calls, wsp-313)",
+            "notes": "notes: what the figures say of themselves (wsp-857) — where more than 1 % of the list's wall is in no bucket (totals.wall_buckets.unattributed_seconds), a line saying how much and that the buckets and waits do not add up to the wall. A member's phases are read from its group window's start (the previous group's pass; for the first group the list's start), as the buckets read it, so a row spawned or given legs days before its window books those days to no gap of this one",
             "time": "per member row, spawn to verdict (wall, gaps); the seat's model and tool time are its own transcript calls inside those phases, legs only where run-leg timings exist",
         },
         "totals": {
@@ -1525,6 +1529,19 @@ mod tests {
         store.save_task(&t).unwrap();
         // The row done 1000 s ago, the barrier's run then, its check seat since 900 s ago.
         let now = util::epoch_secs();
+        // The start came before the work back-dated below.
+        let log = std::fs::read_to_string(store.state_file("events.jsonl")).unwrap();
+        let backdated: Vec<String> = log
+            .lines()
+            .map(|l| {
+                let mut v: Value = serde_json::from_str(l).unwrap();
+                if v["kind"] == "worklist-go" {
+                    v["ts"] = json!(util::iso_at(now - 1600));
+                }
+                v.to_string()
+            })
+            .collect();
+        std::fs::write(store.state_file("events.jsonl"), backdated.join("\n") + "\n").unwrap();
         let append = |file: &str, line: String| {
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(store.state_file(file)).unwrap();
             writeln!(f, "{line}").unwrap();
@@ -2159,7 +2176,7 @@ mod tests {
         std::fs::write(store.state_file("events.jsonl"), format!("{}\n{}\n", ev(at, 1), ev(at + 1200, 2))).unwrap();
         // The window r-2's timeline reads is the one gather finds: group 1's pass.
         assert_eq!(crate::timeline::gather(&store, "r-2").window, Some(at));
-        assert_eq!(crate::timeline::gather(&store, "r-1").window, None, "the first group's window opens at its first start");
+        assert_eq!(crate::timeline::gather(&store, "r-1").window, None, "with no start recorded, the first group's window opens at its first start");
         let r2 = crate::timeline::shapes::figures(&shape("r-2", t0, Some(at)));
         let fig = |id: &str| {
             if id == "r-1" {
@@ -2183,11 +2200,11 @@ mod tests {
     /// What `wsp-857` holds of an effort report with a member read from before
     /// its window: the wall is the windows, every second of it in a bucket,
     /// and the waits agree with the buckets' causes.
-    fn holds_to_its_windows(v: &Value) {
+    fn holds_to_its_windows(v: &Value, windows: [i64; 2]) {
         let t = &v["totals"];
         let b = &t["wall_buckets"];
         let walls: Vec<i64> = v["groups"].as_array().unwrap().iter().map(|g| g["wall_seconds"].as_i64().unwrap()).collect();
-        assert_eq!(walls, vec![1000, 1200], "each group's window: {v}");
+        assert_eq!(walls, windows, "each group's window: {v}");
         assert_eq!(t["wall_seconds"], walls.iter().sum::<i64>(), "the wall is the sum of the group windows: {t}");
         assert_eq!(b["attributed_seconds"], t["wall_seconds"], "{b}");
         assert_eq!(b["unattributed_seconds"], 0, "{b}");
@@ -2208,7 +2225,7 @@ mod tests {
     #[test]
     fn a_member_spawned_days_before_its_window_leaves_the_wall_its_windows_and_nothing_unattributed() {
         let v = early_member("ahead", crate::timeline::shapes::spawned_ahead);
-        holds_to_its_windows(&v);
+        holds_to_its_windows(&v, [1000, 1200]);
         let gap = v["waits"].as_array().unwrap().iter().find(|w| w["cause"].as_str().unwrap().starts_with(crate::timeline::PARKED_CAUSE)).unwrap_or_else(|| panic!("{v}"));
         assert_eq!(gap["seconds"], 90, "from the window's start to the next spawn: {v}");
         assert_eq!(v["totals"]["between_attempts_seconds"], 90);
@@ -2219,8 +2236,47 @@ mod tests {
     #[test]
     fn a_never_started_member_with_legs_added_days_ahead_waits_from_its_window() {
         let v = early_member("legsahead", crate::timeline::shapes::legs_added_ahead);
-        holds_to_its_windows(&v);
+        holds_to_its_windows(&v, [1000, 1200]);
         assert_eq!(v["totals"]["unnamed_wait_seconds"], 100, "the window's start to leg a: {v}");
+    }
+
+    /// `wsp-934`: group 1 opens at the list's start. r-1 was first spawned days
+    /// before it, so its gap is read from the start; r-0 was over before it and
+    /// puts nothing ahead of it in the wall.
+    #[test]
+    fn a_first_group_member_spawned_days_before_the_lists_start_is_read_from_the_start() {
+        use crate::timeline::RowFigures;
+        use crate::wallbuckets::{Class, Span};
+        let (_e, store, _w) = list("lateplan", &["r-0", "r-1"]);
+        store.save_task(&Task::new("r-2", "r-2")).unwrap();
+        assert_eq!(run(&store, &["add", "lateplan", "r-2"], &[]), 0);
+        let w = store.worklist("lateplan").unwrap();
+        assert_eq!(w.groups().len(), 2);
+        let (t0, s): (i64, i64) = (1_000_000_000, 1_000_400_000);
+        let ev = |t: i64, passed: Value, started: bool| json!({ "ts": util::iso_at(t), "kind": "worklist-go", "data": { "id": "lateplan", "passed": passed, "started": started } }).to_string();
+        let lines = [ev(s, Value::Null, true), ev(s + 1100, json!(1), false), ev(s + 2300, json!(2), false)];
+        std::fs::write(store.state_file("events.jsonl"), lines.join("\n") + "\n").unwrap();
+        assert_eq!(crate::timeline::gather(&store, "r-1").window, Some(s));
+        assert_eq!(crate::timeline::gather(&store, "r-2").window, Some(s + 1100));
+        let r1 = crate::timeline::shapes::figures(&crate::timeline::shapes::spawned_ahead("r-1", t0, Some(s)));
+        let seat = |a: i64, b: i64| RowFigures {
+            start: a,
+            end: b,
+            wall: b - a,
+            spans: vec![Span { start: a, end: b, class: Class::Seat }],
+            active: vec![(a, b)],
+            measured: true,
+            ..Default::default()
+        };
+        let fig = |id: &str| match id {
+            "r-0" => seat(t0 + 10, t0 + 300),
+            "r-1" => r1.clone(),
+            _ => seat(s + 1100, s + 2300),
+        };
+        let v = effort_with(&store, &w, None, &fig);
+        holds_to_its_windows(&v, [1100, 1200]);
+        let gap = v["waits"].as_array().unwrap().iter().find(|w| w["cause"].as_str().unwrap().starts_with(crate::timeline::PARKED_CAUSE)).unwrap_or_else(|| panic!("{v}"));
+        assert_eq!(gap["seconds"], 90, "from the list's start to the next spawn: {v}");
     }
 
     /// `wsp-857`: effort.json says so where more than 1 % of the wall is in no

@@ -119,8 +119,8 @@ pub(crate) struct Inputs {
     /// done: a reset by hand, or a spawn that failed (`wsp-902`).
     pub leg_marks: Vec<LegMark>,
     /// Where the row's group window opens: the previous group's pass, off its
-    /// `worklist-go`; `None` for the first group, whose window opens at its
-    /// first start. What the row did, or waited, before it is the previous
+    /// `worklist-go`; for the first group, the list's start ([`start_in`]).
+    /// `None` where neither is recorded: it opens at the first start. What the row did, or waited, before it is the previous
     /// window's, and its phases are read from here on (`wsp-857`: read-api's
     /// wsp-373 first spawned days before its window, and the days were booked
     /// as a gap the buckets never reached).
@@ -224,6 +224,13 @@ pub(crate) fn list_events(store: &Store, kinds: &[&str]) -> Vec<(i64, String, Va
 /// The barriers of `list` an event log says were passed, `(group, when)`.
 fn passes_in(events: &[(i64, String, Value)], list: &str) -> Vec<(usize, i64)> {
     events.iter().filter(|(_, k, d)| k == "worklist-go" && d["id"].as_str() == Some(list)).filter_map(|(t, _, d)| Some((d["passed"].as_u64()? as usize, *t))).collect()
+}
+
+/// When `list` was started: the first `worklist-go` that says `started`, which
+/// `go` records for a person's and for the daemon's start of a planned list
+/// alike (`wsp-934`).
+pub(crate) fn start_in(events: &[(i64, String, Value)], list: &str) -> Option<i64> {
+    events.iter().filter(|(_, k, d)| k == "worklist-go" && d["id"].as_str() == Some(list) && d["started"] == true).map(|(t, _, _)| *t).min()
 }
 
 /// The holds of `list` in an event log's lines, in order, `(start, end, why)`:
@@ -1641,7 +1648,10 @@ pub(crate) fn gather(store: &Store, id: &str) -> Inputs {
         i.parks = parks_of(&ev, l, util::epoch_secs());
         i.holds = holds_of(&ev, l, util::epoch_secs());
         i.passes = passes_in(&ev, l);
-        i.window = group.as_ref().and_then(|(_, n, _)| i.passes.iter().filter(|(g, _)| *g + 1 == *n).map(|(_, t)| *t).min());
+        i.window = group.as_ref().and_then(|(_, n, _)| match n {
+            1 => start_in(&ev, l),
+            _ => i.passes.iter().filter(|(g, _)| *g + 1 == *n).map(|(_, t)| *t).min(),
+        });
         if let Some(w) = store.worklist(l) {
             for (n, g) in w.groups().iter().enumerate() {
                 for c in &g.checks {

@@ -25,8 +25,9 @@
 //! - **check seat** — the barrier's check seat;
 //! - **between groups** — the previous group's pass to this group's first start.
 //!
-//! A group is the window from the previous group's pass (the list's first
-//! start for the first) to its own pass, so the windows tile the wall.
+//! A group is the window from the previous group's pass (the list's start for
+//! the first, or its first member's start where no start is recorded) to its
+//! own pass, so the windows tile the wall.
 
 use std::collections::BTreeMap;
 
