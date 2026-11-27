@@ -1353,21 +1353,26 @@ fn check_wrote(file: &Path) -> BTreeMap<String, String> {
     text.lines().filter_map(|l| l.split_once('\t')).map(|(step, path)| (path.to_string(), step.to_string())).collect()
 }
 
-/// The untracked paths of a tree, as `git status` spells them. It takes no
-/// index lock: it is asked around every check step, beside a seat's commits.
-pub fn untracked_paths(dir: &Path) -> BTreeSet<String> {
-    git(dir, &["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.strip_prefix("?? "))
-        .map(|p| p.trim().to_string())
-        .collect()
+/// The untracked paths of a tree, as `git status` spells them, or `None` where
+/// git cannot be read: an empty set would say that nothing was there before a
+/// step. It takes no index lock: it is asked around every check step, beside a
+/// seat's commits.
+pub fn untracked_paths(dir: &Path) -> Option<BTreeSet<String>> {
+    untracked_in(dir, "all")
+}
+
+fn untracked_in(dir: &Path, mode: &str) -> Option<BTreeSet<String>> {
+    let mode = format!("--untracked-files={mode}");
+    let out = git(dir, &["--no-optional-locks", "status", "--porcelain", &mode])?;
+    Some(out.lines().filter_map(|l| l.strip_prefix("?? ")).map(|p| p.trim().to_string()).collect())
 }
 
 /// Records what the check step `step` created in `dir`: untracked after it and
 /// not `before` it (`wsp-848`). An entry whose path was gone by then is dropped.
-pub fn note_check_wrote(dir: &Path, step: &str, before: &BTreeSet<String>) {
-    let after = untracked_paths(dir);
+/// Where either reading failed, nothing is recorded: the member's own files
+/// would be taken for the step's.
+pub fn note_check_wrote(dir: &Path, step: &str, before: Option<&BTreeSet<String>>) {
+    let (Some(before), Some(after)) = (before, untracked_paths(dir)) else { return };
     let Some(file) = check_wrote_file(dir) else { return };
     let mut wrote = check_wrote(&file);
     wrote.retain(|path, _| before.contains(path));
@@ -1382,29 +1387,73 @@ pub fn note_check_wrote(dir: &Path, step: &str, before: &BTreeSet<String>) {
     let _ = std::fs::write(file, text);
 }
 
-/// What to say of a dirty tree some of whose paths a check step created: whose
-/// they are, that they are not to be committed, and what else is uncommitted.
-/// `None` where none of them is a check's.
+/// How many names one line of a send-back lists before it counts the rest.
+const NAMED: usize = 8;
+
+fn capped(names: &[&str]) -> String {
+    let mut out = names.iter().take(NAMED).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > NAMED {
+        out.push_str(&format!(" and {} more", names.len() - NAMED));
+    }
+    out
+}
+
+/// What to call a path a check step created: the outermost directory over it
+/// that holds nothing tracked (`dirs`, as `git status` collapses them) and none
+/// of the member's `own` paths, else the path itself.
+fn named_as<'a>(path: &'a str, dirs: &BTreeSet<String>, own: &BTreeSet<&str>) -> &'a str {
+    // `git status` quotes a path with a space in it, and not its directory.
+    let bare = path.trim_matches('"');
+    let Some(top) = dirs.iter().map(|d| d.trim_matches('"')).find(|d| d.ends_with('/') && bare.starts_with(d)) else {
+        return path;
+    };
+    bare.match_indices('/')
+        .map(|(i, _)| &bare[..=i])
+        .filter(|d| d.len() >= top.len())
+        .find(|d| !own.range::<&str, _>(*d..).next().is_some_and(|o| o.starts_with(d)))
+        .unwrap_or(path)
+}
+
+/// What to say of a dirty tree some of whose paths a check step created: what
+/// to do, then what else is uncommitted, then whose the rest are. A directory
+/// the checks made is named once, and each list is capped: a build directory is
+/// thousands of files. `None` where none of them is a check's.
 fn check_wrote_said(dir: &Path) -> Option<String> {
     let wrote = check_wrote(&check_wrote_file(dir)?);
-    let mut by_step: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut theirs: Vec<(&str, &str)> = Vec::new();
     let mut own: Vec<String> = Vec::new();
     for (code, path) in dirty_files(dir) {
         match wrote.get_key_value(&path).filter(|_| code == "??") {
-            Some((path, step)) => by_step.entry(step).or_default().push(path),
+            Some((path, step)) => theirs.push((path, step)),
             None => own.push(path),
         }
     }
-    if by_step.is_empty() {
+    if theirs.is_empty() {
         return None;
     }
-    let mut out = String::new();
-    for (step, paths) in by_step {
-        out.push_str(&format!("\n  written by check step `{step}`, not your work — do not commit these: {}", paths.join(", ")));
+    let dirs = untracked_in(dir, "normal").unwrap_or_default();
+    let owned: BTreeSet<&str> = own.iter().map(|p| p.trim_matches('"')).collect();
+    let mut steps_of: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (path, step) in theirs {
+        steps_of.entry(named_as(path, &dirs, &owned)).or_default().insert(step);
     }
-    out.push_str("\n  delete them, and have the check write under $WSP_SCRATCH, outside the tree");
+    let mut by_steps: BTreeMap<BTreeSet<&str>, Vec<&str>> = BTreeMap::new();
+    for (name, steps) in steps_of {
+        by_steps.entry(steps).or_default().push(name);
+    }
+    let mut out = String::from(
+        "\n  do not commit what a check step wrote: look, delete what it wrote, and have it write under $WSP_SCRATCH; then `wsp review` again",
+    );
     if !own.is_empty() {
-        out.push_str(&format!("\n  also uncommitted, and no check's — commit what is work (`wsp commit-help`): {}", own.join(", ")));
+        let own: Vec<&str> = own.iter().map(String::as_str).collect();
+        out.push_str(&format!("\n  also uncommitted, and no check's — commit what is work (`wsp commit-help`): {}", capped(&own)));
+    }
+    for (steps, mut names) in by_steps {
+        // Directories first, so loose files never count one of them away.
+        names.sort_by_key(|n| !n.ends_with('/'));
+        let s = if steps.len() == 1 { "" } else { "s" };
+        let steps = steps.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("\n  written by check step{s} {steps}, not your work: {}", capped(&names)));
     }
     Some(out)
 }
@@ -2401,7 +2450,7 @@ pub fn ready_from(store: &Store, task: &str, cwd: &Path) -> Result<Option<(Strin
     }
     if dirty(&w.dir) {
         if let Some(said) = check_wrote_said(&w.dir) {
-            return Err(format!("{} is not clean, so there is no commit to be ready at; then `wsp review` again{said}", util::contract(&w.dir)));
+            return Err(format!("{} is not clean, so there is no commit to be ready at{said}", util::contract(&w.dir)));
         }
         return Err(format!(
             "{} has uncommitted work — commit it (`wsp commit-help`), then `wsp review` again: a verifier reads the tree at the commit you are ready at",
@@ -2442,7 +2491,7 @@ pub fn rebase_ready(store: &Store, task: &str) -> Prepared {
     let tree = util::contract(&w.dir);
     if dirty(&w.dir) {
         if let Some(said) = check_wrote_said(&w.dir) {
-            return Prepared::Refused(format!("wsp: {tree} is not clean, so the rebase onto {} could not be made; then `wsp review` again{said}", w.branch));
+            return Prepared::Refused(format!("wsp: {tree} is not clean, so the rebase onto {} could not be made{said}", w.branch));
         }
         return Prepared::Refused(format!(
             "wsp: {tree} has uncommitted work, so the rebase onto {} could not be made — commit it (`wsp commit-help`), then `wsp review` again",

@@ -2079,7 +2079,7 @@ pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, run
     } else {
         first
     };
-    crate::cmd_checkout::note_check_wrote(dir, &step.name, &before);
+    crate::cmd_checkout::note_check_wrote(dir, &step.name, before.as_ref());
     if let (Some(r), true, Done::Passed) = (reuse, clean, &ran.done) {
         r.greens.record_by(r.sha, inputs.as_deref(), &step.command, r.env, secs(ran.took), r.who, ran.first.is_some());
     }
@@ -4339,14 +4339,50 @@ mod tests {
         let step = Step { name: "shots".into(), ..sh("echo a > out.txt && mkdir shots && echo b > shots/one", 10) };
         assert!(passed(&run_all(&tree, &[step], &env.path("log"), None, &Runner::Inproc, |_| {})));
         let said = sent_back(&store);
-        assert!(said.contains("written by check step `shots`, not your work — do not commit these: out.txt, shots/one"), "{said}");
+        assert!(said.contains("written by check step `shots`, not your work: shots/, out.txt"), "{said}");
+        assert!(said.contains("do not commit what a check step wrote"), "{said}");
         assert!(!said.contains("commit it") && !said.contains("commit-help"), "{said}");
         let review = crate::cmd_checkout::ready_from(&store, "pj-001", &tree).unwrap_err();
-        assert!(review.contains("do not commit these: out.txt, shots/one"), "{review}");
+        assert!(review.contains("do not commit") && review.contains("not your work: shots/, out.txt"), "{review}");
         // The member's own edit beside them is still theirs to commit.
         std::fs::write(tree.join("mine"), "2\n").unwrap();
         let said = sent_back(&store);
         assert!(said.contains("no check's — commit what is work (`wsp commit-help`): mine"), "{said}");
+    }
+
+    #[test]
+    fn a_build_directory_a_step_wrote_is_named_once_and_the_send_back_stays_short() {
+        let (env, store, tree) = member_world("build");
+        std::fs::create_dir(tree.join("src-tauri")).unwrap();
+        std::fs::write(tree.join("src-tauri/lib"), "1\n").unwrap();
+        git_run(&tree, &["add", "src-tauri"]);
+        git_run(&tree, &["commit", "--quiet", "-m", "pj-001: tauri"]);
+        let writes = "for d in OUT src-tauri/target-served; do mkdir -p $d/deps && for i in $(seq 60); do echo > $d/deps/$i; echo > \"$d/a $i\"; done; done";
+        let step = Step { name: "baseline".into(), ..sh(writes, 10) };
+        assert!(passed(&run_all(&tree, &[step], &env.path("log"), None, &Runner::Inproc, |_| {})));
+        let said = sent_back(&store);
+        assert!(said.ends_with("written by check step `baseline`, not your work: OUT/, src-tauri/target-served/"), "{said}");
+        let first: String = said.chars().take(300).collect();
+        assert!(first.contains("do not commit") && first.contains("$WSP_SCRATCH"), "{said}");
+        assert!(said.len() < 600, "{said}");
+
+        // A directory with a file of the member's in it is not named whole, and
+        // the list under it is capped without crowding that file out.
+        std::fs::write(tree.join("OUT/deps/mine"), "1\n").unwrap();
+        crate::cmd_checkout::note_check_wrote(&tree, "later", None);
+        let said = sent_back(&store);
+        assert!(said.contains("(`wsp commit-help`): OUT/deps/mine\n"), "{said}");
+        assert!(!said.contains("OUT/,") && !said.contains("OUT/deps/,") && said.contains(" more"), "{said}");
+        assert!(said.contains("src-tauri/target-served/") && said.len() < 900, "{said}");
+    }
+
+    #[test]
+    fn nothing_is_the_checks_where_the_tree_could_not_be_read_before_the_step() {
+        let (_env, store, tree) = member_world("unread");
+        std::fs::write(tree.join("new"), "new\n").unwrap();
+        crate::cmd_checkout::note_check_wrote(&tree, "x", None);
+        let said = sent_back(&store);
+        assert!(said.contains("commit it (`wsp commit-help`)") && !said.contains("check step"), "{said}");
     }
 
     #[test]
