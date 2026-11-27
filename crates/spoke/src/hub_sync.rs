@@ -1546,6 +1546,13 @@ impl Worker {
         }
         for st in &stale {
             self.minted.remove(&here(&st.subject));
+            // A list of this workspace never sent, whose slug the hub holds for
+            // a list that shares nothing with it: another list, not a
+            // divergence. It goes to the hub under a new id (`hub_lists`).
+            if let Some(said) = self.second_of_slug(store, &ws, st, objects, by) {
+                wsp_engine::store::log_line(store, &said);
+                continue;
+            }
             // A list kept here under a name of its own meets the door by it.
             if let (Subject::List(l), Subject::List(name)) = (&st.subject, here(&st.subject)) {
                 if name.0 != l.0 {
@@ -1563,6 +1570,40 @@ impl Worker {
                 Err(r) => self.say_once(store, format!("hub-sync: {:?} is stale and was not reconciled: {r:?}", st.subject)),
             }
         }
+    }
+}
+
+impl Worker {
+    /// [`crate::hub_lists::second_of_slug`] where `st` is a list of `ws` that
+    /// was never sent (no synced head, so its move was from none) and whose
+    /// hub head reaches a root through the objects held here without meeting
+    /// one of the list's own journaled records: what the log is told. Its
+    /// journaled records go, made again under the new id at the next turn.
+    fn second_of_slug(&mut self, store: &Store, ws: &str, st: &hub_client::Stale, objects: &ObjectDir, by: &Principal) -> Option<String> {
+        let Subject::List(l) = &st.subject else { return None };
+        if st.from.is_some() || crate::hub_lists::hub_id(store, &l.0) != l.0 || Heads::read(store).head(&st.subject).is_some() {
+            return None;
+        }
+        if !store.worklist(&l.0).is_some_and(|w| w.workspace.to_string() == ws) {
+            return None;
+        }
+        let journal = Journal::of(store);
+        let ours: BTreeSet<ObjectId> = journal.by_subject().remove(&st.subject).map(|(_, es)| es.iter().map(|e| e.id).collect()).unwrap_or_default();
+        let mut at = st.head;
+        while let Some(id) = at {
+            if ours.contains(&id) {
+                return None;
+            }
+            at = Objects::object(objects, &id).and_then(|o| o.parent().copied());
+        }
+        if let Some((_, es)) = journal.by_subject().remove(&st.subject) {
+            for e in &es {
+                journal.remove(e);
+            }
+        }
+        self.minted.remove(&st.subject);
+        let (_, said) = crate::hub_lists::second_of_slug(store, ws, &l.0, &user_of(by));
+        Some(said)
     }
 }
 

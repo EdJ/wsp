@@ -20,9 +20,13 @@
 //! hub's object ids under the local subject, and the list's drive lease is the
 //! hub id's (`drive:<hub id>`). The list that was here first keeps its slug.
 //!
-//! Not covered: two lists of one slug in one workspace (two people making
-//! `run` there before either syncs). The hub holds one subject for them, the
-//! second push is a divergence and stays on its own spoke.
+//! **One slug made twice in one workspace** (two people making `run` there
+//! before either syncs): the hub holds the first pushed; the second spoke's
+//! push is stale or diverged, and its list was never sent and shares no
+//! object with the hub's. That spoke keeps both: its own goes to the hub under
+//! a new id ([`second_of_slug`], `run-<user>`), the hub's comes in under a
+//! name of its own ([`arriving`]), and the log says so once. A divergence of
+//! a list that was sent before is reconciled as ever.
 
 use std::collections::BTreeMap;
 
@@ -100,7 +104,11 @@ pub fn arriving(store: &Store, ws: &str, id: &str) -> String {
     if let Some(l) = names.local(ws, id) {
         return l.clone();
     }
-    let taken_by_other = store.worklist(id).is_some_and(|w| w.workspace.to_string() != ws) || store.project(id).is_some();
+    // Taken, too, by a list of this workspace that goes to the hub under
+    // another id ([`second_of_slug`]): the hub's list of the slug is another.
+    let taken_by_other = store.worklist(id).is_some_and(|w| w.workspace.to_string() != ws)
+        || store.project(id).is_some()
+        || names.0.get(id).is_some_and(|(w, i)| w == ws && i != id);
     if !taken_by_other {
         return id.to_string();
     }
@@ -113,6 +121,28 @@ pub fn arriving(store: &Store, ws: &str, id: &str) -> String {
         names.write(store)
     });
     local
+}
+
+/// The local list `local` of `ws`, never sent to the hub, met another list
+/// under its slug there (two people made the slug in one workspace before
+/// either synced): from now on it goes to the hub under a new id,
+/// `<slug>-<me>` (a number after it where that is taken here), recorded in
+/// [`Names`]; the hub's list of the slug then arrives here under a name of its
+/// own ([`arriving`]). The new id, and what the log is told once.
+pub fn second_of_slug(store: &Store, ws: &str, local: &str, me: &str) -> (String, String) {
+    let base = format!("{local}-{}", wsp_engine::util::slugify(me));
+    let new = store
+        .locked(|| {
+            let mut names = Names::read(store);
+            let taken = |c: &str| names.0.values().any(|(w, i)| w == ws && i == c) || store.worklist(c).is_some() || store.project(c).is_some();
+            let new = std::iter::once(base.clone()).chain((2..).map(|n| format!("{base}-{n}"))).find(|c| !taken(c)).expect("an unbounded search");
+            names.0.insert(local.to_string(), (ws.to_string(), new.clone()));
+            names.write(store).map(|_| new)
+        })
+        .unwrap_or(base);
+    let theirs = format!("{local}-{}", wsp_engine::util::slugify(ws.strip_prefix("shared:").unwrap_or(ws)));
+    let said = format!("hub-sync: {local} in {ws} was made on the hub by someone else too before this spoke sent yours; theirs is kept here as {theirs}, and yours goes to the hub as {new}");
+    (new, said)
 }
 
 /// `body` (a list file) with its frontmatter's `id:` line saying `id`.
@@ -320,5 +350,69 @@ mod tests {
         );
         assert!(ann.worklist("mine").is_some_and(|w| w.workspace.is_private()), "the private list keeps its slug");
         assert_eq!(hub_title(&hub, &tokens, "bo", "shared:one", "mine").as_deref(), Some("bo's shared mine"));
+    }
+
+    /// Two people make a shared list of one slug in one workspace before
+    /// either syncs. The hub holds the first one pushed under the slug; the
+    /// second's chain shares nothing with it, so the second spoke takes the
+    /// hub's list too and sends its own under a new hub id, saying so once.
+    /// Both spokes end with both lists. Either may sync first.
+    #[test]
+    fn lists_one_slug_made_twice_in_one_workspace_before_either_syncs_ends_as_two_lists_on_both() {
+        for first in ["ann", "bo"] {
+            let Some(hub) = TestHub::start(Setup::default()) else { return };
+            let tokens = hub.seed(&["team"], &[("ann", &["team"]), ("bo", &["team"])]);
+            let env = wsp_engine::util::isolated(&format!("hub-lists-same-{first}"));
+            let dir = env.path("spokes");
+            let (ann, ann_home) = spoke(&dir, "ann", &hub, &tokens);
+            let (bo, bo_home) = spoke(&dir, "bo", &hub, &tokens);
+            list(&ann, "run", "ann's run", "shared:team");
+            list(&bo, "run", "bo's run", "shared:team");
+            let (one, one_home, two, two_home, second) = match first {
+                "ann" => (&ann, &ann_home, &bo, &bo_home, "bo"),
+                _ => (&bo, &bo_home, &ann, &ann_home, "ann"),
+            };
+            turns(one, one_home, 1);
+            turns(two, two_home, 3);
+            turns(one, one_home, 2);
+            let both = vec![("shared:team".to_string(), "ann's run".to_string()), ("shared:team".to_string(), "bo's run".to_string())];
+            assert_eq!(kept(&ann), both, "{first} first: ann has both");
+            assert_eq!(kept(&bo), both, "{first} first: bo has both");
+            assert_eq!(hub_title(&hub, &tokens, "ann", "shared:team", "run").as_deref(), Some(format!("{first}'s run").as_str()), "the first keeps the slug");
+            let new_id = format!("run-{second}");
+            assert_eq!(hub_title(&hub, &tokens, "ann", "shared:team", &new_id).as_deref(), Some(format!("{second}'s run").as_str()), "the second under a new hub id");
+            let log = std::fs::read_to_string(two.state.join("cycle.log")).unwrap_or_default();
+            let said = format!("hub-sync: run in shared:team was made on the hub by someone else too before this spoke sent yours; theirs is kept here as run-team, and yours goes to the hub as {new_id}");
+            assert_eq!(log.matches(&said).count(), 1, "said once: {log}");
+            assert!(!log.contains("was not reconciled"), "{log}");
+        }
+    }
+
+    /// A list both spokes had from the hub and both edited is an ordinary
+    /// divergence: reconciled as before, never sent under a new id.
+    #[test]
+    fn lists_an_ordinary_divergence_of_one_list_is_not_taken_for_another_list() {
+        let Some(hub) = TestHub::start(Setup::default()) else { return };
+        let tokens = hub.seed(&["team"], &[("ann", &["team"]), ("bo", &["team"])]);
+        let env = wsp_engine::util::isolated("hub-lists-diverge");
+        let dir = env.path("spokes");
+        let (ann, ann_home) = spoke(&dir, "ann", &hub, &tokens);
+        let (bo, bo_home) = spoke(&dir, "bo", &hub, &tokens);
+        list(&ann, "run", "the run", "shared:team");
+        turns(&ann, &ann_home, 1);
+        turns(&bo, &bo_home, 2);
+        assert!(bo.worklist("run").is_some());
+        for (store, title) in [(&ann, "ann's edit"), (&bo, "bo's edit")] {
+            let mut w = store.worklist("run").unwrap();
+            w.title = title.into();
+            store.save_worklist(&w).unwrap();
+        }
+        turns(&ann, &ann_home, 1);
+        turns(&bo, &bo_home, 3);
+        assert!(Names::read(&bo).0.is_empty(), "bo keeps one list named run: {:?}", Names::read(&bo));
+        assert_eq!(bo.worklists().len(), 1);
+        assert!(hub_title(&hub, &tokens, "bo", "shared:team", "run-bo").is_none(), "nothing sent under a new id");
+        let log = std::fs::read_to_string(bo.state.join("cycle.log")).unwrap_or_default();
+        assert!(!log.contains("was made on the hub by someone else too"), "{log}");
     }
 }
