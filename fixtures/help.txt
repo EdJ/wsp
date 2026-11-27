@@ -359,7 +359,8 @@ AGENTS
                                     worktree. A seat that will not close keeps
                                     its claim; a tree with uncommitted work in it,
                                     or with somebody in it, is kept and said so.
-                                    --keep-tree leaves the checkout alone
+                                    --keep-tree leaves the checkout alone;
+                                    --why "…" is written on the row's log
   wsp despawn <id> --lost           the seat is on a machine that is not coming
                                     back: release the claim, the row to todo,
                                     keep the worktree on the seat. A far seat

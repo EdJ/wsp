@@ -5481,6 +5481,12 @@ fn end_work(
         }
     };
 
+    // Read for every caller, and not only the ones the gate below asks: `wsp
+    // done` passes one from outside any seat too, and a reason nothing read is
+    // reported as a flag `despawn` does not have (`wsp-930`). A bare `--why`
+    // is no reason.
+    let why = args.get("why").map(|w| util::fold(&w)).filter(|w| !w.is_empty() && w != "true");
+
     // Who is asking decides how far this reaches (`wsp-473`): the primary seat
     // any seat, with a why and not mid-turn; a governor the seats of rows on
     // its own list. A caller in no seat is as free as ever.
@@ -5630,6 +5636,15 @@ fn end_work(
     // What the binding said, unless the release found something else there —
     // which it will not, and if it ever does, the release is the later reading.
     let task = ended.or(task);
+
+    // The reason, on the log of the row the seat was on. A verifier's seat
+    // holds no claim, so its row is the member it read.
+    if let Some(why) = &why {
+        let row = task.clone().or_else(|| crate::verification::seats(&store.tasks()).get(seat.as_str()).cloned());
+        if let Some(mut t) = row.and_then(|id| store.task(&id)) {
+            let _ = crate::log::note(store, &mut t, &format!("ended {seat}: {why}"));
+        }
+    }
 
     // A seat ended after its row closed: the row's log names it (`wsp-582`).
     if let Some(mut t) = task.as_deref().and_then(|id| store.task(id)).filter(|t| t.status() == crate::model::Status::Done) {
@@ -5882,7 +5897,8 @@ pub const VERBS: &[crate::verbs::Verb] = &[
                                     worktree. A seat that will not close keeps
                                     its claim; a tree with uncommitted work in it,
                                     or with somebody in it, is kept and said so.
-                                    --keep-tree leaves the checkout alone"##,
+                                    --keep-tree leaves the checkout alone;
+                                    --why "…" is written on the row's log"##,
             },
             crate::verbs::Help {
                 section: crate::verbs::Section::Agents,
@@ -11040,6 +11056,26 @@ mod tests {
         let by_the_primary = Args::synth("despawn", &[], &[("pane", "w1:p1"), ("why", "so the run reseats")]);
         assert_eq!(end_work(&place, &store, &by_the_primary, primary, &tidied.f()), 0);
         assert!(log("t-260816-095").contains(crate::cycle::RESEAT_ASKED), "{}", log("t-260816-095"));
+
+        let _ = std::fs::remove_dir_all(&store.root);
+    }
+
+    /// `wsp-930`: `wsp done` passes `--why` from wherever it was run, and a
+    /// caller in no seat is not asked for one — the verb reads it all the same,
+    /// so nothing reports it as unheard, and the row's log keeps it.
+    #[test]
+    fn despawn_takes_a_why_from_any_caller_and_writes_it_on_the_row() {
+        let _env = no_backend();
+        let store = seat("despawn-why");
+        working(&store, "t-260816-095", "w1:p1");
+        let line = ["despawn", "--pane", "w1:p1", "--keep-tree", "--why", "its verification holds"];
+        let args = Args::parse(line.map(String::from).to_vec());
+
+        let tidied = Tidied::default();
+        assert_eq!(end_work(&Ends::ok(), &store, &args, Caller::default(), &tidied.f()), 0);
+        assert!(!args.dropped().iter().any(|f| f == "why"), "{:?}", args.dropped());
+        let log = store.find_task("t-260816-095").unwrap().section("Log").unwrap_or_default().to_string();
+        assert!(log.contains("ended w1:p1: its verification holds"), "{log}");
 
         let _ = std::fs::remove_dir_all(&store.root);
     }
