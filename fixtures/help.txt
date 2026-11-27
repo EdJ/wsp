@@ -137,7 +137,7 @@ TASKS
                                     the ran/drove/read lines that session's
                                     transcript would give a verdict
   wsp done <id> [--force]           the person's verb (a member finishes with
-                                    `wsp review`); complete; --force over open sub-tasks. Its
+                                    `wsp submit`); complete; --force over open sub-tasks. Its
                                     worktree and branch go too when the work is
                                     on the trunk and nobody is in it; otherwise
                                     kept and said why. --keep-tree leaves it
