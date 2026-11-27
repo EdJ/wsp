@@ -3596,6 +3596,8 @@ fn prepare_ready(store: &Store, list: &str, at: usize, member: &Task) -> bool {
             true
         }
         Prepared::Refused(text) => {
+            // git's stderr, progress lines and all.
+            let text = util::said_plainly(&text).into_owned();
             let read = crate::repair::ready(member);
             store.locked(|| {
                 if let Some(mut m) = store.find_task(&member.id) {
@@ -6295,6 +6297,9 @@ pub mod tests {
         /// tell without `--anyway` is refused (`deliver_as` is `No`), one with it lands
         /// (`wsp-658`: idle to the run, `cannot say whether it is at a prompt` to the verb).
         pub static TELL_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set, and `wsp tell`'s prose check refuses every sentence typed to a
+        /// member on this thread, however clean (`wsp-846`).
+        pub static TELL_PROSE_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Set, and a member's seat answers every tell "delivery still pending" on this
         /// thread (`deliver_as` is `Pending`), ahead of [`TELL_REFUSED`].
         pub static TELL_PENDING_BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

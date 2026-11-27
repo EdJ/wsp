@@ -1841,7 +1841,7 @@ fn deliver_the_reason(store: &Store, args: &Args, reason: &str) {
 /// The delivery itself, by id: `wsp verified --blocks` sends a member back the
 /// way `reopen` does and says it through the same one path.
 pub fn deliver_reason(store: &Store, id: &str, reason: &str) {
-    if !deliver(store, id, &format!("wsp sent {id} back: {reason}")) {
+    if matches!(deliver_as(store, id, &format!("wsp sent {id} back: {reason}")), Told::Pending | Told::No) {
         crate::repair::note_tell_pending(store, id);
     }
 }
@@ -1868,6 +1868,9 @@ pub enum Told {
     Pending,
     /// The pane refused, or `wsp tell` could not run.
     No,
+    /// `wsp tell`'s prose check refused wsp's own sentence. The same sentence
+    /// would be refused again, so nothing retries it: the governor was told.
+    Unsayable,
 }
 
 /// [`deliver`] saying which way it did not deliver. **A pending delivery is
@@ -1896,6 +1899,10 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
     if store.panes_for_task(id).is_empty() {
         return Told::Yes;
     }
+    // A reason built from a command's output (a rebase, a land, a check) carries
+    // what `wsp tell` refuses (`wsp-846`).
+    let line = util::said_plainly(line);
+    let line = line.as_ref();
     if cfg!(test) {
         #[cfg(test)]
         {
@@ -1907,6 +1914,13 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
             }
             if !anyway && crate::cycle::tests::TELL_UNVOUCHED.with(|r| r.get()) {
                 return Told::No;
+            }
+            // `wsp tell`'s own check of what it reads on stdin.
+            let refused = util::terminal_output(line).or_else(|| {
+                crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.get()).then(|| util::TERMINAL_OUTPUT.to_string())
+            });
+            if let Some(why) = refused {
+                return unsayable(store, id, &why);
             }
             crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().push((id.to_string(), line.to_string())));
         }
@@ -1936,6 +1950,9 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
     }
     let (told, said) = match child.wait_with_output() {
         Ok(o) if o.status.success() => (Told::Yes, "it has the sentence".to_string()),
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains(util::TERMINAL_OUTPUT) => {
+            return unsayable(store, id, util::fold(&String::from_utf8_lossy(&o.stderr)).as_str());
+        }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let told = if err.contains(crate::place_compound::DELIVERY_PENDING) { Told::Pending } else { Told::No };
@@ -1950,6 +1967,29 @@ fn deliver_with(store: &Store, id: &str, line: &str, anyway: bool) -> Told {
         ));
     }
     told
+}
+
+/// `wsp tell` refused wsp's own sentence as terminal output. `--anyway` does not
+/// pass that check and the next idle tick would type the same words, so it is
+/// said once: on the row, in the run's log, and to whoever governs the list.
+fn unsayable(store: &Store, id: &str, why: &str) -> Told {
+    let why = util::truncate(&util::fold(&util::said_plainly(why)), 160);
+    crate::store::log_line(store, &format!("tell {id}: not delivered, and not retried — {why}"));
+    store.locked(|| {
+        let Some(mut t) = store.find_task(id) else { return };
+        let _ = crate::log::note(store, &mut t, &format!("{}: {why}", crate::repair::TELL_UNSAYABLE));
+    });
+    let text = format!(
+        "{id}'s seat was NOT told: `wsp tell` refused wsp's own sentence ({why}), and wsp will not retry it. \
+         `wsp show {id}` has the reason; say it to the seat with `wsp tell {id} -`."
+    );
+    match store.find_task(id).and_then(|t| crate::cycle::list_of(store, &t)) {
+        Some(w) => crate::cycle::tell(store, &w, &text),
+        None => {
+            crate::cycle::notice_on_row(store, id, &text);
+        }
+    }
+    Told::Unsayable
 }
 
 /// Reads its prose the same way `note` does — see [`payload_source`].
@@ -6391,5 +6431,54 @@ pub mod tests {
         assert_eq!(reopen(&store, &Args::synth("reopen", &["m-2", "later"], &[("no-seat", "true")])), 0);
         assert!(reseated().is_empty(), "--no-seat leaves it to whoever sent it back");
         assert_eq!(store.find_task("m-2").unwrap().status(), Status::Doing);
+    }
+
+    const REBASE_FAILED: &str = "wsp: the rebase onto master does not apply cleanly\ngit said: Rebasing (1/41)\r\
+        Rebasing (2/41)\rRebasing (3/41)\rerror: could not apply 17079a4... the change\nhint: Resolve all conflicts manually";
+
+    /// A member of a running list with `cpd-1` bound, sent back for a rebase
+    /// whose stderr holds git's progress line, as the run does it.
+    fn sent_back_for_a_rebase(tag: &str) -> Store {
+        let store = scratch(tag);
+        released(&store, "m-1", "claimed by pane cpd-1 · spawned at opus/high");
+        store.set_binding("cpd-1", serde_json::json!({ "task_id": "m-1" }));
+        crate::repair::tests::list(&store, &["m-1"], "claude");
+        crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().clear());
+        crate::cycle::tests::TOLD.with(|t| t.borrow_mut().clear());
+        let mut t = store.find_task("m-1").unwrap();
+        crate::verification::send_back(&mut t, util::now_iso(), "wsp's rebase", None, REBASE_FAILED, None);
+        store.save_task(&t).unwrap();
+        store
+    }
+
+    /// `wsp-846`: the seat is told, without the carriage returns `wsp tell` refuses.
+    #[test]
+    fn a_send_back_for_a_failed_rebase_reaches_the_seat_with_no_carriage_return() {
+        let store = sent_back_for_a_rebase("rebasetold");
+        crate::verification::deliver_unless_reworked(&store, "m-1", REBASE_FAILED);
+        let told = crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(told.len(), 1, "{told:?}");
+        let line = &told[0].1;
+        assert!(line.contains("error: could not apply 17079a4") && line.contains("sent m-1 back"), "{line}");
+        assert!(!line.contains('\r') && !line.contains("Rebasing ("), "{line:?}");
+        let t = store.find_task("m-1").unwrap();
+        let log = t.section("Log").unwrap();
+        assert!(log.contains("could not apply") && !log.contains("Rebasing ("), "{log}");
+        assert!(crate::repair::undelivered_reason(&t).is_none(), "nothing is owed");
+    }
+
+    /// `wsp-846`: a sentence the prose check still refuses goes to the governor
+    /// once, and is not left pending for the seat's next idle.
+    #[test]
+    fn a_tell_the_prose_check_refuses_is_reported_to_the_governor_once_and_not_left_pending() {
+        let store = sent_back_for_a_rebase("rebaserefused");
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(true));
+        crate::verification::deliver_unless_reworked(&store, "m-1", REBASE_FAILED);
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(false));
+        let governed = crate::cycle::tests::TOLD.with(|t| t.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert_eq!(governed.iter().filter(|l| l.contains("m-1") && l.contains("NOT told")).count(), 1, "{governed:?}");
+        assert!(crate::cycle::tests::MEMBER_TOLD.with(|t| t.borrow().is_empty()));
+        let t = store.find_task("m-1").unwrap();
+        assert!(crate::repair::undelivered_reason(&t).is_none(), "{:?}", t.section("Log"));
     }
 }

@@ -1075,7 +1075,7 @@ pub fn verdict_core(store: &Store, member: Task, judged: Judged, me: Option<Stri
             crate::cmd_checkout::Verdict::Blocked(why) => {
                 state = State::Blocks;
                 caption = "the hold could not land the row".to_string();
-                text = format!("{}\n\n{why}", text.trim());
+                text = format!("{}\n\n{}", text.trim(), util::said_plainly(&why));
                 owes = None;
                 println!("{}", Paint::new().red("■ the hold could not land the row, so it is recorded as a block"));
             }
@@ -1240,6 +1240,7 @@ pub fn retry_owed(store: &Store, member: &str, by: &str) -> Option<Owed> {
             Owed::Still(why)
         }
         crate::cmd_checkout::Verdict::Blocked(why) => {
+            let why = util::said_plainly(&why).into_owned();
             store.locked(|| {
                 let mut t = store.find_task(member)?;
                 let mut ps = passes(&t);
@@ -1544,6 +1545,9 @@ pub fn record_checked(
 /// `by` is who sent it ("the verifier blocked", "wsp check failed") and `now`
 /// the one instant the caller also wrote its entry with.
 pub fn send_back(t: &mut Task, now: String, by: &str, read: Option<&str>, text: &str, rework_head: Option<&str>) {
+    // Progress lines would fill the log line before what failed (`wsp-846`).
+    let text = util::said_plainly(text);
+    let text = text.as_ref();
     t.set_status(Status::Doing);
     t.updated = now;
     t.log(&format!(

@@ -1205,7 +1205,94 @@ pub fn terminal_output(text: &str) -> Option<String> {
         '\x07' => "a bell".to_string(),
         c => format!("a control byte (U+{:04X})", c as u32),
     };
-    Some(format!("it is terminal output rather than prose — {named} in it"))
+    Some(format!("{TERMINAL_OUTPUT} — {named} in it"))
+}
+
+/// What [`terminal_output`] says of what it refuses: how a caller reading
+/// another wsp's refusal knows it was this one.
+pub const TERMINAL_OUTPUT: &str = "it is terminal output rather than prose";
+
+/// How many characters of a command's output wsp says to somebody.
+pub const SAID_CAP: usize = 4000;
+
+/// A command's output made fit to say as prose, so wsp's own sentence passes
+/// [`terminal_output`] (`wsp-846`: a rebase's progress line in a send-back, and
+/// the seat was never told). Of each run of `\r`-overwritten text the last
+/// segment is kept, as a terminal would show it; escape sequences, other control
+/// bytes and git's progress lines are dropped. Over `cap` characters the middle
+/// goes: what failed is at the head, and what to do about it at the tail.
+pub fn from_terminal(text: &str, cap: usize) -> String {
+    let kept: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let last = line.rsplit('\r').find(|s| !s.trim().is_empty()).unwrap_or_default();
+            let shown = without_control(last);
+            (!git_progress(&shown)).then_some(shown)
+        })
+        .collect();
+    let out = kept.join("\n");
+    let n = out.chars().count();
+    if n <= cap {
+        return out;
+    }
+    let tail = cap.saturating_sub(1) / 3;
+    let head = cap.saturating_sub(1) - tail;
+    out.chars().take(head).chain(['…']).chain(out.chars().skip(n - tail)).collect()
+}
+
+/// [`from_terminal`] for a sentence that may be a command's output or somebody's
+/// prose: prose is returned as it is, whatever its length.
+pub fn said_plainly(text: &str) -> std::borrow::Cow<'_, str> {
+    match terminal_output(text) {
+        Some(_) => from_terminal(text, SAID_CAP).into(),
+        None => text.into(),
+    }
+}
+
+/// `line` less its escape sequences and every control byte but tab.
+fn without_control(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if !c.is_control() || c == '\t' {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters, then one final byte.
+            Some('[') => {
+                chars.find(|c| ('@'..='~').contains(c));
+            }
+            // OSC: up to a bell, or the `ESC \` that ends it.
+            Some(']') => {
+                if chars.find(|c| matches!(c, '\x07' | '\x1b')) == Some('\x1b') {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether a line is git counting its way through something.
+fn git_progress(line: &str) -> bool {
+    let line = line.trim();
+    let line = line.strip_prefix("remote: ").unwrap_or(line);
+    let counting = [
+        "Enumerating objects:",
+        "Counting objects:",
+        "Compressing objects:",
+        "Writing objects:",
+        "Receiving objects:",
+        "Resolving deltas:",
+        "Unpacking objects:",
+        "Updating files:",
+    ];
+    let rebasing = line.strip_prefix("Rebasing (").and_then(|r| r.strip_suffix(')'));
+    counting.iter().any(|p| line.starts_with(p)) || rebasing.is_some_and(|r| r.split('/').all(|n| n.parse::<u32>().is_ok()))
 }
 
 /// The row a name belongs to: a leg's name is `<row>.<leg>`, a row's is its
@@ -1383,6 +1470,34 @@ mod tests {
             let why = terminal_output(bytes).unwrap_or_default();
             assert!(why.contains(named), "{bytes:?} should name {named}, said {why:?}");
         }
+    }
+
+    #[test]
+    fn from_terminal_keeps_the_last_segment_of_each_return_run_and_drops_git_progress() {
+        let said = "Rebasing (1/41)\rRebasing (2/41)\rerror: could not apply 17079a4\r\n\
+                    remote: Counting objects: 3% (1/30)\rremote: Counting objects: 100% (30/30), done.\n\
+                    Rebasing (41/41)\r\n\
+                    downloading 10%\rdownloading 100%\r\n\
+                    \x1b[31mhint:\x1b[0m Resolve all conflicts\x07\x1b]0;title\x07";
+        let plain = from_terminal(said, SAID_CAP);
+        assert_eq!(plain, "error: could not apply 17079a4\ndownloading 100%\nhint: Resolve all conflicts");
+        assert_eq!(terminal_output(&plain), None);
+    }
+
+    #[test]
+    fn from_terminal_caps_long_input_keeping_both_ends() {
+        let said = format!("error: first\n{}\nthen `wsp review` again", "é".repeat(10_000));
+        let plain = from_terminal(&said, 300);
+        assert_eq!(plain.chars().count(), 300);
+        assert!(plain.starts_with("error: first") && plain.ends_with("then `wsp review` again") && plain.contains('…'), "{plain}");
+    }
+
+    #[test]
+    fn plain_prose_is_unchanged() {
+        let prose = "Two shapes.\n\n\t`wsp verify --alone`, or the tree.\n\nRebasing (1/2) is what git says.";
+        assert_eq!(from_terminal(prose, SAID_CAP), prose);
+        let long = "word ".repeat(SAID_CAP);
+        assert_eq!(said_plainly(&long), long, "prose is not cut by length");
     }
 
     /// The premise this was first written on was false: `WSP_BACKEND_SOCKET_PATH` is

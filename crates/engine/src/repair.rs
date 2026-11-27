@@ -1729,7 +1729,7 @@ pub fn run_said(t: &Task) -> crate::waiting::Said {
             said.undelivered = None;
         } else if l.contains(TELL_PENDING) {
             said.undelivered = stamp_of(l);
-        } else if l.contains(TELL_DELIVERED) {
+        } else if l.contains(TELL_DELIVERED) || l.contains(TELL_UNSAYABLE) {
             said.undelivered = None;
         }
     }
@@ -1856,6 +1856,10 @@ fn landed_since_sent_back(t: &Task) -> Option<String> {
 pub const TELL_PENDING: &str = "wsp: the sent-back reason did not reach its pane — typed when the seat reads idle";
 const TELL_DELIVERED: &str = "wsp: the sent-back reason reached its pane";
 
+/// The row's line for a send-back `wsp tell` refused as terminal output: the
+/// governor has it, and nothing is pending.
+pub const TELL_UNSAYABLE: &str = "wsp: the send-back was refused as terminal output, governor told";
+
 /// Records that the newest send-back could not be typed to the member's pane.
 pub fn note_tell_pending(store: &Store, id: &str) {
     store.locked(|| {
@@ -1875,7 +1879,7 @@ pub fn undelivered_reason(t: &Task) -> Option<String> {
             pending = false;
         } else if l.contains(TELL_PENDING) {
             pending = true;
-        } else if l.contains(TELL_DELIVERED) {
+        } else if l.contains(TELL_DELIVERED) || l.contains(TELL_UNSAYABLE) {
             pending = false;
         }
     }
@@ -1912,6 +1916,10 @@ fn retry_undelivered_tells(store: &Store, seats: &dyn Seats) {
                 "{}: the send-back to {seat} is still pending in its backend — asked again next tick ({}s since it was sent back)",
                 t.id, waited.unwrap_or(0)
             ));
+            continue;
+        }
+        // Said to the governor where it was refused; a fresh seat would not help.
+        if told == crate::cmd_task::Told::Unsayable {
             continue;
         }
         if told == crate::cmd_task::Told::Yes {
