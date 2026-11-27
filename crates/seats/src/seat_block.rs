@@ -122,7 +122,6 @@ mod tests {
     #[test]
     fn a_seat_blocked_at_a_question_raises_one_item_with_its_text_and_clears_when_it_moves_on() {
         for next in [State::Idle, State::Working] {
-            // engine's `hold::tests` fixtures are test-only in engine; a plain store is all this needs.
             let store = crate::testkit::store(&format!("seat-block-{}", next.as_str()));
             assert_eq!(sync(&store, &read(State::Blocked)), (1, 0));
             assert_eq!(sync(&store, &read(State::Blocked)), (0, 0), "once per spell, not once per pass");

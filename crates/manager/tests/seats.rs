@@ -114,7 +114,7 @@ fn place(tag: &str) -> (PathBuf, PathBuf) {
     ] {
         std::env::remove_var(key);
     }
-    let base = std::env::temp_dir();
+    let base = std::env::var_os("WSP_SCRATCH").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let dir = base.join(format!("wm-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let sup = base.join(format!("wm-{tag}-{}.sup", std::process::id()));
