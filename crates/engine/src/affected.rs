@@ -469,11 +469,14 @@ fn has_module(src: &str, name: &str, read: &dyn Fn(&str) -> Option<String>) -> b
     read(&format!("{src}/{name}.rs")).is_some() || read(&format!("{src}/{name}/mod.rs")).is_some()
 }
 
-/// Whether a crate under `crates/` that `reach` reaches has the module a filter
-/// path starts with, so the filter matches its tests too (`wsp-899`). A
-/// workspace that cannot be read counts as having it.
+/// Whether the filter may match tests of a crate under `crates/` that `reach`
+/// reaches too: a path where one has the module it starts with (`wsp-899`), a
+/// bare name always, since it matches any test by substring and `read` cannot
+/// list a crate's tests (`wsp-950`). A workspace that cannot be read counts as
+/// having the module.
 fn in_reached_crate(filter: &str, reach: &Reach, read: &dyn Fn(&str) -> Option<String>) -> bool {
-    let (Reach::Crates(c, d), Some((first, _))) = (reach, filter.split_once("::")) else { return false };
+    let Reach::Crates(c, d) = reach else { return false };
+    let Some((first, _)) = filter.split_once("::") else { return true };
     let Ok(ws) = members(read) else { return true };
     ws.iter().any(|k| !k.dir.is_empty() && c.iter().chain(d).any(|n| *n == k.name) && has_module(&format!("{}/src", k.dir), first, read))
 }
@@ -488,8 +491,9 @@ fn in_reached_crate(filter: &str, reach: &Reach, read: &dyn Fn(&str) -> Option<S
 ///   crate's tests, not the other crates'.
 /// - Either way, a filtered step whose filters can match only the bin's own
 ///   tests runs that one binary (`-p <root> --bin <bin>`), not every `tests/`
-///   binary beside it. A `--workspace` one stays as declared where a changed
-///   crate or a reverse dependent has the filter's module too.
+///   binary beside it. A `--workspace` one stays as declared where crates
+///   changed and a filter is a bare name, or a changed crate or a reverse
+///   dependent has the filter's module too.
 pub fn narrow(command: &str, reach: &Reach, root: Option<&Root>, read: &dyn Fn(&str) -> Option<String>, in_tests: &dyn Fn(&str) -> bool) -> Option<Narrowed> {
     if matches!(reach, Reach::Whole(_)) || !plain_cargo(command) {
         return None;
@@ -1082,6 +1086,13 @@ mod tests {
         assert_eq!(run("cargo test --workspace cycle::", &["crates/view/src/spend.rs"]), "cargo test -p wsp --bin wsp cycle::");
         assert_eq!(run("cargo test --workspace spend::", &["src/spend.rs"]), "cargo test -p wsp --bin wsp spend::");
         assert_eq!(run("cargo test spend::", &["crates/view/src/spend.rs"]), "cargo test -p wsp --bin wsp spend::");
+        // A bare name matches by substring, so any reached crate may hold its tests (`wsp-950`).
+        for command in ["cargo test --workspace spend", "cargo nextest run --workspace a_test_name", "cargo test --workspace cycle:: spend"] {
+            assert_eq!(run(command, &["crates/view/src/spend.rs"]), command);
+            assert_eq!(run(command, &["crates/base/src/lib.rs"]), command);
+        }
+        assert_eq!(run("cargo test --workspace spend", &["src/spend.rs"]), "cargo test -p wsp --bin wsp spend");
+        assert_eq!(run("cargo test spend", &["crates/view/src/spend.rs"]), "cargo test -p wsp --bin wsp spend");
     }
 
     #[test]
