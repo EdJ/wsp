@@ -35,8 +35,9 @@
 //!
 //! `row.add` and `seat.spawn` are always legal (a second `seat.spawn` with the
 //! same `(row, attempt)` as a seat not `gone` changes nothing: 3.2's spawn key).
-//! The verbs of lists, asks and machines are refused with `invalid`: the test
-//! domain does not have them.
+//! The verbs of lists, asks (with an ask's legs, `ask.queue`, `ask.shown`,
+//! `ask.withdraw` and `ask.expire`) and machines are refused with `invalid`:
+//! the test domain does not have them.
 //!
 //! `mirror` is refused as a real domain refuses it (the contract's MAP.md):
 //! `illegal`, with the state `owned` (this domain owns its entities, so nothing
@@ -358,6 +359,10 @@ impl Domain for TestDomain {
             | Command::AskRaise { .. }
             | Command::AskAnswer { .. }
             | Command::AskAck { .. }
+            | Command::AskQueue { .. }
+            | Command::AskShown { .. }
+            | Command::AskWithdraw { .. }
+            | Command::AskExpire { .. }
             | Command::MachineSet { .. } => {
                 return Err(invalid(format!("{} is not in the test domain", verb(cmd))));
             }

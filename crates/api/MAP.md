@@ -17,7 +17,7 @@ Will be used by `wsp-server` (wsp-073), `wsp-client` (wsp-074), and through the 
   `ReqId`, `ApiToken`, `Listen`; `PROTOCOL`, `TOKEN_FILE`, `TOKEN_MODE`, `LISTEN_FILE`, `MAX_EVENTS`,
   `READ_VERBS`, `COMMAND_VERBS`; the contract's types re-exported where a frame carries them
 - `src/principal.rs` — `Principal`'s text form (`person:ed`, `seat:cpd-3698`, `manager:<host>`,
-  `executor:<machine>`, `wsp:<instance>`): `text`, `parse` (a `Malformed` error, never a panic), `KINDS`, and the
+  `executor:<machine>`, `wsp:<instance>`, `agent:<person>`): `text`, `parse` (a `Malformed` error, never a panic), `KINDS`, and the
   `#[serde(with = "principal")]` helpers the envelope's `by` uses
 - `src/conn.rs` — `Connection` (send one frame, receive one with a wait), `ConnError` and `MAX_LINE`; the framing
   rule, copied word for word from `wsp-host-api` (compact JSON plus one `\n`, a 16 MB line cap, `Malformed` keeps the

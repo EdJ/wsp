@@ -1,6 +1,7 @@
 //! A [`Principal`]'s text form, as the envelope's `by`, `hello`'s and
 //! `welcome`'s `by` and `whoami`'s answer write it: `person:ann`,
-//! `seat:<id>`, `manager:<name>`, `executor:<name>`, `wsp:<instance>`.
+//! `seat:<id>`, `manager:<name>`, `executor:<name>`, `wsp:<instance>`,
+//! `agent:<person>`.
 //!
 //! The kind is everything before the first `:`, the name everything after it,
 //! so a name may itself hold a `:`. [`parse`] of [`text`] is the principal
@@ -10,10 +11,10 @@
 //! The module is also a `#[serde(with = "...")]` helper.
 
 use serde::{Deserialize, Deserializer, Serializer};
-use wsp_store_contract::{MachineName, Principal, SeatId};
+use wsp_store_contract::{MachineName, Principal, SeatId, UserName};
 
 /// The kinds of the text form, in the contract's order.
-pub const KINDS: &[&str] = &["person", "seat", "manager", "executor", "wsp"];
+pub const KINDS: &[&str] = &["person", "seat", "manager", "executor", "wsp", "agent"];
 
 /// A string that is not a principal's text form, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,7 @@ pub fn text(p: &Principal) -> String {
         Principal::Manager(MachineName(host)) => format!("manager:{host}"),
         Principal::Executor(MachineName(machine)) => format!("executor:{machine}"),
         Principal::Wsp(instance) => format!("wsp:{instance}"),
+        Principal::Agent(UserName(person)) => format!("agent:{person}"),
     }
 }
 
@@ -55,6 +57,7 @@ pub fn parse(s: &str) -> Result<Principal, Malformed> {
         "manager" => Principal::Manager(MachineName(name)),
         "executor" => Principal::Executor(MachineName(name)),
         "wsp" => Principal::Wsp(name),
+        "agent" => Principal::Agent(UserName(name)),
         _ => return Err(bad("an unknown kind")),
     })
 }

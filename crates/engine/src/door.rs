@@ -261,6 +261,7 @@ pub fn user_of(by: &Principal) -> String {
         Principal::Seat(s) => s.0.clone(),
         Principal::Manager(m) | Principal::Executor(m) => m.0.clone(),
         Principal::Wsp(i) => format!("wsp:{i}"),
+        Principal::Agent(p) => format!("agent:{}", p.0),
     }
 }
 

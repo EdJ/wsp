@@ -139,6 +139,17 @@ pub enum EventKind {
     AskAnswered,
     #[serde(rename = "ask.acked")]
     AskAcked,
+    // An ask's legs (docs/personal-agents.md): queued for the person, shown to
+    // them, withdrawn by its sender, expired past its `deliver: by`. Subject
+    // the ask, payload `null`. A reader that does not know one reads `Unknown`.
+    #[serde(rename = "ask.queued")]
+    AskQueued,
+    #[serde(rename = "ask.shown")]
+    AskShown,
+    #[serde(rename = "ask.withdrawn")]
+    AskWithdrawn,
+    #[serde(rename = "ask.expired")]
+    AskExpired,
     // Claims and leases (2.2).
     #[serde(rename = "claim.taken")]
     ClaimTaken,

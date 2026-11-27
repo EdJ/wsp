@@ -221,7 +221,12 @@ fn about(cmd: &Command) -> Subject {
         | Command::OrderAcked { order, .. }
         | Command::OrderRefused { order, .. }
         | Command::OrderDone { order } => Subject::Order(order.clone()),
-        Command::AskAnswer { ask, .. } | Command::AskAck { ask } => Subject::Ask(ask.clone()),
+        Command::AskAnswer { ask, .. }
+        | Command::AskAck { ask }
+        | Command::AskQueue { ask }
+        | Command::AskShown { ask }
+        | Command::AskWithdraw { ask }
+        | Command::AskExpire { ask } => Subject::Ask(ask.clone()),
         Command::AskRaise { about: Some(s), .. } => s.clone(),
         Command::MachineSet { name, .. } => Subject::Machine(name.clone()),
         Command::HubUserAdd { name, .. } | Command::HubUserRevoke { name } | Command::HubUserAdmin { name, .. } => Subject::User(name.clone()),

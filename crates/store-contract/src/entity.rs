@@ -64,13 +64,71 @@ pub enum OrderState {
     Failed,
 }
 
-/// Which of the three an [`Ask`] is (2.1's `Ask` / `Note` / `Flag`).
+/// Which kind an [`Ask`] is (2.1's `Ask` / `Note` / `Flag`, and a `Tell`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AskKind {
     Ask,
     Note,
     Flag,
+    /// A message that wants no answer (docs/personal-agents.md, "Agent to agent").
+    Tell,
+}
+
+/// How an [`Ask`] is handed to its person once it is in their agent's inbox
+/// (docs/personal-agents.md, "Asynchronous by default"). An ask from before
+/// this field reads as [`WhenActive`](Deliver::WhenActive).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Deliver {
+    /// Held until the person is next active, then handed over.
+    #[default]
+    WhenActive,
+    /// Handed over now, as a notification.
+    Urgent,
+    /// Filed by the agent as knowledge; never queued for the person.
+    AgentOnly,
+    /// When the person is next active, and expired at this moment if not.
+    By(At),
+}
+
+impl Deliver {
+    /// Whether this is the default (what a record's `skip_serializing_if` asks).
+    pub fn is_when_active(&self) -> bool {
+        matches!(self, Deliver::WhenActive)
+    }
+}
+
+/// Where an [`Ask`] is on its two legs: the sender's to the agent's inbox, then
+/// the agent's to its person. An ask from before this field reads as
+/// [`Delivered`](Leg::Delivered). Which move is legal is wsp-873's machine.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Leg {
+    /// In the agent's inbox.
+    #[default]
+    Delivered,
+    /// In the agent's queue for its person.
+    Queued,
+    /// Shown to the person.
+    Shown,
+    /// Answered, by the person or the agent ([`Ask::answered_by`]).
+    Answered,
+    /// Taken back by its sender while it was still queued.
+    Withdrawn,
+    /// Past its [`Deliver::By`] with nobody to answer.
+    Expired,
+}
+
+impl Leg {
+    /// Whether this is the default (what a record's `skip_serializing_if` asks).
+    pub fn is_delivered(&self) -> bool {
+        matches!(self, Leg::Delivered)
+    }
 }
 
 /// An ask's state (2.1: raised, acked, answered).
@@ -263,6 +321,19 @@ pub struct Ask {
     pub state: AskState,
     #[serde(default)]
     pub answer: Option<String>,
+    /// How it is handed to its person; the default is written without the
+    /// field, so an ask stored before it keeps its bytes.
+    #[serde(default, skip_serializing_if = "Deliver::is_when_active")]
+    pub deliver: Deliver,
+    /// Where it is on its two legs; the default is written without the field.
+    #[serde(default, skip_serializing_if = "Leg::is_delivered")]
+    pub leg: Leg,
+    /// Who answered it: its person, or their agent for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<Principal>,
+    /// The ask it replies to, for a thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<AskId>,
     /// Its other fields, by name, as today's files say them; untyped until step
     /// 4 types the ones that stay (wsp-070).
     #[serde(default)]

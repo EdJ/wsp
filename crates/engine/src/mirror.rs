@@ -655,6 +655,10 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
                 text: m.text.clone(),
                 state: ask_state(m.state()),
                 answer,
+                deliver: Default::default(),
+                leg: Default::default(),
+                answered_by: None,
+                re: None,
                 fields: f,
             };
             // `wsp-096`: an open question for the person needs you.
@@ -689,6 +693,10 @@ pub fn asks(messages: &BTreeMap<String, Message>, flags: &BTreeMap<String, serde
             text,
             state: AskState::Raised,
             answer: None,
+            deliver: Default::default(),
+            leg: Default::default(),
+            answered_by: None,
+            re: None,
             fields: f,
         })
     }));

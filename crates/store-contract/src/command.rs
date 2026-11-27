@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entity::{AskKind, Entity};
+use crate::entity::{AskKind, Deliver, Entity};
 use crate::event::Subject;
 use crate::id::*;
 
@@ -209,7 +209,9 @@ pub enum Command {
     /// The order's work is done.
     #[serde(rename = "order.done")]
     OrderDone { order: OrderId },
-    /// Raise an ask, a note or a flag.
+    /// Raise an ask, a note, a flag or a tell. Its `from` is the principal
+    /// `apply` is called with, never an argument; `deliver` and `re` default,
+    /// and are written only when not their default.
     #[serde(rename = "ask.raise")]
     AskRaise {
         kind: AskKind,
@@ -218,11 +220,27 @@ pub enum Command {
         #[serde(default)]
         about: Option<Subject>,
         text: String,
+        #[serde(default, skip_serializing_if = "Deliver::is_when_active")]
+        deliver: Deliver,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        re: Option<AskId>,
     },
     #[serde(rename = "ask.answer")]
     AskAnswer { ask: AskId, text: String },
     #[serde(rename = "ask.ack")]
     AskAck { ask: AskId },
+    /// The agent queues an ask in its inbox for its person (`delivered` → `queued`).
+    #[serde(rename = "ask.queue")]
+    AskQueue { ask: AskId },
+    /// The ask was shown to its person.
+    #[serde(rename = "ask.shown")]
+    AskShown { ask: AskId },
+    /// Its sender takes an ask back while it is still queued.
+    #[serde(rename = "ask.withdraw")]
+    AskWithdraw { ask: AskId },
+    /// An ask's `deliver: by` passed with nobody to answer it.
+    #[serde(rename = "ask.expire")]
+    AskExpire { ask: AskId },
     /// Record a machine, or change how it is reached or what it reported.
     #[serde(rename = "machine.set")]
     MachineSet {

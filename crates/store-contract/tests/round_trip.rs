@@ -69,7 +69,7 @@ fn ed() -> Principal {
     Principal::Person("ed".into())
 }
 
-const COMMANDS: usize = 32;
+const COMMANDS: usize = 36;
 
 fn command(c: &Command) -> (usize, &'static str) {
     match c {
@@ -105,6 +105,10 @@ fn command(c: &Command) -> (usize, &'static str) {
         Command::HubWorkspaceAdd { .. } => (29, "hub.workspace.add"),
         Command::HubMemberSet { .. } => (30, "hub.member.set"),
         Command::HubUserAdmin { .. } => (31, "hub.user.admin"),
+        Command::AskQueue { .. } => (32, "ask.queue"),
+        Command::AskShown { .. } => (33, "ask.shown"),
+        Command::AskWithdraw { .. } => (34, "ask.withdraw"),
+        Command::AskExpire { .. } => (35, "ask.expire"),
     }
 }
 
@@ -183,6 +187,8 @@ fn commands() -> Vec<Command> {
             to: Some(ed()),
             about: Some(Subject::Row(row())),
             text: "?".into(),
+            deliver: Deliver::WhenActive,
+            re: None,
         },
         Command::AskAnswer {
             ask: AskId("m-1".into()),
@@ -255,6 +261,26 @@ fn commands() -> Vec<Command> {
             name: UserName("bo".into()),
             admin: false,
         },
+        Command::AskQueue {
+            ask: AskId("m-2".into()),
+        },
+        Command::AskShown {
+            ask: AskId("m-2".into()),
+        },
+        Command::AskWithdraw {
+            ask: AskId("m-2".into()),
+        },
+        Command::AskExpire {
+            ask: AskId("m-2".into()),
+        },
+        Command::AskRaise {
+            kind: AskKind::Tell,
+            to: Some(Principal::Agent(UserName("ed".into()))),
+            about: None,
+            text: "the API moved to 7488".into(),
+            deliver: Deliver::By(At(5_000)),
+            re: Some(AskId("m-1".into())),
+        },
     ]
 }
 
@@ -298,7 +324,7 @@ fn every_command_round_trips_under_its_verb() {
     });
 }
 
-const EVENT_KINDS: usize = 58;
+const EVENT_KINDS: usize = 62;
 
 fn event_kind(k: &EventKind) -> (usize, &'static str) {
     use EventKind::*;
@@ -361,6 +387,10 @@ fn event_kind(k: &EventKind) -> (usize, &'static str) {
         LeaseExpired => (55, "lease.expired"),
         RefRetired => (56, "ref.retired"),
         HubUserAdminSet => (57, "hub.user.admin_set"),
+        AskQueued => (58, "ask.queued"),
+        AskShown => (59, "ask.shown"),
+        AskWithdrawn => (60, "ask.withdrawn"),
+        AskExpired => (61, "ask.expired"),
     }
 }
 
@@ -426,6 +456,10 @@ fn every_event_kind_round_trips_under_its_name() {
         LeaseExpired,
         RefRetired,
         HubUserAdminSet,
+        AskQueued,
+        AskShown,
+        AskWithdrawn,
+        AskExpired,
     ];
     table(&kinds, EVENT_KINDS, event_kind, as_str);
     // A newer writer's kind reads as Unknown.
@@ -445,6 +479,7 @@ enum AnyState {
     RunKind(RunKind),
     Run(RunState),
     Verdict(RunVerdict),
+    Leg(Leg),
 }
 
 fn entity_state(s: &AnyState) -> (usize, &'static str) {
@@ -491,6 +526,7 @@ fn entity_state(s: &AnyState) -> (usize, &'static str) {
             AskKind::Ask => (29, "ask"),
             AskKind::Note => (30, "note"),
             AskKind::Flag => (31, "flag"),
+            AskKind::Tell => (43, "tell"),
         },
         A::Ask(a) => match a {
             AskState::Raised => (32, "raised"),
@@ -511,10 +547,18 @@ fn entity_state(s: &AnyState) -> (usize, &'static str) {
             RunVerdict::Pass => (41, "pass"),
             RunVerdict::Fail => (42, "fail"),
         },
+        A::Leg(l) => match l {
+            Leg::Delivered => (44, "delivered"),
+            Leg::Queued => (45, "queued"),
+            Leg::Shown => (46, "shown"),
+            Leg::Answered => (47, "answered"),
+            Leg::Withdrawn => (48, "withdrawn"),
+            Leg::Expired => (49, "expired"),
+        },
     }
 }
 
-const ENTITY_STATES: usize = 43;
+const ENTITY_STATES: usize = 50;
 
 /// Round-trips each state through its own type (`"running"` is a list's and a
 /// run's), then checks the table's coverage.
@@ -571,11 +615,22 @@ fn every_entity_state_round_trips_under_its_name() {
         ]
         .map(A::Order),
     );
-    all.extend([AskKind::Ask, AskKind::Note, AskKind::Flag].map(A::AskKind));
+    all.extend([AskKind::Ask, AskKind::Note, AskKind::Flag, AskKind::Tell].map(A::AskKind));
     all.extend([AskState::Raised, AskState::Acked, AskState::Answered].map(A::Ask));
     all.extend([RunKind::Check, RunKind::Verification, RunKind::Barrier].map(A::RunKind));
     all.extend([RunState::Running, RunState::Finished, RunState::Abandoned].map(A::Run));
     all.extend([RunVerdict::Pass, RunVerdict::Fail].map(A::Verdict));
+    all.extend(
+        [
+            Leg::Delivered,
+            Leg::Queued,
+            Leg::Shown,
+            Leg::Answered,
+            Leg::Withdrawn,
+            Leg::Expired,
+        ]
+        .map(A::Leg),
+    );
     let mut seen = BTreeSet::new();
     for s in &all {
         let (n, wire) = entity_state(s);
@@ -590,6 +645,7 @@ fn every_entity_state_round_trips_under_its_name() {
             A::RunKind(x) => trip(x),
             A::Run(x) => trip(x),
             A::Verdict(x) => trip(x),
+            A::Leg(x) => trip(x),
         };
         assert_eq!(as_str(&v), wire, "{s:?}");
         seen.insert(n);
@@ -750,7 +806,30 @@ fn state() -> State {
             text: "?".into(),
             state: AskState::Answered,
             answer: Some("yes".into()),
+            deliver: Default::default(),
+            leg: Default::default(),
+            answered_by: None,
+            re: None,
             fields: BTreeMap::from([("person".into(), "yes".into())]),
+        },
+    );
+    s.asks.insert(
+        AskId("m-2".into()),
+        Ask {
+            workspace: Default::default(),
+            id: AskId("m-2".into()),
+            kind: AskKind::Tell,
+            from: Principal::Agent(UserName("ann".into())),
+            to: Some(Principal::Agent(UserName("ed".into()))),
+            about: None,
+            text: "the API moved to 7488".into(),
+            state: AskState::Answered,
+            answer: Some("noted".into()),
+            deliver: Deliver::By(At(5_000)),
+            leg: Leg::Answered,
+            answered_by: Some(Principal::Agent(UserName("ed".into()))),
+            re: Some(AskId("m-1".into())),
+            fields: BTreeMap::new(),
         },
     );
     s.runs.push(Run {
@@ -1352,4 +1431,63 @@ fn a_record_or_event_with_a_workspace_round_trips_and_without_one_reads_private(
     }))
     .unwrap();
     assert_eq!(old.workspace, WorkspaceId::Private);
+}
+
+/// `agent:<person>` is one more principal (docs/personal-agents.md), in
+/// serde's derived form like the others.
+#[test]
+fn an_agent_is_a_principal_named_by_its_person() {
+    let agent = Principal::Agent(UserName("ed".into()));
+    assert_eq!(trip(&agent), json!({"agent": "ed"}));
+}
+
+/// Every way an ask is handed to its person round-trips, held exhaustive: a
+/// delivery added later fails to compile here until it has a frame.
+#[test]
+fn every_delivery_round_trips() {
+    fn wire(d: &Deliver) -> Value {
+        match d {
+            Deliver::WhenActive => json!("when_active"),
+            Deliver::Urgent => json!("urgent"),
+            Deliver::AgentOnly => json!("agent_only"),
+            Deliver::By(At(ms)) => json!({ "by": ms }),
+        }
+    }
+    for d in [Deliver::WhenActive, Deliver::Urgent, Deliver::AgentOnly, Deliver::By(At(5_000))] {
+        assert_eq!(trip(&d), wire(&d), "{d:?}");
+    }
+    assert_eq!(Deliver::default(), Deliver::WhenActive);
+    assert_eq!(Leg::default(), Leg::Delivered);
+}
+
+/// An `Ask` and an `ask.raise` written before the two legs (wsp-872) decode
+/// with `deliver: when_active`, the first leg, no answerer and no thread, and
+/// are written again with none of the new fields, so their bytes are kept.
+#[test]
+fn asks_from_before_the_legs_still_decode_and_keep_their_bytes() {
+    let old = json!({
+        "id": "m-1", "kind": "ask", "from": {"seat": "cpd-336"}, "to": {"person": "ed"},
+        "about": null, "text": "?", "state": "acked", "answer": null, "fields": {}
+    });
+    let ask: Ask = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(ask.deliver, Deliver::WhenActive);
+    assert_eq!(ask.leg, Leg::Delivered);
+    assert_eq!((ask.answered_by.clone(), ask.re.clone()), (None, None));
+    assert_eq!(ask.state, AskState::Acked);
+    assert_eq!(serde_json::to_value(&ask).unwrap(), old);
+
+    let old = json!({"verb": "ask.raise", "args": {"kind": "flag", "to": null, "about": null, "text": "?"}});
+    let raise: Command = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(
+        raise,
+        Command::AskRaise {
+            kind: AskKind::Flag,
+            to: None,
+            about: None,
+            text: "?".into(),
+            deliver: Deliver::WhenActive,
+            re: None,
+        }
+    );
+    assert_eq!(serde_json::to_value(&raise).unwrap(), old);
 }

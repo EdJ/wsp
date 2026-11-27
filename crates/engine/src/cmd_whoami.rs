@@ -70,6 +70,7 @@ pub fn describe(by: &Principal, server: &str) -> String {
         Principal::Manager(_) => "manager",
         Principal::Executor(_) => "executor",
         Principal::Wsp(_) => "instance",
+        Principal::Agent(_) => "agent",
     };
     format!("{} ({server}: {kind})", wsp_api::principal::text(by))
 }

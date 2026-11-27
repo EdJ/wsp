@@ -249,6 +249,10 @@ fn everything() -> Vec<Entity> {
             text: "look".into(),
             state: AskState::Raised,
             answer: None,
+            deliver: Default::default(),
+            leg: Default::default(),
+            answered_by: None,
+            re: None,
             fields: Default::default(),
         }),
         Entity::Machine(Machine {
@@ -582,6 +586,10 @@ fn wip_answers_bodies_only_on_open_rows_and_state_beside_it_is_unchanged() {
         text: "settled".into(),
         state: AskState::Answered,
         answer: Some("yes".into()),
+        deliver: Default::default(),
+        leg: Default::default(),
+        answered_by: None,
+        re: None,
         fields: Default::default(),
     }));
     apply(&store, put, vec![], "all");

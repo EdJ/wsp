@@ -87,6 +87,10 @@ fn ask(id: &str, state: AskState) -> Entity {
         text: format!("{id}?"),
         state,
         answer: None,
+        deliver: Default::default(),
+        leg: Default::default(),
+        answered_by: None,
+        re: None,
         fields: fields(&[("record", "{}")]),
     })
 }

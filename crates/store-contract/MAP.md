@@ -11,10 +11,10 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
   unchanged; the modules below, re-exported at the root
 - `src/id.rs` — 2.1's keys and 2.2's values: `EventId` (monotonic), `IdempotencyKey`, `Token` (per lease name),
   `Rev`, `At` (Unix ms), the ids (`RowId`, `ListId`, `GroupId`, `SeatId`, `OrderId`, `AskId`, `MachineName`,
-  `LeaseName`, with `LeaseName::deliver(&SeatId)` naming `deliver:<seat>`, `ProjectId`, `RunKey`, and the hub's `UserName`, `TokenId` and `SharedName`: any string, text form the string itself; `WorkspaceId`, wsp-168), and `Principal` (person, seat, manager, executor, `wsp:<instance>`)
+  `LeaseName`, with `LeaseName::deliver(&SeatId)` naming `deliver:<seat>`, `ProjectId`, `RunKey`, and the hub's `UserName`, `TokenId` and `SharedName`: any string, text form the string itself; `WorkspaceId`, wsp-168), and `Principal` (person, seat, manager, executor, `wsp:<instance>`, and `agent:<person>`, wsp-872)
 - `src/entity.rs` — 2.1's entities with section 3's states as enums: `Row`/`RowState` (3.3), `List`, `Group` and
   their shared `ListState` (3.4), `Seat`/`SeatState` (3.2), `Order`/`OrderState` (3.1), `Claim`, `Ask` (kind
-  ask/note/flag), `Run`, `Machine`/`Transport`, `Lease`, and the hub's `User` and `Credential` with `IdentityState` (wsp-158); `State`, the whole domain as `snapshot()` returns it;
+  ask/note/flag/tell, with its two legs: `Deliver`, `Leg`, `answered_by`, `re`, wsp-872), `Run`, `Machine`/`Transport`, `Lease`, and the hub's `User` and `Credential` with `IdentityState` (wsp-158); `State`, the whole domain as `snapshot()` returns it;
   `Entity`, one of row, list, seat, claim, order, ask, machine, whole, as `mirror` puts it (wsp-070). `Row`,
   `List`, `Group`, `Seat` and `Ask` carry `fields` (name → value), `Machine` its `facts`
 - `src/event.rs` — `Event` (2.1: id, at, principal, kind, subject, payload), `EventKind` (the kinds section 3's
@@ -32,10 +32,11 @@ state core's types yet (wsp-046): the conformance suite (wsp-047) and `wsp-store
   `STORE_INSTANCE`; `Reads::wip_snapshot` (wsp-695: what `wip` draws) and the `WIP_BODIES` it leaves out (and the finished lists no seat sits on, wsp-783); the module docs' table of the events a store writes itself, and of `mirror`'s two
 - `src/subscribe.rs` — 4.3: `Subscribe { from? }`, `Feed` (a snapshot, a piece of one, an event, a beat), `BEAT_SECS`,
   `MISSED_BEATS`, `SNAPSHOT_PART`, and `State::split`, `absorb` and `json_len` for a snapshot past one line (wsp-702)
-- `tests/round_trip.rs` — every command, event kind, entity, entity state and refusal round-tripped under its wire name,
+- `tests/round_trip.rs` — every command, event kind, entity, entity state (with `Leg`), delivery and refusal round-tripped under its wire name,
   each table's coverage held by an exhaustive match; `FENCED_VERBS` held to the variants carrying `args.fence`; one
   `State` of every entity, with `fields`; frames from before the `fields` maps, and an `order.send` and `Order` from
-  before `first` and `why`, decode; `LeaseName::deliver`'s spelling; a trivial `Store` and `Domain`
+  before `first` and `why`, decode; an `Ask` and an `ask.raise` from before the legs decode and keep their bytes;
+  `LeaseName::deliver`'s spelling; a trivial `Store` and `Domain`
 
 ## Contract
 
@@ -128,6 +129,28 @@ Multiplayer v1's sync scopes, as types only (R2); wsp-159's domain decides the c
   `hub.workspace.added`, `hub.member.set`. Subjects `Workspace(SharedName)` and `Member { workspace, user }`.
 - **Entities**: `SharedWorkspace { name }` and `Member { workspace, user }`; not in `Entity` or `State` yet.
 - **Who refuses them today**: `TestDomain` (`illegal`, state `""`) and `mirror::Mirror` (`illegal`, state `mirrored`).
+
+## Personal agents: the agent and the two-leg message (wsp-872)
+
+docs/personal-agents.md, "Agent to agent" and "Asynchronous by default", as types only (R2); wsp-873 writes the machine
+that decides them. Nothing parallel is invented: the agent is one more principal, and a message is an `Ask`.
+
+- **`Principal::Agent(UserName)`**: a person's agent, `{"agent": "ed"}` in serde's form, `agent:ed` in the API's text
+  form. Not an entity: a seat speaks as it, bound by the server (wsp-874). `UserName` is the hub's user name (wsp-560's
+  `EngineerName` became it when that row was re-scoped).
+- **`AskKind::Tell`**: an ask that wants no answer. `Ask.to` names the agent; `from` is the principal `apply` was called
+  with, never an argument.
+- **The legs on `Ask`**: `deliver: Deliver` (`when_active`, the default; `urgent`; `agent_only`; `{"by": <At>}`), `leg:
+  Leg` (`delivered` to the agent's inbox, the default; `queued` for the person; `shown`; `answered`; `withdrawn`;
+  `expired`), `answered_by: Option<Principal>` (the person, or their agent for them) and `re: Option<AskId>` (a thread).
+  Each is `#[serde(default)]` and written only when not its default, so an ask stored before them decodes as
+  `when_active`, `delivered`, and keeps its bytes. Assumed: `@Ed` always goes to Ed's agent, so every message to a
+  person has both legs.
+- **Commands**: `ask.raise` carries `to`, `deliver` and `re` (both default, and are left out when default);
+  `ask.queue`, `ask.shown`, `ask.withdraw` and `ask.expire`, each `{ ask }`. Events `ask.queued`, `ask.shown`,
+  `ask.withdrawn`, `ask.expired`, subject the ask, payload `null`. No guard here.
+- **Who refuses them today**: `TestDomain` (`invalid`, as its other ask verbs) and the server's `mirror::Mirror`
+  (`illegal`, state `mirrored`, subject the ask).
 
 ## What a backend and a domain must agree on (wsp-065)
 

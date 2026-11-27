@@ -929,6 +929,7 @@ fn every_principal_kind_is_todays_text_form() {
         (Principal::Executor(MachineName("box".into())), "executor:box"),
         (Principal::Wsp("wsp-hub".into()), "wsp:wsp-hub"),
         (Principal::Person("a:b".into()), "person:a:b"),
+        (Principal::Agent(wsp_store_contract::UserName("ann".into())), "agent:ann"),
     ];
     for (who, text) in &every {
         assert_eq!(p::principal::text(who), *text);

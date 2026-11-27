@@ -105,7 +105,8 @@ pub const READ_VERBS: &[&str] = &[
 
 /// The command verbs, as the contract's [`Command`] names them on the wire: the
 /// 19 of 4.2, step 1's `mirror`, and step 2's orders machine (`order.deliver`
-/// and the executor's answers, wsp-117), and the hub's identity verbs (wsp-158). A server that does not run one yet answers
+/// and the executor's answers, wsp-117), the hub's identity verbs (wsp-158), and
+/// an ask's legs (wsp-872: `ask.queue`, `ask.shown`, `ask.withdraw`, `ask.expire`). A server that does not run one yet answers
 /// it [`Code::Unsupported`]; a verb in neither table is unknown to this build.
 pub const COMMAND_VERBS: &[&str] = &[
     "row.add",
@@ -140,6 +141,10 @@ pub const COMMAND_VERBS: &[&str] = &[
     "hub.workspace.add",
     "hub.member.set",
     "hub.user.admin",
+    "ask.queue",
+    "ask.shown",
+    "ask.withdraw",
+    "ask.expire",
 ];
 
 // ---------------------------------------------------------------- identities

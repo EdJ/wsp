@@ -595,6 +595,10 @@ mod tests {
             text: "may I?".into(),
             state,
             answer: None,
+            deliver: Default::default(),
+            leg: Default::default(),
+            answered_by: None,
+            re: None,
             fields: Default::default(),
         }
     }

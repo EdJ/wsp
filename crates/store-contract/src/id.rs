@@ -204,4 +204,8 @@ pub enum Principal {
     Executor(MachineName),
     /// wsp itself, as one instance (`wsp:<instance>`): the tick, a sweep, a barrier.
     Wsp(String),
+    /// A person's agent (`agent:ed`): a seat that speaks for its person
+    /// (docs/personal-agents.md). Not an entity of its own; which seat speaks
+    /// as it is the server's to bind (wsp-874).
+    Agent(UserName),
 }

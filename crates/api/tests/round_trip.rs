@@ -112,6 +112,10 @@ fn an_ask() -> Ask {
         text: "which?".into(),
         state: AskState::Raised,
         answer: None,
+        deliver: Default::default(),
+        leg: Default::default(),
+        answered_by: None,
+        re: None,
         fields: BTreeMap::new(),
     }
 }
@@ -281,7 +285,7 @@ fn every_frame_type_round_trips() {
 
 /// Read verbs, then the contract's commands, then the unknown verb.
 const VERBS: usize = 18;
-const COMMANDS: usize = 32;
+const COMMANDS: usize = 36;
 const CALLS: usize = VERBS + COMMANDS + 1;
 
 fn verb_ordinal(v: &Verb) -> (usize, &'static str) {
@@ -341,6 +345,10 @@ fn command_ordinal(c: &Command) -> (usize, &'static str) {
         Command::HubWorkspaceAdd { .. } => (29, "hub.workspace.add"),
         Command::HubMemberSet { .. } => (30, "hub.member.set"),
         Command::HubUserAdmin { .. } => (31, "hub.user.admin"),
+        Command::AskQueue { .. } => (32, "ask.queue"),
+        Command::AskShown { .. } => (33, "ask.shown"),
+        Command::AskWithdraw { .. } => (34, "ask.withdraw"),
+        Command::AskExpire { .. } => (35, "ask.expire"),
     }
 }
 
@@ -484,6 +492,8 @@ fn requests() -> Vec<Frame> {
             to: Some(ed()),
             about: Some(Subject::Row(row_id())),
             text: "fyi".into(),
+            deliver: Default::default(),
+            re: None,
         },
         Command::AskAnswer {
             ask: an_ask().id,
@@ -548,6 +558,10 @@ fn requests() -> Vec<Frame> {
             name: UserName("ann".into()),
             admin: true,
         },
+        Command::AskQueue { ask: an_ask().id },
+        Command::AskShown { ask: an_ask().id },
+        Command::AskWithdraw { ask: an_ask().id },
+        Command::AskExpire { ask: an_ask().id },
     ];
     let mut out: Vec<Call> = vec![];
     out.extend(verbs.into_iter().map(Call::Verb));
@@ -1185,6 +1199,7 @@ fn every_principal() -> Vec<(Principal, &'static str)> {
             "executor:eds-macbook-i5",
         ),
         (Principal::Wsp("main".into()), "wsp:main"),
+        (Principal::Agent(UserName("ed".into())), "agent:ed"),
     ]
 }
 
@@ -1196,6 +1211,7 @@ fn principal_ordinal(p: &Principal) -> usize {
         Principal::Manager(_) => 2,
         Principal::Executor(_) => 3,
         Principal::Wsp(_) => 4,
+        Principal::Agent(_) => 5,
     }
 }
 

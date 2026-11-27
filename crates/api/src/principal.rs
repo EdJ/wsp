@@ -1,5 +1,6 @@
 //! A [`Principal`]'s text form (docs/state-core.md 2.1): `person:ed`,
-//! `seat:cpd-3698`, `manager:<host>`, `executor:<machine>`, `wsp:<instance>`.
+//! `seat:cpd-3698`, `manager:<host>`, `executor:<machine>`, `wsp:<instance>`,
+//! `agent:ed` (a person's agent, docs/personal-agents.md).
 //! The contract serializes a principal in serde's derived form
 //! (`{"person":"ed"}`) and leaves this rendering to the API (store-contract
 //! `MAP.md`); the envelope's `by` and `hello`'s `by` are written in it.
@@ -13,10 +14,10 @@
 //! `Principal` is written in the text form.
 
 use serde::{Deserialize, Deserializer, Serializer};
-use wsp_store_contract::{MachineName, Principal, SeatId};
+use wsp_store_contract::{MachineName, Principal, SeatId, UserName};
 
 /// The kinds of the text form, in the contract's order.
-pub const KINDS: &[&str] = &["person", "seat", "manager", "executor", "wsp"];
+pub const KINDS: &[&str] = &["person", "seat", "manager", "executor", "wsp", "agent"];
 
 /// A string that is not a principal's text form, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub fn text(p: &Principal) -> String {
         Principal::Manager(MachineName(host)) => format!("manager:{host}"),
         Principal::Executor(MachineName(machine)) => format!("executor:{machine}"),
         Principal::Wsp(instance) => format!("wsp:{instance}"),
+        Principal::Agent(UserName(person)) => format!("agent:{person}"),
     }
 }
 
@@ -61,6 +63,7 @@ pub fn parse(s: &str) -> Result<Principal, Malformed> {
         "manager" => Principal::Manager(MachineName(name)),
         "executor" => Principal::Executor(MachineName(name)),
         "wsp" => Principal::Wsp(name),
+        "agent" => Principal::Agent(UserName(name)),
         _ => return Err(bad("an unknown kind")),
     })
 }
