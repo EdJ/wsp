@@ -121,8 +121,9 @@ fn seat_row(store: &Store, w: &Worklist, effort: &Value) -> Result<Task, String>
 /// the guards (and the one-per-clear record) but not the evidence.
 pub fn start(store: &Store, w: &Worklist, by_hand: bool) -> Result<String, String> {
     // One reading for the guards, the packet, the record and the list's own
-    // `effort.json`. The last barrier wrote that file before its pass was
-    // recorded, so it is written again here, retro or none (`wsp-852`).
+    // `effort.json`. A hand may have cleared the list with no last
+    // pass to write that file after, so it is written here, retro or none
+    // (`wsp-852`).
     let effort = crate::cmd_report::effort(store, w, None);
     if crate::outputs::declared(w).iter().any(|o| o.name == "effort") {
         if let Err(why) = crate::cmd_report::write_effort_of(&w.id, &effort, "effort report, at the retro") {

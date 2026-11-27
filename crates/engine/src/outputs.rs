@@ -210,6 +210,22 @@ pub fn at_last_barrier(store: &Store, w: &Worklist, said: &str, dry: bool) -> Re
     }
 }
 
+/// The effort report again, once the last pass is on the record (`wsp-862`).
+/// [`at_last_barrier`] writes it before that, for the hold, so that reading has
+/// the list still running and its last check seat uncounted. The list may not
+/// be marked done yet, but every barrier is passed: it is read as done.
+pub fn after_last_pass(store: &Store, w: &Worklist) {
+    let Some(r) = reports() else { return };
+    if !declared(w).iter().any(|o| o.name == "effort") {
+        return;
+    }
+    let mut done = w.clone();
+    done.set_status(WorklistStatus::Done);
+    if let Err(why) = (r.write_effort)(store, &done, None, "effort report, after the last pass") {
+        store.log_event("effort-not-written", json!({ "list": w.id, "why": why }));
+    }
+}
+
 pub fn output(store: &Store, args: &Args) -> i32 {
     let Some(slug) = args.rest.get(1) else {
         eprintln!("{USAGE}");

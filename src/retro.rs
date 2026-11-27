@@ -152,14 +152,16 @@ fn read_effort(slug: &str) -> Option<Value> {
 }
 
 /// The last [`BASELINE`] cleared lists' figures, newest first, read from the
-/// `effort.json` each left: this list is never its own baseline.
+/// `effort.json` each left: this list is never its own baseline. A report that
+/// reads its done list as still running was cut before the last pass, so its
+/// wall is partial and it is skipped (`wsp-862`).
 pub fn baseline(store: &Store, w: &Worklist) -> Vec<Figures> {
     let mut found: Vec<(String, Figures)> = store
         .worklists()
         .into_iter()
         .filter(|o| o.id != w.id && o.status() == crate::model::WorklistStatus::Done && !o.is_cancelled())
         .filter_map(|o| {
-            let v = read_effort(&o.id)?;
+            let v = read_effort(&o.id).filter(|v| v["totals"]["still_running"] != true)?;
             let f = Figures::of(&v);
             (f.wall > 0).then(|| (v["generated"].as_str().unwrap_or("").to_string(), Figures { list: o.id.clone(), ..f }))
         })
@@ -507,6 +509,17 @@ mod tests {
         }
         let b = baseline(&store, &w);
         assert_eq!(b.iter().map(|f| f.list.as_str()).collect::<Vec<_>>(), ["c4", "c3", "c2"]);
+
+        // `wsp-862`: c4 is done, but its report was cut before its last pass.
+        let mut e = effort("c4");
+        e["generated"] = json!("2026-11-04T10:00:00Z");
+        e["totals"]["still_running"] = json!(true);
+        e["totals"]["cut_at"] = json!("2026-11-04T10:00:00Z");
+        std::fs::write(crate::cmd_report::dir("c4").join("effort.json"), e.to_string()).unwrap();
+        let b = baseline(&store, &w);
+        assert_eq!(b.iter().map(|f| f.list.as_str()).collect::<Vec<_>>(), ["c3", "c2", "c1"]);
+        let p = packet_from(&store, &w, &effort("now"), &b, "");
+        assert!(!p.contains("still running, cut at"), "{p}");
     }
 
     /// A list a person parked: the packet and the baseline line give the wall with

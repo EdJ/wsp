@@ -5480,6 +5480,10 @@ fn go_with(
         // (`wsp-326`'s first automatic pass left its check reading `running`).
         if let Some(n) = crossed {
             crate::barrier::settle(store, &w.id, n, said_as);
+            // Before the poke too: the close it starts reads the list's report.
+            if n == groups.len() {
+                crate::outputs::after_last_pass(store, &w);
+            }
         }
         crate::cycle::poke_list(store, &w.id, "go", crossed);
     }

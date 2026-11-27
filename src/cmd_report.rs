@@ -1484,6 +1484,37 @@ mod tests {
         let _ = w;
     }
 
+    /// `wsp-862`: the report was written before the last pass was recorded, and
+    /// read the finished list as running, its last check seat uncounted.
+    #[test]
+    fn the_effort_report_a_passed_last_barrier_leaves_reads_the_list_as_done() {
+        use std::io::Write;
+        let (_e, store, _w) = list("passed", &["r-1"]);
+        assert_eq!(run(&store, &["go", "passed", "start"], &[]), 0);
+        let mut t = store.task("r-1").unwrap();
+        t.status_raw = "done".into();
+        store.save_task(&t).unwrap();
+        // The row done 1000 s ago, the barrier's run then, its check seat since 900 s ago.
+        let now = util::epoch_secs();
+        let append = |file: &str, line: String| {
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(store.state_file(file)).unwrap();
+            writeln!(f, "{line}").unwrap();
+        };
+        for (ago, kind) in [(1500, "task-claimed"), (1100, "task-review"), (1000, "task-verified")] {
+            append("events.jsonl", json!({ "ts": util::iso_at(now - ago), "kind": kind, "data": { "id": "r-1" } }).to_string());
+        }
+        append("cycle.log", format!("{} passed group 1: barrier run — 0 step(s), 0 reused, 0 ran, 0 failed, 0s · scope: full", util::iso_at(now - 1000)));
+        append("cycle.log", format!("{} spawn passed --agent --check 1 --kind claude", util::iso_at(now - 900)));
+
+        assert_eq!(run(&store, &["go", "passed", "fine"], &[("caption", "all of it")]), 0);
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(dir("passed").join("effort.json")).unwrap()).unwrap();
+        assert_eq!((v["status"].clone(), v["totals"]["still_running"].clone()), (json!("done"), json!(false)), "{}", v["totals"]);
+        assert!(!v["waits"].to_string().contains("still running") && !v["totals"]["wall_buckets"].to_string().contains("still running"), "{}", v["totals"]);
+        let check = v["totals"]["wall_buckets"]["check_seat_seconds"].as_i64().unwrap();
+        assert!((900..960).contains(&check), "the check seat runs to the pass: {}", v["totals"]["wall_buckets"]);
+    }
+
     #[test]
     fn two_reports_leave_two_versions_and_a_check_seats_own_work_html_survives() {
         let (_e, store, w) = list("vers", &["r-1"]);
