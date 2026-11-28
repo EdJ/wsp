@@ -568,8 +568,12 @@ pub fn owed(t: &Task) -> Option<String> {
 }
 
 /// What a packet that names a `cargo test` says of how much to run (`wsp-389`):
-/// the narrow filter is the member's, the full suite the barrier's.
-pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`. The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; in your seat the full `cargo nextest run --workspace` is refused until you give a reason (`WSP_FULL_SUITE=\"<why>\"`, for a shared module, a fixture every test reads or a build-wide setting); the reason goes in the row's log and the verifier sees it, and a run is noted in `wsp wip`. Otherwise run your row's checks (`wsp check <row>`), name the full suite in your review summary and leave it to the barrier.";
+/// the narrow filter is the member's, the full suite the barrier's. A moved
+/// name is the exception (`wsp-871`): wsp-490 moved the hub login out of
+/// `$HOME`, its narrow checks were green, and nine tests whose rigs still set
+/// the old one went red at the barrier.
+pub const TEST_SCOPE: &str = "Tests: run only the one command above, or a narrower filter of it, for what you changed — never the full `cargo test`, except for a moved name (below). The full suite runs once per group, at the barrier and (where the project declares it) in the verifier's tier; in your seat the full `cargo nextest run --workspace` is refused until you give a reason (`WSP_FULL_SUITE=\"<why>\"`, for a moved name, a shared module, a fixture every test reads or a build-wide setting); the reason goes in the row's log and the verifier sees it, and a run is noted in `wsp wip`. Otherwise run your row's checks (`wsp check <row>`), name the full suite in your review summary and leave it to the barrier.
+A moved name: if your change moves or renames a variable, path or env name, run the whole suite before review (`WSP_FULL_SUITE=\"moves <name>\" cargo nextest run --workspace --no-fail-fast`), because tests that still set the old one are outside every narrow check. Say in your account how it went, and leave it out of your `checks:`, which are not for the full suite.";
 
 /// The one rule every packet carries on waiting (`wsp-611`): three seats in
 /// eighteen hours held to the tool's 600 s limit by a loop whose `pgrep -f`
@@ -844,6 +848,8 @@ mod tests {
         std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
         let with = build(&row("file: src/a.rs\nverify  cargo test a::"), &dir).unwrap();
         assert!(with.contains(TEST_SCOPE), "{with}");
+        // `wsp-871`: the one case a member runs the whole suite unasked.
+        assert!(with.contains("moves or renames a variable, path or env name, run the whole suite before review"), "{with}");
         let without = build(&row("file: src/a.rs\nSave prints ok."), &dir).unwrap();
         assert!(!without.contains(TEST_SCOPE), "{without}");
         let _ = std::fs::remove_dir_all(&dir);

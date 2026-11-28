@@ -4739,7 +4739,10 @@ about nine minutes), so a row is checked in **three tiers**:
 3. **The full suite at the barrier**, once per group and not per row:
    `- name (limit) at barrier: command`. `wsp check <project> --barrier` runs
    them at the trunk's tip and writes nothing; the barrier row is the one that
-   calls it and records what it ran.
+   calls it and records what it ran. One member runs it too: a row that moves or
+   renames a variable, path or env name runs the whole suite in its seat before
+   review (`WSP_FULL_SUITE="moves <name>"`), because tests that still set the old
+   one are outside every narrow check.
 
 **A step that ran no test is red.** Where a step's output shows cargo test,
 cargo nextest, Vitest or Playwright and that runner ran no test at all, the step

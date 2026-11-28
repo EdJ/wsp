@@ -1252,7 +1252,7 @@ fn failing_tests(body: &str) -> Vec<String> {
 /// What a member is told when it asks for the whole suite without a reason.
 pub fn full_suite_refusal(body: &str) -> String {
     let mut m = format!(
-        "wsp: refused. The barrier runs the full suite once per group; run your row's checks (`wsp check <row>`). If this change needs the whole suite (a shared module, a fixture every test reads, a build-wide setting), run it again with `{FULL_SUITE_WHY}=\"<why>\"`."
+        "wsp: refused. The barrier runs the full suite once per group; run your row's checks (`wsp check <row>`). If this change needs the whole suite (it moves or renames a variable, path or env name; a shared module, a fixture every test reads, a build-wide setting), run it again with `{FULL_SUITE_WHY}=\"<why>\"`."
     );
     let checks = checks_of(body);
     if !checks.is_empty() {
@@ -3322,6 +3322,7 @@ mod tests {
         assert_eq!(run_in(&c, "cargo", &full), 2, "refused");
         let text = said.borrow().join("\n");
         assert!(text.contains("barrier runs the full suite once per group") && text.contains("wsp check <row>") && text.contains("WSP_FULL_SUITE"), "{text}");
+        assert!(text.contains("moves or renames a variable, path or env name"), "{text}");
         assert!(text.contains("tests: cargo test cmd_spawn::"), "the row's own checks: {text}");
         assert!(text.contains("cargo nextest run -E 'test(=cmd_spawn::a_seat_starts)'"), "the failing test, alone: {text}");
         assert_eq!(full_suite_runs(&rig.state, "wsp-9"), 0, "a refused run is not a run");
