@@ -9226,8 +9226,7 @@ mod tests {
         w.set_status(WorklistStatus::Done);
         store.save_worklist(&w).unwrap();
         let told = yours_after_the_seat(&store, "cpd-10");
-        assert_eq!(told.len(), 2, "{told:?}");
-        assert!(told.iter().any(|t| t.contains("last gate") && !t.contains("wsp worklist hold")), "{told:?}");
+        assert_eq!(told.len(), 1, "the first is still there, and the last gate takes no default: {told:?}");
     }
 
     /// And a hold by the check says how to go on; a gate with no default, or one

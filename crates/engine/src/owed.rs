@@ -57,11 +57,16 @@ impl Owed {
 /// Whether the run opens a check on this group's barrier itself: a group run by
 /// an agent line, or a `manual` one whose written stop an agent may check
 /// (`wsp-629`, `cycle::an_agent_may_check`).
-fn checked_by_the_run(g: &Group) -> bool {
+fn checked_by_the_run(w: &Worklist, g: &Group) -> bool {
     if g.policy().is_some() {
         return true;
     }
-    g.agent.trim() == MANUAL && crate::cycle::an_agent_may_check(&g.stop)
+    if g.agent.trim() != MANUAL {
+        return false;
+    }
+    let groups = w.groups();
+    let at = groups.iter().position(|x| x.members == g.members).map_or(1, |i| i + 1);
+    crate::cycle::an_agent_may_check(&g.stop, at, groups.len())
 }
 
 /// What the barrier at group `g` of `w` is waiting on, where its state is
@@ -110,7 +115,7 @@ pub fn of(w: &Worklist, g: &Group, state: ListState, settled: &dyn Fn(&str) -> b
                 return Some(Owed::Check);
             }
             // Blocking: the follow-ups land, and a fresh check reads the group.
-            if last.is_some_and(|c| c.state == CheckState::Blocking) || checked_by_the_run(g) {
+            if last.is_some_and(|c| c.state == CheckState::Blocking) || checked_by_the_run(w, g) {
                 return Some(Owed::Check);
             }
             Some(Owed::Person(if g.stop.trim().is_empty() {
@@ -198,9 +203,15 @@ mod tests {
         assert_eq!(of(&w, &g, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "running");
         let mut manual = group(MANUAL, "the suite is green");
         assert_eq!(of(&w, &manual, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "a manual group's check");
-        // Named, but with a default (`wsp-614`): the check's to take.
+        // Named, but with a default (`wsp-614`): the check's to take, and the
+        // person's on the list's last gate.
         let default = group(MANUAL, "Ed decides. Default: go if under 2.2 s");
-        assert_eq!(of(&w, &default, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "a stated default");
+        let mut two = list(WorklistStatus::Running);
+        two.set_groups(&[default.clone(), Group { members: vec!["a-2".into()], ..default.clone() }]);
+        let groups = two.groups();
+        assert_eq!(of(&two, &groups[0], ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "a stated default");
+        let last = of(&two, &groups[1], ListState::Barrier, &all_landed, NOW).unwrap();
+        assert_eq!(last.word(), "person", "no default on the last gate");
         manual.checks.push(check(CheckState::Blocking));
         assert_eq!(of(&w, &manual, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "waiting on its follow-ups");
         // A held list whose check is still reading it is the check's too.

@@ -1676,15 +1676,15 @@ fn step_in(store: &Store, w: &Worklist, seats: &dyn Seats, starts: Starts) -> Ve
 ///
 /// All of: the group's line is `manual` itself (an empty one is a list from
 /// before `agent:` and stays by hand); every member has landed; the stop is
-/// written and names no person ([`names_a_person`]) or states its default
-/// ([`states_default`]). The line is the list's
+/// written and names no person ([`names_a_person`]) or states a default its
+/// check may take ([`takes_default`]). The line is the list's
 /// usual one ([`usual_line`]).
 fn manual_barrier_policy(groups: &[Group], at: usize, g: &Group, pos: &worklist::Position) -> Option<Policy> {
     if g.agent.trim() != MANUAL || !pos.at_barrier() || pos.members.is_empty() {
         return None;
     }
     let stop = g.stop.trim();
-    if !an_agent_may_check(stop) {
+    if !an_agent_may_check(stop, at, groups.len()) {
         return None;
     }
     Policy::parse(&usual_line(groups, at))
@@ -1698,14 +1698,21 @@ pub fn names_a_person(stop: &str) -> bool {
 }
 
 /// Whether the run may open a `manual` group's check on this stop: one is
-/// written, and it names no person or states its default.
-pub fn an_agent_may_check(stop: &str) -> bool {
-    !stop.trim().is_empty() && (!names_a_person(stop) || states_default(stop))
+/// written, and it names no person or states a default its check may take.
+pub fn an_agent_may_check(stop: &str, at: usize, of: usize) -> bool {
+    !stop.trim().is_empty() && (!names_a_person(stop) || takes_default(stop, at, of))
+}
+
+/// Whether the check of group `at` (1-based) of `of` takes its gate's default:
+/// the stop states one and the group is not the list's last (`wsp-614`). After
+/// the last gate nothing is left to hold, so a `go` there is not turned back.
+pub fn takes_default(stop: &str, at: usize, of: usize) -> bool {
+    at < of && states_default(stop)
 }
 
 /// Whether a stop says what its gate does by default (`wsp-614`): `Default: go
 /// …` or `Default: stop …`. Such a gate is the check's to take, and the person's
-/// to turn back, so a run does not stand waiting for them.
+/// to turn back, so a run does not stand waiting for them ([`takes_default`]).
 pub fn states_default(stop: &str) -> bool {
     let lower = stop.to_lowercase();
     lower.match_indices("default:").any(|(i, label)| {
@@ -4582,7 +4589,7 @@ const LIVE_BAR: &str = "**A bar only the live daemon can show** waits on the ins
      wsp tells the governor to install and have this barrier checked again. Where it is installed already, read \
      that one figure there; it is not the measuring barred above.";
 
-/// What a check is told where its stop [`states_default`] (`wsp-614`).
+/// What a check is told where it [`takes_default`] (`wsp-614`).
 const GATE_DEFAULT: &str = "**This stop states a default: take it, and do not wait for the person.** Read the figure the \
      `Default:` line names from what was committed and do what the line says: `go` is `wsp worklist go`, `stop` is `wsp \
      worklist hold` with `cause: work`. Do not put the question to the person first. The default stands in for their \
@@ -4590,24 +4597,22 @@ const GATE_DEFAULT: &str = "**This stop states a default: take it, and do not wa
      verdict what you took, the figure and its value: wsp puts the verdict on the person's list with how to turn it \
      back, so send them nothing yourself.";
 
+/// And where its stop states one on the list's last gate.
+const LAST_GATE_DEFAULT: &str = "**This is the list's last barrier, where no default is taken.** Read the `Default:` \
+     line as not written: where the stop waits on the person, hold and ask them.";
+
 /// Put on the person's list that a gate with a default was decided by its check:
 /// group `at` of `groups`, read before the open check is settled (`wsp-614`).
 /// wsp raises it and not the check, whose own `wsp tell person` is closed as soon
 /// as its seat ends. A gate no check is reading is the person's own act.
 pub fn tell_gate_taken(store: &Store, list: &str, groups: &[Group], at: usize, passed: bool, said: &str) {
     let Some(g) = at.checked_sub(1).and_then(|i| groups.get(i)) else { return };
-    if !states_default(&g.stop) || crate::barrier::running(g).is_none() {
+    if !takes_default(&g.stop, at, groups.len()) || crate::barrier::running(g).is_none() {
         return;
     }
-    let (did, back) = match (passed, at == groups.len()) {
-        (true, false) => ("passed", format!("To turn it back: `wsp worklist hold {list} \"why\"` — nothing more starts; what is running finishes.")),
-        (true, true) => (
-            "passed",
-            "That was the list's last gate: the go closes the list, so there is nothing to hold. What landed is on the trunk; \
-             to turn it back, file a row that reverts it (`wsp add`)."
-                .to_string(),
-        ),
-        (false, _) => ("held", format!("To turn it back: `wsp worklist go {list} \"why\"`.")),
+    let (did, back) = match passed {
+        true => ("passed", format!("To turn it back: `wsp worklist hold {list} \"why\"` — nothing more starts; what is running finishes.")),
+        false => ("held", format!("To turn it back: `wsp worklist go {list} \"why\"`.")),
     };
     let text = format!(
         "{list} group {at}: the gate that states a default was {did}\n\nThe stop: {}\n\nThe verdict: {}\n\n{back}",
@@ -4666,9 +4671,10 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str, live: bool) -
         "" => "There is no stop condition written at this barrier.".to_string(),
         s => format!("The stop condition, which your verdict answers:\n\n> {s}"),
     };
-    let stop = match states_default(&g.stop) {
-        true => format!("{stop}\n\n{GATE_DEFAULT}"),
-        false => stop,
+    let stop = match (states_default(&g.stop), takes_default(&g.stop, at, w.groups().len())) {
+        (_, true) => format!("{stop}\n\n{GATE_DEFAULT}"),
+        (true, false) => format!("{stop}\n\n{LAST_GATE_DEFAULT}"),
+        (false, false) => stop,
     };
     let tail = match crate::cmd_worklist::spent_by(w, &g.members) {
         None => format!(
@@ -6890,8 +6896,8 @@ pub mod tests {
         assert!(!order.contains("--parent"), "{order}");
     }
 
-    /// `wsp-614`: a stop that states its default is taken by the check. Any
-    /// other stop is read as ever.
+    /// `wsp-614`: a stop that states its default is taken by the check, except
+    /// on the list's last gate. Any other stop is read as ever.
     #[test]
     fn a_stop_that_states_a_default_is_taken_by_the_check() {
         for stop in ["Default: go if the edit is under 2.2 s", "Ed reads the figures. default: **stop** unless half"] {
@@ -6903,11 +6909,13 @@ pub mod tests {
 
         let mut w = Worklist::new("run", "run");
         let g = Group { members: vec!["m-1".into()], stop: "Default: go if under 2.2 s".into(), ..Group::default() };
-        w.set_groups(std::slice::from_ref(&g));
+        w.set_groups(&[g.clone(), g.clone()]);
         let order = barrier_order(&w, 1, &g, "", false);
         assert!(order.contains(GATE_DEFAULT) && !order.contains("wsp tell person"), "{order}");
+        let last = barrier_order(&w, 2, &g, "", false);
+        assert!(last.contains(LAST_GATE_DEFAULT) && !last.contains(GATE_DEFAULT), "{last}");
         let plain = Group { stop: "waits on Ed's decision".into(), ..g };
-        assert!(!barrier_order(&w, 1, &plain, "", false).contains("states a default"));
+        assert!(!barrier_order(&w, 1, &plain, "", false).contains("default is taken"));
     }
 
     /// `wsp-326`: the check is handed the members, their verdicts, the stop's
@@ -9945,6 +9953,21 @@ fn only_a_working_screen_is_ever_overruled() {
             assert!(spawned().is_empty(), "case {i} ({agent:?}, {stop:?}, {status:?}): nothing starts");
             assert!(checks(&store, 1).is_empty(), "case {i}: and no check is opened");
         }
+    }
+
+    /// `wsp-614`: on the list's last gate a stated default is no default, so a
+    /// stop that names the person still waits for them.
+    #[test]
+    fn a_manual_last_barrier_with_a_default_waits_for_its_person() {
+        let (_env, store) = scratch("manuallast");
+        task(&store, "m-1", Status::Review);
+        let mut w = list(&store, &[(&["m-1"], "manual")]);
+        let mut g = w.groups();
+        g[0].stop = "Ed decides. Default: go if under 2.2 s".into();
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        step(&store, &w, &Blind);
+        assert!(spawned().is_empty() && checks(&store, 1).is_empty(), "no check is opened");
     }
 
     /// The cap is on the work, and a member already going counts against it.
