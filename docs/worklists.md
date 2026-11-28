@@ -112,6 +112,29 @@ the test or `file:line` as the runner prints it. While that row is open and not 
   there fails the step too. The red's row is still pulled in.
 - the red's own row, the barrier and the end build do not hold over it.
 
+## A gate states its default (wsp-614)
+
+A stop that waits for the person's decision holds the run until they answer.
+turnaround stood 626 of its 871 minutes at two such gates, and both answers were
+"go on" (Jesper, 2026-11-27).
+
+**At planning.** Where the work behind a gate is cheap to revert, its stop says
+what happens by default and the figure that decides it, in one line:
+
+- `Default: go if <figure> is under <limit>, else the run holds.`
+- `Default: stop unless <figure> is under <limit>.`
+
+The word after `Default:` is `go` or `stop`. A row before the barrier commits
+the figure, since the check does not measure. Where going on would be costly to
+undo, state no default: the gate waits.
+
+**At the barrier.** The check takes the default without asking first, then tells
+the person (`wsp tell person`) what it took, the figure, and how to turn it back:
+`wsp worklist hold <list>` after a go, which stops anything more starting, or
+`wsp worklist go <list>` after a hold. A red check or a member that did not hold
+still holds the barrier. A `manual` group whose stop states a default gets a
+check agent even where the stop names the person.
+
 ## A done-when that waits on another list's run (wsp-870)
 
 An item such as "the next check of <row> ends with no exit 143" is shown by
