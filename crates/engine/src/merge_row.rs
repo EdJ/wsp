@@ -62,11 +62,11 @@ pub const ORDER: &str = "This is a merge row: ask its decisions first, as the pa
 /// The first leg's order. `packet: off`: a generated packet would forbid
 /// reading the conflicts the leg is there to find.
 const DECIDE: &str = "packet: off
-Decide, and resolve nothing. Trial the merge without touching the tree (`git merge-tree --write-tree --name-only HEAD <ref>`). List every conflict with both sides' intent and a proposed resolution, and every choice that is the person's: the merge point, a design clash, a guard or test limit to change, the push (not where `wsp worklist show {list}` has a `push` line: that is the go). Ask them all in one `wsp ask {row} --person --wait --choices -`, a question for each. Leave the conflict list and the answers in your baton.";
+Decide, and resolve nothing. Trial the merge without touching the tree (`git merge-tree --write-tree --name-only HEAD <ref>`). List every conflict with both sides' intent and a proposed resolution, and every choice that is the person's: the merge point, a design clash, a guard or test limit to change, the push (not where `wsp worklist show {list}` has a `push` line: that is the go). Ask them all in one `wsp ask {row} --person --wait --choices -`, a question for each. Leave the conflict list, the answers and the list's `push` line, where it has one, in your baton.";
 
 /// The last leg's order.
 const FINISH: &str = "packet: off
-Merge as the baton's answers say, and never rebase. Resolve, run the row's checks, and submit: a branch that holds the merge and contains master lands by fast-forward, so ask nobody for a `git merge --ff-only`; if master moves, `git merge master` again.";
+Merge as the baton's answers say, and never rebase. The push go is the `push` line of `wsp worklist show {list}`: where it is there, it is the person's answer, so do not ask about the push, even where the row says to ask first. Resolve, run the row's checks, and submit: a branch that holds the merge and contains master lands by fast-forward, so ask nobody for a `git merge --ff-only`; if master moves, `git merge master` again.";
 
 /// What a planner is told of a merge row put in `list`: the two legs to file
 /// where it has none, and the `Push:` line the list's overview lacks. Empty
@@ -137,6 +137,9 @@ mod tests {
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[0].contains("wsp leg add t-1 decide --order -") && said[0].contains("wsp leg add t-1 finish"), "{}", said[0]);
         assert!(said[0].contains("wsp ask t-1 --person") && said[0].contains("wsp worklist show green") && !said[0].contains('{'), "{}", said[0]);
+        let finish = said[0].split_once("wsp leg add t-1 finish").unwrap().1;
+        assert!(finish.contains("The push go is the `push` line of `wsp worklist show green`"), "{finish}");
+        assert!(finish.contains("do not ask about the push"), "{finish}");
         assert!(said[1].contains("wsp worklist edit green --overview -"), "{}", said[1]);
         t.body = "## Legs\n- decide · claude sonnet medium · pending\n  order: x\n".into();
         assert!(planning(&t, "green", "Push: go").is_empty());

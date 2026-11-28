@@ -61,7 +61,8 @@ or `into … master|main|trunk`; or the tag `merge` or `hand-off`
 - The row runs as two legs. `decide` trials the merge, lists every conflict and
   every person-shaped choice (merge point, design clash, guard change, push),
   and asks them in one `wsp ask <row> --person --wait`. `finish` merges as the
-  answers say. Both say `packet: off`.
+  answers say. Both say `packet: off`. `decide` leaves the `push` line in its
+  baton, and `finish` is told to read it from `wsp worklist show <list>`.
 - The list's overview records the push go on a line of its own, `Push: go (who,
   when)` or `Push: no`. `wsp worklist show <list>` prints it as `push`, and a
   row that finds it there asks nothing about the push.
@@ -74,6 +75,16 @@ with no legs, printing the two `wsp leg add` commands, and on a list with no
 
 **Landing.** Merge, never rebase. A branch that holds the merge and contains
 `master` lands by fast-forward, so nobody is asked for a `git merge --ff-only`.
+
+**Who pushes.** Not the member: its seat ends at submit, and the verifier lands
+the row after it. The land does not read the `Push:` line.
+
+- A shared row: wsp pushes, as part of the land. The branch goes to the trunk of
+  the project's `remote:` (`origin` where it names none), fast-forward only,
+  before the local trunk moves.
+- A private row: the land only fast-forwards the local trunk, and pushes
+  nothing. Where the list says `Push: go`, whoever governs the list pushes the
+  trunk by hand once the row has landed.
 
 ## A red the trunk has
 
