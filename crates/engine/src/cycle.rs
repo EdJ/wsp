@@ -2385,6 +2385,8 @@ fn take_member(
         let sent_back = t.status() == Status::Doing && sent_back_unseated(store, &t, &claims);
         let held = crate::starts::held(store, &id);
         let spent = held && crate::starts::spent(store, &id) && (reseating.is_some() || sent_back);
+        // A trunk red's row starts beside the group, whatever its `xN`.
+        let cap = cap.filter(|_| !pulled_as_trunk_red(&t));
         if held && !spent {
             return None;
         }
@@ -2630,6 +2632,85 @@ fn pull_prerequisites(store: &Store, w: &Worklist, at: usize) -> bool {
     true
 }
 
+// ---- a trunk red's row (compound-react-127) -----------------------------------
+
+/// The line the run writes on a trunk red's row when it pulls it into a running
+/// group: `wsp: trunk red, pulled into <list> group <n> …`. A row carrying it
+/// starts beside the group, outside its `xN`.
+pub const TRUNK_RED_PULLED: &str = "wsp: trunk red, pulled into";
+
+/// What the run writes on the row whose check named a trunk red it could not
+/// pull in, once per reason.
+const TRUNK_RED_LEFT: &str = "wsp: trunk red, not pulling in";
+
+/// Whether `t` was pulled in as a trunk red's row, and so runs beside its group.
+fn pulled_as_trunk_red(t: &Task) -> bool {
+    t.section("Log").unwrap_or_default().contains(TRUNK_RED_PULLED)
+}
+
+/// The check of `naming` named a red the row `red` owns: put `red` into the
+/// current group of the running list that holds `naming`, as a member its
+/// barrier waits on, started beside the group's `xN` (the seat's cap still
+/// holds). It runs on the group's agent line, or on its own where a later group
+/// of the list had it. A row another list holds stays there, and the naming row
+/// says so. `true` if this call added it.
+pub fn pull_trunk_red(store: &Store, naming: &str, red: &str) -> bool {
+    let holds = |w: &Worklist, id: &str| w.groups().iter().any(|g| g.members.iter().any(|m| m == id));
+    let left = |why: String| {
+        let said = format!("{TRUNK_RED_LEFT} {red}: {why}");
+        if let Some(mut t) = store.find_task(naming) {
+            if !t.section("Log").unwrap_or_default().contains(&said) {
+                t.log(&said);
+                let _ = store.save_task(&t);
+            }
+        }
+    };
+    let pulled = store.locked(|| {
+        let lists = store.worklists();
+        let mut w = lists.iter().find(|w| w.status() == WorklistStatus::Running && holds(w, naming))?.clone();
+        let at = worklist::position(store, &w, Reading::Settled).at?;
+        if let Some(other) = lists.iter().find(|o| o.id != w.id && o.status() != WorklistStatus::Done && holds(o, red)) {
+            left(format!("{} holds it", other.id));
+            return None;
+        }
+        let mut groups = w.groups();
+        let mut own = None;
+        if let Some(i) = groups.iter().position(|g| g.members.iter().any(|m| m == red)) {
+            // In the group being run, or one before it: it is already owed.
+            if i < at {
+                return None;
+            }
+            if groups[i].members.len() == 1 && !groups[i].stop.trim().is_empty() {
+                left(format!("it is alone in group {} of {}, which has a stop", i + 1, w.id));
+                return None;
+            }
+            own = groups[i].member_agents.remove(red).or_else(|| Some(groups[i].agent.clone()).filter(|a| Policy::parse(a).is_some()));
+            groups[i].members.retain(|m| m != red);
+            if groups[i].members.is_empty() {
+                groups.remove(i);
+            }
+        }
+        let group = &mut groups[at - 1];
+        group.members.insert(0, red.to_string());
+        if let Some(line) = own.filter(|a| a.trim() != group.agent.trim()) {
+            group.member_agents.insert(red.to_string(), line);
+        }
+        w.log(&format!("wsp: group {at} takes in {red} — a trunk red that {naming}'s check named"));
+        w.set_groups(&groups);
+        store.save_worklist(&w).ok()?;
+        let mut r = store.find_task(red)?;
+        r.log(&format!("{TRUNK_RED_PULLED} {} group {at}: {naming}'s check named it", w.id));
+        r.touch();
+        store.save_task(&r).ok()?;
+        Some((w.id.clone(), at))
+    });
+    let Some((list, at)) = pulled else { return false };
+    log_line(store, &format!("{list} group {at}: {red} added — a trunk red that {naming}'s check named"));
+    store.git_commit(&format!("wsp: {list} group {at} takes in trunk red {red}"));
+    poke_list(store, &list, "trunk-red", None);
+    true
+}
+
 /// Sent back since anybody last started on it, and nobody on it now: a member
 /// `wsp reopen` put at `doing` after its agent had gone. `wsp-286`.
 ///
@@ -2752,6 +2833,8 @@ fn members_going(store: &Store, members: &[String], id: &str, claims: &std::coll
         .filter_map(|m| store.find_task(m))
         .filter(|m| !Settlement::of(m).settled())
         .filter(|m| m.status() == Status::Doing || claims.contains_key(&m.id))
+        // A trunk red's row runs beside the group and holds none of its places.
+        .filter(|m| !pulled_as_trunk_red(m))
         // A member that released its seat to wait on a prerequisite is not in
         // flight: counting it would hold the prerequisite out of an `x1` group,
         // which is the member waiting on the row it is holding the place of.
@@ -12672,6 +12755,37 @@ fn only_a_working_screen_is_ever_overruled() {
         hold_all(&store);
         step(&store, &w, &Blind);
         assert_eq!(checks(&store, 1).len(), 1, "both landed and verified: the barrier opens");
+    }
+
+    /// compound-react-127: a trunk red's row joins the group being run and
+    /// starts beside its `x1`; one another list holds stays there.
+    #[test]
+    fn a_trunk_reds_row_is_pulled_in_and_started_beside_the_groups_cap() {
+        let (_env, store) = scratch("trunk-red-beside");
+        task(&store, "m-1", Status::Todo);
+        let mut w = list(&store, &[(&["m-1"], "claude")]);
+        let mut g = w.groups();
+        g[0].cap = Some(1);
+        w.set_groups(&g);
+        store.save_worklist(&w).unwrap();
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("m-1".into(), "claude".into())]);
+        store.set_claim("m-1", serde_json::json!({ "workspace_id": "cpd-9" }));
+        task(&store, "red", Status::Todo);
+
+        assert!(pull_trunk_red(&store, "m-1", "red"));
+        assert!(!pull_trunk_red(&store, "m-1", "red"), "once");
+        let w = store.worklist("run").unwrap();
+        assert_eq!(w.groups()[0].members, vec!["red", "m-1"]);
+        step(&store, &w, &Blind);
+        assert_eq!(spawned(), vec![("red".into(), "claude".into())], "beside the member holding the one place");
+
+        task(&store, "held", Status::Todo);
+        let mut other = Worklist::new("other", "other");
+        other.set_groups(&[Group { members: vec!["held".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&other).unwrap();
+        assert!(!pull_trunk_red(&store, "m-1", "held"));
+        assert!(store.find_task("m-1").unwrap().section("Log").unwrap_or_default().contains("not pulling in held: other holds it"));
     }
 
     /// A row another list holds is not pulled in, a done row owes nothing, and a

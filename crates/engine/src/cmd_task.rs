@@ -2505,12 +2505,16 @@ fn rule_gate(store: &Store, t: &Task, anyway: Option<&str>) -> Result<Vec<String
     }
     let mut said = Vec::new();
     let mut red: Vec<(crate::check::Step, String)> = Vec::new();
+    let reds = crate::check::known_reds(store, t);
     for step in &steps {
         let log = store.state.join("review-rules").join(format!("{}-{}.log", t.id, step.name));
-        match crate::check::run_at_review(&tree, step, &log) {
+        match crate::check::run_at_review(&tree, &crate::check::past_failures(&reds, step), &log) {
             crate::check::AtReview::Green => said.push(format!("{} green in the seat at {short} (`{}`)", step.name, step.command)),
             crate::check::AtReview::Skipped(why) => said.push(why),
-            crate::check::AtReview::Red(tail) => red.push((step.clone(), tail)),
+            crate::check::AtReview::Red(tail) => match crate::check::weigh_red(store, &t.id, &reds, step, &log) {
+                Some(what) => said.push(format!("{} red only on the trunk red {what}, held over until that row lands", step.name)),
+                None => red.push((step.clone(), tail)),
+            },
         }
     }
     if red.is_empty() {

@@ -145,7 +145,7 @@ pub fn close_with(store: &Store, row: &str, batch: usize, standing: &dyn Fn(&Pat
         let reuse = ledger.as_ref().map(|g| Reuse { greens: g, sha: &head, env: greens::Env::Warm, who: row });
         let dir = store.state_file("checks");
         let _ = std::fs::create_dir_all(&dir);
-        let results = check::run_all(&row_dir, &steps, &dir.join(format!("{row}-batch-{batch}.log")), reuse.as_ref(), &runner, |_| {});
+        let results = check::run_row(store, &t, &row_dir, &steps, &dir.join(format!("{row}-batch-{batch}.log")), reuse.as_ref(), &runner, |_| {});
         let (r, n) = check::tally(&results);
         (reused, ran) = (r, n);
         // `wsp-067`: a tree that went under the run is no red to file a fix for.

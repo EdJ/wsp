@@ -74,3 +74,19 @@ with no legs, printing the two `wsp leg add` commands, and on a list with no
 
 **Landing.** Merge, never rebase. A branch that holds the merge and contains
 `master` lands by fast-forward, so nobody is asked for a `git merge --ff-only`.
+
+## A red the trunk has
+
+A row owns a red on the trunk by saying so in its log: `wsp note <row> "trunk red: <test>"`,
+the test or `file:line` as the runner prints it. While that row is open and not landed:
+
+- the first check in its project that names the red pulls the row into the current group of the
+  running list that holds the checked row. The barrier waits on it, and it starts beside the
+  group's `xN` (the seat cap still holds). It runs on the group's agent line, or on the one it had
+  in a later group of that list. A row another list holds stays there, and the checked row's log
+  says so.
+- a row's check (`wsp check`, the review rule steps, the rerun at a land, piece checks) passes over a step whose only
+  failures are named ones. It still fails on any other failing test, a build error, a crash, a run
+  cut short, output it cannot count, or a line chaining several commands. While a red is known,
+  cargo steps run with `--no-fail-fast`.
+- the red's own row, the barrier and the end build do not hold over it.

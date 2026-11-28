@@ -1938,7 +1938,7 @@ fn landed_at_doing(store: &Store, w: &Worklist, at: usize, pos: &Position) {
 /// The commit of a landing written below the newest send-back (or any landing,
 /// where there has been none): work that reached the trunk after the row was
 /// last told to go back to it.
-fn landed_since_sent_back(t: &Task) -> Option<String> {
+pub(crate) fn landed_since_sent_back(t: &Task) -> Option<String> {
     let log = t.section("Log")?;
     let lines: Vec<&str> = log.lines().collect();
     let from = lines.iter().rposition(|l| l.contains(crate::cycle::SENT_BACK)).map_or(0, |i| i + 1);

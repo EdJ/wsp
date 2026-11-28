@@ -215,7 +215,7 @@ pub fn attend(store: &Store, args: &Args) -> i32 {
             return 1;
         }
     };
-    let checks = check::run_all(&here, &opted.steps, &dir.join("verify.log"), None, &runner, |_| {});
+    let checks = check::run_row(store, &t, &here, &opted.steps, &dir.join("verify.log"), None, &runner, |_| {});
     let green = check::passed(&checks);
     say("Stop", &session);
     let account = format!(

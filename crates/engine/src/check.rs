@@ -1579,12 +1579,21 @@ pub enum Done {
     TreeMissing(String),
     /// An earlier step failed, so this one was not run.
     Skipped,
+    /// Red, and every failure in its output is a known trunk red
+    /// ([`TrunkRed`], compound-react-127): the red and the row that owns it.
+    /// Reads as a pass, and is recorded as no green.
+    HeldOver(String),
 }
 
 impl Done {
     /// Anything that stops a run: a red step or one that could not start.
     pub fn is_red(&self) -> bool {
         matches!(self, Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) | Done::NoTests(_))
+    }
+
+    /// Passed, or red on nothing but a known trunk red.
+    pub fn is_green(&self) -> bool {
+        matches!(self, Done::Passed | Done::HeldOver(_))
     }
 
     /// Anything after which the next step is not run: a red step, or a tree
@@ -1764,7 +1773,7 @@ fn excludes_by_glob(command: &str) -> bool {
 }
 
 /// Flags without a value that mean the same to both.
-const SAME: &[&str] = &["--lib", "--bins", "--tests", "--workspace", "--all", "--all-features", "--no-default-features", "-r", "--release"];
+const SAME: &[&str] = &["--no-fail-fast", "--lib", "--bins", "--tests", "--workspace", "--all", "--all-features", "--no-default-features", "-r", "--release"];
 
 /// Flags with a value, as `cargo test` and then nextest spell them: nextest's
 /// own `--profile` is its run profile.
@@ -1924,7 +1933,12 @@ pub fn runner_script(command: &str, metadata: impl FnOnce(Option<&str>) -> Optio
         if !packages.is_empty() {
             let named: String = packages.iter().map(|p| format!(" -p {p}")).collect();
             let rest: String = doc.rest.iter().map(|w| format!(" {w}")).collect();
-            run = format!("{run} && cargo test --doc{named}{rest}");
+            run = if run.contains(" --no-fail-fast") {
+                // The doctests run whatever nextest said, so none is hidden.
+                format!("{{ {run}; a=$?; cargo test --doc{named}{rest} && [ $a -eq 0 ]; }}")
+            } else {
+                format!("{run} && cargo test --doc{named}{rest}")
+            };
             line = BY_NEXTEST_AND_DOC;
         }
     }
@@ -2251,6 +2265,12 @@ pub fn run_every(dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, 
 /// and is not written again), and a pass is recorded when the tree was clean at
 /// that commit before the step ran.
 pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, runner: &Runner<'_>) -> Ran {
+    run_again_as(dir, step, step, log, reuse, runner)
+}
+
+/// [`run_again`] for `step`, running `as_run`'s command: the ledger, the entry
+/// and what the check wrote are the declared step's.
+fn run_again_as(dir: &Path, step: &Step, as_run: &Step, log: &Path, reuse: Option<&Reuse>, runner: &Runner<'_>) -> Ran {
     let inputs = reuse.and_then(|r| crate::affected::key(dir, r.sha, &step.command));
     if let Some(r) = reuse {
         if let Some(green) = r.greens.lookup_by(r.sha, inputs.as_deref(), &step.command, r.env) {
@@ -2260,7 +2280,7 @@ pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, run
     let clean = reuse.is_some_and(|r| greens::clean_at(dir, r.sha));
     // What the step creates in the tree is noted as the check's (`wsp-848`).
     let before = crate::cmd_checkout::untracked_paths(dir);
-    let mut first = run_step(dir, step, log, runner);
+    let mut first = run_step(dir, as_run, log, runner);
     // `wsp-067`: a missing tree is waited for, and the step run once more when
     // it is back; still gone, the step stays "tree missing".
     if matches!(first.done, Done::TreeMissing(_)) {
@@ -2272,16 +2292,16 @@ pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, run
         if !dir.is_dir() {
             return Ran { took: first.took + waited.elapsed(), ..first };
         }
-        first = run_step(dir, step, log, runner);
+        first = run_step(dir, as_run, log, runner);
     }
-    let ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
-        let second = run_step(dir, step, log, runner);
+    let mut ran = if matches!(first.done, Done::Failed { timed_out: false, .. }) {
+        let second = run_step(dir, as_run, log, runner);
         Ran { took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
     } else if matches!(first.done, Done::Failed { timed_out: true, .. }) && still_building(log) {
         // `wsp-364`: stopped in a cold build. The second run has room for the
         // build, and what is judged is its run once cargo said it had built.
         let why = format!("stopped at its {}s limit while cargo was still building (a cold `target/`)", step.limit.as_secs());
-        let wide = Step { limit: step.limit * 2 + COLD_BUILD_LIMIT, ..step.clone() };
+        let wide = Step { limit: step.limit * 2 + COLD_BUILD_LIMIT, ..as_run.clone() };
         let second = run_step(dir, &wide, log, runner);
         let build = built_in(log).map(|b| first.took + b.min(second.took));
         let mut ran = Ran { step: step.clone(), took: first.took + second.took, first: Some((why, first.tail.clone())), build, ..second };
@@ -2290,17 +2310,227 @@ pub fn run_again(dir: &Path, step: &Step, log: &Path, reuse: Option<&Reuse>, run
         }
         ran
     } else if matches!(first.done, Done::Failed { timed_out: true, .. }) {
-        let wide = Step { limit: step.limit * 2, ..step.clone() };
+        let wide = Step { limit: step.limit * 2, ..as_run.clone() };
         let second = run_step(dir, &wide, log, runner);
         Ran { step: step.clone(), took: first.took + second.took, first: Some((why_failed(&first), first.tail.clone())), ..second }
     } else {
         first
     };
+    ran.step = Step { limit: ran.step.limit, ..step.clone() };
     crate::cmd_checkout::note_check_wrote(dir, &step.name, before.as_ref());
     if let (Some(r), true, Done::Passed) = (reuse, clean, &ran.done) {
         r.greens.record_by(r.sha, inputs.as_deref(), &step.command, r.env, secs(ran.took), r.who, ran.first.is_some());
     }
     ran
+}
+
+// ---- a trunk red that has its own row (compound-react-127) -------------------
+//
+// A row says it owns a red the trunk has with a line in its log, `wsp note
+// <row> "trunk red: <test>"`. While that row is open, another row's check that
+// fails on nothing but the named tests passes over them, and the first check
+// that names one pulls the row into the running group
+// ([`crate::cycle::pull_trunk_red`]). Decision d1, 2026-11-23.
+
+/// What opens the log line a row declares its trunk red with.
+pub const TRUNK_RED: &str = "trunk red:";
+
+/// A red the trunk has, and the open row that owns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrunkRed {
+    pub row: String,
+    /// The test, or its `file:line`, as the runner's output writes it.
+    pub name: String,
+}
+
+/// The names `t`'s log declares as its trunk reds.
+fn declared_reds(t: &Task) -> Vec<String> {
+    t.section("Log")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (_, said) = l.trim().strip_prefix("- ")?.split_once(' ')?;
+            let name = said.strip_prefix(TRUNK_RED)?;
+            // A person's note is signed `· <engineer>` at its end.
+            let name = name.split(" · ").next().unwrap_or(name).trim().trim_matches('`');
+            (name.len() >= 3).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// The trunk reds `own`'s check may hold over: those declared by another row of
+/// its project that has not landed. Never one `own` declares itself.
+pub fn known_reds(store: &Store, own: &Task) -> Vec<TrunkRed> {
+    let mine = declared_reds(own);
+    store
+        .tasks_shared()
+        .iter()
+        .filter(|t| t.id != own.id && t.project == own.project && t.status() != Status::Done)
+        .filter(|t| crate::repair::landed_since_sent_back(t).is_none())
+        .flat_map(|t| declared_reds(t).into_iter().map(|name| TrunkRed { row: t.id.clone(), name }))
+        .filter(|r| !mine.contains(&r.name))
+        .collect()
+}
+
+/// Whether `line` names `red` as a whole word, so `a::b` is not `a::bc`.
+fn names_red(line: &str, red: &str) -> bool {
+    let part = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(red).any(|(i, _)| !line[..i].chars().next_back().is_some_and(part) && !line[i + red.len()..].chars().next().is_some_and(part))
+}
+
+/// The tests a runner's output says failed, and whether those are all that did.
+struct Failures {
+    tests: Vec<String>,
+    /// False where something could be red and unnamed: a build error, a crash,
+    /// a run cut short, or a summary counting more failures than are named.
+    whole: bool,
+}
+
+/// Read libtest's, nextest's, Vitest's and Playwright's output for what failed.
+fn failures_in(output: &str) -> Failures {
+    const NEXTEST: &[&str] = &["FAIL", "TIMEOUT", "ABORT", "SIGSEGV", "SIGABRT", "SIGKILL", "LEAK-FAIL"];
+    let (mut libtest, mut nextest, mut vitest, mut playwright) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut libtest_said, mut nextest_said, mut vitest_said, mut playwright_said) = (0, 0, 0, 0);
+    let (mut bad_binaries, mut reruns, mut whole) = (0, 0, true);
+    let mut in_playwright = false;
+    // The number before `word` in a summary.
+    let count = |line: &str, word: &str| -> usize {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words.windows(2).filter(|w| w[1].trim_end_matches([',', ';']) == word).filter_map(|w| w[0].parse::<usize>().ok()).sum()
+    };
+    for line in output.lines() {
+        let line = plain_text(line);
+        let line = line.trim();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if in_playwright {
+            if line.contains(" › ") {
+                playwright.push(line.to_string());
+                continue;
+            }
+            in_playwright = false;
+        }
+        match words.as_slice() {
+            [n, "failed"] => {
+                if let Ok(n) = n.parse::<usize>() {
+                    playwright_said += n;
+                    in_playwright = true;
+                }
+            }
+            [_, "interrupted"] | [_, "did", "not", "run"] => whole = false,
+            [first, second, ..] if NEXTEST.contains(first) && second.starts_with('[') => {
+                if let Some((_, rest)) = line.split_once("] ") {
+                    let rest = rest.trim_start();
+                    let rest = rest.strip_prefix('(').and_then(|r| r.split_once(") ")).map_or(rest, |(_, r)| r);
+                    let test = rest.trim().to_string();
+                    if !nextest.contains(&test) {
+                        nextest.push(test);
+                    }
+                }
+            }
+            ["FAIL", ..] => {
+                let test = line["FAIL".len()..].trim().to_string();
+                if !test.is_empty() && !vitest.contains(&test) {
+                    vitest.push(test);
+                }
+            }
+            _ => {}
+        }
+        if let Some(test) = line.strip_prefix("test ").and_then(|l| l.strip_suffix(" ... FAILED")) {
+            libtest.push(test.to_string());
+        }
+        if line.starts_with("test result: FAILED.") {
+            libtest_said += count(line, "failed");
+            bad_binaries += 1;
+        }
+        if line.starts_with("Summary [") && line.contains(" run: ") {
+            nextest_said += count(line, "failed") + count(line, "timed");
+            whole &= count(line, "exec") == 0;
+        }
+        if line.starts_with("Tests  ") {
+            vitest_said += count(line, "failed");
+        }
+        if line.starts_with("error: test failed, to rerun pass") {
+            reruns += 1;
+        }
+        let cut = line.starts_with("error[E")
+            || line.starts_with("error: could not compile")
+            || line.starts_with("Errors  ")
+            || line.starts_with("Canceling due to")
+            || line.contains("not run due to")
+            || line.contains("was not a part of any test")
+            || line.contains("(signal:");
+        whole &= !cut;
+    }
+    whole &= libtest.len() >= libtest_said && nextest.len() >= nextest_said && vitest.len() >= vitest_said && playwright.len() >= playwright_said;
+    // A test binary that failed with no result of its own crashed.
+    whole &= reruns <= bad_binaries;
+    let tests: Vec<String> = [libtest, nextest, vitest, playwright].concat();
+    whole &= !tests.is_empty();
+    Failures { tests, whole }
+}
+
+/// Whether `command` is one command (after a `cd <dir> &&`), so no later part
+/// of it was left unrun by the failure.
+fn one_command(command: &str) -> bool {
+    let (_, rest) = split_cd(without_opt_out(command));
+    !rest.replace("2>&1", "").trim().contains(['\n', ';', '|', '&'])
+}
+
+/// `step` as it runs while a trunk red is known: a cargo run goes past its
+/// first failing binary, so a second red is seen and not hidden behind the
+/// known one.
+pub fn past_failures(reds: &[TrunkRed], step: &Step) -> Step {
+    let mut out = step.clone();
+    let (_, rest) = split_cd(&step.command);
+    if reds.is_empty() || step.command.contains("--no-fail-fast") {
+        return out;
+    }
+    if let Some(runner) = ["cargo test", "cargo nextest run"].into_iter().find(|r| rest.trim_start().starts_with(r)) {
+        out.command = step.command.replacen(runner, &format!("{runner} --no-fail-fast"), 1);
+    }
+    out
+}
+
+/// What a red step's `log` says of the known reds: the rows it names are pulled
+/// into `row`'s running group, and `Some` says what the step is held over,
+/// where those are all that failed.
+pub fn weigh_red(store: &Store, row: &str, reds: &[TrunkRed], step: &Step, log: &Path) -> Option<String> {
+    if reds.is_empty() {
+        return None;
+    }
+    let output = std::fs::read(log).ok()?;
+    let failed = failures_in(&String::from_utf8_lossy(&output));
+    let named: Vec<&TrunkRed> = reds.iter().filter(|r| failed.tests.iter().any(|t| names_red(t, &r.name))).collect();
+    let mut rows: Vec<&str> = named.iter().map(|r| r.row.as_str()).collect();
+    rows.dedup();
+    for red in rows {
+        crate::cycle::pull_trunk_red(store, row, red);
+    }
+    let all = failed.whole && one_command(&step.command) && failed.tests.iter().all(|t| named.iter().any(|r| names_red(t, &r.name)));
+    all.then(|| named.iter().map(|r| format!("`{}` ({})", r.name, r.row)).collect::<Vec<_>>().join(", "))
+}
+
+/// [`run_all`] for the row `row`'s own check: a step red on nothing but a known
+/// trunk red does not fail it, and does not stop the steps after it.
+pub fn run_row(store: &Store, row: &Task, dir: &Path, steps: &[Step], log: &Path, reuse: Option<&Reuse>, runner: &Runner<'_>, mut each: impl FnMut(&Ran)) -> Vec<Ran> {
+    let reds = known_reds(store, row);
+    let mut out: Vec<Ran> = Vec::new();
+    for s in steps {
+        let ran = if out.last().is_some_and(|r| r.done.stops()) {
+            Ran { step: s.clone(), done: Done::Skipped, took: Duration::ZERO, tail: String::new(), first: None, reused: None, build: None, via: None }
+        } else {
+            let mut ran = run_again_as(dir, s, &past_failures(&reds, s), log, reuse, runner);
+            if matches!(ran.done, Done::Failed { timed_out: false, .. }) {
+                if let Some(what) = weigh_red(store, &row.id, &reds, s, log) {
+                    ran.done = Done::HeldOver(what);
+                }
+            }
+            ran
+        };
+        each(&ran);
+        out.push(ran);
+    }
+    out
 }
 
 /// How many steps of a run were reused from the ledger and how many ran.
@@ -2317,7 +2547,7 @@ pub fn tally_line(ran: &[Ran]) -> String {
 }
 
 pub fn passed(ran: &[Ran]) -> bool {
-    ran.iter().all(|r| r.done == Done::Passed)
+    ran.iter().all(|r| r.done.is_green())
 }
 
 pub fn secs(d: Duration) -> u64 {
@@ -2382,6 +2612,7 @@ pub fn account(ran: &[Ran]) -> String {
                 ("✗", format!("{}s · {}{twice}", secs(r.took), why_failed(r)))
             }
             (Done::Skipped, _) => ("–", "skipped".to_string()),
+            (Done::HeldOver(what), _) => ("✓", format!("{}s · red only on the trunk red {what}, held over until that row lands", secs(r.took))),
         };
         let via = r.via.map(|v| format!(" · by {v}")).unwrap_or_default();
         out.push(format!("{mark} {} · {}{via} · {rest} · {}", r.step.name, r.step.command.lines().next().unwrap_or_default(), why_in(&r.step)));
@@ -2418,7 +2649,8 @@ pub fn owed(ran: &[Ran], sha: &str) -> String {
     let tail: Vec<&str> = r.tail.lines().collect();
     let tail = tail[tail.len().saturating_sub(12)..].join("\n");
     format!(
-        "wsp check failed at {}: `{}` ({}) — {}, {}s. Run it yourself and fix what it reports; the whole run is under ## Verification.\n\n{tail}",
+        "wsp check failed at {}: `{}` ({}) — {}, {}s. Run it yourself and fix what it reports; the whole run is under ## Verification. \
+         A test red on the trunk too is not yours to fix: the row that owns it says so with `wsp note <that row> \"{TRUNK_RED} <test>\"`.\n\n{tail}",
         &sha[..sha.len().min(12)],
         r.step.name,
         r.step.command.lines().next().unwrap_or_default(),
@@ -2815,7 +3047,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
             println!("  {}", p.dim(&format!("narrowed: {l}")));
         }
     }
-    let ran = run_all(&tree, &steps, &dir.join("last.log"), ledger.as_ref(), &runner, |r| {
+    let ran = run_row(store, &t, &tree, &steps, &dir.join("last.log"), ledger.as_ref(), &runner, |r| {
         if !auto && !args.json() {
             let (mark, tail) = match &r.done {
                 Done::Passed if r.reused.is_some() => (p.green("✓"), " · reused".to_string()),
@@ -2823,6 +3055,7 @@ pub fn check(store: &Store, args: &Args) -> i32 {
                 Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) | Done::NoTests(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
                 Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
                 Done::Skipped => (p.dim("–"), " · skipped".to_string()),
+                Done::HeldOver(what) => (p.green("✓"), format!(" · held over the trunk red {what}")),
             };
             // A named commit may have been named by a symbol, so each step says
             // which commit it was.
@@ -3281,6 +3514,7 @@ fn barrier(store: &Store, args: &Args, project: &str) -> i32 {
             Done::Failed { .. } | Done::Malformed(_) | Done::Hung(_) | Done::NoTests(_) => (p.red("✗"), format!(" · {}", why_failed(r))),
             Done::TreeMissing(_) => (p.dim("?"), format!(" · {}", why_failed(r))),
             Done::Skipped => (p.dim("–"), " · skipped".to_string()),
+            Done::HeldOver(what) => (p.green("✓"), format!(" · held over the trunk red {what}")),
         };
         println!("  {mark} {} · {}s{tail}", r.step.name, secs(r.took));
     });
@@ -3891,7 +4125,11 @@ pub fn rerun(
         Ok(r) => r,
         Err(why) => return Rerun::NoLock(why),
     };
-    let ran = run_all(dir, &steps, &lockdir.join("land.log"), reuse.as_ref(), &runner, |_| {});
+    let log = lockdir.join("land.log");
+    let ran = match store.find_task(task) {
+        Some(t) => run_row(store, &t, dir, &steps, &log, reuse.as_ref(), &runner, |_| {}),
+        None => run_all(dir, &steps, &log, reuse.as_ref(), &runner, |_| {}),
+    };
     drop(lock);
     if !passed(&ran) {
         return Rerun::Failed(owed(&ran, new_head));
@@ -4754,6 +4992,92 @@ mod tests {
         t.set_status(Status::Review);
         crate::log::note(&store, &mut t, &format!("{} {sha} on pj-001", crate::repair::LANDED)).unwrap();
         (env, store, sha)
+    }
+
+    #[test]
+    fn only_an_output_whose_every_failure_is_named_reads_as_whole() {
+        let read = |s: &str| {
+            let f = failures_in(s);
+            (f.tests.len(), f.whole)
+        };
+        let libtest = "test a::tp1 ... FAILED\ntest result: FAILED. 3 passed; 1 failed; 0 ignored\nerror: test failed, to rerun pass `--lib`\n";
+        assert_eq!(read(libtest), (1, true));
+        assert_eq!(read("test result: FAILED. 3 passed; 2 failed;\ntest a::tp1 ... FAILED\n"), (1, false), "one failure unnamed");
+        assert_eq!(read(&format!("{libtest}error: could not compile `x`\n")), (1, false));
+        assert_eq!(read(&format!("{libtest}error: test failed, to rerun pass `--test b`\n")), (1, false), "a binary that crashed");
+        let nextest = "        FAIL [   0.012s] (1/2) pj a::tp1\n     Summary [ 1.0s] 2 tests run: 1 passed, 1 failed, 0 skipped\n        FAIL [   0.012s] pj a::tp1\n";
+        assert_eq!(read(nextest), (1, true));
+        assert_eq!(read(&format!("{nextest}warning: 3/5 tests were not run due to test failure\n")), (1, false));
+        let playwright = "  ✘  1 [chromium] › tests/taskpage.spec.ts:99:5 › TP1 (1.2s)\n\n  1 failed\n    [chromium] › tests/taskpage.spec.ts:99:5 › TP1 ───\n  4 passed (9s)\n";
+        assert_eq!(read(playwright), (1, true));
+        assert_eq!(read(&format!("{playwright}  2 did not run\n")), (1, false));
+        let vitest = " FAIL  src/x.test.ts > suite > name\n      Tests  1 failed | 5 passed (6)\n";
+        assert_eq!(read(vitest), (1, true));
+        assert_eq!(read("error: something else\n"), (0, false), "a red that names no test");
+
+        assert!(names_red("[chromium] › tests/taskpage.spec.ts:99:5 › TP1", "taskpage.spec.ts:99"));
+        assert!(!names_red("tests/taskpage.spec.ts:990:5", "taskpage.spec.ts:99"));
+        assert!(!names_red("a::tp10", "a::tp1"));
+        assert!(one_command("cd web && npx playwright test 2>&1"));
+        assert!(!one_command("cargo test -p a && cargo test -p b"));
+    }
+
+    #[test]
+    fn while_a_trunk_red_is_known_a_cargo_run_goes_past_its_first_failure() {
+        let red = [TrunkRed { row: "pj-002".into(), name: "a::tp1".into() }];
+        let run = |reds: &[TrunkRed], c: &str| past_failures(reds, &step(&format!("- t: {c}"))).command;
+        assert_eq!(run(&red, "cargo test -p a"), "cargo test --no-fail-fast -p a");
+        assert_eq!(run(&red, "cd x && cargo nextest run"), "cd x && cargo nextest run --no-fail-fast");
+        assert_eq!(run(&red, "npx playwright test"), "npx playwright test");
+        assert_eq!(run(&[], "cargo test"), "cargo test");
+        let script = runner_script("cargo test --no-fail-fast -p a", |_| Some(r#"{"packages":[{"name":"a","id":"a","targets":[{"doctest":true}]}],"workspace_members":["a"],"workspace_default_members":["a"]}"#.into())).unwrap();
+        assert!(script.contains("a=$?; cargo test --doc -p a --no-fail-fast && [ $a -eq 0 ]; }"), "{script}");
+    }
+
+    /// `pj-001`'s check, red on `a::tp1`, which the open row `pj-002` declares,
+    /// with `pj-001` in a running list.
+    fn trunk_red_world(name: &str, script: &str) -> (util::Isolated, Store) {
+        let (env, store, _) = world(name, "- script: sh check.sh", script);
+        let mut red = Task::new("tp1 is red on the trunk", "pj-002");
+        red.project = Some("pj".into());
+        red.log("trunk red: `a::tp1`");
+        store.save_task(&red).unwrap();
+        let mut w = crate::model::Worklist::new("run", "run");
+        w.set_status(crate::model::WorklistStatus::Running);
+        w.set_groups(&[crate::model::Group { members: vec!["pj-001".into()], agent: "claude".into(), ..Default::default() }]);
+        store.save_worklist(&w).unwrap();
+        (env, store)
+    }
+
+    const TP1_RED: &str = "echo 'test a::tp1 ... FAILED'; echo 'test result: FAILED. 3 passed; 1 failed;'; exit 101\n";
+
+    #[test]
+    fn a_check_holds_over_a_known_trunk_red_and_pulls_its_row_into_the_running_group() {
+        let (_env, store) = trunk_red_world("trunk-held", TP1_RED);
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 0);
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(t.status(), Status::Review, "not sent back");
+        assert!(v::runs(&t)[0].text.contains("held over until that row lands"), "{}", v::runs(&t)[0].text);
+        assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"]);
+        assert!(store.find_task("pj-002").unwrap().section("Log").unwrap().contains(crate::cycle::TRUNK_RED_PULLED));
+
+        // The red's own row owes it, and so does everybody once that row is done.
+        assert!(known_reds(&store, &store.find_task("pj-002").unwrap()).is_empty());
+        let mut red = store.find_task("pj-002").unwrap();
+        red.set_status(Status::Done);
+        store.save_task(&red).unwrap();
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[("again", "true")])), 1);
+    }
+
+    #[test]
+    fn a_check_with_another_red_beside_the_known_one_still_fails_and_still_pulls_the_row() {
+        let (_env, store) = trunk_red_world(
+            "trunk-other",
+            "echo 'test a::tp1 ... FAILED'; echo 'test a::mine ... FAILED'; echo 'test result: FAILED. 3 passed; 2 failed;'; exit 101\n",
+        );
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 1);
+        assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
+        assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"]);
     }
 
     #[test]
