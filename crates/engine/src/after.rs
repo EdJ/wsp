@@ -179,19 +179,31 @@ fn wait_elsewhere(store: &Store, task: &str, on: &[String]) -> Vec<(String, Stri
     let waits = store.locked(|| {
         let mut out: Vec<(String, String)> = Vec::new();
         let Some(mut t) = store.find_task(task) else { return out };
-        if t.status() != Status::Doing || crate::inner::run_inside(&t) {
+        if t.status() != Status::Doing {
             return out;
         }
         let lists = store.worklists();
         let holds = |w: &Worklist, id: &str| ordinal_of(&w.groups(), id).is_some();
-        let Some(mine) = lists.iter().find(|w| w.status() == WorklistStatus::Running && holds(w, &t.id)) else {
-            return out;
-        };
+        let mine = lists.iter().find(|w| w.status() == WorklistStatus::Running && holds(w, &t.id));
         let mut repos = None;
         for o in on {
             let elsewhere = list_named(store, o).is_some()
-                || (!holds(mine, o) && lists.iter().any(|w| w.status() != WorklistStatus::Done && holds(w, o)));
+                || (!mine.is_some_and(|m| holds(m, o))
+                    && lists.iter().any(|w| w.status() != WorklistStatus::Done && !holds(w, &t.id) && holds(w, o)));
             if !elsewhere {
+                continue;
+            }
+            // A member is told when it is not to release: nothing would seat it.
+            let Some(mine) = mine.filter(|_| !crate::inner::run_inside(&t)) else {
+                eprintln!(
+                    "note: no wait on {o} is written, so do not release for it: {} is run as legs or pieces, or no running list holds it",
+                    t.id
+                );
+                continue;
+            };
+            // An edge set before the lists stood as they do now.
+            if let Some(at) = needs(store, o, &t.id) {
+                eprintln!("note: no wait on {o} is written, so do not release for it: `{at}` holds {}, so {o} would never finish first", t.id);
                 continue;
             }
             if landed(store, &mut repos, o) {
@@ -272,12 +284,6 @@ pub fn refuse(store: &Store, t: &Task, on: &[String]) -> Result<(), String> {
     }
 
     let added: Vec<&String> = on.iter().filter(|o| !t.after.contains(o)).collect();
-    // A list that cannot finish until `t` does is never waited out.
-    for o in &added {
-        if let Some(at) = list_named(store, o).and_then(|l| needs(store, &l, &t.id)) {
-            return Err(format!("{} cannot rest on the list {o}: `{at}` holds {}, so {o} would never finish first", t.id, t.id));
-        }
-    }
     let changed: Vec<&String> =
         added.iter().copied().chain(t.after.iter().filter(|o| !on.contains(o))).collect();
     for w in store.worklists().iter().filter(|w| w.status() != WorklistStatus::Done) {
@@ -306,21 +312,72 @@ pub fn refuse(store: &Store, t: &Task, on: &[String]) -> Result<(), String> {
             }
         }
     }
+    // What cannot finish until `t` does is never waited out. Asked last, so
+    // an edge out of order on one list is told how to be put right.
+    for o in &added {
+        if let Some(at) = needs(store, o, &t.id) {
+            let what = if list_named(store, o).is_some() { "the list " } else { "" };
+            return Err(format!("{} cannot rest on {what}{o}: `{at}` holds {}, so {o} would never finish first", t.id, t.id));
+        }
+    }
     Ok(())
 }
 
-/// The list holding `task` that `list` is, or waits on through `worklist
-/// after`.
-fn needs(store: &Store, list: &Worklist, task: &str) -> Option<String> {
-    let (mut next, mut seen) = (vec![list.clone()], BTreeSet::new());
-    while let Some(w) = next.pop() {
-        if !seen.insert(w.id.clone()) || w.status() == WorklistStatus::Done {
+/// The open list holding `task` that stands between `on`, a list or a row, and
+/// its finish: `on` cannot finish until `task` has. `None` where it can.
+///
+/// A list finishes after the lists it waits on (`worklist after`) and each of
+/// its members. A row lands after the lists its own list waits on, the earlier
+/// groups there, and what it is waiting on itself: every edge for a member at
+/// `doing`, which may have released for it, and otherwise only the same-group
+/// ones the run holds.
+fn needs(store: &Store, on: &str, task: &str) -> Option<String> {
+    let lists: Vec<Worklist> = store.worklists().into_iter().filter(|w| w.status() != WorklistStatus::Done).collect();
+    let holder = |id: &str| lists.iter().find(|w| ordinal_of(&w.groups(), id).is_some()).map(|w| w.id.clone());
+    let mut repos = None;
+    let (mut next, mut seen) = (vec![on.to_string()], BTreeSet::new());
+    while let Some(at) = next.pop() {
+        if !seen.insert(at.clone()) {
             continue;
         }
-        if ordinal_of(&w.groups(), task).is_some() {
-            return Some(w.id);
+        if let Some(l) = list_named(store, &at) {
+            if l.status() == WorklistStatus::Done {
+                continue;
+            }
+            let groups = l.groups();
+            if ordinal_of(&groups, task).is_some() {
+                return Some(l.id);
+            }
+            next.extend(l.after.iter().cloned());
+            next.extend(groups.into_iter().flat_map(|g| g.members));
+            continue;
         }
-        next.extend(w.after.iter().filter_map(|a| store.worklist(a)));
+        if at == task {
+            return holder(task);
+        }
+        if landed(store, &mut repos, &at) {
+            continue;
+        }
+        let Some(row) = store.find_task(&at) else { continue };
+        let doing = row.status() == Status::Doing;
+        if doing {
+            next.extend(row.after.iter().cloned());
+        }
+        for w in &lists {
+            let groups = w.groups();
+            let Some(n) = ordinal_of(&groups, &row.id) else { continue };
+            next.extend(w.after.iter().cloned());
+            let earlier = groups[..n - 1].iter().flat_map(|g| &g.members);
+            for m in earlier {
+                if m == task {
+                    return Some(w.id.clone());
+                }
+                next.push(m.clone());
+            }
+            if !doing {
+                next.extend(row.after.iter().filter(|o| groups[n - 1].members.contains(o)).cloned());
+            }
+        }
     }
     None
 }
@@ -654,6 +711,39 @@ mod tests {
         other.set_status(WorklistStatus::Done);
         s.save_worklist(&other).unwrap();
         assert!(landed(&s, &mut None, "other"));
+    }
+
+    /// `wsp-870`: nor a row that only starts or lands once this one has — one
+    /// a later list holds, or one whose list waits on this one's.
+    #[test]
+    fn a_row_or_list_that_needs_the_row_to_finish_is_refused() {
+        let s = store_named("never");
+        for id in ["a-1", "a-2", "a-3", "b-1", "c-1", "c-2"] {
+            task(&s, id, &[]);
+        }
+        list(&s, "run", &[&["a-2"], &["a-1", "a-3"]], WorklistStatus::Running);
+        list(&s, "successor", &[&["b-1"]], WorklistStatus::Draft);
+        let mut successor = s.worklist("successor").unwrap();
+        successor.after = vec!["run".into()];
+        s.save_worklist(&successor).unwrap();
+        let a1 = s.find_task("a-1").unwrap();
+
+        let why = refuse(&s, &a1, &["b-1".into()]).unwrap_err();
+        assert!(why.contains("`run` holds a-1"), "{why}");
+        assert!(refuse(&s, &a1, &["a-2".into()]).is_ok(), "its own list, an earlier group");
+        assert!(refuse(&s, &a1, &["a-3".into()]).is_ok(), "its own list, the same group");
+
+        // Two members naming each other's list.
+        list(&s, "other", &[&["c-1"], &["c-2"]], WorklistStatus::Running);
+        let mut a3 = s.find_task("a-3").unwrap();
+        a3.set_status(Status::Doing);
+        a3.after = vec!["other".into()];
+        s.save_task(&a3).unwrap();
+        let c2 = s.find_task("c-2").unwrap();
+        assert!(refuse(&s, &c2, &["run".into()]).is_err(), "run waits on the list holding c-2");
+        assert!(refuse(&s, &c2, &["a-1".into()]).is_ok(), "a-1 does not wait for a-3");
+        let c1 = s.find_task("c-1").unwrap();
+        assert!(refuse(&s, &c1, &["a-3".into()]).is_err(), "a-3 waits on the list holding c-1");
     }
 
     fn after(store: &Store, words: &[&str], flags: &[(&str, &str)]) -> i32 {

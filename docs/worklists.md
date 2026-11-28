@@ -127,7 +127,8 @@ ask and not a watch (Jesper, 2026-11-24):
 3. Once the row has landed, or the list is done or cancelled, the run seats the
    member again. It reads the check and submits the item as held, or not held.
 
-`wsp after <row> --clear` calls the wait off. A list that holds the member, or
-that waits on one that does (`wsp worklist after`), is refused. A row run as
-legs or pieces is not held this way (wsp-835).
-
+`wsp after <row> --clear` calls the wait off. What cannot finish before the
+member does is refused: a list that holds the member, one that waits on one that
+does (`wsp worklist after`), a row such a list holds, and a list or row where
+another member already waits on this one's. A row run as legs or pieces is not
+held this way (wsp-835).
