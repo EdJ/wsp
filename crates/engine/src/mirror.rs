@@ -1222,6 +1222,9 @@ pub fn project_of(store: &Store, about: &About) -> Option<String> {
 
 /// What an item holds: the list and group it unblocks, or the row.
 pub fn unblocks(store: &Store, q: &Message) -> Option<String> {
+    if crate::lapse::is_standing_notice(q) {
+        return None;
+    }
     match &q.about {
         About::Group { scope, group } => Some(format!("{scope} group {group}")),
         About::Scope(s) => Some(s.clone()),

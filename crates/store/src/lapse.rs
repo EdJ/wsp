@@ -51,7 +51,8 @@
 //!
 //! **Nor is a [`standing_notice`]** (`wsp-614`): it reports what was done to a
 //! list, so the seat ending, the barrier passed and the list closing are no
-//! reason for the person not to read it.
+//! reason for the person not to read it. And it asks nothing of the run, so it
+//! holds nothing: the list is not waiting on them for it ([`is_standing_notice`]).
 //!
 //! # By whom, and why this may close a person's question
 //!
@@ -164,12 +165,15 @@ pub fn governor_ended(store: &Store, scope: &str, pane: Option<&str>) -> Vec<Str
 
 /// What wsp tells the person it did to `list` (`wsp-614`), on `wsp yours` until
 /// they answer it. No pane stands behind it and no row: the list is named as
-/// what waits, which is also how [`list_moved`] knows to leave it.
+/// what waits, which is also how [`is_standing_notice`] knows it again.
 pub fn standing_notice(list: &str, text: &str) -> Message {
     Message::question(Party::wsp(), Kind::Note, text, Waiting::new("", list)).about(About::Scope(list.to_string())).for_the_person()
 }
 
-fn stands(m: &Message, list: &str) -> bool {
+/// Whether `m` is a [`standing_notice`]: [`list_moved`] leaves it, and nothing
+/// reads it as the list waiting or held.
+pub fn is_standing_notice(m: &Message) -> bool {
+    let Some(list) = m.about.scope() else { return false };
     m.from == Party::wsp() && m.waiting.as_ref().is_some_and(|w| w.pane.is_empty() && w.task == list)
 }
 
@@ -195,7 +199,7 @@ pub fn list_moved(store: &Store, w: &Worklist) -> Vec<String> {
     };
     let crossed = crate::model::crossed(&w.groups());
     close_where(store, &Party::lapsed(), |m| {
-        if !of_it(m) || stands(m, &w.id) {
+        if !of_it(m) || is_standing_notice(m) {
             return None;
         }
         if let Some(why) = ended {

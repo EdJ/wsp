@@ -5490,7 +5490,10 @@ fn go_with(
         // it read, and a settlement written after that read is lost with it
         // (`wsp-326`'s first automatic pass left its check reading `running`).
         if let Some(n) = crossed {
-            crate::cycle::tell_gate_taken(store, &w.id, &groups, n, true, &said);
+            // A `followup --next` has already put its group behind this one;
+            // the check was ordered on the list without it.
+            let ordered = groups.len() - usize::from(said_as == crate::barrier::State::Next);
+            crate::cycle::tell_gate_taken(store, &w.id, &groups[..ordered], n, true, &said);
             crate::barrier::settle(store, &w.id, n, said_as);
             // Before the poke too: the close it starts reads the list's report.
             if n == groups.len() {
@@ -9227,6 +9230,44 @@ mod tests {
         store.save_worklist(&w).unwrap();
         let told = yours_after_the_seat(&store, "cpd-10");
         assert_eq!(told.len(), 1, "the first is still there, and the last gate takes no default: {told:?}");
+    }
+
+    /// A default taken is reported, not asked: the run that went on is not
+    /// waiting on the person, and the item holds nothing.
+    #[test]
+    fn a_go_by_default_leaves_the_running_list_waiting_on_nobody() {
+        let _env = util::isolated("gate-notice");
+        let store = at_barrier_one_seated("gate-notice");
+        no_outputs(&store, "run");
+        gate_stop(&store, 1, "Default: go if under 2.2 s");
+        assert_eq!(run(&store, &["go", "run", "took", "go:", "1.9", "s"]), 0);
+
+        let items = crate::message::for_the_person(&store);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(crate::cmd_message::unblocks(&store, &items[0]), None);
+        let w = store.worklist("run").unwrap();
+        let at = worklist::position(&store, &w, Reading::Landed);
+        assert!(!worklist::phase(&store, &w, &at).flags.waiting_on_ed);
+    }
+
+    /// `followup --next` writes its group before it passes, and the last
+    /// barrier is still the one its check was told takes no default.
+    #[test]
+    fn a_default_is_not_reported_by_a_followup_past_the_last_barrier() {
+        let _env = util::isolated("gate-last-followup");
+        let store = at_barrier_one_seated("gate-last-followup");
+        no_outputs(&store, "run");
+        assert_eq!(run(&store, &["go", "run", "holds"]), 0);
+        task(&store, "wl-002", "review");
+        check_in(&store, "run", 2, "cpd-10");
+        gate_stop(&store, 2, "Default: go if under 3 s");
+        task(&store, "wl-900", "todo");
+
+        let from = verdict("gate-last-followup", "holds, with a tail");
+        assert_eq!(follow(&store, &["followup", "run", "wl-900"], &[("next", "true"), ("from", &from)], &["cpd-10"]), 0);
+        assert_eq!(store.worklist("run").unwrap().groups().len(), 3);
+        let items = crate::message::for_the_person(&store);
+        assert!(items.is_empty(), "{items:?}");
     }
 
     /// And a hold by the check says how to go on; a gate with no default, or one

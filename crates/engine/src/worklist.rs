@@ -847,14 +847,15 @@ impl Phase {
 
 /// Is the person owed something on this list: the group the run is at is
 /// `manual`, or a question only the person may close is open about the list,
-/// one of its groups, or one of its members.
+/// one of its groups, or one of its members. What wsp only reports to them
+/// ([`crate::lapse::is_standing_notice`]) is owed nothing by the run.
 fn waiting_on_ed(store: &Store, w: &Worklist, at: Option<usize>) -> bool {
     let groups = w.groups();
     if at.and_then(|n| groups.get(n.wrapping_sub(1))).is_some_and(|g| g.agent == crate::model::MANUAL) {
         return true;
     }
     use crate::message::About;
-    crate::message::for_the_person(store).iter().any(|m| match &m.about {
+    crate::message::for_the_person(store).iter().filter(|m| !crate::lapse::is_standing_notice(m)).any(|m| match &m.about {
         About::Scope(s) | About::Group { scope: s, .. } => *s == w.id,
         About::Task(t) => groups.iter().any(|g| g.members.iter().any(|m| m == t)),
         About::Nothing => false,
