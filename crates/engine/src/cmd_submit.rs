@@ -58,8 +58,8 @@
 //! row. Either way the seat is ended (D1, `wsp-615`): from this call it holds no
 //! place under the cap, and [`crate::ending::end_exit`] ends it at its `Stop`,
 //! the tree kept — a verifier's and a check's seat the same. The answer to a
-//! decision ask reopens the row with the answer as its `sent back:` reason
-//! ([`answered`]).
+//! decision ask reopens the row with the answer as its `sent back:` reason, and
+//! each answer is a decision on the row ([`answered`]).
 
 use crate::closing;
 use crate::exit::{Ask, Exit, Kind, Outcome, Refusal, To};
@@ -809,23 +809,46 @@ fn end_at_stop(store: &Store, seat: &str) -> i32 {
 /// time from the ask to the decision is written on the row and as a
 /// `decision-waited` event, so a slow decision is seen in the effort and the
 /// retro. Nothing for any other question.
+///
+/// **Every ask of an exit is settled on its own** (`wsp-613`). A seat's answer
+/// is kept as a decision under the ask it answered — never under the row's
+/// `blocked:` line, which is the exit's first ask only — and so is one given
+/// after an earlier answer already reopened the row. A person's is a decision
+/// already, from the close. The `decided:` line keeps a repeat from counting.
 pub fn answered(store: &Store, q: &Message, answer: &str) {
     let Some(w) = q.waiting.as_ref().filter(|w| w.pane.is_empty() && !w.task.is_empty()) else { return };
-    let Some(t) = store.find_task(&w.task) else { return };
-    let ours = t.section("Log").is_some_and(|l| l.lines().any(|x| x.contains("asked (") && x.ends_with(&format!(" · {}", q.id))));
-    if t.status() != Status::Blocked || !ours {
-        return;
-    }
     let secs = (util::epoch_secs() - util::epoch_of(&q.at)).max(0);
-    log_on(store, &t.id, &[format!("decided: {} answered {}m after it was asked", q.id, secs / 60)]);
-    store.log_event("decision-waited", serde_json::json!({ "id": t.id, "question": q.id, "asked": q.at, "secs": secs }));
     let answer = fold(answer);
     let reason = match answer.is_empty() {
         true => format!("decided ({})", q.id),
         false => answer,
     };
-    // The person's answer is a decision on the row already; a seat's is not yet.
-    let _ = crate::cmd_task::reopen_keeping(store, &Args::synth("reopen", &[&t.id, &reason], &[]), !q.for_person);
+    let done = format!("decided: {} answered ", q.id);
+    let took = store.locked(|| {
+        let mut t = store.find_task(&w.task)?;
+        let log = t.section("Log")?;
+        let ours = log.lines().any(|x| x.contains("asked (") && x.ends_with(&format!(" · {}", q.id)));
+        let counted = log.lines().any(|x| x.trim().trim_start_matches("- ").split_once(' ').is_some_and(|(_, l)| l.starts_with(&done)));
+        if !ours || counted {
+            return None;
+        }
+        t.log(&format!("{done}{}m after it was asked", secs / 60));
+        let kept = (!q.for_person).then(|| crate::decisions::decide_task(&mut t, &format!("answering its block ({}): {reason}", fold(&q.text)), &[]));
+        t.touch();
+        store.save_task(&t).ok()?;
+        Some((t, kept))
+    });
+    let Some((t, kept)) = took else { return };
+    store.log_event("decision-waited", serde_json::json!({ "id": t.id, "question": q.id, "asked": q.at, "secs": secs }));
+    if let Some(d) = kept {
+        println!("  {}", Paint::new().dim(&format!("kept as decision {d} on {}: every later seat reads it", t.id)));
+    }
+    if t.status() != Status::Blocked {
+        store.git_commit(&format!("wsp: {} — {} is answered", t.id, q.id));
+        return;
+    }
+    // The answer is a decision on the row by now, so the reopen keeps no second.
+    let _ = crate::cmd_task::reopen_keeping(store, &Args::synth("reopen", &[&t.id, &reason], &[]), false);
 }
 
 fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str, from: &str, me: Option<&str>) -> i32 {
@@ -1945,6 +1968,31 @@ mod tests {
         assert!(crate::model::decisions_of(&t.body).is_empty(), "a person's answer is decided where it is answered, not twice");
         answered(&store, &q, "keep the old panel");
         assert_eq!(store.task("wsp-101").unwrap().section("Log").unwrap().matches("decided:").count(), 1, "once");
+    }
+
+    /// `wsp-613`: two governor asks from one exit, answered second-first. Each
+    /// answer is a decision under its own ask, the one that arrives after the
+    /// row was reopened too, and a repeat records nothing.
+    #[test]
+    fn each_of_a_governors_answers_is_a_decision_under_the_ask_it_answered() {
+        let (env, store, _tree) = member("submit-two-asks", ARTEFACTS);
+        let text = "summary: half done\n\nTwo calls are owed.\n\ndone-when:\n- not held: the work — the UI half\n\nasks:\n- governor: Accept the in-tree runs?\n- governor: Drop the old panel?\n\nowed:\n- the UI half\n";
+        assert_eq!(run(&env, &store, text, &[]), 0);
+        // No seat governs here, so the asks went up; a governor's are not the person's.
+        let ask = |words: &str| {
+            let mut q = crate::message::raised_to_the_person(&store).into_iter().find(|q| q.text.contains(words)).expect("the ask");
+            q.for_person = false;
+            q
+        };
+        let (runs, panel) = (ask("in-tree runs"), ask("old panel"));
+        answered(&store, &panel, "yes, drop it");
+        assert_ne!(store.task("wsp-101").unwrap().status_raw, "blocked", "the first answer reopens the row");
+        answered(&store, &runs, "accept them");
+        answered(&store, &runs, "accept them");
+        answered(&store, &panel, "yes, drop it");
+        let d: Vec<String> = crate::model::decisions_of(&store.task("wsp-101").unwrap().body).into_iter().map(|d| d.text).collect();
+        assert_eq!(d, ["answering its block (Drop the old panel?): yes, drop it", "answering its block (Accept the in-tree runs?): accept them"]);
+        assert_eq!(log(&store).matches("sent back:").count(), 1, "reopened once");
     }
 
     #[test]

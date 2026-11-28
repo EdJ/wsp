@@ -1636,8 +1636,9 @@ pub fn reopen(store: &Store, args: &Args) -> i32 {
     reopen_keeping(store, args, true)
 }
 
-/// [`reopen`], for a caller whose answer is a decision on the row already (a
-/// person's answer to a question): `keep` false records no second one.
+/// [`reopen`], for a caller whose answer is a decision on the row already (an
+/// answered question, [`crate::cmd_submit::answered`]): `keep` false records no
+/// second one.
 pub(crate) fn reopen_keeping(store: &Store, args: &Args, keep: bool) -> i32 {
     const USAGE: &str = "wsp reopen <id> \"what is owed\"   (or `-` to read it from stdin)";
     let (reason, _) = match prose_payload(args, USAGE) {
