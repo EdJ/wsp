@@ -20,6 +20,15 @@
 //! an error** — the list carries it, the graph draws it as `not on this list`,
 //! and the run ignores it.
 //!
+//! # A list, and a wait on another list (`wsp-870`)
+//!
+//! `<on>` may be a list: a done-when item only that list's run can show is a
+//! wait on it, and it is finished when the list is done or cancelled. A
+//! member at `doing` that names a list, or a row another list holds, is
+//! written a [`crate::cycle::PREREQUISITE`] line: it releases its seat, and
+//! its run seats it again once that has [`landed`] ([`wait_elsewhere`]). So
+//! nobody has to remember a watch.
+//!
 //! # What the run does with it
 //!
 //! Only a **same-group** edge holds anything: the run starts a member once
@@ -102,7 +111,16 @@ pub fn run(store: &Store, args: &Args) -> i32 {
     });
     // A same-group edge cannot change under a started group (refusal 5), so
     // nothing the run is doing is changed by this. No poke.
+    let waits = wait_elsewhere(store, &t.id, &on);
     if !args.json() {
+        for (o, list) in &waits {
+            eprintln!(
+                "note: {} waits on {o}: commit, `wsp release {}`, and the `{list}` run seats it again once {o} has {}",
+                t.id,
+                t.id,
+                if store.task(o).is_some() { "landed" } else { "finished" }
+            );
+        }
         for w in store.worklists().iter().filter(|w| w.status() != WorklistStatus::Done) {
             for line in chains(store, w, Some(&t.id)) {
                 eprintln!("note: on `{}`, {line}", w.id);
@@ -125,6 +143,10 @@ fn print(store: &Store, args: &Args, t: &Task) -> i32 {
     }
     println!("{}  {}", p.bold(&t.id), p.dim("after"));
     for on in &t.after {
+        if let Some(l) = list_named(store, on) {
+            println!("  {}  {}  {}", p.dim(&l.id), p.dim(&crate::util::pad(l.status().as_str(), 8)), crate::util::truncate(&l.title, 56));
+            continue;
+        }
         match store.find_task(on) {
             Some(o) => println!("  {}  {}  {}", p.dim(&o.id), p.dim(&crate::util::pad(o.status().as_str(), 8)), crate::util::truncate(&o.title, 56)),
             None => println!("  {}  {}", p.dim(on), p.dim("no task answers to it")),
@@ -139,8 +161,67 @@ pub fn split(s: &str) -> Vec<String> {
     s.split([',', ' ']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
 }
 
-/// The ids typed, as the tasks' own ids, in order and once each — and
-/// refusals 1 and 2, which need nothing but the typing.
+/// The list `needle` names, when no task has that id. Asked before a task is
+/// searched for by title, so a list's slug is never read as the row whose
+/// title mentions it.
+pub fn list_named(store: &Store, needle: &str) -> Option<Worklist> {
+    match store.task(needle) {
+        Some(_) => None,
+        None => store.worklist(needle),
+    }
+}
+
+/// Write the wait on each of `on` that `task`'s own run cannot see end: a
+/// list, or a row another list holds. Only for a member at `doing` of a
+/// running list, and not for a row run as legs or pieces, whose seats this
+/// does not hold. Returns each wait with the list that will seat it again.
+fn wait_elsewhere(store: &Store, task: &str, on: &[String]) -> Vec<(String, String)> {
+    let waits = store.locked(|| {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let Some(mut t) = store.find_task(task) else { return out };
+        if t.status() != Status::Doing || crate::inner::run_inside(&t) {
+            return out;
+        }
+        let lists = store.worklists();
+        let holds = |w: &Worklist, id: &str| ordinal_of(&w.groups(), id).is_some();
+        let Some(mine) = lists.iter().find(|w| w.status() == WorklistStatus::Running && holds(w, &t.id)) else {
+            return out;
+        };
+        let mut repos = None;
+        for o in on {
+            let elsewhere = list_named(store, o).is_some()
+                || (!holds(mine, o) && lists.iter().any(|w| w.status() != WorklistStatus::Done && holds(w, o)));
+            if !elsewhere {
+                continue;
+            }
+            if landed(store, &mut repos, o) {
+                eprintln!("note: {o} has already landed or finished, so nothing waits on it: name the list whose run is still to show it");
+                continue;
+            }
+            t.log(&format!(
+                "{} {o} waited on from {}: release the seat; the run seats this row again once it has landed or finished, \
+                 to read there what it waited for and close",
+                crate::cycle::PREREQUISITE,
+                mine.id
+            ));
+            out.push((o.clone(), mine.id.clone()));
+        }
+        if !out.is_empty() {
+            t.touch();
+            if store.save_task(&t).is_err() {
+                out.clear();
+            }
+        }
+        out
+    });
+    if !waits.is_empty() {
+        store.git_commit(&format!("wsp: {task} waits on {}", waits.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>().join(" ")));
+    }
+    waits
+}
+
+/// The ids typed, as the tasks' own ids or the lists' slugs, in order and
+/// once each — and refusals 1 and 2, which need nothing but the typing.
 ///
 /// `task` is the id of the task the edges are for, or `None` for one that does
 /// not exist yet (`wsp add --after`), which cannot be named and so cannot be
@@ -148,15 +229,21 @@ pub fn split(s: &str) -> Vec<String> {
 pub fn resolve(store: &Store, task: &str, typed: &[String]) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for needle in typed {
-        let on = store.task_or_why(needle).map_err(|why| {
-            format!("{task} cannot rest on `{needle}`: {}", why.trim_start_matches("wsp: "))
-        })?;
+        let on = match list_named(store, needle) {
+            Some(l) => l.id,
+            None => {
+                store
+                    .task_or_why(needle)
+                    .map_err(|why| format!("{task} cannot rest on `{needle}`: {}", why.trim_start_matches("wsp: ")))?
+                    .id
+            }
+        };
         // 1. On itself. Not a wait on anything, and the cycle of length one.
-        if on.id == task {
+        if on == task {
             return Err(format!("{task} cannot rest on itself"));
         }
-        if !out.contains(&on.id) {
-            out.push(on.id);
+        if !out.contains(&on) {
+            out.push(on);
         }
     }
     Ok(out)
@@ -185,6 +272,12 @@ pub fn refuse(store: &Store, t: &Task, on: &[String]) -> Result<(), String> {
     }
 
     let added: Vec<&String> = on.iter().filter(|o| !t.after.contains(o)).collect();
+    // A list that cannot finish until `t` does is never waited out.
+    for o in &added {
+        if let Some(at) = list_named(store, o).and_then(|l| needs(store, &l, &t.id)) {
+            return Err(format!("{} cannot rest on the list {o}: `{at}` holds {}, so {o} would never finish first", t.id, t.id));
+        }
+    }
     let changed: Vec<&String> =
         added.iter().copied().chain(t.after.iter().filter(|o| !on.contains(o))).collect();
     for w in store.worklists().iter().filter(|w| w.status() != WorklistStatus::Done) {
@@ -216,6 +309,22 @@ pub fn refuse(store: &Store, t: &Task, on: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The list holding `task` that `list` is, or waits on through `worklist
+/// after`.
+fn needs(store: &Store, list: &Worklist, task: &str) -> Option<String> {
+    let (mut next, mut seen) = (vec![list.clone()], BTreeSet::new());
+    while let Some(w) = next.pop() {
+        if !seen.insert(w.id.clone()) || w.status() == WorklistStatus::Done {
+            continue;
+        }
+        if ordinal_of(&w.groups(), task).is_some() {
+            return Some(w.id);
+        }
+        next.extend(w.after.iter().filter_map(|a| store.worklist(a)));
+    }
+    None
+}
+
 /// Refusals 4 and 5 for a list edit: `before` is the list as it stands, and
 /// `groups` the membership it is about to be written with.
 ///
@@ -227,6 +336,16 @@ pub fn refuse_membership(store: &Store, before: &Worklist, groups: &[Group]) -> 
     let tasks = store.tasks();
     let after_of: BTreeMap<&str, &[String]> = tasks.iter().map(|x| (x.id.as_str(), x.after.as_slice())).collect();
     let old = before.groups();
+    // A member joining the list it rests on would wait for its own end.
+    let joins = |m: &&String| {
+        ordinal_of(&old, m).is_none() && after_of.get(m.as_str()).is_some_and(|on| on.contains(&before.id))
+    };
+    if let Some(m) = groups.iter().flat_map(|g| &g.members).find(joins) {
+        return Err(format!(
+            "{m} rests on the list `{id}` (after:), so it cannot be a member of it — `wsp after {m}` says what it rests on",
+            id = before.id
+        ));
+    }
     let late = |gs: &[Group]| -> BTreeSet<(String, String, usize, usize)> {
         edges_on(gs, &after_of)
             .into_iter()
@@ -400,7 +519,8 @@ pub fn chains(store: &Store, w: &Worklist, only: Option<&str>) -> Vec<String> {
     out
 }
 
-/// Whether a member's work is on the trunk — the event a hold waits for.
+/// Whether a member's work is on the trunk — the event a hold waits for. For
+/// a list, whether it is done or cancelled.
 ///
 /// **The member's own record first**: `wsp land` writes [`crate::repair::LANDED`]
 /// on it, and so does the repair that finds a landing nobody recorded. It is
@@ -413,6 +533,9 @@ pub fn chains(store: &Store, w: &Worklist, only: Option<&str>) -> Vec<String> {
 /// the trunk has not got is as landed as it will ever be. One git reading per
 /// such member, and only for one at `review` or `done` without the line.
 pub fn landed(store: &Store, repos: &mut Option<Repos>, id: &str) -> bool {
+    if let Some(l) = list_named(store, id) {
+        return l.status() == WorklistStatus::Done;
+    }
     let Some(t) = store.find_task(id) else { return true };
     if crate::repair::landed(&t).is_some() {
         return true;
@@ -434,10 +557,13 @@ pub const VERBS: &[crate::verbs::Verb] = &[
             crate::verbs::Help {
                 section: crate::verbs::Section::Tasks,
                 order: 330,
-                text: r##"  wsp after <id> <on>…              it rests on those: a wait, never where it
-                                    came from (that is --parent). A run starts
-                                    it once each one in its own group has
-                                    landed; --clear empties it, bare reads it.
+                text: r##"  wsp after <id> <on>…              it rests on those rows or lists: a wait,
+                                    never where it came from (that is --parent).
+                                    A run starts it once each one in its own
+                                    group has landed. A running member that
+                                    names a list, or a row another list holds,
+                                    releases and is seated again once that has
+                                    finished. --clear empties it, bare reads it.
                                     Refused on itself, a cycle, or a list with
                                     <on> in a later group or this group started"##,
             },
@@ -500,6 +626,34 @@ mod tests {
         let lines = chains(&store, &w, None);
         assert_eq!(lines.len(), 1, "only the b → c in group 2: {lines:?}");
         assert!(lines[0].starts_with("group 2:") && lines[0].contains("b → c"), "{lines:?}");
+    }
+
+    /// `wsp-870`: a list is something to rest on, finished when it is done —
+    /// but not one that holds the row, or waits on a list that does.
+    #[test]
+    fn a_list_can_be_rested_on_unless_it_needs_the_row_to_finish() {
+        let s = store_named("lists");
+        task(&s, "t-1", &[]);
+        task(&s, "t-2", &[]);
+        list(&s, "mine", &[&["t-1"]], WorklistStatus::Running);
+        list(&s, "other", &[&["t-2"]], WorklistStatus::Draft);
+        list(&s, "later", &[], WorklistStatus::Draft);
+        let mut later = s.worklist("later").unwrap();
+        later.after = vec!["mine".into()];
+        s.save_worklist(&later).unwrap();
+
+        assert_eq!(after(&s, &["t-1", "mine"], &[]), 1, "its own list");
+        assert_eq!(after(&s, &["t-1", "later"], &[]), 1, "a list that waits on its own");
+        assert_eq!(after(&s, &["t-1", "other"], &[]), 0);
+        assert_eq!(edges(&s, "t-1"), ["other"]);
+        assert!(!landed(&s, &mut None, "other"));
+        let mut other = s.worklist("other").unwrap();
+        let mut groups = other.groups();
+        groups[0].members.push("t-1".into());
+        assert!(refuse_membership(&s, &other, &groups).is_err(), "nor does it join the list it rests on");
+        other.set_status(WorklistStatus::Done);
+        s.save_worklist(&other).unwrap();
+        assert!(landed(&s, &mut None, "other"));
     }
 
     fn after(store: &Store, words: &[&str], flags: &[(&str, &str)]) -> i32 {

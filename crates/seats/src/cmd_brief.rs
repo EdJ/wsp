@@ -1518,6 +1518,7 @@ fn brief_lines(r: &Brief, p: &Paint, depth: Depth) -> Vec<String> {
                 if r.leg.is_none() {
                     row("split", p.dim(&crate::split::route(&t.id)).to_string());
                     row("", p.dim(crate::split::NOT_A_SUBTASK).to_string());
+                    row("waits", p.dim(&crate::split::wait_elsewhere(&t.id)).to_string());
                 }
             }
             // The files this row names outside its own tree, which is a

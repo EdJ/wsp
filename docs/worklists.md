@@ -111,3 +111,23 @@ the test or `file:line` as the runner prints it. While that row is open and not 
   `describe.configure({ mode: "serial" })` or `describe.serial`. A file that cannot be found
   there fails the step too. The red's row is still pulled in.
 - the red's own row, the barrier and the end build do not hold over it.
+
+## A done-when that waits on another list's run (wsp-870)
+
+An item such as "the next check of <row> ends with no exit 143" is shown by
+another list's run, and this list cannot cause it. It is a dependency, not an
+ask and not a watch (Jesper, 2026-11-24):
+
+1. The member runs `wsp after <row> <what produces the check>`, naming a row
+   another list holds, or the list itself where the row has already landed and
+   the check is a later run of that list.
+2. It commits and runs `wsp release <row>`. The row stays at `doing`. It holds
+   no place of its group's `xN`, and the run neither reseats it nor names it
+   silent. The group's barrier still waits for it.
+3. Once the row has landed, or the list is done or cancelled, the run seats the
+   member again. It reads the check and submits the item as held, or not held.
+
+`wsp after <row> --clear` calls the wait off. A list that holds the member, or
+that waits on one that does (`wsp worklist after`), is refused. A row run as
+legs or pieces is not held this way (wsp-835).
+

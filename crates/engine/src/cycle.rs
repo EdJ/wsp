@@ -2550,9 +2550,11 @@ fn take_member(
 
 // ---- a member's prerequisite (wsp-495) ---------------------------------------------
 
-/// The line the run writes on a member when it adds a row the member names with
-/// `after` to the member's running group: `wsp: prerequisite <row> added to
-/// <list> group <n> …`. It is also what [`awaiting_prerequisite`] reads.
+/// The line written on a member that is to wait on what it names with `after`:
+/// the run's `wsp: prerequisite <row> added to <list> group <n> …` when it adds
+/// the row to the member's running group, and `wsp after`'s `wsp: prerequisite
+/// <row or list> waited on from <list> …` for what another list produces. It is
+/// what [`awaiting_prerequisite`] reads.
 pub const PREREQUISITE: &str = "wsp: prerequisite";
 
 /// What the run writes when the rows a released member waited on have landed
@@ -2577,9 +2579,11 @@ fn prerequisites_named(t: &Task) -> Vec<String> {
         .collect()
 }
 
-/// A member that released its seat to wait on a prerequisite the run pulled in:
-/// `None` for any other row. Otherwise the rows still owed, and **empty once
-/// every one has landed, which is when the member is due its seat again**.
+/// A member that released its seat to wait on a prerequisite the run pulled in,
+/// or on a list or another list's row (`wsp-870`, [`crate::after`]): `None` for
+/// any other row. Otherwise what is still owed, and **empty once every one has
+/// landed, which is when the member is due its seat again**. One the row no
+/// longer names with `after` is not owed: that is how a wait is called off.
 ///
 /// The member is at `doing` with no claim and no pane, and the run's
 /// [`PREREQUISITE`] line is newer than the last start or claim on its row — read
@@ -2591,7 +2595,8 @@ fn awaiting_prerequisite(store: &Store, t: &Task, claims: &std::collections::BTr
     }
     let mut repos = None;
     let mut on = prerequisites_named(t);
-    on.retain(|o| !crate::after::landed(store, &mut repos, o));
+    let renamed = store.renamed_ids();
+    on.retain(|o| t.after.contains(renamed.get(o).unwrap_or(o)) && !crate::after::landed(store, &mut repos, o));
     Some(on)
 }
 
@@ -2617,6 +2622,9 @@ fn pull_prerequisites(store: &Store, w: &Worklist, at: usize) -> bool {
             }
             for o in &t.after {
                 if g.members.contains(o) || out.iter().any(|(_, x)| x == o) {
+                    continue;
+                }
+                if crate::after::list_named(store, o).is_some() {
                     continue;
                 }
                 let Some(row) = store.find_task(o) else { continue };
@@ -12853,6 +12861,51 @@ fn only_a_working_screen_is_ever_overruled() {
         hold_all(&store);
         step(&store, &w, &Blind);
         assert_eq!(checks(&store, 1).len(), 1, "both landed and verified: the barrier opens");
+    }
+
+    /// `wsp-870`: a running member whose done-when only another list's run can
+    /// show names that list or its row with `wsp after`, releases its seat, and
+    /// is seated again once that has finished, with nobody watching. The row
+    /// stays where it is.
+    #[test]
+    fn a_member_waiting_on_another_lists_row_or_list_is_seated_again_once_it_finishes() {
+        for on in ["held", "elsewhere"] {
+            let (_env, store) = scratch(&format!("waits-on-{on}"));
+            task(&store, "m-1", Status::Todo);
+            task(&store, "held", Status::Todo);
+            let mut other = Worklist::new("elsewhere", "elsewhere");
+            other.set_status(WorklistStatus::Draft);
+            other.set_groups(&[Group { members: vec!["held".into()], agent: "claude".into(), ..Group::default() }]);
+            store.save_worklist(&other).unwrap();
+            let w = list(&store, &[(&["m-1"], "claude")]);
+            step(&store, &w, &Blind);
+            assert_eq!(spawned(), vec![("m-1".into(), "claude".into())]);
+            store.set_claim("m-1", serde_json::json!({ "workspace_id": "cpd-9" }));
+
+            assert_eq!(crate::after::run(&store, &Args::synth("after", &["m-1", on], &[])), 0);
+            let log = store.find_task("m-1").unwrap().section("Log").unwrap_or_default().to_string();
+            assert!(log.contains(&format!("{PREREQUISITE} {on} waited on from run")), "{log}");
+
+            store.clear_claim("m-1");
+            left_unseated(&store, "m-1", &[], 900);
+            step(&store, &w, &Blind);
+            step(&store, &w, &Blind);
+            assert!(spawned().is_empty(), "{on}: not reseated while it waits, silent as it is");
+            assert_eq!(store.worklist("run").unwrap().groups()[0].members, vec!["m-1"], "nothing joined");
+            assert!(silent(&store, &["m-1".into()]).is_empty());
+
+            if on == "held" {
+                let mut h = store.find_task("held").unwrap();
+                h.set_status(Status::Review);
+                h.log(&format!("{} 1234567abc on master", crate::repair::LANDED));
+                store.save_task(&h).unwrap();
+            } else {
+                other.set_status(WorklistStatus::Done);
+                store.save_worklist(&other).unwrap();
+            }
+            step(&store, &w, &Blind);
+            assert_eq!(spawned(), vec![("m-1".into(), "claude".into())], "{on}: finished, so seated again");
+        }
     }
 
     /// compound-react-127: a trunk red's row joins the group being run and

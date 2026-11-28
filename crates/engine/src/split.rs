@@ -47,6 +47,15 @@ fn steps(id: &str) -> String {
     )
 }
 
+/// What a member's seat does with a done-when item that only another list's
+/// run can show (`wsp-870`).
+pub fn wait_elsewhere(id: &str) -> String {
+    format!(
+        "a done-when only another list's run can show? `wsp after {id} <that row or list>`, commit, `wsp release {id}`: \
+         the run seats you again once it has finished; do not ask"
+    )
+}
+
 /// The sentence that goes with [`route`]: why not a sub-task.
 pub const NOT_A_SUBTASK: &str =
     "never `wsp add --parent` for a piece of this row: a sub-task is no member, so nothing runs or verifies it; \
