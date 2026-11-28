@@ -841,6 +841,11 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
                     // by one wsp runs.
                     if !ran_by_wsp(&w, passed) {
                         let _ = step(store, &w, seats());
+                        // No sentence about the run, which is its governor's
+                        // own doing; the install is still owed.
+                        if let Some(order) = passed.and_then(|n| install_owed(store, &w, n)) {
+                            tell(store, &w, &order);
+                        }
                         return 0;
                     }
                     if let Some(n) = passed {
@@ -965,7 +970,64 @@ fn passed_sentence(store: &Store, w: &Worklist, passed: Option<usize>) -> String
             w.id
         ),
     };
-    format!("{head}{tail}")
+    let install = passed.and_then(|n| install_owed(store, &w, n)).map(|o| format!("\n\n{o}")).unwrap_or_default();
+    format!("{head}{tail}{install}")
+}
+
+/// A file only wsp's own source tree has.
+const OWN_CODE: &str = "crates/engine/src/cycle.rs";
+
+/// The install passing barrier `n` leaves its governor owing, `None` where no
+/// member of the group landed a commit in wsp's own repository (`wsp-869`).
+///
+/// **The daemon runs only what somebody installed.** On `verify-fix-2` a fix
+/// held by its verifier waited 65 min for a person's install, the daemon's own
+/// checks running the old build and a row parked behind it. The person's answer,
+/// 2026-11-24: the governor installs as soon as the fix's barrier passes, and a
+/// seat never does.
+fn install_owed(store: &Store, w: &Worklist, n: usize) -> Option<String> {
+    let w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
+    let g = w.groups().into_iter().nth(n.checked_sub(1)?)?;
+    let index = crate::resolve::Index::new(store.projects());
+    let own = |root: &std::path::Path| root.join(OWN_CODE).is_file();
+    let landed: Vec<String> = g
+        .members
+        .iter()
+        .filter_map(|m| {
+            let t = store.find_task(m).filter(|t| !crate::repair::landed_nothing(t))?;
+            let sha = crate::repair::landed_line(&t)?;
+            let project = t.project?;
+            // A sub-project with no root of its own works in its parent's.
+            let roots = std::iter::once(project.clone())
+                .chain(index.ancestors(&project))
+                .filter_map(|p| store.project(&p))
+                .find(|p| !p.roots.is_empty())?
+                .roots;
+            roots.iter().any(|r| own(&util::expand(r))).then(|| format!("{m} at {sha}"))
+        })
+        .collect();
+    if landed.is_empty() {
+        return None;
+    }
+    // The check read the list's repository, which in a run across several need
+    // not be wsp's.
+    let checked = g
+        .checks
+        .last()
+        .and_then(|c| c.read.clone())
+        .filter(|_| crate::resolve::list_root(store, &index, &w.id).is_some_and(|r| own(&util::expand(&r))));
+    let build = match checked {
+        Some(sha) => format!("build {sha}, the barrier-checked commit"),
+        None => "build the trunk commit that holds them".to_string(),
+    };
+    Some(format!(
+        "Install owed: barrier {n} of {} passed changes to wsp's own code ({}), and the daemon runs the old build \
+         until they are installed. You, the governor, install now (standing approval, 2026-11-24): {build}, run \
+         `wsp install`, check jobs.json and the seat hook, confirm the daemon re-exec'd, and report after. A \
+         worker seat never installs, so do not hand this to one.",
+        w.id,
+        landed.join(", "),
+    ))
 }
 
 /// A block on anything in a run is a decision somebody owes, so the seat
@@ -8025,6 +8087,42 @@ fn only_a_working_screen_is_ever_overruled() {
                 "unseated": 1,
             }),
         );
+    }
+
+    /// `wsp-869`: a passed barrier whose group landed in wsp's own repository
+    /// tells the governor to install the commit the check read, in the sentence
+    /// the pass already sends; a group that landed elsewhere, or landed nothing,
+    /// is told of no install.
+    #[test]
+    fn a_pass_over_wsps_own_code_tells_the_governor_to_install_the_checked_commit() {
+        let (_env, store) = scratch("install-owed");
+        let repo = _env.path("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.project = Some("p".into());
+        store.save_task(&m).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        let read = Some("c9a5c581639b".to_string());
+        let mech = crate::barrier::Mechanical::No;
+        assert!(crate::barrier::open_within(&store, &w, 1, read, None, mech, &|_: &str| false, &|| true).is_some());
+        let own = repo.join(OWN_CODE);
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, "").unwrap();
+        assert_eq!(install_owed(&store, &w, 1), None, "nothing landed yet");
+
+        let mut m = store.find_task("m-1").unwrap();
+        crate::log::note(&store, &mut m, &format!("{} 323faba83e4c on master", crate::repair::LANDED)).unwrap();
+        let said = passed_sentence(&store, &w, Some(1));
+        assert!(said.contains("Install owed") && said.contains("m-1 at 323faba83e4c"), "{said}");
+        assert!(said.contains("build c9a5c581639b, the barrier-checked commit") && said.contains("`wsp install`"), "{said}");
+
+        std::fs::remove_file(&own).unwrap();
+        let said = passed_sentence(&store, &w, Some(1));
+        assert!(!said.contains("Install owed"), "another project's code is not the daemon's: {said}");
     }
 
     /// `wsp-216`: `go` on the last barrier of a group wsp ran is the close, and
