@@ -2568,10 +2568,38 @@ fn cargo_run_end(command: &str) -> Option<usize> {
     Some(last.as_ptr() as usize - command.as_ptr() as usize + last.len())
 }
 
+/// The spec file a failed test's line names, without its `:line:column`.
+fn spec_file(test: &str) -> Option<&str> {
+    test.split_whitespace().map(|w| w.split(':').next().unwrap_or(w)).find(|f| {
+        let mut parts = f.rsplit('.');
+        matches!(parts.next(), Some("ts" | "tsx" | "js" | "jsx" | "mts" | "mjs" | "cts" | "cjs")) && matches!(parts.next(), Some("spec" | "test"))
+    })
+}
+
+/// Whether a spec file's `source` puts tests in serial mode, comment lines aside.
+fn runs_serially(source: &str) -> bool {
+    let code: String = source.lines().map(str::trim).filter(|l| !["//", "/*", "*"].iter().any(|c| l.starts_with(c))).collect();
+    let code: String = code.chars().filter(|c| !c.is_whitespace()).map(|c| if c == '\'' || c == '`' { '"' } else { c }).collect();
+    code.contains("describe.serial") || code.split("describe.configure(").skip(1).any(|a| a.split(')').next().unwrap_or(a).contains("mode:\"serial\""))
+}
+
+/// Whether a failure of `test` may have left tests of its file unrun: its spec
+/// file, looked for under `dir`, runs in serial mode, where Playwright skips
+/// what follows a failure and the quiet report lists no skipped test. A spec
+/// file that cannot be read there counts too, as nothing shows it is not.
+fn may_have_skipped(dir: &Path, test: &str) -> bool {
+    let Some(file) = spec_file(test) else { return false };
+    let listed = git(dir, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).unwrap_or_default();
+    let under = format!("/{file}");
+    let mut found = listed.split('\0').filter(|f| *f == file || f.ends_with(&under)).peekable();
+    found.peek().is_none() || found.any(|f| std::fs::read_to_string(dir.join(f)).map_or(true, |s| runs_serially(&s)))
+}
+
 /// What a red step's `log` says of the known reds: the rows it names are pulled
 /// into `row`'s running group, and `Some` says what the step is held over,
-/// where those are all that failed.
-pub fn weigh_red(store: &Store, row: &str, reds: &[TrunkRed], step: &Step, log: &Path) -> Option<String> {
+/// where those are all that failed and none is in a serial-mode spec file of
+/// `tree`, the checkout the step ran in.
+pub fn weigh_red(store: &Store, row: &str, reds: &[TrunkRed], tree: &Path, step: &Step, log: &Path) -> Option<String> {
     if reds.is_empty() {
         return None;
     }
@@ -2583,7 +2611,11 @@ pub fn weigh_red(store: &Store, row: &str, reds: &[TrunkRed], step: &Step, log: 
     for red in rows {
         crate::cycle::pull_trunk_red(store, row, red);
     }
-    let all = failed.whole && one_command(&step.command) && failed.tests.iter().all(|t| named.iter().any(|r| names_red(t, &r.name)));
+    let ran_in = split_cd(without_opt_out(&step.command)).0.map_or_else(|| tree.to_path_buf(), |d| tree.join(d));
+    let all = failed.whole
+        && one_command(&step.command)
+        && failed.tests.iter().all(|t| named.iter().any(|r| names_red(t, &r.name)))
+        && !failed.tests.iter().any(|t| may_have_skipped(&ran_in, t));
     all.then(|| named.iter().map(|r| format!("`{}` ({})", r.name, r.row)).collect::<Vec<_>>().join(", "))
 }
 
@@ -2598,7 +2630,7 @@ pub fn run_row(store: &Store, row: &Task, dir: &Path, steps: &[Step], log: &Path
         } else {
             let mut ran = run_again_as(dir, s, &past_failures(&reds, s), log, reuse, runner);
             if matches!(ran.done, Done::Failed { timed_out: false, .. }) {
-                if let Some(what) = weigh_red(store, &row.id, &reds, s, log) {
+                if let Some(what) = weigh_red(store, &row.id, &reds, dir, s, log) {
                     ran.done = Done::HeldOver(what);
                 }
             }
@@ -5144,11 +5176,50 @@ mod tests {
             ("vitest", "vitest 1 failing", "✗ taskpage.spec.ts:99 › TP1: Error: no".to_string(), 1),
         ] {
             let script = format!("cat <<'EOF'\n{}EOF\nexit 1\n", quiet_report(stages, &cases));
-            let (_env, store) = trunk_red_world(&format!("trunk-quiet-{name}"), &script);
+            let (env, store) = trunk_red_world(&format!("trunk-quiet-{name}"), &script);
+            spec(&env, &store, "taskpage.spec.ts", "test(\"TP1\", () => {});\n");
             let mut red = store.find_task("pj-002").unwrap();
             red.log("trunk red: taskpage.spec.ts:99");
             store.save_task(&red).unwrap();
             assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), code, "{name}");
+            assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"], "{name}");
+        }
+    }
+
+    /// An `e2e/<name>` spec file in [`trunk_red_world`]'s tree, at the commit
+    /// `pj-001` is checked at.
+    fn spec(env: &util::Isolated, store: &Store, name: &str, source: &str) {
+        let dir = env.path("repo").join("e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), source).unwrap();
+        git_run(&env.path("repo"), &["add", "e2e"]);
+        git_run(&env.path("repo"), &["commit", "--quiet", "-m", "pj-001: a spec"]);
+        let sha = git(&env.path("repo"), &["rev-parse", "HEAD"]).unwrap();
+        let mut t = store.find_task("pj-001").unwrap();
+        crate::log::note(store, &mut t, &format!("{} {} on pj-001", crate::repair::LANDED, sha.trim())).unwrap();
+    }
+
+    #[test]
+    fn a_known_red_in_a_serial_mode_spec_file_is_not_held_over() {
+        let serial = "import { test } from \"@playwright/test\";\ntest.describe.configure({ mode: \"serial\" });\n";
+        let parallel = "// not test.describe.configure({ mode: \"serial\" })\ntest.describe.configure({ mode: 'parallel' });\n";
+        for (name, source, code) in [
+            ("serial", Some(serial), 1),
+            ("serial-block", Some("test.describe.serial(\"s\", () => {});\n"), 1),
+            ("serial-wrapped", Some("test.describe.configure({\n  retries: 1,\n  mode: 'serial',\n});\n"), 1),
+            ("parallel", Some(parallel), 0),
+            ("unread", None, 1),
+        ] {
+            let script = format!("cat <<'EOF'\n{}EOF\nexit 1\n", quiet_report("playwright 1 failing", "✗ plugin.spec.ts:12 › P1: Error: no"));
+            let (env, store) = trunk_red_world(&format!("trunk-spec-{name}"), &script);
+            if let Some(source) = source {
+                spec(&env, &store, "plugin.spec.ts", source);
+            }
+            let mut red = store.find_task("pj-002").unwrap();
+            red.log("trunk red: plugin.spec.ts:12");
+            store.save_task(&red).unwrap();
+            assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), code, "{name}");
+            // Held over or not, the red's row is pulled in.
             assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"], "{name}");
         }
     }

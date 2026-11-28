@@ -105,4 +105,9 @@ the test or `file:line` as the runner prints it. While that row is open and not 
   is named by its file and line or by its title up to the first `: `, never by its message. It is
   held over only where `playwright` is the one red stage and every failure it counts is such a
   line, since an earlier red stage stops it before Playwright.
+- a named red in a serial-mode spec file is not held over: Playwright skips the tests after a
+  failure there, and the quiet report lists no skipped test. The `*.spec.*` or `*.test.*` file the
+  failure names is read in the checked tree, under the step's `cd` directory, for
+  `describe.configure({ mode: "serial" })` or `describe.serial`. A file that cannot be found
+  there fails the step too. The red's row is still pulled in.
 - the red's own row, the barrier and the end build do not hold over it.
