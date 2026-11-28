@@ -30,11 +30,12 @@
 //!   ([`ended_empty`]). The second time it is flagged and left. `wsp leg reset`
 //!   forgives the count ([`forgive_ended`]).
 //! - **A barrier check seat that says nothing** (`wsp-903`): idle, no verdict
-//!   file, a tell that was delivered and no turn since it, as a model request
-//!   that never returned leaves it. wsp ends it and the run seats another, once per verdict
+//!   file, no shell of its own, a tell that was delivered and no turn since it,
+//!   as a model request that never returned leaves it. [`SILENT_AFTER`] from
+//!   the tell wsp ends it and the run seats another, once per verdict
 //!   ([`reseat_silent`]). The second one is flagged and left. A check that
-//!   answered the tell, or that nothing can say of, is not silent, and is
-//!   flagged as before.
+//!   answered the tell, that has a shell of its own, or that nothing can say
+//!   of, is not silent, and is flagged as before.
 //!
 //! # The other three closing verbs (`wsp-374`)
 //!
@@ -89,6 +90,9 @@ pub const TELL_AFTER: i64 = 3 * 60;
 
 /// How long after the tell the leg may still be open before wsp acts, in seconds.
 pub const SECOND_WINDOW: i64 = 5 * 60;
+
+/// How long after the tell a silent check seat is left before wsp ends it.
+pub const SILENT_AFTER: i64 = 10 * 60;
 
 /// A close this long after the baton was written is called late.
 pub const LATE_AFTER: i64 = 2 * 60;
@@ -562,10 +566,12 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let undelivered = std::cell::Cell::new(false);
             let tell = |idle: i64| undelivered.set(!tell_verdict(store, Kind::Check, &key, &seat, idle, &what, start));
             let close = |why: Why| {
-                let silent = matches!(why, Why::Idle(_)) && written.is_none() && told.is_some_and(|t| no_turn_since(store, seats, &seat, t));
-                match silent && again {
-                    true => reseat_silent(store, &w, at, &seat, why),
-                    false => settle_check(store, &w, at, &seat, start, why, now),
+                let silent = told.filter(|t| matches!(why, Why::Idle(_)) && written.is_none() && silent_since(store, seats, &w.id, &seat, *t));
+                match silent.filter(|_| again) {
+                    // Not dealt with: the next tick asks again.
+                    Some(t) if now - t < SILENT_AFTER => false,
+                    Some(_) => reseat_silent(store, &w, at, &seat, why),
+                    None => settle_check(store, &w, at, &seat, start, why, now),
                 }
             };
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
@@ -1119,11 +1125,15 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
 
 // ---- a barrier check --------------------------------------------------------------
 
-/// Whether `seat` has neither ended a turn nor begun one since `since`: what
-/// it was told then is unread. A seat nothing can say a turn of is not: the
-/// port's `None` holds.
-fn no_turn_since(store: &Store, seats: &dyn Seats, seat: &str, since: i64) -> bool {
-    seats.turn_end(seat).is_none_or(|e| e.at < since) && seats.turn_began_since(store, seat, since) == Some(false)
+/// Whether the idle `seat` has neither ended a turn nor begun one since
+/// `since`, and has no shell of its own: what it was told then is unread, and
+/// nothing it started will wake it. A seat nothing can say a turn of is not:
+/// the port's `None` holds.
+fn silent_since(store: &Store, seats: &dyn Seats, row: &str, seat: &str, since: i64) -> bool {
+    seats.turn_end(seat).is_none_or(|e| e.at < since)
+        && seats.turn_began_since(store, seat, since) == Some(false)
+        // No questions handed in: `advance` has already held a seat on one.
+        && crate::waiting::reading(Some(State::Idle), &Default::default(), &seats.shells(&[seat]), seat, row).is_none()
 }
 
 /// A check seat that said nothing (`wsp-903`): end it, abandon its entry as
@@ -2184,9 +2194,15 @@ mod tests {
     }
 
     /// Idle, and its start was heard with no turn begun since: what a seat
-    /// whose model request never returned reads as.
-    struct Hung;
+    /// whose model request never returned reads as. With this many shells.
+    struct Hung(usize);
     impl Seats for Hung {
+        fn shells(&self, _seats: &[&str]) -> crate::waiting::Shells {
+            match self.0 {
+                0 => Default::default(),
+                n => crate::waiting::Shells::one("cpd-4", n),
+            }
+        }
         fn state(&self, _seat: &str) -> Option<State> {
             Some(State::Idle)
         }
@@ -2195,9 +2211,10 @@ mod tests {
         }
     }
 
-    /// The tick that tells an idle check seat and the one that closes it.
+    /// The tick that tells an idle check seat, the one that closes it and the
+    /// one that would end it as silent.
     fn left_idle(store: &Store, seats: &dyn Seats, t0: i64) {
-        for after in [0, TELL_AFTER, TELL_AFTER + SECOND_WINDOW] {
+        for after in [0, TELL_AFTER, TELL_AFTER + SECOND_WINDOW, TELL_AFTER + SILENT_AFTER] {
             tick_at(store, seats, t0 + after);
         }
     }
@@ -2207,14 +2224,19 @@ mod tests {
     fn a_silent_check_seat_is_ended_and_seated_again_once_and_the_second_is_flagged() {
         let env = util::isolated("closing-c-silent");
         let store = staged_check(&env);
-        let fake = Hung;
+        let fake = Hung(0);
         clear_told();
         crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
         crate::cycle::tests::WAKES.with(|s| s.borrow_mut().clear());
         let ended = || crate::cycle::tests::ENDED.with(|s| s.borrow().clone());
         let checks = || store.worklist("run").unwrap().groups()[0].checks.clone();
         let t0 = util::epoch_secs();
-        left_idle(&store, &fake, t0);
+        for after in [0, TELL_AFTER, TELL_AFTER + SECOND_WINDOW, TELL_AFTER + SILENT_AFTER - 1] {
+            tick_at(&store, &fake, t0 + after);
+        }
+        assert!(ended().is_empty() && checks()[0].open() && !checks()[0].silent, "not before ten minutes: {:?}", checks());
+        assert!(raised_texts(&store).is_empty(), "{:?}", raised_texts(&store));
+        tick_at(&store, &fake, t0 + TELL_AFTER + SILENT_AFTER);
         assert_eq!(ended(), ["cpd-4"]);
         assert!(checks().len() == 1 && !checks()[0].open() && checks()[0].silent, "{:?}", checks());
         assert!(raised_texts(&store).is_empty(), "the first is wsp's to mend: {:?}", raised_texts(&store));
@@ -2273,6 +2295,19 @@ mod tests {
         assert_eq!(raised_texts(&store).len(), 1, "{:?}", raised_texts(&store));
     }
 
+    /// Its own shell will wake it: a suite it runs while its request hangs.
+    #[test]
+    fn a_check_seat_with_a_shell_of_its_own_is_flagged_and_not_ended() {
+        let env = util::isolated("closing-c-shell");
+        let store = staged_check(&env);
+        crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
+        left_idle(&store, &Hung(1), util::epoch_secs());
+        assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()));
+        assert_eq!(raised_texts(&store).len(), 1, "{:?}", raised_texts(&store));
+        let checks = store.worklist("run").unwrap().groups()[0].checks.clone();
+        assert!(checks[0].open() && !checks[0].silent, "{checks:?}");
+    }
+
     /// A seat that never got the tell has not left it unread.
     #[test]
     fn a_check_seat_the_tell_did_not_reach_is_not_ended() {
@@ -2280,7 +2315,7 @@ mod tests {
         let store = staged_check(&env);
         crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
         crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(true));
-        left_idle(&store, &Hung, util::epoch_secs());
+        left_idle(&store, &Hung(0), util::epoch_secs());
         crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(false));
         assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()));
         let checks = store.worklist("run").unwrap().groups()[0].checks.clone();

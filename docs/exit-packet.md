@@ -395,17 +395,19 @@ leg runs the leg validator, and a valid one closes with its summary as caption.
 - `closing::wsps_close_of_a_leg_with_a_valid_exit_closes_it_with_the_exits_summary_as_caption`
 
 **A silent check seat is seated again, once** (wsp-903). A barrier check seat of
-a running list that is idle a window after the reminder, with no verdict file,
-is ended by wsp when the reminder was delivered and the seat reads as having
-ended no turn and begun none since. Its entry is marked `silent`, and the run
-seats another. This happens once per verdict on the barrier. The next silent one
-is flagged and left. A seat that answered the reminder, that the reminder did not
-reach, or that nothing can say began a turn is flagged as before.
+a running list that is idle 10 minutes after the reminder, with no verdict file
+and no shell of its own, is ended by wsp when the reminder was delivered and the
+seat reads as having ended no turn and begun none since. Its entry is marked
+`silent`, and the run seats another. This happens once per verdict on the
+barrier. The next silent one is flagged and left. A seat that answered the
+reminder, that the reminder did not reach, that has a shell of its own, or that
+nothing can say began a turn is flagged as before.
 
 - `closing::a_silent_check_seat_is_ended_and_seated_again_once_and_the_second_is_flagged`
 - `closing::a_check_seat_that_answered_the_tell_is_flagged_and_not_ended`
 - `closing::a_check_seat_nothing_can_say_a_turn_of_is_flagged_and_not_ended`
 - `closing::a_check_seat_the_tell_did_not_reach_is_not_ended`
+- `closing::a_check_seat_with_a_shell_of_its_own_is_flagged_and_not_ended`
 
 ## 8. What it absorbed
 
