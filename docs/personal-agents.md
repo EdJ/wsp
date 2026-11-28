@@ -1,6 +1,6 @@
 # Personal agents: acting as you in the group and org workspaces
 
-Nov 19, 2026 · @Jesper
+Nov 19, 2026 · @Jesper · phase 1 re-planned on the hub, Nov 28, 2026 (decision d8)
 
 Each engineer has a personal agent that speaks for them in the shared workspaces. You can tell it "@Ed, the API moved to port 7488" and Ed's agent receives it, files it and tells Ed when it matters.
 
@@ -19,19 +19,19 @@ It is not an autonomous stand-in. It acts only within a mandate its person write
 
 &#91;embedded content: personal agents · a tell between two, a quorum in the group\]
 
-Top: your "@Ed" travels agent to agent through the server, which stamps who sent it, and Ed hears only what matters to him. Bottom: a proposal in the group workspace, where Ed's agent hands the question to Ed because it falls outside his mandate.
+Top: your "@Ed" travels agent to agent through the hub, which stamps who sent it from your login, and Ed hears only what matters to him. Bottom: a proposal in the group workspace, where Ed's agent hands the question to Ed because it falls outside his mandate.
 
 ## Agent to agent
 
-You write `@Ed` in web-chrome's Chat or in any agent session, and wsp delivers it to Ed's personal agent through the shared server. The verbs are Pi intercom's; the transport, the identity and the inbox are wsp's.
+You write `@Ed` in web-chrome's Chat or in any agent session, and wsp delivers it to Ed's personal agent through the hub (docs/multiplayer.md). The verbs are Pi intercom's; the transport, the identity and the inbox are wsp's.
 
 |  | Pi intercom | Personal agents on wsp |
 | --- | --- | --- |
-| Reach | One machine: a local broker on a unix socket; an opt-in relay over ssh can `send` to other machines, sender unverified | The org's wsp server, over the tailnet, from any machine |
-| Address | A session's name or id | `@ed` (a person's agent), `@platform` (a group's agents), `@cpd-12` (a seat) |
-| Sender | Same-user trust; metadata is display only | The server stamps `from` from the token: you cannot pose as someone else |
+| Reach | One machine: a local broker on a unix socket; an opt-in relay over ssh can `send` to other machines, sender unverified | The hub, over TLS, from any wsp logged in to it |
+| Address | A session's name or id | `@ed` (a person's agent), `@cpd-12` (a seat on your own wsp); `@platform` (a group's agents) waits for groups on the hub (phase 5) |
+| Sender | Same-user trust; metadata is display only | The hub stamps `from` from the sender's login token: you cannot pose as someone else |
 | Kinds | `send`, `ask` / `reply`, `pending`, `list`, `status`, `handover` | `tell`, `ask` / `reply`, `pending`, `who`, `handover`, plus `propose` (Quorum) |
-| Offline target | An in-memory mailbox, 24 hours, lost on restart; `ask` fails | A durable inbox in the store; `ask` waits, then becomes an open ask in the target's Needs you |
+| Offline target | An in-memory mailbox, 24 hours, lost on restart; `ask` fails | A durable inbox on the hub; `ask` waits, then becomes an open ask in the target's Needs you |
 | Busy target | Steered into its run, or held until a turn boundary | Held until a turn boundary; urgent marks interrupt |
 
 **What the receiving agent does with a message:**
@@ -40,7 +40,7 @@ You write `@Ed` in web-chrome's Chat or in any agent session, and wsp delivers i
 2. **Answers it** when the answer is in what it may share, and says so: "Ed's agent: per Ed's notes from 12 Nov, yes."
 3. **Surfaces it** to its person when the message needs a decision, names them as needed, or is marked urgent. It lands in Needs you as an ask, and the person's answer goes back as theirs, not the agent's.
 
-Scope follows the multiplayer design: an agent can message anyone in a group it shares with them, and the org's agents only through the org workspace. A message never carries anything out of a private workspace unless the sender's person put it there.
+Scope follows the multiplayer design: an agent can message anyone its person shares a shared workspace with, as the hub already decides for `primary:<user>`. A message never carries anything out of a private workspace unless the sender's person put it there.
 
 ## Asynchronous by default
 
@@ -48,11 +48,11 @@ The agent is always reachable and the person often isn't, so every message trave
 
 | Leg | When | Where it waits |
 | --- | --- | --- |
-| Your agent to Ed's agent | Immediately, through the server | Ed's agent's inbox in the store |
-| Ed's agent to Ed | When Ed is next active, or at once if urgent | A "for Ed" queue the agent keeps beside its inbox |
-| Ed's answer back to you | Immediately to your agent, then to you when you are active | The same two queues, the other way |
+| Your agent to Ed's agent | Immediately, through the hub | Ed's inbox on the hub, until one of Ed's machines is up and his agent reads it |
+| Ed's agent to Ed | When Ed is next active, or at once if urgent | The same record on the hub, at leg `queued`, shown in Needs you on Ed's own wsp |
+| Ed's answer back to you | Immediately to your inbox, then to you when you are active | The same two legs, the other way |
 
-**The agent lives where it is always on.** Ed's agent runs on the org's server, not on Ed's laptop, so a message lands even when every one of Ed's machines is off. His laptop is only where he reads it.
+**The inbox lives where it is always on.** Ed's inbox is on the hub, so a message lands even when every one of Ed's machines is off. Ed's agent is a seat on Ed's own wsp: it reads the inbox when one of his machines comes up, and it speaks as `agent:ed` over Ed's login. Nobody but Ed's own wsp can speak as `agent:ed`.
 
 **Each message says how to deliver it to the person:**
 
@@ -61,7 +61,7 @@ The agent is always reachable and the person often isn't, so every message trave
 - **For the agent only**: filed as knowledge ("the API moved to 7488"); Ed hears of it only when it becomes relevant to something he does.
 - **By a deadline**: if Ed is still away when it passes, his agent answers from what it may share, or tells the sender it expired unanswered. It never stays silent.
 
-**Presence comes from what wsp already sees:** web-chrome open and in focus, Needs you read, a command run as `person:ed`, typing in one of his sessions. The mandate adds quiet hours and do-not-disturb, so "active" never means the middle of Ed's night.
+**Presence comes from what Ed's own wsp already sees:** web-chrome open and in focus, Needs you read, a command run as `person:ed`, typing in one of his sessions. The hub sees none of this; it is told only that a message was shown. The mandate adds quiet hours and do-not-disturb, so "active" never means the middle of Ed's night.
 
 **The hand-over is a digest, not a stream.** When Ed returns, his agent gives him one short list, ordered by what needs him: decisions first, then things that name him, then a line counting what it filed or answered on his behalf. It merges repeats and drops what was superseded while he was away ("the port moved again").
 
@@ -96,7 +96,7 @@ Any "needs my person" turns into an ask in that person's Needs you, and the prop
 
 ## Acting as you
 
-Your agent's authority is a mandate you write and can change at any time; by default it may share nothing private and agree to nothing. The server enforces the mandate, not only the agent's prompt.
+Your agent's authority is a mandate you write and can change at any time; by default it may share nothing private and agree to nothing. wsp enforces the mandate, not only the agent's prompt (see "Phases 2 to 5 under the hub" for where).
 
 **Its own principal.** The agent acts as `agent:jesper`, never as `person:jesper`. Every message, answer and vote shows "Jesper's agent", so nobody mistakes its word for yours, and every rule can tell the two apart.
 
@@ -113,29 +113,88 @@ Your agent's authority is a mandate you write and can change at any time; by def
 
 ## Built on wsp
 
-Most of the parts exist: wsp already has asks with an owner (`of`), an answerer (`answered_by`), waiting and cancelling, and delivers messages into agent panes. Personal agents add one principal, one row kind and a mandate, on top of the multiplayer design.
+Most of the parts exist: wsp already has asks with an owner (`of`), an answerer (`answered_by`), waiting and cancelling, delivers messages into agent panes, and sends a message for another user through the hub's queue. Personal agents add one principal, one row kind and a mandate, on top of the multiplayer design.
 
 | Need | wsp today | Add |
 | --- | --- | --- |
-| Who is speaking | `Principal`: person, seat, manager, executor, wsp | `agent:<person>`, with its person and mandate |
-| Messages | Asks: `wsp ask`, `answer`, `wait`, `cancel`; delivery into panes | `tell` (an ask that wants no answer), addressing by `@person` and `@group` |
-| Inbox | Asks in the store; Needs you reads them | The same store, per agent; nothing kept only in memory |
+| Who is speaking | `Principal`: person, seat, manager, executor, wsp | `agent:<person>`, stamped by the hub only on that person's own login, with its mandate |
+| Messages | Asks: `wsp ask`, `answer`, `wait`, `cancel`; delivery into panes; `msg.send` through the hub | `tell` (an ask that wants no answer), addressing by `@person` (and `@group` once the hub has groups) |
+| Inbox | The hub's per-user message queue, emptied on `msg.ack`; Needs you reads local asks | The hub keeps each message as a record its two ends read, with its leg; each end's wsp keeps a copy; nothing kept only in memory |
 | Decisions | DECISIONS on a row | Row kind `proposal`, with answers, rule and outcome |
-| Who may see what | One person sees all | Workspaces, groups and roles from the multiplayer design |
-| Where it runs | Seats under compound-sup on a machine | One seat per engineer, kept alive by the daemon like a governor, in their private workspace |
+| Who may see what | Private workspaces stay on their machine; shared ones sync to members (d7) | The same, plus one rule on the hub: a message is read by its two ends only |
+| Where it runs | Seats under compound-sup on a machine | One seat per person, on that person's own wsp, kept alive by the daemon like a governor while it is logged in to a hub |
 | Any harness | `wsp-session.ts` for Pi, hooks for Claude Code | The same: the agent can be Claude Code or Pi, reached by `wsp tell` and `wsp ask` |
 
 web-chrome gets `@` completion in Chat and in Needs you, a per-agent thread, and a proposal card on the group board.
 
 ## Phasing
 
-It starts after the multiplayer design's phase 2 (identity and workspaces), because verified senders and scopes are what make `@Ed` safe.
+It builds on the hub (decisions d5 to d7, docs/multiplayer.md): per-user logins, shared workspaces and the hub's message routing are what make `@Ed` safe.
 
-1. **Tell and ask between people's agents.** `agent:<person>` principal, `wsp tell @ed`, `ask` / `reply`, a durable inbox, `@` in web-chrome Chat. Done when your "@Ed" reaches Ed's agent from another machine while all of Ed's machines are off, is handed to Ed when he next opens web-chrome, and Ed's agent cannot be impersonated.
-2. **The mandate.** Written, enforced by the server, with the share and agree lists. Done when an agent asked for a private row refuses and says why.
+1. **Tell and ask between people's agents.** `agent:<person>` principal, `wsp tell @ed`, `ask` / `reply`, a durable inbox on the hub, `@` in web-chrome Chat. Done when your `@Ed` is queued on the hub while all of Ed's machines are off, reaches Ed's agent and Ed when one comes up, and nobody but Ed's own wsp can speak as `agent:ed` (d8). How it is built is "Phase 1 on the hub", below.
+2. **The mandate.** Written, enforced by wsp (where, under the hub: see "Phases 2 to 5 under the hub"), with the share and agree lists. Done when an agent asked for a private row refuses and says why.
 3. **Filing and surfacing.** The receiving agent's notes per workspace, and the rule for when it raises Needs you. Done when a week of messages to Ed needs Ed only for what names him or needs a decision.
 4. **Quorum.** `wsp propose`, the proposal row, answers, the kind rules and the deadline. Done when a schedule question settles among three agents with no person asked, and a trunk question always reaches the people.
 5. **Org scale.** `@group` and org-wide proposals, agents in several groups, rate limits so one chatty agent cannot flood a group.
+
+## Phase 1 on the hub
+
+Decided by the person on 2026-11-28 (d8, "Personal agents under the hub"), after pa1-tell group 1 was held: the first plan for phase 1 rested on the retired single-server design, which d5 to d7 replaced with a hub and a local wsp per person (the hold's reasons are in `wsp worklist show pa1-tell --log`, 2026-11-27). The plan below replaces it. Group 1 (wsp-872: `agent:<person>` in the contract and the text forms, `AskKind::Tell`, `Deliver`, `Leg`) stands as built.
+
+**Where each part lives.**
+
+| Part | Where | How |
+|---|---|---|
+| The inbox | The hub | A message to `agent:<user>` is queued for that user, as `primary:<user>` is today, whether or not any of their machines is up. It is kept as a record after it is taken, with its leg. |
+| Who sent it | The hub | The hub stamps the sender from the login token of the connection that sent it: `person:<user>`, or `agent:<user>` when the send asks to speak as the agent. No field names another user, so only `<user>`'s own login can produce `agent:<user>`. The person's login is the only credential involved. |
+| Who may read it | The hub | A 1:1 message is a hub record readable by its two ends, the sender's user and the recipient's user (as person or agent). Anyone else, a hub admin included, reads `not_found`. It is not a record of either end's private workspace. |
+| Who may send it | The hub | The sender must share a shared workspace with the recipient, the rule `primary:<user>` already has; otherwise `not_found`. |
+| The agent | The person's own wsp | One seat, kept alive by that wsp's daemon as a governor is, while the wsp is logged in to a hub and its connection is on. It holds no row and no claim. That wsp records which seat it is, and only a send from that seat asks the hub to stamp `agent:<user>`. |
+| Delivery into the agent | The person's own wsp | The spoke takes the user's messages from the hub (`msg.take`) and hands each to the agent seat at a turn boundary through the orders machine, keyed on the hub's id, so a message is typed once. With no agent seat up, the message stays queued on the hub. |
+| The hand-over to the person | The person's own wsp | A message the agent queues for its person is in Needs you on the person's own wsp. It is shown when the person reads it there (or the app draws it), and that wsp tells the hub. The hub sees no presence. |
+| Each end's copy | Both ends' wsp | Each end keeps a copy of the messages it sent and received, with the leg the hub reports, so `wsp ask <id>` and `wsp pending` read without a dial. |
+
+**The legs and who may move them.** The hub applies this table (wsp-984). The actor is the principal the hub stamped. "The recipient's login" is `person:<p>` or `agent:<p>` on `<p>`'s own token.
+
+| From | Move | To | Who |
+|---|---|---|---|
+| (new) | `msg.send` to `agent:<p>` | `delivered` | any user sharing a shared workspace with `<p>`, as person or agent |
+| `delivered` | queue, with the agent's line on why | `queued` | the recipient's login |
+| `queued` | shown | `shown` | the recipient's login, as `person:<p>` |
+| `delivered`, `queued`, `shown` | answer | `answered` | the recipient's login; `answered_by` is the stamped principal, so a person's answer reads as theirs and the agent's as the agent's; a `tell` takes no answer |
+| `delivered`, `queued` | withdraw | `withdrawn` | the sender's login; refused once `shown` |
+| `delivered`, `queued` | expire | `expired` | the hub's own sweep, at or after a `by` deadline |
+
+Every other move is refused, by name, with nothing written. An answer with text goes back to the sender as a reply, as replies through the hub do today. `deliver` is stored in phase 1: urgent and agent-only are acted on by phases 2 and 3, except that the agent's own pass never queues an agent-only message for its person.
+
+**The rows** (pa1-tell, re-planned by wsp-975). A contract row and the hub's own rows come before the rows that use them.
+
+| Row | What | Where |
+|---|---|---|
+| wsp-983 | The wire carries the record: `agent:<user>`, `as_agent`, the stamped `by`, kind, deliver, leg, `msg.leg`, `msg.list` (R5) | crates/hub-protocol |
+| wsp-974 | The hub's principal text learns `agent:<person>` | the hub's repository |
+| wsp-984 | The hub keeps the record, stamps the sender, routes `agent:<user>`, applies the leg table | the hub's repository |
+| wsp-874 | Which seat on the person's wsp speaks as `agent:<user>`; `whoami` there | crates/store, crates/engine |
+| wsp-875 | `@<name>` resolves to the hub's `agent:<name>` | crates/engine/src/address.rs |
+| wsp-876 | The local message record carries the hub's fields; the add-on's message interface widens | crates/engine |
+| wsp-878 | The agent seat, kept alive like a governor | crates/seats, crates/engine/src/repair.rs |
+| wsp-985 | The spoke sends, takes, lists and follows messages against a real hub | crates/spoke |
+| wsp-877 | `wsp tell|ask @`, `reply`, `pending`, `who`, `ask withdraw` | crates/engine, crates/seats, crates/spoke |
+| wsp-879 | The inbox reaches the agent seat once, and survives a reseat | crates/engine/src/address.rs, crates/seats |
+| wsp-880 | The second leg: queued, shown on the person's own wsp, answered as the person | crates/engine |
+| compound-react-129 | `@` in Chat and a thread per agent, through the local wsp | compound-react |
+| wsp-881 | The gate, in a sandbox against a real hub; then the person's live step | tests/personal_agents.rs |
+
+wsp-873 (a message machine in `wsp-machines`, applied by the local store) is dropped: the record and its legs are the hub's, whose machines live in its own repository, and each end's copy only follows what the hub reports.
+
+## Phases 2 to 5 under the hub
+
+They are not re-planned yet. What d5 to d8 change for each:
+
+- **2. The mandate.** "Enforced by the server" splits in two. The hub can refuse only what it sees, the messages and legs an agent sends. What the agent may read and do (a private row, a tree, spawning, claiming) is enforced on its person's own wsp, where the agent seat runs. The mandate stays in the person's private workspace, so it never leaves their machine. mp3's rights table (groups, roles, stewards) is gone with the org, so pa2's rows that rest on it (wsp-649, the server checking every command and read of an agent, is one) are re-planned against the hub's users and shared workspaces.
+- **3. Filing and surfacing.** "Active" is what the person's own wsp sees, as in phase 1. The hub has no presence. Notes per workspace are kept on the person's wsp: private notes in the private workspace, and anything filed into a shared workspace syncs through the hub like any shared row.
+- **4. Quorum.** The hub hosts no agents and runs no builds (d5), so "the server runs a proposal" has to become either the proposer's wsp driving it as it drives a shared list, or a hub-side rule applied to answers. Either way the answers arrive only when each member's machine is up, which the deadline rule has to allow for.
+- **5. Org scale.** `@group`, org-wide proposals and "agents in several groups" need groups on the hub, which docs/multiplayer.md lists under "Later". Phase 5 waits for that design.
 
 ## Open questions
 
@@ -150,13 +209,19 @@ It starts after the multiplayer design's phase 2 (identity and workspaces), beca
 
 - [pi-intercom on pi.dev](https://pi.dev/packages/pi-intercom): the original 1:1 session intercom for Pi
 - [Agent Intercom for Pi, README](https://cdn.jsdelivr.net/gh/dataforxyz/agent-intercom-pi@main/README.md): the cross-harness fork with a durable inbox and team scope
-- wsp multiplayer: team capabilities on the server, the companion design this builds on
+- docs/multiplayer.md, "wsp multiplayer: a small hub and a local wsp per person": the companion design this builds on (decisions d5 to d8)
 
 ## Breakdown
 
 Filed by wsp-155 on 2026-11-19, as five worklists, one per phase, each left at **init** (a planned list is picked up
-by the daemon within a minute). The spec above is copied as it stood; this section is the only addition. Nothing here
-settles an open question: each list's overview says what the person confirms before its first group.
+by the daemon within a minute). Nothing here settles an open question: each list's overview says what the person
+confirms before its first group.
+
+**Phase 1 was re-planned on 2026-11-28** (wsp-975, decision d8): "Phase 1 on the hub", above, is its plan, and the
+table of reuse and the assumptions below are updated to match. The row ids in the table of lists are the ones wsp-155
+filed, before they were renumbered; pa1-tell's are wsp-872 to wsp-881, compound-react-129 and the rows wsp-975 added.
+The rest of this section describes phases 2 to 5 as wsp-155 planned them, on the retired server design; "Phases 2 to
+5 under the hub" says what changes.
 
 Reviewed with the other two breakdowns by wsp-157 (2026-11-20): `pa1-tell`, `pa3-filing`, `pa4-quorum` and
 `pa5-org-scale` are planned at low priority, and each starts by itself once its `after` is complete. `pa2-mandate`
@@ -200,31 +265,33 @@ wsp-247, wsp-249, wsp-250).
 
 | the spec's need | what carries it |
 |---|---|
-| `agent:<person>` | one more variant of the contract's `Principal` (state-core 2.1), with its text form in `wsp-api` |
-| "the server stamps `from`" | mp1's derivation of `by` from the token (wsp-161). The agent's seat uses mp1's seat token (wsp-164), bound to `agent:<person>` by the server when it spawns the seat. No long-lived agent secret is added |
-| tell, ask, reply | the contract's `Ask` and `ask.raise/answer/ack` (state-core 4.2), with a `Tell` kind and two legs |
-| the durable inbox, the "for Ed" queue | asks addressed to an agent, in the server's store, read through the contract. Nothing is kept only in memory |
-| delivery at a turn boundary | the orders machine under `deliver:<seat>` (state-core 3.1), keyed on the ask's id |
-| the always-on agent | a seat kept alive by the daemon as a governor is, spawned through the server host's manager (agent-manager section 3) with the idempotency key `(agent:<person>, attempt)` |
-| deadlines, settling a quorum once | a sweep under `sweep:<kind>` with an idempotency key (state-core 8.1: a lease plus a key) |
-| who may see what | mp2's workspaces and scope rule (wsp-168, wsp-173), plus one clause: an ask is in scope for its two ends |
-| presence, Needs you | mp2's presence (wsp-178) and three bands (wsp-179) |
-| what an agent may do | mp3's rights table (wsp-182, wsp-184), narrowed by the mandate |
+| `agent:<person>` | one more variant of the contract's `Principal` (state-core 2.1), with its text form in `wsp-api` and `wsp-hub-protocol` (wsp-872), and in the hub's own copy (wsp-974) |
+| "the hub stamps `from`" | the hub's derivation of who a connection is from its login token (docs/multiplayer.md, "Login and tokens"). A send that asks to speak as the agent is stamped `agent:<user>` for the token's own user and no other (wsp-983, wsp-984). On the person's wsp only the recorded agent seat asks for it (wsp-874). The person's login is the only credential |
+| tell, ask, reply | the contract's `Ask` with a `Tell` kind, `Deliver` and `Leg` (wsp-872), carried on the hub's `msg.send`, `msg.leg` and `msg.list` (wsp-983) |
+| the durable inbox, the "for Ed" queue | the hub's record of the message, queued for the user and kept after `msg.ack`, with its leg (wsp-984); each end's wsp keeps a copy (wsp-876, wsp-985). Nothing is kept only in memory |
+| delivery at a turn boundary | the spoke's `msg.take`, handed to the seat through the orders machine under `deliver:<seat>`, keyed on the hub's id (wsp-879) |
+| the agent, reachable while its person is away | the inbox on the hub, plus a seat on the person's own wsp kept alive by its daemon as a governor is, while that wsp is logged in (wsp-878) |
+| deadlines, settling a quorum once | for a message, the hub's sweep (wsp-984); for a quorum, phase 4's to decide |
+| who may see what | the hub: a message is read by its two ends only, and sent only between users who share a shared workspace (wsp-984) |
+| presence, Needs you | what the person's own wsp sees, and its Needs you (wsp-880) |
+| what an agent may do | phase 2's mandate, enforced where the act happens (see "Phases 2 to 5 under the hub") |
 | the proposal | a row with a kind, whose answers and outcome are store records and read as the row's log |
 
 **Assumptions the rows build on, for the person to confirm.** Each is marked "Assumes (to confirm)" in its row.
 
 1. `@Ed` always goes to Ed's agent, which hands it to Ed (the spec's own proposed answer to open question 1).
-2. A 1:1 message is a record of the recipient's private workspace, and its sender can read its state. It is not a
-   record of the group the two share, so other members do not see it.
-3. The agent's seat runs on the server's host, under that host's manager and its harness login.
+2. A 1:1 message is a hub record readable by its two ends, the sender's user and the recipient's user (d8). It is not
+   a record of either end's private workspace, nor of a shared workspace they are both in, so other members do not
+   see it.
+3. The agent's seat runs on its person's own wsp, under that machine's manager and its harness login, and speaks as
+   `agent:<person>` over its person's hub login (d8).
 4. Notes are kept per workspace and are not used across groups (open question 2).
 5. A group's quorum rules are set by its leads, and `trunk`, `release` and `spend` can never be agent-settled (open
    question 3).
 6. A vote withdrawn after settlement marks the decision contested and reopens it only by a new proposal (open
    question 4).
-7. Which kind and tier an agent runs on is an org setting. The rows add the setting and do not choose its default or
-   whose budget pays (open question 5).
+7. Which kind and tier an agent runs on is a setting of its person's wsp. The rows add the setting and do not choose
+   its default or whose budget pays (open question 5).
 8. No Pi intercom bridge is filed (open question 6): `wsp tell` reaches an agent from any harness.
 
 **What the spec left unsaid, and how the rows read it.**
