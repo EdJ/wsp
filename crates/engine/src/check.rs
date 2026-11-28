@@ -1645,7 +1645,7 @@ pub fn hung_after() -> Duration {
 #[cfg(test)]
 thread_local! {
     /// A test's own hung threshold, kept to its thread.
-    static HUNG_AFTER: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    pub static HUNG_AFTER: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone, Debug)]
@@ -5114,6 +5114,35 @@ mod tests {
         assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 1);
         assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
         assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"]);
+    }
+
+    #[test]
+    fn an_env_prefixed_cargo_step_runs_past_the_known_red_and_fails_on_the_next() {
+        use std::os::unix::fs::PermissionsExt;
+        let (env, store) = trunk_red_world("trunk-prefixed", "");
+        // A `cargo` that stops at its first failing binary unless told not to.
+        let bin = env.path("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("cargo"),
+            r#"#!/bin/sh
+red() { echo "test $1 ... FAILED"; echo 'test result: FAILED. 0 passed; 1 failed;'; echo "error: test failed, to rerun pass '--test $2'"; }
+red a::tp1 a
+case " $* " in *' --no-fail-fast '*) red b::mine b; echo 'error: 2 targets failed:' ;; esac
+exit 101
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("cargo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut p = Project::new("pj");
+        p.roots = vec![env.path("repo").display().to_string()];
+        p.body = format!("## Checks\n- script: PATH={}:$PATH cargo test\n", bin.display());
+        store.save_project(&p).unwrap();
+
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 1);
+        let t = store.find_task("pj-001").unwrap();
+        assert_eq!(t.status(), Status::Doing);
+        assert!(t.body.contains("test b::mine ... FAILED"), "the second binary ran: {}", t.body);
     }
 
     #[test]

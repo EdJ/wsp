@@ -5002,6 +5002,28 @@ pub mod tests {
         assert!(said.iter().any(|l| l.contains("layering not finished in the seat: stopped at its 1s limit")), "{said:?}");
     }
 
+    /// compound-react-127: a rule step cut short is not held over, whatever it
+    /// had printed of a known trunk red.
+    #[test]
+    fn a_hung_rule_step_that_printed_only_a_known_trunk_red_is_not_held_over() {
+        let (_env, store, _tree) = a_member_adding_a_module("review-layering-hung", false, &[]);
+        let own = store.task("wsp-101").unwrap();
+        let mut red = Task::new("tp1 is red on the trunk", "wsp-102");
+        red.project = own.project.clone();
+        red.log("trunk red: `a::tp1`");
+        store.save_task(&red).unwrap();
+        let printed = "echo 'test a::tp1 ... FAILED'; echo 'test result: FAILED. 3 passed; 1 failed;'";
+        rule_run(&format!("{printed}; exit 101"), 30);
+        let said = rule_gate(&store, &own, None).unwrap();
+        assert!(said.iter().any(|l| l.contains("held over until that row lands")), "{said:?}");
+
+        crate::check::HUNG_AFTER.with(|h| h.set(Some(std::time::Duration::from_secs(1))));
+        rule_run(&format!("{printed}; sleep 30"), 60);
+        let refused = rule_gate(&store, &own, None);
+        crate::check::HUNG_AFTER.with(|h| h.set(None));
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
     /// compounding-617: a `## Checks` line that runs `wsp check` on its own row
     /// (compounding-520, wsp-638) is refused at review, named, and the row does
     /// not move; with the line fixed the review goes through.
