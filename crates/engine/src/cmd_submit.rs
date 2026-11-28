@@ -824,7 +824,8 @@ pub fn answered(store: &Store, q: &Message, answer: &str) {
         true => format!("decided ({})", q.id),
         false => answer,
     };
-    let _ = crate::cmd_task::reopen(store, &Args::synth("reopen", &[&t.id, &reason], &[]));
+    // The person's answer is a decision on the row already; a seat's is not yet.
+    let _ = crate::cmd_task::reopen_keeping(store, &Args::synth("reopen", &[&t.id, &reason], &[]), !q.for_person);
 }
 
 fn take(store: &Store, args: &Args, t: &Task, c: &Checked, e: &Exit, text: &str, from: &str, me: Option<&str>) -> i32 {
@@ -1941,6 +1942,7 @@ mod tests {
         let log = t.section("Log").unwrap();
         assert!(log.contains(&format!("decided: {} answered 0m after it was asked", q.id)), "the wait is on the row: {log}");
         assert!(log.contains("sent back: keep the old panel"), "the answer is its reason: {log}");
+        assert!(crate::model::decisions_of(&t.body).is_empty(), "a person's answer is decided where it is answered, not twice");
         answered(&store, &q, "keep the old panel");
         assert_eq!(store.task("wsp-101").unwrap().section("Log").unwrap().matches("decided:").count(), 1, "once");
     }

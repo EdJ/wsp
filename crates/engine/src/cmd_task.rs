@@ -1626,17 +1626,38 @@ pub fn done_with(store: &Store, args: &Args, live: &dyn Fn(&str) -> bool, reader
 /// **Not this row:** inferring a reopen from a bare `wsp tell`. The row's own
 /// decision stands, and it is the right one: a status change has to be stated,
 /// because a tell is prose and prose is ambiguous.
+///
+/// **On a blocked row the reason is the answer, so it is kept as a decision
+/// (`wsp-613`).** The `sent back:` line reaches the next seat and no later one
+/// reads it as settled: wsp-350's governor answered two asks in a reopen, a
+/// rework leg ran, and the finish leg after it asked the first one again. A
+/// reopen of a row that was not blocked is only what is owed, and records none.
 pub fn reopen(store: &Store, args: &Args) -> i32 {
+    reopen_keeping(store, args, true)
+}
+
+/// [`reopen`], for a caller whose answer is a decision on the row already (a
+/// person's answer to a question): `keep` false records no second one.
+pub(crate) fn reopen_keeping(store: &Store, args: &Args, keep: bool) -> i32 {
     const USAGE: &str = "wsp reopen <id> \"what is owed\"   (or `-` to read it from stdin)";
     let (reason, _) = match prose_payload(args, USAGE) {
         Ok(v) => v,
         Err(code) => return code,
     };
+    let mut kept = None;
     let code = mutate_saying(store, args, "reopen", Some(&reason), |t| {
+        if keep && t.status() == Status::Blocked {
+            let asked = t.blocked_question().unwrap_or_else(|| "its question".to_string());
+            let text = format!("answering its block ({}): {}", util::truncate(&util::fold(&asked), 80), util::fold(&reason));
+            kept = Some((crate::decisions::decide_task(t, &text, &[]), t.id.clone()));
+        }
         t.set_status(Status::Doing);
         t.log(&format!("sent back: {}", reason.trim()));
     });
     if code == 0 {
+        if let Some((d, id)) = kept.filter(|_| !args.json()) {
+            println!("  {}", Paint::new().dim(&format!("kept as decision {d} on {id}: every later seat reads it")));
+        }
         deliver_the_reason(store, args, reason.trim());
         let run = took_back_held_run(store, args, reason.trim());
         reseat(store, args, run);
@@ -6676,6 +6697,27 @@ pub mod tests {
         assert_eq!(told.len(), 1, "and the reason reached the pane: {told:?}");
         assert_eq!(told[0].0, "m-1");
         assert!(told[0].1.contains("install and drive delivery live"), "{}", told[0].1);
+    }
+
+    /// `wsp-613`: a governor answered a block's asks in the send-back, and a
+    /// later leg asked again because nothing on the row said it was settled.
+    #[test]
+    fn a_send_back_of_a_blocked_row_keeps_the_answer_as_a_decision() {
+        let store = scratch("reopendecides");
+        let mut t = Task::new("m-1", "m-1");
+        t.set_status(Status::Blocked);
+        t.log("blocked: accept the in-tree runs?");
+        store.save_task(&t).unwrap();
+
+        assert_eq!(reopen(&store, &Args::synth("reopen", &["m-1", "Accept them.\nThis row only."], &[("no-seat", "true")])), 0);
+        let said = || crate::model::decisions_of(&store.find_task("m-1").unwrap().body);
+        let d = said();
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].text, "answering its block (accept the in-tree runs?): Accept them. This row only.");
+
+        // The row is at `doing` now: more that is owed answers no question.
+        assert_eq!(reopen(&store, &Args::synth("reopen", &["m-1", "and rerun the build"], &[("no-seat", "true")])), 0);
+        assert_eq!(said().len(), 1);
     }
 
     /// A reopen with no reason would put work back into a group with nothing to
