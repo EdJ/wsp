@@ -2388,7 +2388,35 @@ struct Failures {
     whole: bool,
 }
 
-/// Read libtest's, nextest's, Vitest's and Playwright's output for what failed.
+/// The test one case line of a quiet `check.mjs` report names: `✗ <file> ›
+/// <title>`, without the message after it, which may name another test. The
+/// title ends at its first `: `, as the line does not say where the message
+/// starts. `None` for a case that is no test (a global error, tests not run).
+fn quiet_case(line: &str) -> Option<String> {
+    let case = line.strip_prefix("✗ ")?;
+    let (file, title) = match case.split_once(" › ") {
+        Some((file, title)) => (file, Some(title)),
+        None => (case.split_once(": ").map_or(case, |(f, _)| f).trim_end_matches(':'), None),
+    };
+    if file.contains(' ') || !file.contains('.') {
+        return None;
+    }
+    Some(match title {
+        Some(t) => format!("{file} › {}", t.split_once(": ").map_or(t, |(t, _)| t).trim_end_matches(':')),
+        None => file.to_string(),
+    })
+}
+
+/// Whether a `check red:` line's stages are Playwright alone, and how many
+/// failures it counts there. `check.mjs` stops before Playwright when an
+/// earlier stage is red, so any other red stage leaves tests unrun.
+fn quiet_playwright_only(stages: &str) -> Option<usize> {
+    let stages = stages.rsplit_once(" (").map_or(stages, |(s, _)| s);
+    stages.strip_prefix("playwright ")?.strip_suffix(" failing")?.parse().ok()
+}
+
+/// Read libtest's, nextest's, Vitest's and Playwright's output, and a quiet
+/// `check.mjs` report (compound-react's), for what failed.
 fn failures_in(output: &str) -> Failures {
     const NEXTEST: &[&str] = &["FAIL", "TIMEOUT", "ABORT", "SIGSEGV", "SIGABRT", "SIGKILL", "LEAK-FAIL"];
     let (mut libtest, mut nextest, mut vitest, mut playwright) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -2396,6 +2424,8 @@ fn failures_in(output: &str) -> Failures {
     let (mut bad_binaries, mut reruns, mut whole) = (0, 0, true);
     let (mut doc_reruns, mut gone_past) = (0, 0);
     let mut in_playwright = false;
+    // The quiet report: its tests, and whether the lines now are its cases.
+    let (mut quiet, mut quiet_said, mut in_cases, mut several) = (Vec::new(), 0, false, false);
     // The number before `word` in a summary.
     let count = |line: &str, word: &str| -> usize {
         let words: Vec<&str> = line.split_whitespace().collect();
@@ -2405,6 +2435,28 @@ fn failures_in(output: &str) -> Failures {
         let line = plain_text(line);
         let line = line.trim();
         let words: Vec<&str> = line.split_whitespace().collect();
+        if let Some(stages) = line.strip_prefix("check red: ") {
+            // Every failure it counts has to be a named test below it.
+            match quiet_playwright_only(stages) {
+                Some(n) => quiet_said += n,
+                None => whole = false,
+            }
+            (in_cases, several) = (true, stages.contains(" failing, "));
+            continue;
+        }
+        // The cases end at the blank line before their detail; each stage of
+        // several opens with `== <stage>`.
+        if several && line.starts_with("== ") {
+            in_cases = true;
+            continue;
+        }
+        if in_cases {
+            if line.starts_with("✗ ") {
+                quiet.extend(quiet_case(line));
+                continue;
+            }
+            in_cases = false;
+        }
         if in_playwright {
             if line.contains(" › ") {
                 playwright.push(line.to_string());
@@ -2471,12 +2523,12 @@ fn failures_in(output: &str) -> Failures {
             || line.contains("(signal:");
         whole &= !cut;
     }
-    whole &= libtest.len() >= libtest_said && nextest.len() >= nextest_said && vitest.len() >= vitest_said && playwright.len() >= playwright_said;
+    whole &= libtest.len() >= libtest_said && nextest.len() >= nextest_said && vitest.len() >= vitest_said && playwright.len() >= playwright_said && quiet.len() == quiet_said;
     // A test binary that failed with no result of its own crashed.
     whole &= reruns <= bad_binaries;
     // Cargo stopped at a failed target, and those after it never ran.
     whole &= reruns + doc_reruns <= gone_past;
-    let tests: Vec<String> = [libtest, nextest, vitest, playwright].concat();
+    let tests: Vec<String> = [libtest, nextest, vitest, playwright, quiet].concat();
     whole &= !tests.is_empty();
     Failures { tests, whole }
 }
@@ -5051,6 +5103,54 @@ mod tests {
         assert!(!names_red("a::tp10", "a::tp1"));
         assert!(one_command("cd web && npx playwright test 2>&1"));
         assert!(!one_command("cargo test -p a && cargo test -p b"));
+    }
+
+    /// `check.mjs`'s red output, as `npm run check` prints it.
+    fn quiet_report(stages: &str, cases: &str) -> String {
+        format!("\n> web-chrome@0.0.0 check\n> node scripts/check.mjs\n\ncheck red: {stages} (types 0s, vitest 0s, playwright 0s)\n{cases}\n\nError: element not found\n  shot: test-results/failed-shots/tp1.png\n")
+    }
+
+    const QUIET_TP1: &str = "✗ taskpage.spec.ts:99 › TP1: Error: element not found";
+
+    #[test]
+    fn a_quiet_check_report_is_whole_only_with_playwright_alone_and_every_case_a_test() {
+        let read = |stages: &str, cases: &str| {
+            let f = failures_in(&quiet_report(stages, cases));
+            (f.tests, f.whole)
+        };
+        let tp1 = || vec!["taskpage.spec.ts:99 › TP1".to_string()];
+        assert_eq!(read("playwright 1 failing", QUIET_TP1), (tp1(), true));
+        assert_eq!(read("playwright 2 failing", QUIET_TP1), (tp1(), false), "one unnamed");
+        assert_eq!(read("playwright 41 failing", &format!("{QUIET_TP1}\n… and 1 more failing")), (tp1(), false));
+        // A message naming the known red does not make another test it.
+        let other = "✗ board.spec.ts:7 › B1: Error: see taskpage.spec.ts:99";
+        assert_eq!(read("playwright 1 failing", other), (vec!["board.spec.ts:7 › B1".to_string()], true));
+        for no_test in ["✗ Error: boom", "✗ 3 of 9 reported passed were not run, first taskpage.spec.ts:99 › TP1", "Executable doesn't exist"] {
+            assert_eq!(read("playwright 1 failing", no_test), (vec![], false), "{no_test}");
+        }
+        // An earlier stage red: named, so its row is pulled, and never whole.
+        let vitest = "✗ src/a.test.ts › a works: AssertionError: no";
+        assert_eq!(read("vitest 1 failing", vitest), (vec!["src/a.test.ts › a works".to_string()], false));
+        let both = format!("== types\nsrc/a.ts(1,1): error TS1: no\n== vitest\n{vitest}");
+        assert_eq!(read("types 1 failing, vitest 1 failing", &both), (vec!["src/a.test.ts › a works".to_string()], false));
+    }
+
+    #[test]
+    fn a_quiet_check_report_red_on_the_known_test_alone_is_held_over_and_pulls_its_row() {
+        let other = "✗ board.spec.ts:7 › B1: Error: no";
+        for (name, stages, cases, code) in [
+            ("alone", "playwright 1 failing", QUIET_TP1.to_string(), 0),
+            ("second", "playwright 2 failing", format!("{QUIET_TP1}\n{other}"), 1),
+            ("vitest", "vitest 1 failing", "✗ taskpage.spec.ts:99 › TP1: Error: no".to_string(), 1),
+        ] {
+            let script = format!("cat <<'EOF'\n{}EOF\nexit 1\n", quiet_report(stages, &cases));
+            let (_env, store) = trunk_red_world(&format!("trunk-quiet-{name}"), &script);
+            let mut red = store.find_task("pj-002").unwrap();
+            red.log("trunk red: taskpage.spec.ts:99");
+            store.save_task(&red).unwrap();
+            assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), code, "{name}");
+            assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"], "{name}");
+        }
     }
 
     #[test]

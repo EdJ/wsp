@@ -90,4 +90,8 @@ the test or `file:line` as the runner prints it. While that row is open and not 
   cut short, output it cannot count, or a line chaining several commands. While a red is known,
   cargo steps run with `--no-fail-fast` (after `env`, `NAME=value` and `+toolchain` too). A cargo
   run that stopped at a failed target all the same, as one inside a script can, is not held over.
+- compound-react's quiet `check.mjs` report is read too: a `✗ <file>:<line> › <title>: …` line
+  is named by its file and line or by its title up to the first `: `, never by its message. It is
+  held over only where `playwright` is the one red stage and every failure it counts is such a
+  line, since an earlier red stage stops it before Playwright.
 - the red's own row, the barrier and the end build do not hold over it.
