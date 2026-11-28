@@ -88,5 +88,6 @@ the test or `file:line` as the runner prints it. While that row is open and not 
 - a row's check (`wsp check`, the review rule steps, the rerun at a land, piece checks) passes over a step whose only
   failures are named ones. It still fails on any other failing test, a build error, a crash, a run
   cut short, output it cannot count, or a line chaining several commands. While a red is known,
-  cargo steps run with `--no-fail-fast`.
+  cargo steps run with `--no-fail-fast` (after `env`, `NAME=value` and `+toolchain` too). A cargo
+  run that stopped at a failed target all the same, as one inside a script can, is not held over.
 - the red's own row, the barrier and the end build do not hold over it.

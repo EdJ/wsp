@@ -2511,7 +2511,7 @@ fn rule_gate(store: &Store, t: &Task, anyway: Option<&str>) -> Result<Vec<String
         match crate::check::run_at_review(&tree, &crate::check::past_failures(&reds, step), &log) {
             crate::check::AtReview::Green => said.push(format!("{} green in the seat at {short} (`{}`)", step.name, step.command)),
             crate::check::AtReview::Skipped(why) => said.push(why),
-            crate::check::AtReview::Red(tail) => match crate::check::weigh_red(store, &t.id, &reds, step, &log) {
+            crate::check::AtReview::Red(tail, failed) => match failed.then(|| crate::check::weigh_red(store, &t.id, &reds, step, &log)).flatten() {
                 Some(what) => said.push(format!("{} red only on the trunk red {what}, held over until that row lands", step.name)),
                 None => red.push((step.clone(), tail)),
             },

@@ -863,8 +863,9 @@ pub fn structure_steps(read: &dyn Fn(&str) -> Option<String>, changed: &[String]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AtReview {
     Green,
-    /// Red: the tail of its output.
-    Red(String),
+    /// Red: the tail of its output, and whether the step ran to its own failing
+    /// exit (not hung, malformed or without tests).
+    Red(String, bool),
     /// Not run, or not run to its end: why, for the review's output.
     Skipped(String),
 }
@@ -929,7 +930,7 @@ pub fn run_at_review(tree: &Path, step: &Step, log: &Path) -> AtReview {
             step.name,
             step.limit.as_secs()
         )),
-        d if d.is_red() => AtReview::Red(ran.tail.clone()),
+        d if d.is_red() => AtReview::Red(ran.tail.clone(), matches!(d, Done::Failed { .. })),
         _ => AtReview::Skipped(format!("{} not run in the seat: {}", step.name, why_failed(&ran))),
     }
 }
@@ -2382,7 +2383,8 @@ fn names_red(line: &str, red: &str) -> bool {
 struct Failures {
     tests: Vec<String>,
     /// False where something could be red and unnamed: a build error, a crash,
-    /// a run cut short, or a summary counting more failures than are named.
+    /// a run cut short (cargo stopping at its first failing target too), or a
+    /// summary counting more failures than are named.
     whole: bool,
 }
 
@@ -2392,6 +2394,7 @@ fn failures_in(output: &str) -> Failures {
     let (mut libtest, mut nextest, mut vitest, mut playwright) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut libtest_said, mut nextest_said, mut vitest_said, mut playwright_said) = (0, 0, 0, 0);
     let (mut bad_binaries, mut reruns, mut whole) = (0, 0, true);
+    let (mut doc_reruns, mut gone_past) = (0, 0);
     let mut in_playwright = false;
     // The number before `word` in a summary.
     let count = |line: &str, word: &str| -> usize {
@@ -2452,6 +2455,13 @@ fn failures_in(output: &str) -> Failures {
         if line.starts_with("error: test failed, to rerun pass") {
             reruns += 1;
         }
+        if line.starts_with("error: doctest failed, to rerun pass") {
+            doc_reruns += 1;
+        }
+        // Only a `--no-fail-fast` run ends by counting its failed targets.
+        if let ["error:", n, "target" | "targets", "failed:"] = words.as_slice() {
+            gone_past += n.parse().unwrap_or(0);
+        }
         let cut = line.starts_with("error[E")
             || line.starts_with("error: could not compile")
             || line.starts_with("Errors  ")
@@ -2464,6 +2474,8 @@ fn failures_in(output: &str) -> Failures {
     whole &= libtest.len() >= libtest_said && nextest.len() >= nextest_said && vitest.len() >= vitest_said && playwright.len() >= playwright_said;
     // A test binary that failed with no result of its own crashed.
     whole &= reruns <= bad_binaries;
+    // Cargo stopped at a failed target, and those after it never ran.
+    whole &= reruns + doc_reruns <= gone_past;
     let tests: Vec<String> = [libtest, nextest, vitest, playwright].concat();
     whole &= !tests.is_empty();
     Failures { tests, whole }
@@ -2478,17 +2490,30 @@ fn one_command(command: &str) -> bool {
 
 /// `step` as it runs while a trunk red is known: a cargo run goes past its
 /// first failing binary, so a second red is seen and not hidden behind the
-/// known one.
+/// known one. A cargo run this does not reach (a script, an alias) stops there,
+/// and [`failures_in`] reads its output as not whole.
 pub fn past_failures(reds: &[TrunkRed], step: &Step) -> Step {
     let mut out = step.clone();
-    let (_, rest) = split_cd(&step.command);
     if reds.is_empty() || step.command.contains("--no-fail-fast") {
         return out;
     }
-    if let Some(runner) = ["cargo test", "cargo nextest run"].into_iter().find(|r| rest.trim_start().starts_with(r)) {
-        out.command = step.command.replacen(runner, &format!("{runner} --no-fail-fast"), 1);
+    if let Some(at) = cargo_run_end(&step.command) {
+        out.command.insert_str(at, " --no-fail-fast");
     }
     out
+}
+
+/// Where the `test` or `nextest run` of `command`'s first `cargo` ends, past a
+/// `+toolchain`. What stands before the `cargo` (`env`, `NAME=value`) is not
+/// read.
+fn cargo_run_end(command: &str) -> Option<usize> {
+    let mut words = command.split_whitespace().skip_while(|w| *w != "cargo").skip(1).skip_while(|w| w.starts_with('+'));
+    let last = match words.next()? {
+        w @ "test" => w,
+        "nextest" => words.next().filter(|w| *w == "run")?,
+        _ => return None,
+    };
+    Some(last.as_ptr() as usize - command.as_ptr() as usize + last.len())
 }
 
 /// What a red step's `log` says of the known reds: the rows it names are pulled
@@ -5000,8 +5025,14 @@ mod tests {
             let f = failures_in(s);
             (f.tests.len(), f.whole)
         };
-        let libtest = "test a::tp1 ... FAILED\ntest result: FAILED. 3 passed; 1 failed; 0 ignored\nerror: test failed, to rerun pass `--lib`\n";
-        assert_eq!(read(libtest), (1, true));
+        let stopped = "test a::tp1 ... FAILED\ntest result: FAILED. 3 passed; 1 failed; 0 ignored\nerror: test failed, to rerun pass `--lib`\n";
+        assert_eq!(read(stopped), (1, false), "cargo stopped at its first failing target");
+        let libtest = format!("{stopped}error: 1 target failed:\n    `--lib`\n");
+        assert_eq!(read(&libtest), (1, true));
+        assert_eq!(read(&format!("{libtest}{stopped}")), (2, false), "a later run that stopped");
+        let doc = "test src/lib.rs - f (line 1) ... FAILED\ntest result: FAILED. 0 passed; 1 failed;\nerror: doctest failed, to rerun pass `--doc`\n";
+        assert_eq!(read(doc), (1, false));
+        assert_eq!(read(&format!("{doc}error: 1 target failed:\n    `--doc`\n")), (1, true));
         assert_eq!(read("test result: FAILED. 3 passed; 2 failed;\ntest a::tp1 ... FAILED\n"), (1, false), "one failure unnamed");
         assert_eq!(read(&format!("{libtest}error: could not compile `x`\n")), (1, false));
         assert_eq!(read(&format!("{libtest}error: test failed, to rerun pass `--test b`\n")), (1, false), "a binary that crashed");
@@ -5029,6 +5060,11 @@ mod tests {
         assert_eq!(run(&red, "cargo test -p a"), "cargo test --no-fail-fast -p a");
         assert_eq!(run(&red, "cd x && cargo nextest run"), "cd x && cargo nextest run --no-fail-fast");
         assert_eq!(run(&red, "npx playwright test"), "npx playwright test");
+        assert_eq!(run(&red, "FOO=1 cargo test -p a"), "FOO=1 cargo test --no-fail-fast -p a");
+        assert_eq!(run(&red, "env FOO=\"b c\" cargo test"), "env FOO=\"b c\" cargo test --no-fail-fast");
+        assert_eq!(run(&red, "cargo +stable test"), "cargo +stable test --no-fail-fast");
+        assert_eq!(run(&red, "cd x && A=1 cargo +nightly nextest run -p a"), "cd x && A=1 cargo +nightly nextest run --no-fail-fast -p a");
+        assert_eq!(run(&red, "cargo build"), "cargo build");
         assert_eq!(run(&[], "cargo test"), "cargo test");
         let script = runner_script("cargo test --no-fail-fast -p a", |_| Some(r#"{"packages":[{"name":"a","id":"a","targets":[{"doctest":true}]}],"workspace_members":["a"],"workspace_default_members":["a"]}"#.into())).unwrap();
         assert!(script.contains("a=$?; cargo test --doc -p a --no-fail-fast && [ $a -eq 0 ]; }"), "{script}");
@@ -5078,6 +5114,17 @@ mod tests {
         assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 1);
         assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
         assert_eq!(store.worklist("run").unwrap().groups()[0].members, ["pj-002", "pj-001"]);
+    }
+
+    #[test]
+    fn a_check_whose_cargo_run_stopped_at_the_known_red_fails() {
+        // A script's cargo, which keeps fail-fast: a later binary never ran.
+        let (_env, store) = trunk_red_world(
+            "trunk-stopped",
+            "echo 'test a::tp1 ... FAILED'; echo 'test result: FAILED. 3 passed; 1 failed;'; echo 'error: test failed, to rerun pass `--test a`'; exit 101\n",
+        );
+        assert_eq!(check(&store, &Args::synth("check", &["pj-001"], &[])), 1);
+        assert_eq!(store.find_task("pj-001").unwrap().status(), Status::Doing);
     }
 
     #[test]
