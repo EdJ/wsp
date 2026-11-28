@@ -1768,14 +1768,19 @@ fn stamp_of(line: &str) -> Option<i64> {
 /// **A refusal is stamped, never retried.** A member whose agent has exited is
 /// the case this exists for and `wsp tell` refuses it for exactly that reason;
 /// the respawn is the fallback, on a later tick.
-pub fn tell_member(store: &Store, id: &str, text: &str) {
-    match type_to_seat(store, id, text, None) {
+///
+/// `false` when the sentence is known not to have been delivered.
+pub fn tell_member(store: &Store, id: &str, text: &str) -> bool {
+    let typed = type_to_seat(store, id, text, None);
+    let delivered = matches!(typed, Typed::Yes | Typed::InTest);
+    match typed {
         Typed::Yes => stamp(store, &format!("told {id}: it has the sentence")),
         Typed::NoRun(e) => stamp(store, &format!("tell {id}: could not run `wsp tell` ({e})")),
         Typed::No(why) => stamp(store, &format!("told {id}: not delivered — {why}")),
         // Said where it was refused; a test's tell stops short of a process.
         Typed::Unsayable | Typed::InTest => {}
     }
+    delivered
 }
 
 /// What [`type_to_seat`] came to.

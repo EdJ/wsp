@@ -30,10 +30,11 @@
 //!   ([`ended_empty`]). The second time it is flagged and left. `wsp leg reset`
 //!   forgives the count ([`forgive_ended`]).
 //! - **A barrier check seat that says nothing** (`wsp-903`): idle, no verdict
-//!   file, and no turn since the tell, as a model request that never returned
-//!   leaves it. wsp ends it and the run seats another, once per verdict
+//!   file, a tell that was delivered and no turn since it, as a model request
+//!   that never returned leaves it. wsp ends it and the run seats another, once per verdict
 //!   ([`reseat_silent`]). The second one is flagged and left. A check that
-//!   answered the tell is not silent, and is flagged as before.
+//!   answered the tell, or that nothing can say of, is not silent, and is
+//!   flagged as before.
 //!
 //! # The other three closing verbs (`wsp-374`)
 //!
@@ -456,6 +457,9 @@ struct Seen {
     stop: Option<i64>,
     /// Its on-screen prompt was raised (`wsp-616`): once per spell at it.
     prompted: bool,
+    /// A check's tell did not reach its seat (`wsp-903`), so its having taken
+    /// no turn since says nothing.
+    undelivered: bool,
 }
 
 fn record_path(store: &Store) -> PathBuf {
@@ -474,6 +478,7 @@ fn read(store: &Store) -> std::collections::BTreeMap<String, Seen> {
                 flagged: e["flagged"].as_bool().unwrap_or(false),
                 stop: e["stop"].as_i64(),
                 prompted: e["prompted"].as_bool().unwrap_or(false),
+                undelivered: e["undelivered"].as_bool().unwrap_or(false),
             },
         );
     }
@@ -483,7 +488,7 @@ fn read(store: &Store) -> std::collections::BTreeMap<String, Seen> {
 fn write(store: &Store, seen: &std::collections::BTreeMap<String, Seen>) {
     let v: serde_json::Map<String, Value> = seen
         .iter()
-        .map(|(k, s)| (k.clone(), json!({ "idle_since": s.idle_since, "told": s.told, "flagged": s.flagged, "stop": s.stop, "prompted": s.prompted })))
+        .map(|(k, s)| (k.clone(), json!({ "idle_since": s.idle_since, "told": s.told, "flagged": s.flagged, "stop": s.stop, "prompted": s.prompted, "undelivered": s.undelivered })))
         .collect();
     let _ = std::fs::create_dir_all(&store.state);
     let _ = std::fs::write(record_path(store), Value::Object(v).to_string());
@@ -523,7 +528,9 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let what = format!("the {} verifier's pass", t.id);
             let raise = Raise { about: crate::message::About::Task(t.id.clone()), what: what.clone(), list: crate::cycle::list_of(store, t) };
             let item = Item { key: format!("verify/{}/{seat}", t.id), row: &t.id, seat: &seat, written, start, raise: Some(raise) };
-            let tell = |idle: i64| tell_verdict(store, Kind::Verifier, &t.id, &seat, idle, &what, start);
+            let tell = |idle: i64| {
+                tell_verdict(store, Kind::Verifier, &t.id, &seat, idle, &what, start);
+            };
             let close = |why: Why| settle_verifier(store, &t.id, &seat, start, why, now);
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
         }
@@ -550,9 +557,10 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             // Keyed by seat and opening: a check seated again is owed its own
             // tell and flag.
             let item_key = format!("check/{key}/{seat}/{}", c.at);
-            let told = seen.get(&item_key).and_then(|s| s.told);
-            let item = Item { key: item_key, row: &w.id, seat: &seat, written, start, raise: Some(raise) };
-            let tell = |idle: i64| tell_verdict(store, Kind::Check, &key, &seat, idle, &what, start);
+            let told = seen.get(&item_key).filter(|s| !s.undelivered).and_then(|s| s.told);
+            let item = Item { key: item_key.clone(), row: &w.id, seat: &seat, written, start, raise: Some(raise) };
+            let undelivered = std::cell::Cell::new(false);
+            let tell = |idle: i64| undelivered.set(!tell_verdict(store, Kind::Check, &key, &seat, idle, &what, start));
             let close = |why: Why| {
                 let silent = matches!(why, Why::Idle(_)) && written.is_none() && told.is_some_and(|t| no_turn_since(store, seats, &seat, t));
                 match silent && again {
@@ -561,6 +569,9 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
                 }
             };
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
+            if let Some(s) = seen.get_mut(&item_key).filter(|_| undelivered.get()) {
+                s.undelivered = true;
+            }
         }
     }
     seen.retain(|k, _| open.contains(k));
@@ -936,10 +947,11 @@ fn flag_about(store: &Store, row: &str, what: &str, seat: &str, evidence: &str, 
 }
 
 /// Said once to a verifier's or a check's seat that has sat with its item open.
-fn tell_verdict(store: &Store, kind: Kind, key: &str, seat: &str, idle_min: i64, what: &str, start: Option<i64>) {
+/// Whether the seat has it.
+fn tell_verdict(store: &Store, kind: Kind, key: &str, seat: &str, idle_min: i64, what: &str, start: Option<i64>) -> bool {
     let text = exit_tell(store, kind, key, start, what, SECOND_WINDOW / 60);
     crate::store::log_line(store, &format!("{what}: {seat} idle {idle_min} min with it open — told to close it"));
-    crate::repair::tell_member(store, seat, &text);
+    crate::repair::tell_member(store, seat, &text)
 }
 
 /// What a verdict file and the tree say, as a flag's evidence.
@@ -1108,9 +1120,10 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
 // ---- a barrier check --------------------------------------------------------------
 
 /// Whether `seat` has neither ended a turn nor begun one since `since`: what
-/// it was told then is unread.
+/// it was told then is unread. A seat nothing can say a turn of is not: the
+/// port's `None` holds.
 fn no_turn_since(store: &Store, seats: &dyn Seats, seat: &str, since: i64) -> bool {
-    seats.turn_end(seat).is_none_or(|e| e.at < since) && seats.turn_began_since(store, seat, since) != Some(true)
+    seats.turn_end(seat).is_none_or(|e| e.at < since) && seats.turn_began_since(store, seat, since) == Some(false)
 }
 
 /// A check seat that said nothing (`wsp-903`): end it, abandon its entry as
@@ -2170,24 +2183,38 @@ mod tests {
         assert_eq!(raised_texts(&store).len(), 1, "flagged once");
     }
 
+    /// Idle, and its start was heard with no turn begun since: what a seat
+    /// whose model request never returned reads as.
+    struct Hung;
+    impl Seats for Hung {
+        fn state(&self, _seat: &str) -> Option<State> {
+            Some(State::Idle)
+        }
+        fn turn_began_since(&self, _store: &Store, _seat: &str, _since: i64) -> Option<bool> {
+            Some(false)
+        }
+    }
+
+    /// The tick that tells an idle check seat and the one that closes it.
+    fn left_idle(store: &Store, seats: &dyn Seats, t0: i64) {
+        for after in [0, TELL_AFTER, TELL_AFTER + SECOND_WINDOW] {
+            tick_at(store, seats, t0 + after);
+        }
+    }
+
     /// `wsp-903`: two hung model requests held crate-split's barrier 4 for 55m.
     #[test]
     fn a_silent_check_seat_is_ended_and_seated_again_once_and_the_second_is_flagged() {
         let env = util::isolated("closing-c-silent");
         let store = staged_check(&env);
-        let fake = Fake(RefCell::new(Some(State::Idle)), false);
+        let fake = Hung;
         clear_told();
         crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
         crate::cycle::tests::WAKES.with(|s| s.borrow_mut().clear());
         let ended = || crate::cycle::tests::ENDED.with(|s| s.borrow().clone());
         let checks = || store.worklist("run").unwrap().groups()[0].checks.clone();
-        let silent_from = |t0: i64| {
-            tick_at(&store, &fake, t0);
-            tick_at(&store, &fake, t0 + TELL_AFTER);
-            tick_at(&store, &fake, t0 + TELL_AFTER + SECOND_WINDOW);
-        };
         let t0 = util::epoch_secs();
-        silent_from(t0);
+        left_idle(&store, &fake, t0);
         assert_eq!(ended(), ["cpd-4"]);
         assert!(checks().len() == 1 && !checks()[0].open() && checks()[0].silent, "{:?}", checks());
         assert!(raised_texts(&store).is_empty(), "the first is wsp's to mend: {:?}", raised_texts(&store));
@@ -2199,7 +2226,7 @@ mod tests {
         let w = store.worklist("run").unwrap();
         assert!(crate::barrier::open_within(&store, &w, 1, None, None, crate::barrier::Mechanical::No, &|_: &str| false, &|| true).is_some());
         assert!(crate::barrier::name_seat(&store, "run", 1, "cpd-5"));
-        silent_from(t0 + 3600);
+        left_idle(&store, &fake, t0 + 3600);
         assert_eq!(ended(), ["cpd-4"], "not ended a second time");
         assert!(checks()[1].open(), "{:?}", checks());
         assert_eq!(raised_texts(&store).len(), 1, "the second is the person's: {:?}", raised_texts(&store));
@@ -2220,6 +2247,9 @@ mod tests {
             fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
                 Some(crate::waiting::TurnEnd { at: self.0, words: None, denied: false })
             }
+            fn turn_began_since(&self, _store: &Store, _seat: &str, _since: i64) -> Option<bool> {
+                Some(false)
+            }
         }
         let env = util::isolated("closing-c-answered");
         let store = staged_check(&env);
@@ -2230,6 +2260,31 @@ mod tests {
         tick_at(&store, &Answered(t0 + 60), t0 + SECOND_WINDOW);
         assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()));
         assert_eq!(raised_texts(&store).len(), 1, "{:?}", raised_texts(&store));
+    }
+
+    /// No Stop record and nothing folded: nobody can say it took no turn.
+    #[test]
+    fn a_check_seat_nothing_can_say_a_turn_of_is_flagged_and_not_ended() {
+        let env = util::isolated("closing-c-unsaid");
+        let store = staged_check(&env);
+        crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
+        left_idle(&store, &Fake(RefCell::new(Some(State::Idle)), false), util::epoch_secs());
+        assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()));
+        assert_eq!(raised_texts(&store).len(), 1, "{:?}", raised_texts(&store));
+    }
+
+    /// A seat that never got the tell has not left it unread.
+    #[test]
+    fn a_check_seat_the_tell_did_not_reach_is_not_ended() {
+        let env = util::isolated("closing-c-undelivered");
+        let store = staged_check(&env);
+        crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(true));
+        left_idle(&store, &Hung, util::epoch_secs());
+        crate::cycle::tests::TELL_PROSE_REFUSED.with(|r| r.set(false));
+        assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()));
+        let checks = store.worklist("run").unwrap().groups()[0].checks.clone();
+        assert!(checks[0].open() && !checks[0].silent, "{checks:?}");
     }
 
     #[test]
