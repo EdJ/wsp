@@ -627,6 +627,7 @@ pub fn add(store: &Store, args: &Args) -> i32 {
     }
     save(store, &mut w, &groups, "add", &format!("add {}", members.join(" ")));
     warn_same_file(&w.id, ordinal, &same_file);
+    warn_merge_rows(store, &w, &members);
 
     if args.json() {
         println!("{}", worklist_json(store, &w));
@@ -3705,6 +3706,10 @@ pub fn show(store: &Store, args: &Args) -> i32 {
     // know it was never stated.
     println!("{}  {}", p.dim(&util::pad("under", 8)), home_line(&p, &w.id, worklist::home(store, &w).as_ref()));
     println!("{}  {}", p.dim(&util::pad("outputs", 8)), crate::outputs::line(&w));
+    // `wsp-866`: where a merge row reads the push go it must not ask for.
+    if let Some(said) = crate::merge_row::push_line(&w.section("Overview").unwrap_or_default()) {
+        println!("{}  {said}", p.dim(&util::pad("push", 8)));
+    }
     if let Some(u) = &w.for_user {
         println!("{}  for {u}", p.dim(&util::pad("for", 8)));
     }
@@ -7547,6 +7552,18 @@ fn size_gate(store: &Store, args: &Args, ids: &[String], verb: &str) -> Option<i
     }
 }
 
+/// A merge or hand-off row put in `w` or planned with it (`wsp-866`): the legs
+/// that ask its decisions first, and the list's `Push:` line, where either is
+/// missing. A warning, never a refusal.
+fn warn_merge_rows(store: &Store, w: &Worklist, ids: &[String]) {
+    let overview = w.section("Overview").unwrap_or_default();
+    for t in ids.iter().filter_map(|id| store.find_task(id)).filter(|t| t.status().is_open()) {
+        for line in crate::merge_row::planning(&t, &w.id, &overview) {
+            eprintln!("{line}");
+        }
+    }
+}
+
 /// `wsp worklist size-check [warn|refuse|off]`: the mode the size check runs in,
 /// and with a word, sets it. With none, says the mode and how many rows each
 /// signal has caught, off the `size-check` events.
@@ -7648,6 +7665,7 @@ pub fn status(store: &Store, args: &Args) -> i32 {
                 if let Some(code) = size_gate(store, args, &members, "planned") {
                     return code;
                 }
+                warn_merge_rows(store, &w, &members);
                 w.set_planned();
             } else {
                 w.set_status(WorklistStatus::Draft);

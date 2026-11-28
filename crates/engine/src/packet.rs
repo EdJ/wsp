@@ -221,6 +221,9 @@ pub fn order_in(store: &Store, task: &str, flow: crate::cmd_checkout::Flow) -> S
 /// [`order_in`] for a row in hand, reading its named files under `root`.
 pub fn order_for(t: &Task, root: &Path, flow: crate::cmd_checkout::Flow) -> String {
     let narrow = order(&t.id, flow);
+    if crate::merge_row::is(t) {
+        return narrow.replace(NARROW, crate::merge_row::ORDER);
+    }
     match misses_subject(t, root) {
         true => narrow.replace(NARROW, SEARCH_RULE),
         false => narrow,
@@ -481,6 +484,9 @@ fn inside(path: &str) -> bool {
 
 pub fn build(t: &Task, root: &Path) -> Result<String, String> {
     let Some(mut p) = of(t) else { return Err(format!("{} has no ## {SECTION} section", t.id)) };
+    if crate::merge_row::is(t) {
+        p.text = format!("{}\n\n{}", p.text, crate::merge_row::RULE.replace("<row>", &t.id)).trim().to_string();
+    }
     if misses_subject(t, root) {
         p.text = format!("{}\n\n{SEARCH_RULE}", p.text).trim().to_string();
     }
@@ -1314,6 +1320,21 @@ A test over a leg record whose seat ended at T and whose line stays `running` to
 
     fn spawn(store: &Store, full: bool, no_packet: bool) -> Option<u64> {
         at_spawn(store, Some("pj-001"), true, full, no_packet, true)
+    }
+
+    /// `wsp-866`: a merge row worked as one seat is told to ask its decisions in
+    /// one batch first, and its order lets it read where the conflicts are.
+    #[test]
+    fn a_merge_rows_packet_and_order_ask_its_decisions_first() {
+        let mut t = row("Merge it.\nfile: src/a.rs");
+        let dir = tree("merge", &[("src/a.rs", "pub fn a() {}\n")]);
+        assert!(!build(&t, &dir).unwrap().contains(crate::merge_row::RULE.lines().next().unwrap()));
+        t.title = "Merge origin/master into the trunk".into();
+        let printed = build(&t, &dir).unwrap();
+        assert!(printed.contains("## A merge row: decisions first") && printed.contains("wsp ask t-1 --person"), "{printed}");
+        let o = order_for(&t, &dir, Flow::of(true));
+        assert!(o.contains(crate::merge_row::ORDER) && !o.contains(NARROW) && !o.contains('\n') && o.is_ascii(), "{o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

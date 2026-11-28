@@ -67,6 +67,7 @@ pub mod legs;
 pub mod list_sweep;
 pub mod liveness;
 pub mod local_trust;
+pub mod merge_row;
 pub mod mirror;
 pub mod orders;
 pub mod outputs;

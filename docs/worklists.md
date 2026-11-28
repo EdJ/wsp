@@ -45,3 +45,32 @@ trunk before the second starts.
 The check runs only when rows are put into a group. Rows that a running
 group's barrier attaches (`followup`) are checked by wsp-565's duplicate check
 instead.
+
+## Merge and hand-off rows: decisions first (wsp-866)
+
+A row that brings other history in asks everything that is the person's before
+it resolves anything. trunk-green's merge row asked as it went, and 44 of the
+list's 116 minutes were waiting on the person (Jesper, 2026-11-23).
+
+**Which rows.** A title that starts with "Merge" and names `origin/`, upstream,
+or `into … master|main|trunk`; or the tag `merge` or `hand-off`
+(`crate::merge_row::is`).
+
+**At planning.**
+
+- The row runs as two legs. `decide` trials the merge, lists every conflict and
+  every person-shaped choice (merge point, design clash, guard change, push),
+  and asks them in one `wsp ask <row> --person --wait`. `finish` merges as the
+  answers say. Both say `packet: off`.
+- The list's overview records the push go on a line of its own, `Push: go (who,
+  when)` or `Push: no`. `wsp worklist show <list>` prints it as `push`, and a
+  row that finds it there asks nothing about the push.
+
+`wsp worklist add` and `wsp worklist status <list> planned` warn on a merge row
+with no legs, printing the two `wsp leg add` commands, and on a list with no
+`Push:` line. They refuse nothing.
+
+**A merge row left as one seat** gets the same rule in its packet.
+
+**Landing.** Merge, never rebase. A branch that holds the merge and contains
+`master` lands by fast-forward, so nobody is asked for a `git merge --ff-only`.
