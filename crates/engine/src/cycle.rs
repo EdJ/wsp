@@ -810,13 +810,18 @@ fn advance_in(store: &Store, args: &Args) -> i32 {
         let passed = args.get("passed").and_then(|n| n.parse::<usize>().ok());
         if let Some(w) = store.worklist(list) {
             match event.as_str() {
-                "hold" => tell(store, &w, &format!(
-                    "The {} run was held at its barrier: `wsp worklist show {}` has the reason. \
-                     wsp starts nothing more until somebody runs `wsp worklist go {}` — or, where the \
-                     check held on a member that still owes work, `wsp reopen <id> \"what is owed\"`, \
-                     which runs its group again and checks the barrier afresh.",
-                    w.id, w.id, w.id
-                )),
+                "hold" => {
+                    // A hold on the install alone is the governor's to clear
+                    // (`wsp-557`), so it is said with the hold and not after.
+                    let install = install_on_hold(store, &w).map(|o| format!("\n\n{o}")).unwrap_or_default();
+                    tell(store, &w, &format!(
+                        "The {} run was held at its barrier: `wsp worklist show {}` has the reason. \
+                         wsp starts nothing more until somebody runs `wsp worklist go {}` — or, where the \
+                         check held on a member that still owes work, `wsp reopen <id> \"what is owed\"`, \
+                         which runs its group again and checks the barrier afresh.{install}",
+                        w.id, w.id, w.id
+                    ))
+                }
                 // `wsp-173`: a person's pause, said as one, and said as not a
                 // barrier — the sentence `hold` sent here told native-window's
                 // seat its barrier had been checked when nobody had.
@@ -986,6 +991,46 @@ const OWN_CODE: &str = "crates/engine/src/cycle.rs";
 /// 2026-11-24: the governor installs as soon as the fix's barrier passes, and a
 /// seat never does.
 fn install_owed(store: &Store, w: &Worklist, n: usize) -> Option<String> {
+    let (landed, build) = uninstalled(store, w, n)?;
+    Some(format!(
+        "Install owed: barrier {n} of {} passed changes to wsp's own code ({landed}), and the daemon runs the old build \
+         until they are installed. You, the governor, install now (standing approval, 2026-11-24): {build}, {INSTALL_STEPS}",
+        w.id,
+    ))
+}
+
+/// What a hold with `cause: env` leaves the governor of a group that changed
+/// wsp's own code (`wsp-557`): the install, and the barrier checked again.
+///
+/// **A bar only the live daemon can show cannot be met before the install**, and
+/// read-api's barrier stood held 115 min waiting for a person's. The person's
+/// answer, 2026-11-24: where the code is verified and the install is all that is
+/// missing, the governor installs at once and the barrier re-checks or
+/// re-measures. `park` then `resume` is the way to a fresh check that records no
+/// verdict.
+fn install_on_hold(store: &Store, w: &Worklist) -> Option<String> {
+    if !crate::cmd_worklist::held_on_env(w) {
+        return None;
+    }
+    let n = worklist::position(store, w, Reading::Landed).at?;
+    let (landed, build) = uninstalled(store, w, n)?;
+    Some(format!(
+        "The hold says `cause: env`, and barrier {n}'s group changed wsp's own code ({landed}), which the daemon does \
+         not run until it is installed. If the code is verified and the install is all the hold waits on, you, the \
+         governor, install now (standing approval, 2026-11-24): {build}, {INSTALL_STEPS} Then have the barrier \
+         checked again, which records no verdict: `wsp worklist park {id} \"installed, check again\"` and \
+         `wsp worklist resume {id}`. Do not `go` in place of that check.",
+        id = w.id,
+    ))
+}
+
+/// How every install order ends.
+const INSTALL_STEPS: &str = "run `wsp install`, check jobs.json and the seat hook, confirm the daemon re-exec'd, \
+     and report after. A worker seat never installs, so do not hand this to one.";
+
+/// The members of group `n` that landed a commit in wsp's own repository, each
+/// with its commit, and which build holds them. `None` where there are none.
+fn uninstalled(store: &Store, w: &Worklist, n: usize) -> Option<(String, String)> {
     let w = store.worklist(&w.id).unwrap_or_else(|| w.clone());
     let g = w.groups().into_iter().nth(n.checked_sub(1)?)?;
     let index = crate::resolve::Index::new(store.projects());
@@ -1020,14 +1065,7 @@ fn install_owed(store: &Store, w: &Worklist, n: usize) -> Option<String> {
         Some(sha) => format!("build {sha}, the barrier-checked commit"),
         None => "build the trunk commit that holds them".to_string(),
     };
-    Some(format!(
-        "Install owed: barrier {n} of {} passed changes to wsp's own code ({}), and the daemon runs the old build \
-         until they are installed. You, the governor, install now (standing approval, 2026-11-24): {build}, run \
-         `wsp install`, check jobs.json and the seat hook, confirm the daemon re-exec'd, and report after. A \
-         worker seat never installs, so do not hand this to one.",
-        w.id,
-        landed.join(", "),
-    ))
+    Some((landed.join(", "), build))
 }
 
 /// A block on anything in a run is a decision somebody owes, so the seat
@@ -4519,6 +4557,13 @@ const MEASURED_VERIFIER: &str = "**Never re-measure**: where the row produced fi
 const MEASURED_CHECK: &str = "**Do not measure** (timings, baselines, benchmarks): a figure the stop asks for \
      is read from what a measurement row committed, and where none did, that row is owed.";
 
+/// What a check is told where its group changed wsp's own code (`wsp-557`).
+const LIVE_BAR: &str = "**A bar only the live daemon can show** waits on the install, since this group changed \
+     wsp's own code and the daemon runs what was installed. You never install or restart it. Where the code is \
+     verified and the install is all that is missing, `hold` with `cause: env — <what to read after the install>`: \
+     wsp tells the governor to install and have this barrier checked again. Where it is installed already, read \
+     that one figure there; it is not the measuring barred above.";
+
 /// A check's work order, composed from the list as it stands when it is asked,
 /// since a check has no row to keep it on: what `wsp spawn --check` hands the
 /// agent and what `wsp brief` shows in its seat.
@@ -4526,7 +4571,8 @@ pub fn check_order(store: &Store, list: &str, at: usize) -> Option<String> {
     let w = store.worklist(list)?;
     let g = w.groups().into_iter().nth(at - 1)?;
     let packet = packet_text(store, &w, at, &g);
-    Some(barrier_order(&w, at, &g, &packet))
+    let live = uninstalled(store, &w, at).is_some();
+    Some(barrier_order(&w, at, &g, &packet, live))
 }
 
 /// What the check is handed so it need not gather it (`wsp-326`): each member
@@ -4560,7 +4606,7 @@ fn packet_text(store: &Store, w: &Worklist, at: usize, g: &Group) -> String {
 /// The third answer, `wsp worklist followup` (`wsp-210`), is offered only while
 /// the group still has its one round. A group that has spent it is told so, so
 /// the check knows that whatever more it finds goes to the governor.
-fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
+fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str, live: bool) -> String {
     let stop = match g.stop.trim() {
         "" => "There is no stop condition written at this barrier.".to_string(),
         s => format!("The stop condition, which your verdict answers:\n\n> {s}"),
@@ -4609,7 +4655,7 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
         members = g.members.join(" "),
         caption = CAPTION_ORDER,
         packet = packet,
-        measured = MEASURED_CHECK,
+        measured = if live { format!("{MEASURED_CHECK}\n\n{LIVE_BAR}") } else { MEASURED_CHECK.to_string() },
     )
 }
 
@@ -6780,7 +6826,7 @@ pub mod tests {
         let mut w = Worklist::new("run", "run");
         w.set_groups(&[Group { members: vec!["m-1".into()], agent: "claude".into(), ..Group::default() }]);
         let g = w.groups().remove(0);
-        let order = barrier_order(&w, 1, &g, "");
+        let order = barrier_order(&w, 1, &g, "", false);
         assert!(order.contains("`wsp add \"…\" --from <member>`"), "{order}");
         assert!(!order.contains("--parent"), "{order}");
     }
@@ -8131,6 +8177,49 @@ fn only_a_working_screen_is_ever_overruled() {
         std::fs::remove_file(&own).unwrap();
         let said = passed_sentence(&store, &w, Some(1));
         assert!(!said.contains("Install owed"), "another project's code is not the daemon's: {said}");
+    }
+
+    /// `wsp-557`: a hold with `cause: env` on a group that changed wsp's own
+    /// code tells the governor to install and have the barrier checked again,
+    /// and the check is told to hold that way; a hold on the work says neither.
+    #[test]
+    fn a_hold_on_env_over_wsps_own_code_tells_the_governor_to_install_and_check_again() {
+        let (_env, store) = scratch("install-hold");
+        let repo = _env.path("repo");
+        let own = repo.join(OWN_CODE);
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, "").unwrap();
+        let mut p = crate::model::Project::new("p");
+        p.roots = vec![repo.display().to_string()];
+        store.save_project(&p).unwrap();
+        task(&store, "m-1", Status::Review);
+        let mut m = store.find_task("m-1").unwrap();
+        m.project = Some("p".into());
+        crate::log::note(&store, &mut m, &format!("{} 323faba83e4c on master", crate::repair::LANDED)).unwrap();
+        let w = list(&store, &[(&["m-1"], "claude")]);
+        hold_all(&store);
+        let read = Some("c9a5c581639b".to_string());
+        let mech = crate::barrier::Mechanical::No;
+        assert!(crate::barrier::open_within(&store, &w, 1, read, None, mech, &|_: &str| false, &|| true).is_some());
+        let order = check_order(&store, "run", 1).expect("an order");
+        assert!(order.contains(LIVE_BAR), "{order}");
+
+        let held = |why: &str| {
+            let mut w = store.worklist("run").unwrap();
+            w.set_status(WorklistStatus::Running);
+            store.save_worklist(&w).unwrap();
+            let args = Args::synth("worklist", &["hold", "run", why], &[("caption", "the live daemon is old")]);
+            assert_eq!(crate::cmd_worklist::hold(&store, &args), 0);
+            install_on_hold(&store, &store.worklist("run").unwrap())
+        };
+        assert_eq!(held("m-1 misses the done-when\n\ncause: work — one item is not met"), None);
+        let said = held("wip reads slow on the live store\n\ncause: env — the fix is not installed").expect("an order");
+        assert!(said.contains("m-1 at 323faba83e4c") && said.contains("build c9a5c581639b"), "{said}");
+        assert!(said.contains("`wsp install`") && said.contains("`wsp worklist resume run`"), "{said}");
+
+        std::fs::remove_file(&own).unwrap();
+        assert_eq!(install_on_hold(&store, &store.worklist("run").unwrap()), None, "another project's code");
+        assert!(!check_order(&store, "run", 1).unwrap_or_default().contains(LIVE_BAR));
     }
 
     /// `wsp-216`: `go` on the last barrier of a group wsp ran is the close, and

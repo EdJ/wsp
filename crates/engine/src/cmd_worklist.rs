@@ -4054,6 +4054,12 @@ const HELD: &str = "held —";
 /// back as the hold and not as the reason somebody paused.
 const PARKED: &str = "parked —";
 
+/// Whether the newest hold names `cause: env`: what held it is not the work
+/// (`wsp-557`). A check's `cause:` line is folded into the logged reason.
+pub fn held_on_env(w: &Worklist) -> bool {
+    last_logged(w, HELD).is_some_and(|said| said.contains("cause: env "))
+}
+
 fn last_logged(w: &Worklist, mark: &str) -> Option<String> {
     last_entry(w, mark).map(|(_, said, _)| said)
 }

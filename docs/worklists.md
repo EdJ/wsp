@@ -132,3 +132,25 @@ member does is refused: a list that holds the member, one that waits on one that
 does (`wsp worklist after`), a row such a list holds, and a list or row where
 another member already waits on this one's. A row run as legs or pieces is not
 held this way (wsp-835).
+
+## A bar only the live daemon can show (wsp-557)
+
+The daemon and the CLI run what was installed, so a figure read on the live
+store does not move when a member's commit lands. No seat can show it: a member
+or a check never installs or swaps the live daemon. read-api's barrier ran
+green and stood held 115 minutes waiting for the install (Jesper, 2026-11-24).
+
+**At planning.** A done-when or a stop names two things apart:
+
+- what the member shows, on a copy of the store served by its own build, such as
+  "on a `.backup` copy, `wsp wip --json` under 100 ms";
+- the live measurement, written as **owed after the install**, such as "owed
+  after install: the same under 100 ms on the live store". It is no item the
+  member is asked to hold.
+
+**At the barrier.** A check whose only miss is the install, with the code
+verified, holds with `cause: env`. Where the group changed wsp's own code, wsp
+then tells the governor to install at once (the standing approval of
+2026-11-24) and to have the barrier checked again: `wsp worklist park <list>
+"…"`, then `wsp worklist resume <list>`. The fresh check re-reads the figure.
+`go` is not used for it, since it passes the barrier unchecked.
