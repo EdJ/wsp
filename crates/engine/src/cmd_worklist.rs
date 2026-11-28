@@ -5490,6 +5490,7 @@ fn go_with(
         // it read, and a settlement written after that read is lost with it
         // (`wsp-326`'s first automatic pass left its check reading `running`).
         if let Some(n) = crossed {
+            crate::cycle::tell_gate_taken(store, &w.id, &groups, n, true, &said);
             crate::barrier::settle(store, &w.id, n, said_as);
             // Before the poke too: the close it starts reads the list's report.
             if n == groups.len() {
@@ -6174,6 +6175,7 @@ pub fn hold_by(store: &Store, args: &Args, here: Option<&[String]>) -> i32 {
     // The check on the barrier the run stands at, if one is open, held it —
     // or was overruled by whoever did. Its seat is ended by the tick.
     if let Some(at) = pos.at {
+        crate::cycle::tell_gate_taken(store, &w.id, &groups, at, false, &said);
         crate::barrier::settle(store, &w.id, at, crate::barrier::State::Holds);
     }
     crate::cycle::poke_list(store, &w.id, "hold", None);
@@ -9186,6 +9188,67 @@ mod tests {
         assert!(store.tasks().iter().all(|t| !t.tags.iter().any(|g| g == crate::cycle::BARRIER_TAG)), "and no row anywhere");
         let lines = crate::barrier::lines(&Paint::plain(), &groups_of(&store, "run")[0]).join("\n");
         assert!(lines.contains("passed") && lines.contains("in cpd-9"), "{lines}");
+    }
+
+    fn gate_stop(store: &Store, at: usize, stop: &str) {
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        groups[at - 1].stop = stop.into();
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
+    }
+
+    /// What `wsp yours` lists, once the check's seat has ended.
+    fn yours_after_the_seat(store: &Store, seat: &str) -> Vec<String> {
+        crate::lapse::seat_ended(store, seat);
+        crate::message::for_the_person(store).into_iter().map(|m| m.text).collect()
+    }
+
+    /// `wsp-614`: the check takes a gate's default, and the person still has it
+    /// on `wsp yours` after the check's seat, the barrier and the list are gone.
+    #[test]
+    fn a_default_taken_stays_on_the_persons_list_after_the_check_and_the_list_end() {
+        let _env = util::isolated("gate-default");
+        let store = at_barrier_one_seated("gate-default");
+        no_outputs(&store, "run");
+        gate_stop(&store, 1, "Default: go if under 2.2 s");
+        gate_stop(&store, 2, "Default: go if under 3 s");
+
+        assert_eq!(run(&store, &["go", "run", "took", "go:", "1.9", "s"]), 0);
+        let told = yours_after_the_seat(&store, "cpd-9");
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("took go: 1.9 s") && told[0].contains("`wsp worklist hold run \"why\"`"), "{told:?}");
+
+        task(&store, "wl-002", "review");
+        check_in(&store, "run", 2, "cpd-10");
+        assert_eq!(run(&store, &["go", "run", "took", "go:", "2.5", "s"]), 0);
+        let mut w = store.worklist("run").unwrap();
+        w.set_status(WorklistStatus::Done);
+        store.save_worklist(&w).unwrap();
+        let told = yours_after_the_seat(&store, "cpd-10");
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told.iter().any(|t| t.contains("last gate") && !t.contains("wsp worklist hold")), "{told:?}");
+    }
+
+    /// And a hold by the check says how to go on; a gate with no default, or one
+    /// no check is reading, tells nothing.
+    #[test]
+    fn a_default_that_holds_is_told_and_a_gate_with_none_is_not() {
+        let _env = util::isolated("gate-hold");
+        let store = at_barrier_one_seated("gate-hold");
+        gate_stop(&store, 1, "Default: stop unless under 2.2 s");
+        assert_eq!(flagged(&store, &["hold", "run", "3.1 s. cause: work — too slow"], &[("caption", "3.1 s is too slow")]), 0);
+        let told = yours_after_the_seat(&store, "cpd-9");
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("was held") && told[0].contains("`wsp worklist go run \"why\"`"), "{told:?}");
+
+        assert_eq!(run(&store, &["go", "run", "go", "on"]), 0);
+        assert_eq!(yours_after_the_seat(&store, "cpd-9").len(), 1, "the person's own turn back tells them nothing");
+
+        let store = at_barrier_one_seated("gate-none");
+        gate_stop(&store, 1, "the edit is under 2.2 s");
+        assert_eq!(run(&store, &["go", "run", "it", "holds"]), 0);
+        assert!(yours_after_the_seat(&store, "cpd-9").is_empty());
     }
 
     /// Follow-ups from a seat: the seat is the check's name in the log, the

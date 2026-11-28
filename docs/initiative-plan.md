@@ -74,7 +74,7 @@ goes through `wsp`; read `wsp help` for a verb you are not sure of.
   for more (run alone).
 - A stop that waits for the person's decision states its default where the work
   behind it is cheap to revert: `Default: go …` or `Default: stop …`, with the
-  figure that decides it. The barrier's check takes it and tells the person
+  figure that decides it. The barrier's check takes it, and wsp tells the person
   (docs/worklists.md).
 - Make the lists with `wsp worklist new <slug> "title" --initiative <id>`,
   one list per repository where that helps, and fill them with

@@ -55,14 +55,13 @@ impl Owed {
 }
 
 /// Whether the run opens a check on this group's barrier itself: a group run by
-/// an agent line, or a `manual` one whose written stop names no person
-/// (`wsp-629`, `cycle::manual_barrier_policy`).
+/// an agent line, or a `manual` one whose written stop an agent may check
+/// (`wsp-629`, `cycle::an_agent_may_check`).
 fn checked_by_the_run(g: &Group) -> bool {
     if g.policy().is_some() {
         return true;
     }
-    let stop = g.stop.trim();
-    g.agent.trim() == MANUAL && !stop.is_empty() && !crate::cycle::names_a_person(stop)
+    g.agent.trim() == MANUAL && crate::cycle::an_agent_may_check(&g.stop)
 }
 
 /// What the barrier at group `g` of `w` is waiting on, where its state is
@@ -199,6 +198,9 @@ mod tests {
         assert_eq!(of(&w, &g, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "running");
         let mut manual = group(MANUAL, "the suite is green");
         assert_eq!(of(&w, &manual, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "a manual group's check");
+        // Named, but with a default (`wsp-614`): the check's to take.
+        let default = group(MANUAL, "Ed decides. Default: go if under 2.2 s");
+        assert_eq!(of(&w, &default, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "a stated default");
         manual.checks.push(check(CheckState::Blocking));
         assert_eq!(of(&w, &manual, ListState::Barrier, &all_landed, NOW), Some(Owed::Check), "waiting on its follow-ups");
         // A held list whose check is still reading it is the check's too.

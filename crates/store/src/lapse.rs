@@ -49,6 +49,10 @@
 //! delivery of its own (`held_replies`, `ack`); closing it is not this row's
 //! decision, and the answer is on the asker's task log whichever way.
 //!
+//! **Nor is a [`standing_notice`]** (`wsp-614`): it reports what was done to a
+//! list, so the seat ending, the barrier passed and the list closing are no
+//! reason for the person not to read it.
+//!
 //! # By whom, and why this may close a person's question
 //!
 //! `lapsed` or `seat-gone`, both wsp, both by handles no verb can speak as.
@@ -58,7 +62,7 @@
 //! A `--wait` is released the way every other ending releases it: the waiter
 //! polls the record, finds it closed, and returns the abandonment (exit 3).
 
-use crate::message::{self, About, Message, Party, Shape};
+use crate::message::{self, About, Kind, Message, Party, Shape, Waiting};
 use crate::model::{Status, Worklist, WorklistStatus};
 use crate::store::Store;
 
@@ -158,6 +162,17 @@ pub fn governor_ended(store: &Store, scope: &str, pane: Option<&str>) -> Vec<Str
     })
 }
 
+/// What wsp tells the person it did to `list` (`wsp-614`), on `wsp yours` until
+/// they answer it. No pane stands behind it and no row: the list is named as
+/// what waits, which is also how [`list_moved`] knows to leave it.
+pub fn standing_notice(list: &str, text: &str) -> Message {
+    Message::question(Party::wsp(), Kind::Note, text, Waiting::new("", list)).about(About::Scope(list.to_string())).for_the_person()
+}
+
+fn stands(m: &Message, list: &str) -> bool {
+    m.from == Party::wsp() && m.waiting.as_ref().is_some_and(|w| w.pane.is_empty() && w.task == list)
+}
+
 /// The reason every seat-shaped ending gives.
 pub const AGENT_CLOSED: &str = "agent closed";
 
@@ -180,7 +195,7 @@ pub fn list_moved(store: &Store, w: &Worklist) -> Vec<String> {
     };
     let crossed = crate::model::crossed(&w.groups());
     close_where(store, &Party::lapsed(), |m| {
-        if !of_it(m) {
+        if !of_it(m) || stands(m, &w.id) {
             return None;
         }
         if let Some(why) = ended {
@@ -197,7 +212,6 @@ pub fn list_moved(store: &Store, w: &Worklist) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::choices::Choices;
-    use crate::message::{Kind, Waiting};
     use crate::model::{Group, Task};
     use serde_json::{json, Value};
 

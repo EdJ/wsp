@@ -128,12 +128,16 @@ The word after `Default:` is `go` or `stop`. A row before the barrier commits
 the figure, since the check does not measure. Where going on would be costly to
 undo, state no default: the gate waits.
 
-**At the barrier.** The check takes the default without asking first, then tells
-the person (`wsp tell person`) what it took, the figure, and how to turn it back:
-`wsp worklist hold <list>` after a go, which stops anything more starting, or
-`wsp worklist go <list>` after a hold. A red check or a member that did not hold
-still holds the barrier. A `manual` group whose stop states a default gets a
-check agent even where the stop names the person.
+**At the barrier.** The check takes the default without asking first, and names
+in its verdict what it took and the figure. As the verdict is recorded wsp puts
+it on the person's list (`wsp yours`) with how to turn it back: `wsp worklist
+hold <list>` after a go, which stops anything more starting, or `wsp worklist go
+<list>` after a hold. The item stays until the person answers it; the check's
+seat ending, the barrier and the list closing do not take it off. At a list's
+last gate a go closes the list, so turning it back is a row that reverts what
+landed. A red check or a member that did not hold still holds the barrier. A
+`manual` group whose stop states a default gets a check agent even where the stop
+names the person.
 
 ## A done-when that waits on another list's run (wsp-870)
 
