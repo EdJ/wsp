@@ -82,9 +82,9 @@ the row after it. The land does not read the `Push:` line.
 - A shared row: wsp pushes, as part of the land. The branch goes to the trunk of
   the project's `remote:` (`origin` where it names none), fast-forward only,
   before the local trunk moves.
-- A private row: the land only fast-forwards the local trunk, and pushes
-  nothing. Where the list says `Push: go`, whoever governs the list pushes the
-  trunk by hand once the row has landed.
+- A private row: the land fast-forwards the local trunk, and no step of the run
+  pushes it. A `Push: go` on the list is not acted on by wsp: the trunk stays
+  local until someone pushes it by hand.
 
 ## A red the trunk has
 
