@@ -50,7 +50,7 @@ use crate::base::args::Args;
 
 #[cfg(test)]
 pub use crate::checks::{push, text};
-pub use crate::checks::{wait_after, RETRY_BACKOFF, TRIES, instant, Check, Ending, Run, State, Suite};
+pub use crate::checks::{reseated_silent, wait_after, RETRY_BACKOFF, TRIES, instant, Check, Ending, Run, State, Suite};
 
 /// What `wsp wip` and the seat's own label call a check: against its list,
 /// since there is no row to name it by.
@@ -475,6 +475,26 @@ pub fn settle(store: &Store, list: &str, at: usize, state: State) -> Option<Stri
     seat
 }
 
+/// Change the open check on group `at` that is seated in `seat`.
+fn change_open_in(store: &Store, list: &str, at: usize, seat: &str, f: impl FnOnce(&mut Check)) -> bool {
+    change(store, list, at, |g| g.checks.iter_mut().rev().find(|c| c.open() && c.pane.as_deref() == Some(seat)).map(f).is_some())
+}
+
+/// The check in `seat` said nothing (`wsp-903`). Written **before** the seat is
+/// ended: the ending is another process, and a step that reads it first
+/// replaces the entry, which must already count.
+pub fn mark_silent(store: &Store, list: &str, at: usize, seat: &str) -> bool {
+    change_open_in(store, list, at, seat, |c| c.silent = true)
+}
+
+/// And its seat is ended: abandoned, so the next step opens another.
+pub fn abandon(store: &Store, list: &str, at: usize, seat: &str) -> bool {
+    change_open_in(store, list, at, seat, |c| {
+        c.state = State::Abandoned;
+        c.ending = Ending::Ended;
+    })
+}
+
 /// Record the ending of the check that ran in `seat`, wherever it is.
 /// `despawn` calls it for every seat it ends, so the record follows the
 /// ending however it came about.
@@ -560,6 +580,9 @@ pub fn lines(p: &Paint, g: &Group) -> Vec<String> {
             if let Some(b) = &c.by {
                 parts.push(format!("by {b}, no agent"));
             }
+            if c.silent {
+                parts.push("silent".into());
+            }
             p.dim(&parts.join(" · "))
         })
         .collect()
@@ -614,7 +637,7 @@ fn legacy(row: &Task, w: &Worklist, g: &Group, later: bool) -> Check {
         .find_map(|l| l.split("spawned at ").nth(1))
         .and_then(|r| r.split_whitespace().next())
         .map(str::to_string);
-    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false, suite: None, run: None, by: None }
+    Check { at: row.created.clone(), state, read: None, pane, on, ending: Ending::Ended, was: Some(row.id.clone()), tries: 1, gave_up: false, suite: None, run: None, by: None, silent: false }
 }
 
 /// What [`migrate`] would do.
@@ -818,6 +841,7 @@ mod tests {
             suite: Some(Suite::Red),
             run: Some(Run { pid: 25037, lease: "25037-1763639349.run".into() }),
             by: Some("wsp".into()),
+            silent: true,
         };
         let bare = Check::opened(None, None);
         let g = Group {

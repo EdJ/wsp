@@ -29,6 +29,11 @@
 //!   nothing to close or guess at: it is reset and started again, once
 //!   ([`ended_empty`]). The second time it is flagged and left. `wsp leg reset`
 //!   forgives the count ([`forgive_ended`]).
+//! - **A barrier check seat that says nothing** (`wsp-903`): idle, no verdict
+//!   file, and no turn since the tell, as a model request that never returned
+//!   leaves it. wsp ends it and the run seats another, once per verdict
+//!   ([`reseat_silent`]). The second one is flagged and left. A check that
+//!   answered the tell is not silent, and is flagged as before.
 //!
 //! # The other three closing verbs (`wsp-374`)
 //!
@@ -529,6 +534,7 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
         for (i, g) in groups.iter().enumerate() {
             let Some(c) = crate::barrier::running(g) else { continue };
             let Some(seat) = c.standing().map(str::to_string) else { continue };
+            let again = w.status() == WorklistStatus::Running && !crate::barrier::reseated_silent(&g.checks);
             // A barrier already passed has nothing for this check to decide:
             // the tick ends its seat, and it is not told to close or closed
             // with a `go` (`wsp-385`).
@@ -541,9 +547,19 @@ pub fn tick_at(store: &Store, seats: &dyn Seats, now: i64) {
             let written = fresh_verdict(store, &key, Kind::Check, start);
             let what = format!("the {} barrier {at} check", w.id);
             let raise = Raise { about: crate::message::About::Scope(w.id.clone()), what: what.clone(), list: Some(w.clone()) };
-            let item = Item { key: format!("check/{key}"), row: &w.id, seat: &seat, written, start, raise: Some(raise) };
+            // Keyed by seat and opening: a check seated again is owed its own
+            // tell and flag.
+            let item_key = format!("check/{key}/{seat}/{}", c.at);
+            let told = seen.get(&item_key).and_then(|s| s.told);
+            let item = Item { key: item_key, row: &w.id, seat: &seat, written, start, raise: Some(raise) };
             let tell = |idle: i64| tell_verdict(store, Kind::Check, &key, &seat, idle, &what, start);
-            let close = |why: Why| settle_check(store, &w, at, &seat, start, why, now);
+            let close = |why: Why| {
+                let silent = matches!(why, Why::Idle(_)) && written.is_none() && told.is_some_and(|t| no_turn_since(store, seats, &seat, t));
+                match silent && again {
+                    true => reseat_silent(store, &w, at, &seat, why),
+                    false => settle_check(store, &w, at, &seat, start, why, now),
+                }
+            };
             advance(store, seats, &mut asks, &mut seen, &mut open, &item, now, &tell, &close);
         }
     }
@@ -1090,6 +1106,37 @@ fn settle_verifier(store: &Store, member: &str, seat: &str, start: Option<i64>, 
 }
 
 // ---- a barrier check --------------------------------------------------------------
+
+/// Whether `seat` has neither ended a turn nor begun one since `since`: what
+/// it was told then is unread.
+fn no_turn_since(store: &Store, seats: &dyn Seats, seat: &str, since: i64) -> bool {
+    seats.turn_end(seat).is_none_or(|e| e.at < since) && seats.turn_began_since(store, seat, since) != Some(true)
+}
+
+/// A check seat that said nothing (`wsp-903`): end it, abandon its entry as
+/// silent and step the list, which seats another. A seat that will not end is
+/// flagged, so that two never read one barrier. Returns whether the item is
+/// dealt with, as [`settle_check`] does.
+fn reseat_silent(store: &Store, w: &Worklist, at: usize, seat: &str, why: Why) -> bool {
+    let what = format!("the barrier {at} check");
+    if !crate::barrier::mark_silent(store, &w.id, at, seat) {
+        return true;
+    }
+    if let Err(e) = crate::cycle::despawn_seat(seat) {
+        let evidence = format!("no verdict and no turn since wsp told it; {} (it could not be ended to start another: {})", why.words(), util::truncate(&e, 200));
+        let fix = format!("End it with `wsp despawn --pane {seat}`; `wsp worklist advance {}` then starts the check again.", w.id);
+        flag_about(store, &w.id, &what, seat, &evidence, &fix, Some(w), true);
+        return true;
+    }
+    // Nothing to change where a step already replaced the ended entry.
+    crate::barrier::abandon(store, &w.id, at, seat);
+    let line = format!("{what}'s seat {seat} was silent ({}, no verdict, no turn since wsp told it); ended, and a new one is started, once", why.words());
+    crate::store::log_line(store, &format!("{}: {line}", w.id));
+    crate::cycle::tell(store, w, &format!("{}: {line}.", w.id));
+    // A wake and not the bare `advance`, which is a person asking again.
+    crate::cycle::wake_after(store, &w.id, 0);
+    true
+}
 
 /// `worklist go`/`hold` given no words: read the verdict from the barrier's file,
 /// when its first line is the verb's own word.
@@ -2098,6 +2145,14 @@ mod tests {
     fn a_check_seat_idle_with_no_verdict_is_told_once_then_escalated_and_nothing_is_passed_or_held() {
         let env = util::isolated("closing-c-noverdict");
         let store = staged_check(&env);
+        // Already seated again once for a silent one (`wsp-903`).
+        let mut w = store.worklist("run").unwrap();
+        let mut groups = w.groups();
+        let mut before = crate::barrier::Check::opened(None, None);
+        (before.state, before.silent) = (crate::barrier::State::Abandoned, true);
+        groups[0].checks.insert(0, before);
+        w.set_groups(&groups);
+        store.save_worklist(&w).unwrap();
         let fake = Fake(RefCell::new(Some(State::Idle)), false);
         clear_told();
         let t0 = util::epoch_secs();
@@ -2113,6 +2168,68 @@ mod tests {
         assert!(governor_told().iter().any(|t| t.contains("not closing")), "{:?}", governor_told());
         tick_at(&store, &fake, t0 + TELL_AFTER + SECOND_WINDOW + 600);
         assert_eq!(raised_texts(&store).len(), 1, "flagged once");
+    }
+
+    /// `wsp-903`: two hung model requests held crate-split's barrier 4 for 55m.
+    #[test]
+    fn a_silent_check_seat_is_ended_and_seated_again_once_and_the_second_is_flagged() {
+        let env = util::isolated("closing-c-silent");
+        let store = staged_check(&env);
+        let fake = Fake(RefCell::new(Some(State::Idle)), false);
+        clear_told();
+        crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
+        crate::cycle::tests::WAKES.with(|s| s.borrow_mut().clear());
+        let ended = || crate::cycle::tests::ENDED.with(|s| s.borrow().clone());
+        let checks = || store.worklist("run").unwrap().groups()[0].checks.clone();
+        let silent_from = |t0: i64| {
+            tick_at(&store, &fake, t0);
+            tick_at(&store, &fake, t0 + TELL_AFTER);
+            tick_at(&store, &fake, t0 + TELL_AFTER + SECOND_WINDOW);
+        };
+        let t0 = util::epoch_secs();
+        silent_from(t0);
+        assert_eq!(ended(), ["cpd-4"]);
+        assert!(checks().len() == 1 && !checks()[0].open() && checks()[0].silent, "{:?}", checks());
+        assert!(raised_texts(&store).is_empty(), "the first is wsp's to mend: {:?}", raised_texts(&store));
+        assert!(governor_told().iter().any(|t| t.contains("was silent")), "{:?}", governor_told());
+        assert_eq!(crate::cycle::tests::WAKES.with(|s| s.borrow().len()), 1, "the list is stepped");
+        assert!(!held(&store), "nothing is passed or held");
+
+        // The step opens another, in the same pane id for the worst case.
+        let w = store.worklist("run").unwrap();
+        assert!(crate::barrier::open_within(&store, &w, 1, None, None, crate::barrier::Mechanical::No, &|_: &str| false, &|| true).is_some());
+        assert!(crate::barrier::name_seat(&store, "run", 1, "cpd-5"));
+        silent_from(t0 + 3600);
+        assert_eq!(ended(), ["cpd-4"], "not ended a second time");
+        assert!(checks()[1].open(), "{:?}", checks());
+        assert_eq!(raised_texts(&store).len(), 1, "the second is the person's: {:?}", raised_texts(&store));
+
+        // A verdict since gives the barrier its one again.
+        crate::barrier::settle(&store, "run", 1, crate::barrier::State::Holds);
+        assert!(!crate::barrier::reseated_silent(&checks()));
+    }
+
+    /// A check that ends a turn after the tell has read it: waiting, not silent.
+    #[test]
+    fn a_check_seat_that_answered_the_tell_is_flagged_and_not_ended() {
+        struct Answered(i64);
+        impl Seats for Answered {
+            fn state(&self, _seat: &str) -> Option<State> {
+                Some(State::Idle)
+            }
+            fn turn_end(&self, _seat: &str) -> Option<crate::waiting::TurnEnd> {
+                Some(crate::waiting::TurnEnd { at: self.0, words: None, denied: false })
+            }
+        }
+        let env = util::isolated("closing-c-answered");
+        let store = staged_check(&env);
+        crate::cycle::tests::ENDED.with(|s| s.borrow_mut().clear());
+        let t0 = util::epoch_secs();
+        tick_at(&store, &Answered(t0), t0);
+        tick_at(&store, &Answered(t0 + 60), t0 + 90);
+        tick_at(&store, &Answered(t0 + 60), t0 + SECOND_WINDOW);
+        assert!(crate::cycle::tests::ENDED.with(|s| s.borrow().is_empty()));
+        assert_eq!(raised_texts(&store).len(), 1, "{:?}", raised_texts(&store));
     }
 
     #[test]

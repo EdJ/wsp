@@ -394,6 +394,16 @@ leg runs the leg validator, and a valid one closes with its summary as caption.
 - `closing::wsps_close_of_a_leg_runs_the_leg_exit_validator_a_refused_exit_is_flagged_with_its_lines_and_stays_open`
 - `closing::wsps_close_of_a_leg_with_a_valid_exit_closes_it_with_the_exits_summary_as_caption`
 
+**A silent check seat is seated again, once** (wsp-903). A barrier check seat of
+a running list that is idle a window after the reminder, with no verdict file
+and no turn ended or begun since the reminder, is ended by wsp, its entry is
+marked `silent`, and the run seats another. This happens once per verdict on the
+barrier. The next silent one is flagged and left. A seat that answered the
+reminder is flagged as before.
+
+- `closing::a_silent_check_seat_is_ended_and_seated_again_once_and_the_second_is_flagged`
+- `closing::a_check_seat_that_answered_the_tell_is_flagged_and_not_ended`
+
 ## 8. What it absorbed
 
 - **wsp-606**: its raise is S1's "wants somebody" branch, unchanged.

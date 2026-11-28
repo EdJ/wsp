@@ -754,7 +754,7 @@ const RETRY_EVENT: &str = "retry";
 /// process like every other step [`launch`] starts, and the daemon's tick
 /// still steps the list too: whichever comes first starts it, and the step
 /// lock keeps it to one.
-fn wake_after(store: &Store, list: &str, secs: i64) {
+pub(crate) fn wake_after(store: &Store, list: &str, secs: i64) {
     let after = (secs.max(0) + 1).to_string();
     let argv = ["worklist", "advance", list, "--event", RETRY_EVENT, "--after", after.as_str()];
     #[cfg(test)]

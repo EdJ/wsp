@@ -104,6 +104,15 @@ pub struct Check {
     pub run: Option<Run>,
     /// Who settled it, when it was not an agent: `wsp`.
     pub by: Option<String>,
+    /// wsp ended its seat for saying nothing and started another (`wsp-903`).
+    /// Once per verdict: [`reseated_silent`] reads it.
+    pub silent: bool,
+}
+
+/// Whether wsp has already replaced a silent check seat since the last verdict
+/// on this barrier: a settled check starts the allowance again.
+pub fn reseated_silent(checks: &[Check]) -> bool {
+    checks.iter().rev().take_while(|c| matches!(c.state, State::Running | State::Abandoned)).any(|c| c.silent)
 }
 
 /// The process of a barrier's mechanical run and its lease (wsp-057):
@@ -214,6 +223,7 @@ impl Check {
             suite: None,
             run: None,
             by: None,
+            silent: false,
         }
     }
 
@@ -282,6 +292,7 @@ pub fn push(acc: &mut Vec<Check>, text: &str) {
                 suite: None,
                 run: None,
                 by: None,
+                silent: false,
             });
             continue;
         }
@@ -298,6 +309,7 @@ pub fn push(acc: &mut Vec<Check>, text: &str) {
             Some(_) => {}
             None => match tok {
                 "gave-up" => c.gave_up = true,
+                "silent" => c.silent = true,
                 "ended" => c.ending = Ending::Ended,
                 "end-failed" => c.ending = Ending::Failed,
                 w => {
@@ -332,6 +344,9 @@ pub fn text(checks: &[Check]) -> String {
         }
         if c.gave_up {
             e.push("gave-up".into());
+        }
+        if c.silent {
+            e.push("silent".into());
         }
         if let Some(s) = c.suite {
             e.push(format!("suite:{}", s.as_str()));

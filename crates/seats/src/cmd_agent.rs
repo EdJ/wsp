@@ -11214,6 +11214,7 @@ mod from_ending {
             suite: None,
             run: None,
             by: None,
+            silent: false,
         });
         w.set_groups(&g);
         store.save_worklist(&w).unwrap();
