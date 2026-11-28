@@ -4205,7 +4205,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
          Read what was asked and what was done with `wsp show {m}`, then check it against the \
          code rather than against the report: the commits, whether they \
          do what the overview asked, and the tests that cover them — `cargo test <module>::` in \
-         debug for what it touched, never `wsp verify` or a release build.{stop}{legs}{pieces}{whole}{ran_full}{split}\n\n\
+         debug for what it touched, never `wsp verify` or a release build. {measured}{stop}{legs}{pieces}{whole}{ran_full}{split}\n\n\
          **Finish with one command.** Write your verdict to a file — what you checked, what held, \
          what did not, and when it does not hold, what has to change — then:\n\
          - {holds};\n\
@@ -4221,6 +4221,7 @@ fn verifier_base(store: &Store, member: &Task) -> String {
         title = util::truncate(&member.title, 80),
         caption = CAPTION_ORDER,
         checked = CHECKED_ORDER,
+        measured = MEASURED_VERIFIER,
         legs = legs_line(member),
         pieces = pieces_block(store, member),
         whole = crate::size_check::whole_line(member),
@@ -4355,6 +4356,16 @@ const CHECKED_ORDER: &str = "**Say which done-when items you checked.** In the v
      the commands you ran, what you drove, what you read — so do not list those. A blocking verdict's `not held` \
      items are sent back as what is owed. A line that does not end in `held` or `not held` is refused.";
 
+/// What a verifier is told of figures a row measured (`wsp-868`, d1):
+/// measurements are outputs, not checks.
+const MEASURED_VERIFIER: &str = "**Never re-measure**: where the row produced figures (timings, baselines, load), \
+     check what it committed (the figures and raw data are there, their schema and paths are right, they came from \
+     the committed script) and do not take them again.";
+
+/// The same for a barrier check, whose stop condition may ask for a figure.
+const MEASURED_CHECK: &str = "**Do not measure** (timings, baselines, benchmarks): a figure the stop asks for \
+     is read from what a measurement row committed, and where none did, that row is owed.";
+
 /// A check's work order, composed from the list as it stands when it is asked,
 /// since a check has no row to keep it on: what `wsp spawn --check` hands the
 /// agent and what `wsp brief` shows in its seat.
@@ -4425,7 +4436,7 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
          and each has a verifier's verdict, as a note on the member: {members}.\n\n\
          {stop}\n\n\
          {packet}\n\
-         **Do not edit, commit, land or rebase.** The per-member reviews are done; what is \
+         **Do not edit, commit, land or rebase.** {measured} The per-member reviews are done; what is \
          left is what only the group as a whole can show. `wsp worklist next {list}` gives \
          what the group landed and which members touched one file. Read the verdicts, check \
          the group together on the trunk — it builds, its suites pass together, no two members \
@@ -4445,6 +4456,7 @@ fn barrier_order(w: &Worklist, at: usize, g: &Group, packet: &str) -> String {
         members = g.members.join(" "),
         caption = CAPTION_ORDER,
         packet = packet,
+        measured = MEASURED_CHECK,
     )
 }
 
@@ -6640,6 +6652,7 @@ pub mod tests {
         assert!(bare.contains("The packet") && bare.contains("m-1"), "{bare}");
         assert!(bare.contains("gate (1m): sh gate.sh"), "the stop's mechanical items are shown: {bare}");
         assert!(bare.contains("ran no checks for this barrier"), "{bare}");
+        assert!(bare.contains(MEASURED_CHECK), "{bare}");
         // The packet ends with the check's exit template, submitted for the list (`wsp-617`).
         let w = store.worklist("run").unwrap();
         let packet = packet_text(&store, &w, 1, &w.groups()[0]);
@@ -6727,6 +6740,7 @@ pub mod tests {
         assert!(order.contains("--holds --from FILE --caption") && order.contains("under 60 characters") && order.contains("no commit hashes"), "{order}");
         // `wsp-325`: and the one thing about the pass only the verifier can say.
         assert!(order.contains("checked: <the item") && order.contains("held` or `not held"), "{order}");
+        assert!(order.contains(MEASURED_VERIFIER), "{order}");
         assert_eq!(spawned(), vec![("m-1 · verifying".into(), "opencode".into())], "on the same policy: the floor holds");
         step(&store, &w, &Blind);
         assert!(spawned().is_empty() && passes_on(&store, "m-1").len() == 1, "and only once");

@@ -4803,6 +4803,32 @@ names each step's tier and whether the greens ledger already holds it at that
 commit (`green · reused, 101s`), which is what a run would skip. `--set` warns,
 and does not refuse, when a project declares `at end` without `at barrier`.
 
+### Measurements are outputs, not checks (`wsp-868`)
+
+Jesper, 2026-11-23. A measuring command (a timing, a baseline, a benchmark, a
+trial) cannot fail the way a test does: its figure is the figure. As a check
+line it is run again on every check, on the row's critical path. In
+`cr-events-1` two baselines that were already committed were re-run as check
+lines, 14 minutes, 17 % of the list's wall.
+
+- **The row that measures** commits the figures, the raw data and the script
+  that produced them.
+- **`## Checks` and `stop-checks:` hold only pass/fail lines.** A cheap line
+  that reads the committed figures and fails on a bad one (schema, paths) is a
+  check; a line that takes them again is not.
+- **The verifier** validates the committed figures (schema, paths, that they
+  come from the committed script) and never re-measures.
+- **The barrier's check** does not measure either. A stop condition that asks
+  for a figure is read from what a row committed; where none did, a
+  measurement row is owed (a follow-up).
+- **Measuring again is a measurement row's job.** It records the load average
+  and the other running seats for every trial; if the 1-minute load passes half
+  the core count, the trial is run again when the host is quieter, or the row
+  says that its numbers are loaded. A project's handbook may ask for more.
+
+The verifier's order, the barrier check's order and the plan agent's order
+(`docs/initiative-plan.md`) say this to the seats they start.
+
 ### Test tiers (`wsp-342`)
 
 The tier table is above. Three things make the tiers skip each other.

@@ -56,6 +56,11 @@ barrier's check is open they may be changed, as the stop may. **A wsp from befor
 this reads these lines as more members**: `wsp install` before a list carrying
 one is run by an older binary.
 
+A stop check is pass/fail, and so is a member's `## Checks` line: neither takes
+a measurement (`wsp-868`; README, *Measurements are outputs, not checks*). A
+stop that asks for a figure is answered from what a measurement row committed.
+The check agent does not time anything itself.
+
 ### Blame
 
 A failed step is attributed to a member:

@@ -62,6 +62,16 @@ goes through `wsp`; read `wsp help` for a verb you are not sure of.
 - Where one row builds on another, say so: `wsp after <row> <on>`. Where two
   rows touch the same file, name that file in both overviews so the second
   is planned knowing the first.
+- Measurements are outputs, not checks. Where a figure is wanted (a timing, a
+  baseline, a benchmark), a row measures it and its done-when asks for the
+  figures, the raw data and the script that produced them, committed. Never
+  write a measuring command into `## Checks` or `stop-checks`, which hold only
+  pass/fail lines, and never write a stop condition that has the barrier's
+  check measure: it reads the figures that row committed. A measurement row
+  records, for every trial, the load average and the other running seats; if
+  the 1-minute load passes half the core count, it re-runs the trial when the
+  host is quieter or says the figure is loaded. The project's handbook may ask
+  for more (run alone).
 - Make the lists with `wsp worklist new <slug> "title" --initiative <id>`,
   one list per repository where that helps, and fill them with
   `wsp worklist add <slug> <row>…` — one call is one group, run in order;
